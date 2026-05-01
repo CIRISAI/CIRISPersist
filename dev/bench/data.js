@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777673269857,
+  "lastUpdate": 1777674543977,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -1535,6 +1535,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 21155845,
             "range": "± 331619",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "d20b4c209f0fed4e90fc211499592cb58b89ad99",
+          "message": "docs(pypi): document v0.1.13 multi-arch wheel matrix",
+          "timestamp": "2026-05-01T17:22:53-05:00",
+          "tree_id": "c8a5c6067e96c8b7d1d9ecfb04179a069b23ba6a",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/d20b4c209f0fed4e90fc211499592cb58b89ad99"
+        },
+        "date": 1777674543226,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 91110,
+            "range": "± 239",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 228433,
+            "range": "± 664",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 502792,
+            "range": "± 3510",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1904016,
+            "range": "± 34583",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 384,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1394,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7211,
+            "range": "± 35",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 271,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 2489,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 7971,
+            "range": "± 36",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 37540,
+            "range": "± 1530",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 561,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2340009,
+            "range": "± 179365",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6270578,
+            "range": "± 161942",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 21125118,
+            "range": "± 210482",
             "unit": "ns/iter"
           }
         ]
