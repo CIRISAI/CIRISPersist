@@ -181,13 +181,16 @@ mod tests {
         let backend = Arc::new(MemoryBackend::new());
         let (_dir, journal) = temp_journal();
         std::mem::forget(_dir); // keep tempdir alive for test duration
-        let handle = spawn_persister(
+        let (handle, persister) = spawn_persister(
             queue_depth,
             backend.clone(),
             Arc::new(PythonJsonDumpsCanonicalizer),
             Arc::new(NullScrubber),
             journal.clone(),
         );
+        // Detach the persister handle from the test's lifetime;
+        // graceful-shutdown coverage lives in queue::tests.
+        std::mem::forget(persister);
         (router(AppState { handle, journal }), backend)
     }
 

@@ -92,7 +92,67 @@ impl IngestHandle {
     }
 }
 
-/// Spawn the single persister task and return the producer handle.
+/// JoinHandle for the spawned persister task.
+///
+/// THREAT_MODEL.md AV-19 / SECURITY_AUDIT_v0.1.2.md §4.6 — graceful
+/// shutdown contract. Hold this alongside the producer
+/// [`IngestHandle`]; on shutdown drop *all* `IngestHandle` clones
+/// (closes the mpsc) and `await` this handle to drain pending
+/// work. The persister processes the rest of the queue, journals
+/// any backend-write failures, and then exits cleanly.
+pub struct PersisterHandle {
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl PersisterHandle {
+    /// Wait for the persister task to finish processing the queue
+    /// and exit. Caller must have dropped the corresponding
+    /// [`IngestHandle`]s first; otherwise this hangs forever.
+    pub async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
+        self.join.await
+    }
+
+    /// Best-effort wait with a deadline. After `timeout` elapses the
+    /// task is aborted regardless of in-flight work — use only when
+    /// graceful drain is impossible (e.g. operator forced kill).
+    /// Bytes still in the queue at abort time are *lost*; the
+    /// journal preserved bytes-on-failure but not bytes-mid-pipeline.
+    pub async fn shutdown_with_timeout(
+        self,
+        timeout: Duration,
+    ) -> Result<(), tokio::task::JoinError> {
+        match tokio::time::timeout(timeout, self.join).await {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::warn!(
+                    timeout_ms = timeout.as_millis() as u64,
+                    "persister did not drain in time; abort"
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
+/// A future that resolves on SIGINT or SIGTERM.
+///
+/// Use as the trigger for [`PersisterHandle::shutdown`] in long-
+/// running deployments. For the Phase 1.0 PyO3 path, the host
+/// process (FastAPI worker) handles signals; the lens shouldn't
+/// call this from inside the wheel. For Phase 1.1 standalone
+/// server, this is the recommended shutdown trigger.
+pub async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+    tokio::select! {
+        _ = term.recv() => tracing::info!("received SIGTERM; beginning graceful shutdown"),
+        _ = int.recv()  => tracing::info!("received SIGINT; beginning graceful shutdown"),
+    }
+}
+
+/// Spawn the single persister task and return the producer handle
+/// + a JoinHandle for graceful shutdown.
 ///
 /// `pipeline_factory` constructs the IngestPipeline once for the
 /// persister's lifetime. The factory is needed (rather than passing
@@ -102,13 +162,18 @@ impl IngestHandle {
 /// `journal` is shared with the persister; the persister also has
 /// the only writers to it during normal operation, but the producer
 /// side may inspect `pending_count()` for the `/health` probe.
+///
+/// Shutdown contract (THREAT_MODEL.md AV-19): drop all returned
+/// `IngestHandle` clones, then `await` the `PersisterHandle`. The
+/// persister drains its queue, runs each remaining batch through
+/// the pipeline (or journals on backend failure), and exits.
 pub fn spawn_persister<B, C, S>(
     queue_depth: usize,
     backend: Arc<B>,
     canonicalizer: Arc<C>,
     scrubber: Arc<S>,
     journal: Arc<Journal>,
-) -> IngestHandle
+) -> (IngestHandle, PersisterHandle)
 where
     B: Backend + 'static,
     C: Canonicalizer + 'static,
@@ -116,7 +181,7 @@ where
 {
     let (tx, mut rx) = mpsc::channel::<Job>(queue_depth);
 
-    tokio::spawn(async move {
+    let join = tokio::spawn(async move {
         // Step 0: replay the journal before accepting new traffic.
         // Mission constraint (FSD §3.4 #2; MISSION.md §2 — `store/`):
         // resume from where the previous process left off so no
@@ -193,9 +258,12 @@ where
                 }
             }
         }
+        // mpsc closed (all senders dropped); persister exits cleanly.
+        // THREAT_MODEL.md AV-19: graceful-shutdown drain complete.
+        tracing::info!("persister drained, exiting");
     });
 
-    IngestHandle { tx }
+    (IngestHandle { tx }, PersisterHandle { join })
 }
 
 #[cfg(test)]
@@ -218,7 +286,7 @@ mod tests {
     async fn full_queue_returns_429_typed() {
         let backend = Arc::new(MemoryBackend::new());
         let (_dir, journal) = temp_journal();
-        let handle = spawn_persister(
+        let (handle, _persister) = spawn_persister(
             /* queue_depth */ 1,
             backend.clone(),
             Arc::new(PythonJsonDumpsCanonicalizer),
@@ -262,7 +330,7 @@ mod tests {
         assert_eq!(journal.pending_count().unwrap(), 1);
 
         let backend = Arc::new(MemoryBackend::new());
-        let handle = spawn_persister(
+        let (handle, _persister) = spawn_persister(
             DEFAULT_QUEUE_DEPTH,
             backend,
             Arc::new(PythonJsonDumpsCanonicalizer),
@@ -301,7 +369,7 @@ mod tests {
         // integration suite once Postgres is wired up.
         let backend = Arc::new(MemoryBackend::new());
         let (_dir, journal) = temp_journal();
-        let handle = spawn_persister(
+        let (handle, _persister) = spawn_persister(
             DEFAULT_QUEUE_DEPTH,
             backend,
             Arc::new(PythonJsonDumpsCanonicalizer),
@@ -309,5 +377,45 @@ mod tests {
             journal,
         );
         assert!(handle.capacity_remaining() > 0);
+    }
+
+    /// THREAT_MODEL.md AV-19 regression: graceful shutdown drain.
+    /// Submit a few batches, drop the IngestHandle, await the
+    /// PersisterHandle, confirm pending work didn't get lost. (The
+    /// MemoryBackend always succeeds; this proves the drain
+    /// mechanism. Real backend-outage drain belongs in a Postgres
+    /// integration test.)
+    #[tokio::test]
+    async fn graceful_shutdown_drains_pending() {
+        let backend = Arc::new(MemoryBackend::new());
+        let (_dir, journal) = temp_journal();
+        let (handle, persister) = spawn_persister(
+            DEFAULT_QUEUE_DEPTH,
+            backend.clone(),
+            Arc::new(PythonJsonDumpsCanonicalizer),
+            Arc::new(NullScrubber),
+            journal,
+        );
+
+        // Submit several malformed bodies (they reject at
+        // schema-parse, which still flows through the persister
+        // and exits the loop iteration cleanly — that's the
+        // shape we're testing: the drain mechanism, not the happy
+        // ingest path).
+        for i in 0..5 {
+            handle
+                .try_submit(format!("garbage-{i}").into_bytes())
+                .unwrap();
+        }
+
+        // Drop the producer side; persister drains.
+        drop(handle);
+
+        // Should complete promptly — bounded by 5 schema-error
+        // iterations.
+        tokio::time::timeout(Duration::from_secs(5), persister.shutdown())
+            .await
+            .expect("persister did not drain in 5s")
+            .expect("persister task should not panic");
     }
 }

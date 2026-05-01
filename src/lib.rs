@@ -35,7 +35,10 @@ pub mod verify;
 
 pub use ingest::{BatchSummary, IngestError, IngestPipeline};
 pub use journal::{Journal, JournalError};
-pub use queue::{spawn_persister, IngestHandle, QueueError, DEFAULT_QUEUE_DEPTH};
+pub use queue::{
+    shutdown_signal, spawn_persister, IngestHandle, PersisterHandle, QueueError,
+    DEFAULT_QUEUE_DEPTH,
+};
 
 // Phase 1 surfaces still pending implementation:
 //   #[cfg(feature = "server")] pub mod server;
