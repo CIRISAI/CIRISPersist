@@ -22,9 +22,9 @@ mkdir -p ~/.ciris-build-sign-persist && cd ~/.ciris-build-sign-persist
 ciris-build-sign generate-keys --output-dir .
 # Produces:
 #   ed25519.seed       (32 bytes — Ed25519 seed)
-#   ed25519.public     (32 bytes — Ed25519 public key)
-#   mldsa65.secret     (~4032 bytes — ML-DSA-65 secret)
-#   mldsa65.public     (~1952 bytes — ML-DSA-65 public)
+#   ed25519.pub        (32 bytes — Ed25519 public key)
+#   mldsa65.secret     (32 bytes — ML-DSA-65 seed; full key derived at sign time)
+#   mldsa65.pub        (1952 bytes — ML-DSA-65 public)
 
 # 3. Base64-encode the secrets for GitHub-secret upload:
 base64 -w0 ed25519.seed   # paste into GH repo secret CIRIS_BUILD_ED25519_SECRET
