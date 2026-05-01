@@ -23,9 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::schema::{BatchEnvelope, BatchEvent, CompleteTrace, Error as SchemaError};
 use crate::scrub::{ScrubError, Scrubber};
 use crate::store::{Backend, Error as StoreError, InsertReport};
-use crate::verify::{
-    canonical::Canonicalizer, ed25519::verify_trace, Error as VerifyError,
-};
+use crate::verify::{canonical::Canonicalizer, ed25519::verify_trace, Error as VerifyError};
 
 /// What the ingest pipeline did with one `events[]` body.
 ///
@@ -94,9 +92,9 @@ pub enum IngestError {
 /// persistence-layer key directory.
 pub struct IngestPipeline<'a, B, C, S>
 where
-    B: Backend,
-    C: Canonicalizer,
-    S: Scrubber,
+    B: Backend + ?Sized,
+    C: Canonicalizer + ?Sized,
+    S: Scrubber + ?Sized,
 {
     pub backend: &'a B,
     pub canonicalizer: &'a C,
@@ -105,9 +103,9 @@ where
 
 impl<'a, B, C, S> IngestPipeline<'a, B, C, S>
 where
-    B: Backend,
-    C: Canonicalizer,
-    S: Scrubber,
+    B: Backend + ?Sized,
+    C: Canonicalizer + ?Sized,
+    S: Scrubber + ?Sized,
 {
     /// Run the FSD §3.3 pipeline over a raw HTTP body.
     ///
@@ -292,7 +290,10 @@ mod tests {
 
         assert_eq!(summary.envelopes_processed, 1);
         assert_eq!(summary.signatures_verified, 1);
-        assert_eq!(summary.trace_events_inserted, 2, "two components → two rows");
+        assert_eq!(
+            summary.trace_events_inserted, 2,
+            "two components → two rows"
+        );
         assert_eq!(summary.trace_events_conflicted, 0);
         assert_eq!(summary.trace_llm_calls_inserted, 0);
         assert_eq!(summary.scrubbed_fields, 0);
@@ -406,7 +407,10 @@ mod tests {
             scrubber: &NullScrubber,
         };
         let err = pipeline.receive_and_persist(&bytes).await.unwrap_err();
-        assert!(matches!(err, IngestError::Verify(VerifyError::SignatureMismatch)));
+        assert!(matches!(
+            err,
+            IngestError::Verify(VerifyError::SignatureMismatch)
+        ));
         assert!(
             backend.snapshot_events().is_empty(),
             "rejected traces must produce zero rows"

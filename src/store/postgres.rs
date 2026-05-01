@@ -67,9 +67,9 @@ impl PostgresBackend {
             recycling_method: RecyclingMethod::Fast,
         };
         let mut cfg = Config::new();
-        cfg.host = pg_config.get_hosts().first().and_then(|h| match h {
-            tokio_postgres::config::Host::Tcp(s) => Some(s.clone()),
-            tokio_postgres::config::Host::Unix(p) => Some(p.to_string_lossy().into_owned()),
+        cfg.host = pg_config.get_hosts().first().map(|h| match h {
+            tokio_postgres::config::Host::Tcp(s) => s.clone(),
+            tokio_postgres::config::Host::Unix(p) => p.to_string_lossy().into_owned(),
         });
         cfg.port = pg_config.get_ports().first().copied();
         cfg.user = pg_config.get_user().map(str::to_owned);
@@ -139,8 +139,7 @@ impl Backend for PostgresBackend {
         sql.push_str(COLS);
         sql.push_str(") VALUES ");
 
-        let mut params: Vec<Box<dyn ToSql + Sync + Send>> =
-            Vec::with_capacity(rows.len() * N_COLS);
+        let mut params: Vec<Box<dyn ToSql + Sync + Send>> = Vec::with_capacity(rows.len() * N_COLS);
         for (i, row) in rows.iter().enumerate() {
             if i > 0 {
                 sql.push(',');
@@ -206,8 +205,10 @@ impl Backend for PostgresBackend {
             " ON CONFLICT (trace_id, thought_id, event_type, attempt_index, ts) DO NOTHING",
         );
 
-        let params_refs: Vec<&(dyn ToSql + Sync)> =
-            params.iter().map(|b| b.as_ref() as &(dyn ToSql + Sync)).collect();
+        let params_refs: Vec<&(dyn ToSql + Sync)> = params
+            .iter()
+            .map(|b| b.as_ref() as &(dyn ToSql + Sync))
+            .collect();
 
         let inserted = tx
             .execute(sql.as_str(), &params_refs)
@@ -225,10 +226,7 @@ impl Backend for PostgresBackend {
         })
     }
 
-    async fn insert_trace_llm_calls_batch(
-        &self,
-        rows: &[TraceLlmCallRow],
-    ) -> Result<usize, Error> {
+    async fn insert_trace_llm_calls_batch(&self, rows: &[TraceLlmCallRow]) -> Result<usize, Error> {
         if rows.is_empty() {
             return Ok(0);
         }
@@ -251,8 +249,7 @@ impl Backend for PostgresBackend {
         sql.push_str(COLS);
         sql.push_str(") VALUES ");
 
-        let mut params: Vec<Box<dyn ToSql + Sync + Send>> =
-            Vec::with_capacity(rows.len() * N_COLS);
+        let mut params: Vec<Box<dyn ToSql + Sync + Send>> = Vec::with_capacity(rows.len() * N_COLS);
         for (i, r) in rows.iter().enumerate() {
             if i > 0 {
                 sql.push(',');
@@ -296,8 +293,10 @@ impl Backend for PostgresBackend {
             params.push(Box::new(r.response_text.clone()));
         }
 
-        let params_refs: Vec<&(dyn ToSql + Sync)> =
-            params.iter().map(|b| b.as_ref() as &(dyn ToSql + Sync)).collect();
+        let params_refs: Vec<&(dyn ToSql + Sync)> = params
+            .iter()
+            .map(|b| b.as_ref() as &(dyn ToSql + Sync))
+            .collect();
 
         let inserted = tx
             .execute(sql.as_str(), &params_refs)

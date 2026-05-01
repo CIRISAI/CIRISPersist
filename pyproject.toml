@@ -1,0 +1,35 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "ciris-persist"
+description = "Unified Rust persistence for the CIRIS Trinity — signed events, time-series, runtime state."
+readme = "README.md"
+license = { text = "AGPL-3.0-or-later" }
+authors = [{ name = "CIRIS AI", email = "hello@ciris.ai" }]
+requires-python = ">=3.11"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Topic :: Database",
+    "Topic :: System :: Logging",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://ciris.ai"
+Repository = "https://github.com/CIRISAI/CIRISPersist"
+Issues = "https://github.com/CIRISAI/CIRISPersist/issues"
+
+[tool.maturin]
+features = ["pyo3"]
+module-name = "ciris_persist"
+# abi3-py311: one wheel covers Python 3.11+ per
+# PLATFORM_ARCHITECTURE.md §3.5.
+python-source = "python"
+strip = true

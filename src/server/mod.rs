@@ -177,10 +177,7 @@ mod tests {
             Arc::new(NullScrubber),
             journal.clone(),
         );
-        (
-            router(AppState { handle, journal }),
-            backend,
-        )
+        (router(AppState { handle, journal }), backend)
     }
 
     /// Mission category §4 "Backpressure": the agent's POST flow

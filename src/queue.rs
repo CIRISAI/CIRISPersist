@@ -204,7 +204,7 @@ mod tests {
     use crate::scrub::NullScrubber;
     use crate::store::MemoryBackend;
     use crate::verify::PythonJsonDumpsCanonicalizer;
-    use ed25519_dalek::SigningKey;
+    
 
     fn temp_journal() -> (tempfile::TempDir, Arc<Journal>) {
         let dir = tempfile::tempdir().unwrap();

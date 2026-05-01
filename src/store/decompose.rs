@@ -55,9 +55,7 @@ pub fn decompose(trace: &CompleteTrace) -> Result<Decomposed, Error> {
     let mut llm_calls = Vec::new();
 
     for component in &trace.components {
-        let attempt_index = component
-            .attempt_index()
-            .map_err(Error::Schema)?;
+        let attempt_index = component.attempt_index().map_err(Error::Schema)?;
 
         let cost = component.cost_summary();
 
@@ -199,9 +197,10 @@ mod tests {
             component_type: match event_type {
                 ReasoningEventType::ThoughtStart => ComponentType::Observation,
                 ReasoningEventType::SnapshotAndContext => ComponentType::Context,
-                ReasoningEventType::DmaResults | ReasoningEventType::IdmaResult |
-                ReasoningEventType::AspdmaResult | ReasoningEventType::TsaspdmaResult =>
-                    ComponentType::Rationale,
+                ReasoningEventType::DmaResults
+                | ReasoningEventType::IdmaResult
+                | ReasoningEventType::AspdmaResult
+                | ReasoningEventType::TsaspdmaResult => ComponentType::Rationale,
                 ReasoningEventType::VerbSecondPassResult => ComponentType::VerbSecondPass,
                 ReasoningEventType::ConscienceResult => ComponentType::Conscience,
                 ReasoningEventType::ActionResult => ComponentType::Action,
@@ -316,7 +315,11 @@ mod tests {
                     assert!((ev.cost_usd.unwrap() - 0.276).abs() < 1e-9);
                 }
                 _ => {
-                    assert!(ev.cost_llm_calls.is_none(), "{:?} → cost columns must be None", ev.event_type);
+                    assert!(
+                        ev.cost_llm_calls.is_none(),
+                        "{:?} → cost columns must be None",
+                        ev.event_type
+                    );
                     assert!(ev.cost_tokens.is_none());
                     assert!(ev.cost_usd.is_none());
                 }

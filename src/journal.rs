@@ -20,9 +20,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use redb::{
-    Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
-};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 
 const QUEUED_BATCHES: TableDefinition<u64, &[u8]> = TableDefinition::new("queued_batches");
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
@@ -44,8 +42,7 @@ impl Journal {
                     .map_err(|e| JournalError::Io(format!("create_dir_all: {e}")))?;
             }
         }
-        let db =
-            Database::create(path.as_ref()).map_err(|e| JournalError::Open(e.to_string()))?;
+        let db = Database::create(path.as_ref()).map_err(|e| JournalError::Open(e.to_string()))?;
 
         // Bootstrap tables (idempotent on existing files) and read
         // any persisted next_seq.
@@ -234,7 +231,11 @@ mod tests {
         let collected = collected.into_inner().unwrap();
         assert_eq!(
             collected,
-            vec![b"batch-1".to_vec(), b"batch-2".to_vec(), b"batch-3".to_vec()],
+            vec![
+                b"batch-1".to_vec(),
+                b"batch-2".to_vec(),
+                b"batch-3".to_vec()
+            ],
             "replayed in append order"
         );
     }

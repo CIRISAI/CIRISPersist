@@ -89,9 +89,8 @@ fn attempt_index_extracts_for_every_component() {
     for (name, _, _) in FIXTURES {
         let trace = load_fixture(name);
         for (i, c) in trace.components.iter().enumerate() {
-            c.attempt_index().unwrap_or_else(|e| {
-                panic!("{name} component {i} ({:?}): {e}", c.event_type)
-            });
+            c.attempt_index()
+                .unwrap_or_else(|e| panic!("{name} component {i} ({:?}): {e}", c.event_type));
         }
     }
 }
@@ -150,10 +149,7 @@ fn llm_calls_decompose_to_typed_summaries() {
                 count += 1;
             }
         }
-        assert_eq!(
-            count, *expected_llm_calls,
-            "{name} LLM_CALL count"
-        );
+        assert_eq!(count, *expected_llm_calls, "{name} LLM_CALL count");
     }
 }
 

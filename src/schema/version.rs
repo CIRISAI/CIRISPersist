@@ -97,7 +97,7 @@ impl SchemaVersion {
     /// True iff this `SchemaVersion` is in [`SUPPORTED_VERSIONS`].
     /// Used by [`BatchEnvelope::from_json`] for the typed gate.
     pub fn is_supported(&self) -> bool {
-        SUPPORTED_VERSIONS.iter().any(|&v| v == self.0)
+        SUPPORTED_VERSIONS.contains(&self.0)
     }
 }
 

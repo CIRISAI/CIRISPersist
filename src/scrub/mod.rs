@@ -16,7 +16,7 @@
 //! field-level redaction policies) without restructuring the
 //! ingest pipeline.
 
-use crate::schema::{BatchEvent, BatchEnvelope, TraceLevel};
+use crate::schema::{BatchEnvelope, TraceLevel};
 
 /// PII scrubber trait.
 ///
@@ -163,16 +163,10 @@ where
     }
 }
 
-/// Convenience: a scrubber that returns each event's typed shape
-/// after callbacks. Used by the test suite (and as a parity reference
-/// for the Python callable shim once PyO3 lands in Phase 1.9).
-#[cfg(test)]
-pub fn _silence(_: BatchEvent) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{BatchEnvelope, BatchEvent, TraceLevel};
+    use crate::schema::{BatchEnvelope, TraceLevel};
 
     fn ascii_envelope(level: TraceLevel) -> BatchEnvelope {
         let body = serde_json::json!({

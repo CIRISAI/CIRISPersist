@@ -8,9 +8,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::events::{
-    AuditAnchor, ComponentType, CostSummary, LlmCallSummary, ReasoningEventType,
-};
+use super::events::{AuditAnchor, ComponentType, CostSummary, LlmCallSummary, ReasoningEventType};
 use super::version::SchemaVersion;
 use super::Error;
 
@@ -86,8 +84,12 @@ impl TraceComponent {
         // intentionally re-serialize a new object so that downstream
         // `data` JSONB storage is untouched.
         let mut subset = serde_json::Map::new();
-        for k in ["audit_sequence_number", "audit_entry_hash", "audit_signature", "audit_entry_id"]
-        {
+        for k in [
+            "audit_sequence_number",
+            "audit_entry_hash",
+            "audit_signature",
+            "audit_entry_id",
+        ] {
             if let Some(v) = self.data.get(k) {
                 subset.insert(k.to_owned(), v.clone());
             }
@@ -108,7 +110,11 @@ impl TraceComponent {
         if self.event_type != ReasoningEventType::ActionResult {
             return CostSummary::default();
         }
-        let llm_calls = self.data.get("llm_calls").and_then(|v| v.as_i64()).map(|n| n as i32);
+        let llm_calls = self
+            .data
+            .get("llm_calls")
+            .and_then(|v| v.as_i64())
+            .map(|n| n as i32);
         let tokens_total = self
             .data
             .get("tokens_total")
@@ -239,7 +245,10 @@ mod tests {
             serde_json::json!({}),
         );
         let err = c.attempt_index().unwrap_err();
-        assert!(matches!(err, Error::MissingField("attempt_index")), "got {err:?}");
+        assert!(
+            matches!(err, Error::MissingField("attempt_index")),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -253,7 +262,10 @@ mod tests {
             serde_json::json!({"attempt_index": -1}),
         );
         let err = c.attempt_index().unwrap_err();
-        assert!(matches!(err, Error::NegativeAttemptIndex(-1)), "got {err:?}");
+        assert!(
+            matches!(err, Error::NegativeAttemptIndex(-1)),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -264,7 +276,13 @@ mod tests {
             serde_json::json!({"attempt_index": "not a number"}),
         );
         let err = c.attempt_index().unwrap_err();
-        assert!(matches!(err, Error::FieldTypeMismatch { field: "attempt_index", .. }));
+        assert!(matches!(
+            err,
+            Error::FieldTypeMismatch {
+                field: "attempt_index",
+                ..
+            }
+        ));
     }
 
     /// Mission category §4 "Schema parity": audit anchor extracted
@@ -283,7 +301,10 @@ mod tests {
                 "audit_signature": "BBBB",
             }),
         );
-        let a = c.audit_anchor().unwrap().expect("ACTION_RESULT should expose anchor");
+        let a = c
+            .audit_anchor()
+            .unwrap()
+            .expect("ACTION_RESULT should expose anchor");
         assert_eq!(a.audit_sequence_number, 42);
 
         // Anchor present but on a non-ACTION_RESULT component → None
@@ -411,7 +432,10 @@ mod tests {
         let first = &trace.components[0];
         assert_eq!(first.event_type, ReasoningEventType::ThoughtStart);
         assert_eq!(first.attempt_index().unwrap(), 0);
-        assert!(first.audit_anchor().unwrap().is_none(), "anchor only on ACTION_RESULT");
+        assert!(
+            first.audit_anchor().unwrap().is_none(),
+            "anchor only on ACTION_RESULT"
+        );
 
         let last = &trace.components[1];
         assert_eq!(last.event_type, ReasoningEventType::ActionResult);
@@ -437,7 +461,12 @@ mod tests {
         let attempt = c.attempt_index().unwrap();
         // The four-tuple lands as concrete typed values, never as
         // serde_json::Value.
-        let dedup_key = (trace_id.to_owned(), thought_id.to_owned(), c.event_type, attempt);
+        let dedup_key = (
+            trace_id.to_owned(),
+            thought_id.to_owned(),
+            c.event_type,
+            attempt,
+        );
         assert_eq!(dedup_key.2, ReasoningEventType::ConscienceResult);
         assert_eq!(dedup_key.3, 2);
     }

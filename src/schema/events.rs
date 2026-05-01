@@ -223,12 +223,18 @@ mod tests {
     fn event_type_round_trip() {
         for &(et, s) in &[
             (ReasoningEventType::ThoughtStart, "THOUGHT_START"),
-            (ReasoningEventType::SnapshotAndContext, "SNAPSHOT_AND_CONTEXT"),
+            (
+                ReasoningEventType::SnapshotAndContext,
+                "SNAPSHOT_AND_CONTEXT",
+            ),
             (ReasoningEventType::DmaResults, "DMA_RESULTS"),
             (ReasoningEventType::IdmaResult, "IDMA_RESULT"),
             (ReasoningEventType::AspdmaResult, "ASPDMA_RESULT"),
             (ReasoningEventType::TsaspdmaResult, "TSASPDMA_RESULT"),
-            (ReasoningEventType::VerbSecondPassResult, "VERB_SECOND_PASS_RESULT"),
+            (
+                ReasoningEventType::VerbSecondPassResult,
+                "VERB_SECOND_PASS_RESULT",
+            ),
             (ReasoningEventType::ConscienceResult, "CONSCIENCE_RESULT"),
             (ReasoningEventType::ActionResult, "ACTION_RESULT"),
             (ReasoningEventType::LlmCall, "LLM_CALL"),
@@ -245,14 +251,38 @@ mod tests {
     fn component_type_wire_tokens() {
         // Spelling matches TRACE_WIRE_FORMAT.md §4 verbatim. A typo
         // here silently mis-routes events at ingest.
-        assert_eq!(serde_json::to_string(&ComponentType::Observation).unwrap(), r#""observation""#);
-        assert_eq!(serde_json::to_string(&ComponentType::Context).unwrap(), r#""context""#);
-        assert_eq!(serde_json::to_string(&ComponentType::Rationale).unwrap(), r#""rationale""#);
-        assert_eq!(serde_json::to_string(&ComponentType::Conscience).unwrap(), r#""conscience""#);
-        assert_eq!(serde_json::to_string(&ComponentType::Action).unwrap(), r#""action""#);
-        assert_eq!(serde_json::to_string(&ComponentType::VerbSecondPass).unwrap(), r#""verb_second_pass""#);
-        assert_eq!(serde_json::to_string(&ComponentType::LlmCall).unwrap(), r#""llm_call""#);
-        assert_eq!(serde_json::to_string(&ComponentType::Unknown).unwrap(), r#""unknown""#);
+        assert_eq!(
+            serde_json::to_string(&ComponentType::Observation).unwrap(),
+            r#""observation""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ComponentType::Context).unwrap(),
+            r#""context""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ComponentType::Rationale).unwrap(),
+            r#""rationale""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ComponentType::Conscience).unwrap(),
+            r#""conscience""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ComponentType::Action).unwrap(),
+            r#""action""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ComponentType::VerbSecondPass).unwrap(),
+            r#""verb_second_pass""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ComponentType::LlmCall).unwrap(),
+            r#""llm_call""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ComponentType::Unknown).unwrap(),
+            r#""unknown""#
+        );
     }
 
     #[test]
@@ -269,7 +299,9 @@ mod tests {
             assert_eq!(
                 serde_json::to_string(&st).unwrap(),
                 format!(r#""{s}""#),
-                "{:?} → {:?}", st, s
+                "{:?} → {:?}",
+                st,
+                s
             );
         }
     }

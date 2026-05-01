@@ -109,10 +109,7 @@ pub trait Backend: Send + Sync {
     /// Phase 3 surface; the encryption boundary stays *above* the
     /// persistence layer — this method receives ciphertext as opaque
     /// JSONB (FSD §5.7).
-    fn add_graph_node(
-        &self,
-        _n: &GraphNode,
-    ) -> impl Future<Output = Result<(), Error>> + Send {
+    fn add_graph_node(&self, _n: &GraphNode) -> impl Future<Output = Result<(), Error>> + Send {
         async { Err(Error::NotImplemented("add_graph_node (Phase 3)")) }
     }
 }

@@ -121,10 +121,7 @@ impl Backend for MemoryBackend {
         })
     }
 
-    async fn insert_trace_llm_calls_batch(
-        &self,
-        rows: &[TraceLlmCallRow],
-    ) -> Result<usize, Error> {
+    async fn insert_trace_llm_calls_batch(&self, rows: &[TraceLlmCallRow]) -> Result<usize, Error> {
         let mut state = self.state.lock().expect("memory backend lock");
         let n = rows.len();
         state.llm_calls.extend(rows.iter().cloned());
@@ -145,9 +142,9 @@ impl Backend for MemoryBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::CompleteTrace;
     use crate::schema::{ComponentType, SchemaVersion, TraceLevel};
     use crate::store::decompose::decompose;
-    use crate::schema::CompleteTrace;
 
     fn fixture_row(attempt_index: u32, event_type: ReasoningEventType) -> TraceEventRow {
         TraceEventRow {
@@ -229,7 +226,11 @@ mod tests {
         let vkey = signing.verifying_key();
 
         // Lookup with no entry → None (typed; not panic).
-        assert!(backend.lookup_public_key("missing").await.unwrap().is_none());
+        assert!(backend
+            .lookup_public_key("missing")
+            .await
+            .unwrap()
+            .is_none());
 
         backend.add_public_key("key-id-1", vkey);
         let got = backend
@@ -302,10 +303,7 @@ mod tests {
         let d = decompose(&trace).expect("decompose ok");
         let backend = MemoryBackend::new();
 
-        let event_report = backend
-            .insert_trace_events_batch(&d.events)
-            .await
-            .unwrap();
+        let event_report = backend.insert_trace_events_batch(&d.events).await.unwrap();
         assert_eq!(event_report.inserted, 3);
         let llm_count = backend
             .insert_trace_llm_calls_batch(&d.llm_calls)

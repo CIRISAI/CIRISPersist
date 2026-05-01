@@ -311,7 +311,8 @@ mod tests {
         let keys = MemKeys {
             keys: HashMap::new(),
         };
-        let err = verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &keys).unwrap_err();
+        let err =
+            verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &keys).unwrap_err();
         assert!(matches!(err, Error::UnknownKey(_)));
     }
 
@@ -328,7 +329,8 @@ mod tests {
         };
         keys.keys.insert(key_id.to_owned(), sk.verifying_key());
 
-        let err = verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &keys).unwrap_err();
+        let err =
+            verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &keys).unwrap_err();
         assert!(matches!(err, Error::InvalidSignature(_)));
     }
 
@@ -347,7 +349,8 @@ mod tests {
         };
         keys.keys.insert(key_id.to_owned(), sk.verifying_key());
 
-        let err = verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &keys).unwrap_err();
+        let err =
+            verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &keys).unwrap_err();
         assert!(matches!(err, Error::InvalidSignature(_)));
     }
 
@@ -365,9 +368,11 @@ mod tests {
         let mut keys = MemKeys {
             keys: HashMap::new(),
         };
-        keys.keys.insert(key_id.to_owned(), sk_other.verifying_key());
+        keys.keys
+            .insert(key_id.to_owned(), sk_other.verifying_key());
 
-        let err = verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &keys).unwrap_err();
+        let err =
+            verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &keys).unwrap_err();
         assert!(matches!(err, Error::SignatureMismatch));
     }
 }

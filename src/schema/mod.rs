@@ -28,8 +28,7 @@ pub mod version;
 
 pub use envelope::{BatchEnvelope, BatchEvent, CorrelationMetadata, TraceLevel};
 pub use events::{
-    AuditAnchor, ComponentType, CostSummary, LlmCallStatus, LlmCallSummary,
-    ReasoningEventType,
+    AuditAnchor, ComponentType, CostSummary, LlmCallStatus, LlmCallSummary, ReasoningEventType,
 };
 pub use trace::{CompleteTrace, TraceComponent};
 pub use version::{SchemaVersion, SUPPORTED_VERSIONS};

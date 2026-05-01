@@ -247,8 +247,14 @@ mod tests {
             assert_eq!(back, level);
         }
         // Spelling matches TRACE_WIRE_FORMAT.md §1 verbatim.
-        assert_eq!(serde_json::to_string(&TraceLevel::Generic).unwrap(), r#""generic""#);
-        assert_eq!(serde_json::to_string(&TraceLevel::Detailed).unwrap(), r#""detailed""#);
+        assert_eq!(
+            serde_json::to_string(&TraceLevel::Generic).unwrap(),
+            r#""generic""#
+        );
+        assert_eq!(
+            serde_json::to_string(&TraceLevel::Detailed).unwrap(),
+            r#""detailed""#
+        );
         assert_eq!(
             serde_json::to_string(&TraceLevel::FullTraces).unwrap(),
             r#""full_traces""#

@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS Trinity — signed events, time-series, runtime state."
@@ -20,7 +20,9 @@ default = []
 # Phase 1 features.
 postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:bytes", "dep:postgres-types", "dep:refinery"]
 server   = ["dep:axum", "dep:tower", "dep:http-body-util"]
-pyo3     = ["dep:pyo3"]
+# pyo3 implies postgres — the lens FastAPI integration shape (FSD §3.5)
+# needs the Postgres backend to be available.
+pyo3     = ["dep:pyo3", "postgres"]
 
 # Phase 2 features (declared now; impls land later — MISSION.md §2 / FSD §4).
 sqlite         = ["dep:rusqlite"]

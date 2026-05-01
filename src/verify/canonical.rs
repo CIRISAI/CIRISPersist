@@ -210,9 +210,7 @@ mod tests {
     use serde_json::json;
 
     fn pyc(v: serde_json::Value) -> String {
-        let bytes = PythonJsonDumpsCanonicalizer
-            .canonicalize_value(&v)
-            .unwrap();
+        let bytes = PythonJsonDumpsCanonicalizer.canonicalize_value(&v).unwrap();
         String::from_utf8(bytes).unwrap()
     }
 
@@ -248,7 +246,7 @@ mod tests {
     #[test]
     fn no_whitespace_in_separators() {
         assert_eq!(pyc(json!({"a":1,"b":2})), "{\"a\":1,\"b\":2}");
-        assert_eq!(pyc(json!([1,2,3])), "[1,2,3]");
+        assert_eq!(pyc(json!([1, 2, 3])), "[1,2,3]");
     }
 
     #[test]

@@ -1,0 +1,133 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # Mission category §4 (PLATFORM_ARCHITECTURE.md §4):
+  # the linux-x86_64 path that runs the full feature set with a
+  # real Postgres backing the integration tests.
+  linux-x86_64-test:
+    name: linux-x86_64 (full features)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: timescale/timescaledb:latest-pg16
+        env:
+          POSTGRES_USER: ciris
+          POSTGRES_PASSWORD: ciris
+          POSTGRES_DB: ciris_persist_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ciris"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (postgres + server + pyo3)
+        env:
+          CIRIS_PERSIST_TEST_PG_URL: postgres://ciris:ciris@localhost:5432/ciris_persist_test
+        run: cargo test --features "postgres server pyo3" --all-targets
+      - name: cargo test (default — fixture suite)
+        run: cargo test --test wire_format_fixtures
+
+  # Mission category §4 "Backend parity": cross-compile to arm64 to
+  # catch arch-specific issues before they hit Pi-class deployments
+  # (PLATFORM_ARCHITECTURE.md §3.3).
+  linux-aarch64-build:
+    name: linux-aarch64 (cross-compile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: install gcc-aarch64
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: cargo build (postgres + server)
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --target aarch64-unknown-linux-gnu --features "postgres server"
+
+  # Mission alignment: macOS dev path (PLATFORM_ARCHITECTURE.md §1).
+  darwin-aarch64-test:
+    name: darwin-aarch64 (no postgres)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (no postgres feature)
+        run: cargo test --features server
+
+  # Mission category §4 + PLATFORM_ARCHITECTURE.md §3.1: iOS device
+  # build path. Runs on macOS with the iOS targets.
+  ios-build:
+    name: ios-aarch64 (device build)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build (ios device)
+        run: cargo build --target aarch64-apple-ios --no-default-features
+      - name: cargo build (ios simulator)
+        run: cargo build --target aarch64-apple-ios-sim --no-default-features
+
+  # Mission category §4 "Mission rejection" + audit/lint.
+  lint:
+    name: clippy + fmt + audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --all-targets --features "postgres server pyo3" -- -D warnings
+
+  # Mission category §4 "Mission rejection": the clippy + fmt gate
+  # plus a license-deny pass per CRATE_RECOMMENDATIONS §6.
+  license-audit:
+    name: cargo deny (license + advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # Build the abi3-py311 wheel via maturin. Per
+  # PLATFORM_ARCHITECTURE.md §3.5: one wheel per (os, arch) pair.
+  pyo3-wheel:
+    name: maturin abi3-py311 wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: install maturin
+        run: pip install maturin
+      - name: maturin build
+        run: maturin build --release --strip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ciris_persist-wheel-${{ runner.os }}
+          path: target/wheels/*.whl
