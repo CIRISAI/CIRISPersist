@@ -5,6 +5,75 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.1.12] — 2026-05-01
+
+PyPI publication via OIDC trusted publishing. Closes the lens
+cold-build bottleneck (~75min Rust compile per cold cache → ~10s
+`pip install`).
+
+### What's new
+
+- **`.github/workflows/ci.yml::publish-pypi`** — tag-gated job
+  that downloads the abi3 wheel produced by `pyo3-wheel`,
+  sanity-checks its shape (rejects non-`cp311-abi3` builds to
+  prevent v0.1.10-class regressions silently shipping), and
+  publishes to PyPI via `pypa/gh-action-pypi-publish@release/v1`.
+- **OIDC trusted publishing** — no API token in CI secrets. PyPI
+  validates the workflow's GitHub-issued JWT against a pre-
+  configured trust policy. Standard pattern across the OSS
+  ecosystem (sigstore cosign, npm provenance, PEP 740 attestations).
+- **PEP 740 sigstore attestations** enabled by default
+  (`attestations: true`). The PyPI artifact carries a verifiable
+  link back to this exact GHA workflow identity, compounding with
+  the existing CIRISRegistry BuildManifest signature.
+- **Environment-gated** — the publish job runs in the `pypi`
+  GitHub environment, allowing optional human-approval gates per
+  release if the repo maintainer adds them.
+
+### Operator setup (one-time, on PyPI side)
+
+See `docs/PYPI_PUBLISH.md`. Summary:
+
+1. Reserve `ciris-persist` on PyPI via "Pending Publisher"
+   (https://pypi.org/manage/account/publishing/) with:
+   - Owner: `CIRISAI`
+   - Repository: `CIRISPersist`
+   - Workflow: `ci.yml`
+   - Environment: `pypi`
+2. (Optional) Configure GitHub environment `pypi` with required
+   reviewers for human-approval gates.
+3. Push v0.1.12 tag → publish triggers automatically.
+
+After v0.1.12 ships:
+
+```bash
+pip install ciris-persist==0.1.12
+# from python:3.11-slim, ~10 seconds vs ~75min source build
+```
+
+### Trust posture
+
+Three independent provenance layers now stack on every release:
+
+| Layer | Proves | Stored at |
+|---|---|---|
+| git tag + commit hash | source-of-truth identity | GitHub |
+| BuildManifest hybrid signature (Ed25519 + ML-DSA-65) | binary built from that commit by CIRISAI's signing key | CIRISRegistry |
+| PEP 740 sigstore attestation | PyPI artifact was uploaded by CIRISAI's GHA on that commit | PyPI |
+
+The cryptographic root remains the BuildManifest (hybrid hardware-
+ready signature, registry round-trip verified per commit). PyPI is
+the fast delivery channel; verifiable but not load-bearing on its
+own.
+
+### Notes
+
+- Wheel platform: linux x86_64 only at v0.1.12. macOS / arm64
+  wheels can be added later by extending the `pyo3-wheel` matrix;
+  not load-bearing for the lens cold-build win that motivated this
+  release.
+- No code changes; CI workflow + docs only. 131 tests green.
+
 ## [0.1.11] — 2026-05-01
 
 CI registration step end-to-end. Closes the implementation half of
