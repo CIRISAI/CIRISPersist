@@ -5,6 +5,140 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.1.9] — 2026-05-01
+
+Consume CIRISVerify v1.8.0's substrate primitives. Five interlocking
+landings; all `BuildPrimitive::Persist` consumer work the upstream's
+release notes named.
+
+### Upstream dep bumps
+
+- `ciris-keyring` v1.6.4 → **v1.8.0**.
+- `ciris-verify-core` **v1.8.0** added (new direct dep).
+- `rusqlite` 0.39 → **0.31** (Phase 2 stub; downgraded to match
+  ciris-verify-core's `links = "sqlite3"` resolution).
+
+### Drop the prediction shim — `storage_descriptor()` is authoritative
+
+v0.1.7 introduced a vendored `predicted_software_seed_path` that
+replicated ciris-keyring's private `default_key_dir()` logic, with
+a documented "this is brittle" caveat. v0.1.8 ships
+`HardwareSigner::storage_descriptor()` upstream — typed enum
+returning `Hardware { hardware_type, blob_path }` /
+`SoftwareFile { path }` / `SoftwareOsKeyring { backend, scope }` /
+`InMemory`.
+
+v0.1.9 swaps the shim for the real thing:
+
+- `Engine.keyring_path()` is **authoritative**, not predicted. Returns
+  `Some(path)` for `SoftwareFile` and `Hardware { blob_path: Some }`;
+  `None` for HSM-only / OS-keyring / in-memory.
+- New `Engine.keyring_storage_kind() -> str` returns one of seven
+  stable tokens: `hardware_hsm_only`, `hardware_wrapped_blob`,
+  `software_file`, `software_os_keyring_user`,
+  `software_os_keyring_system`, `software_os_keyring_unknown`,
+  `in_memory`. `/health` surfaces this without parsing the verbose
+  descriptor.
+- Boot-time warn dispatches typed cases: `SoftwareFile` keeps the
+  ephemeral-path heuristic; `SoftwareOsKeyring{User}` warns
+  separately (logout-bound); `InMemory` warns hard (key dies with
+  process).
+- `dirs` dep dropped (only used by the deleted prediction shim).
+- 3 unit tests replaced with `storage_kind_token_dispatch`.
+
+### `BuildPrimitive::Persist` — first-class manifest primitive
+
+- New `src/manifest/mod.rs` defines `PersistExtras` (typed
+  schema for the persist primitive's manifest extras blob)
+  + `PersistExtrasValidator` (impl of upstream's `ExtrasValidator`
+  trait) + `register()` public init function.
+- Three persist-specific extras fields, all deterministic at build
+  time:
+  - `supported_schema_versions: Vec<String>` — wire-format versions
+    this build accepts.
+  - `migration_set_sha256: String` — sha256 of canonicalised
+    `migrations/postgres/lens/V*.sql` concatenation (LF-normalised,
+    file-separator-prefixed, lex-sorted).
+  - `dep_tree_sha256: String` — sha256 of normalised `cargo tree`
+    output (line-sorted, dedup-stripped).
+- 6 unit tests cover happy path, malformed `sha256:` prefix, wrong
+  hex length, empty schema versions, forward-compat tolerance,
+  primitive discriminator.
+
+### CI manifest signing via `ciris-build-sign`
+
+- `.github/workflows/ci.yml::build-manifest` job rewritten to use
+  upstream's CLI. `cargo install --git ...CIRISVerify --tag v1.8.0
+  ciris-build-tool` pulls `ciris-build-sign` at the same tag we
+  depend on.
+- New CI step `emit PersistExtras JSON` runs
+  `cargo run --release --bin emit_persist_extras` to produce the
+  typed extras blob. Output is fed to `ciris-build-sign --extras`.
+- Hybrid Ed25519 + ML-DSA-65 signing per PoB §1.4. Two new repo
+  secrets required:
+  - `CIRIS_BUILD_ED25519_SECRET` (base64-encoded 32-byte seed)
+  - `CIRIS_BUILD_MLDSA_SECRET` (base64-encoded ~4 KB ML-DSA-65 secret)
+- Bridge team uploads both per `docs/BUILD_SIGNING.md`. The
+  workflow no longer falls back to unsigned mode — both signatures
+  are required at v1.8.0+.
+- New binary target `src/bin/emit_persist_extras.rs` produces the
+  primitive-specific extras JSON. Reads source-tree migrations
+  + `cargo tree` output; deterministic per checkout.
+
+### Tooling — legacy python helper deprecated
+
+- `tools/ciris_manifest.py` → `tools/legacy/ciris_manifest.py`.
+  CI no longer calls it. Kept for one-release transition; deleted
+  in v0.2.0.
+- `tools/legacy/README.md` documents the upstream replacement
+  path.
+
+### deny.toml
+
+- 5 transitive advisories accepted (all from ciris-verify-core's
+  verification stack — DNS, HTTP, rustls, mobile attestation —
+  none on persist's hot path):
+  - RUSTSEC-2025-0134 — rustls-pemfile unmaintained
+  - RUSTSEC-2026-0098 — rustls-webpki URI-name constraint
+  - RUSTSEC-2026-0099 — rustls-webpki wildcard-DNS constraint
+  - RUSTSEC-2026-0104 — rustls-webpki CRL parse panic
+  - RUSTSEC-2026-0119 — hickory-proto DNS-encoding O(n²)
+- License allow-list: **`CDLA-Permissive-2.0`** added (webpki-roots
+  0.26+).
+
+### Documentation
+
+- **NEW**: `docs/BUILD_SIGNING.md` — bridge-team operator runbook
+  for `ciris-build-sign generate-keys` + GitHub-secret upload +
+  rotation.
+- `docs/INTEGRATION_LENS.md` §11.5 — drop the predicted-vs-
+  authoritative caveat; document the new typed dispatch + the
+  `keyring_storage_kind()` method.
+- `docs/THREAT_MODEL.md` — AV-27 promoted from "predicted" to
+  "authoritative via upstream trait method"; mitigation matrix
+  updated.
+
+### Tests
+
+- 109 lib + 5 AV-4 integration + 8 QA + 9 fixture =
+  **131 tests, all green**.
+- 6 new unit tests in `manifest::tests`.
+- 1 new unit test (`storage_kind_token_dispatch`) replaces the
+  3 deleted prediction-shim tests; net +3 over v0.1.8.
+- clippy clean across postgres,pyo3,server,tls.
+
+### Notes for consumers
+
+- **Lens / agent / registry**: bump persist dep to v0.1.9 to pick
+  up the upstream v1.8.0 substrate.
+- **CIRISRegistry persist support** (`docs/TODO_REGISTRY.md`)
+  remains the cross-repo follow-up. The registry-side `register`
+  step in CI is still TODO; once registry accepts persist
+  primitives, that one step lands trivially.
+- **Operators on hardware-keyed deployments** see no behavior
+  change — the warn paths only fire on software / in-memory
+  signers, and only when the storage location is suspect.
+
 ## [0.1.8] — 2026-05-01
 
 P0 production fix — closes THREAT_MODEL.md AV-4 (timestamp

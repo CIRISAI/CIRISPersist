@@ -23,6 +23,12 @@ allow = [
     "GPL-3.0",
     "GPL-3.0-or-later",
     "CC0-1.0",
+    # v0.1.9 — webpki-roots 0.26+ relicensed to CDLA-Permissive-2.0
+    # (Linux Foundation's Community Data License Agreement, permissive
+    # variant). It's AGPL-compatible: distribution permitted, no
+    # patent-grant requirement, attribution preserved. Transitive
+    # via ciris-verify-core's reqwest/ureq stack.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.85
 
@@ -42,8 +48,21 @@ yanked = "warn"
 # - RUSTSEC-2024-0384 instant — wall-clock helpers; Phase 2.3
 #   Reticulum work may replace this branch entirely
 ignore = [
-    "RUSTSEC-2024-0388",  # derivative unmaintained
-    "RUSTSEC-2024-0384",  # instant unmaintained
+    "RUSTSEC-2024-0388",  # derivative unmaintained (via ciris-keyring TPM derive stack)
+    "RUSTSEC-2024-0384",  # instant unmaintained (Phase 2.3 Reticulum may obsolete)
+
+    # v0.1.9 — new advisories surfaced after the v1.6.4 → v1.8.0
+    # ciris-keyring/ciris-verify-core bump. All transitive via
+    # ciris-verify-core's verification stack (DNS, HTTP, rustls,
+    # mobile attestation). Upstream's own deny.toml ignores the
+    # rustls-webpki ones with the same rationale; we inherit.
+    # None of these advisories touch persist's ingest hot path.
+    "RUSTSEC-2026-0119",  # hickory-proto DNS encoding O(n²) — DoS during DNS encoding;
+                           # persist talks to Postgres, no DNS encode path
+    "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained — transitive via reqwest/rustls
+    "RUSTSEC-2026-0098",  # rustls-webpki URI-name constraint (we don't validate URI SANs)
+    "RUSTSEC-2026-0099",  # rustls-webpki wildcard-DNS constraint (no name-constraint certs)
+    "RUSTSEC-2026-0104",  # rustls-webpki CRL parse panic (we don't parse CRLs)
 ]
 
 [sources]

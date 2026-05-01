@@ -32,6 +32,7 @@
 pub mod ffi;
 pub mod ingest;
 pub mod journal;
+pub mod manifest;
 pub mod queue;
 pub mod schema;
 pub mod scrub;

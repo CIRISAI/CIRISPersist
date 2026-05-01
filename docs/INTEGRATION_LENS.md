@@ -630,30 +630,47 @@ Permission: container user `cirislens` (uid 1000). `local`
 driver volumes inherit container user perms by default; should
 just work.
 
-### How v0.1.7 catches this for you
+### How v0.1.9 catches this for you
 
-At Engine construction, persist now:
+At Engine construction, persist queries the **authoritative**
+storage descriptor via ciris-keyring v1.8.0's
+`HardwareSigner::storage_descriptor()` (no prediction shim) and
+dispatches on the typed enum:
 
 1. Logs the signer variant (`hardware_backed=true|false`,
    `variant=hardware|software`).
-2. **If software**: predicts the seed path and checks against an
+2. **`SoftwareFile { path }`**: checks `path` against an
    ephemeral-path heuristic (`/home/`, `/root/`, `/tmp/`,
-   `/var/cache/`, `/var/tmp/`). If the path matches, emits a loud
+   `/var/cache/`, `/var/tmp/`). If matched, emits a loud
    `tracing::warn!`:
 
    ```
    WARN ciris-persist: SoftwareSigner seed path looks ephemeral.
-        predicted_path=/home/cirislens/.local/share/ciris-verify/lens-scrub-v1.key
+        path=/home/cirislens/.local/share/ciris-verify/lens-scrub-v1.key
         Container writable layers / /tmp / /home are wiped on
         restart, which churns the deployment identity (breaks
         one-key-three-roles per PoB §3.2). Mount a persistent
         volume and set CIRIS_DATA_DIR=<volume-mount-point>.
    ```
 
-3. Exposes `Engine.keyring_path() -> Optional[str]` for `/health`
-   surfacing. `None` for hardware-backed; the predicted path for
-   software-backed. Wire it through your existing `/health` so
-   probes can verify "yes, this points at the persistent volume."
+3. **`SoftwareOsKeyring { scope: User }`** (Linux secret-service in
+   user session, etc.): warns separately — user-scope entries
+   disappear at logout, NOT suitable for longitudinal-score
+   primitives.
+4. **`InMemory`**: warns hard — RAM-only signer means the key dies
+   with the process. Only valid for dev/test.
+5. **`Hardware`**: info-level only. HSM-backed keys are stable by
+   construction.
+6. Exposes:
+   - `Engine.keyring_path() -> Optional[str]` — authoritative
+     filesystem path (or `None` for HSM-only / OS-keyring / RAM-only).
+   - `Engine.keyring_storage_kind() -> str` — stable token
+     (`hardware_hsm_only`, `hardware_wrapped_blob`,
+     `software_file`, `software_os_keyring_user`,
+     `software_os_keyring_system`, `software_os_keyring_unknown`,
+     `in_memory`). Wire either or both into your `/health` so
+     probes can verify the deployment posture without grepping
+     logs.
 
 ### Suppressing the warn
 
@@ -668,18 +685,17 @@ CIRIS_PERSIST_KEYRING_PATH_OK=1
 The warn line drops; the info-level path log stays so ops still
 have visibility.
 
-### Caveat — predicted vs. authoritative
+### Authoritative storage path (v0.1.9+)
 
-The predicted path is computed by replicating ciris-keyring v1.6.4's
-`default_key_dir()` private logic. If a future ciris-keyring tag
-changes resolution priority, the prediction may drift from reality.
-We're tracking the upstream `HardwareSigner::storage_descriptor()`
-trait method that would make the path authoritative; v0.1.8+ will
-swap to that and the prediction layer will be deleted.
+The path persist surfaces is **authoritative**, not predicted. It
+comes directly from ciris-keyring v1.8.0's
+`HardwareSigner::storage_descriptor()` trait method, which every
+signer impl implements with full knowledge of where it actually
+stored the seed. No vendored path-resolution logic to drift; no
+caveat.
 
-If you've audited your container template and are confident the
-key lands on a mounted volume, the suppression env var stays
-correct regardless of any future ciris-keyring drift.
+Persist v0.1.7 + v0.1.8 had a predicted-path shim that replicated
+upstream's private `default_key_dir()`; that's gone in v0.1.9.
 
 ---
 

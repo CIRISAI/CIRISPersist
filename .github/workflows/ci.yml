@@ -147,63 +147,107 @@ jobs:
   # the cross-repo refactor that lands `tools/ciris_manifest.py`
   # as a shared tool.
   build-manifest:
-    name: Generate + sign build manifest
+    name: Generate + sign build manifest (v1.8.0 hybrid Ed25519 + ML-DSA-65)
     runs-on: ubuntu-latest
     needs: pyo3-wheel
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          python-version: "3.12"
-      - name: install signing deps
-        run: pip install cryptography
+          toolchain: stable
+      - name: Install TPM2 TSS runtime libs (ciris-keyring transitive dep)
+        run: |
+          if ! sudo apt-get install -y libtss2-esys0 libtss2-tctildr0 libtss2-mu0; then
+            if ! sudo apt-get install -y libtss2-esys-3.0.2-0 libtss2-tctildr0 libtss2-mu-4.0.1-0; then
+              sudo apt-get install -y libtss2-esys-3.0.2-0t64 libtss2-tctildr0t64 libtss2-mu-4.0.1-0t64
+            fi
+          fi
       - name: extract version from Cargo.toml
         id: version
         run: |
           VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "ciris-persist version: $VERSION"
-      - name: generate manifest
+      - name: install ciris-build-sign
+        # v1.8.0 ships the CLI in the ciris-build-tool crate. We
+        # `cargo install` from the same git tag we depend on so the
+        # signing tool's BuildManifest shape exactly matches what
+        # our PersistExtrasValidator expects.
+        run: |
+          cargo install --locked --git https://github.com/CIRISAI/CIRISVerify \
+            --tag v1.8.0 ciris-build-tool
+      - name: emit PersistExtras JSON
+        # Reads the source tree (migrations/ + cargo tree) and emits
+        # the typed extras blob. Deterministic per checkout. Target
+        # is set so dep_tree_sha256 reflects the linux-x86_64 build
+        # closure — the target this manifest applies to.
+        env:
+          CIRIS_PERSIST_DEP_TARGET: x86_64-unknown-linux-gnu
         run: |
           mkdir -p dist
-          python tools/ciris_manifest.py generate \
-            --project ciris-persist \
-            --root . \
-            --version "${{ steps.version.outputs.version }}" \
-            --modules core \
-            --source-repo "https://github.com/CIRISAI/CIRISPersist" \
-            --source-commit "$GITHUB_SHA" \
-            --output "dist/ciris-persist-${{ steps.version.outputs.version }}.manifest.json"
-      - name: sign manifest
+          cargo run --release --bin emit_persist_extras \
+            > "dist/persist-extras-${{ steps.version.outputs.version }}.json"
+          echo "PersistExtras emitted:"
+          cat "dist/persist-extras-${{ steps.version.outputs.version }}.json"
+      - name: locate signed wheel for binary_hash
+        id: artifact
+        # The ciris-build-sign --binary input expects a single file
+        # whose sha256 lands in BuildManifest.binary_hash. We use
+        # the maturin-built wheel from the prior pyo3-wheel job as
+        # the canonical artifact for the linux-x86_64 build.
+        uses: actions/download-artifact@v4
+        with:
+          name: ciris_persist-wheel-Linux
+          path: dist/wheel
+      - name: sign manifest with hybrid Ed25519 + ML-DSA-65
         env:
-          CIRIS_BUILD_SIGN_KEY: ${{ secrets.CIRIS_BUILD_SIGN_KEY }}
+          # Bridge team uploads these as repo secrets (see
+          # docs/BUILD_SIGNING.md). If either is missing the step
+          # fails loudly — we don't fall back to unsigned at v1.8.0.
+          CIRIS_BUILD_ED25519_SECRET: ${{ secrets.CIRIS_BUILD_ED25519_SECRET }}
+          CIRIS_BUILD_MLDSA_SECRET: ${{ secrets.CIRIS_BUILD_MLDSA_SECRET }}
         run: |
-          # If the secret isn't configured yet on this repo, emit an
-          # unsigned manifest with a clear UNSIGNED key_id so the
-          # ops team sees the gap. CI doesn't fail; a follow-up that
-          # populates CIRIS_BUILD_SIGN_KEY upgrades the artifact to
-          # signed transparently.
-          ALLOW_UNSIGNED_FLAG=""
-          if [ -z "${CIRIS_BUILD_SIGN_KEY}" ]; then
-            echo "::warning::CIRIS_BUILD_SIGN_KEY not configured; emitting UNSIGNED manifest"
-            ALLOW_UNSIGNED_FLAG="--allow-unsigned"
+          if [ -z "${CIRIS_BUILD_ED25519_SECRET}" ] || [ -z "${CIRIS_BUILD_MLDSA_SECRET}" ]; then
+            echo "::error::Hybrid signing secrets not configured."
+            echo "::error::Set CIRIS_BUILD_ED25519_SECRET and CIRIS_BUILD_MLDSA_SECRET."
+            echo "::error::See docs/BUILD_SIGNING.md for ciris-build-sign generate-keys + secret upload."
+            exit 1
           fi
-          python tools/ciris_manifest.py sign \
-            --manifest "dist/ciris-persist-${{ steps.version.outputs.version }}.manifest.json" \
+          # Materialize the secret bytes to short-lived files. The
+          # script-level set +x stays OFF so the secret never echoes
+          # to logs (GH Actions auto-masks declared secrets, but
+          # belt-and-suspenders here too).
+          umask 077
+          ED_KEY_PATH=$(mktemp)
+          MLDSA_KEY_PATH=$(mktemp)
+          # Secrets are stored base64-encoded; decode to raw bytes
+          # for the CLI.
+          printf '%s' "${CIRIS_BUILD_ED25519_SECRET}" | base64 -d > "$ED_KEY_PATH"
+          printf '%s' "${CIRIS_BUILD_MLDSA_SECRET}" | base64 -d > "$MLDSA_KEY_PATH"
+          BINARY="$(ls dist/wheel/*.whl | head -1)"
+          ciris-build-sign sign \
+            --primitive persist \
+            --build-id "${{ steps.version.outputs.version }}" \
+            --target x86_64-unknown-linux-gnu \
+            --binary "$BINARY" \
+            --binary-version "${{ steps.version.outputs.version }}" \
+            --extras "dist/persist-extras-${{ steps.version.outputs.version }}.json" \
+            --ed25519-seed "$ED_KEY_PATH" \
+            --mldsa-secret "$MLDSA_KEY_PATH" \
             --key-id ciris-persist-build-v1 \
-            $ALLOW_UNSIGNED_FLAG \
-            --output "dist/ciris-persist-${{ steps.version.outputs.version }}.manifest.signed.json"
+            --output "dist/ciris-persist-${{ steps.version.outputs.version }}.manifest.json"
+          # Wipe key files immediately after signing.
+          shred -uz "$ED_KEY_PATH" "$MLDSA_KEY_PATH" 2>/dev/null || rm -f "$ED_KEY_PATH" "$MLDSA_KEY_PATH"
+          echo "Signed manifest:"
+          cat "dist/ciris-persist-${{ steps.version.outputs.version }}.manifest.json"
       # TODO(persist→registry): when CIRISRegistry adds persist support,
-      # add a `register` step here:
-      #   python tools/ciris_manifest.py register \
-      #     --signed-manifest "dist/...signed.json" \
-      #     --registry-addr "${{ secrets.REGISTRY_GRPC_ADDR }}"
-      # Track at docs/TODO_REGISTRY.md.
+      # add a register step here invoking the registry's gRPC. The
+      # signed manifest is the input. Track at docs/TODO_REGISTRY.md.
       - uses: actions/upload-artifact@v4
         with:
           name: ciris-persist-build-manifest-${{ steps.version.outputs.version }}
           path: |
+            dist/persist-extras-*.json
             dist/ciris-persist-*.manifest.json
-            dist/ciris-persist-*.manifest.signed.json
