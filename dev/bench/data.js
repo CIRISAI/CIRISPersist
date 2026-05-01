@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777678843942,
+  "lastUpdate": 1777679235194,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -1991,6 +1991,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 22727094,
             "range": "± 8796471",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "e857762726dd6e81c742811b88a33ef0586ff9df",
+          "message": "fix(test): serialize env-mutating bootstrap-lock tests\n\nCI's parallel test runner flagged the v0.1.14 bootstrap-lock\ntests racing on CIRIS_DATA_DIR. bootstrap_lock_path_resolution\nsets CIRIS_DATA_DIR=/var/lib/cirislens; if that test panics or\nraces, the value leaks into bootstrap_lock_acquire_and_release\nwhich then opens /var/lib/cirislens/keyring/.persist-bootstrap.lock\nand gets PermissionDenied (runner can't write that path).\n\nFix: serial_test::serial(env_ciris_data_dir) on both tests +\nRAII EnvGuard for panic-safe cleanup.\n\nLocal repro was clean because tests ran fast enough that the race\nwindow stayed closed; CI's slower runner exposed it.",
+          "timestamp": "2026-05-01T18:41:27-05:00",
+          "tree_id": "8824b3754755b590d7785cab22559cf886d78c15",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/e857762726dd6e81c742811b88a33ef0586ff9df"
+        },
+        "date": 1777679234678,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101069,
+            "range": "± 1107",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 248376,
+            "range": "± 941",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 542092,
+            "range": "± 1892",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1932088,
+            "range": "± 19003",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 424,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1611,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8271,
+            "range": "± 215",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 329,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 2530,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 8081,
+            "range": "± 63",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 35470,
+            "range": "± 68",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 643,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2017747,
+            "range": "± 47640",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6221519,
+            "range": "± 32575",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 22729052,
+            "range": "± 80936",
             "unit": "ns/iter"
           }
         ]
