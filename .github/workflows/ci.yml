@@ -136,3 +136,74 @@ jobs:
         with:
           name: ciris_persist-wheel-${{ runner.os }}
           path: target/wheels/*.whl
+
+  # Build manifest registration scaffold (v0.1.3+). Generates a
+  # file-tree manifest of the source tree, Ed25519-signs it via
+  # ciris-keyring-shaped CIRIS_BUILD_SIGN_KEY (32-byte seed in
+  # base64), uploads as an artifact. The `register` step that
+  # would push to CIRISRegistry is intentionally NOT here — the
+  # registry doesn't yet accept project="ciris-persist". See
+  # docs/TODO_REGISTRY.md and the CIRISAgent tracking issue for
+  # the cross-repo refactor that lands `tools/ciris_manifest.py`
+  # as a shared tool.
+  build-manifest:
+    name: Generate + sign build manifest
+    runs-on: ubuntu-latest
+    needs: pyo3-wheel
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install signing deps
+        run: pip install cryptography
+      - name: extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "ciris-persist version: $VERSION"
+      - name: generate manifest
+        run: |
+          mkdir -p dist
+          python tools/ciris_manifest.py generate \
+            --project ciris-persist \
+            --root . \
+            --version "${{ steps.version.outputs.version }}" \
+            --modules core \
+            --source-repo "https://github.com/CIRISAI/CIRISPersist" \
+            --source-commit "$GITHUB_SHA" \
+            --output "dist/ciris-persist-${{ steps.version.outputs.version }}.manifest.json"
+      - name: sign manifest
+        env:
+          CIRIS_BUILD_SIGN_KEY: ${{ secrets.CIRIS_BUILD_SIGN_KEY }}
+        run: |
+          # If the secret isn't configured yet on this repo, emit an
+          # unsigned manifest with a clear UNSIGNED key_id so the
+          # ops team sees the gap. CI doesn't fail; a follow-up that
+          # populates CIRIS_BUILD_SIGN_KEY upgrades the artifact to
+          # signed transparently.
+          ALLOW_UNSIGNED_FLAG=""
+          if [ -z "${CIRIS_BUILD_SIGN_KEY}" ]; then
+            echo "::warning::CIRIS_BUILD_SIGN_KEY not configured; emitting UNSIGNED manifest"
+            ALLOW_UNSIGNED_FLAG="--allow-unsigned"
+          fi
+          python tools/ciris_manifest.py sign \
+            --manifest "dist/ciris-persist-${{ steps.version.outputs.version }}.manifest.json" \
+            --key-id ciris-persist-build-v1 \
+            $ALLOW_UNSIGNED_FLAG \
+            --output "dist/ciris-persist-${{ steps.version.outputs.version }}.manifest.signed.json"
+      # TODO(persist→registry): when CIRISRegistry adds persist support,
+      # add a `register` step here:
+      #   python tools/ciris_manifest.py register \
+      #     --signed-manifest "dist/...signed.json" \
+      #     --registry-addr "${{ secrets.REGISTRY_GRPC_ADDR }}"
+      # Track at docs/TODO_REGISTRY.md.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ciris-persist-build-manifest-${{ steps.version.outputs.version }}
+          path: |
+            dist/ciris-persist-*.manifest.json
+            dist/ciris-persist-*.manifest.signed.json
