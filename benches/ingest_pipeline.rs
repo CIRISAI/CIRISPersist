@@ -22,6 +22,12 @@ mod common;
 fn ingest_pipeline_sweep(c: &mut Criterion) {
     let mut group = c.benchmark_group("ingest_pipeline");
     let runtime = tokio::runtime::Runtime::new().unwrap();
+    // Belt-and-suspenders runtime guard — IngestPipeline doesn't
+    // call tokio::spawn directly in v0.1.7, but
+    // `Backend::insert_trace_events_batch` may in future backends,
+    // and `cargo test --all-targets` runs bench bins in smoke mode
+    // outside any runtime context. See benches/queue.rs comment.
+    let _guard = runtime.enter();
 
     for &n_components in &[1usize, 6, 16, 64] {
         // Pre-build the request body for each iteration; we re-use

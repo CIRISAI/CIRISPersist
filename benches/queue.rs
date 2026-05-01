@@ -23,6 +23,15 @@ mod common;
 fn queue_submit_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("queue_submit");
     let runtime = tokio::runtime::Runtime::new().unwrap();
+    // Enter runtime context for the duration of this bench function.
+    // criterion's `iter_with_setup` closures run synchronously
+    // outside `block_on`, but `spawn_persister` calls
+    // `tokio::spawn` which needs a runtime in the calling thread's
+    // context. The guard makes that context available for setup
+    // and measurement alike. Without it, `cargo test --all-targets`
+    // (which runs bench bins in smoke mode) panics with "no
+    // reactor running" — see CI run 25221610071.
+    let _guard = runtime.enter();
 
     for &batch_count in &[8usize, 32, 128] {
         let sk = common::make_signing_key(0xCC);
