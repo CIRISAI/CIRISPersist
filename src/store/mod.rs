@@ -46,6 +46,23 @@ pub enum Error {
     /// future variants can be added per-backend.
     #[error("backend: {0}")]
     Backend(String),
+
+    /// Migration phase error. v0.1.5: the `sqlstate` is extracted from
+    /// the underlying tokio-postgres error chain when available so
+    /// lens-side callers can distinguish 40P01 (deadlock detected),
+    /// 42P07 (relation already exists — multi-worker boot race
+    /// signature pre-advisory-lock), 08006 (connection lost), etc.
+    /// without parsing display strings. THREAT_MODEL.md AV-26.
+    #[error("migration: {detail}")]
+    Migration {
+        /// Postgres SQLSTATE class+code (e.g. "42P07"), if the
+        /// underlying error chain surfaced one. `None` for non-
+        /// Postgres errors (refinery internal, IO, etc.).
+        sqlstate: Option<String>,
+        /// Operator-readable detail. Includes the SQLSTATE in
+        /// brackets when present; safe for tracing logs.
+        detail: String,
+    },
 }
 
 // Bridge schema errors into the store layer.
@@ -65,6 +82,7 @@ impl Error {
             Error::Schema(s) => s.kind(),
             Error::NotImplemented(_) => "store_not_implemented",
             Error::Backend(_) => "store_backend",
+            Error::Migration { .. } => "store_migration",
         }
     }
 }

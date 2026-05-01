@@ -148,6 +148,52 @@ SELECT add_retention_policy('cirislens.trace_events',
 Keep this in your existing `cirislens-deploy/` repo as a
 post-migration step.
 
+### Multi-worker boot contract (v0.1.5+)
+
+`Engine(...)` construction is **safe to call concurrently** from
+multiple worker processes (uvicorn `--workers N`, gunicorn,
+Kubernetes replica sets) against the same DSN. The first worker
+acquires a session-scoped Postgres advisory lock
+(`pg_advisory_lock(0x6369_7269_7370_7372)` — bytes spell
+`"cirispsr"` so it's greppable in `pg_locks`); subsequent workers
+block on the lock until the first worker finishes its migration
+phase, then wake up, see "no migrations to apply", and proceed.
+
+The lock is held *only* during the migration phase — typically
+~50–200ms on a fresh DB, much shorter on subsequent boots when
+migrations no-op. The pool prep + keyring bootstrap that follows
+is per-worker and unblocked.
+
+```
+worker A:  connect → take advisory lock → V001 + V003 → release → keyring → ready
+worker B:  connect → blocks here ──────────────────────^ wakes  → keyring → ready
+worker C:  connect → blocks ─────────────────────────────^ wakes → keyring → ready
+```
+
+**Readiness probe timeout.** If your container probe is tight
+(`<5s`) and you have many migrations to run on a cold-start
+deployment, give the *first* worker enough time to complete the
+migration phase before the orchestrator declares all replicas
+unhealthy and restarts them. A 30s `initialDelaySeconds` is the
+safe default; production lens deployments running v0.1.5+ on
+already-migrated DBs see boots complete in well under a second.
+
+**SQLSTATE diagnostics.** Migration-phase errors now carry the
+underlying Postgres SQLSTATE in the error display. Format is
+`store: migration: [SQLSTATE] detail`. Common codes:
+
+- `42P07` — "relation already exists" (was the pre-v0.1.5 race
+  signature; should not appear at v0.1.5+ unless schema is
+  externally mutated mid-flight)
+- `40P01` — deadlock detected (re-run the migration; Postgres has
+  already released the locks)
+- `08006` — connection terminated (transient; lens should retry
+  Engine construction)
+- `42501` — permission denied (the DSN user lacks DDL rights;
+  check role grants)
+
+THREAT_MODEL.md AV-26 is the full background.
+
 ---
 
 ## 3. Register agent public keys

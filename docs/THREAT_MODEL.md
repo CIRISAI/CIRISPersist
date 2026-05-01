@@ -667,6 +667,66 @@ revocation surface). CIRISVerify's threat model §5 — Security
 Levels by Hardware Type — is the authoritative classification
 of what each backing tier provides.
 
+#### AV-26: Multi-worker migration race
+
+**Attack surface (operational, not adversarial)**: a lens deployment
+spinning up multiple uvicorn workers / replica pods / sidecars
+concurrently against a single Postgres instance. Each worker calls
+`Engine(...)` on startup, which connects + calls `run_migrations()`.
+
+**Pre-v0.1.5 failure**: the workers raced on Postgres catalog
+inserts — TimescaleDB hypertable type registration in `pg_type`,
+`IF NOT EXISTS` checks across the V001 + V003 migration set,
+refinery's own schema_history bootstrap. The second worker through
+hit `42P07 relation already exists` (or, less commonly, deadlock
+on `pg_namespace`) which refinery wrapped opaquely as
+`"error asserting migrations table — db error"`. Production
+deployments saw worker pods fail readiness, restart, race again,
+and stay unhealthy until the orchestrator escalated.
+
+This is not a threat in the adversarial sense — there is no
+attacker — but it is a real availability vector: a config change
+that scales worker count from 1 to N can trigger a stuck-restart
+loop on cold deploys. THREAT_MODEL.md catalogues it for the same
+reason MISSION.md treats reliability as a mission concern: a
+substrate that's unreachable can't carry evidence.
+
+**Mitigation in v0.1.5**: session-scoped Postgres advisory lock
+(`pg_advisory_lock(0x6369_7269_7370_7372)` — bytes spell
+`"cirispsr"` for grep visibility) acquired on a *dedicated single-
+use connection* (not from the pool, so the lock can't taint a
+recycled pool conn). The lock is held across refinery's
+multi-transaction migration phase. First worker wins immediately;
+subsequent workers block on the lock, wake when the first worker's
+session closes, and proceed cleanly through the now-no-op migration
+phase. Lock auto-releases on connection close — including the
+panic-mid-migration case (the connection task observes EOF, the
+session ends, the lock goes; no orphaned locks across worker
+crashes).
+
+**Diagnostic surface**: v0.1.5 also added `Error::Migration {
+sqlstate: Option<String>, detail: String }` so the lens sees
+`store: migration: [SQLSTATE] detail` instead of "db error". 42P07
+should not appear at v0.1.5+ unless schema is externally mutated
+mid-flight; 40P01 (deadlock detected) is the indicator for "retry
+construction"; 08006 is "connection lost, retry"; 42501 is
+"DSN user lacks DDL rights — config bug, not transient."
+
+**Residual**: a worker holding the lock that is *paused indefinitely*
+(SIGSTOP, kernel scheduler starvation, or a tracing tool with a
+breakpoint inside the migration phase) leaves concurrent workers
+blocked on `pg_advisory_lock`. This is a deployment-operational
+concern (orchestrator liveness probes catch it; the held-lock
+worker's connection eventually times out per Postgres
+`tcp_keepalives` if configured). Out of scope for the
+substrate.
+
+**QA harness coverage**: `tests/qa_harness.rs::av26_concurrent_boot_advisory_lock`
+spawns 10 concurrent boots against a fresh DB, asserts every one
+returns `Ok(())`, and verifies the migration_history table contains
+exactly one row per migration script (not 10×N — that would mean
+the lock didn't hold). Gated on `CIRIS_PERSIST_TEST_PG_URL`.
+
 ### 3.6 Operational / hardening vectors (catalogued in SECURITY_AUDIT_v0.1.2.md §3)
 
 AV-17 through AV-23 were surfaced by the post-v0.1.2 SOTA
@@ -719,6 +779,7 @@ summary. Briefly:
 | AV-23 | `consent_timestamp` range unconstrained | (deferred) | Schema-required-or-422 gate (TRACE_WIRE_FORMAT.md §1) | ⚠ Track | v0.2.x |
 | AV-24 | Lens-scrub bypass / forgery | UNCONDITIONAL signed scrub envelope (FSD §3.3 step 3.5; §3.4 robustness primitive #7) — every component, every level, key never null. `original_content_hash + scrub_signature + scrub_key_id + scrub_timestamp` columns proof the deployment's handling. | Single-key principle — agent uses its existing wire-format §8 key; no separate scrub key to compromise | **✓ Mitigated v0.1.3** | — |
 | AV-25 | Scrub-key compromise | Hardware-backed `ciris-keyring` (TPM / Secure Enclave / StrongBox / DPAPI) — seed never leaves the keyring; never crosses the FFI boundary | `SoftwareSigner` fallback for hardware-less deployments (named residual) | ✓ Mitigated where hardware available; ⚠ residual on software-fallback | CIRISVerify hardware-attestation tier governs |
+| AV-26 | Multi-worker migration race | Session-scoped `pg_advisory_lock(0x6369_7269_7370_7372)` on dedicated single-use connection in `run_migrations()` — workers serialize on cold-boot, lock auto-releases on session close (incl. panic) | `Error::Migration { sqlstate, detail }` surfaces SQLSTATE for lens-side retry policy | **✓ Mitigated v0.1.5** | — |
 
 ---
 

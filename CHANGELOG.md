@@ -5,6 +5,91 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.1.5] — 2026-05-01
+
+### Production hot-fix — multi-worker boot race (THREAT_MODEL.md AV-26)
+
+The lens hit a race during a multi-worker production cutover:
+several uvicorn workers calling `Engine(...)` concurrently against
+the same DB raced on Postgres catalog inserts (hypertable type
+registration in `pg_type`, `IF NOT EXISTS` checks across the
+V001+V003 set, refinery's own schema_history bootstrap). Pre-v0.1.5
+the second worker saw the unhelpful
+`migrations: 'error asserting migrations table', 'db error'` —
+no SQLSTATE handle, no way to distinguish "race" from
+"unreachable" from "permission denied".
+
+v0.1.5 closes the race with a session-scoped Postgres advisory
+lock acquired on a dedicated single-use connection at the top of
+`run_migrations()`. The lock id is `0x6369_7269_7370_7372`
+(`"cirispsr"` in ASCII — greppable in `pg_locks`). Concurrent
+workers serialize on the lock; the first worker through runs
+migrations, subsequent workers block until the first's session
+closes, then wake up, see "no migrations to apply", and proceed.
+Lock auto-releases on connection close — including the
+panic-mid-migration case (process dies → connection ends → lock
+goes).
+
+### Diagnostic improvement — SQLSTATE on migration errors
+
+New `store::Error::Migration { sqlstate: Option<String>, detail }`
+variant. The migration path walks the `tokio_postgres::Error`
+source chain, extracts the SQLSTATE class+code, and surfaces it
+in the Display format `migration: [42P07] ...`. The lens can now
+distinguish:
+
+- `42P07` "relation already exists" (pre-v0.1.5 race signature;
+  shouldn't appear at v0.1.5+ unless schema is externally mutated
+  mid-flight)
+- `40P01` deadlock detected (caller should retry)
+- `08006` connection terminated (transient; lens retries Engine
+  construction)
+- `42501` permission denied (DSN user lacks DDL rights — config
+  bug, not transient)
+
+`Error::kind()` returns the new stable token `store_migration` for
+HTTP / PyO3 mapping.
+
+### Tests
+
+- 91 lib + 8 QA + 9 fixture = **108 tests, all green**.
+- New QA scenario H — `av26_concurrent_boot_advisory_lock`: spawns
+  10 concurrent `PostgresBackend::connect + run_migrations` calls
+  against a freshly-truncated DB, asserts every one returns
+  `Ok(())` and the migration history table has exactly one row
+  per migration script (not N_WORKERS × migrations — that would
+  mean the lock didn't hold). Gated on
+  `CIRIS_PERSIST_TEST_PG_URL` like the other postgres integration
+  tests; serialized via `serial_test::serial(postgres)`.
+
+### Breaking change (small)
+
+- `PostgresBackend::from_pool(pool: Pool)` →
+  `PostgresBackend::from_pool(pool: Pool, dsn: impl Into<String>)`.
+  The dsn is required for the migration phase to spin up a
+  dedicated single-use lock-holder connection (the pool can't be
+  used because session-scoped advisory locks would taint pooled
+  connections). External callers were nil at the time of
+  bump — no public-API users in the tree.
+
+### Documentation
+
+- `docs/INTEGRATION_LENS.md` §2 — new "Multi-worker boot contract
+  (v0.1.5+)" subsection: serialization diagram, readiness-probe
+  timeout guidance, SQLSTATE crib sheet.
+- `docs/THREAT_MODEL.md` — AV-26 (Multi-worker migration race)
+  added with the v0.1.5 mitigation prose.
+
+### Notes
+
+- The advisory lock takes ~negligible time on a warm lens
+  deployment (migrations no-op after the first boot ever). On a
+  fresh DB, ~50–200ms total.
+- Best-effort `pg_advisory_unlock` is issued before the dedicated
+  connection drops — shaves wait time off concurrent workers
+  vs. relying on session close. Drop is the correctness guarantee;
+  the unlock is the latency optimization.
+
 ## [0.1.4] — 2026-05-01
 
 ### QA harness landed as permanent CI gate

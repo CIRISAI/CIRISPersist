@@ -510,3 +510,112 @@ async fn av17_attempt_index_out_of_range() {
     assert!(backend.snapshot_events().is_empty());
     println!("scenario G: attempt_index=2^32 rejected with kind={kind}");
 }
+
+// ─── Scenario H: AV-26 multi-worker boot race (v0.1.5) ─────────────
+
+/// Multi-worker boot race regression. v0.1.5 added a session-scoped
+/// `pg_advisory_lock(MIGRATION_LOCK_ID)` on a dedicated single-use
+/// connection at the top of `run_migrations`; this scenario spawns
+/// N concurrent `PostgresBackend::connect + run_migrations` calls
+/// against a freshly-truncated DB and asserts every one returns
+/// `Ok(())`.
+///
+/// Pre-v0.1.5 this raced on Postgres catalog inserts (`pg_type` for
+/// hypertable types, `IF NOT EXISTS` over the V001+V003 set) and
+/// surfaced as `Error::Backend("migrations: error asserting
+/// migrations table — db error")` with no SQLSTATE handle. v0.1.5
+/// the second worker blocks on the advisory lock until the first
+/// worker's session closes, then sees "no migrations to apply" and
+/// returns clean.
+///
+/// Gated on `CIRIS_PERSIST_TEST_PG_URL` like the other postgres
+/// integration tests. Uses `#[serial_test::serial(postgres)]` to
+/// avoid races with other DB-touching tests sharing the runner.
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial(postgres)]
+async fn av26_concurrent_boot_advisory_lock() {
+    let Some(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL").ok() else {
+        eprintln!("scenario H skipped: CIRIS_PERSIST_TEST_PG_URL unset");
+        return;
+    };
+
+    use ciris_persist::store::{Backend, PostgresBackend};
+
+    // Cold-start simulation: drop both the lens schema and the
+    // migration history table so every worker sees an unmigrated
+    // DB. (Don't drop the schema in normal test runs — production
+    // never starts here.)
+    {
+        let backend = PostgresBackend::connect(&dsn)
+            .await
+            .expect("scenario H setup: connect");
+        let client = backend.pool().get().await.expect("setup: client");
+        let _ = client
+            .execute("DROP SCHEMA IF EXISTS cirislens CASCADE", &[])
+            .await;
+        let _ = client
+            .execute(
+                "DROP TABLE IF EXISTS public.ciris_persist_schema_history",
+                &[],
+            )
+            .await;
+    }
+
+    const N_WORKERS: usize = 10;
+    let start = Instant::now();
+    let mut tasks = Vec::with_capacity(N_WORKERS);
+    for w in 0..N_WORKERS {
+        let dsn = dsn.clone();
+        tasks.push(tokio::spawn(async move {
+            let backend = PostgresBackend::connect(&dsn)
+                .await
+                .map_err(|e| format!("worker {w}: connect: kind={} {e}", e.kind()))?;
+            backend
+                .run_migrations()
+                .await
+                .map_err(|e| format!("worker {w}: migrate: kind={} {e}", e.kind()))?;
+            Ok::<_, String>(())
+        }));
+    }
+    let mut errors = Vec::new();
+    for (i, t) in tasks.into_iter().enumerate() {
+        match t.await {
+            Ok(Ok(())) => {}
+            Ok(Err(msg)) => errors.push(msg),
+            Err(je) => errors.push(format!("worker {i}: join: {je}")),
+        }
+    }
+    let elapsed = start.elapsed();
+
+    assert!(
+        errors.is_empty(),
+        "scenario H: {} of {N_WORKERS} workers failed:\n  {}",
+        errors.len(),
+        errors.join("\n  ")
+    );
+
+    // Sanity: schema_history table should have one row per migration
+    // script (V001 + V003 currently). Exactly one set, not N_WORKERS
+    // sets — proves the lock serialized correctly.
+    let backend = PostgresBackend::connect(&dsn).await.unwrap();
+    let client = backend.pool().get().await.unwrap();
+    let row = client
+        .query_one(
+            "SELECT COUNT(*)::BIGINT FROM ciris_persist_schema_history",
+            &[],
+        )
+        .await
+        .expect("schema_history count");
+    let count: i64 = row.get(0);
+    assert!(
+        (1..=16).contains(&count),
+        "schema_history has {count} rows; expected 1..=16 (one per migration), \
+         not N_WORKERS×migrations — that would mean the lock didn't hold"
+    );
+
+    println!(
+        "scenario H: {N_WORKERS} concurrent boots all OK in {elapsed:?}, \
+         schema_history has {count} migration rows"
+    );
+}

@@ -47,9 +47,27 @@ mod embedded {
     refinery::embed_migrations!("migrations/postgres/lens");
 }
 
+/// Postgres advisory-lock namespace for the migration phase.
+///
+/// `pg_advisory_lock(bigint)` takes a single int8; the bytes spell
+/// `"cirispsr"` in ASCII so the value is greppable in pg_locks /
+/// pg_stat_activity. Stable across worker boots so multi-worker
+/// boot contention serializes on the *same* lock id (the whole point
+/// of the v0.1.5 fix). THREAT_MODEL.md AV-26.
+const MIGRATION_LOCK_ID: i64 = 0x6369_7269_7370_7372_i64;
+
 /// Postgres-backed [`Backend`] impl.
 pub struct PostgresBackend {
     pool: Pool,
+    /// Original DSN, retained for the migration phase's dedicated
+    /// connection. The pool can't be used for the advisory-lock
+    /// holder: if a session-scoped `pg_advisory_lock` is taken on a
+    /// pooled connection and that connection is recycled into the
+    /// pool, the next user inherits the lock until the session ends.
+    /// The migration path uses a one-shot non-pooled connection so
+    /// the lock auto-releases when the connection drops — including
+    /// the panic-mid-migration case.
+    dsn: String,
 }
 
 impl PostgresBackend {
@@ -116,14 +134,25 @@ impl PostgresBackend {
             .create_pool(Some(Runtime::Tokio1), NoTls)
             .map_err(|e| Error::Backend(format!("pool create: {e}")))?;
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            dsn: dsn.to_owned(),
+        })
     }
 
     /// Construct from an already-built deadpool. For tests / advanced
     /// embeddings (e.g. lens binary that wants to share a pool with
     /// other queries).
-    pub fn from_pool(pool: Pool) -> Self {
-        Self { pool }
+    ///
+    /// `dsn` is required so the migration phase (v0.1.5+) can spin up
+    /// a dedicated single-use connection to hold the advisory lock —
+    /// see [`run_migrations`](Backend::run_migrations) and the
+    /// `MIGRATION_LOCK_ID` doc.
+    pub fn from_pool(pool: Pool, dsn: impl Into<String>) -> Self {
+        Self {
+            pool,
+            dsn: dsn.into(),
+        }
     }
 
     /// Borrow the underlying pool. Phase 2's `peer-replicate` channel
@@ -138,6 +167,97 @@ impl PostgresBackend {
             .await
             .map_err(|e| Error::Backend(format!("pool get: {e}")))
     }
+
+    /// Open a one-shot non-pooled connection. Used by
+    /// [`Backend::run_migrations`] to hold the session-scoped
+    /// advisory lock. When the returned client drops, the
+    /// connection task observes EOF and the session ends — the lock
+    /// auto-releases. Includes the panic-mid-migration case.
+    #[cfg(not(feature = "tls"))]
+    async fn dedicated_connect(&self) -> Result<tokio_postgres::Client, Error> {
+        let (client, connection) =
+            tokio_postgres::connect(&self.dsn, NoTls)
+                .await
+                .map_err(|e| Error::Migration {
+                    sqlstate: extract_sqlstate(&e),
+                    detail: format!("dedicated connect: {e}"),
+                })?;
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::warn!(error = %e, "migration-lock connection terminated");
+            }
+        });
+        Ok(client)
+    }
+
+    #[cfg(feature = "tls")]
+    async fn dedicated_connect(&self) -> Result<tokio_postgres::Client, Error> {
+        use rustls::ClientConfig;
+        use tokio_postgres_rustls::MakeRustlsConnect;
+        let mut roots = rustls::RootCertStore::empty();
+        let cert_result = rustls_native_certs::load_native_certs();
+        for cert in cert_result.certs {
+            roots.add(cert).map_err(|e| Error::Migration {
+                sqlstate: None,
+                detail: format!("native-cert add: {e}"),
+            })?;
+        }
+        if !cert_result.errors.is_empty() {
+            tracing::warn!(
+                errors = ?cert_result.errors,
+                "some native certs failed to load (non-fatal)"
+            );
+        }
+        let tls_config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = MakeRustlsConnect::new(tls_config);
+        let (client, connection) = tokio_postgres::connect(&self.dsn, connector)
+            .await
+            .map_err(|e| Error::Migration {
+                sqlstate: extract_sqlstate(&e),
+                detail: format!("dedicated connect (tls): {e}"),
+            })?;
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::warn!(error = %e, "migration-lock connection terminated");
+            }
+        });
+        Ok(client)
+    }
+}
+
+/// Walk the std::error::Error source chain; if a tokio-postgres
+/// error is found, return its SQLSTATE class+code as a stable string.
+///
+/// Used by [`Backend::run_migrations`] to surface 42P07 / 40P01 /
+/// 08006 distinctly to the lens. Every fallible Postgres path goes
+/// through `tokio_postgres::Error` somewhere in the source chain;
+/// refinery wraps it but doesn't strip it.
+fn extract_sqlstate(err: &(dyn std::error::Error + 'static)) -> Option<String> {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cur {
+        if let Some(pg_err) = e.downcast_ref::<tokio_postgres::Error>() {
+            return pg_err.code().map(|c| c.code().to_owned());
+        }
+        cur = e.source();
+    }
+    None
+}
+
+/// Format a migration-phase error with the SQLSTATE prepended
+/// (when available) so the Display string is greppable in lens
+/// logs without separate field-extraction.
+fn migration_error<E>(stage: &str, err: E) -> Error
+where
+    E: std::error::Error + 'static,
+{
+    let sqlstate = extract_sqlstate(&err);
+    let detail = match &sqlstate {
+        Some(code) => format!("{stage}: [{code}] {err}"),
+        None => format!("{stage}: {err}"),
+    };
+    Error::Migration { sqlstate, detail }
 }
 
 impl Backend for PostgresBackend {
@@ -416,14 +536,61 @@ impl Backend for PostgresBackend {
     }
 
     async fn run_migrations(&self) -> Result<(), Error> {
-        let mut client = self.get_client().await?;
-        // refinery wraps tokio-postgres directly; we hand off our
-        // pooled client.
-        embedded::migrations::runner()
-            .set_migration_table_name("ciris_persist_schema_history")
-            .run_async(&mut **client)
+        // v0.1.5 — multi-worker boot race fix. Before this, two
+        // workers calling `run_migrations` concurrently against the
+        // same DB would race on Postgres's catalog (`pg_type` insert
+        // for hypertable types, `IF NOT EXISTS` checks across the
+        // V001 + V003 set, refinery's own schema_history table).
+        // Pre-v0.1.5 the second worker saw "error asserting
+        // migrations table — db error" with no SQLSTATE handle.
+        //
+        // Fix: take a session-scoped advisory lock on a dedicated
+        // single-use connection. The first worker acquires it
+        // immediately; subsequent workers block on
+        // `pg_advisory_lock` until the first worker drops its
+        // connection. Lock auto-releases on connection close — even
+        // if the first worker panics mid-migration. THREAT_MODEL.md
+        // AV-26.
+        let mut lock_client = self.dedicated_connect().await?;
+
+        // Block until the lock is held. First worker through wins
+        // immediately; later workers wake up when the first worker's
+        // connection closes (after migrations complete or panic).
+        // Lens-side readiness probe should be at least the
+        // observed migration runtime + a small buffer.
+        lock_client
+            .execute("SELECT pg_advisory_lock($1)", &[&MIGRATION_LOCK_ID])
             .await
-            .map_err(|e| Error::Backend(format!("migrations: {e}")))?;
+            .map_err(|e| migration_error("acquire advisory lock", e))?;
+
+        tracing::info!(
+            lock_id = MIGRATION_LOCK_ID,
+            "ciris-persist: migration phase begin (advisory lock acquired)"
+        );
+
+        // Run refinery on the same lock-holding connection. refinery
+        // wraps each migration in its own transaction; the advisory
+        // lock is at session scope, so it persists across all of
+        // them. If a single migration fails, refinery rolls back its
+        // transaction; we drop the connection below; lock releases.
+        let migration_result = embedded::migrations::runner()
+            .set_migration_table_name("ciris_persist_schema_history")
+            .run_async(&mut lock_client)
+            .await
+            .map_err(|e| migration_error("migrations", e));
+
+        // Best-effort explicit unlock — graceful path. The drop below
+        // is the actual guarantee (session ends → lock releases),
+        // but releasing explicitly returns the lock as soon as the
+        // last migration commits, shaving wait time off concurrent
+        // workers.
+        let _ = lock_client
+            .execute("SELECT pg_advisory_unlock($1)", &[&MIGRATION_LOCK_ID])
+            .await;
+        drop(lock_client);
+
+        migration_result?;
+        tracing::info!("ciris-persist: migration phase complete");
         Ok(())
     }
 }
