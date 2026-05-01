@@ -55,6 +55,16 @@ pub trait PublicKeyDirectory {
 /// We construct the payload as a `serde_json::Value` and let the
 /// `Canonicalizer` produce the actual bytes — the canonicalizer is
 /// pluggable (Python-compat or JCS), the field set is fixed.
+///
+/// **THREAT_MODEL.md AV-4 (closed v0.1.8)**: timestamps come from
+/// [`crate::schema::WireDateTime::wire`], not from re-formatting a
+/// `DateTime<Utc>`. The agent emitted Python `isoformat()` bytes
+/// over the wire; we preserve those bytes verbatim into the
+/// canonical input. Pre-v0.1.8 a `format_iso8601` helper
+/// re-formatted via chrono's `%.6f%:z`, which always emitted six
+/// digits of microseconds — diverging from Python's "drop
+/// microseconds when zero" rule and breaking signature verify on
+/// every batch with a `.000000`-shaped agent timestamp.
 pub fn canonical_payload_value(trace: &CompleteTrace) -> serde_json::Value {
     // Per §8, the canonical fields are:
     //   trace_id, thought_id, task_id, agent_id_hash, started_at,
@@ -74,7 +84,7 @@ pub fn canonical_payload_value(trace: &CompleteTrace) -> serde_json::Value {
                 "component_type": c.component_type,
                 "data": serde_json::Value::Object(c.data.clone()),
                 "event_type": c.event_type,
-                "timestamp": format_iso8601(&c.timestamp),
+                "timestamp": c.timestamp.wire(),
             })
         })
         .collect();
@@ -102,11 +112,11 @@ pub fn canonical_payload_value(trace: &CompleteTrace) -> serde_json::Value {
     );
     payload.insert(
         "started_at".into(),
-        serde_json::Value::String(format_iso8601(&trace.started_at)),
+        serde_json::Value::String(trace.started_at.wire().to_owned()),
     );
     payload.insert(
         "completed_at".into(),
-        serde_json::Value::String(format_iso8601(&trace.completed_at)),
+        serde_json::Value::String(trace.completed_at.wire().to_owned()),
     );
     payload.insert(
         "trace_level".into(),
@@ -119,28 +129,6 @@ pub fn canonical_payload_value(trace: &CompleteTrace) -> serde_json::Value {
     payload.insert("components".into(), serde_json::Value::Array(components));
 
     serde_json::Value::Object(payload)
-}
-
-/// Format a `DateTime<Utc>` as Python `datetime.isoformat()` produces:
-/// `"2026-04-30T00:15:53.123456+00:00"` — microsecond precision,
-/// `+00:00` suffix (not `Z`).
-///
-/// Mission category §4 "Canonicalization parity": Python and chrono
-/// disagree on the timestamp formatter by default; chrono prefers
-/// trailing `Z` and may emit different fractional-second precision.
-/// This function pins the format to what the agent's signer
-/// produced.
-///
-/// **Caveat:** for verify against agent-produced canonical bytes, we
-/// should round-trip the original timestamp string from the wire if
-/// possible (preserves byte-exact). When that's not available (Phase
-/// 2 internal-signing path), this format function is the canonical
-/// shape.
-fn format_iso8601(t: &chrono::DateTime<chrono::Utc>) -> String {
-    // Python's datetime.isoformat() emits microsecond precision:
-    //   "%Y-%m-%dT%H:%M:%S.%6f%:z"
-    // chrono format: %.6f gives microseconds, %:z gives "+HH:MM".
-    t.format("%Y-%m-%dT%H:%M:%S%.6f%:z").to_string()
 }
 
 /// Verify a `CompleteTrace`'s signature against the canonical bytes

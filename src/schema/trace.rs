@@ -5,7 +5,6 @@
 //! time; reasoning over it without a typed accessor would be the
 //! anti-pattern.
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::events::{AuditAnchor, ComponentType, CostSummary, LlmCallSummary, ReasoningEventType};
@@ -30,7 +29,12 @@ pub struct TraceComponent {
     /// Specific event-type discriminant within that category.
     pub event_type: ReasoningEventType,
     /// Wall-clock at which this component was emitted.
-    pub timestamp: DateTime<Utc>,
+    ///
+    /// THREAT_MODEL.md AV-4 (closed v0.1.8): stored as
+    /// [`WireDateTime`] so the wire bytes the agent signed are
+    /// preserved verbatim through canonicalization. Use `.parsed()`
+    /// for time arithmetic; canonicalization uses `.wire()`.
+    pub timestamp: super::WireDateTime,
     /// The agent's `data` dict, kept verbatim for JSONB storage. Use
     /// the typed accessors below to extract specific fields with
     /// schema validation.
@@ -193,9 +197,12 @@ pub struct CompleteTrace {
     pub agent_id_hash: String,
 
     /// When the trace started.
-    pub started_at: DateTime<Utc>,
+    ///
+    /// THREAT_MODEL.md AV-4 (closed v0.1.8): see
+    /// [`TraceComponent::timestamp`].
+    pub started_at: super::WireDateTime,
     /// When the trace was sealed (`ACTION_RESULT` emitted).
-    pub completed_at: DateTime<Utc>,
+    pub completed_at: super::WireDateTime,
 
     /// Privacy / bandwidth tier of the trace.
     pub trace_level: super::envelope::TraceLevel,

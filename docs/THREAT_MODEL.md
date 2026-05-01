@@ -258,11 +258,20 @@ the "produce different bytes that verify" branch to
   triggered by any production fixture; track if a real
   divergence appears in the corpus.
 - **Timestamp formatting drift** (`verify::ed25519::format_iso8601`).
-  We re-format `DateTime<Utc>` for canonicalization rather than
-  round-tripping the original wire string. If an agent emits a
-  timestamp shape we don't reproduce byte-exact, verify fails.
-  Track in a Phase 1.x patch — preserve the on-the-wire string
-  for canonicalization.
+  ✓ **CLOSED v0.1.8**. Was: re-format `DateTime<Utc>` via chrono's
+  `%.6f%:z` for canonicalization, which always emitted six
+  microsecond digits. Python's `datetime.isoformat()` drops the
+  fraction entirely when microseconds==0, so a wire timestamp of
+  `2026-04-30T00:15:53+00:00` became `2026-04-30T00:15:53.000000+00:00`
+  on the verify side, canonical bytes diverged, signature rejected.
+  Hit lens production cutover. v0.1.8 closes by adding
+  `schema::WireDateTime` — wraps `(raw: String, parsed: DateTime<Utc>)`
+  with `Serialize` emitting the raw bytes verbatim. Replaces
+  `DateTime<Utc>` in `CompleteTrace.{started_at, completed_at}`
+  and `TraceComponent.timestamp`. `canonical_payload_value` now
+  reads `.wire()` instead of `format_iso8601(&parsed)`.
+  Regression coverage: `tests/av4_timestamp_round_trip.rs` (5
+  scenarios including the production-bug zero-microsecond shape).
 
 ### 3.2 Denial of Service — adversary wants the lens unable to receive evidence
 
@@ -757,7 +766,7 @@ summary. Briefly:
 | AV-1 | Forged trace from attacker key | Public-key directory lookup | N_eff drift detection (lens-side) | ✓ Mitigated | — |
 | AV-2 | Forged trace from compromised key | (out of scope at persistence layer) | Audit anchor + Phase 2 peer-replicate | ⚠ Phase 2 closes | FSD §4.5 |
 | AV-3 | Replay of legitimate batch | Idempotency on dedup key | TLS at edge | ✓ Mitigated | — |
-| AV-4 | Canonicalization mismatch | Byte-exact parity tests + pluggable canonicalizer | Ed25519 collision resistance | ⚠ Float / timestamp drift residual | v0.1.x patch |
+| AV-4 | Canonicalization mismatch | Byte-exact parity tests + pluggable canonicalizer + `WireDateTime` preserves wire bytes verbatim through canonicalization | Ed25519 collision resistance | **✓ Mitigated v0.1.8** (timestamp closed; float drift residual untriggered, tracked) | — |
 | AV-5 | Schema-version flood (mem leak) | `Cow<'static, str>` (no leak) | (deploy-edge rate limit) | **✓ Mitigated v0.1.2** | — |
 | AV-6 | JSON-bomb amplification | `MAX_DATA_DEPTH=32` walker | Bounded queue + typed envelope | **✓ Mitigated v0.1.2** | — |
 | AV-7 | Body-size flood | `DefaultBodyLimit::max(8 MiB)` | Deploy-edge proxy | **✓ Mitigated v0.1.2** | — |

@@ -5,6 +5,99 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.1.8] — 2026-05-01
+
+P0 production fix — closes THREAT_MODEL.md AV-4 (timestamp
+canonicalization drift) that was rejecting every batch from
+Python agents containing zero-microsecond timestamps.
+
+### The bug
+
+The lens production cutover hit `verify_invalid_signature` on
+every batch. Root cause: persist's `verify::ed25519::format_iso8601`
+helper re-formatted `DateTime<Utc>` via chrono's
+`%Y-%m-%dT%H:%M:%S%.6f%:z` format string, which always emits six
+microsecond digits. Python's `datetime.isoformat()` (the agent's
+emitter, per TRACE_WIRE_FORMAT.md §8) drops the microsecond
+fraction entirely when `microseconds == 0`. So an agent-signed
+wire timestamp of `2026-04-30T00:15:53+00:00` became
+`2026-04-30T00:15:53.000000+00:00` on the verify side, the
+canonical bytes diverged, and `verify_strict` rejected.
+
+The threat model had flagged this as the AV-4 residual since
+v0.1.2 ("track in a Phase 1.x patch — preserve the on-the-wire
+string"). Production confirmed it as P0.
+
+### The fix — `schema::WireDateTime`
+
+New wrapper type holding `(raw: String, parsed: DateTime<Utc>)`:
+
+- `Deserialize` captures the wire string into `raw`, parses into
+  `parsed` for typed access.
+- `Serialize` emits `raw` verbatim — re-serialization is byte-equal.
+- `wire()` accessor returns the raw bytes for canonicalization;
+  `parsed()` returns the `DateTime<Utc>` for time arithmetic.
+- Equality is *wire-byte equality*, not instant equality:
+  `2026-04-30T00:15:53Z` and `2026-04-30T00:15:53+00:00` are the
+  same instant but compare unequal because canonicalization
+  treats them differently.
+
+Replaces `DateTime<Utc>` in:
+
+- `schema::CompleteTrace.{started_at, completed_at}`
+- `schema::TraceComponent.timestamp`
+
+`verify::ed25519::canonical_payload_value` now reads `.wire()`
+instead of calling `format_iso8601`. The helper is removed.
+
+`store::decompose` uses `.parsed()` to populate the `ts:
+DateTime<Utc>` column on `TraceEventRow` / `TraceLlmCallRow` —
+storage shape unchanged, only the verify path differs.
+
+### Regression coverage
+
+`tests/av4_timestamp_round_trip.rs` — 5 integration tests:
+
+1. **Zero microseconds, no fraction** (the production-bug shape).
+   `2026-04-30T00:15:53+00:00`. Pre-v0.1.8 this rejected; v0.1.8
+   verifies clean.
+2. Six-digit microseconds (Python isoformat with non-zero
+   sub-second).
+3. Z-suffix form.
+4. Three-digit millisecond precision.
+5. Tampered timestamp still rejected (verify gate didn't widen).
+
+Plus 5 unit tests in `schema::wire_datetime` covering
+deserialize/serialize byte-exact round-trips, equality semantics,
+and parser rejection of invalid forms.
+
+### Tests
+
+- 103 lib + 5 AV-4 integration + 8 QA + 9 fixture =
+  **125 tests, all green**.
+- clippy clean across postgres,pyo3,server,tls feature combos.
+
+### Notes for the lens team
+
+- After deploying v0.1.8 + re-rolling the bridge, the existing
+  `PERSIST_ROUTE` / `PERSIST_DELEGATE_RESULT` /
+  `PERSIST_DELEGATE_REJECT` logs will confirm in seconds whether
+  verify passes on real agent traffic.
+- No API change; `Engine` ctor signature is unchanged. The shape
+  change is internal to `CompleteTrace`.
+- If you have any code that constructs `CompleteTrace` directly
+  (vs. via wire-format deserialization), the timestamp fields are
+  now `WireDateTime` instead of `DateTime<Utc>`. `"...".parse()`
+  works (FromStr impl returns `WireDateTime`) — most call sites
+  need no change.
+
+### Float canonicalization residual
+
+The other AV-4 sub-residual (Python `repr(float)` vs Rust `ryu`)
+remains tracked but untriggered. No production divergence
+observed; will close per-fixture-growth or when JCS becomes the
+agent's canonicalizer.
+
 ## [0.1.7] — 2026-05-01
 
 Three landings: bench harness + perf trend infrastructure, keyring

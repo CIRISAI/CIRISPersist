@@ -74,7 +74,10 @@ pub fn decompose(trace: &CompleteTrace) -> Result<Decomposed, Error> {
             step_point,
             event_type: component.event_type,
             attempt_index,
-            ts: component.timestamp,
+            // v0.1.8 — component.timestamp is now WireDateTime
+            // (preserves wire bytes for verify); the row stores a
+            // chrono::DateTime<Utc> for time-series queries.
+            ts: component.timestamp.parsed(),
             agent_name: agent_name.clone(),
             agent_id_hash: trace.agent_id_hash.clone(),
             cognitive_state: cognitive_state.clone(),
@@ -129,7 +132,9 @@ fn build_llm_call_row(
         // Spec §5.10 puts timestamp inside data; release/2.7.8 emits
         // it at the component level only. Fall back to the component
         // timestamp when data.timestamp is absent.
-        ts: call.timestamp.unwrap_or(component.timestamp),
+        ts: call
+            .timestamp
+            .unwrap_or_else(|| component.timestamp.parsed()),
         duration_ms: call.duration_ms,
         handler_name: call.handler_name.clone(),
         service_name: call.service_name.clone(),
@@ -191,7 +196,7 @@ mod tests {
     use super::*;
     use crate::schema::{ComponentType, SchemaVersion, TraceLevel};
 
-    fn ts(s: &str) -> DateTime<Utc> {
+    fn ts(s: &str) -> crate::schema::WireDateTime {
         s.parse().unwrap()
     }
 

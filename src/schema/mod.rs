@@ -25,6 +25,7 @@ pub mod envelope;
 pub mod events;
 pub mod trace;
 pub mod version;
+pub mod wire_datetime;
 
 pub use envelope::{BatchEnvelope, BatchEvent, CorrelationMetadata, TraceLevel};
 pub use events::{
@@ -32,6 +33,7 @@ pub use events::{
 };
 pub use trace::{CompleteTrace, TraceComponent};
 pub use version::{SchemaVersion, SUPPORTED_VERSIONS};
+pub use wire_datetime::WireDateTime;
 
 /// Schema-layer errors.
 ///
