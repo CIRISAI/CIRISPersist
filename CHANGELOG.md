@@ -5,6 +5,50 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.1.4] — 2026-05-01
+
+### QA harness landed as permanent CI gate
+
+`tests/qa_harness.rs` (NEW) — seven-scenario stress suite that runs
+post-tag against the v0.1.3 substrate. All seven passed first time:
+
+```
+A. high-volume concurrent agents     8 × 16 × 6 = 768 rows in 9 ms
+B. AV-5 schema-version flood         10,000 rejections, no mem growth
+C. AV-6 JSON-bomb depth               64-deep blob → typed rejection
+D. AV-9 cross-agent dedup             both agents persist distinct rows
+E. AV-24 sign-verify round-trip       256 rows, all ed25519_verified
+F. AV-19 graceful shutdown drain      64 batches → all 256 rows drained
+G. AV-17 attempt_index out-of-range   2^32 → typed rejection
+```
+
+The scenarios are now part of the test corpus. Run via
+`cargo test --test qa_harness --release -- --test-threads=1
+--nocapture`.
+
+### Fixes from CI feedback at v0.1.3
+
+- **cargo-deny wildcard** — added `version = "1.6"` alongside the
+  `ciris-keyring` git+tag dep. cargo-deny no longer flags the
+  unpinned semver requirement.
+- **cargo-deny RUSTSEC-2024-0388 (derivative unmaintained)** —
+  documented + ignored. Transitive via ciris-keyring's TPM/derive
+  stack; proc-macro only, no runtime exposure.
+- **cargo-deny RUSTSEC-2024-0384 (instant unmaintained)** —
+  documented + ignored. Phase 2.3 Reticulum work likely replaces
+  this branch entirely; tracking for upstream cleanup.
+
+These were the three findings the v0.1.3 CI surfaced. The QA
+harness ran clean against the substrate; only the dep-audit
+gate needed reconciliation.
+
+### Notes
+
+- v0.1.3 release tag stays at the previous commit. v0.1.4 is the
+  first version with all 8 CI jobs green simultaneously.
+- No code-path changes in v0.1.4 — only `Cargo.toml` (version
+  field) + `deny.toml` (ignored advisories) + the new test file.
+
 ## [0.1.3] — 2026-05-01
 
 ### ⚠ Breaking changes

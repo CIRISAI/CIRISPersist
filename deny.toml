@@ -32,7 +32,19 @@ wildcards = "deny"
 
 [advisories]
 yanked = "warn"
-ignore = []
+# QA-harness findings v0.1.3 → ignore in v0.1.4. Both are
+# unmaintained-track advisories pulled in transitively via
+# ciris-keyring (CIRISVerify's TPM/keyring stack). Can't fix
+# downstream from here. Track upstream for cleanup; the
+# unmaintained code paths aren't on our hot path:
+# - RUSTSEC-2024-0388 derivative — proc-macro for derive impls
+#   (compile-time only, no runtime exposure)
+# - RUSTSEC-2024-0384 instant — wall-clock helpers; Phase 2.3
+#   Reticulum work may replace this branch entirely
+ignore = [
+    "RUSTSEC-2024-0388",  # derivative unmaintained
+    "RUSTSEC-2024-0384",  # instant unmaintained
+]
 
 [sources]
 unknown-registry = "deny"
