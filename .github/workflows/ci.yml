@@ -123,9 +123,28 @@ jobs:
 
   # Build the abi3-py311 wheel via maturin. Per
   # PLATFORM_ARCHITECTURE.md §3.5: one wheel per (os, arch) pair.
+  #
+  # v0.1.13 — matrix build covering the agent's full PyPI surface:
+  #   linux x86_64, linux aarch64, darwin arm64, darwin x86_64.
+  # iOS / Android don't ship via PyPI (xcframework / UniFFI native
+  # packaging) so they're out of scope here; Phase 1 spec.
+  #
+  # Each matrix entry runs on a NATIVE runner for that target so we
+  # avoid cross-compile drama (sysroot, linkers, vendored openssl
+  # quirks). GitHub Actions Linux ARM64 runners
+  # (`ubuntu-24.04-arm`) have been GA + free for public repos
+  # since 2025-01.
   pyo3-wheel:
-    name: maturin abi3-py311 wheel
-    runs-on: ubuntu-latest
+    name: maturin abi3-py311 wheel (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,    label: linux-x86_64,   tag: manylinux_2_34_x86_64 }
+          - { os: ubuntu-24.04-arm, label: linux-aarch64,  tag: manylinux_2_34_aarch64 }
+          - { os: macos-14,         label: darwin-aarch64, tag: macosx_11_0_arm64 }
+          - { os: macos-13,         label: darwin-x86_64,  tag: macosx_10_12_x86_64 }
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -136,9 +155,21 @@ jobs:
         run: pip install maturin
       - name: maturin build
         run: maturin build --release --strip
+      - name: confirm wheel shape
+        # Reject anything that isn't cp311-abi3 — the v0.1.10 regression
+        # showed mixed-mode maturin can silently emit cp31N-cp31N
+        # wheels which break consumer install on other minors. Catching
+        # at build time, before the wheel reaches PyPI.
+        run: |
+          ls -la target/wheels/
+          if ! ls target/wheels/*-cp311-abi3-*.whl >/dev/null 2>&1; then
+            echo "::error::Expected cp311-abi3 wheel for ${{ matrix.label }}; got:"
+            ls target/wheels/*.whl 2>/dev/null || echo "  (no wheels)"
+            exit 1
+          fi
       - uses: actions/upload-artifact@v4
         with:
-          name: ciris_persist-wheel-${{ runner.os }}
+          name: ciris_persist-wheel-${{ matrix.label }}
           path: target/wheels/*.whl
 
   # v0.1.12 — publish abi3 wheel to PyPI on every tag push.
@@ -178,23 +209,39 @@ jobs:
       # no long-lived secret.
       id-token: write
     steps:
-      - name: download abi3 wheel
+      - name: download all multi-arch wheels
+        # v0.1.13 — pull every wheel the matrix produced into one
+        # dist/ dir for the upload action. `merge-multiple: true`
+        # flattens the per-artifact subdirs since the .whl
+        # filenames already encode the target tag (e.g.
+        # `-manylinux_2_34_aarch64`) so there's no collision.
         uses: actions/download-artifact@v4
         with:
-          name: ciris_persist-wheel-Linux
+          pattern: ciris_persist-wheel-*
+          merge-multiple: true
           path: dist
-      - name: sanity-check wheel shape before publish
+      - name: sanity-check wheel shapes before publish
+        # Reject anything that isn't cp311-abi3 — the v0.1.10
+        # regression showed mixed-mode maturin can silently emit
+        # cp31N-cp31N wheels which break consumer install. Catch
+        # at publish time too (also caught at build time per
+        # matrix entry).
         run: |
           ls -la dist/
-          # The cp311-abi3 form is what lens consumes (python:3.11-slim).
-          # Reject anything else — a regression to cp312-cp312 or
-          # similar would silently break consumers.
-          if ! ls dist/*-cp311-abi3-*.whl >/dev/null 2>&1; then
-            echo "::error::Expected cp311-abi3-manylinux wheel; got:"
+          COUNT=$(ls dist/*.whl 2>/dev/null | wc -l)
+          if [ "${COUNT}" -lt 4 ]; then
+            echo "::error::Expected 4 wheels (linux x86_64 + aarch64, darwin arm64 + x86_64); got ${COUNT}"
             ls dist/*.whl 2>/dev/null || echo "  (no .whl files at all)"
             exit 1
           fi
-          echo "✓ Found cp311-abi3 wheel: $(ls dist/*-cp311-abi3-*.whl)"
+          for wheel in dist/*.whl; do
+            if ! [[ "${wheel}" =~ -cp311-abi3- ]]; then
+              echo "::error::Non-abi3 wheel detected: ${wheel}"
+              exit 1
+            fi
+            echo "✓ ${wheel}"
+          done
+          echo "✓ All ${COUNT} wheels conform to cp311-abi3."
       - name: publish to PyPI via OIDC trusted publishing
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
@@ -265,16 +312,29 @@ jobs:
             > "dist/persist-extras-${{ steps.version.outputs.version }}.json"
           echo "PersistExtras emitted:"
           cat "dist/persist-extras-${{ steps.version.outputs.version }}.json"
-      - name: locate signed wheel for binary_hash
-        id: artifact
+      - name: download wheel for BuildManifest signing (linux x86_64)
         # The ciris-build-sign --binary input expects a single file
-        # whose sha256 lands in BuildManifest.binary_hash. We use
-        # the maturin-built wheel from the prior pyo3-wheel job as
-        # the canonical artifact for the linux-x86_64 build.
+        # whose sha256 lands in BuildManifest.binary_hash. We sign
+        # the linux-x86_64 wheel as the canonical reference; the
+        # registry's binary-manifest POST below carries hashes for
+        # all targets so multi-arch is provenance-covered.
         uses: actions/download-artifact@v4
         with:
-          name: ciris_persist-wheel-Linux
+          name: ciris_persist-wheel-linux-x86_64
           path: dist/wheel
+      - name: download all multi-arch wheels for binary-manifest aggregation
+        # v0.1.13 — registry's `binaries: HashMap<target, sha256>`
+        # field carries every target persist publishes to PyPI.
+        # We download all four artifacts into per-target subdirs
+        # so the POST payload below can compute each hash.
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ciris_persist-wheel-*
+          path: dist/wheels
+          # `merge-multiple: false` so each artifact lands in its
+          # own subdir matching the artifact name. With four wheels
+          # named identically across matrix entries we'd otherwise
+          # collide.
       - name: sign manifest with hybrid Ed25519 + ML-DSA-65
         env:
           # Bridge team uploads these as repo secrets (see
@@ -348,6 +408,12 @@ jobs:
         # CIRISRegistry commit 254a89e, tracked under persist
         # issue #2). The registry signs server-side with its
         # steward key; we verify the round-trip in the next step.
+        #
+        # v0.1.13 — `binaries` carries hashes for all four PyPI
+        # targets we publish (linux x86_64 + aarch64, darwin
+        # arm64 + x86_64). Each target's wheel sha256 is stored
+        # under its rust target-triple key, matching the convention
+        # in PLATFORM_ARCHITECTURE.md §3.5.
         env:
           REGISTRY_URL: ${{ vars.REGISTRY_URL }}
           REGISTRY_ADMIN_TOKEN: ${{ secrets.REGISTRY_ADMIN_TOKEN }}
@@ -361,21 +427,54 @@ jobs:
             echo "::error::See docs/BUILD_SIGNING.md (registry-registration section) for the wire shape."
             exit 1
           fi
-          BINARY="$(ls dist/wheel/*.whl | head -1)"
-          BIN_SHA="sha256:$(sha256sum "$BINARY" | cut -d' ' -f1)"
+
+          # Compute per-target sha256 hashes from each downloaded
+          # wheel artifact. Maps the artifact-dir name to the
+          # rust target triple the registry expects.
+          declare -A TARGET_FOR=(
+            ["ciris_persist-wheel-linux-x86_64"]="x86_64-unknown-linux-gnu"
+            ["ciris_persist-wheel-linux-aarch64"]="aarch64-unknown-linux-gnu"
+            ["ciris_persist-wheel-darwin-aarch64"]="aarch64-apple-darwin"
+            ["ciris_persist-wheel-darwin-x86_64"]="x86_64-apple-darwin"
+          )
+
+          # Build a JSON object {target: "sha256:..."} aggregating
+          # all targets the matrix produced. Missing wheels (e.g.
+          # if a matrix entry failed) are omitted with a warning;
+          # downstream consumers will still see hashes for the
+          # successfully-built targets.
+          BINARIES_JSON="{}"
+          for ARTDIR in "${!TARGET_FOR[@]}"; do
+            TARGET="${TARGET_FOR[$ARTDIR]}"
+            WHEEL="$(ls dist/wheels/${ARTDIR}/*.whl 2>/dev/null | head -1)"
+            if [ -z "${WHEEL}" ]; then
+              echo "::warning::No wheel found for ${TARGET} (artifact ${ARTDIR}); skipping"
+              continue
+            fi
+            SHA="sha256:$(sha256sum "${WHEEL}" | cut -d' ' -f1)"
+            echo "  ${TARGET}: ${SHA} ($(basename ${WHEEL}))"
+            BINARIES_JSON=$(python3 -c "
+          import json, sys
+          d = json.loads(sys.argv[1])
+          d['${TARGET}'] = '${SHA}'
+          print(json.dumps(d))
+          " "${BINARIES_JSON}")
+          done
+
           GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           PAYLOAD=$(python3 -c "
           import json, sys
+          binaries = json.loads(sys.argv[1])
           print(json.dumps({
               'project': 'ciris-persist',
               'version': '${{ steps.version.outputs.version }}',
-              'binaries': {'x86_64-unknown-linux-gnu': '${BIN_SHA}'},
+              'binaries': binaries,
               'generated_at': '${GENERATED_AT}',
-              'notes': 'CIRIS Trinity persist substrate; manifest signed via ciris-build-sign --primitive persist (CIRISVerify v1.8.0).',
+              'notes': 'CIRIS Trinity persist substrate; manifest signed via ciris-build-sign --primitive persist (CIRISVerify v1.8.0). Multi-arch publish: linux x86_64 + aarch64, darwin arm64 + x86_64.',
           }))
-          ")
+          " "${BINARIES_JSON}")
           echo "POST ${REGISTRY_URL}/v1/verify/binary-manifest"
-          echo "Payload (logged for diagnostics — no secret content):"
+          echo "Payload:"
           echo "${PAYLOAD}" | python3 -m json.tool
           HTTP_CODE=$(curl -sS -o dist/registry-response.json -w "%{http_code}" \
             -X POST "${REGISTRY_URL}/v1/verify/binary-manifest" \
@@ -388,11 +487,14 @@ jobs:
             echo "::error::Registration failed with HTTP ${HTTP_CODE}"
             exit 1
           fi
+          # Stash the binaries map for the round-trip step.
+          echo "${BINARIES_JSON}" > dist/binaries-posted.json
       - name: round-trip verify GET /v1/builds/{version}
         # Persist issue #2 close gate: confirm the registered
         # manifest comes back via the public GET endpoint with
-        # project=ciris-persist. Hash + version round-trip;
-        # diff against what we POSTed.
+        # project=ciris-persist. v0.1.13 verifies ALL FOUR target
+        # hashes (linux x86_64 + aarch64, darwin arm64 + x86_64)
+        # round-trip cleanly; any single-target mismatch fails.
         env:
           REGISTRY_URL: ${{ vars.REGISTRY_URL }}
         run: |
@@ -409,30 +511,40 @@ jobs:
             echo "::error::Round-trip GET failed with HTTP ${HTTP_CODE} — registration didn't land or the public endpoint is rejecting project=ciris-persist"
             exit 1
           fi
-          # Verify the binary hash we POSTed comes back unchanged.
-          BINARY="$(ls dist/wheel/*.whl | head -1)"
-          BIN_SHA="sha256:$(sha256sum "$BINARY" | cut -d' ' -f1)"
-          GOT_SHA=$(python3 -c "
-          import json
-          d = json.load(open('dist/round-trip.json'))
-          # Registry response shape: binaries dict keyed by target.
-          binaries = d.get('binaries') or d.get('manifest', {}).get('binaries') or {}
-          print(binaries.get('x86_64-unknown-linux-gnu', '<missing>'))
-          ")
-          if [ "${GOT_SHA}" != "${BIN_SHA}" ]; then
-            echo "::error::Round-trip hash mismatch:"
-            echo "  posted: ${BIN_SHA}"
-            echo "  got:    ${GOT_SHA}"
-            exit 1
-          fi
-          echo "✓ Round-trip verified: posted hash matches GET response."
+          # Verify every target hash we POSTed comes back unchanged.
+          # The binaries map saved at registration time is
+          # authoritative; the GET response should match it
+          # exactly.
+          python3 <<'PY'
+          import json, sys
+          posted = json.load(open('dist/binaries-posted.json'))
+          got_doc = json.load(open('dist/round-trip.json'))
+          got = got_doc.get('binaries') or got_doc.get('manifest', {}).get('binaries') or {}
+          mismatches = []
+          for target, posted_sha in posted.items():
+              got_sha = got.get(target, '<missing>')
+              if got_sha != posted_sha:
+                  mismatches.append(f"  {target}:\n    posted: {posted_sha}\n    got:    {got_sha}")
+          if mismatches:
+              print("::error::Round-trip hash mismatch on the following targets:")
+              for m in mismatches:
+                  print(m)
+              sys.exit(1)
+          print(f"✓ Round-trip verified: {len(posted)} target hashes match GET response:")
+          for target, sha in posted.items():
+              print(f"  {target}: {sha}")
+          PY
           {
             echo "## Registry round-trip"
             echo ""
             echo "- registry: \`${REGISTRY_URL}\`"
             echo "- version: \`${VERSION}\`"
-            echo "- target: \`x86_64-unknown-linux-gnu\`"
-            echo "- binary_hash: \`${BIN_SHA}\`"
+            echo "- targets:"
+            python3 -c "
+          import json
+          for k, v in json.load(open('dist/binaries-posted.json')).items():
+              print(f'  - \`{k}\`: \`{v}\`')
+          "
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
@@ -443,3 +555,4 @@ jobs:
             dist/steward-key.json
             dist/registry-response.json
             dist/round-trip.json
+            dist/binaries-posted.json

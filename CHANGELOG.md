@@ -5,6 +5,71 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.1.13] — 2026-05-01
+
+Multi-arch PyPI publish across the agent's full Phase 1 PyO3
+surface. Closes [`CIRISPersist#3`](https://github.com/CIRISAI/CIRISPersist/issues/3).
+
+### Wheels published
+
+| Target triple | Wheel tag | Runner |
+|---|---|---|
+| `x86_64-unknown-linux-gnu` | `manylinux_2_34_x86_64` | `ubuntu-latest` |
+| `aarch64-unknown-linux-gnu` | `manylinux_2_34_aarch64` | `ubuntu-24.04-arm` |
+| `aarch64-apple-darwin` | `macosx_11_0_arm64` | `macos-14` |
+| `x86_64-apple-darwin` | `macosx_10_12_x86_64` | `macos-13` |
+
+Each wheel is `cp311-abi3` so consumer Python ≥ 3.11 picks the
+right `(os, arch)` automatically. The agent's matrix per
+`FSD/PLATFORM_ARCHITECTURE.md` §3.5; iOS / Android out of scope
+(xcframework / UniFFI native packaging, not PyPI).
+
+### CI changes
+
+- **`pyo3-wheel`** — matrix expansion to four entries. Each runs
+  on a *native* runner for its target so we avoid cross-compile
+  drama (sysroot, linkers, vendored openssl quirks). GitHub
+  Actions Linux ARM64 runners (`ubuntu-24.04-arm`) have been
+  GA + free for public repos since 2025-01.
+- **Per-matrix-entry wheel-shape sanity check** — rejects
+  non-`cp311-abi3` builds at build time, not just at publish
+  time. Catches v0.1.10-class regressions before they propagate.
+- **`build-manifest`** — POSTs all four target hashes in one
+  binary-manifest with `binaries: { target: sha256, ... }`.
+  Round-trip verify confirms every target's hash matches the
+  GET response; any single-target mismatch fails the build.
+- **`publish-pypi`** — downloads all four wheel artifacts via
+  glob pattern, sanity-checks the count + tag shape, uploads
+  all in one `pypa/gh-action-pypi-publish` action call. Single
+  PEP 740 sigstore attestation covers the full upload set.
+
+### Lens cold-build win extends to ARM64
+
+Pre-v0.1.13: lens's multi-arch Docker build (`linux/amd64` +
+`linux/arm64`) had no PyPI option for arm64 — would either
+fall back to compiling persist from source on arm64 (~75min,
+defeating the v0.1.12 win) or fail outright if no sdist.
+
+v0.1.13: both arches `pip install ciris-persist==0.1.13` in
+~10s. Lens cold-build matrix collapses uniformly across the
+two production architectures.
+
+### Provenance
+
+The BuildManifest signing path stays single-target (linux x86_64
+canonical reference; per-target signing is a v0.1.14+ deliverable
+once a concrete consumer asks). The registry's binary-manifest
+covers all four targets via the multi-target `binaries` map;
+each target's hash is registry-signed server-side with the
+hybrid Ed25519 + ML-DSA-65 steward key. PEP 740 sigstore
+attestation on the PyPI upload covers all four wheels in one
+attestation bundle.
+
+### Tests
+
+131 tests green (no Rust code changes); clippy clean across
+all feature combos.
+
 ## [0.1.12] — 2026-05-01
 
 PyPI publication via OIDC trusted publishing. Closes the lens
