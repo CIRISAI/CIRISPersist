@@ -5,6 +5,96 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.1.7] — 2026-05-01
+
+Three landings: bench harness + perf trend infrastructure, keyring
+warn-on-ephemeral (production hot-fix), `Engine.keyring_path()`
+observability surface.
+
+### Added — bench harness + gh-pages perf trend
+
+- **`benches/{ingest_pipeline,canonicalize,sign,dedup_key,queue}.rs`**.
+  Five criterion-based benchmarks covering the hot paths:
+  full pipeline against `MemoryBackend` (1 / 6 / 16 / 64 components),
+  Python-compat canonicalization across payload sizes, Ed25519
+  software-sign latency, decompose + dedup-key throughput, and
+  bounded mpsc submit + drain. Local baseline:
+  - sign 256/1024/16384 bytes: 13 / 15 / 56 µs
+  - ingest_pipeline 1 / 6 / 16 / 64 components: 65 µs / 158 µs / 332 µs / 1.2 ms
+- **`.github/workflows/bench.yml`**. Mirrors CIRISAgent's
+  memory-benchmark trigger shape — Monday 7am UTC cron + manual
+  dispatch + push-to-main + path-touched PR runs. Plus
+  `benchmark-action/github-action-benchmark` publishing to
+  `gh-pages` so the trend chart at
+  `https://cirisai.github.io/CIRISPersist/` captures every release
+  point. PR runs comment regression analysis at >10% threshold;
+  no fail-on-alert until the runner's noise floor is established.
+  90-day artifact retention on raw criterion JSON.
+
+### Added — keyring warn-on-ephemeral (THREAT_MODEL.md AV-27)
+
+The lens production cutover hit this:
+[`get_platform_signer`](https://github.com/CIRISAI/CIRISVerify/) on a
+container without TPM access falls back to `Ed25519SoftwareSigner`,
+which writes the seed to a default path inside the container's
+writable layer. Every `docker rm` + `docker run` bootstraps a fresh
+keypair; the one-key-three-roles invariant (PoB §3.2) breaks
+silently. Registry pubkey, scrub-envelope signer, and Phase 2.3
+Reticulum address all churn together.
+
+v0.1.7 catches it at boot:
+
+- **At Engine construction**, when `is_hardware_available() == false`,
+  predict the SoftwareSigner seed-storage path (replicating
+  ciris-keyring v1.6.4's `default_key_dir()` logic) and check it
+  against an ephemeral-path heuristic (`/home/`, `/root/`, `/tmp/`,
+  `/var/cache/`, `/var/tmp/`). If matched, emit a loud
+  `tracing::warn!` with the predicted path, the breakage mode, and
+  the fix (`CIRIS_DATA_DIR=<persistent-volume>`).
+- **Suppression**: `CIRIS_PERSIST_KEYRING_PATH_OK=1` after operators
+  have audited that the path is on persistent storage (e.g. they
+  mounted a volume at one of the heuristic-flagged prefixes).
+- **`Engine.keyring_path() -> Optional[str]`** PyO3 method exposes
+  the predicted path for `/health` surfacing — operators can
+  confirm "this points at the persistent volume" without grepping
+  logs. Returns `None` for hardware-backed deployments.
+
+3 new unit tests cover the ephemeral / persistent / env-override
+classification.
+
+**Caveat — predicted vs. authoritative**: the path is predicted by
+replicating ciris-keyring v1.6.4 private logic. A future
+ciris-keyring tag bump may drift. We're tracking the upstream
+`HardwareSigner::storage_descriptor()` trait method that would
+make the path authoritative; v0.1.8+ swaps to that and the
+prediction layer is removed. Suppression env var stays correct
+either way.
+
+### Documentation
+
+- `docs/INTEGRATION_LENS.md` §11.5 — new "Keyring storage" section.
+  docker-compose snippet for the fix (env + volume), how the warn
+  reads in production logs, the suppression env var, the predicted-
+  vs-authoritative caveat. **Required reading for any non-TPM
+  deployment.**
+
+### Tests
+
+- 95 lib + 3 new pyo3 unit + 8 QA + 9 fixture = **115 tests**, all
+  green.
+- Bench harness compiles + smoke-runs cleanly across all five
+  benches.
+
+### Notes
+
+- v0.1.7 ships the bench infrastructure first so the gh-pages
+  baseline lands at a known-good commit before subsequent perf
+  changes write to the trend chart.
+- Two CIRISVerify issues queued (per design discussion):
+  `HardwareSigner::storage_descriptor()` trait method (closes the
+  prediction-drift caveat above) and generic `PoBManifest` +
+  `verify_pob_manifest` (unblocks CIRISRegistry persist support).
+
 ## [0.1.6] — 2026-05-01
 
 Hygiene batch from `docs/SECURITY_AUDIT_v0.1.4.md` §5. No

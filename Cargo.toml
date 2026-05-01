@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS Trinity — signed events, time-series, runtime state."
@@ -50,6 +50,12 @@ tls = ["dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-native-certs"]
 # DPAPI); SoftwareSigner fallback for dev / sovereign deployments.
 ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v1.6.4", version = "1.6" }
 async-trait   = "0.1"
+# v0.1.7 — needed by predicted_software_seed_path() in ffi/pyo3.rs
+# to mirror ciris-keyring v1.6.4's default_key_dir() resolution.
+# Pinned to the same major as ciris-keyring to avoid duplicate
+# versions in the dep graph. When CIRISVerify ships
+# `HardwareSigner::storage_descriptor()` we drop this dep.
+dirs          = "5"
 serde         = { version = "1", features = ["derive"] }
 serde_json    = "1"
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
@@ -111,10 +117,43 @@ tempfile = "3"
 # postgres-tagged tests to run one at a time without slowing the
 # rest of the suite.
 serial_test = "3"
+# v0.1.7 — bench harness. criterion writes JSON to target/criterion/
+# which github-action-benchmark consumes for the gh-pages trend
+# chart. Pinning to 0.5.x; 0.6 changes the JSON shape and would
+# break the action.
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [lib]
 name = "ciris_persist"
 path = "src/lib.rs"
+
+# v0.1.7 — bench declarations. Each `[[bench]]` entry runs as a
+# separate harness binary so failures in one don't mask the rest.
+# `harness = false` opts out of the default test harness in favor of
+# criterion's. SECURITY_AUDIT_v0.1.4.md §5 cited "p99 ingest latency"
+# as a v0.2.x track item; these benches are the regression baseline
+# for that work.
+[[bench]]
+name = "ingest_pipeline"
+harness = false
+required-features = ["postgres"]
+
+[[bench]]
+name = "canonicalize"
+harness = false
+
+[[bench]]
+name = "sign"
+harness = false
+
+[[bench]]
+name = "dedup_key"
+harness = false
+
+[[bench]]
+name = "queue"
+harness = false
+required-features = ["postgres"]
 
 [profile.release]
 lto = "thin"

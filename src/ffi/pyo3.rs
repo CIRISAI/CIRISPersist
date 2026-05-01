@@ -123,6 +123,43 @@ impl PyEngine {
             },
             "ciris-persist: signer initialised"
         );
+
+        // v0.1.7 — warn-on-ephemeral. Production lens cutover hit
+        // this exact failure: a container without TPM access falls
+        // back to SoftwareSigner, which writes the seed to
+        // `~/.local/share/ciris-verify/{alias}.key` by default. If
+        // that path is inside the container's writable layer, every
+        // restart bootstraps a fresh keypair and the
+        // one-key-three-roles invariant (PoB §3.2) breaks silently.
+        //
+        // Without a trait method on `HardwareSigner` to expose the
+        // resolved storage location, we replicate ciris-keyring's
+        // path-resolution logic here. THIS IS BRITTLE — see the
+        // CIRISVerify issue tracking the trait-method ask. When
+        // that ships, the `predicted_software_seed_path` helper
+        // below collapses to a single trait-method call.
+        if !hardware_available && std::env::var("CIRIS_PERSIST_KEYRING_PATH_OK").is_err() {
+            let predicted = predicted_software_seed_path(&signer_key_id_owned);
+            if path_looks_ephemeral(&predicted) {
+                tracing::warn!(
+                    predicted_path = %predicted.display(),
+                    signing_key_id = signer_key_id_owned.as_str(),
+                    "ciris-persist: SoftwareSigner seed path looks ephemeral. \
+                     Container writable layers / /tmp / /home are wiped on \
+                     restart, which churns the deployment identity (breaks \
+                     one-key-three-roles per PoB §3.2). Mount a persistent \
+                     volume and set CIRIS_DATA_DIR=<volume-mount-point>. \
+                     Suppress this warning with CIRIS_PERSIST_KEYRING_PATH_OK=1 \
+                     once you've verified the path is on persistent storage."
+                );
+            } else {
+                tracing::info!(
+                    predicted_path = %predicted.display(),
+                    "ciris-persist: SoftwareSigner seed path looks persistent (no warn fired)"
+                );
+            }
+        }
+
         let signer: Arc<dyn HardwareSigner> = Arc::from(signer);
 
         // Wrap the scrubber. None → NullScrubber (mission constraint:
@@ -141,6 +178,37 @@ impl PyEngine {
             signer,
             signer_key_id: signing_key_id.to_owned(),
         })
+    }
+
+    /// v0.1.7 — return the predicted SoftwareSigner seed-storage
+    /// path for observability surfaces (lens `/health`).
+    ///
+    /// Returns `None` when the deployment is hardware-backed (the
+    /// seed lives in TPM / Secure Enclave / StrongBox / DPAPI, not
+    /// on the filesystem). Returns `Some(path)` when on the
+    /// software fallback path; the path is what
+    /// [`predicted_software_seed_path`] computes.
+    ///
+    /// Operators can call this after `Engine(...)` construction to
+    /// confirm "yes, this is `/var/lib/cirislens/keyring/lens-scrub-v1.key`
+    /// which I know is mounted persistent" without grepping logs.
+    /// Wired into the lens's existing `/health` handler.
+    ///
+    /// **Caveat**: this is a *prediction* based on a vendored copy
+    /// of ciris-keyring's path-resolution logic. When CIRISVerify
+    /// ships `HardwareSigner::storage_descriptor()`, this method
+    /// will return the authoritative path and the prediction
+    /// fallback will be removed.
+    fn keyring_path(&self) -> Option<String> {
+        if is_hardware_available() {
+            None
+        } else {
+            Some(
+                predicted_software_seed_path(&self.signer_key_id)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        }
     }
 
     /// Return the deployment's Ed25519 public key (base64) — for
@@ -380,6 +448,128 @@ impl Scrubber for PyCallableScrubber {
             *env = new_env;
             Ok(tuple.1)
         })
+    }
+}
+
+/// Replicate ciris-keyring v1.6.4's `default_key_dir()` private
+/// helper to predict where the SoftwareSigner will land its seed.
+///
+/// **THIS IS LOAD-BEARING DRIFT.** ciris-keyring may change its
+/// resolution priority in a future tag bump; if persist still calls
+/// this function, the warn-on-ephemeral check is computing against
+/// a stale path while the actual seed lands somewhere else.
+/// Tracking the trait-method swap as the v0.1.8+ deliverable
+/// (`HardwareSigner::storage_descriptor()`).
+///
+/// Resolution priority (must match
+/// `ciris-keyring::platform::factory::default_key_dir`):
+/// 1. `$CIRIS_DATA_DIR`
+/// 2. Platform default — Linux/Windows: `data_local_dir/ciris-verify/`;
+///    macOS: `data_local_dir/ai.ciris.verify/`
+/// 3. Current directory (`.`) as a last-resort fallback
+///
+/// Returns the predicted seed file path: `<dir>/<alias>.key`.
+fn predicted_software_seed_path(alias: &str) -> std::path::PathBuf {
+    let dir: std::path::PathBuf = if let Ok(d) = std::env::var("CIRIS_DATA_DIR") {
+        std::path::PathBuf::from(d)
+    } else if let Some(local) = dirs::data_local_dir() {
+        // ciris-keyring uses different subdir names per OS; mirror
+        // what factory.rs does verbatim. Linux + Windows share
+        // "ciris-verify"; macOS uses "ai.ciris.verify".
+        #[cfg(target_os = "macos")]
+        {
+            local.join("ai.ciris.verify")
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            local.join("ciris-verify")
+        }
+    } else {
+        std::path::PathBuf::from(".")
+    };
+    dir.join(format!("{alias}.key"))
+}
+
+/// Heuristic: does this path look like it's on ephemeral storage?
+///
+/// Conservative: if the path is rooted at any of these
+/// container-writable-layer prefixes, we assume the operator
+/// hasn't mounted a persistent volume there. Operators who *have*
+/// mounted persistent storage at one of these locations can
+/// suppress with `CIRIS_PERSIST_KEYRING_PATH_OK=1`.
+///
+/// False-positive cases (warning fires but path is fine):
+/// - host running outside Docker with `/home/user/...`
+/// - bind-mount at `/tmp/keyring`
+///
+/// False-negative cases (warning doesn't fire but path is bad):
+/// - container with writable layer mounted at a path not in this
+///   list (e.g. `/data/keyring` if `/data` is the container's
+///   writable root and not a mounted volume — this is unusual but
+///   possible)
+///
+/// On the trade: false positives are an extra log line; false
+/// negatives are silent identity churn. Prefer false positives.
+fn path_looks_ephemeral(path: &std::path::Path) -> bool {
+    const EPHEMERAL_PREFIXES: &[&str] = &["/home/", "/root/", "/tmp/", "/var/cache/", "/var/tmp/"];
+    let s = path.to_string_lossy();
+    EPHEMERAL_PREFIXES.iter().any(|p| s.starts_with(p))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ephemeral_paths_flagged() {
+        for ephemeral in [
+            "/home/cirislens/.local/share/ciris-verify/lens-scrub-v1.key",
+            "/root/.local/share/ciris-verify/lens-scrub-v1.key",
+            "/tmp/ciris/lens-scrub-v1.key",
+            "/var/cache/ciris/lens-scrub-v1.key",
+            "/var/tmp/ciris/lens-scrub-v1.key",
+        ] {
+            assert!(
+                path_looks_ephemeral(std::path::Path::new(ephemeral)),
+                "expected ephemeral: {ephemeral}"
+            );
+        }
+    }
+
+    #[test]
+    fn persistent_paths_not_flagged() {
+        for persistent in [
+            "/var/lib/cirislens/keyring/lens-scrub-v1.key",
+            "/data/ciris/lens-scrub-v1.key",
+            "/srv/ciris/keyring/lens-scrub-v1.key",
+            "/mnt/persistent/lens-scrub-v1.key",
+            "/opt/ciris/lens-scrub-v1.key",
+        ] {
+            assert!(
+                !path_looks_ephemeral(std::path::Path::new(persistent)),
+                "expected persistent: {persistent}"
+            );
+        }
+    }
+
+    #[test]
+    fn predicted_path_respects_ciris_data_dir() {
+        let prev = std::env::var("CIRIS_DATA_DIR").ok();
+        // SAFETY for std::env::set_var: tests in this module run
+        // serial via the lib-test harness's default behaviour for
+        // env-mutating tests; no #[serial_test::serial] needed
+        // because we restore on exit and the test is the only env
+        // reader.
+        std::env::set_var("CIRIS_DATA_DIR", "/var/lib/cirislens/keyring");
+        let p = predicted_software_seed_path("lens-scrub-v1");
+        assert_eq!(
+            p,
+            std::path::PathBuf::from("/var/lib/cirislens/keyring/lens-scrub-v1.key")
+        );
+        match prev {
+            Some(v) => std::env::set_var("CIRIS_DATA_DIR", v),
+            None => std::env::remove_var("CIRIS_DATA_DIR"),
+        }
     }
 }
 

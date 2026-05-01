@@ -1,0 +1,164 @@
+name: Bench
+
+# v0.1.7 — performance trend tracking. Mirrors CIRISAgent's
+# memory-benchmark.yml trigger shape (weekly cron + manual + path-
+# touched PR runs) plus push-to-main so the gh-pages trend chart
+# captures every release point.
+#
+# The five bench harnesses (`benches/{ingest_pipeline,canonicalize,
+# sign,dedup_key,queue}.rs`) are criterion-based; criterion writes
+# JSON to `target/criterion/` which `benchmark-action/github-action-
+# benchmark` consumes for the gh-pages publish.
+#
+# SECURITY_AUDIT_v0.1.4.md §3.4 cited per-batch latency as a
+# v0.2.x track item; this workflow is the regression baseline for
+# that work.
+
+on:
+  schedule:
+    # Monday 7am UTC — one hour after CIRISAgent's memory benchmark
+    # so a single coffee surveys both PoB primitives' health.
+    - cron: '0 7 * * 1'
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'src/ingest.rs'
+      - 'src/queue.rs'
+      - 'src/store/**'
+      - 'src/verify/**'
+      - 'src/scrub/**'
+      - 'benches/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+
+permissions:
+  # benchmark-action needs `contents: write` to push to the
+  # gh-pages branch. PR runs use the default ephemeral token which
+  # cannot push; the action handles that gracefully (saves results
+  # locally, comments PR with regression analysis, no gh-pages
+  # publish).
+  contents: write
+  # PR comment for regression alerts.
+  pull-requests: write
+
+jobs:
+  bench:
+    name: Criterion bench suite
+    runs-on: ubuntu-latest
+    # Five benches × ~60s each + warmup + setup. Observed ~5 min
+    # locally; double that for the runner. Bump if we add more
+    # benches.
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          # Match clippy.toml's MSRV pin (`msrv = "1.75"`) so the
+          # bench artifacts come from the same toolchain we ship
+          # against, not whatever stable happens to be on the runner.
+          toolchain: stable
+
+      - name: Cache cargo + criterion baseline
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Cargo.lock is gitignored (library convention), so the
+          # cache key hashes Cargo.toml — version bumps + new deps
+          # invalidate cleanly. The criterion target dir is
+          # included so subsequent runs see the previous baseline
+          # (criterion writes a per-bench `base` snapshot; the
+          # action's regression analysis works without it but is
+          # nicer with it).
+          key: bench-${{ runner.os }}-${{ hashFiles('Cargo.toml') }}
+          restore-keys: |
+            bench-${{ runner.os }}-
+
+      - name: Install TPM2 TSS runtime libs (ciris-keyring transitive dep)
+        # Same fallback chain CIRISAgent uses — Debian / newer
+        # Debian / Ubuntu 24.04 t64 package renames.
+        run: |
+          if ! sudo apt-get install -y libtss2-esys0 libtss2-tctildr0 libtss2-mu0; then
+            if ! sudo apt-get install -y libtss2-esys-3.0.2-0 libtss2-tctildr0 libtss2-mu-4.0.1-0; then
+              sudo apt-get install -y libtss2-esys-3.0.2-0t64 libtss2-tctildr0t64 libtss2-mu-4.0.1-0t64
+            fi
+          fi
+
+      - name: System info
+        run: |
+          {
+            echo "## System info"
+            echo '```'
+            echo "Rust:  $(rustc --version)"
+            echo "OS:    $(uname -a)"
+            echo "RAM:   $(free -h | grep Mem | awk '{print $2}')"
+            echo "CPU:   $(nproc) cores ($(lscpu | grep 'Model name' | head -1 | sed 's/Model name:\s*//'))"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run criterion benches
+        run: |
+          cargo bench --features postgres --bench ingest_pipeline -- --output-format bencher | tee bench-output.txt
+          cargo bench --bench canonicalize -- --output-format bencher | tee -a bench-output.txt
+          cargo bench --bench sign -- --output-format bencher | tee -a bench-output.txt
+          cargo bench --bench dedup_key -- --output-format bencher | tee -a bench-output.txt
+          cargo bench --features postgres --bench queue -- --output-format bencher | tee -a bench-output.txt
+
+      - name: Top-line summary to GH step summary
+        run: |
+          {
+            echo "## Bench top-line"
+            echo '```'
+            grep -E '^test ' bench-output.txt || cat bench-output.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish to gh-pages trend chart
+        # Only on push to main (no PR pushes — the action's perm
+        # check handles this but skipping early avoids noise).
+        # benchmark-action writes per-bench history to gh-pages
+        # branch; the resulting site at
+        # https://cirisai.github.io/CIRISPersist/ shows trend
+        # charts per bench function.
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: ciris-persist criterion benchmarks
+          tool: 'cargo'
+          output-file-path: bench-output.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          # Threshold for "this commit regressed". 110% means a
+          # bench got 10% slower than its previous-best on this
+          # branch. Below 110% is the noise floor on a shared
+          # runner; above is real and worth investigating.
+          alert-threshold: '110%'
+          # Don't fail the build on regression — comment-only.
+          # We can flip to fail-on-alert: true once the trend
+          # chart shows the runner's day-to-day noise floor.
+          fail-on-alert: false
+          comment-on-alert: true
+          # Mention me + repo owners on regression so the comment
+          # actually pages someone.
+          alert-comment-cc-users: '@CIRISAI/cirispersist-maintainers'
+
+      - name: Save raw criterion JSON as artifact
+        # 90-day retention matches CIRISAgent's memory-benchmark
+        # workflow. The raw target/criterion/ tree is the
+        # ground-truth for any post-hoc analysis past what
+        # gh-pages exposes.
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: criterion-${{ github.run_id }}
+          path: |
+            target/criterion/**
+            bench-output.txt
+          retention-days: 90

@@ -576,6 +576,113 @@ double-handler-rewrite that would otherwise happen.
 
 ---
 
+## 11.5. v0.1.7 — Keyring storage (READ THIS if no TPM)
+
+**Production lens cutover hit this exact failure**, so it gets a
+loud section here. tl;dr: if your deployment doesn't have hardware
+key-attestation (TPM / Secure Enclave / StrongBox / DPAPI), the
+SoftwareSigner falls back to a filesystem path. If that path is
+inside the container's writable layer, *every restart bootstraps
+a new keypair* and the one-key-three-roles invariant (PoB §3.2)
+breaks silently. Your registry pubkey, your scrub envelope signer,
+and your future Reticulum address all churn together.
+
+### The problem
+
+`ciris-keyring`'s `Ed25519SoftwareSigner` resolves its seed-storage
+path in this order:
+
+1. `$CIRIS_DATA_DIR/{alias}.key` — explicit env var
+2. Platform default — Linux: `~/.local/share/ciris-verify/{alias}.key`,
+   macOS: `~/Library/Application Support/ai.ciris.verify/{alias}.key`,
+   Windows: `%LOCALAPPDATA%\ciris-verify\{alias}.key`
+3. `./<alias>.key` (current directory) — last-resort fallback
+
+Default Docker container layouts put `~/.local/share/...` inside
+the writable image layer. `docker rm` + `docker run` wipes it.
+Result: silent identity churn.
+
+### The fix (one env + one mount)
+
+```yaml
+# docker-compose.yml (or k8s manifest equivalent)
+services:
+  api:
+    image: ghcr.io/cirisai/cirislens-api:latest
+    environment:
+      - CIRIS_DATA_DIR=/var/lib/cirislens/keyring
+    volumes:
+      - cirislens-keyring:/var/lib/cirislens/keyring
+
+volumes:
+  cirislens-keyring:
+    driver: local
+```
+
+After `docker compose up -d --force-recreate`, the next deploy:
+
+1. Generates a fresh seed once (or reads any existing seed) into
+   the persistent volume
+2. Every subsequent restart reads the same seed → same pubkey →
+   stable lens identity
+
+Permission: container user `cirislens` (uid 1000). `local`
+driver volumes inherit container user perms by default; should
+just work.
+
+### How v0.1.7 catches this for you
+
+At Engine construction, persist now:
+
+1. Logs the signer variant (`hardware_backed=true|false`,
+   `variant=hardware|software`).
+2. **If software**: predicts the seed path and checks against an
+   ephemeral-path heuristic (`/home/`, `/root/`, `/tmp/`,
+   `/var/cache/`, `/var/tmp/`). If the path matches, emits a loud
+   `tracing::warn!`:
+
+   ```
+   WARN ciris-persist: SoftwareSigner seed path looks ephemeral.
+        predicted_path=/home/cirislens/.local/share/ciris-verify/lens-scrub-v1.key
+        Container writable layers / /tmp / /home are wiped on
+        restart, which churns the deployment identity (breaks
+        one-key-three-roles per PoB §3.2). Mount a persistent
+        volume and set CIRIS_DATA_DIR=<volume-mount-point>.
+   ```
+
+3. Exposes `Engine.keyring_path() -> Optional[str]` for `/health`
+   surfacing. `None` for hardware-backed; the predicted path for
+   software-backed. Wire it through your existing `/health` so
+   probes can verify "yes, this points at the persistent volume."
+
+### Suppressing the warn
+
+Once you've audited that the predicted path is on persistent
+storage (or you're using a non-default mount point that the
+heuristic flags as a false positive), set:
+
+```
+CIRIS_PERSIST_KEYRING_PATH_OK=1
+```
+
+The warn line drops; the info-level path log stays so ops still
+have visibility.
+
+### Caveat — predicted vs. authoritative
+
+The predicted path is computed by replicating ciris-keyring v1.6.4's
+`default_key_dir()` private logic. If a future ciris-keyring tag
+changes resolution priority, the prediction may drift from reality.
+We're tracking the upstream `HardwareSigner::storage_descriptor()`
+trait method that would make the path authoritative; v0.1.8+ will
+swap to that and the prediction layer will be deleted.
+
+If you've audited your container template and are confident the
+key lands on a mounted volume, the suppression env var stays
+correct regardless of any future ciris-keyring drift.
+
+---
+
 ## 12. What's NOT in v0.1.x
 
 - **Phase 2** (agent's `audit_log` + `service_correlations`): the
