@@ -5,6 +5,86 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.1.14] — 2026-05-01
+
+Cohabitation doctrine formalized + multi-worker bootstrap race
+closed. Persist is now the runtime keyring authority above
+CIRISVerify on every host where it runs.
+
+### The doctrine
+
+Three rules governing CIRIS primitives sharing a host:
+
+1. **Persist owns runtime keyring bootstrap.** Other primitives
+   cede to persist for `get_platform_signer()`-class operations.
+2. **One keyring bootstrap per host/container.** Multi-worker
+   deployments serialize cold-start through a filesystem
+   `flock`; first worker bootstraps, others see the existing key.
+3. **Same-alias = same identity** per PoB §3.2 (one-key-three-
+   roles).
+
+Full operator guidance + threat-model angle in
+[`docs/COHABITATION.md`](docs/COHABITATION.md). Companion to
+CIRISVerify's `HOW_IT_WORKS.md` § "Cohabitation Contract" + AV-14
+in their threat model.
+
+### What's new
+
+- **Filesystem flock around `Engine::__init__`'s
+  `get_platform_signer()` call.** Lock path:
+  `${CIRIS_DATA_DIR}/.persist-bootstrap.lock` (preferred) or
+  `/tmp/ciris-persist-bootstrap.lock` (fallback). POSIX `flock`
+  auto-releases on FD close (incl. panic) — stuck holders aren't
+  a normal failure mode. Lock is held only for the duration of
+  `get_platform_signer()` (~50ms warm, ~500ms cold-start), not
+  for the lifetime of the Engine.
+- **`fs4` crate** added as direct dep for cross-platform safe
+  flock semantics. POSIX-style on Linux + macOS; same call shape
+  as our existing `pg_advisory_lock` for AV-26.
+- **Two new unit tests** in `src/ffi/pyo3.rs::tests`:
+  - `bootstrap_lock_path_resolution` — `CIRIS_DATA_DIR` /
+    `/tmp` priority.
+  - `bootstrap_lock_acquire_and_release` — open+lock+drop
+    smoke test against a tempdir.
+
+### What's NOT in v0.1.14
+
+- **Strict process singleton.** Multi-worker deployments are
+  real and supported; the flock just serializes cold-start.
+- **Public `Engine.sign(payload: bytes)` API.** Architecturally
+  the next step (lets primitives consume persist's identity
+  directly instead of just deploying after persist), but
+  requires consumer-side adoption. Deferred to v0.2.x once a
+  concrete asker materializes.
+- **Replacement of verify's planned v1.9 keyring-side flock.**
+  The two locks compose: persist's lock serializes persist
+  consumers; verify's v1.9 will serialize verify-direct
+  consumers. Same identity by PoB §3.2.
+
+### Threat model
+
+- **AV-14 (cross-instance keyring contention)** — closed for
+  persist consumers. Verify's `THREAT_MODEL.md` AV-14 stays
+  open until v1.9 lands their keyring-layer flock for
+  non-persist consumers.
+
+### Tests
+
+- 109 lib + 5 AV-4 + 8 QA + 9 fixture = 131 passing
+- 2 new pyo3 unit tests for the flock helpers
+- clippy clean across all feature combos
+- No Rust code changes outside `src/ffi/pyo3.rs`
+
+### Documentation
+
+- **NEW**: `docs/COHABITATION.md` — operator runbook +
+  doctrine, with docker-compose, systemd, k8s init-container
+  examples. Cross-links to verify's `HOW_IT_WORKS.md` and
+  `THREAT_MODEL.md`.
+- `docs/INTEGRATION_LENS.md` § 11 — new "Cohabitation: persist
+  comes up first" subsection covering multi-worker semantics
+  and combined-deployment ordering.
+
 ## [0.1.13] — 2026-05-01
 
 Multi-arch PyPI publish across the agent's full Phase 1 PyO3

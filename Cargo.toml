@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "0.1.13"
+version = "0.1.14"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS Trinity — signed events, time-series, runtime state."
@@ -51,6 +51,13 @@ tls = ["dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-native-certs"]
 ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v1.8.0", version = "1.8" }
 ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v1.8.0", version = "1.8" }
 async-trait   = "0.1"
+# v0.1.14 — filesystem advisory locks for the cohabitation
+# bootstrap (docs/COHABITATION.md). POSIX flock cross-process,
+# auto-releases on FD close (including panic). Used to serialize
+# `get_platform_signer()` calls when multiple workers/processes
+# coexist on one host. fs4 is the maintained fork of fs2; pinned
+# to 0.x because the API is stable but pre-1.0.
+fs4           = "0.13"
 serde         = { version = "1", features = ["derive"] }
 serde_json    = "1"
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }

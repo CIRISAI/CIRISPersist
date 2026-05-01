@@ -685,6 +685,34 @@ CIRIS_PERSIST_KEYRING_PATH_OK=1
 The warn line drops; the info-level path log stays so ops still
 have visibility.
 
+### Cohabitation: persist comes up first (v0.1.14+)
+
+For combined deployments where multiple CIRIS primitives share a
+host (lens + bridge same container, agent + lens + persist on one
+VM, etc.), v0.1.14 formalizes the cohabitation doctrine:
+
+**Persist owns runtime keyring bootstrap.** Other primitives cede
+to persist via deployment ordering. The full doctrine lives in
+[`docs/COHABITATION.md`](COHABITATION.md); the lens-relevant
+summary:
+
+1. **Multi-worker is safe.** `uvicorn --workers N` workers
+   serialize cold-start through a filesystem `flock` at
+   `${CIRIS_DATA_DIR}/.persist-bootstrap.lock`. First worker
+   bootstraps; others see the existing key and become read-only
+   consumers. POSIX `flock` auto-releases on FD close (incl.
+   panic) so a worker crash doesn't strand the lock.
+2. **Combined deployments use a shared volume + shared alias.**
+   See `docs/COHABITATION.md` for docker-compose / k8s
+   init-container examples.
+3. **Same alias = same identity** per PoB §3.2. If lens and
+   bridge are on one host, both should resolve to the same
+   `signing_key_id` to share one identity.
+
+The lens's existing single-worker / single-replica deployment
+posture is unaffected — the new flock is a no-op when there's no
+contention.
+
 ### Authoritative storage path (v0.1.9+)
 
 The path persist surfaces is **authoritative**, not predicted. It

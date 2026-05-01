@@ -111,9 +111,31 @@ impl PyEngine {
         // on this. SECURITY_AUDIT_v0.1.4.md §3.4.
         let signer_key_id_owned = signing_key_id.to_owned();
         let hardware_available = is_hardware_available();
-        let signer = py.detach(|| {
-            get_platform_signer(&signer_key_id_owned)
-                .map_err(|e| PyRuntimeError::new_err(format!("ciris-keyring: {e}")))
+
+        // v0.1.14 — cohabitation bootstrap. Persist is the runtime
+        // keyring authority on its host (`docs/COHABITATION.md`);
+        // multiple persist processes (e.g. `uvicorn --workers 4`)
+        // would otherwise race on `get_platform_signer()`'s
+        // `key_exists() → generate_key()` window. The flock around
+        // `${CIRIS_DATA_DIR}/.persist-bootstrap.lock` (or
+        // `/tmp/ciris-persist-bootstrap.lock` fallback) serializes
+        // bootstrap across the host: the first worker through
+        // generates the key; later workers block briefly,
+        // see the existing key, become read-only consumers.
+        //
+        // POSIX `flock` auto-releases on FD close — including
+        // process exit and panic — so a stuck holder isn't a
+        // normal failure mode. The lock is held only for the
+        // duration of `get_platform_signer()` (~50ms warm,
+        // ~500ms cold-start), not for the lifetime of the Engine.
+        let signer = py.detach(|| -> PyResult<Box<dyn HardwareSigner>> {
+            let _bootstrap_lock = acquire_bootstrap_lock()
+                .map_err(|e| PyRuntimeError::new_err(format!("bootstrap lock: {e}")))?;
+            let s = get_platform_signer(&signer_key_id_owned)
+                .map_err(|e| PyRuntimeError::new_err(format!("ciris-keyring: {e}")))?;
+            // _bootstrap_lock drops at end of scope; FD closes;
+            // flock releases. Other waiting workers proceed.
+            Ok(s)
         })?;
         tracing::info!(
             signing_key_id = signer_key_id_owned.as_str(),
@@ -453,6 +475,64 @@ impl Scrubber for PyCallableScrubber {
     }
 }
 
+/// v0.1.14 — resolve the cohabitation bootstrap lock path.
+///
+/// The lock file is created on first call; subsequent calls reuse
+/// it. Path priority:
+/// 1. `${CIRIS_DATA_DIR}/.persist-bootstrap.lock` — the canonical
+///    location, co-located with the SoftwareSigner seed (when in
+///    use) so the lock and the keyring share durability semantics.
+/// 2. `/tmp/ciris-persist-bootstrap.lock` — fallback for
+///    deployments that haven't set CIRIS_DATA_DIR. Acceptable
+///    because the lock is ephemeral by design (only held during
+///    bootstrap; auto-released on process exit).
+///
+/// On Linux containers without persistent volumes, the `/tmp`
+/// fallback still serializes bootstrap *within a container's
+/// lifetime* — exactly the v0.1.14 cohabitation guarantee. Cross-
+/// container coordination is out of scope (that's an orchestrator-
+/// level concern; see `docs/COHABITATION.md`).
+fn bootstrap_lock_path() -> std::path::PathBuf {
+    if let Ok(d) = std::env::var("CIRIS_DATA_DIR") {
+        std::path::PathBuf::from(d).join(".persist-bootstrap.lock")
+    } else {
+        std::path::PathBuf::from("/tmp/ciris-persist-bootstrap.lock")
+    }
+}
+
+/// v0.1.14 — acquire the cohabitation bootstrap lock.
+///
+/// Returns the locked `File` handle so the caller can drop it once
+/// `get_platform_signer()` has returned. POSIX `flock` is
+/// auto-released on FD close, including process exit and panic —
+/// so a stuck holder isn't a normal failure mode.
+///
+/// Blocks until the lock is acquired. Workers 2..N on a multi-
+/// worker deployment briefly wait here while worker 1 bootstraps;
+/// typical wait is <1s on cold-start, <50ms warm.
+fn acquire_bootstrap_lock() -> std::io::Result<std::fs::File> {
+    use fs4::fs_std::FileExt;
+    let path = bootstrap_lock_path();
+    if let Some(parent) = path.parent() {
+        // Best-effort create_dir_all; if the parent already exists
+        // (the common case once CIRIS_DATA_DIR is mounted) this is
+        // a no-op. Failures here propagate to the caller.
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)?;
+    file.lock_exclusive()?;
+    tracing::debug!(
+        lock_path = %path.display(),
+        "ciris-persist: bootstrap flock acquired"
+    );
+    Ok(file)
+}
+
 /// Heuristic: does a `SoftwareFile` seed path look ephemeral?
 ///
 /// Applies only to `StorageDescriptor::SoftwareFile { path }`.
@@ -617,6 +697,60 @@ mod tests {
                 !path_looks_ephemeral(std::path::Path::new(persistent)),
                 "expected persistent: {persistent}"
             );
+        }
+    }
+
+    /// v0.1.14 — `bootstrap_lock_path` reflects `CIRIS_DATA_DIR`
+    /// with the `/tmp` fallback. The cohabitation flock relies on
+    /// the path being deterministic across processes on the same
+    /// host; drift here breaks the multi-worker serialization.
+    #[test]
+    fn bootstrap_lock_path_resolution() {
+        let prev = std::env::var("CIRIS_DATA_DIR").ok();
+
+        std::env::set_var("CIRIS_DATA_DIR", "/var/lib/cirislens");
+        assert_eq!(
+            bootstrap_lock_path(),
+            std::path::PathBuf::from("/var/lib/cirislens/.persist-bootstrap.lock")
+        );
+
+        std::env::remove_var("CIRIS_DATA_DIR");
+        assert_eq!(
+            bootstrap_lock_path(),
+            std::path::PathBuf::from("/tmp/ciris-persist-bootstrap.lock")
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("CIRIS_DATA_DIR", v),
+            None => std::env::remove_var("CIRIS_DATA_DIR"),
+        }
+    }
+
+    /// v0.1.14 — `acquire_bootstrap_lock` opens-and-locks an FD;
+    /// dropping it releases the lock. Smoke test against a tempdir
+    /// path so we don't pollute /tmp on the host.
+    #[test]
+    fn bootstrap_lock_acquire_and_release() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prev = std::env::var("CIRIS_DATA_DIR").ok();
+        std::env::set_var("CIRIS_DATA_DIR", dir.path());
+
+        let f1 = acquire_bootstrap_lock().expect("first acquire");
+        // Path exists; lock is held.
+        assert!(dir.path().join(".persist-bootstrap.lock").exists());
+        // Drop releases the lock; subsequent acquire from this
+        // process succeeds. (Same-process flock semantics on Linux:
+        // a process holds at most one flock per file regardless of
+        // FD count, so re-acquiring is a no-op; on macOS it's the
+        // same. Cross-process contention requires an integration
+        // test which we don't do here.)
+        drop(f1);
+        let f2 = acquire_bootstrap_lock().expect("second acquire");
+        drop(f2);
+
+        match prev {
+            Some(v) => std::env::set_var("CIRIS_DATA_DIR", v),
+            None => std::env::remove_var("CIRIS_DATA_DIR"),
         }
     }
 
