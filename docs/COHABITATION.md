@@ -1,45 +1,128 @@
 # Cohabitation Doctrine — persist as the runtime keyring authority
 
-**Status:** authoritative architecture for v0.1.14+. This doc is
-the persist-side complement to CIRISVerify's
+**Status:** authoritative architecture for v0.1.14+. Companion to
+CIRISVerify's
 [`HOW_IT_WORKS.md` § "Cohabitation Contract"](https://github.com/CIRISAI/CIRISVerify/blob/main/docs/HOW_IT_WORKS.md#cohabitation-contract)
-and `THREAT_MODEL.md` § AV-14. Read both.
+and `THREAT_MODEL.md` § AV-14.
 
 ---
 
 ## TL;DR
 
-Three rules:
+**Persist is a Python wheel — not a daemon.** Every consumer
+(lens, agent, bridge, registry-client) imports it as a library
+and constructs `Engine(...)` in their own process. There is no
+`persist.service`. Three rules for hosts where multiple consumers
+import persist:
 
-1. **Persist owns runtime keyring bootstrap.** Other CIRIS primitives on the same host *cede* to persist for `get_platform_signer()`-class operations.
-2. **One keyring bootstrap per host/container.** Multi-worker deployments (e.g. `uvicorn --workers 4`) serialize cold-start through a filesystem `flock`; first worker bootstraps, others see the existing key.
-3. **Same-alias = same identity.** Per Proof-of-Benefit Federation §3.2 (one-key-three-roles), a host with both an agent and a persist daemon should use the same alias to share one identity.
+1. **First `Engine::__init__` on the host bootstraps the keyring.**
+   Subsequent calls (other workers, other consumers) see the existing
+   key. POSIX `flock` serializes cold-start across processes.
+2. **One keyring identity per host/container.** Different consumers
+   on the same host using the same `signing_key_id` resolve to the
+   same identity by construction (PoB §3.2 one-key-three-roles).
+3. **Persist's library code is the canonical bootstrap path on a
+   host.** Other primitives that go through persist (lens, agent's
+   PyO3 path, bridge) inherit the cohabitation guarantee for free.
+   Direct ciris-keyring callers (a hypothetical Rust binary that
+   skips persist) need verify's planned v1.9 keyring-layer flock.
 
 ---
 
-## Why persist is the right runtime authority
+## What "persist as authority" actually means
 
-PoB §3.2 names a single Ed25519 key as identity-and-address-and-signer. That key has to exist on the host before any primitive can use it. Three primitives could be the bootstrap authority:
+Persist isn't a *process* that other primitives wait on. It's a
+*library* whose `Engine` constructor performs the canonical
+keyring bootstrap. The architectural claim is:
 
-- **CIRISVerify** — pure crypto + keyring backend. Library, not a service. Has no process of its own at runtime; it's loaded as a static library by something else. So verify can't *own* the bootstrap; whoever loads verify first does.
-- **CIRISAgent** — has a process, but the agent depends on persistence. If persist isn't up, the agent has nothing to write to. Agent-as-bootstrap means the keyring exists but the substrate doesn't, which is operationally awkward.
-- **CIRISPersist** — has a process, has state, is the lowest CIRIS substrate primitive above verify. Already does Postgres bootstrap (advisory-lock-protected per AV-26), already has a process model with explicit `Engine::__init__`, already lifetime-manages the runtime. Adding "owns keyring bootstrap" is a natural extension of "owns persistence bootstrap."
+> Persist is the lowest stateful CIRIS substrate above verify. Its
+> `Engine::__init__` is the canonical entry point for keyring
+> resolution on a host. Any consumer importing persist gets the
+> serialized-bootstrap guarantee for free; the flock makes
+> cold-start safe regardless of how many consumers race the
+> import.
 
-Persist is the cleanest authority. The three rules above formalize what's structurally true: persist is the first stateful CIRIS primitive to come up on any host, so it owns the runtime keyring bootstrap.
+There's no daemon. There's no `Requires=After=persist.service`.
+There's no init container that runs persist-the-binary before the
+workload. The doctrine is purely about **library code paths**:
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                        Host / Container                    │
+│                                                            │
+│  ┌─────────────────────────┐  ┌──────────────────────────┐ │
+│  │ uvicorn worker 1        │  │ uvicorn worker 2         │ │
+│  │   from ciris_persist    │  │   from ciris_persist     │ │
+│  │       import Engine     │  │       import Engine      │ │
+│  │   Engine(...) ──┐       │  │   Engine(...) ──┐        │ │
+│  │                 │       │  │                 │        │ │
+│  └─────────────────┼───────┘  └─────────────────┼────────┘ │
+│                    ▼                            ▼          │
+│       ┌────────────────────────────────────────────┐       │
+│       │ flock(${CIRIS_DATA_DIR}/.persist-          │       │
+│       │       bootstrap.lock)                      │       │
+│       │   → get_platform_signer(alias) [keyring]   │       │
+│       └────────────────────────────────────────────┘       │
+│                    │                                       │
+│                    ▼                                       │
+│       ┌────────────────────────────────────────────┐       │
+│       │ OS keyring backend (TPM / Secure Enclave / │       │
+│       │   StrongBox / DPAPI / SoftwareSigner file) │       │
+│       └────────────────────────────────────────────┘       │
+└────────────────────────────────────────────────────────────┘
+```
+
+Worker 1 acquires the flock, hits `get_platform_signer(alias)` —
+which generates the key on cold-start or returns the existing one.
+Worker 2 blocks on the flock briefly; by the time it gets through,
+worker 1 has released it and the key already exists in the keyring
+backend. Worker 2's `get_platform_signer` returns the existing key
+without generating.
+
+Both workers proceed to operate as read-only consumers of the same
+identity. There is no separate persist process.
 
 ---
 
-## What this means for deployments
+## Why "lowest stateful library above verify" lands persist as the authority
 
-### Single-process, single-worker
+PoB §3.2 names a single Ed25519 key as identity-and-address-and-
+signer. Some library on each host has to be the canonical entry
+point for resolving that key, because:
 
-The simplest case. Persist's `Engine::__init__` calls `get_platform_signer(alias)` exactly once. No race, no contention. Already worked at v0.1.13 and earlier.
+- **CIRISVerify** is pure crypto + keyring backend. It's a library
+  loaded by something else; it has no inherent "first call" timing
+  on a host. Multiple consumers loading verify directly would each
+  call `get_platform_signer()` independently — exactly the AV-14
+  race verify v1.9's keyring-side flock will close generally.
+- **CIRISAgent / CIRISLens / CIRISBridge** are higher-level
+  primitives that *consume* persistence + crypto. They don't have
+  a natural "owner of the keyring" claim — putting the bootstrap
+  authority in any one of them creates asymmetry across primitives.
+- **CIRISPersist** is the lowest stateful library above verify.
+  Every higher primitive that needs durable state imports persist.
+  Its `Engine::__init__` is naturally the first point on a host
+  where state initialization happens; pinning the keyring
+  bootstrap there means *every consumer that uses persist*
+  inherits the guarantee for free.
 
-### Multi-worker (uvicorn / gunicorn / k8s replicas)
+This is doctrinal, not operational. Persist is the authority
+**because it's the canonical first-stateful-library**, not because
+it runs as a daemon. Future primitives (CIRISReticulum, sovereign-
+mode mesh-relay) that also touch state can either go through
+persist's Engine (and inherit), or implement their own
+flock-on-the-same-path convention until verify v1.9 generalizes.
 
-Each worker spawns a Python process; each imports persist; each calls `Engine::__init__`. Pre-v0.1.14 these would race on `key_exists() → generate_key()` per CIRISVerify's AV-14.
+---
 
-**v0.1.14 fix**: filesystem `flock` around `Engine::__init__`'s `get_platform_signer()` call. Multi-worker semantics:
+## Multi-worker semantics
+
+Each worker spawns a Python process; each imports persist; each
+calls `Engine::__init__`. Pre-v0.1.14 these would race on
+`key_exists() → generate_key()` per CIRISVerify's AV-14.
+
+**v0.1.14 fix**: filesystem `flock` around `Engine::__init__`'s
+`get_platform_signer()` call.
 
 ```
 worker 1:  flock acquired → get_platform_signer (bootstrap if cold) → release
@@ -48,7 +131,9 @@ worker 3:  flock blocks  → ...waits ~50ms... → release seen → get_platform
 worker 4:  flock blocks  → ...waits ~50ms... → release seen → get_platform_signer (sees existing key) → release
 ```
 
-POSIX `flock` auto-releases on FD close (including process panic). A worker crash mid-bootstrap doesn't strand the lock; the next worker acquires immediately.
+POSIX `flock` auto-releases on FD close (including process panic).
+A worker crash mid-bootstrap doesn't strand the lock; the next
+worker acquires immediately.
 
 **Lock path**:
 
@@ -57,87 +142,73 @@ ${CIRIS_DATA_DIR}/.persist-bootstrap.lock     (preferred — co-located with see
 /tmp/ciris-persist-bootstrap.lock              (fallback when CIRIS_DATA_DIR unset)
 ```
 
-The `/tmp` fallback is acceptable because the lock is ephemeral by design. Cross-container coordination is out of scope (use orchestrator-level ordering — see below).
+The `/tmp` fallback is acceptable because the lock is ephemeral
+by design.
 
-### Multi-primitive on one host
+---
 
-Common case: a single container or VM running both an agent and a lens, or a bridge + lens, or any combination. Each primitive is its own daemon. **Deployment ordering rule:**
+## Multi-primitive on one host
 
-```
-persist.service
-agent.service (Requires=persist.service, After=persist.service)
-lens.service (Requires=persist.service, After=persist.service)
-bridge.service (Requires=persist.service, After=persist.service)
-```
+Common case: one container or VM running both an agent and a
+lens, or a bridge + lens, or any combination. **All of them
+import persist** (because all of them need durable state). Each
+constructs `Engine(...)` — same alias, same `CIRIS_DATA_DIR`,
+same flock path → same identity by construction.
 
-By the time the dependent services start, persist has already bootstrapped the keyring. They become read-only consumers (their own ciris-keyring imports find the existing key and don't try to generate one).
-
-**docker-compose equivalent:**
+**docker-compose example** (lens + bridge sharing one identity):
 
 ```yaml
 services:
-  persist:
-    image: ghcr.io/cirisai/cirispersist:0.1.14
+  lens:
+    image: ghcr.io/cirisai/cirislens:latest    # imports ciris-persist
     volumes:
       - ciris-keyring:/var/lib/ciris/keyring
     environment:
       - CIRIS_DATA_DIR=/var/lib/ciris/keyring
+      - CIRIS_PERSIST_SIGNING_KEY_ID=lens-bridge-v1
 
-  lens:
-    image: ghcr.io/cirisai/cirislens:latest
-    depends_on:
-      persist:
-        condition: service_started
+  bridge:
+    image: ghcr.io/cirisai/cirisbridge:latest  # imports ciris-persist
     volumes:
-      - ciris-keyring:/var/lib/ciris/keyring  # SAME volume, same alias
+      - ciris-keyring:/var/lib/ciris/keyring   # SAME volume
     environment:
       - CIRIS_DATA_DIR=/var/lib/ciris/keyring
+      - CIRIS_PERSIST_SIGNING_KEY_ID=lens-bridge-v1   # SAME alias
 
 volumes:
   ciris-keyring:
     driver: local
 ```
 
-The shared volume + shared `CIRIS_DATA_DIR` ensures both primitives see the same keyring; the `depends_on` ordering ensures persist bootstraps first.
+The shared volume + shared alias is the whole story. Whichever
+container's `Engine::__init__` runs first does the bootstrap; the
+other sees the existing key. No `depends_on`, no service ordering,
+no init container — the flock handles ordering implicitly.
 
-**k8s equivalent (init container)**:
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: cirislens
-spec:
-  template:
-    spec:
-      initContainers:
-      - name: persist-bootstrap
-        image: ghcr.io/cirisai/cirispersist:0.1.14
-        command: ["python", "-c", "from ciris_persist import Engine; Engine(dsn='${DSN}', signing_key_id='lens-scrub-v1')"]
-        env:
-        - name: CIRIS_DATA_DIR
-          value: /var/lib/ciris/keyring
-        volumeMounts:
-        - name: keyring
-          mountPath: /var/lib/ciris/keyring
-      containers:
-      - name: lens
-        # ... rest of pod spec, mounting the same volume
-```
-
-The init container runs to completion (bootstraps the keyring + runs Postgres migrations + exits), then the main container starts. Multi-replica deployments share the persistent volume; the init container's lock serializes across replicas at scheduling time.
-
-### Multi-host
-
-Out of scope for the cohabitation contract. Cross-host identity goes through CIRISRegistry — each host has its own keyring identity; the federation tracks them as distinct primitives.
+**Per-replica scaling** (k8s `replicas: N`): each replica is a
+separate pod, each imports persist, each calls `Engine::__init__`.
+The shared persistent volume means all replicas see the same
+keyring backend; the flock serializes any replica that hits the
+cold-start path.
 
 ---
 
 ## What v0.1.14 does NOT do
 
-- **Doesn't enforce a strict process singleton.** Multi-worker deployments are a real and supported pattern; the flock just serializes cold-start, not the lifetime of each process.
-- **Doesn't replace verify's planned v1.9 flock** (in `ciris-keyring`). Verify's flock targets the keyring layer for non-persist consumers (e.g. a Rust binary that uses `ciris-keyring` directly without going through persist). The two locks compose cleanly: persist's lock serializes persist consumers; verify's lock will serialize verify-direct consumers; both target the same identity by PoB §3.2.
-- **Doesn't move to an out-of-process verify daemon.** That's verify's planned v2.0 architecture. When it lands, persist will likely become a thin client of that daemon. Until then, persist holds the runtime authority on each host.
+- **Doesn't add a daemon.** Persist is and remains a Python wheel.
+  Doctrine is about library code paths, not process lifecycle.
+- **Doesn't replace verify's planned v1.9 flock** (in
+  `ciris-keyring`). Verify's flock targets the keyring layer for
+  consumers that don't go through persist (e.g. a hypothetical
+  Rust binary that uses `ciris-keyring` directly). The two locks
+  compose cleanly: persist's lock serializes persist consumers;
+  verify's will serialize verify-direct consumers; both target
+  the same identity by PoB §3.2.
+- **Doesn't move to an out-of-process verify daemon.** That's
+  verify's planned v2.0 architecture. When it lands, persist's
+  library will likely become a thin client of that daemon — the
+  cohabitation guarantee gets stronger (singleton by construction)
+  while persist's API stays the same.
 
 ---
 
@@ -147,9 +218,12 @@ Out of scope for the cohabitation contract. Cross-host identity goes through CIR
 |---|---|---|
 | AV-26 (multi-worker boot race — Postgres migrations) | ✓ Mitigated v0.1.5 (`pg_advisory_lock`) | unchanged |
 | AV-27 (identity churn via ephemeral keyring storage) | ✓ Mitigated v0.1.7 (predicted), v0.1.9 (authoritative `storage_descriptor`) | unchanged |
-| **AV-14** (cross-instance keyring contention) | ⚠ Open — race on cold-start `get_platform_signer` | ✓ **Mitigated v0.1.14** for persist consumers (flock); ⚠ residual for non-persist consumers until verify v1.9 |
+| **AV-14** (cross-instance keyring contention) | ⚠ Open — race on cold-start `get_platform_signer` | ✓ **Mitigated v0.1.14** for persist consumers (library flock); ⚠ residual for direct `ciris-keyring` callers until verify v1.9 |
 
-The v0.1.14 flock closes the AV-14 cold-start window for any host where persist is the keyring authority — which, per the doctrine above, is every host with persist running.
+The v0.1.14 flock closes AV-14 for any host where the consumers
+go through persist's library. The "go through persist" qualifier
+covers everything that imports `ciris-persist` — which, per the
+doctrine, is every higher-level CIRIS primitive that needs state.
 
 ---
 
@@ -159,7 +233,7 @@ The v0.1.14 flock closes the AV-14 cold-start window for any host where persist 
 |---|---|---|
 | Bootstrap-lock helpers | `src/ffi/pyo3.rs::{bootstrap_lock_path, acquire_bootstrap_lock}` | POSIX flock via `fs4` crate; auto-released on FD close |
 | Lock acquisition site | `src/ffi/pyo3.rs::PyEngine::new` | Wraps `get_platform_signer()` only; not held for the lifetime of the Engine |
-| Unit tests | `src/ffi/pyo3.rs::tests::bootstrap_lock_*` | Smoke tests; cross-process contention tested via integration |
+| Unit tests | `src/ffi/pyo3.rs::tests::bootstrap_lock_*` | Smoke tests; cross-process contention tested via integration on real deployments |
 
 ---
 
@@ -168,5 +242,5 @@ The v0.1.14 flock closes the AV-14 cold-start window for any host where persist 
 - **CIRISVerify** [`HOW_IT_WORKS.md` § Cohabitation Contract](https://github.com/CIRISAI/CIRISVerify/blob/main/docs/HOW_IT_WORKS.md#cohabitation-contract) — operator rules + roadmap
 - **CIRISVerify** [`THREAT_MODEL.md` § AV-14](https://github.com/CIRISAI/CIRISVerify/blob/main/docs/THREAT_MODEL.md) — threat-model angle
 - **CIRISPersist** [`docs/THREAT_MODEL.md` § AV-26](THREAT_MODEL.md) — companion advisory-lock pattern (Postgres migrations)
-- **CIRISPersist** [`docs/INTEGRATION_LENS.md` § 11.5](INTEGRATION_LENS.md) — keyring-storage operator guidance
+- **CIRISPersist** [`docs/INTEGRATION_LENS.md` § 11](INTEGRATION_LENS.md) — keyring-storage operator guidance
 - **PoB FSD** § 3.2 — one-key-three-roles single-identity rationale

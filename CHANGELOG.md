@@ -5,6 +5,99 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.1.15] — 2026-05-01
+
+P0 production fix + cohabitation doctrine refinement.
+
+### The P0 fix — base64 alphabet mismatch
+
+Persist's `verify::ed25519::verify_trace` decoded incoming
+signatures with `base64::STANDARD` (`+`, `/`, `=` alphabet). The
+agent emits signatures via Python's `base64.urlsafe_b64encode`
+per `TRACE_WIRE_FORMAT.md` §8 — URL-safe (`-`, `_`, no padding).
+**Every production batch failed `verify_invalid_signature`**
+because the decoder either errored on `_` / `-` chars or
+produced wrong-length bytes that `Signature::from_bytes`
+rejected.
+
+Concretely, all 4 wire fixtures in
+`tests/fixtures/wire/2.7.0/*.json` use URL-safe-no-pad
+signatures (86 chars, contain `-` / `_`, no `=`). Pre-v0.1.15
+these were unverifiable through persist; the fixture tests
+silently passed because they stop at decompose without
+attempting verify.
+
+This is the **universal** verify failure mode — independent of
+canonicalization, payload, trace level, timestamps. AV-4
+timestamp drift (closed v0.1.8) was real but secondary; the
+base64 alphabet was the load-bearing bug.
+
+### The fix
+
+New `decode_signature(s)` helper in `src/verify/ed25519.rs`
+tries `STANDARD` first (cheap; matches admin tooling + tests),
+falls back through `URL_SAFE_NO_PAD` then `URL_SAFE`. Same
+defensive shape `accord_api.py:1903` uses on the legacy Python
+verify path. No agent-side coordination needed; the agent can
+emit either alphabet without persist breaking.
+
+### Regression coverage
+
+Two new unit tests in `src/verify/ed25519.rs::tests`:
+
+- `decode_signature_accepts_all_alphabets` — round-trips a
+  64-byte payload through all four base64 variants (STANDARD
+  with/without padding, URL_SAFE with/without padding); decoder
+  must produce identical bytes for all.
+- `url_safe_signed_trace_verifies` — end-to-end verify against
+  a trace signed with `URL_SAFE_NO_PAD` (the agent's production
+  form). Pre-v0.1.15 this rejected; post-v0.1.15 verifies clean.
+
+### Cohabitation doctrine — daemon framing dropped
+
+`docs/COHABITATION.md` rewritten to reflect what's structurally
+true: **persist is a Python wheel, not a daemon.** The
+"persist owns the keyring because it runs as a process" framing
+was wrong. The actual claim:
+
+> Persist is the lowest stateful CIRIS substrate library above
+> verify. Its `Engine::__init__` is the canonical entry point
+> for keyring resolution on a host. Any consumer importing
+> persist gets the serialized-bootstrap guarantee for free; the
+> flock makes cold-start safe regardless of how many consumers
+> race the import.
+
+Practical changes in the doc:
+
+- Drop `persist.service` / `Requires=After=` systemd examples.
+- Drop the k8s init-container example (it implied persist runs
+  as a separate process that exits before the workload).
+- Replace with multi-worker examples — each worker imports
+  persist, all workers race through the flock, all converge on
+  the same identity by construction.
+- Reframe rule 1 from "persist owns runtime keyring bootstrap"
+  to "first `Engine::__init__` on the host bootstraps the
+  keyring; subsequent calls see existing key."
+- Doctrinal section explains why "lowest stateful library above
+  verify" lands persist as the authority — not the process
+  shape, but the position in the dependency stack.
+
+Implementation (the v0.1.14 flock) is unchanged. Only the
+operator-facing framing.
+
+### Tests
+
+133 lib + 5 AV-4 + 8 QA + 9 fixture = **155 tests** (109 prior
++ 2 new url-safe + 44 verify suite count includes existing).
+
+### Notes
+
+- Lens cutover unblocked. Real production traffic now verifies
+  end-to-end through persist.
+- v0.1.14's PyPI publish is unaffected — wheels for that version
+  carry the bug. Lens should bump persist dep pin to
+  `==0.1.15` immediately.
+
 ## [0.1.14] — 2026-05-01
 
 Cohabitation doctrine formalized + multi-worker bootstrap race

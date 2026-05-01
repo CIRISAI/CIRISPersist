@@ -14,8 +14,36 @@
 //! Source-of-truth: TRACE_WIRE_FORMAT.md §8 (canonical payload
 //! construction); FSD §3.3 step 2 (verify-before-persist contract).
 
-use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
+// BASE64 is the alias used by the *signing* (test-only) path
+// below — emits standard base64. Verify must accept both
+// alphabets; see `decode_signature` for the production decoder.
+#[cfg(test)]
+use base64::engine::general_purpose::STANDARD as BASE64;
+
+/// Decode a base64 signature string accepting both standard
+/// (`+`, `/`, `=`) and URL-safe (`-`, `_`, optional `=`) alphabets.
+///
+/// THREAT_MODEL.md AV-4 (production-bug shape): the agent emits
+/// signatures via Python's `base64.urlsafe_b64encode` (URL-safe
+/// alphabet, no padding) per its wire-format §8 path. Persist's
+/// pre-v0.1.15 decoder used `STANDARD` only, which rejected `-` /
+/// `_` characters and produced wrong-length bytes — every
+/// production batch failed `verify_invalid_signature` regardless
+/// of canonicalization, payload, or trace level.
+///
+/// The fix is alphabet-agnostic decode: try standard first
+/// (cheap, matches lots of code), fall back through URL-safe
+/// variants. Same defensive shape `accord_api.py:1903` uses on
+/// the Python side. No signer-side coordination needed; the agent
+/// can flip alphabets without persist breaking.
+fn decode_signature(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    STANDARD
+        .decode(s)
+        .or_else(|_| URL_SAFE_NO_PAD.decode(s))
+        .or_else(|_| URL_SAFE.decode(s))
+}
 use ed25519_dalek::{Signature, VerifyingKey, SIGNATURE_LENGTH};
 
 use super::canonical::Canonicalizer;
@@ -150,10 +178,11 @@ pub fn verify_trace<C>(
 where
     C: Canonicalizer + ?Sized,
 {
-    // 1. Decode signature bytes from base64.
-    let sig_bytes = BASE64
-        .decode(&trace.signature)
-        .map_err(|e| Error::InvalidSignature(e.to_string()))?;
+    // 1. Decode signature bytes from base64. Agent emits URL-safe
+    // (Python `base64.urlsafe_b64encode`); admin tooling and tests
+    // sometimes emit standard. `decode_signature` tries both.
+    let sig_bytes =
+        decode_signature(&trace.signature).map_err(|e| Error::InvalidSignature(e.to_string()))?;
     if sig_bytes.len() != SIGNATURE_LENGTH {
         return Err(Error::InvalidSignature(format!(
             "expected {SIGNATURE_LENGTH}-byte signature, got {}",
@@ -267,6 +296,79 @@ mod tests {
 
         verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &keys)
             .expect("known-good trace must verify");
+    }
+
+    /// THREAT_MODEL.md AV-4 (production-bug shape, v0.1.15):
+    /// agent's signatures are URL-safe-no-pad base64 per wire-
+    /// format §8 (Python `base64.urlsafe_b64encode`). Persist's
+    /// pre-v0.1.15 STANDARD decoder rejected `-` / `_` chars; every
+    /// production batch failed `verify_invalid_signature`.
+    /// `decode_signature` accepts all four base64 variants.
+    #[test]
+    fn decode_signature_accepts_all_alphabets() {
+        // Same 64-byte payload, encoded four ways:
+        let sig_bytes = vec![0xAB; 64];
+        let std_pad = STANDARD.encode(&sig_bytes);
+        let url_pad = URL_SAFE.encode(&sig_bytes);
+        let url_no_pad = URL_SAFE_NO_PAD.encode(&sig_bytes);
+        // Standard-no-pad: STANDARD without trailing `=`.
+        let std_no_pad = std_pad.trim_end_matches('=').to_owned();
+
+        for (label, encoded) in [
+            ("STANDARD with padding", &std_pad),
+            ("STANDARD no padding", &std_no_pad),
+            ("URL_SAFE with padding", &url_pad),
+            ("URL_SAFE no padding", &url_no_pad),
+        ] {
+            let decoded =
+                decode_signature(encoded).unwrap_or_else(|e| panic!("{label}: decode failed: {e}"));
+            assert_eq!(
+                decoded, sig_bytes,
+                "{label}: decoded bytes must match original"
+            );
+        }
+    }
+
+    /// End-to-end: trace signed with URL-safe-no-pad (the agent's
+    /// production form) verifies cleanly. Pre-v0.1.15 this rejected.
+    #[test]
+    fn url_safe_signed_trace_verifies() {
+        let sk = fixed_signing_key();
+        let key_id = "test-key:42";
+        // Build the trace exactly like make_trace, but encode the
+        // signature with URL_SAFE_NO_PAD instead of STANDARD —
+        // matching what the production agent emits.
+        let trace_unsigned = CompleteTrace {
+            trace_id: "trace-urlsafe-1".into(),
+            thought_id: "th-1".into(),
+            task_id: None,
+            agent_id_hash: "deadbeef".into(),
+            started_at: "2026-04-30T00:15:53.123456+00:00".parse().unwrap(),
+            completed_at: "2026-04-30T00:16:12.789012+00:00".parse().unwrap(),
+            trace_level: crate::schema::TraceLevel::Generic,
+            trace_schema_version: SchemaVersion::parse("2.7.0").unwrap(),
+            components: vec![],
+            signature: String::new(),
+            signature_key_id: key_id.to_owned(),
+        };
+        let payload = canonical_payload_value(&trace_unsigned);
+        let bytes = PythonJsonDumpsCanonicalizer
+            .canonicalize_value(&payload)
+            .unwrap();
+        let sig = sk.sign(&bytes);
+        let trace = CompleteTrace {
+            // The production-bug shape: URL-safe-no-pad, no `=` padding.
+            signature: URL_SAFE_NO_PAD.encode(sig.to_bytes()),
+            ..trace_unsigned
+        };
+
+        let mut keys = MemKeys {
+            keys: HashMap::new(),
+        };
+        keys.keys.insert(key_id.to_owned(), sk.verifying_key());
+
+        verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &keys)
+            .expect("URL-safe-no-pad signature MUST verify post-v0.1.15");
     }
 
     /// Mission category §4 "Verify rejection": tampered bytes →
