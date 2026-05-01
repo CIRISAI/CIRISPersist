@@ -143,7 +143,17 @@ jobs:
           - { os: ubuntu-latest,    label: linux-x86_64,   tag: manylinux_2_34_x86_64 }
           - { os: ubuntu-24.04-arm, label: linux-aarch64,  tag: manylinux_2_34_aarch64 }
           - { os: macos-14,         label: darwin-aarch64, tag: macosx_11_0_arm64 }
-          - { os: macos-13,         label: darwin-x86_64,  tag: macosx_10_12_x86_64 }
+          # darwin-x86_64 (macos-13) intentionally omitted — GitHub
+          # Actions Intel macOS runners have ongoing capacity issues
+          # (jobs queue indefinitely). CIRISAgent's matrix dropped it
+          # for the same reason; their build.yml explicitly notes
+          # "macOS Intel: built and uploaded manually (GitHub runner
+          # capacity issues)". Persist's
+          # FSD/PLATFORM_ARCHITECTURE.md §3.5 already classifies
+          # darwin-x86_64 as "sunset target — keep CI green only";
+          # publishing a wheel for it is nice-to-have, not load-
+          # bearing for the lens cutover. Add back via manual upload
+          # if a real consumer materializes.
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -229,8 +239,8 @@ jobs:
         run: |
           ls -la dist/
           COUNT=$(ls dist/*.whl 2>/dev/null | wc -l)
-          if [ "${COUNT}" -lt 4 ]; then
-            echo "::error::Expected 4 wheels (linux x86_64 + aarch64, darwin arm64 + x86_64); got ${COUNT}"
+          if [ "${COUNT}" -lt 3 ]; then
+            echo "::error::Expected 3 wheels (linux x86_64 + aarch64, darwin arm64); got ${COUNT}"
             ls dist/*.whl 2>/dev/null || echo "  (no .whl files at all)"
             exit 1
           fi
@@ -435,7 +445,6 @@ jobs:
             ["ciris_persist-wheel-linux-x86_64"]="x86_64-unknown-linux-gnu"
             ["ciris_persist-wheel-linux-aarch64"]="aarch64-unknown-linux-gnu"
             ["ciris_persist-wheel-darwin-aarch64"]="aarch64-apple-darwin"
-            ["ciris_persist-wheel-darwin-x86_64"]="x86_64-apple-darwin"
           )
 
           # Build a JSON object {target: "sha256:..."} aggregating
@@ -470,7 +479,7 @@ jobs:
               'version': '${{ steps.version.outputs.version }}',
               'binaries': binaries,
               'generated_at': '${GENERATED_AT}',
-              'notes': 'CIRIS Trinity persist substrate; manifest signed via ciris-build-sign --primitive persist (CIRISVerify v1.8.0). Multi-arch publish: linux x86_64 + aarch64, darwin arm64 + x86_64.',
+              'notes': 'CIRIS Trinity persist substrate; manifest signed via ciris-build-sign --primitive persist (CIRISVerify v1.8.0). Multi-arch publish: linux x86_64 + aarch64, darwin arm64. (darwin x86_64 omitted — GH Actions Intel runner capacity issues; matches CIRISAgent matrix.)',
           }))
           " "${BINARIES_JSON}")
           echo "POST ${REGISTRY_URL}/v1/verify/binary-manifest"

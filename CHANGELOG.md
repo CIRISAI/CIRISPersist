@@ -17,12 +17,21 @@ surface. Closes [`CIRISPersist#3`](https://github.com/CIRISAI/CIRISPersist/issue
 | `x86_64-unknown-linux-gnu` | `manylinux_2_34_x86_64` | `ubuntu-latest` |
 | `aarch64-unknown-linux-gnu` | `manylinux_2_34_aarch64` | `ubuntu-24.04-arm` |
 | `aarch64-apple-darwin` | `macosx_11_0_arm64` | `macos-14` |
-| `x86_64-apple-darwin` | `macosx_10_12_x86_64` | `macos-13` |
 
 Each wheel is `cp311-abi3` so consumer Python ≥ 3.11 picks the
 right `(os, arch)` automatically. The agent's matrix per
 `FSD/PLATFORM_ARCHITECTURE.md` §3.5; iOS / Android out of scope
 (xcframework / UniFFI native packaging, not PyPI).
+
+`darwin-x86_64` intentionally omitted — GitHub Actions Intel
+macOS runners (`macos-13`) have ongoing capacity issues that
+queue jobs indefinitely. CIRISAgent's matrix dropped it for the
+same reason ("macOS Intel: built and uploaded manually (GitHub
+runner capacity issues)" in their `build.yml`).
+`FSD/PLATFORM_ARCHITECTURE.md` §3.5 already classifies it as a
+"sunset target — keep CI green only"; not load-bearing for the
+lens cutover. Add back via manual upload if a concrete consumer
+materializes.
 
 ### CI changes
 

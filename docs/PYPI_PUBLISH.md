@@ -109,7 +109,12 @@ triggers `.github/workflows/ci.yml::publish-pypi`. The job:
 | `x86_64-unknown-linux-gnu` | `manylinux_2_34_x86_64` | `ubuntu-latest` | 1 |
 | `aarch64-unknown-linux-gnu` | `manylinux_2_34_aarch64` | `ubuntu-24.04-arm` | 1 |
 | `aarch64-apple-darwin` | `macosx_11_0_arm64` | `macos-14` | 1 |
-| `x86_64-apple-darwin` | `macosx_10_12_x86_64` | `macos-13` | 1 sunset |
+
+`darwin-x86_64` (macos-13) intentionally omitted: GH Actions
+Intel macOS runners queue indefinitely due to capacity issues.
+CIRISAgent's matrix dropped it for the same reason. Persist's
+PLATFORM_ARCHITECTURE.md §3.5 classifies it as a sunset target;
+add back via manual upload if a real consumer asks.
 
 iOS / Android out of scope here — they ship via xcframework /
 UniFFI native packaging, not PyPI. See
