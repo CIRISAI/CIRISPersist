@@ -182,7 +182,17 @@ impl Backend for PostgresBackend {
             params.push(Box::new(row.task_id.clone()));
             params.push(Box::new(row.step_point.clone()));
             params.push(Box::new(row.event_type.as_str().to_owned()));
-            params.push(Box::new(row.attempt_index as i32));
+            // THREAT_MODEL.md AV-17 (v0.1.3): bounded by
+// schema::MAX_ATTEMPT_INDEX at parse time, so this fits in i32.
+// `try_from` rejects out-of-range explicitly instead of
+// silently wrapping.
+params.push(Box::new(
+    i32::try_from(row.attempt_index)
+        .map_err(|_| Error::Backend(format!(
+            "attempt_index {} exceeds i32::MAX (postgres INT)",
+            row.attempt_index
+        )))?,
+));
             params.push(Box::new(row.ts));
             params.push(Box::new(row.agent_name.clone()));
             params.push(Box::new(row.agent_id_hash.clone()));
@@ -275,7 +285,14 @@ impl Backend for PostgresBackend {
             params.push(Box::new(r.task_id.clone()));
             params.push(Box::new(r.parent_event_id));
             params.push(Box::new(r.parent_event_type.as_str().to_owned()));
-            params.push(Box::new(r.parent_attempt_index as i32));
+            // THREAT_MODEL.md AV-17 (v0.1.3): same bound on parent_attempt_index.
+params.push(Box::new(
+    i32::try_from(r.parent_attempt_index)
+        .map_err(|_| Error::Backend(format!(
+            "parent_attempt_index {} exceeds i32::MAX",
+            r.parent_attempt_index
+        )))?,
+));
             params.push(Box::new(r.attempt_index as i32));
             params.push(Box::new(r.ts));
             params.push(Box::new(r.duration_ms));

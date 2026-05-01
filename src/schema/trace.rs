@@ -57,7 +57,16 @@ impl TraceComponent {
         if n < 0 {
             return Err(Error::NegativeAttemptIndex(n));
         }
-        Ok(n as u32)
+        // THREAT_MODEL.md AV-17 (v0.1.3): bounded conversion, no
+        // silent truncation. MAX_ATTEMPT_INDEX is generous over
+        // the production agent's retry budget (~5); values above
+        // that bound are adversarial.
+        let max = super::MAX_ATTEMPT_INDEX;
+        if n > i64::from(max) {
+            return Err(Error::AttemptIndexOutOfRange { got: n, max });
+        }
+        // Now safe: 0 <= n <= MAX_ATTEMPT_INDEX (= 1024) fits in u32.
+        Ok(u32::try_from(n).expect("range-checked above"))
     }
 
     /// Extract the audit anchor from an `ACTION_RESULT` component
@@ -266,6 +275,53 @@ mod tests {
             matches!(err, Error::NegativeAttemptIndex(-1)),
             "got {err:?}"
         );
+    }
+
+    /// THREAT_MODEL.md AV-17 regression (v0.1.3): values above
+    /// MAX_ATTEMPT_INDEX are rejected with a typed error rather
+    /// than silently truncating via `as u32` to collide with a
+    /// legitimate retry-0 row on the dedup tuple.
+    #[test]
+    fn attempt_index_above_max_rejected() {
+        // 2^32 — would have wrapped to 0 under the pre-fix `as u32`.
+        let c = component(
+            ComponentType::Conscience,
+            ReasoningEventType::ConscienceResult,
+            serde_json::json!({"attempt_index": 4_294_967_296i64}),
+        );
+        let err = c.attempt_index().unwrap_err();
+        match err {
+            Error::AttemptIndexOutOfRange { got, max } => {
+                assert_eq!(got, 4_294_967_296);
+                assert_eq!(max, super::super::MAX_ATTEMPT_INDEX);
+            }
+            other => panic!("expected AttemptIndexOutOfRange, got {other:?}"),
+        }
+    }
+
+    /// THREAT_MODEL.md AV-17: just above the bound also rejects;
+    /// MAX_ATTEMPT_INDEX itself is accepted.
+    #[test]
+    fn attempt_index_max_plus_one_rejected_max_accepted() {
+        let max = super::super::MAX_ATTEMPT_INDEX;
+        // Accepted at the bound:
+        let c_ok = component(
+            ComponentType::Conscience,
+            ReasoningEventType::ConscienceResult,
+            serde_json::json!({"attempt_index": max}),
+        );
+        assert_eq!(c_ok.attempt_index().unwrap(), max);
+
+        // Rejected one above:
+        let c_bad = component(
+            ComponentType::Conscience,
+            ReasoningEventType::ConscienceResult,
+            serde_json::json!({"attempt_index": (max as i64) + 1}),
+        );
+        assert!(matches!(
+            c_bad.attempt_index(),
+            Err(Error::AttemptIndexOutOfRange { .. })
+        ));
     }
 
     #[test]

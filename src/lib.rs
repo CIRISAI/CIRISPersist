@@ -1,3 +1,10 @@
+// THREAT_MODEL.md §6 #6 / SECURITY_AUDIT_v0.1.2.md §4.1 — no
+// `unsafe` blocks in our code, gated at the crate level. PyO3 +
+// redb + tokio-postgres etc. have transitive `unsafe` (which is
+// fine and out of our scope); `forbid` here only applies to this
+// crate.
+#![forbid(unsafe_code)]
+
 //! ciris-persist — unified Rust persistence for the CIRIS Trinity.
 //!
 //! Mission: see [`MISSION.md`](https://github.com/CIRISAI/CIRISPersist/blob/main/MISSION.md).

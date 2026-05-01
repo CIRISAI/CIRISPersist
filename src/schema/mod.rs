@@ -82,7 +82,25 @@ pub enum Error {
     /// otherwise pass through unchecked.
     #[error("component data blob exceeds max depth ({0})")]
     DataTooDeep(usize),
+
+    /// THREAT_MODEL.md AV-17 (v0.1.3): `attempt_index` exceeds
+    /// [`MAX_ATTEMPT_INDEX`]. Pre-fix, `as u32` / `as i32` casts
+    /// silently truncated values above the boundary, allowing an
+    /// adversary to submit `2^32` and have it land at 0,
+    /// colliding with a legitimate retry-0 row on the dedup tuple.
+    #[error("attempt_index out of range: got {got}, max {max}")]
+    AttemptIndexOutOfRange { got: i64, max: u32 },
 }
+
+/// Maximum legitimate `attempt_index` value.
+///
+/// THREAT_MODEL.md AV-17: real retry counts in the production
+/// agent (`recursive_processing.py`) are bounded by 5; 1024 is
+/// generous safety headroom while still catching adversarial
+/// out-of-range submissions before they hit `as u32` truncation.
+/// `overflow-checks = true` on the release profile is the
+/// belt-and-suspenders backstop.
+pub const MAX_ATTEMPT_INDEX: u32 = 1024;
 
 impl Error {
     /// Stable string-token identifying the error variant.
@@ -100,6 +118,7 @@ impl Error {
             Error::FieldTypeMismatch { .. } => "schema_field_type_mismatch",
             Error::NegativeAttemptIndex(_) => "schema_negative_attempt_index",
             Error::DataTooDeep(_) => "schema_data_too_deep",
+            Error::AttemptIndexOutOfRange { .. } => "schema_attempt_index_out_of_range",
         }
     }
 }

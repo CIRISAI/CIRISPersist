@@ -99,3 +99,14 @@ path = "src/lib.rs"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+# SECURITY_AUDIT_v0.1.2.md §4.2 — panic = "abort" so a bug in a
+# transitive dep or a future unwrap() we missed crashes the
+# process fast (supervisor restarts, journal-replay path runs).
+# Unwind into a half-shut state with no restart trigger is the
+# failure mode this prevents.
+panic = "abort"
+# SECURITY_AUDIT_v0.1.2.md §4.3 — overflow-checks=true on release
+# turns AV-17-class integer-truncation bugs into runtime panics
+# instead of silent corruption. Single-digit-percent perf cost;
+# defense-in-depth on top of the typed try_into AV-17 fix.
+overflow-checks = true
