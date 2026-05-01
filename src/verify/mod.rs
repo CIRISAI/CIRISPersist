@@ -6,8 +6,15 @@
 //! provably produced by the claimed agent at the claimed moment, OR
 //! be explicitly marked unverified. There is no third state.
 //!
-//! Status: Phase 1.2 — module skeleton; impl lands next via TDD per
-//! task #10 in the project task list.
+//! Status: Phase 1.2 in flight. `canonical` is implemented and tested;
+//! `ed25519` (signature verify wrapper) and `chain` (audit anchor
+//! Phase 2) are next.
+
+pub mod canonical;
+pub mod ed25519;
+
+pub use canonical::{Canonicalizer, PythonJsonDumpsCanonicalizer};
+pub use ed25519::{canonical_payload_value, verify_trace, PublicKeyDirectory};
 
 /// Verify-layer errors.
 #[derive(Debug, thiserror::Error)]
