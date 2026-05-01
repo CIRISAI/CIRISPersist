@@ -114,7 +114,14 @@ impl ReasoningEventType {
 pub struct AuditAnchor {
     pub audit_sequence_number: i64,
     pub audit_entry_hash: String,
-    pub audit_signature: String,
+    /// Optional in practice — the production agent (release/2.7.8)
+    /// ships `audit_sequence_number` + `audit_entry_hash` on
+    /// ACTION_RESULT but not always `audit_signature` (the chain
+    /// link is recomputable from the agent-side audit_log when
+    /// peer-replicate lands; FSD §4.5). Spec §5.9 lists it as
+    /// present; production fixtures show it omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_signature: Option<String>,
     /// Optional per spec — the agent's `audit_log.entry_id` for
     /// cross-reference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -170,7 +177,12 @@ pub enum LlmCallStatus {
 pub struct LlmCallSummary {
     pub handler_name: String,
     pub service_name: String,
-    pub timestamp: DateTime<Utc>,
+    /// Optional in production: spec §5.10 lists `timestamp` inside
+    /// `data`, but `release/2.7.8` only emits it at the component
+    /// level (TraceComponent.timestamp). Decomposition pulls from
+    /// the component-level timestamp when this is None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<DateTime<Utc>>,
 
     /// Wall-clock; ≥ 0.
     pub duration_ms: f64,
@@ -280,7 +292,7 @@ mod tests {
         let a: AuditAnchor = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(a.audit_sequence_number, 42);
         assert_eq!(a.audit_entry_hash, "abcd");
-        assert_eq!(a.audit_signature, "BBBB");
+        assert_eq!(a.audit_signature.as_deref(), Some("BBBB"));
         assert_eq!(a.audit_entry_id.as_deref(), Some("audit-xyz"));
 
         // entry_id absent is fine.

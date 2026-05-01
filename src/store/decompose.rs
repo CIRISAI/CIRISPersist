@@ -117,7 +117,10 @@ fn build_llm_call_row(
         parent_event_type: component.event_type,
         parent_attempt_index: attempt_index,
         attempt_index: call.attempt_index,
-        ts: call.timestamp,
+        // Spec §5.10 puts timestamp inside data; release/2.7.8 emits
+        // it at the component level only. Fall back to the component
+        // timestamp when data.timestamp is absent.
+        ts: call.timestamp.unwrap_or(component.timestamp),
         duration_ms: call.duration_ms,
         handler_name: call.handler_name.clone(),
         service_name: call.service_name.clone(),

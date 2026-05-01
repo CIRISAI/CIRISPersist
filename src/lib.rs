@@ -16,12 +16,18 @@
 //! tree implements.
 
 pub mod ingest;
+pub mod journal;
+pub mod queue;
 pub mod schema;
 pub mod scrub;
+#[cfg(feature = "server")]
+pub mod server;
 pub mod store;
 pub mod verify;
 
 pub use ingest::{BatchSummary, IngestError, IngestPipeline};
+pub use journal::{Journal, JournalError};
+pub use queue::{spawn_persister, IngestHandle, QueueError, DEFAULT_QUEUE_DEPTH};
 
 // Phase 1 surfaces still pending implementation:
 //   #[cfg(feature = "server")] pub mod server;
