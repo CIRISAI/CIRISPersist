@@ -1,0 +1,231 @@
+{
+  "trace_id": "trace-th_followup_th_seed__438b6432-1b1-20260501000358",
+  "thought_id": "th_followup_th_seed__438b6432-1b1",
+  "task_id": "e7747e00-bf80-4235-a57c-a3ca341621a8",
+  "agent_id_hash": "8a0b70302aaeb401",
+  "started_at": "2026-05-01T00:03:58.161592+00:00",
+  "completed_at": "2026-05-01T00:03:58.426641+00:00",
+  "trace_level": "generic",
+  "trace_schema_version": "2.7.0",
+  "components": [
+    {
+      "component_type": "observation",
+      "data": {
+        "round_number": 0,
+        "thought_depth": 1,
+        "task_priority": 0,
+        "updated_info_available": false,
+        "attempt_index": 0
+      },
+      "event_type": "THOUGHT_START",
+      "timestamp": "2026-05-01T00:03:58.161592+00:00"
+    },
+    {
+      "component_type": "llm_call",
+      "data": {
+        "handler_name": "EthicalPDMAEvaluator",
+        "service_name": "MockLLMService",
+        "model": "mock-model",
+        "response_model": "EthicalDMAResult",
+        "duration_ms": 0.49185752868652344,
+        "prompt_tokens": 5948,
+        "completion_tokens": 2048,
+        "prompt_bytes": 37296,
+        "completion_bytes": 492,
+        "cost_usd": 0.001804,
+        "status": "ok",
+        "attempt_count": 1,
+        "retry_count": 0,
+        "attempt_index": 0
+      },
+      "event_type": "LLM_CALL",
+      "timestamp": "2026-05-01T00:03:58.283116+00:00"
+    },
+    {
+      "component_type": "llm_call",
+      "data": {
+        "handler_name": "CSDMAEvaluator",
+        "service_name": "MockLLMService",
+        "model": "mock-model",
+        "response_model": "CSDMAResult",
+        "duration_ms": 0.38313865661621094,
+        "prompt_tokens": 4264,
+        "completion_tokens": 2048,
+        "prompt_bytes": 27141,
+        "completion_bytes": 198,
+        "cost_usd": 0.0014672,
+        "status": "ok",
+        "attempt_count": 1,
+        "retry_count": 0,
+        "attempt_index": 1
+      },
+      "event_type": "LLM_CALL",
+      "timestamp": "2026-05-01T00:03:58.287282+00:00"
+    },
+    {
+      "component_type": "llm_call",
+      "data": {
+        "handler_name": "BaseDSDMA",
+        "service_name": "MockLLMService",
+        "model": "mock-model",
+        "response_model": "DSDMAResult",
+        "duration_ms": 0.270843505859375,
+        "prompt_tokens": 2901,
+        "completion_tokens": 2048,
+        "prompt_bytes": 18941,
+        "completion_bytes": 55371,
+        "cost_usd": 0.0011946,
+        "status": "ok",
+        "attempt_count": 1,
+        "retry_count": 0,
+        "attempt_index": 2
+      },
+      "event_type": "LLM_CALL",
+      "timestamp": "2026-05-01T00:03:58.291032+00:00"
+    },
+    {
+      "component_type": "llm_call",
+      "data": {
+        "handler_name": "IDMAEvaluator",
+        "service_name": "MockLLMService",
+        "model": "mock-model",
+        "response_model": "IDMAResult",
+        "duration_ms": 0.5090236663818359,
+        "prompt_tokens": 6593,
+        "completion_tokens": 2048,
+        "prompt_bytes": 52877,
+        "completion_bytes": 361,
+        "cost_usd": 0.001933,
+        "status": "ok",
+        "attempt_count": 1,
+        "retry_count": 0,
+        "attempt_index": 3
+      },
+      "event_type": "LLM_CALL",
+      "timestamp": "2026-05-01T00:03:58.322432+00:00"
+    },
+    {
+      "component_type": "context",
+      "data": {
+        "agent_name": "Ally",
+        "cognitive_state": "shutdown",
+        "attestation_context": "CIRIS VERIFY ATTESTATION: Level 3/5 | \u2713Binary \u2713Environment \u2717Registry \u2717FileIntegrity \u25cbAudit\nKey: local (fingerprint: 8a0b70302aaeb401...) [HARDWARE-BACKED]\n\u26a0\ufe0f WARNING: COMMUNITY MODE. License: NONE. Hardware: TpmFirmware. No valid professional license found. Not a licensed professional service. Consult qualified professionals for medical, legal, or financial advice.",
+        "attestation_level": 3,
+        "attestation_status": "partial",
+        "disclosure_severity": "warning",
+        "binary_ok": true,
+        "env_ok": true,
+        "registry_ok": false,
+        "file_integrity_ok": false,
+        "audit_ok": false,
+        "play_integrity_ok": false,
+        "hardware_backed": true,
+        "memory_count": 0,
+        "context_tokens": 1,
+        "attempt_index": 0
+      },
+      "event_type": "SNAPSHOT_AND_CONTEXT",
+      "timestamp": "2026-05-01T00:03:58.203466+00:00"
+    },
+    {
+      "component_type": "llm_call",
+      "data": {
+        "handler_name": "ActionSelectionPDMAEvaluator",
+        "service_name": "MockLLMService",
+        "model": "mock-model",
+        "response_model": "ASPDMALLMResult",
+        "duration_ms": 1.7948150634765625,
+        "prompt_tokens": 19861,
+        "completion_tokens": 2048,
+        "prompt_bytes": 143745,
+        "completion_bytes": 688,
+        "cost_usd": 0.004586600000000001,
+        "status": "ok",
+        "attempt_count": 1,
+        "retry_count": 0,
+        "attempt_index": 4
+      },
+      "event_type": "LLM_CALL",
+      "timestamp": "2026-05-01T00:03:58.382270+00:00"
+    },
+    {
+      "component_type": "rationale",
+      "data": {
+        "csdma": {
+          "plausibility_score": 0.9
+        },
+        "dsdma": {
+          "domain_alignment": 0.9
+        },
+        "pdma": {
+          "has_conflicts": false
+        },
+        "attempt_index": 0
+      },
+      "event_type": "DMA_RESULTS",
+      "timestamp": "2026-05-01T00:03:58.328085+00:00"
+    },
+    {
+      "component_type": "rationale",
+      "data": {
+        "k_eff": 1.0,
+        "effective_source_count": 1.0,
+        "correlation_risk": 0.0,
+        "source_overlap": 0.0,
+        "phase": "rigidity",
+        "reasoning_state": "rigidity",
+        "fragility_flag": true,
+        "reasoning_is_fragile": true,
+        "attempt_index": 0
+      },
+      "event_type": "IDMA_RESULT",
+      "timestamp": "2026-05-01T00:03:58.328085+00:00"
+    },
+    {
+      "component_type": "rationale",
+      "data": {
+        "selected_action": "HandlerActionType.TASK_COMPLETE",
+        "is_recursive": false,
+        "attempt_index": 0
+      },
+      "event_type": "ASPDMA_RESULT",
+      "timestamp": "2026-05-01T00:03:58.385003+00:00"
+    },
+    {
+      "component_type": "conscience",
+      "data": {
+        "conscience_passed": true,
+        "action_was_overridden": false,
+        "updated_status_detected": false,
+        "entropy_level": 0.0,
+        "coherence_level": 1.0,
+        "attempt_index": 0
+      },
+      "event_type": "CONSCIENCE_RESULT",
+      "timestamp": "2026-05-01T00:03:58.389801+00:00"
+    },
+    {
+      "component_type": "action",
+      "data": {
+        "execution_success": true,
+        "execution_time_ms": 20.650000000000002,
+        "tokens_input": 39567,
+        "tokens_output": 10240,
+        "tokens_total": 49807,
+        "cost_cents": 1.09854,
+        "carbon_grams": 2.4903500000000003,
+        "energy_mwh": 4980.7,
+        "llm_calls": 5,
+        "audit_sequence_number": 3,
+        "audit_entry_hash": "59bac7293c4d6cd5b386c3715745b66f56de488215d2b84211e1b437947bcfc3",
+        "has_positive_moment": false,
+        "has_execution_error": false,
+        "attempt_index": 0
+      },
+      "event_type": "ACTION_RESULT",
+      "timestamp": "2026-05-01T00:03:58.426641+00:00"
+    }
+  ],
+  "signature": "WUHZ_p-n9rF1CE7X7uCZEU2HhSgkY7qoFsrwOlpqKae0yvPlZHgOfF6Us3iruiHRQ2UZZplWAyZPEucKjBulAQ",
+  "signature_key_id": "agent-8a0b70302aae"
+}
