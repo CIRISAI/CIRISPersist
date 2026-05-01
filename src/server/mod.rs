@@ -23,7 +23,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -40,12 +40,23 @@ pub struct AppState {
     pub journal: Arc<Journal>,
 }
 
+/// Maximum body size for `POST /api/v1/accord/events`.
+///
+/// THREAT_MODEL.md AV-7: 8 MiB caps the largest legitimate
+/// production fixture (a `full_traces` 16-component trace lands
+/// at ~3 MB) with 2.6× headroom. Larger bodies hit
+/// `413 Payload Too Large` before reaching the queue or backend.
+/// The lens deployment-edge proxy can also enforce a body cap;
+/// this is defense-in-depth at the crate level.
+pub const MAX_INGEST_BODY_BYTES: usize = 8 * 1024 * 1024;
+
 /// Build the axum router with the Phase-1 endpoints. Caller is
 /// responsible for binding the listener and serving.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/accord/events", post(post_events))
         .route("/health", get(get_health))
+        .layer(DefaultBodyLimit::max(MAX_INGEST_BODY_BYTES))
         .with_state(state)
 }
 
@@ -236,6 +247,26 @@ mod tests {
         // Mission constraint: thin handler accepts, persister
         // rejects-and-logs.
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// THREAT_MODEL.md AV-7 regression: bodies above
+    /// MAX_INGEST_BODY_BYTES are rejected with 413 before reaching
+    /// the queue.
+    #[tokio::test]
+    async fn oversized_body_returns_413() {
+        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH);
+        // 9 MiB body — over the 8 MiB cap.
+        let big = vec![b'x'; 9 * 1024 * 1024];
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/accord/events")
+                    .header("Content-Type", "application/octet-stream")
+                    .body(Body::from(big))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     /// Mission category §4 "Backpressure": queue saturation surfaces

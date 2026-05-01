@@ -151,11 +151,17 @@ fn pluck_string_from_first(trace: &CompleteTrace, key: &str) -> Option<String> {
         .find_map(|c| c.data.get(key).and_then(|v| v.as_str()).map(str::to_owned))
 }
 
-/// Build the `(trace_id, thought_id, event_type, attempt_index)`
-/// dedup tuple for a row — exposed for the in-memory backend's
-/// idempotency map.
-pub fn dedup_key(row: &TraceEventRow) -> (String, String, ReasoningEventType, u32) {
+/// Build the
+/// `(agent_id_hash, trace_id, thought_id, event_type, attempt_index)`
+/// dedup tuple for a row.
+///
+/// THREAT_MODEL.md AV-9: agent_id_hash is the dedup-key prefix so a
+/// malicious agent reusing another agent's trace_id/thought_id
+/// shape cannot DOS the victim's traces. Matches the SQL UNIQUE
+/// index `trace_events_dedup` in V001.
+pub fn dedup_key(row: &TraceEventRow) -> (String, String, String, ReasoningEventType, u32) {
     (
+        row.agent_id_hash.clone(),
         row.trace_id.clone(),
         row.thought_id.clone(),
         row.event_type,

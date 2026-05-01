@@ -1,6 +1,7 @@
 # CIRISPersist Threat Model
 
-**Status:** v0.1.1 baseline. Updated each minor release.
+**Status:** v0.1.2 baseline (5 of 5 known integration-blocking
+exposures from v0.1.1 mitigated). Updated each minor release.
 **Audience:** lens team integrators, federation peers, security reviewers.
 **Companion:** [`MISSION.md`](../MISSION.md), [`FSD/CIRIS_PERSIST.md`](../FSD/CIRIS_PERSIST.md).
 **Inspired by:** [`CIRISVerify/docs/THREAT_MODEL.md`](https://github.com/CIRISAI/CIRISVerify/blob/main/docs/THREAT_MODEL.md) — the structural template.
@@ -566,17 +567,17 @@ every trace), so directory enumeration is not a high-impact leak.
 | AV-2 | Forged trace from compromised key | (out of scope at persistence layer) | Audit anchor + Phase 2 peer-replicate | ⚠ Phase 2 closes | FSD §4.5 |
 | AV-3 | Replay of legitimate batch | Idempotency on dedup key | TLS at edge | ✓ Mitigated | — |
 | AV-4 | Canonicalization mismatch | Byte-exact parity tests + pluggable canonicalizer | Ed25519 collision resistance | ⚠ Float / timestamp drift residual | v0.1.x patch |
-| AV-5 | Schema-version flood (mem leak) | **None** | **None** | **❌ EXPOSED** | **v0.1.2 hot-fix** |
-| AV-6 | JSON-bomb amplification | Bounded queue + typed envelope | Edge body limit | ⚠ `data` recursion uncapped | v0.1.2 hot-fix |
-| AV-7 | Body-size flood | (deployment-edge proxy only) | — | ⚠ No crate-level limit | v0.1.2 hot-fix |
+| AV-5 | Schema-version flood (mem leak) | `Cow<'static, str>` (no leak) | (deploy-edge rate limit) | **✓ Mitigated v0.1.2** | — |
+| AV-6 | JSON-bomb amplification | `MAX_DATA_DEPTH=32` walker | Bounded queue + typed envelope | **✓ Mitigated v0.1.2** | — |
+| AV-7 | Body-size flood | `DefaultBodyLimit::max(8 MiB)` | Deploy-edge proxy | **✓ Mitigated v0.1.2** | — |
 | AV-8 | Queue saturation | 429 + Retry-After | Single-consumer transaction discipline | ✓ Mitigated | — |
-| AV-9 | Dedup-key collision across agents | trace_id "globally unique per agent" convention | (agent_id_hash not in dedup key) | ⚠ Cross-agent DOS possible | v0.1.x patch |
+| AV-9 | Dedup-key collision across agents | `agent_id_hash` in UNIQUE index + ON CONFLICT target | trace_id "globally unique per agent" convention | **✓ Mitigated v0.1.2** | — |
 | AV-10 | Audit anchor injection | (anchor not part of dedup key) | Phase 2 peer-replicate validates chain | ⚠ Phase 2 closes | FSD §4.5 |
-| AV-11 | Public-key re-registration | First-write-wins (ON CONFLICT DO NOTHING) | Manual UPDATE for legitimate rotation | ⚠ No rotation API | v0.2.x |
+| AV-11 | Public-key re-registration | First-write-wins (`ON CONFLICT DO NOTHING`) + lens-canonical `revoked_at`/`revoked_reason`/`added_by` audit columns | Manual UPDATE for legitimate rotation | ⚠ No explicit rotation API | v0.2.x |
 | AV-12 | Schema-version downgrade | Strict allowlist | Per-version payload gates | ✓ Mitigated | track at version bump |
 | AV-13 | JSONB injection | Parameterized typed binding | — | ✓ Mitigated (Phase 3 follow-up) | Phase 3 audit |
 | AV-14 | Scrubber bypass via schema-altering callback | Schema-preservation gates | Python process boundary | ✓ Mitigated | — |
-| AV-15 | PII leak via errors | Typed error variants | (no sanitization wrapper) | ⚠ Some surfaces leak verbatim | v0.1.2 hot-fix |
+| AV-15 | PII leak via errors | Typed `kind()` tokens at HTTP/PyO3 boundary; verbose form to tracing logs only | — | **✓ Mitigated v0.1.2** | — |
 | AV-16 | Side-channel timing | Ed25519 verify_strict constant-time | (no constant-response wrapper) | ⚠ Directory enumeration possible | v0.2.x research |
 
 ---
@@ -714,38 +715,42 @@ Risks CIRISPersist mitigates but cannot fully eliminate.
 
 ---
 
-## 9. v0.1.1 Threat Posture Summary
+## 9. v0.1.2 Threat Posture Summary
 
 ```
-KNOWN EXPOSURES (block hot-fix)
-  ❌ AV-5: schema-version flood mem leak (parse_lenient Box::leak)
-  ⚠ AV-6: data-blob recursion uncapped
-  ⚠ AV-7: no crate-level body size limit
-  ⚠ AV-9: dedup key doesn't include agent_id_hash
-  ⚠ AV-15: error messages can leak verbatim PII
+v0.1.1 INTEGRATION-BLOCKING EXPOSURES → all closed in v0.1.2
+  ✓ AV-5  schema-version flood mem leak  (Cow<'static, str>)
+  ✓ AV-6  data-blob recursion uncapped   (MAX_DATA_DEPTH=32 walker)
+  ✓ AV-7  no crate-level body size limit (DefaultBodyLimit::max(8 MiB))
+  ✓ AV-9  dedup key cross-agent collision (agent_id_hash in UNIQUE index)
+  ✓ AV-15 error messages leaking verbatim (kind() tokens at FFI boundary)
 
-PHASE-2-CLOSES
-  ⚠ AV-2: stolen-key forgery (peer-replicate audit chain)
-  ⚠ AV-10: audit anchor capture without verification
+PHASE-2-CLOSES (architecturally deferred)
+  ⚠ AV-2  stolen-key forgery (peer-replicate audit chain)
+  ⚠ AV-10 audit anchor capture without verification
+
+V0.2.X TRACK
+  ⚠ AV-11 explicit rotate_public_key(rotation_proof) API
+  ⚠ AV-16 side-channel timing on key-directory enumeration
 
 DESIGN-DECISIONS-PER-MISSION (intentional, not defects)
-  ✓ AV-1: identity gating via public-key directory
-  ✓ AV-3: idempotency via dedup-key conflict
-  ✓ AV-4: canonicalization parity tests + pluggable trait
-  ✓ AV-8: 429 backpressure honest
-  ✓ AV-12: strict schema-version allowlist
-  ✓ AV-13: parameterized binding only
-  ✓ AV-14: scrubber-output schema gates
+  ✓ AV-1  identity gating via public-key directory
+  ✓ AV-3  idempotency via dedup-key conflict
+  ✓ AV-4  canonicalization parity tests + pluggable trait
+  ✓ AV-8  429 backpressure honest
+  ✓ AV-12 strict schema-version allowlist
+  ✓ AV-13 parameterized binding only
+  ✓ AV-14 scrubber-output schema gates
 
 CARGO AUDIT
   ✓ 0 vulnerabilities across 299 dependencies as of 2026-05-01
 ```
 
-The integration-blocking exposures are AV-5 (memory leak) and
-AV-9 (cross-agent dedup collision). Both are scoped for the
-v0.1.2 hot-fix release. The lens team can begin integration
-against v0.1.1 with deployment-edge rate limiting in place;
-v0.1.2 should land before high-volume production traffic.
+All five integration-blocking exposures from the v0.1.1 baseline
+are closed. Phase 2 (audit-chain peer-replicate) closes AV-2 and
+AV-10 architecturally; v0.2.x track has explicit-rotation API and
+timing-oracle hardening. Lens integration can proceed against
+v0.1.2 with no known integration-blocker.
 
 ---
 
@@ -759,5 +764,6 @@ This document is updated:
   added for the new trait surfaces.
 - On every wire-format schema-version bump: AV-4 / AV-12 review.
 
-Last updated: 2026-05-01 (v0.1.1 baseline, pre-AV-5/AV-6/AV-7/AV-9
-hot-fix).
+Last updated: 2026-05-01 (v0.1.2 — AV-5/6/7/9/15 closed; Path B
+schema reconciliation against the lens-canonical accord_public_keys
+shape complete).

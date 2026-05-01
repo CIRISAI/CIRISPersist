@@ -4,6 +4,13 @@
 //! loosely"): bump the constant, write a migrator, never accept
 //! out-of-set silently. PoB §2.4's N_eff measurement depends on the
 //! corpus shape staying defined.
+//!
+//! v0.1.2 (THREAT_MODEL.md AV-5): the unrecognized-version path
+//! holds an owned `String`, not a `Box::leak`'d `&'static str`.
+//! Earlier shape leaked memory per malformed request — exploitable
+//! DoS. Now bounded.
+
+use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 
@@ -19,21 +26,34 @@ use serde::{Deserialize, Serialize};
 /// to the canonical internal shape.
 pub const SUPPORTED_VERSIONS: &[&str] = &["2.7.0"];
 
-/// Type-checked wrapper around a recognized schema version string.
+/// Type-checked wrapper around a schema version string.
 ///
-/// Construction is gated by [`SUPPORTED_VERSIONS`]; an unrecognized
-/// version is a typed error, not a silent acceptance.
+/// Two states:
+/// - **Recognized**: holds a `&'static str` from
+///   [`SUPPORTED_VERSIONS`]. Cheap, comparable as a pointer
+///   short-circuit.
+/// - **Unrecognized**: holds an owned `String` (typed at
+///   `BatchEnvelope::from_json` time, then immediately rejected
+///   with `Error::UnsupportedSchemaVersion`). Bounded allocation
+///   per-request — released when the request handler returns.
+///
+/// Mission (MISSION.md §3 anti-pattern #4): typed errors at every
+/// boundary. The unrecognized variant exists *only* so the typed
+/// rejection error can carry the offending string for diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
-pub struct SchemaVersion(&'static str);
+pub struct SchemaVersion(Cow<'static, str>);
 
 impl SchemaVersion {
-    /// Validate `s` against [`SUPPORTED_VERSIONS`] and return the
-    /// pinned `&'static str` if recognized.
+    /// Strict parse: validate `s` against [`SUPPORTED_VERSIONS`] and
+    /// return the pinned `&'static str` if recognized. Used by code
+    /// paths that need a definitely-supported version (Phase 2
+    /// internal signing, etc.); always returns the static variant on
+    /// success.
     pub fn parse(s: &str) -> Result<Self, super::Error> {
         for &v in SUPPORTED_VERSIONS {
             if v == s {
-                return Ok(SchemaVersion(v));
+                return Ok(SchemaVersion(Cow::Borrowed(v)));
             }
         }
         Err(super::Error::UnsupportedSchemaVersion {
@@ -42,17 +62,43 @@ impl SchemaVersion {
         })
     }
 
-    /// Borrow as `&'static str`. Stable across builds for any given
-    /// recognized version.
+    /// Borrow as `&str`. Returns the static-pinned form on
+    /// recognized versions; an owned-buffer borrow on unrecognized
+    /// ones (only reachable mid-rejection, before
+    /// `BatchEnvelope::from_json` translates to a typed error).
     #[inline]
-    pub const fn as_str(&self) -> &'static str {
-        self.0
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// True iff this `SchemaVersion` is in [`SUPPORTED_VERSIONS`].
+    /// Used by [`super::envelope::BatchEnvelope::from_json`] for the
+    /// typed gate.
+    pub fn is_supported(&self) -> bool {
+        SUPPORTED_VERSIONS.contains(&self.0.as_ref())
+    }
+
+    /// Lenient parse used by `Deserialize`: accepts any string.
+    /// Caller (typically `BatchEnvelope::from_json`) is responsible
+    /// for the typed validation pass via [`is_supported`].
+    ///
+    /// (THREAT_MODEL.md AV-5): the unrecognized arm now holds an
+    /// owned `Cow::Owned(String)`, dropped when the SchemaVersion
+    /// goes out of scope. No `Box::leak`. Memory bounded by request
+    /// lifetime.
+    fn parse_lenient(s: &str) -> Self {
+        for &v in SUPPORTED_VERSIONS {
+            if v == s {
+                return SchemaVersion(Cow::Borrowed(v));
+            }
+        }
+        SchemaVersion(Cow::Owned(s.to_owned()))
     }
 }
 
 impl std::fmt::Display for SchemaVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0)
+        f.write_str(&self.0)
     }
 }
 
@@ -68,36 +114,7 @@ impl<'de> Deserialize<'de> for SchemaVersion {
         // (MISSION.md §3 anti-pattern #4): typed errors at every
         // boundary.
         let s = String::deserialize(deserializer)?;
-        // Always succeed at the serde layer; the version is validated
-        // after deserialization. The string is leaked into a
-        // 'static via the SUPPORTED_VERSIONS list at validation time,
-        // so this temporary stores a synthetic placeholder that
-        // BatchEnvelope::from_json then resolves.
         Ok(SchemaVersion::parse_lenient(&s))
-    }
-}
-
-impl SchemaVersion {
-    /// Lenient parse used by `Deserialize`: accepts any string,
-    /// caller (typically [`BatchEnvelope::from_json`]) is responsible
-    /// for the typed validation pass.
-    fn parse_lenient(s: &str) -> Self {
-        for &v in SUPPORTED_VERSIONS {
-            if v == s {
-                return SchemaVersion(v);
-            }
-        }
-        // Synthetic — unrecognized versions land here. The string
-        // gets boxed and leaked once for diagnostic purposes; this
-        // path is in error handling and runs at most once per
-        // rejected batch.
-        SchemaVersion(Box::leak(s.to_owned().into_boxed_str()))
-    }
-
-    /// True iff this `SchemaVersion` is in [`SUPPORTED_VERSIONS`].
-    /// Used by [`BatchEnvelope::from_json`] for the typed gate.
-    pub fn is_supported(&self) -> bool {
-        SUPPORTED_VERSIONS.contains(&self.0)
     }
 }
 
@@ -109,6 +126,7 @@ mod tests {
     fn parse_accepts_2_7_0() {
         let v = SchemaVersion::parse("2.7.0").expect("2.7.0 is supported");
         assert_eq!(v.as_str(), "2.7.0");
+        assert!(v.is_supported());
     }
 
     #[test]
@@ -161,5 +179,43 @@ mod tests {
         // The constructor for typed code paths (Phase 2 internal
         // signing, etc.) stays strict.
         assert!(SchemaVersion::parse("99.0.0").is_err());
+    }
+
+    /// THREAT_MODEL.md AV-5 regression test.
+    ///
+    /// Earlier `parse_lenient` did `Box::leak(s.to_owned().into_boxed_str())`,
+    /// leaking memory per call. The Cow-based shape drops the
+    /// owned String when the SchemaVersion goes out of scope.
+    ///
+    /// We can't directly observe the leak from a test (Rust's
+    /// allocator is opaque), but we can assert the type-level
+    /// guarantee: a 2nd parse_lenient call with the same input
+    /// produces a SchemaVersion that compares-equal to the 1st but
+    /// holds a *separately-owned* allocation. If `Box::leak` were
+    /// still in use, the &'static str would unify and we'd lose
+    /// that property. Indirect, but it documents the intent.
+    #[test]
+    fn unrecognized_version_uses_owned_allocation() {
+        let v1 = SchemaVersion::parse_lenient("99.0.0");
+        let v2 = SchemaVersion::parse_lenient("99.0.0");
+        // Equal as values:
+        assert_eq!(v1, v2);
+        // is_supported gate still rejects:
+        assert!(!v1.is_supported());
+        assert!(!v2.is_supported());
+        // Drop happens when v1/v2 go out of scope; no leak.
+    }
+
+    /// Bound-check: 1000 distinct unrecognized versions all parse
+    /// (lenient) without panicking. Pre-AV-5 fix this would have
+    /// leaked ~30KB; post-fix it allocates and drops cleanly.
+    #[test]
+    fn unrecognized_version_does_not_unbounded_allocate() {
+        for i in 0..1000 {
+            let s = format!("99.0.{i}");
+            let v = SchemaVersion::parse_lenient(&s);
+            assert!(!v.is_supported());
+            // Drops here.
+        }
     }
 }

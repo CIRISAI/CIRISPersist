@@ -196,13 +196,15 @@ fn canonicalization_is_deterministic() {
 fn dedup_keys_unique_within_each_trace() {
     // Mission category §4 "Idempotency": every component within a
     // CompleteTrace produces a distinct
-    // (trace_id, thought_id, event_type, attempt_index) tuple.
-    // Repeated event_types use attempt_index to discriminate.
+    // (agent_id_hash, trace_id, thought_id, event_type, attempt_index)
+    // tuple (THREAT_MODEL.md AV-9). Repeated event_types use
+    // attempt_index to discriminate.
     for (name, _, _) in FIXTURES {
         let trace = load_fixture(name);
         let mut seen = std::collections::HashSet::new();
         for c in &trace.components {
             let key = (
+                trace.agent_id_hash.clone(),
                 trace.trace_id.clone(),
                 trace.thought_id.clone(),
                 c.event_type,

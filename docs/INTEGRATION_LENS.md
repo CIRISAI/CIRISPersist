@@ -1,4 +1,4 @@
-# Lens Integration Guide — `ciris-persist` v0.1.1
+# Lens Integration Guide — `ciris-persist` v0.1.2
 
 **Audience:** the CIRISLens team. You're swapping the 92-column
 `accord_traces` `INSERT` path in `api/accord_api.py` for
@@ -25,9 +25,12 @@ ENGINE = Engine(
 
 # One-time, on agent registration:
 ENGINE.register_public_key(
-    signature_key_id="agent-8a0b70302aae",
-    public_key_b64=agent.public_key_b64,
-    agent_id_hash="8a0b70302aaeb401...",
+    signature_key_id="agent-8a0b70302aae",   # → key_id column
+    public_key_b64=agent.public_key_b64,     # → public_key_base64 column
+    algorithm="Ed25519",                      # default; explicit is documentation
+    description="Datum production agent",     # optional, for admin tooling
+    added_by="lens-bootstrap",                # optional, for audit
+    # expires_at="2027-04-16T00:00:00Z",     # optional; matches Accord renewal
 )
 
 # Every request:
@@ -143,16 +146,42 @@ handshake (TRACE_WIRE_FORMAT.md §8). Store the key once on receipt:
 
 ```python
 ENGINE.register_public_key(
-    signature_key_id=request.signature_key_id,   # e.g. "agent-8a0b70302aae"
-    public_key_b64=request.public_key_b64,        # 32 bytes Ed25519 in base64
-    agent_id_hash=request.agent_id_hash,          # optional but recommended
+    signature_key_id=request.signature_key_id,   # → key_id column
+    public_key_b64=request.public_key_b64,        # → public_key_base64 column
+    algorithm="Ed25519",                          # default; explicit is doc
+    description=f"agent {request.agent_id_hash[:16]}…",  # admin-tool friendly
+    expires_at=request.expires_at,                # optional ISO-8601
+    added_by="lens-accord-handshake",             # optional, for audit
 )
 ```
 
-`register_public_key` is idempotent (re-registering the same key id
-is a no-op). Re-registering a *different* key for the same id is
-treated as the agent's choice — no rotation alarm yet; that's a
-follow-up for v0.2.x.
+### v0.1.2 — schema reconciliation note
+
+The crate now writes the **lens-canonical `accord_public_keys` shape**
+verbatim:
+`(key_id PK, public_key_base64, algorithm, description,
+ created_at, expires_at, revoked_at, revoked_reason, added_by)`.
+
+If your lens already applied `sql/011 + sql/022`, V001 is a no-op
+on your DB (every `CREATE TABLE IF NOT EXISTS` short-circuits).
+Existing rows + queries against `key_id` / `public_key_base64`
+keep working unchanged. The crate's Python API reads those columns
+under the friendly Python names `signature_key_id` / `public_key_b64`,
+which the wire format already calls them.
+
+`register_public_key` is idempotent — re-registering the same
+`signature_key_id` is a no-op (`ON CONFLICT (key_id) DO NOTHING`).
+For genuine **key rotation**, set `revoked_at` + `revoked_reason`
+on the old row via the lens's existing admin tooling, then call
+`register_public_key` with a new `signature_key_id`. Mission
+constraint (MISSION.md §3 anti-pattern #3): no automated key
+rotation under attacker control. Explicit
+`rotate_public_key(rotation_proof=signed_by_old_key)` API is v0.2.x
+scope (THREAT_MODEL.md AV-11).
+
+`lookup_public_key` filters on `revoked_at IS NULL AND (expires_at
+IS NULL OR expires_at > NOW())` — both gates the lens already
+enforced.
 
 The current production agent (`release/2.7.8`) ships
 `signature_key_id` prefix `agent-...`; the four captured fixtures

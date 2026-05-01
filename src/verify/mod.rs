@@ -46,3 +46,17 @@ pub enum Error {
     #[error("internal: {0}")]
     Internal(#[from] serde_json::Error),
 }
+
+impl Error {
+    /// Stable string-token identifying the error variant.
+    /// THREAT_MODEL.md AV-15: HTTP / PyO3 sanitization.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Error::SignatureMismatch => "verify_signature_mismatch",
+            Error::Canonicalization(_) => "verify_canonicalization_internal",
+            Error::UnknownKey(_) => "verify_unknown_key",
+            Error::InvalidSignature(_) => "verify_invalid_signature",
+            Error::Internal(_) => "verify_internal",
+        }
+    }
+}

@@ -74,4 +74,79 @@ pub enum Error {
     /// `(trace_id, thought_id, event_type, attempt_index)` dedup key.
     #[error("attempt_index must be non-negative, got {0}")]
     NegativeAttemptIndex(i64),
+
+    /// THREAT_MODEL.md AV-6: a component's `data` blob is nested
+    /// past [`MAX_DATA_DEPTH`]. Deserialization-bomb defense; bounds
+    /// allocation in case an attacker submits deeply-nested JSON
+    /// inside the `data` field that the typed envelope would
+    /// otherwise pass through unchecked.
+    #[error("component data blob exceeds max depth ({0})")]
+    DataTooDeep(usize),
+}
+
+impl Error {
+    /// Stable string-token identifying the error variant.
+    ///
+    /// THREAT_MODEL.md AV-15: this is what crosses HTTP / PyO3
+    /// boundaries. The verbose `Display` form (which can include
+    /// attacker-supplied content) goes to tracing logs only.
+    /// Callers map kinds to status codes / detail bodies.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Error::Json(_) => "schema_malformed_json",
+            Error::UnsupportedSchemaVersion { .. } => "schema_unsupported_version",
+            Error::UnknownTraceLevel(_) => "schema_unknown_trace_level",
+            Error::MissingField(_) => "schema_missing_field",
+            Error::FieldTypeMismatch { .. } => "schema_field_type_mismatch",
+            Error::NegativeAttemptIndex(_) => "schema_negative_attempt_index",
+            Error::DataTooDeep(_) => "schema_data_too_deep",
+        }
+    }
+}
+
+/// Maximum nesting depth of any component's `data` blob.
+///
+/// 32 levels is generous for the production wire format
+/// (`SNAPSHOT_AND_CONTEXT.system_snapshot` is the deepest legitimate
+/// shape and tops out around 8 levels). An attacker submitting
+/// `{"a":{"a":{"a":...}}}` 64-deep is rejected at parse time with
+/// [`Error::DataTooDeep`].
+pub const MAX_DATA_DEPTH: usize = 32;
+
+/// Walk a `data` object's values and reject if depth exceeds
+/// [`MAX_DATA_DEPTH`].
+///
+/// Called by [`envelope::BatchEnvelope::from_json`] over each
+/// component's `data` field after typed parse succeeds. Bounded
+/// recursion (the function itself uses Rust's stack and our own
+/// depth counter; no allocation amplification — walks borrowed
+/// data, no clones).
+pub(crate) fn check_data_depth(
+    data: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), Error> {
+    fn walk(v: &serde_json::Value, depth: usize) -> Result<(), Error> {
+        if depth > MAX_DATA_DEPTH {
+            return Err(Error::DataTooDeep(MAX_DATA_DEPTH));
+        }
+        match v {
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, depth + 1)?;
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for child in map.values() {
+                    walk(child, depth + 1)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    // The outer `data` map itself counts as depth 1; children at
+    // depth 2.
+    for v in data.values() {
+        walk(v, 1)?;
+    }
+    Ok(())
 }

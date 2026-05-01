@@ -1,11 +1,18 @@
--- 001 — trace_events + trace_llm_calls (carry over from
--- ~/CIRISLens/sql/027_trace_events.sql; renumbered to 001 as the
--- crate-owned baseline per FSD §3.1).
+-- 001 — trace_events + trace_llm_calls + accord_public_keys.
 --
--- One row per `@streaming_step` broadcast (FSD §3.3 step 4 +
--- agent FSD/TRACE_EVENT_LOG_PERSISTENCE.md §5). Append-only.
--- Idempotency on `(trace_id, thought_id, event_type, attempt_index)`
--- per FSD §3.4 robustness primitive #4.
+-- Carry-over from CIRISLens/sql/027_trace_events.sql, renumbered to
+-- 001 as the crate-owned baseline per FSD §3.1. The
+-- accord_public_keys shape matches the lens's existing
+-- sql/011 + sql/022 schema verbatim — so when the lens applies V001
+-- on a database that already has the lens table, every CREATE
+-- TABLE IF NOT EXISTS no-ops cleanly. Sovereign-mode deployments
+-- (no pre-existing lens schema) get the same shape on a fresh DB.
+--
+-- Mission alignment (MISSION.md §2 — `store/`): the lens has 30
+-- migrations of historical truth; the crate adapts to it. See
+-- THREAT_MODEL.md AV-11 — the lens-canonical shape's revoked_at +
+-- revoked_reason + added_by are the rotation-audit surface that
+-- v0.1.1's invented thinner shape lacked.
 
 CREATE SCHEMA IF NOT EXISTS cirislens;
 
@@ -39,13 +46,22 @@ CREATE TABLE IF NOT EXISTS cirislens.trace_events (
     signature_verified BOOLEAN  NOT NULL DEFAULT FALSE,
     schema_version  TEXT,
     pii_scrubbed    BOOLEAN     NOT NULL DEFAULT FALSE,
+    audit_sequence_number BIGINT,
+    audit_entry_hash      TEXT,
+    audit_signature       TEXT,
     PRIMARY KEY (event_id, ts)
 );
 
 -- The dedup index FSD §3.4 #4 names. UNIQUE so ON CONFLICT DO NOTHING
--- can target it in INSERT ... ON CONFLICT.
+-- can target it.
+--
+-- THREAT_MODEL.md AV-9: the dedup key MUST include agent_id_hash so a
+-- malicious agent reusing another agent's `thought_id` shape cannot
+-- DOS the victim's traces. trace_id is "globally unique per agent"
+-- (TRACE_WIRE_FORMAT.md §3) by convention; the SQL layer treats it
+-- as adversary-controllable and gates with agent_id_hash.
 CREATE UNIQUE INDEX IF NOT EXISTS trace_events_dedup
-    ON cirislens.trace_events (trace_id, thought_id, event_type, attempt_index, ts);
+    ON cirislens.trace_events (agent_id_hash, trace_id, thought_id, event_type, attempt_index, ts);
 
 CREATE INDEX IF NOT EXISTS trace_events_journey
     ON cirislens.trace_events (thought_id, ts);
@@ -53,6 +69,9 @@ CREATE INDEX IF NOT EXISTS trace_events_agent_ts
     ON cirislens.trace_events (agent_name, ts DESC);
 CREATE INDEX IF NOT EXISTS trace_events_type_ts
     ON cirislens.trace_events (event_type, ts DESC);
+CREATE INDEX IF NOT EXISTS trace_events_audit_seq
+    ON cirislens.trace_events (audit_sequence_number)
+    WHERE audit_sequence_number IS NOT NULL;
 
 -- TimescaleDB hypertable: only created when the extension is present.
 -- Pure-Postgres deployments (some Phase 2 agents per FSD §7 #7) skip
@@ -138,18 +157,25 @@ $$;
 -- range (FSD §7 #7).
 
 -- ─── accord_public_keys: agent verification key directory ──────────
--- Phase 1 source-of-truth for verify (FSD §3.3 step 2). Phase 2's
--- peer-replicate channel (FSD §4.4) extends this with Reticulum-fed
--- announces.
+--
+-- Lens-canonical shape (matches CIRISLens sql/011_accord_public_keys
+-- + sql/022_revocation). Phase 1 source-of-truth for verify (FSD
+-- §3.3 step 2). Phase 2's peer-replicate channel (FSD §4.4) extends
+-- this with Reticulum-fed announces.
+--
+-- v0.1.2 reconciliation (THREAT_MODEL.md AV-11): the lens already
+-- has key rotation audit columns (revoked_at, revoked_reason,
+-- added_by) that v0.1.1's invented thinner shape lacked. Adopting
+-- the lens-canonical shape closes the rotation-audit gap.
 
 CREATE TABLE IF NOT EXISTS cirislens.accord_public_keys (
-    signature_key_id TEXT        PRIMARY KEY,
-    public_key_b64   TEXT        NOT NULL,
-    agent_id_hash    TEXT,
-    registered_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    revoked_at       TIMESTAMPTZ,
-    metadata         JSONB
+    key_id            TEXT        PRIMARY KEY,
+    public_key_base64 TEXT        NOT NULL,
+    algorithm         TEXT,
+    description       TEXT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at        TIMESTAMPTZ,
+    revoked_at        TIMESTAMPTZ,
+    revoked_reason    TEXT,
+    added_by          TEXT
 );
-
-CREATE INDEX IF NOT EXISTS accord_public_keys_agent
-    ON cirislens.accord_public_keys (agent_id_hash);

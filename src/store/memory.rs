@@ -23,6 +23,11 @@ use super::types::{TraceEventRow, TraceLlmCallRow};
 use super::Error;
 use crate::schema::ReasoningEventType;
 
+/// Dedup-tuple shape for the in-memory event index. Mirrors
+/// `super::decompose::dedup_key`'s return type and the V001 SQL
+/// UNIQUE index `trace_events_dedup`. THREAT_MODEL.md AV-9.
+type DedupKey = (String, String, String, ReasoningEventType, u32);
+
 /// In-memory backend.
 ///
 /// Locks: a single `Mutex` guards all state. This is fine for tests
@@ -33,8 +38,9 @@ pub struct MemoryBackend {
 }
 
 struct State {
-    /// Inserted `trace_events` rows, keyed by dedup tuple.
-    events: HashMap<(String, String, ReasoningEventType, u32), (i64, TraceEventRow)>,
+    /// Inserted `trace_events` rows, keyed by dedup tuple
+    /// (THREAT_MODEL.md AV-9). See [`DedupKey`].
+    events: HashMap<DedupKey, (i64, TraceEventRow)>,
     /// Inserted `trace_llm_calls` rows.
     llm_calls: Vec<TraceLlmCallRow>,
     /// Monotonic event_id counter (mimics Postgres BIGSERIAL).
@@ -97,6 +103,7 @@ impl Backend for MemoryBackend {
         let mut seen = HashSet::new();
         for row in rows {
             let key = (
+                row.agent_id_hash.clone(),
                 row.trace_id.clone(),
                 row.thought_id.clone(),
                 row.event_type,
@@ -200,6 +207,28 @@ mod tests {
         assert_eq!(r2.inserted, 0);
         assert_eq!(r2.conflicted, 2);
         // Same total count after second insert.
+        assert_eq!(backend.snapshot_events().len(), 2);
+    }
+
+    /// THREAT_MODEL.md AV-9 regression: two distinct agents with
+    /// the same trace_id/thought_id/event_type/attempt_index/ts
+    /// shape no longer collide. Pre-fix this would have silently
+    /// dropped one agent's row.
+    #[tokio::test]
+    async fn dedup_keyed_by_agent_id_hash() {
+        let backend = MemoryBackend::new();
+        let mut row_a = fixture_row(0, ReasoningEventType::ActionResult);
+        let mut row_b = fixture_row(0, ReasoningEventType::ActionResult);
+        // Same trace shape; different agent.
+        row_a.agent_id_hash = "agent-a".into();
+        row_b.agent_id_hash = "agent-b".into();
+
+        let r = backend
+            .insert_trace_events_batch(&[row_a, row_b])
+            .await
+            .unwrap();
+        assert_eq!(r.inserted, 2, "distinct agents must not collide");
+        assert_eq!(r.conflicted, 0);
         assert_eq!(backend.snapshot_events().len(), 2);
     }
 

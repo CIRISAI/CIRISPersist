@@ -446,11 +446,11 @@ mod tests {
     }
 
     /// Mission category §4 "Idempotency": the dedup key
-    /// `(trace_id, thought_id, event_type, attempt_index)` is
-    /// derivable from typed values. Confirm we extract all four
-    /// without re-parsing.
+    /// `(agent_id_hash, trace_id, thought_id, event_type, attempt_index)`
+    /// is derivable from typed values (THREAT_MODEL.md AV-9).
     #[test]
     fn dedup_key_components_typed() {
+        let agent_id_hash = "deadbeef";
         let trace_id = "trace-x";
         let thought_id = "th_x";
         let c = component(
@@ -459,15 +459,16 @@ mod tests {
             serde_json::json!({"attempt_index": 2}),
         );
         let attempt = c.attempt_index().unwrap();
-        // The four-tuple lands as concrete typed values, never as
+        // The five-tuple lands as concrete typed values, never as
         // serde_json::Value.
         let dedup_key = (
+            agent_id_hash.to_owned(),
             trace_id.to_owned(),
             thought_id.to_owned(),
             c.event_type,
             attempt,
         );
-        assert_eq!(dedup_key.2, ReasoningEventType::ConscienceResult);
-        assert_eq!(dedup_key.3, 2);
+        assert_eq!(dedup_key.3, ReasoningEventType::ConscienceResult);
+        assert_eq!(dedup_key.4, 2);
     }
 }

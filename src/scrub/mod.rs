@@ -55,6 +55,17 @@ pub enum ScrubError {
     Internal(#[from] serde_json::Error),
 }
 
+impl ScrubError {
+    /// Stable string-token identifying the error variant.
+    /// THREAT_MODEL.md AV-15: HTTP / PyO3 sanitization.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ScrubError::External(_) => "scrub_external",
+            ScrubError::Internal(_) => "scrub_internal",
+        }
+    }
+}
+
 /// Pass-through scrubber — used when `trace_level = generic` (no
 /// content text by design) and as the default for tests.
 ///

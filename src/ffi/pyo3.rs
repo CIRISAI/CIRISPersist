@@ -96,27 +96,65 @@ impl PyEngine {
 
     /// Register the agent's Ed25519 public key for verification.
     ///
-    /// `signature_key_id` is the same string the agent ships in
-    /// `signature_key_id` on every CompleteTrace.
-    /// `public_key_b64` is the agent's 32-byte Ed25519 verifying key
-    /// in standard base64.
+    /// Maps the wire-level `signature_key_id` to the lens-canonical
+    /// `key_id` column (THREAT_MODEL.md AV-11; v0.1.2 Path B
+    /// reconciliation).
     ///
-    /// Idempotent: re-registering the same key id is fine; if a
-    /// different key is registered for an existing id, this raises
-    /// (mission constraint MISSION.md §3 anti-pattern #3: no
-    /// silent rotation).
+    /// Parameters:
+    /// - `signature_key_id` — the same string the agent ships on
+    ///   every CompleteTrace's `signature_key_id` field. Becomes
+    ///   `accord_public_keys.key_id` in storage.
+    /// - `public_key_b64` — the agent's 32-byte Ed25519 verifying
+    ///   key in standard base64. Becomes
+    ///   `accord_public_keys.public_key_base64` in storage.
+    /// - `algorithm` — defaults to `"Ed25519"` (the only supported
+    ///   shape in v0.1.x; multi-algorithm hybrid PoB §6 is Phase 2+).
+    /// - `description` — free-form annotation; visible in
+    ///   admin tooling.
+    /// - `expires_at` — optional ISO-8601 timestamp; if set, the
+    ///   key stops verifying after that point. Maps to
+    ///   `accord_public_keys.expires_at`.
+    /// - `added_by` — operator / process annotation for audit.
+    ///
+    /// Idempotent: re-registering the same `signature_key_id`
+    /// is a no-op (ON CONFLICT DO NOTHING). For genuine key
+    /// rotation, use the lens's revocation surface (set
+    /// `revoked_at` on the old row, register a new row with a
+    /// different `signature_key_id`). Mission constraint
+    /// (MISSION.md §3 anti-pattern #3): no automated key rotation
+    /// under attacker control.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (signature_key_id, public_key_b64,
+                        algorithm = None, description = None,
+                        expires_at = None, added_by = None))]
     fn register_public_key(
         &self,
         py: Python<'_>,
         signature_key_id: &str,
         public_key_b64: &str,
-        agent_id_hash: Option<&str>,
+        algorithm: Option<&str>,
+        description: Option<&str>,
+        expires_at: Option<&str>,
+        added_by: Option<&str>,
     ) -> PyResult<()> {
         let backend = self.backend.clone();
         let runtime = self.runtime.clone();
         let key_id = signature_key_id.to_owned();
         let pub_b64 = public_key_b64.to_owned();
-        let agent_id = agent_id_hash.map(str::to_owned);
+        let algo = algorithm.unwrap_or("Ed25519").to_owned();
+        let desc = description.map(str::to_owned);
+        let added = added_by.map(str::to_owned);
+
+        // Parse expires_at ISO-8601 → DateTime<Utc>; reject
+        // malformed values upfront (typed error preferred over
+        // letting the SQL layer choke).
+        let expires_dt: Option<chrono::DateTime<chrono::Utc>> = match expires_at {
+            None => None,
+            Some(s) => Some(s.parse().map_err(|e| {
+                PyValueError::new_err(format!("expires_at must be ISO-8601 (got {s:?}): {e}"))
+            })?),
+        };
+
         py.detach(|| {
             runtime.block_on(async move {
                 let client = backend
@@ -127,10 +165,11 @@ impl PyEngine {
                 client
                     .execute(
                         "INSERT INTO cirislens.accord_public_keys \
-                         (signature_key_id, public_key_b64, agent_id_hash) \
-                         VALUES ($1, $2, $3) \
-                         ON CONFLICT (signature_key_id) DO NOTHING",
-                        &[&key_id, &pub_b64, &agent_id],
+                         (key_id, public_key_base64, algorithm, description, \
+                          expires_at, added_by) \
+                         VALUES ($1, $2, $3, $4, $5, $6) \
+                         ON CONFLICT (key_id) DO NOTHING",
+                        &[&key_id, &pub_b64, &algo, &desc, &expires_dt, &added],
                     )
                     .await
                     .map_err(|e| PyRuntimeError::new_err(format!("register: {e}")))?;
@@ -177,13 +216,23 @@ impl PyEngine {
                 dict.set_item("signatures_verified", s.signatures_verified)?;
                 Ok(dict)
             }
-            // Schema / verify / scrub → ValueError (caller-fault;
-            // 4xx).
-            Err(IngestError::Schema(e)) => Err(PyValueError::new_err(format!("schema: {e}"))),
-            Err(IngestError::Verify(e)) => Err(PyValueError::new_err(format!("verify: {e}"))),
-            Err(IngestError::Scrub(e)) => Err(PyValueError::new_err(format!("scrub: {e}"))),
-            // Store → RuntimeError (server-fault; 5xx).
-            Err(IngestError::Store(e)) => Err(PyRuntimeError::new_err(format!("store: {e}"))),
+            // THREAT_MODEL.md AV-15: sanitize at the FFI boundary.
+            // Verbose `Display` form (which may include
+            // attacker-supplied content) goes to tracing logs; the
+            // Python exception carries only the stable kind token.
+            // The lens HTTP layer maps token → status code.
+            Err(e) => {
+                let kind = e.kind();
+                tracing::warn!(error = %e, kind = kind, "ingest rejected");
+                match e {
+                    // Schema / verify / scrub → ValueError (caller-fault; 4xx).
+                    IngestError::Schema(_) | IngestError::Verify(_) | IngestError::Scrub(_) => {
+                        Err(PyValueError::new_err(kind))
+                    }
+                    // Store → RuntimeError (server-fault; 5xx).
+                    IngestError::Store(_) => Err(PyRuntimeError::new_err(kind)),
+                }
+            }
         }
     }
 }

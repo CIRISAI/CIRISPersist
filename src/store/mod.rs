@@ -54,3 +54,17 @@ impl From<crate::schema::Error> for Error {
         Error::Schema(e)
     }
 }
+
+impl Error {
+    /// Stable string-token identifying the error variant.
+    /// THREAT_MODEL.md AV-15: HTTP / PyO3 sanitization. The verbose
+    /// `Display` form (which may include Postgres error context)
+    /// goes to tracing logs only.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Error::Schema(s) => s.kind(),
+            Error::NotImplemented(_) => "store_not_implemented",
+            Error::Backend(_) => "store_backend",
+        }
+    }
+}

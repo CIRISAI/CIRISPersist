@@ -201,8 +201,13 @@ impl Backend for PostgresBackend {
             params.push(Box::new(audit_hash));
             params.push(Box::new(audit_sig));
         }
+        // THREAT_MODEL.md AV-9: dedup-key target now includes
+        // agent_id_hash so a malicious agent reusing another agent's
+        // trace_id/thought_id shape cannot DOS the victim's traces.
+        // Matches the V001 trace_events_dedup UNIQUE index.
         sql.push_str(
-            " ON CONFLICT (trace_id, thought_id, event_type, attempt_index, ts) DO NOTHING",
+            " ON CONFLICT (agent_id_hash, trace_id, thought_id, \
+             event_type, attempt_index, ts) DO NOTHING",
         );
 
         let params_refs: Vec<&(dyn ToSql + Sync)> = params
@@ -311,11 +316,18 @@ impl Backend for PostgresBackend {
     }
 
     async fn lookup_public_key(&self, key_id: &str) -> Result<Option<VerifyingKey>, Error> {
+        // SQL maps the wire-level `signature_key_id` to the lens-
+        // canonical `key_id` column (THREAT_MODEL.md AV-11; v0.1.2
+        // Path B reconciliation). Public-key rows are filtered by
+        // revocation: revoked_at IS NULL AND (expires_at IS NULL OR
+        // expires_at > now()) — both gates the lens already had.
         let client = self.get_client().await?;
         let row_opt = client
             .query_opt(
-                "SELECT public_key_b64 FROM cirislens.accord_public_keys \
-                 WHERE signature_key_id = $1 AND revoked_at IS NULL",
+                "SELECT public_key_base64 FROM cirislens.accord_public_keys \
+                 WHERE key_id = $1 \
+                   AND revoked_at IS NULL \
+                   AND (expires_at IS NULL OR expires_at > NOW())",
                 &[&key_id],
             )
             .await
@@ -326,10 +338,10 @@ impl Backend for PostgresBackend {
         let b64: String = row.get(0);
         let bytes = BASE64
             .decode(&b64)
-            .map_err(|e| Error::Backend(format!("public_key_b64 decode: {e}")))?;
+            .map_err(|e| Error::Backend(format!("public_key_base64 decode: {e}")))?;
         if bytes.len() != 32 {
             return Err(Error::Backend(format!(
-                "public_key_b64 wrong length: got {}, expected 32",
+                "public_key_base64 wrong length: got {}, expected 32",
                 bytes.len()
             )));
         }

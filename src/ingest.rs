@@ -78,6 +78,21 @@ pub enum IngestError {
     Store(#[from] StoreError),
 }
 
+impl IngestError {
+    /// Stable string-token identifying the error variant.
+    /// THREAT_MODEL.md AV-15: HTTP / PyO3 sanitization. The verbose
+    /// `Display` form goes to tracing logs only; the kind is what
+    /// the lens surfaces in HTTP error bodies.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            IngestError::Schema(e) => e.kind(),
+            IngestError::Verify(e) => e.kind(),
+            IngestError::Scrub(e) => e.kind(),
+            IngestError::Store(e) => e.kind(),
+        }
+    }
+}
+
 /// Composition of dependencies for one ingest call.
 ///
 /// Mission constraint (MISSION.md §2 — `store/`, `verify/`, `scrub/`):

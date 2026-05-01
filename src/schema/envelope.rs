@@ -132,6 +132,19 @@ impl BatchEnvelope {
         if env.events.is_empty() {
             return Err(super::Error::MissingField("events"));
         }
+        // THREAT_MODEL.md AV-6: deserialization-bomb defense.
+        // Reject any component `data` blob nested past
+        // MAX_DATA_DEPTH. Walk happens after typed envelope parse
+        // succeeded — bounded by event count and per-data depth.
+        for event in &env.events {
+            match event {
+                BatchEvent::CompleteTrace { trace, .. } => {
+                    for component in &trace.components {
+                        super::check_data_depth(&component.data)?;
+                    }
+                }
+            }
+        }
         Ok(env)
     }
 }
@@ -233,6 +246,89 @@ mod tests {
           "trace_schema_version": "2.7.0"
         });
         assert!(BatchEnvelope::from_json(body.to_string().as_bytes()).is_err());
+    }
+
+    /// THREAT_MODEL.md AV-6 regression: deeply nested `data` blobs
+    /// are rejected. We construct a 64-deep-nested object inside one
+    /// component's `data` and confirm it fails the depth gate.
+    #[test]
+    fn reject_deeply_nested_data_blob() {
+        // Build a nested JSON value 64 levels deep:
+        // {"a":{"a":{"a": ... 64 times ... :null}}}
+        let mut nested = serde_json::Value::Null;
+        for _ in 0..64 {
+            let mut m = serde_json::Map::new();
+            m.insert("a".into(), nested);
+            nested = serde_json::Value::Object(m);
+        }
+        let body = serde_json::json!({
+          "events": [{
+            "event_type": "complete_trace",
+            "trace_level": "generic",
+            "trace": {
+              "trace_id": "trace-bomb",
+              "thought_id": "th-bomb",
+              "agent_id_hash": "deadbeef",
+              "started_at": "2026-04-30T00:00:00Z",
+              "completed_at": "2026-04-30T00:01:00Z",
+              "trace_level": "generic",
+              "trace_schema_version": "2.7.0",
+              "components": [{
+                "component_type": "observation",
+                "event_type": "THOUGHT_START",
+                "timestamp": "2026-04-30T00:00:00Z",
+                "data": nested
+              }],
+              "signature": "AAAA",
+              "signature_key_id": "k"
+            }
+          }],
+          "batch_timestamp": "2026-04-30T00:00:00Z",
+          "consent_timestamp": "2025-01-01T00:00:00Z",
+          "trace_level": "generic",
+          "trace_schema_version": "2.7.0"
+        });
+        let err = BatchEnvelope::from_json(body.to_string().as_bytes())
+            .expect_err("64-deep blob must be rejected");
+        assert!(
+            matches!(err, super::super::Error::DataTooDeep(_)),
+            "got: {err:?}"
+        );
+    }
+
+    /// Sanity counter-test: a typical shallow data blob still parses
+    /// cleanly. The production fixtures (see
+    /// tests/wire_format_fixtures.rs) bottom out at depth ~6.
+    #[test]
+    fn shallow_data_blob_passes() {
+        let body = serde_json::json!({
+          "events": [{
+            "event_type": "complete_trace",
+            "trace_level": "generic",
+            "trace": {
+              "trace_id": "trace-ok",
+              "thought_id": "th-ok",
+              "agent_id_hash": "deadbeef",
+              "started_at": "2026-04-30T00:00:00Z",
+              "completed_at": "2026-04-30T00:01:00Z",
+              "trace_level": "generic",
+              "trace_schema_version": "2.7.0",
+              "components": [{
+                "component_type": "observation",
+                "event_type": "THOUGHT_START",
+                "timestamp": "2026-04-30T00:00:00Z",
+                "data": {"attempt_index": 0, "nested": {"k": [1, 2, 3]}}
+              }],
+              "signature": "AAAA",
+              "signature_key_id": "k"
+            }
+          }],
+          "batch_timestamp": "2026-04-30T00:00:00Z",
+          "consent_timestamp": "2025-01-01T00:00:00Z",
+          "trace_level": "generic",
+          "trace_schema_version": "2.7.0"
+        });
+        BatchEnvelope::from_json(body.to_string().as_bytes()).expect("shallow blob parses");
     }
 
     #[test]
