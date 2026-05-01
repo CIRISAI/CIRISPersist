@@ -5,6 +5,81 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.1.10] — 2026-05-01
+
+P0 wheel-tagging regression fix from v0.1.9.
+
+### The bug
+
+v0.1.9's `maturin build` produced `ciris_persist-0.1.9-cp312-cp312-manylinux_2_39_x86_64.whl`
+instead of the expected
+`ciris_persist-0.1.9-cp311-abi3-manylinux_2_34_x86_64.whl`. Lens
+runs on `python:3.11-slim` containers — a `cp312-cp312` wheel is
+not installable there, so the v0.1.9 release was unconsumable for
+lens.
+
+### Root cause
+
+v0.1.9 added `src/bin/emit_persist_extras.rs` (a build-time CI
+helper that emits the typed `PersistExtras` JSON). With the
+existing `python-source = "python"` mixed-mode layout in
+`pyproject.toml` plus the new `[[bin]]` target, maturin 1.13
+auto-detection switched to "binary project wheel" mode and
+started building the binary as the wheel's content instead of the
+PyO3 cdylib library. The `[lib]` block in `Cargo.toml` had no
+explicit `crate-type`, so maturin couldn't disambiguate.
+
+### The fix
+
+One-line `Cargo.toml` change:
+
+```toml
+[lib]
+name = "ciris_persist"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]   # ← v0.1.10
+```
+
+`cdylib` is the Python module maturin packages; `rlib` keeps the
+library importable from `src/bin/*` and integration tests. With
+the explicit declaration, maturin 1.13's mixed-mode build
+correctly picks the cdylib for the wheel and produces the
+abi3 form.
+
+### Verification
+
+```text
+maturin build --release --strip
+  → 📦 Built wheel for abi3 Python ≥ 3.11 to
+       target/wheels/ciris_persist-0.1.10-cp311-abi3-manylinux_2_34_x86_64.whl
+
+cargo run --release --bin emit_persist_extras
+  → {"supported_schema_versions":["2.7.0"],"migration_set_sha256":"sha256:...",
+     "dep_tree_sha256":"sha256:..."}
+```
+
+Both build paths work; the binary still runs for CI's manifest
+emission.
+
+### What's NOT in v0.1.10
+
+The CIRISRegistry `register` step (issue #2) ships in **v0.1.11**.
+Splitting that out so this release is purely the wheel-tagging
+fix that unblocks lens; the registration step lands once the
+bridge team has uploaded the v1.8.0 hybrid signing secrets and we
+have one valid signed manifest to register end-to-end.
+
+### Notes for lens team
+
+- Bump persist dep to v0.1.10. The wheel will install on
+  `python:3.11-slim` cleanly. v0.1.9 is broken on PyPI; **don't
+  use it.**
+- All v0.1.9 features (storage_descriptor authoritative,
+  PersistExtrasValidator, AV-4 closure) ship in v0.1.10
+  unchanged. Only the wheel-packaging shape differs.
+
+131 tests green; clippy clean; cargo-deny clean.
+
 ## [0.1.9] — 2026-05-01
 
 Consume CIRISVerify v1.8.0's substrate primitives. Five interlocking

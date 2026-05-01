@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS Trinity — signed events, time-series, runtime state."
@@ -126,6 +126,19 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [lib]
 name = "ciris_persist"
 path = "src/lib.rs"
+# v0.1.10 — explicit crate-type so maturin builds the PyO3 extension
+# module (cdylib) as the wheel's Python module, not as a "binary
+# project wheel" containing src/bin/* artifacts.
+#
+# Background: v0.1.9 added `src/bin/emit_persist_extras.rs` as a CI
+# helper. With the existing `python-source = "python"` mixed-mode
+# layout in pyproject.toml plus the new `[[bin]]` targets, maturin
+# 1.13's auto-detection picked the binary target instead of the lib,
+# producing cp312-cp312 wheels (no abi3) instead of cp311-abi3
+# wheels. Explicit `crate-type = ["cdylib", "rlib"]` makes the
+# lib unambiguous: cdylib is the Python module; rlib keeps the
+# library importable from src/bin/* and integration tests.
+crate-type = ["cdylib", "rlib"]
 
 # v0.1.7 — bench declarations. Each `[[bench]]` entry runs as a
 # separate harness binary so failures in one don't mask the rest.
