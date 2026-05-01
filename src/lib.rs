@@ -16,11 +16,11 @@
 //! tree implements.
 
 pub mod schema;
+pub mod store;
 pub mod verify;
 
 // Phase 1 surfaces still pending implementation:
 //   pub mod scrub;
-//   pub mod store;
 //   #[cfg(feature = "server")] pub mod server;
 //   #[cfg(feature = "pyo3")]   pub mod ffi;
 
@@ -36,6 +36,9 @@ pub enum Error {
 
     #[error("verify: {0}")]
     Verify(#[from] verify::Error),
+
+    #[error("store: {0}")]
+    Store(#[from] store::Error),
 }
 
 /// Crate-wide `Result` alias.
