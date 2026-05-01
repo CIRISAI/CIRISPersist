@@ -5,6 +5,125 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.1.3] — 2026-05-01
+
+### ⚠ Breaking changes
+
+- `Engine(...)` constructor in PyO3 now **requires** a
+  `signing_key_id` parameter. v0.1.2's no-key path is gone. See
+  `docs/INTEGRATION_LENS.md` §11 for the migration shape.
+
+### Cryptographic provenance — scrub-signing pipeline (FSD §3.3 step 3.5)
+
+- Every persisted row now carries a four-tuple scrub envelope:
+  `original_content_hash`, `scrub_signature`, `scrub_key_id`,
+  `scrub_timestamp`. **Always populated** — every component, every
+  trace level. No "skip signing" code path; uniform contract.
+- New direct dep on `ciris-keyring` (CIRISVerify's Rust crate, tag
+  `v1.6.4`). Pipeline uses `&dyn HardwareSigner` directly — no
+  wrapper trait. Hardware-backed where available (TPM / Secure
+  Enclave / StrongBox / DPAPI); `Ed25519SoftwareSigner` for tests
+  + dev / sovereign deployments.
+- Pipeline gains step 3.5 between scrub and decompose:
+  - `original_content_hash = sha256(canonical(component.data_pre_scrub))`
+  - `scrub_signature = ed25519_sign(canonical(component.data_post_scrub))`
+  - `scrub_key_id` + `scrub_timestamp` stamped per-row
+- New `IngestError::Sign(String)` variant and `kind()` token
+  `sign_keyring`. Maps to HTTP 5xx (operator-side fault, never
+  agent-side).
+- New `Engine.public_key_b64()` method exposes the deployment's
+  public key for registry / lens-discovery layer publication.
+
+### One key, three roles (PoB §3.2 — addressing IS identity)
+
+The scrub-signing key is also the deployment's Reticulum
+destination (`SHA256(public_key)[..16]`, when Phase 2.3 lands)
+and the registry-published public key. One Ed25519 key, three
+operational roles. No translation layer between cryptographic
+provenance and federation transport. THREAT_MODEL.md AV-25
+mitigation prose updated with the cost-asymmetry implication.
+
+### Migrations
+
+- **V003** (additive `ALTER TABLE`): adds the four envelope columns
+  to `cirislens.trace_events`. No backfill — pre-v0.1.3 rows have
+  NULLs (historical artifact bounded by 30-day retention). New
+  partial index `trace_events_scrub_key` on
+  `(scrub_key_id, ts DESC) WHERE scrub_signature IS NOT NULL` for
+  per-deployment queries.
+
+### Threat-model exposures closed
+
+- **AV-17** (P0) — `attempt_index` integer truncation. Typed
+  `MAX_ATTEMPT_INDEX = 1024` constant + new
+  `Error::AttemptIndexOutOfRange { got, max }` variant; replace
+  `as u32`/`as i32` casts with `try_into` throughout. Two regression
+  tests: `2^32` rejected, `MAX+1` rejected, `MAX` accepted.
+- **AV-18** (P1) — plaintext Postgres connection. New optional `tls`
+  feature (default off) pulling in `tokio-postgres-rustls` +
+  `rustls-native-certs`. Sovereign-mode deployments with remote DBs
+  enable via `cargo build --features postgres,server,tls,...`.
+- **AV-19** (P1) — graceful shutdown. `spawn_persister(...)` signature
+  changes from `-> IngestHandle` to `-> (IngestHandle, PersisterHandle)`.
+  Drop all `IngestHandle`s, `await persister.shutdown()` for clean
+  drain. New `shutdown_signal()` async helper resolves on
+  SIGTERM / SIGINT for the Phase 1.1 standalone server.
+- **AV-24** (NEW v0.1.3) — Lens-scrub bypass / forgery. Mitigated by
+  the always-on signed scrub envelope above.
+- **AV-25** (NEW v0.1.3) — Scrub-key compromise. Mitigated by
+  hardware-backed `ciris-keyring` (residual on `SoftwareSigner`
+  fallback documented).
+
+### General hardening (SECURITY_AUDIT_v0.1.2.md §4)
+
+- `#![forbid(unsafe_code)]` at lib root (§4.1).
+- `[profile.release] panic = "abort"` (§4.2): process dies fast on
+  bug, supervisor restarts, journal-replay path runs.
+- `[profile.release] overflow-checks = true` (§4.3): AV-17-class
+  integer-truncation bugs panic in CI release builds.
+- §4.12 PyO3 `catch_unwind` boundary — RESOLVED, subsumed by §4.2's
+  panic-abort. With panic=abort there is no unwind to UB on across
+  the FFI boundary; documented Option A vs B trade-off in the
+  audit doc.
+
+### CI / build manifest
+
+- New `tools/ciris_manifest.py` (vendored from a planned shared
+  refactor — tracking issue
+  [CIRISAI/CIRISAgent#707](https://github.com/CIRISAI/CIRISAgent/issues/707)).
+  Three subcommands (`generate` / `sign` / `register`); manifest
+  schema matches CIRISVerify's signature shape.
+- New CI job `build-manifest` after `pyo3-wheel`: generates +
+  Ed25519-signs (via `CIRIS_BUILD_SIGN_KEY` secret) + uploads
+  artifact. The `register` step is intentionally not yet wired;
+  CIRISRegistry needs persist-side support first
+  (`docs/TODO_REGISTRY.md`).
+
+### Tests
+
+- 95 lib + 9 fixture = 104 tests, all green.
+- New regression coverage:
+  - AV-17: `attempt_index` 2^32 → typed rejection
+  - AV-19: graceful shutdown drains pending under load
+  - AV-24: every row's `scrub_signature` round-trips through
+    `ed25519_verify(scrub_signature, canonical(payload), public_key)`
+  - PostgresBackend `as i32` paths use bounded `try_into`
+
+### Documentation
+
+- `FSD/CIRIS_PERSIST.md` updated with §3.3 step 3.5, §3.4
+  robustness primitive #7, §3.7 schema additions. "One key, three
+  roles" framing throughout.
+- `docs/THREAT_MODEL.md` updated with AV-17..23 promoted from audit
+  + AV-24/25 added; mitigation matrix and posture summary current.
+- `docs/SECURITY_AUDIT_v0.1.2.md` updated with §4.12 resolution
+  rationale.
+- `docs/INTEGRATION_LENS.md` rewritten for v0.1.3 — §11 new
+  scrub-signing pipeline section with migration path from v0.1.2.
+- `docs/TODO_REGISTRY.md` (NEW) — tracks the cross-repo refactor
+  ([CIRISAgent#707](https://github.com/CIRISAI/CIRISAgent/issues/707))
+  and the registry-side persist-support work.
+
 ## [0.1.2] — 2026-05-01
 
 ### Security — threat-model hot-fixes

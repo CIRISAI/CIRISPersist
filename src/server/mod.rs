@@ -178,15 +178,21 @@ mod tests {
     }
 
     fn build_app(queue_depth: usize) -> (Router, Arc<MemoryBackend>) {
+        use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner};
         let backend = Arc::new(MemoryBackend::new());
         let (_dir, journal) = temp_journal();
         std::mem::forget(_dir); // keep tempdir alive for test duration
+        let mut signer = Ed25519SoftwareSigner::new("server-test-signer");
+        signer.import_key(&[0xA5u8; 32]).expect("import_key");
+        let signer_arc: Arc<dyn HardwareSigner> = Arc::new(signer);
         let (handle, persister) = spawn_persister(
             queue_depth,
             backend.clone(),
             Arc::new(PythonJsonDumpsCanonicalizer),
             Arc::new(NullScrubber),
             journal.clone(),
+            signer_arc,
+            "server-test-signer".to_owned(),
         );
         // Detach the persister handle from the test's lifetime;
         // graceful-shutdown coverage lives in queue::tests.

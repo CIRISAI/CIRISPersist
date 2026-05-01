@@ -18,6 +18,8 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
+use ciris_keyring::HardwareSigner;
+
 use crate::ingest::{IngestError, IngestPipeline};
 use crate::journal::{Journal, JournalError};
 use crate::scrub::Scrubber;
@@ -173,6 +175,8 @@ pub fn spawn_persister<B, C, S>(
     canonicalizer: Arc<C>,
     scrubber: Arc<S>,
     journal: Arc<Journal>,
+    signer: Arc<dyn HardwareSigner>,
+    signer_key_id: String,
 ) -> (IngestHandle, PersisterHandle)
 where
     B: Backend + 'static,
@@ -189,6 +193,8 @@ where
         let backend_clone = backend.clone();
         let canon_clone = canonicalizer.clone();
         let scrub_clone = scrubber.clone();
+        let signer_clone_outer = signer.clone();
+        let signer_key_id_outer = signer_key_id.clone();
 
         let replay_result = journal.replay(|_seq, bytes| {
             // Synchronous handler — bridge to async via block_on on
@@ -197,6 +203,8 @@ where
             let backend = backend_clone.clone();
             let canon = canon_clone.clone();
             let scrub = scrub_clone.clone();
+            let signer_clone = signer_clone_outer.clone();
+            let signer_key_id_clone = signer_key_id_outer.clone();
             let bytes_owned = bytes.to_vec();
             let rt = tokio::runtime::Handle::current();
             let outcome = std::thread::scope(|s| {
@@ -206,6 +214,8 @@ where
                             backend: &*backend,
                             canonicalizer: &*canon,
                             scrubber: &*scrub,
+                            signer: &*signer_clone,
+                            signer_key_id: &signer_key_id_clone,
                         };
                         pipeline.receive_and_persist(&bytes_owned).await
                     })
@@ -227,6 +237,8 @@ where
                 backend: &*backend,
                 canonicalizer: &*canonicalizer,
                 scrubber: &*scrubber,
+                signer: &*signer,
+                signer_key_id: &signer_key_id,
             };
             match pipeline.receive_and_persist(&job.bytes).await {
                 Ok(summary) => {
@@ -273,6 +285,16 @@ mod tests {
     use crate::store::MemoryBackend;
     use crate::verify::PythonJsonDumpsCanonicalizer;
 
+    /// Test-only signer factory (Ed25519SoftwareSigner with a fixed
+    /// seed). Returns Arc<dyn HardwareSigner> + key id.
+    fn test_signer_arc() -> (Arc<dyn HardwareSigner>, String) {
+        use ciris_keyring::Ed25519SoftwareSigner;
+        let key_id = "test-scrub-key-v1".to_owned();
+        let mut signer = Ed25519SoftwareSigner::new(&key_id);
+        signer.import_key(&[0xA5u8; 32]).expect("import_key");
+        (Arc::new(signer) as Arc<dyn HardwareSigner>, key_id)
+    }
+
     fn temp_journal() -> (tempfile::TempDir, Arc<Journal>) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("j.redb");
@@ -286,12 +308,15 @@ mod tests {
     async fn full_queue_returns_429_typed() {
         let backend = Arc::new(MemoryBackend::new());
         let (_dir, journal) = temp_journal();
+        let (signer, signer_key_id) = test_signer_arc();
         let (handle, _persister) = spawn_persister(
             /* queue_depth */ 1,
             backend.clone(),
             Arc::new(PythonJsonDumpsCanonicalizer),
             Arc::new(NullScrubber),
             journal,
+            signer,
+            signer_key_id,
         );
 
         // Saturate the queue with garbage bytes (which the persister
@@ -330,12 +355,15 @@ mod tests {
         assert_eq!(journal.pending_count().unwrap(), 1);
 
         let backend = Arc::new(MemoryBackend::new());
+        let (signer, signer_key_id) = test_signer_arc();
         let (handle, _persister) = spawn_persister(
             DEFAULT_QUEUE_DEPTH,
             backend,
             Arc::new(PythonJsonDumpsCanonicalizer),
             Arc::new(NullScrubber),
             journal.clone(),
+            signer,
+            signer_key_id,
         );
 
         // Yield so the persister loop has a chance to run.
@@ -369,12 +397,15 @@ mod tests {
         // integration suite once Postgres is wired up.
         let backend = Arc::new(MemoryBackend::new());
         let (_dir, journal) = temp_journal();
+        let (signer, signer_key_id) = test_signer_arc();
         let (handle, _persister) = spawn_persister(
             DEFAULT_QUEUE_DEPTH,
             backend,
             Arc::new(PythonJsonDumpsCanonicalizer),
             Arc::new(NullScrubber),
             journal,
+            signer,
+            signer_key_id,
         );
         assert!(handle.capacity_remaining() > 0);
     }
@@ -389,12 +420,15 @@ mod tests {
     async fn graceful_shutdown_drains_pending() {
         let backend = Arc::new(MemoryBackend::new());
         let (_dir, journal) = temp_journal();
+        let (signer, signer_key_id) = test_signer_arc();
         let (handle, persister) = spawn_persister(
             DEFAULT_QUEUE_DEPTH,
             backend.clone(),
             Arc::new(PythonJsonDumpsCanonicalizer),
             Arc::new(NullScrubber),
             journal,
+            signer,
+            signer_key_id,
         );
 
         // Submit several malformed bodies (they reject at

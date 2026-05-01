@@ -86,6 +86,15 @@ pub fn decompose(trace: &CompleteTrace) -> Result<Decomposed, Error> {
             signature_verified: true,
             schema_version: trace.trace_schema_version.as_str().to_owned(),
             pii_scrubbed: false,
+            // FSD §3.7 envelope fields. decompose itself doesn't sign;
+            // the IngestPipeline (step 3.5) populates these per-row
+            // after this function returns. Pure-decomposition callers
+            // (tests, sovereign-mode tools) get None and can fill in
+            // their own envelopes if needed.
+            original_content_hash: None,
+            scrub_signature: None,
+            scrub_key_id: None,
+            scrub_timestamp: None,
         };
         events.push(event_row);
 

@@ -175,6 +175,13 @@ mod tests {
             signature_verified: true,
             schema_version: "2.7.0".into(),
             pii_scrubbed: false,
+            // FSD §3.7 envelope columns: tests for the in-memory
+            // dedup / idempotency surface use None — pipeline tests
+            // populate them.
+            original_content_hash: None,
+            scrub_signature: None,
+            scrub_key_id: None,
+            scrub_timestamp: None,
         }
     }
 

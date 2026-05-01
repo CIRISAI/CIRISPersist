@@ -21,6 +21,7 @@
 
 use std::sync::Arc;
 
+use ciris_keyring::{get_platform_signer, HardwareSigner};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
@@ -43,23 +44,40 @@ pub struct PyEngine {
     backend: Arc<PostgresBackend>,
     runtime: Arc<Runtime>,
     scrubber: Arc<dyn Scrubber>,
+    signer: Arc<dyn HardwareSigner>,
+    signer_key_id: String,
 }
 
 #[pymethods]
 impl PyEngine {
-    /// Connect to Postgres, run migrations, build the ingest
-    /// pipeline. Optionally accepts a Python callable that receives
-    /// each batch as a JSON-compatible dict and returns
-    /// `(scrubbed_dict, modified_count)`.
+    /// Connect to Postgres, run migrations, instantiate the
+    /// scrub-signing key via ciris-keyring (idempotent — generates
+    /// if missing, returns existing otherwise), and build the
+    /// ingest pipeline.
     ///
-    /// Raises `RuntimeError` if Postgres is unreachable or
-    /// migrations fail.
+    /// **BREAKING CHANGE from v0.1.2**: `signing_key_id` is now
+    /// REQUIRED. The v0.1.2 "no-key" path is gone — every persisted
+    /// row carries a cryptographic scrub envelope (FSD §3.3 step
+    /// 3.5; THREAT_MODEL.md AV-24). Same-key principle: agent
+    /// deployments point this at the agent's existing wire-format
+    /// §8 signing key id; lens deployments use a lens-owned id like
+    /// `lens-scrub-v1`.
+    ///
+    /// **One key, three roles** (PoB §3.2): the signing key here is
+    /// also the deployment's Reticulum destination address (when
+    /// Phase 2.3 lands) and the registry-published public key.
+    ///
+    /// Raises `RuntimeError` if Postgres is unreachable, migrations
+    /// fail, or the keyring is inaccessible.
     #[new]
-    #[pyo3(signature = (dsn, scrubber=None))]
-    fn new(py: Python<'_>, dsn: &str, scrubber: Option<Py<PyAny>>) -> PyResult<Self> {
+    #[pyo3(signature = (dsn, signing_key_id, scrubber=None))]
+    fn new(
+        py: Python<'_>,
+        dsn: &str,
+        signing_key_id: &str,
+        scrubber: Option<Py<PyAny>>,
+    ) -> PyResult<Self> {
         // Build a multi-thread runtime once per Engine instance.
-        // Phase 1.9 leans on the conservative shape (one runtime per
-        // engine) per CRATE_RECOMMENDATIONS §2.7 + FSD §7 #2.
         let runtime =
             Runtime::new().map_err(|e| PyRuntimeError::new_err(format!("tokio runtime: {e}")))?;
         let runtime = Arc::new(runtime);
@@ -78,6 +96,17 @@ impl PyEngine {
             })
         })?;
 
+        // ciris-keyring: hardware-backed signer where available,
+        // SoftwareSigner fallback otherwise. get_platform_signer
+        // is idempotent: returns existing key if present, generates
+        // and stores under the alias if not.
+        let signer_key_id_owned = signing_key_id.to_owned();
+        let signer = py.detach(|| {
+            get_platform_signer(&signer_key_id_owned)
+                .map_err(|e| PyRuntimeError::new_err(format!("ciris-keyring: {e}")))
+        })?;
+        let signer: Arc<dyn HardwareSigner> = Arc::from(signer);
+
         // Wrap the scrubber. None → NullScrubber (mission constraint:
         // explicit choice; the caller knows their trace_level).
         let scrubber: Arc<dyn Scrubber> = match scrubber {
@@ -91,6 +120,29 @@ impl PyEngine {
             backend,
             runtime,
             scrubber,
+            signer,
+            signer_key_id: signing_key_id.to_owned(),
+        })
+    }
+
+    /// Return the deployment's Ed25519 public key (base64) — for
+    /// publishing to the registry / lens-discovery layer at deploy
+    /// time. Same key that signs every persisted row's scrub
+    /// envelope; same key that becomes the Reticulum destination
+    /// when Phase 2.3 lands (one key, three roles).
+    fn public_key_b64(&self, py: Python<'_>) -> PyResult<String> {
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine as _;
+        let signer = self.signer.clone();
+        let runtime = self.runtime.clone();
+        py.detach(|| {
+            runtime.block_on(async move {
+                let bytes = signer
+                    .public_key()
+                    .await
+                    .map_err(|e| PyRuntimeError::new_err(format!("public_key: {e}")))?;
+                Ok::<_, PyErr>(BASE64.encode(bytes))
+            })
         })
     }
 
@@ -192,6 +244,8 @@ impl PyEngine {
         let bytes = body.as_bytes().to_vec();
         let backend = self.backend.clone();
         let scrubber = self.scrubber.clone();
+        let signer = self.signer.clone();
+        let signer_key_id = self.signer_key_id.clone();
         let runtime = self.runtime.clone();
 
         let summary = py.detach(|| {
@@ -200,6 +254,8 @@ impl PyEngine {
                     backend: &*backend,
                     canonicalizer: &PythonJsonDumpsCanonicalizer,
                     scrubber: &*scrubber,
+                    signer: &*signer,
+                    signer_key_id: &signer_key_id,
                 };
                 pipeline.receive_and_persist(&bytes).await
             })
@@ -229,8 +285,13 @@ impl PyEngine {
                     IngestError::Schema(_) | IngestError::Verify(_) | IngestError::Scrub(_) => {
                         Err(PyValueError::new_err(kind))
                     }
-                    // Store → RuntimeError (server-fault; 5xx).
-                    IngestError::Store(_) => Err(PyRuntimeError::new_err(kind)),
+                    // Store / Sign → RuntimeError (server-fault; 5xx).
+                    // AV-25: signing failure is operator-side
+                    // (keyring locked, hardware unavailable, etc.) —
+                    // never the agent's fault, never a 4xx.
+                    IngestError::Store(_) | IngestError::Sign(_) => {
+                        Err(PyRuntimeError::new_err(kind))
+                    }
                 }
             }
         }

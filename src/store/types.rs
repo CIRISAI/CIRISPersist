@@ -66,6 +66,25 @@ pub struct TraceEventRow {
     pub schema_version: String,
     /// True after the scrubber pass ran.
     pub pii_scrubbed: bool,
+
+    // ─── v0.1.3 scrub envelope columns (FSD §3.7; THREAT_MODEL.md
+    // AV-24/25). Always populated on rows produced by the v0.1.3+
+    // pipeline; pre-v0.1.3 rows have these as None.
+    /// sha256 of canonical(component.data_pre_scrub) — proves what
+    /// the scrubber input was without retaining the original bytes.
+    pub original_content_hash: Option<String>,
+    /// base64(ed25519_sign(canonical(component.data_post_scrub))) —
+    /// cryptographic proof that *this deployment* processed *this
+    /// payload* at *this time*, verifiable by any peer with the
+    /// deployment's published public key.
+    pub scrub_signature: Option<String>,
+    /// The deployment's signing-key id (lens-scrub-v1, etc.). Same
+    /// key as the agent's wire-format §8 key on Phase 2+
+    /// deployments — single-key principle.
+    pub scrub_key_id: Option<String>,
+    /// When the scrub+sign happened. Bounds the window between the
+    /// trace's `completed_at` and lens handling.
+    pub scrub_timestamp: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// A row landing on `cirislens.trace_llm_calls`

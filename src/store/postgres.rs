@@ -94,9 +94,9 @@ impl PostgresBackend {
             // failures don't kill the load.
             let cert_result = rustls_native_certs::load_native_certs();
             for cert in cert_result.certs {
-                roots.add(cert).map_err(|e| {
-                    Error::Backend(format!("native-cert add: {e}"))
-                })?;
+                roots
+                    .add(cert)
+                    .map_err(|e| Error::Backend(format!("native-cert add: {e}")))?;
             }
             if !cert_result.errors.is_empty() {
                 tracing::warn!(
@@ -164,8 +164,9 @@ impl Backend for PostgresBackend {
                             attempt_index, ts, agent_name, agent_id_hash, cognitive_state, \
                             trace_level, payload, cost_llm_calls, cost_tokens, cost_usd, \
                             signature, signing_key_id, signature_verified, schema_version, \
-                            pii_scrubbed, audit_sequence_number, audit_entry_hash, audit_signature";
-        const N_COLS: usize = 23;
+                            pii_scrubbed, audit_sequence_number, audit_entry_hash, audit_signature, \
+                            original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp";
+        const N_COLS: usize = 27;
 
         let mut sql = String::with_capacity(2048);
         sql.push_str("INSERT INTO cirislens.trace_events (");
@@ -216,16 +217,17 @@ impl Backend for PostgresBackend {
             params.push(Box::new(row.step_point.clone()));
             params.push(Box::new(row.event_type.as_str().to_owned()));
             // THREAT_MODEL.md AV-17 (v0.1.3): bounded by
-// schema::MAX_ATTEMPT_INDEX at parse time, so this fits in i32.
-// `try_from` rejects out-of-range explicitly instead of
-// silently wrapping.
-params.push(Box::new(
-    i32::try_from(row.attempt_index)
-        .map_err(|_| Error::Backend(format!(
-            "attempt_index {} exceeds i32::MAX (postgres INT)",
-            row.attempt_index
-        )))?,
-));
+            // schema::MAX_ATTEMPT_INDEX at parse time, so this fits in i32.
+            // `try_from` rejects out-of-range explicitly instead of
+            // silently wrapping.
+            params.push(Box::new(i32::try_from(row.attempt_index).map_err(
+                |_| {
+                    Error::Backend(format!(
+                        "attempt_index {} exceeds i32::MAX (postgres INT)",
+                        row.attempt_index
+                    ))
+                },
+            )?));
             params.push(Box::new(row.ts));
             params.push(Box::new(row.agent_name.clone()));
             params.push(Box::new(row.agent_id_hash.clone()));
@@ -243,6 +245,11 @@ params.push(Box::new(
             params.push(Box::new(audit_seq));
             params.push(Box::new(audit_hash));
             params.push(Box::new(audit_sig));
+            // v0.1.3 scrub envelope columns (V003).
+            params.push(Box::new(row.original_content_hash.clone()));
+            params.push(Box::new(row.scrub_signature.clone()));
+            params.push(Box::new(row.scrub_key_id.clone()));
+            params.push(Box::new(row.scrub_timestamp));
         }
         // THREAT_MODEL.md AV-9: dedup-key target now includes
         // agent_id_hash so a malicious agent reusing another agent's
@@ -319,14 +326,21 @@ params.push(Box::new(
             params.push(Box::new(r.parent_event_id));
             params.push(Box::new(r.parent_event_type.as_str().to_owned()));
             // THREAT_MODEL.md AV-17 (v0.1.3): same bound on parent_attempt_index.
-params.push(Box::new(
-    i32::try_from(r.parent_attempt_index)
-        .map_err(|_| Error::Backend(format!(
-            "parent_attempt_index {} exceeds i32::MAX",
-            r.parent_attempt_index
-        )))?,
-));
-            params.push(Box::new(r.attempt_index as i32));
+            params.push(Box::new(i32::try_from(r.parent_attempt_index).map_err(
+                |_| {
+                    Error::Backend(format!(
+                        "parent_attempt_index {} exceeds i32::MAX",
+                        r.parent_attempt_index
+                    ))
+                },
+            )?));
+            // Same bound for the LLM_CALL row's own attempt_index.
+            params.push(Box::new(i32::try_from(r.attempt_index).map_err(|_| {
+                Error::Backend(format!(
+                    "attempt_index {} exceeds i32::MAX",
+                    r.attempt_index
+                ))
+            })?));
             params.push(Box::new(r.ts));
             params.push(Box::new(r.duration_ms));
             params.push(Box::new(r.handler_name.clone()));
@@ -501,6 +515,10 @@ mod tests {
             signature_verified: true,
             schema_version: "2.7.0".into(),
             pii_scrubbed: false,
+            original_content_hash: None,
+            scrub_signature: None,
+            scrub_key_id: None,
+            scrub_timestamp: None,
         };
 
         let r1 = backend

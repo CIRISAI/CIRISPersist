@@ -1,4 +1,9 @@
-# Lens Integration Guide — `ciris-persist` v0.1.2
+# Lens Integration Guide — `ciris-persist` v0.1.3
+
+> **BREAKING CHANGE from v0.1.2:** `Engine.__init__` now requires a
+> `signing_key_id` parameter. The v0.1.2 "no-key" path is gone — every
+> persisted row carries a cryptographic scrub envelope (FSD §3.3 step
+> 3.5; THREAT_MODEL.md AV-24). See §11 below for the migration shape.
 
 **Audience:** the CIRISLens team. You're swapping the 92-column
 `accord_traces` `INSERT` path in `api/accord_api.py` for
@@ -14,14 +19,21 @@ two files, and registering one public key per agent.
 ## TL;DR
 
 ```python
-# api/accord_api.py (after)
+# api/accord_api.py (after, v0.1.3)
 from ciris_persist import Engine
 from cirislens_core.scrub import scrub_envelope_dict  # your existing scrubber
 
 ENGINE = Engine(
     dsn=os.environ["CIRISLENS_DB_URL"],
+    signing_key_id="lens-scrub-v1",   # REQUIRED in v0.1.3
     scrubber=lambda envelope: (scrub_envelope_dict(envelope), 0),
 )
+
+# One-time, at deploy: publish the lens's public key. Same key that
+# signs every row's scrub envelope; same key that becomes the lens's
+# Reticulum destination (when Phase 2.3 lands); same key the registry
+# stores. PoB §3.2 — addressing IS identity.
+publish_to_registry("lens-scrub-v1", ENGINE.public_key_b64())
 
 # One-time, on agent registration:
 ENGINE.register_public_key(
@@ -424,7 +436,101 @@ to catch TimescaleDB version drift early.
 
 ---
 
-## 11. What's NOT in v0.1.x
+## 11. v0.1.3 — scrub-signing pipeline (BREAKING from v0.1.2)
+
+Every persisted row now carries a cryptographic scrub envelope:
+`(original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp)`.
+**Always populated, every component, every trace level.** No
+"skip signing" code path; the v0.1.2 no-key API is gone.
+
+### What the lens drops
+
+- `pii_scrubber._signing_key` — the scrub key now lives in
+  `ciris-keyring` (CIRISVerify's Rust crate). The Python process
+  never holds the seed bytes; the seed never crosses the FFI boundary.
+- `accord_api.py`'s `sign_content(...)` call — persist signs every
+  row internally as part of step 3.5 (FSD §3.3).
+- `lens_signing_keys` table — superseded by `ciris-keyring`'s OS
+  keyring backing (Secret Service / Keychain / DPAPI / Keystore;
+  hardware-backed where available — TPM, Secure Enclave, StrongBox).
+
+### What the lens gains
+
+- `Engine(signing_key_id="lens-scrub-v1", ...)` REQUIRED at ctor.
+  Idempotent — generates the key on first run via ciris-keyring's
+  `get_platform_signer(alias)`, returns existing on subsequent runs.
+- `engine.public_key_b64()` — base64-encoded Ed25519 public key for
+  publishing to the registry. Same key that signs every row.
+
+### One key, three roles (PoB §3.2)
+
+The signing key is **also** the deployment's Reticulum destination
+(`SHA256(public_key)[..16]`, when Phase 2.3 lands) and the
+registry-published public key. One key, three roles:
+
+1. Cryptographic provenance (signs scrub envelope)
+2. Federation transport address (Reticulum destination, Phase 2.3)
+3. Registry identity (the public key consumers look up)
+
+Compromise the key, you compromise all three roles simultaneously.
+That triples the cost-asymmetry — strong argument for
+hardware-backed keyring entries (TPM, Secure Enclave) over
+software-fallback in production.
+
+### Per-batch latency tax
+
+Signing happens per-component per-batch. Cost: one Ed25519 sign per
+component (~30 µs hardware-backed, ~100 µs software-backed). For
+the agent's default `batch_size = 10` events × ~14 components =
+~140 sign calls per batch; at hardware speed, single-digit
+milliseconds added per batch. Acceptable.
+
+### What downstream peers verify
+
+A peer fetching rows from the lens (Phase 2.3 federation; or any
+auditor with DB read access today) verifies:
+
+```
+ed25519_verify(
+    scrub_signature,
+    canonical(payload),                  # JSONB column post-scrub
+    registry.public_key_for(scrub_key_id)
+)
+```
+
+Bilateral cryptography: agent's wire-format §8 signature proves
+authorship of the original; the lens's v0.1.3 scrub envelope proves
+handling. PoB §3.1 — "the lens role is a function any peer can run
+on data the peer already has" — becomes cryptographically
+attestable, not socially trusted.
+
+### Migration from v0.1.2 → v0.1.3
+
+If your lens is already running v0.1.2 in production:
+
+1. Apply the V003 migration (additive ALTER TABLE — no data loss):
+   ```sql
+   ALTER TABLE cirislens.trace_events
+       ADD COLUMN IF NOT EXISTS original_content_hash TEXT,
+       ADD COLUMN IF NOT EXISTS scrub_signature       TEXT,
+       ADD COLUMN IF NOT EXISTS scrub_key_id          TEXT,
+       ADD COLUMN IF NOT EXISTS scrub_timestamp       TIMESTAMPTZ;
+   ```
+   Migrations run automatically on `Engine()` construction; or apply
+   directly if your admin path needs the bump first.
+2. Update `Engine(...)` ctor to add `signing_key_id="lens-scrub-v1"`.
+3. Add the deploy-time `publish_to_registry` call.
+4. Pre-v0.1.3 rows have NULLs in the four envelope columns. That's
+   expected — they pre-date the contract. Queries needing the
+   provenance guarantee filter on `WHERE scrub_signature IS NOT NULL`.
+
+The recommended path for lenses that haven't yet started v0.1.2
+integration: **skip v0.1.2, jump straight to v0.1.3**. Avoids the
+double-handler-rewrite that would otherwise happen.
+
+---
+
+## 12. What's NOT in v0.1.x
 
 - **Phase 2** (agent's `audit_log` + `service_correlations`): the
   Backend trait shape is sealed for it, but the methods return
@@ -442,7 +548,7 @@ revisited.
 
 ---
 
-## 12. Contact / source-of-truth
+## 13. Contact / source-of-truth
 
 - Crate repo: https://github.com/CIRISAI/CIRISPersist
 - FSD: [`FSD/CIRIS_PERSIST.md`](../FSD/CIRIS_PERSIST.md)
