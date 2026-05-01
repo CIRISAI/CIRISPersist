@@ -125,12 +125,33 @@ Per batch:
 
 1. Deserialize envelope → `BatchEnvelope { events, trace_level, trace_schema_version, batch_timestamp, consent_timestamp, signature, signing_key_id, … }`.
 2. Verify Ed25519 signature against canonical payload bytes (sort_keys + `(,:)` separators) using `accord_public_keys` lookup. Reject on mismatch.
-3. If `trace_level = full_traces`, run PII scrub via existing `cirislens-core` scrubber (no behavior change).
-4. For each event in batch:
-   - Decompose `CompleteTrace.components` → one `trace_events` row per component, keyed by `(trace_id, thought_id, event_type, attempt_index)`.
+3. If `trace_level = full_traces`, run PII scrub via existing `cirislens-core` scrubber (no behavior change). Hold the **pre-scrub canonical bytes** in memory through this step (one extra `Vec<u8>` per component, dropped at step 5) — needed for step 3.5's hash. At `generic` and `detailed`, scrubbing may still mutate sub-fields per the scrubber's own policy; the contract just doesn't *require* it. In every case, `data_pre_scrub == data_post_scrub` is the no-op path — the next step still runs over them.
+4. **(NEW v0.1.3) Sign per-component envelope. Always.** Every persisted row gets cryptographic provenance, every trace level, every deployment. The signing key is **never null** — `ciris-keyring` (CIRISVerify's Rust crate) guarantees there is always a key to sign with, hardware-backed where available, software-backed otherwise. For each component:
+   - `original_content_hash = sha256(canonical(component.data_pre_scrub))`
+   - `scrub_signature = ed25519_sign(canonical(component.data_post_scrub))` via the deployment's keyring-resident signing key.
+   - `scrub_key_id = signer.key_id()`
+   - `scrub_timestamp = Utc::now()`
+
+   **Same-key principle across deployments**:
+   - **Lens deployment** (Phase 1 — this FSD): the key is owned by the lens, identifier conventionally `lens-scrub-v1` (or per-deployment scheme). Generated once via `ciris-keyring` bootstrap, stored under the OS keyring (Secret Service / Keychain / DPAPI / Keystore) backed by hardware where available.
+   - **Agent deployment** (Phase 2+, FSD §4): the key is *the same key the agent already uses for its wire-format §8 signature*. There is no separate "agent-scrub key" vs "agent-audit key" — one identity, one signing key, two attestations (per-action audit chain + per-component scrub envelope). The agent's existing keyring entry is reused; persist looks it up by id rather than minting a new one.
+
+   The signing call is on the hot path. Cost: one Ed25519 sign per component (~30 µs hardware-backed, ~100 µs software-backed) — bounded by component count per batch (typical: 12-16). For the agent's default `batch_size = 10` events × ~14 components = ~140 sign calls per batch; at hardware speeds, single-digit milliseconds added to the per-batch latency budget. Acceptable.
+
+   **Why this matters (mission alignment).** Before v0.1.3, the `pii_scrubbed = true` boolean column was the only attestation that scrubbing happened. Trivially forgeable by anyone with DB write. After v0.1.3, every persisted row carries cryptographic proof that *this specific* deployment handled *this specific* payload at *this specific* time, verifiable by any peer with the published public key.
+
+   PoB §3.1 — "the lens role is a function any peer can run on data the peer already has" — becomes *cryptographically attestable* rather than socially trusted. The federation primitive's substrate now has bilateral cryptography: the agent's wire-format §8 signature proves authorship; the v0.1.3 scrub envelope proves handling. A peer fetching a row can verify both ends.
+
+   MISSION.md §2 — `scrub/` constraint "PII never crosses the persistence boundary at trace levels where it isn't warranted" — flips from a *trust* claim to a *verifiable* claim. The unconditional nature is load-bearing: special-casing by trace_level (e.g., "skip signing at generic since there's no PII to attest about") would create a path where a misconfigured deployment claims to be at GENERIC while emitting unverified content. Every level signs; uniform contract; no special cases (MISSION.md §3 anti-pattern #3 — "no bypass branches; admin keys, agent keys, and federation peer keys all verify by the same path").
+
+   The hash + signature also closes a privacy-bridging gap: a lens configured at higher `trace_level` than its scrubber permits cannot pretend it scrubbed when it didn't. A downstream auditor with the `original_content_hash` + `scrub_signature` + the deployment's public key + the bytes that ended up in storage can verify the deployment's attestation without needing the original content.
+
+5. For each event in batch:
+   - Decompose `CompleteTrace.components` → one `trace_events` row per component, keyed by `(agent_id_hash, trace_id, thought_id, event_type, attempt_index, ts)`. (THREAT_MODEL.md AV-9: `agent_id_hash` is the dedup-key prefix from v0.1.2 onward.)
    - Map `LLM_CALL` components → `trace_llm_calls` rows, linked via `parent_event_id`.
    - Capture audit anchor on `ACTION_RESULT` rows.
-5. Batch INSERT via `COPY ... FROM STDIN BINARY` for `trace_events`, separate batch for `trace_llm_calls`. Per-batch transaction; on conflict `(trace_id, thought_id, event_type, attempt_index)` do nothing (adapter retries are safe).
+   - Capture scrub envelope (`original_content_hash`, `scrub_signature`, `scrub_key_id`, `scrub_timestamp`) on every row when step 3.5 produced one.
+6. Batch INSERT via parameterized `INSERT ... VALUES (...) ON CONFLICT DO NOTHING` for `trace_events`, separate batch for `trace_llm_calls`. Per-batch transaction; on conflict `(agent_id_hash, trace_id, thought_id, event_type, attempt_index, ts)` do nothing (adapter retries are safe). (`COPY ... FROM STDIN BINARY` is the long-term shape per FSD original wording; `INSERT VALUES + ON CONFLICT` works for the agent's default `batch_size=10` and supports the conflict path natively.)
 
 ### 3.4 Robustness primitives
 
@@ -138,10 +159,19 @@ These land in Phase 1 and carry through Phases 2 and 3:
 
 1. **Bounded ingest queue.** `tokio::sync::mpsc` channel, capacity ~1024 batches. Producer (axum handler / PyO3 entry) blocks on full queue; persister side is the single consumer that owns Postgres.
 2. **Local journal.** `redb` append-only file at `/var/lib/cirislens/journal.redb`. If Postgres is unreachable on a batch, the batch is journaled and the persister reschedules. On startup, replay any journaled batches before accepting new traffic. Append-only event semantics make this trivially safe.
-3. **Schema-version gate.** Reject `trace_schema_version` not in `SUPPORTED_VERSIONS` with HTTP 422 + `{"detail": "unsupported trace_schema_version", "supported": [...]}`.
-4. **Idempotency.** Unique index on `(trace_id, thought_id, event_type, attempt_index)`; `ON CONFLICT DO NOTHING`. Adapter retries can't double-insert.
+3. **Schema-version gate.** Reject `trace_schema_version` not in `SUPPORTED_VERSIONS` with HTTP 422 + `{"detail": "schema_unsupported_version", ...}`. (v0.1.2 AV-15: HTTP-surfaced errors carry stable `kind()` tokens; verbose form to tracing logs only.)
+4. **Idempotency.** Unique index on `(agent_id_hash, trace_id, thought_id, event_type, attempt_index, ts)`; `ON CONFLICT DO NOTHING`. Adapter retries can't double-insert. (v0.1.2 THREAT_MODEL.md AV-9: `agent_id_hash` is the dedup-key prefix so cross-agent dedup-tuple reuse cannot DOS a victim's traces.)
 5. **Backpressure.** Full queue → HTTP 429 with `Retry-After`. Agent-side already retries.
-6. **Memory-safe parse.** No `serde_json::Value` anywhere in the hot path. Concrete structs from §3.1 schema/ module.
+6. **Memory-safe parse.** No `serde_json::Value` anywhere in the hot path. Concrete structs from §3.1 schema/ module. Body-size cap `MAX_INGEST_BODY_BYTES = 8 MiB` at the axum router (v0.1.2 AV-7); `data` recursion-depth cap `MAX_DATA_DEPTH = 32` (v0.1.2 AV-6); `MAX_ATTEMPT_INDEX = 1024` typed bound (v0.1.3 AV-17).
+7. **(NEW v0.1.3) Always-present signing key, isolated in `ciris-keyring`.** The signing key is **never null**. CIRISVerify guarantees `ciris-keyring` always has a key for the configured `key_id` — generated on first call, hardware-backed where available (Linux Secret Service / TPM 2.0; macOS Keychain / Secure Enclave; iOS / Android StrongBox; Windows DPAPI / TPM), software-backed via `SoftwareSigner` fallback otherwise. Persist depends directly on `ciris-keyring` (CIRISVerify's Rust crate); the consuming Python process (FastAPI, agent) never holds the signing-key seed in memory — the bytes never cross the FFI boundary.
+
+   `Engine` construction takes `signing_key_id` as a **required** parameter. The ctor calls into the keyring's bootstrap path internally — idempotent: returns the existing key if it exists, generates a new seed and stores it if not. The lens / agent then publishes the corresponding public key to the registry / lens-discovery layer. There is no "no-signing" mode; the substrate's contract assumes every row carries provenance.
+
+   On the agent (Phase 2+ deployments, FSD §4): persist points at the agent's existing wire-format §8 signing key by id — same key, no new keyring entries. The agent's identity stays single-keyed.
+
+   (Secondary mitigation against THREAT_MODEL.md AV-25 "scrub-key compromise"; the `SoftwareSigner` fallback is acceptable for dev / sovereign deployments without hardware backing, and is named as a residual risk in §8 of the threat model.)
+
+   Mission alignment: MISSION.md §2 — `ffi/` "every divergence between iOS and server reasoning is a place the Federated Ratchet can be silently broken — different bug surfaces, different invariants, different PII boundaries. One core; many shells." The keyring dep is the realization of that on the key-storage axis. MISSION.md §3 anti-pattern #3 ("no bypass branches; same path for every key") is realized by the always-present-signing rule: there is no "skip signing" code path to attack.
 
 ### 3.5 Migration / cutover
 
@@ -160,6 +190,35 @@ These land in Phase 1 and carry through Phases 2 and 3:
 **Nothing.** The Ed25519 hash chain already lives in the agent's `audit_log` table (`sequence_number`, `previous_hash`, `entry_hash`, `signature`, `signing_key_id`). The audit-chain anchor is already broadcast on every `ACTION_RESULT` event (TRACE_WIRE_FORMAT.md §5.9: `audit_entry_id`, `audit_sequence_number`, `audit_entry_hash`, `audit_signature`). The wire format ships with `trace_schema_version: "2.7.0"` and `attempt_index` per `(thought_id, event_type)` (TRACE_WIRE_FORMAT.md §6) — both already 2.7.8-shipping. The lens-side change is purely additive: add three columns on `trace_events`, capture them on the `ACTION_RESULT` row.
 
 **Future agent ask (Phase 2 only, conditional):** if peer-to-peer trace replication needs per-event tamper-evidence without dragging the full batch, broadcast a chain link on every intermediate event (`DMA_RESULTS`, `LLM_CALL`, etc.) — not just on `ACTION_RESULT`. Held until peer replication is real work, not speculative.
+
+### 3.7 v0.1.3 schema additions — scrub envelope columns
+
+`migrations/postgres/lens/V003__scrub_envelope.sql` (additive ALTER TABLE; no backfill):
+
+```sql
+ALTER TABLE cirislens.trace_events
+    ADD COLUMN IF NOT EXISTS original_content_hash TEXT,
+    ADD COLUMN IF NOT EXISTS scrub_signature       TEXT,
+    ADD COLUMN IF NOT EXISTS scrub_key_id          TEXT,
+    ADD COLUMN IF NOT EXISTS scrub_timestamp       TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS trace_events_scrub_key
+    ON cirislens.trace_events (scrub_key_id, ts DESC)
+    WHERE scrub_signature IS NOT NULL;
+```
+
+| Column | Shape | What it proves |
+|---|---|---|
+| `original_content_hash` | TEXT — sha256 hex of `canonical(data_pre_scrub)` | Anyone with the original content can verify it was the input to scrubbing. The deployment doesn't need to retain the original — the hash is enough for spot-check audit. At GENERIC trace-level (no PII to scrub) this equals `sha256(canonical(data_post_scrub))` since pre==post; that's expected. |
+| `scrub_signature` | TEXT — base64 of `ed25519_sign(canonical(data_post_scrub))` | The deployment processed *this exact* post-scrub payload at *this exact* time — verifiable by any peer with the deployment's published public key. |
+| `scrub_key_id` | TEXT — the deployment's `signing_key_id` | Identifies which deployment (or which key generation under that deployment) signed. On the lens this is `lens-scrub-v1` (or per-deployment scheme); on the agent (Phase 2+) this is the agent's existing wire-format §8 signing key id. |
+| `scrub_timestamp` | TIMESTAMPTZ | When the scrub+sign happened. The window between the trace's `completed_at` and `scrub_timestamp` bounds how long the unscrubbed bytes existed in deployment memory — useful for forensics / SLA. |
+
+**Every v0.1.3+ row has all four columns populated.** Step 3.4 robustness primitive #7 makes the signing key always-present, so the persist pipeline always produces an envelope. There is no "row without a scrub envelope" code path going forward.
+
+**Pre-v0.1.3 rows** (the lens's existing pre-cutover history in `accord_traces`, plus any v0.1.0 → v0.1.2 rows that may have landed in `trace_events` during early integration) have NULLs in all four envelope columns. They pre-date the contract; that's a historical artifact, not an ongoing one. Queries that need the envelope-attestation guarantee filter on `WHERE scrub_signature IS NOT NULL`. Operationally, pre-v0.1.3 rows hit retention drop within the lens's standard 30-day window, so the NULL-envelope cohort is bounded.
+
+Schema-version of the *crate* bumps to `0.1.3`; schema-version of the *wire format* (`trace_schema_version`) stays `2.7.0`. The wire format isn't changing — the persistence layer is adding cryptographic provenance to its own handling.
 
 ## 4. Phase 2 — Subsumption of agent signed-events persistence
 

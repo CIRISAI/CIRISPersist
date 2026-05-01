@@ -41,6 +41,17 @@ shape, the agent-side persistence service (Phase 2/3). It protects:
 - **Memory-safe parsing of untrusted bytes**: Rust's static
   guarantees at the wire edge close the recurring CVE class for
   network-facing services (MISSION.md §2 — `server/`).
+- **(NEW v0.1.3) Cryptographic provenance of deployment handling**:
+  every persisted row carries a four-tuple envelope
+  (`original_content_hash`, `scrub_signature`, `scrub_key_id`,
+  `scrub_timestamp`) that proves *this specific deployment processed
+  this specific payload at this specific time*. Always present —
+  every component, every trace level, key never null (FSD §3.3 step
+  3.5 + §3.4 robustness primitive #7). The federation primitive
+  PoB §3.1 — "the lens role is a function any peer can run on data
+  the peer already has" — becomes cryptographically attestable.
+  Bilateral cryptography: agent's wire-format §8 signature proves
+  authorship, lens's v0.1.3 scrub envelope proves handling.
 
 ### What CIRISPersist Does NOT Protect (Phase 1)
 
@@ -557,6 +568,106 @@ implemented naïvely) — track as research-grade hardening.
 treats `signature_key_id` as public anyway (it's emitted on
 every trace), so directory enumeration is not a high-impact leak.
 
+### 3.5 Provenance — adversary wants to forge "deployment handled this" attestation
+
+These vectors are introduced by v0.1.3's always-on scrub-signing
+contract (FSD §3.3 step 3.5 + §3.4 robustness primitive #7). The
+contract turns the `pii_scrubbed = true` boolean column from a
+*trust* claim into a *verifiable* claim — every persisted row
+carries cryptographic proof of the deployment's handling.
+
+#### AV-24: Lens-scrub bypass / forgery
+
+**Attack**: An adversary with row-level write access to the
+lens's Postgres (compromised lens process, malicious DB
+operator, etc.) inserts rows with `pii_scrubbed = true` but no
+matching `scrub_signature` — or with a scrub_signature signed by
+a key the federation doesn't recognize. Downstream peers reading
+these rows treat them as legitimately-handled.
+
+**Mitigation in v0.1.3**: every persisted row from v0.1.3's
+pipeline carries a four-tuple envelope (`original_content_hash`,
+`scrub_signature`, `scrub_key_id`, `scrub_timestamp`).
+Downstream peers verify `ed25519_verify(scrub_signature,
+canonical(payload), known_pubkey_for(scrub_key_id))` before
+trusting the row's provenance. Rows with NULL envelope columns
+or an unrecognized `scrub_key_id` are flagged and not counted
+in the federation primitive's N_eff measurement.
+
+The signing key is the deployment's own — a malicious operator
+who controls the lens process *also* controls the signing key
+(or, with hardware-backing, the keyring access path), and can
+mint apparently-valid envelopes. This is the same trust boundary
+as agent-side AV-2 (compromised key); the persistence layer
+cannot detect bytes signed by the legitimate key under
+adversarial control. Downstream PoB N_eff drift detection
+(behavioral anomaly over time) is the federation-level
+mitigation.
+
+**Secondary**: the lens publishes its public key to the
+registry / lens-discovery layer at deploy time. A peer fetching
+rows can cross-check `scrub_key_id` against the registry's
+roster of legitimate lens keys; rows signed by a key not in the
+registry are quarantined.
+
+**Residual**: a compromised lens with legitimate keyring access
+can mint envelopes that *look* valid. Detection is statistical
+(N_eff drift over time) rather than pointwise — the same residual
+the agent-side AV-2 has. PoB §6 framing applies.
+
+#### AV-25: Scrub-key compromise
+
+**Attack**: An adversary extracts the deployment's signing-key
+seed from the host's filesystem / memory / debug interface and
+mints arbitrary envelopes under that key. Forged "deployment X
+processed payload Y at time Z" attestations the federation
+treats as legitimate.
+
+**Mitigation in v0.1.3**: `ciris-keyring` (CIRISVerify's Rust
+crate) stores the seed in OS-keyring backed by hardware where
+available — Linux Secret Service / TPM 2.0; macOS Keychain /
+Secure Enclave; iOS / Android StrongBox; Windows DPAPI / TPM.
+The Python process never holds the seed bytes; the seed never
+crosses the FFI boundary. Hardware-backed deployments require
+physical access (and on most platforms, exploitation of an
+enclave-grade vulnerability) to extract.
+
+**Secondary**: `ciris-keyring`'s `SoftwareSigner` fallback exists
+for dev / sovereign deployments without hardware backing. The
+seed is in OS-keyring on disk — root access on the host can
+extract it. Named residual; mitigation is operational
+(avoid software-fallback in production, prefer hardware-attested
+deployments).
+
+**Residual**: software-backed deployments have no key isolation
+beyond OS keyring file permissions. Mitigations are
+deployment-level (full-disk encryption, restrict who has root,
+short-lived keys with rotation through the registry's
+revocation surface). CIRISVerify's threat model §5 — Security
+Levels by Hardware Type — is the authoritative classification
+of what each backing tier provides.
+
+### 3.6 Operational / hardening vectors (catalogued in SECURITY_AUDIT_v0.1.2.md §3)
+
+AV-17 through AV-23 were surfaced by the post-v0.1.2 SOTA
+gap-analysis pass (Pass 3). The audit document carries the full
+prose; the mitigation matrix in §4 below carries the one-line
+summary. Briefly:
+
+- **AV-17** — `attempt_index` integer truncation (P0). v0.1.3 caps
+  `MAX_ATTEMPT_INDEX = 1024` with `try_into` + typed
+  `Error::AttemptIndexOutOfRange`. `overflow-checks = true` on the
+  release profile is the defense-in-depth backstop.
+- **AV-18** — plaintext Postgres connection (P1). v0.1.3 adds
+  optional `tls` feature (`tokio-postgres-rustls`).
+- **AV-19** — no graceful shutdown / lost in-flight commits (P1).
+  v0.1.3 adds `tokio::signal::ctrl_c` + drain protocol.
+- **AV-20** — no `statement_timeout` (P2). Track for v0.2.x.
+- **AV-21** — no per-agent rate limiting (P2). Track for v0.2.x;
+  PoB §5.6 acceptance-policy adjacent.
+- **AV-22** — no clock-skew validation (P2). Track for v0.2.x.
+- **AV-23** — `consent_timestamp` range unconstrained (P3). Track.
+
 ---
 
 ## 4. Mitigation Matrix
@@ -579,6 +690,15 @@ every trace), so directory enumeration is not a high-impact leak.
 | AV-14 | Scrubber bypass via schema-altering callback | Schema-preservation gates | Python process boundary | ✓ Mitigated | — |
 | AV-15 | PII leak via errors | Typed `kind()` tokens at HTTP/PyO3 boundary; verbose form to tracing logs only | — | **✓ Mitigated v0.1.2** | — |
 | AV-16 | Side-channel timing | Ed25519 verify_strict constant-time | (no constant-response wrapper) | ⚠ Directory enumeration possible | v0.2.x research |
+| AV-17 | Integer truncation on `attempt_index` | Typed `MAX_ATTEMPT_INDEX = 1024` + `try_into` bound | `overflow-checks = true` on release profile (defense in depth) | **✓ Mitigated v0.1.3** | — |
+| AV-18 | Plaintext Postgres connection | Optional `tls` feature — `tokio-postgres-rustls` | `sslmode=verify-full` via DSN | **✓ Mitigated v0.1.3** | — |
+| AV-19 | No graceful shutdown / lost in-flight commits | `tokio::signal::ctrl_c` + drain protocol; producer close → persister drains → exit | Journal preserves bytes-on-failure (FSD §3.4 #2) | **✓ Mitigated v0.1.3** | — |
+| AV-20 | No statement_timeout on Postgres | (deferred) | Pool size limits | ⚠ Track | v0.2.x |
+| AV-21 | No per-agent rate limiting | (deferred) | Shared-queue 429 backpressure | ⚠ Track; PoB §5.6 acceptance policy adjacent | v0.2.x |
+| AV-22 | No clock-skew validation on incoming timestamps | (deferred) | Retention-window absorbs out-of-window data | ⚠ Track | v0.2.x |
+| AV-23 | `consent_timestamp` range unconstrained | (deferred) | Schema-required-or-422 gate (TRACE_WIRE_FORMAT.md §1) | ⚠ Track | v0.2.x |
+| AV-24 | Lens-scrub bypass / forgery | UNCONDITIONAL signed scrub envelope (FSD §3.3 step 3.5; §3.4 robustness primitive #7) — every component, every level, key never null. `original_content_hash + scrub_signature + scrub_key_id + scrub_timestamp` columns proof the deployment's handling. | Single-key principle — agent uses its existing wire-format §8 key; no separate scrub key to compromise | **✓ Mitigated v0.1.3** | — |
+| AV-25 | Scrub-key compromise | Hardware-backed `ciris-keyring` (TPM / Secure Enclave / StrongBox / DPAPI) — seed never leaves the keyring; never crosses the FFI boundary | `SoftwareSigner` fallback for hardware-less deployments (named residual) | ✓ Mitigated where hardware available; ⚠ residual on software-fallback | CIRISVerify hardware-attestation tier governs |
 
 ---
 
