@@ -26,7 +26,9 @@ use crate::schema::{CompleteTrace, ReasoningEventType, TraceComponent};
 /// `LLM_CALL` components inside.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Decomposed {
+    /// One [`TraceEventRow`] per component in the source trace.
     pub events: Vec<TraceEventRow>,
+    /// Sibling-table rows extracted from `LLM_CALL` components.
     pub llm_calls: Vec<TraceLlmCallRow>,
 }
 

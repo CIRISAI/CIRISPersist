@@ -21,7 +21,7 @@
 
 use std::sync::Arc;
 
-use ciris_keyring::{get_platform_signer, HardwareSigner};
+use ciris_keyring::{get_platform_signer, is_hardware_available, HardwareSigner};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
@@ -100,11 +100,29 @@ impl PyEngine {
         // SoftwareSigner fallback otherwise. get_platform_signer
         // is idempotent: returns existing key if present, generates
         // and stores under the alias if not.
+        //
+        // v0.1.6 — log the variant chosen at construction so ops can
+        // see in deployment logs whether the deployment is on the
+        // hardware path or the software fallback. Per-batch latency
+        // tax (~30 µs vs ~100 µs per sign) and security tier
+        // (UNLICENSED_COMMUNITY when software-fallback) both depend
+        // on this. SECURITY_AUDIT_v0.1.4.md §3.4.
         let signer_key_id_owned = signing_key_id.to_owned();
+        let hardware_available = is_hardware_available();
         let signer = py.detach(|| {
             get_platform_signer(&signer_key_id_owned)
                 .map_err(|e| PyRuntimeError::new_err(format!("ciris-keyring: {e}")))
         })?;
+        tracing::info!(
+            signing_key_id = signer_key_id_owned.as_str(),
+            hardware_backed = hardware_available,
+            variant = if hardware_available {
+                "hardware"
+            } else {
+                "software"
+            },
+            "ciris-persist: signer initialised"
+        );
         let signer: Arc<dyn HardwareSigner> = Arc::from(signer);
 
         // Wrap the scrubber. None → NullScrubber (mission constraint:

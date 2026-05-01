@@ -48,7 +48,9 @@ pub enum Error {
     /// (FSD §3.4 robustness primitive #3 — schema-version gate).
     #[error("unsupported trace_schema_version: {got:?}; supported = {supported:?}")]
     UnsupportedSchemaVersion {
+        /// Version string the agent shipped.
         got: String,
+        /// Allow-list of supported wire-format versions.
         supported: &'static [&'static str],
     },
 
@@ -64,8 +66,11 @@ pub enum Error {
     /// of the wrong JSON shape.
     #[error("field {field} has wrong type in component data: expected {expected}, got {got}")]
     FieldTypeMismatch {
+        /// Name of the field that failed type-check.
         field: &'static str,
+        /// Expected JSON shape (e.g. "non-negative integer").
         expected: &'static str,
+        /// Actual JSON shape observed in the payload.
         got: &'static str,
     },
 
@@ -89,7 +94,12 @@ pub enum Error {
     /// adversary to submit `2^32` and have it land at 0,
     /// colliding with a legitimate retry-0 row on the dedup tuple.
     #[error("attempt_index out of range: got {got}, max {max}")]
-    AttemptIndexOutOfRange { got: i64, max: u32 },
+    AttemptIndexOutOfRange {
+        /// The (out-of-range) value the agent shipped.
+        got: i64,
+        /// Configured maximum (`MAX_ATTEMPT_INDEX`).
+        max: u32,
+    },
 }
 
 /// Maximum legitimate `attempt_index` value.

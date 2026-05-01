@@ -36,7 +36,9 @@ use crate::queue::{IngestHandle, QueueError};
 /// Server state shared across handlers.
 #[derive(Clone)]
 pub struct AppState {
+    /// Producer-side handle into the bounded ingest queue.
     pub handle: IngestHandle,
+    /// Shared local journal for outage tolerance (FSD §3.4 #2).
     pub journal: Arc<Journal>,
 }
 
@@ -64,9 +66,15 @@ pub fn router(state: AppState) -> Router {
 /// we follow the convention CIRISLens already uses).
 #[derive(Debug, Clone, Serialize)]
 pub struct Health {
+    /// `"ok"` when the service is accepting writes; otherwise a
+    /// short status token ("degraded", "draining", etc.).
     pub status: &'static str,
+    /// Bounded-queue slots still available (saturation watcher).
     pub queue_capacity_remaining: usize,
+    /// Pending entries in the local journal (reflects outage
+    /// recovery state; non-zero means we're replaying).
     pub journal_pending: u64,
+    /// Wire-format schema versions this build accepts.
     pub schema_versions_supported: &'static [&'static str],
 }
 
@@ -74,9 +82,13 @@ pub struct Health {
 #[cfg(test)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct HealthOwned {
+    /// Owned mirror of [`Health::status`].
     pub status: String,
+    /// Owned mirror of [`Health::queue_capacity_remaining`].
     pub queue_capacity_remaining: usize,
+    /// Owned mirror of [`Health::journal_pending`].
     pub journal_pending: u64,
+    /// Owned mirror of [`Health::schema_versions_supported`].
     pub schema_versions_supported: Vec<String>,
 }
 

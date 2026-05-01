@@ -115,9 +115,14 @@ impl IngestError {
 /// re-sign.
 #[derive(Debug, Clone)]
 pub struct ScrubEnvelope {
+    /// sha256(canonical(component.data_pre_scrub)) — proves what the
+    /// scrubber input was without retaining the original bytes.
     pub original_content_hash: String,
+    /// base64(ed25519_sign(canonical(component.data_post_scrub))).
     pub scrub_signature: String,
+    /// Identifier for the deployment's signing key.
     pub scrub_key_id: String,
+    /// When the scrub+sign happened.
     pub scrub_timestamp: chrono::DateTime<chrono::Utc>,
 }
 
@@ -139,8 +144,12 @@ where
     C: Canonicalizer + ?Sized,
     S: Scrubber + ?Sized,
 {
+    /// Storage backend (Postgres / SQLite / in-memory).
     pub backend: &'a B,
+    /// Canonicalization strategy (Python-compat or RFC 8785 JCS).
     pub canonicalizer: &'a C,
+    /// PII-scrubbing pass (NullScrubber for tests; lens-side
+    /// scrubber callable in production).
     pub scrubber: &'a S,
     /// v0.1.3: scrub-signing key. UNCONDITIONAL — always present,
     /// every row signed (FSD §3.4 robustness primitive #7;

@@ -40,20 +40,28 @@ pub enum TraceLevel {
 /// upstream; the lens trusts what the agent shipped.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CorrelationMetadata {
+    /// Deployment region (datacenter / cloud zone) when consented.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment_region: Option<String>,
+    /// Deployment type (production / staging / dev / etc.).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment_type: Option<String>,
+    /// Agent role tag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_role: Option<String>,
+    /// Agent template / configuration identifier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_template: Option<String>,
+    /// Coarse user-location string (when consented).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_location: Option<String>,
+    /// User timezone (when consented).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_timezone: Option<String>,
+    /// User latitude (when consented; precision-bounded upstream).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_latitude: Option<String>,
+    /// User longitude (when consented; precision-bounded upstream).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_longitude: Option<String>,
 }
@@ -72,6 +80,7 @@ pub struct CorrelationMetadata {
 pub enum BatchEvent {
     /// A full sealed CompleteTrace + signature (TRACE_WIRE_FORMAT.md §3).
     CompleteTrace {
+        /// The signed trace payload.
         trace: CompleteTrace,
         /// Same value as the batch's `trace_level`. Carried on the
         /// envelope element for §7 gating consistency checks.
@@ -96,14 +105,22 @@ pub enum BatchEvent {
 /// a free-form blob.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BatchEnvelope {
+    /// One or more events shipped in the batch.
     pub events: Vec<BatchEvent>,
 
+    /// Wall-clock when the batch was emitted by the agent.
     pub batch_timestamp: DateTime<Utc>,
+    /// User-consent timestamp (lens MUST 422 if missing or empty;
+    /// TRACE_WIRE_FORMAT.md §1).
     pub consent_timestamp: DateTime<Utc>,
 
+    /// Privacy / bandwidth tier this batch was emitted at.
     pub trace_level: TraceLevel,
+    /// Wire-format schema version (gated by [`super::version::SUPPORTED_VERSIONS`]).
     pub trace_schema_version: SchemaVersion,
 
+    /// Optional correlation metadata; populated only when the agent
+    /// has explicit user consent for each named field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_metadata: Option<CorrelationMetadata>,
 }

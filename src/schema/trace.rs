@@ -24,8 +24,12 @@ use super::Error;
 /// `data` access is intentionally allowed for the JSONB write path.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TraceComponent {
+    /// Logical category of the component (observation / rationale /
+    /// conscience / etc.).
     pub component_type: ComponentType,
+    /// Specific event-type discriminant within that category.
     pub event_type: ReasoningEventType,
+    /// Wall-clock at which this component was emitted.
     pub timestamp: DateTime<Utc>,
     /// The agent's `data` dict, kept verbatim for JSONB storage. Use
     /// the typed accessors below to extract specific fields with
@@ -177,20 +181,28 @@ impl TraceComponent {
 /// schema and write a migrator.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompleteTrace {
+    /// Stable trace identifier.
     pub trace_id: String,
+    /// Thought-iteration identifier within the trace.
     pub thought_id: String,
     /// Optional per spec: not all internal thoughts (system probes)
     /// have parent tasks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
+    /// SHA-256 digest of the agent's identity tuple.
     pub agent_id_hash: String,
 
+    /// When the trace started.
     pub started_at: DateTime<Utc>,
+    /// When the trace was sealed (`ACTION_RESULT` emitted).
     pub completed_at: DateTime<Utc>,
 
+    /// Privacy / bandwidth tier of the trace.
     pub trace_level: super::envelope::TraceLevel,
+    /// Wire-format schema version this trace was emitted under.
     pub trace_schema_version: SchemaVersion,
 
+    /// Sequence of components making up the trace.
     pub components: Vec<TraceComponent>,
 
     /// Base64-encoded Ed25519 signature over the canonical bytes

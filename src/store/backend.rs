@@ -121,11 +121,15 @@ pub trait Backend: Send + Sync {
 /// rows or merely confirmed existing ones.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct InsertReport {
+    /// Number of rows that were newly inserted.
     pub inserted: usize,
+    /// Number of rows that hit `ON CONFLICT DO NOTHING` (idempotent
+    /// re-submission).
     pub conflicted: usize,
 }
 
 impl InsertReport {
+    /// Total rows considered by the backend (inserted + conflicted).
     pub fn total_seen(&self) -> usize {
         self.inserted + self.conflicted
     }

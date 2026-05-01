@@ -5,6 +5,47 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.1.6] — 2026-05-01
+
+Hygiene batch from `docs/SECURITY_AUDIT_v0.1.4.md` §5. No
+behavior changes; CI gates tightened.
+
+### Added
+
+- **`clippy.toml`** with `msrv = "1.75"` pin. Without this, a
+  Rust toolchain bump on the CI runner can introduce new
+  default-on lints that fail `-D warnings` for reasons unrelated
+  to our code (we hit this once between Rust 1.93 and 1.95).
+  Pinning to our declared MSRV applies the lint set as it was at
+  that toolchain, even when the runner is newer.
+- **Signer-variant log line** at PyO3 `Engine` construction.
+  Emits a `tracing::info!` with `hardware_backed=true|false` and
+  `variant=hardware|software` so ops can see in deployment logs
+  whether the deployment is on the hardware path or the software
+  fallback. Per-batch latency tax (~30 µs vs ~100 µs per sign)
+  and security tier (UNLICENSED_COMMUNITY when software) both
+  depend on this.
+- **`#![deny(missing_docs)]`** at the lib root. Every public
+  item now carries a doc comment; CI fails on any addition that
+  ships without one. Pass over `src/store/types.rs`,
+  `src/schema/{events,envelope,trace,mod}.rs`,
+  `src/{ingest,journal,lib}.rs`,
+  `src/store/{backend,decompose}.rs`, and `src/scrub/mod.rs` —
+  ~160 doc additions, all on row-shaped types, error variants,
+  and trait surfaces. Operator-readable: "what does this column
+  mean" no longer requires reading the migration SQL alongside
+  the source.
+
+### Deferred to v0.1.7
+
+- `Engine::with_software_fallback` env-flag opt-in
+  (`SECURITY_AUDIT_v0.1.4.md` §3.1). `get_platform_signer`
+  already auto-falls-back to software when no hardware is
+  available — the env-flag pathway only matters when the OS
+  keyring itself is unavailable (headless Linux without
+  Secret Service / DBus). Narrower-than-thought; deferred until
+  someone hits it.
+
 ## [0.1.5] — 2026-05-01
 
 ### Production hot-fix — multi-worker boot race (THREAT_MODEL.md AV-26)

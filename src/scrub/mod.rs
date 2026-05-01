@@ -117,6 +117,9 @@ impl<F> CallbackScrubber<F>
 where
     F: Fn(serde_json::Value) -> Result<(serde_json::Value, usize), ScrubError> + Send + Sync,
 {
+    /// Wrap a closure into a [`Scrubber`] impl. The callback receives
+    /// each component's `data` blob as a JSON value and must return
+    /// `(scrubbed_value, fields_modified_count)`.
     pub fn new(callback: F) -> Self {
         Self { callback }
     }

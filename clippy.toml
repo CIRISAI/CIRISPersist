@@ -1,0 +1,18 @@
+# Clippy config for ciris-persist.
+#
+# SECURITY_AUDIT_v0.1.4.md §5 — v0.1.6 hygiene batch.
+#
+# Pinning the clippy MSRV is the load-bearing setting here: without
+# it, a Rust toolchain bump on the CI runner can introduce new
+# default-on lints that fail the `-D warnings` gate for reasons
+# unrelated to our code (we hit this once between Rust 1.93 and
+# 1.95 — float-strict comparison + `cloned_ref_to_slice_refs`).
+# Pinning to our declared MSRV (`Cargo.toml`'s `rust-version`)
+# means clippy applies the lint set as it was at that toolchain,
+# even when the runner is newer.
+msrv = "1.75"
+
+# We don't override `cognitive-complexity-threshold` etc. — clippy
+# defaults are reasonable for this crate's size. If a future
+# refactor hits the threshold, prefer breaking the function over
+# raising the limit.

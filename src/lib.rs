@@ -4,6 +4,13 @@
 // fine and out of our scope); `forbid` here only applies to this
 // crate.
 #![forbid(unsafe_code)]
+// SECURITY_AUDIT_v0.1.4.md §4 §4.4 — v0.1.6 hygiene batch.
+// Every public item gets a doc comment. CI fails on any addition
+// that ships without one. The intent is operator-readable:
+// row-shaped types, error variants, and trait surfaces are the
+// substrate's contract; "what does this column mean" should never
+// require digging through the migration SQL alongside the source.
+#![deny(missing_docs)]
 
 //! ciris-persist — unified Rust persistence for the CIRIS Trinity.
 //!
@@ -51,15 +58,19 @@ pub use queue::{
 /// no `.unwrap()` / `.expect()` in non-test paths.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Schema-layer failure (parse, validation, depth, range).
     #[error("schema: {0}")]
     Schema(#[from] schema::Error),
 
+    /// Signature verification failure.
     #[error("verify: {0}")]
     Verify(#[from] verify::Error),
 
+    /// PII-scrubber failure.
     #[error("scrub: {0}")]
     Scrub(#[from] scrub::ScrubError),
 
+    /// Storage backend failure (Postgres / SQLite / in-memory).
     #[error("store: {0}")]
     Store(#[from] store::Error),
 }

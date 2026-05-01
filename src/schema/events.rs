@@ -25,13 +25,21 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComponentType {
+    /// Passive observation of agent state.
     Observation,
+    /// Context snapshot — operating environment.
     Context,
+    /// Rationale step in the reasoning chain.
     Rationale,
+    /// Conscience evaluation step.
     Conscience,
+    /// Selected action (the verb).
     Action,
+    /// Second-pass evaluation of a verb.
     VerbSecondPass,
+    /// Individual LLM call (sibling-table candidate).
     LlmCall,
+    /// Forward-compat fallback for unrecognized component types.
     Unknown,
 }
 
@@ -112,7 +120,10 @@ impl ReasoningEventType {
 /// peer-replicate validates it against the agent's local chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditAnchor {
+    /// Per-agent monotonic sequence number identifying this audit
+    /// chain link.
     pub audit_sequence_number: i64,
+    /// sha256 of the agent's audit log entry — the chain link itself.
     pub audit_entry_hash: String,
     /// Optional in practice — the production agent (release/2.7.8)
     /// ships `audit_sequence_number` + `audit_entry_hash` on
@@ -156,11 +167,17 @@ pub struct CostSummary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LlmCallStatus {
+    /// Provider returned a usable completion.
     Ok,
+    /// Call timed out at the client.
     Timeout,
+    /// Provider returned 429 / explicit rate-limit signal.
     RateLimited,
+    /// Provider does not have the requested model available.
     ModelNotAvailable,
+    /// `instructor` library retried due to schema-validation failure.
     InstructorRetry,
+    /// Catch-all error class for un-typed provider failures.
     OtherError,
 }
 
@@ -175,7 +192,9 @@ pub enum LlmCallStatus {
 /// as `None`, not as a panic.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmCallSummary {
+    /// Agent handler that issued the call.
     pub handler_name: String,
+    /// Provider service identifier (e.g. "openai", "anthropic").
     pub service_name: String,
     /// Optional in production: spec §5.10 lists `timestamp` inside
     /// `data`, but `release/2.7.8` only emits it at the component
@@ -190,18 +209,29 @@ pub struct LlmCallSummary {
     /// Closed-enum status per §5.10.
     pub status: LlmCallStatus,
 
+    /// Model identifier returned by the provider.
     pub model: Option<String>,
+    /// Provider base URL (when non-default).
     pub base_url: Option<String>,
+    /// Provider's response_model identifier (instructor).
     pub response_model: Option<String>,
 
+    /// Token count for the prompt side.
     pub prompt_tokens: Option<i32>,
+    /// Token count for the completion side.
     pub completion_tokens: Option<i32>,
+    /// UTF-8 byte length of the prompt.
     pub prompt_bytes: Option<i32>,
+    /// UTF-8 byte length of the completion.
     pub completion_bytes: Option<i32>,
+    /// USD cost as reported by the provider.
     pub cost_usd: Option<f64>,
 
+    /// Provider-specific error class on failure.
     pub error_class: Option<String>,
+    /// Total attempt count across retries.
     pub attempt_count: Option<i32>,
+    /// Number of retries that fired.
     pub retry_count: Option<i32>,
 
     /// Monotonic per `(thought_id, event_type)` — TRACE_WIRE_FORMAT.md §6.

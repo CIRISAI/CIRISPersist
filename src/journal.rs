@@ -182,10 +182,13 @@ impl Journal {
 /// Journal-layer errors.
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
+    /// Filesystem IO failure (path not writable, ENOSPC, etc.).
     #[error("io: {0}")]
     Io(String),
+    /// `redb` failed to open or initialize the journal file.
     #[error("redb open: {0}")]
     Open(String),
+    /// `redb` runtime error during read/write.
     #[error("redb backend: {0}")]
     Backend(String),
     /// Handler-supplied replay failure.
