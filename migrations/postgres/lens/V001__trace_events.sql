@@ -113,18 +113,23 @@ BEGIN
             chunk_time_interval => INTERVAL '1 day',
             if_not_exists => TRUE
         );
-
-        PERFORM add_compression_policy('cirislens.trace_events',
-            INTERVAL '7 days', if_not_exists => TRUE);
-        PERFORM add_retention_policy('cirislens.trace_events',
-            INTERVAL '30 days', if_not_exists => TRUE);
-        PERFORM add_compression_policy('cirislens.trace_llm_calls',
-            INTERVAL '3 days', if_not_exists => TRUE);
-        PERFORM add_retention_policy('cirislens.trace_llm_calls',
-            INTERVAL '14 days', if_not_exists => TRUE);
     END IF;
 END;
 $$;
+
+-- Compression + retention policies are NOT applied here.
+-- TimescaleDB 2.18+ split storage into rowstore vs. columnstore;
+-- `add_compression_policy` now requires explicit
+-- `ALTER TABLE … SET (timescaledb.enable_columnstore = true)` first,
+-- and the right knob varies across the 2.13–2.18 range that real
+-- deployments span.
+--
+-- These policies are *operational concerns*, not structural. The
+-- right tuning for a high-volume lens differs from a Pi-class
+-- sovereign deployment. The lens deploy-script applies the version-
+-- appropriate policies post-migration; CI runs without them so the
+-- migration stays version-portable across the supported TimescaleDB
+-- range (FSD §7 #7).
 
 -- ─── accord_public_keys: agent verification key directory ──────────
 -- Phase 1 source-of-truth for verify (FSD §3.3 step 2). Phase 2's

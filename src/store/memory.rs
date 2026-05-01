@@ -72,7 +72,7 @@ impl MemoryBackend {
     pub fn snapshot_events(&self) -> Vec<TraceEventRow> {
         let state = self.state.lock().expect("memory backend lock");
         let mut rows: Vec<_> = state.events.values().map(|(_, r)| r.clone()).collect();
-        rows.sort_by(|a, b| a.ts.cmp(&b.ts));
+        rows.sort_by_key(|a| a.ts);
         rows
     }
 

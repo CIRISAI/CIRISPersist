@@ -77,6 +77,11 @@ hex-literal = "0.4"
 proptest = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tempfile = "3"
+# Postgres integration tests share a single test database; parallel
+# test execution races on schema setup. serial_test forces the
+# postgres-tagged tests to run one at a time without slowing the
+# rest of the suite.
+serial_test = "3"
 
 [lib]
 name = "ciris_persist"

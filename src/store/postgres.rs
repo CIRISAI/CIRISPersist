@@ -390,7 +390,12 @@ mod tests {
 
     /// Smoke: connect + run_migrations. Skipped if no test DB is
     /// configured.
+    ///
+    /// `serial_test::serial` forces postgres tests to run one at a
+    /// time so concurrent migration races (`pg_type_typname_nsp_index`)
+    /// don't surface as flake.
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn migrations_run_clean() {
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -404,6 +409,7 @@ mod tests {
 
     /// Mission category §4 "Idempotency": ON CONFLICT DO NOTHING.
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn insert_idempotent() {
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -436,7 +442,7 @@ mod tests {
         };
 
         let r1 = backend
-            .insert_trace_events_batch(&[row.clone()])
+            .insert_trace_events_batch(std::slice::from_ref(&row))
             .await
             .unwrap();
         assert_eq!(r1.inserted, 1);

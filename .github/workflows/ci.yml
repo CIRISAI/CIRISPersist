@@ -53,11 +53,32 @@ jobs:
         with:
           targets: aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
-      - name: install gcc-aarch64
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: install cross-compile toolchain + arm64 openssl
+        run: |
+          # Multi-arch apt for arm64 libssl-dev. Required because
+          # refinery transitively pulls postgres-native-tls →
+          # openssl-sys, which needs target-arch openssl headers.
+          sudo dpkg --add-architecture arm64
+          # Move the default repo entries to amd64-only so apt update
+          # doesn't try to fetch arm64 from x86 mirrors.
+          sudo sed -i -E 's|^(deb|deb-src) (https?://[^ ]+)|\1 [arch=amd64] \2|' /etc/apt/sources.list || true
+          # Add ports.ubuntu.com for arm64 packages.
+          sudo tee /etc/apt/sources.list.d/arm64.sources >/dev/null <<'EOF'
+          Types: deb
+          URIs: http://ports.ubuntu.com/ubuntu-ports
+          Suites: noble noble-updates noble-security
+          Components: main universe
+          Architectures: arm64
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          EOF
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu libssl-dev:arm64 pkg-config
       - name: cargo build (postgres + server)
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          PKG_CONFIG_ALLOW_CROSS: "1"
+          PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig
+          OPENSSL_NO_VENDOR: "1"
         run: cargo build --target aarch64-unknown-linux-gnu --features "postgres server"
 
   # Mission alignment: macOS dev path (PLATFORM_ARCHITECTURE.md §1).
