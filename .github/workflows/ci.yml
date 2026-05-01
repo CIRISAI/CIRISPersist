@@ -242,12 +242,130 @@ jobs:
           shred -uz "$ED_KEY_PATH" "$MLDSA_KEY_PATH" 2>/dev/null || rm -f "$ED_KEY_PATH" "$MLDSA_KEY_PATH"
           echo "Signed manifest:"
           cat "dist/ciris-persist-${{ steps.version.outputs.version }}.manifest.json"
-      # TODO(persist→registry): when CIRISRegistry adds persist support,
-      # add a register step here invoking the registry's gRPC. The
-      # signed manifest is the input. Track at docs/TODO_REGISTRY.md.
+      - name: pre-flight registry steward-key check
+        # CIRISRegistry exposes GET /v1/steward-key with the active
+        # signing key + key_id. We log it for human-visible
+        # confirmation that the registry isn't running in ephemeral
+        # mode. Per persist issue #2 / registry's own AV-28: an
+        # ephemeral-key registry signs every manifest with a key
+        # that disappears on registry restart, invalidating
+        # downstream verify caches.
+        #
+        # We don't fail the build on ephemeral mode (registry might
+        # be staging / dev intentionally); we surface it loudly so
+        # the human running CI sees the posture before downstream
+        # peers do.
+        env:
+          REGISTRY_URL: ${{ vars.REGISTRY_URL }}
+        run: |
+          if [ -z "${REGISTRY_URL}" ]; then
+            REGISTRY_URL="https://registry.ciris.ai"
+            echo "::warning::REGISTRY_URL repo variable unset; defaulting to ${REGISTRY_URL}"
+          fi
+          echo "Registry steward-key snapshot for ${REGISTRY_URL}:"
+          curl -sf "${REGISTRY_URL}/v1/steward-key" | tee dist/steward-key.json | python3 -m json.tool
+          # Surface key_id to the step summary so it's grep-able
+          # later for cross-build cache-stability checks.
+          KID=$(python3 -c 'import json; print(json.load(open("dist/steward-key.json"))["classical"]["key_id"])')
+          echo "registry steward key_id=${KID}" >> "$GITHUB_STEP_SUMMARY"
+      - name: register binary manifest with CIRISRegistry
+        # POST the binary catalog to /v1/verify/binary-manifest with
+        # project=ciris-persist (registry-side support shipped in
+        # CIRISRegistry commit 254a89e, tracked under persist
+        # issue #2). The registry signs server-side with its
+        # steward key; we verify the round-trip in the next step.
+        env:
+          REGISTRY_URL: ${{ vars.REGISTRY_URL }}
+          REGISTRY_ADMIN_TOKEN: ${{ secrets.REGISTRY_ADMIN_TOKEN }}
+        run: |
+          if [ -z "${REGISTRY_URL}" ]; then
+            REGISTRY_URL="https://registry.ciris.ai"
+          fi
+          if [ -z "${REGISTRY_ADMIN_TOKEN}" ]; then
+            echo "::error::REGISTRY_ADMIN_TOKEN repo secret not configured."
+            echo "::error::Ask the bridge / registry team to issue + upload the persist build identity's admin token."
+            echo "::error::See docs/BUILD_SIGNING.md (registry-registration section) for the wire shape."
+            exit 1
+          fi
+          BINARY="$(ls dist/wheel/*.whl | head -1)"
+          BIN_SHA="sha256:$(sha256sum "$BINARY" | cut -d' ' -f1)"
+          GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          PAYLOAD=$(python3 -c "
+          import json, sys
+          print(json.dumps({
+              'project': 'ciris-persist',
+              'version': '${{ steps.version.outputs.version }}',
+              'binaries': {'x86_64-unknown-linux-gnu': '${BIN_SHA}'},
+              'generated_at': '${GENERATED_AT}',
+              'notes': 'CIRIS Trinity persist substrate; manifest signed via ciris-build-sign --primitive persist (CIRISVerify v1.8.0).',
+          }))
+          ")
+          echo "POST ${REGISTRY_URL}/v1/verify/binary-manifest"
+          echo "Payload (logged for diagnostics — no secret content):"
+          echo "${PAYLOAD}" | python3 -m json.tool
+          HTTP_CODE=$(curl -sS -o dist/registry-response.json -w "%{http_code}" \
+            -X POST "${REGISTRY_URL}/v1/verify/binary-manifest" \
+            -H "Authorization: Bearer ${REGISTRY_ADMIN_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "${PAYLOAD}")
+          echo "HTTP ${HTTP_CODE}"
+          cat dist/registry-response.json | python3 -m json.tool
+          if [ "${HTTP_CODE}" != "200" ] && [ "${HTTP_CODE}" != "201" ]; then
+            echo "::error::Registration failed with HTTP ${HTTP_CODE}"
+            exit 1
+          fi
+      - name: round-trip verify GET /v1/builds/{version}
+        # Persist issue #2 close gate: confirm the registered
+        # manifest comes back via the public GET endpoint with
+        # project=ciris-persist. Hash + version round-trip;
+        # diff against what we POSTed.
+        env:
+          REGISTRY_URL: ${{ vars.REGISTRY_URL }}
+        run: |
+          if [ -z "${REGISTRY_URL}" ]; then
+            REGISTRY_URL="https://registry.ciris.ai"
+          fi
+          VERSION="${{ steps.version.outputs.version }}"
+          echo "GET ${REGISTRY_URL}/v1/verify/binary-manifest/${VERSION}?project=ciris-persist"
+          HTTP_CODE=$(curl -sS -o dist/round-trip.json -w "%{http_code}" \
+            "${REGISTRY_URL}/v1/verify/binary-manifest/${VERSION}?project=ciris-persist")
+          echo "HTTP ${HTTP_CODE}"
+          cat dist/round-trip.json | python3 -m json.tool
+          if [ "${HTTP_CODE}" != "200" ]; then
+            echo "::error::Round-trip GET failed with HTTP ${HTTP_CODE} — registration didn't land or the public endpoint is rejecting project=ciris-persist"
+            exit 1
+          fi
+          # Verify the binary hash we POSTed comes back unchanged.
+          BINARY="$(ls dist/wheel/*.whl | head -1)"
+          BIN_SHA="sha256:$(sha256sum "$BINARY" | cut -d' ' -f1)"
+          GOT_SHA=$(python3 -c "
+          import json
+          d = json.load(open('dist/round-trip.json'))
+          # Registry response shape: binaries dict keyed by target.
+          binaries = d.get('binaries') or d.get('manifest', {}).get('binaries') or {}
+          print(binaries.get('x86_64-unknown-linux-gnu', '<missing>'))
+          ")
+          if [ "${GOT_SHA}" != "${BIN_SHA}" ]; then
+            echo "::error::Round-trip hash mismatch:"
+            echo "  posted: ${BIN_SHA}"
+            echo "  got:    ${GOT_SHA}"
+            exit 1
+          fi
+          echo "✓ Round-trip verified: posted hash matches GET response."
+          {
+            echo "## Registry round-trip"
+            echo ""
+            echo "- registry: \`${REGISTRY_URL}\`"
+            echo "- version: \`${VERSION}\`"
+            echo "- target: \`x86_64-unknown-linux-gnu\`"
+            echo "- binary_hash: \`${BIN_SHA}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
           name: ciris-persist-build-manifest-${{ steps.version.outputs.version }}
           path: |
             dist/persist-extras-*.json
             dist/ciris-persist-*.manifest.json
+            dist/steward-key.json
+            dist/registry-response.json
+            dist/round-trip.json

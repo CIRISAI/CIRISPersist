@@ -149,6 +149,80 @@ rotation operationally visible.
 
 ---
 
+## Registry registration (v0.1.11+)
+
+After the build-manifest job successfully signs, CI registers the
+binary manifest with CIRISRegistry so downstream peers can fetch +
+verify it programmatically.
+
+### What's required
+
+In addition to the two signing secrets above, the registry
+registration step needs:
+
+- **`REGISTRY_ADMIN_TOKEN`** (repo secret, sensitive). The
+  registry team issues this against the persist build identity.
+  Until it's set, the registration step fails with a typed
+  `::error::REGISTRY_ADMIN_TOKEN repo secret not configured`
+  message pointing here.
+
+- **`REGISTRY_URL`** (repo variable, public). Defaults to
+  `https://registry.ciris.ai` if unset. Override for
+  staging / sovereign-mode deployments. Variables (not secrets)
+  are correct here because the URL is a public service endpoint.
+
+Both values come from the registry team. The sequence is:
+
+1. Bridge / build-signing keys generated + uploaded (above).
+2. Registry team issues admin token, uploads as
+   `REGISTRY_ADMIN_TOKEN`.
+3. (Optional) Set `REGISTRY_URL` repo variable if not on prod.
+4. Next push to main: build-manifest job goes green end-to-end.
+
+### What CI does
+
+```
+sign manifest                 ── ciris-build-sign --primitive persist
+pre-flight registry           ── GET /v1/steward-key (logs key_id)
+register binary manifest      ── POST /v1/verify/binary-manifest with project=ciris-persist
+round-trip verify             ── GET /v1/verify/binary-manifest/<version>?project=ciris-persist
+                                  diff against POST'd binary_hash
+upload artifacts              ── all responses preserved 90 days
+```
+
+The pre-flight `steward-key` snapshot is logged but does NOT gate
+registration. If the registry is in ephemeral mode (no
+`ED25519_KEY_PATH` / `MLDSA_KEY_PATH` configured registry-side),
+the step's GH-summary line surfaces the ephemeral `key_id` so
+operators can see it. Hard-gating on this would be over-strict —
+staging registries legitimately run ephemeral.
+
+### Round-trip verification
+
+CI's last registration step does:
+
+```bash
+GET ${REGISTRY_URL}/v1/verify/binary-manifest/<version>?project=ciris-persist
+```
+
+…and compares the returned `binaries["x86_64-unknown-linux-gnu"]`
+sha256 against what was POSTed. **Mismatch fails the build.**
+This is the close gate for persist issue #2: at least one signed
+manifest must round-trip cleanly through the registry before that
+issue resolves.
+
+### When to rotate `REGISTRY_ADMIN_TOKEN`
+
+Rotate when:
+
+- Token leaks (treat as P0; registry team revokes + reissues).
+- Routine schedule (registry team's call; tokens are scoped to
+  the persist build identity, not crate-version-specific, so
+  rotation is decoupled from persist releases).
+
+Persist doesn't enforce a rotation cadence; we trust the registry
+team's policy.
+
 ## Failure modes
 
 - **Either secret missing in CI.** The build-manifest job

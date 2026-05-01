@@ -5,6 +5,86 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.1.11] — 2026-05-01
+
+CI registration step end-to-end. Closes the implementation half of
+[`#2`](https://github.com/CIRISAI/CIRISPersist/issues/2); the issue's
+explicit close gate ("at least one persist build registered end-to-end
+and round-tripped") now lives in CI.
+
+### CI workflow — three new steps after sign-manifest
+
+1. **Pre-flight steward-key check**. `GET ${REGISTRY_URL}/v1/steward-key`
+   logs the registry's active hybrid signing key + `key_id` to the
+   GH step summary. Surfaces ephemeral-mode registries
+   (registry-side AV-28: when `ED25519_KEY_PATH` / `MLDSA_KEY_PATH`
+   aren't configured, every restart cycles the steward pubkey). Does
+   not hard-gate registration; visibility-only so operators can see
+   the posture before downstream peers do.
+
+2. **Register binary manifest**. `POST ${REGISTRY_URL}/v1/verify/binary-manifest`
+   with `project=ciris-persist`, the wheel's sha256, version, target.
+   Auth via `Bearer ${REGISTRY_ADMIN_TOKEN}` (registry team issues +
+   uploads as a repo secret). Registry signs server-side with its
+   steward key.
+
+3. **Round-trip verify**. `GET ${REGISTRY_URL}/v1/verify/binary-manifest/<version>?project=ciris-persist`,
+   diff the returned `binaries["x86_64-unknown-linux-gnu"]` sha256
+   against what was POSTed. Hash mismatch fails the build with a
+   typed error. **This is persist #2's explicit close gate** — a
+   green CI run on v0.1.11+ is evidence-of-registration.
+
+### Two new operational secrets / variables
+
+| Name | Type | Provided by | Default |
+|---|---|---|---|
+| `REGISTRY_URL` | repo variable | persist team | `https://registry.ciris.ai` |
+| `REGISTRY_ADMIN_TOKEN` | repo secret | registry team | (required) |
+
+Until `REGISTRY_ADMIN_TOKEN` is set, the registration step fails
+with a typed message pointing at `docs/BUILD_SIGNING.md`. Same
+pattern as the v0.1.9 `CIRIS_BUILD_*_SECRET` gates: failure is
+self-documenting; the operational dependency is visible in CI
+output, not buried in code.
+
+### Documentation
+
+- `docs/BUILD_SIGNING.md` — new "Registry registration (v0.1.11+)"
+  section: required secrets/vars, the four CI steps, round-trip
+  verification semantics, rotation guidance.
+- `docs/TODO_REGISTRY.md` — rewritten as a historical "what
+  shipped" audit trail. The three TODOs the doc once tracked
+  (registry persist support, manifest tool refactor,
+  ciris-keyring-sign-cli) all landed upstream; the doc now points
+  at the resolutions.
+
+### Artifacts
+
+The build-manifest CI artifact gains three new files alongside
+the existing `persist-extras-*.json` + `ciris-persist-*.manifest.json`:
+
+- `steward-key.json` — registry steward-key snapshot at registration time
+- `registry-response.json` — raw response body of the binary-manifest POST
+- `round-trip.json` — raw response body of the round-trip GET
+
+90-day retention; same as the existing v0.1.9 artifacts.
+
+### What still depends on bridge / ops action
+
+Persist's CI is fully ungated code-side. The remaining gates are
+operational:
+
+- bridge uploads `CIRIS_BUILD_ED25519_SECRET` + `CIRIS_BUILD_MLDSA_SECRET` (per `docs/BUILD_SIGNING.md`)
+- registry team issues + uploads `REGISTRY_ADMIN_TOKEN`
+
+When both happen, CI flips green end-to-end. Persist #2 closes
+on the round-trip evidence.
+
+### Tests
+
+131 tests green; clippy clean; cargo-deny clean. No code-side
+changes outside the workflow YAML.
+
 ## [0.1.10] — 2026-05-01
 
 P0 wheel-tagging regression fix from v0.1.9.
