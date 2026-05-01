@@ -85,18 +85,35 @@ preemptively:
 
 ### 4. Push the tag
 
-After steps 1-3, the next `git tag v0.1.12 && git push origin v0.1.12`
+After steps 1-3, the next `git tag v0.1.13 && git push origin v0.1.13`
 triggers `.github/workflows/ci.yml::publish-pypi`. The job:
 
-1. Waits for `pyo3-wheel` + `build-manifest` to succeed.
-2. Downloads the abi3 wheel artifact.
-3. Sanity-checks shape (rejects non-`cp311-abi3` to prevent
-   silent breakage on consumers).
+1. Waits for `pyo3-wheel` (matrix of 4 entries) + `build-manifest`
+   to succeed.
+2. Downloads all four wheel artifacts (linux x86_64 + aarch64,
+   darwin arm64 + x86_64) via the `ciris_persist-wheel-*` glob.
+3. Sanity-checks count + shape (rejects anything that isn't
+   exactly 4 cp311-abi3 wheels — prevents v0.1.10-class
+   regressions reaching consumers).
 4. Calls `pypa/gh-action-pypi-publish@release/v1` with
-   `attestations: true` (PEP 740 sigstore attestation).
+   `attestations: true`. One sigstore attestation bundle covers
+   all four wheels.
 5. PyPI accepts the upload via OIDC trusted publishing.
-6. `pip install ciris-persist==0.1.12` works within ~30 seconds of
-   the workflow finishing.
+6. `pip install ciris-persist==0.1.13` works within ~30 seconds
+   of the workflow finishing on every supported `(os, arch)`.
+
+### Wheel matrix (v0.1.13+)
+
+| Target triple | Wheel tag | Runner | Phase |
+|---|---|---|---|
+| `x86_64-unknown-linux-gnu` | `manylinux_2_34_x86_64` | `ubuntu-latest` | 1 |
+| `aarch64-unknown-linux-gnu` | `manylinux_2_34_aarch64` | `ubuntu-24.04-arm` | 1 |
+| `aarch64-apple-darwin` | `macosx_11_0_arm64` | `macos-14` | 1 |
+| `x86_64-apple-darwin` | `macosx_10_12_x86_64` | `macos-13` | 1 sunset |
+
+iOS / Android out of scope here — they ship via xcframework /
+UniFFI native packaging, not PyPI. See
+`FSD/PLATFORM_ARCHITECTURE.md` §3.5 for the full matrix.
 
 ---
 
