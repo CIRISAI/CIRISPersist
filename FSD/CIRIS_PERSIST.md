@@ -167,7 +167,11 @@ These land in Phase 1 and carry through Phases 2 and 3:
 
    `Engine` construction takes `signing_key_id` as a **required** parameter. The ctor calls into the keyring's bootstrap path internally — idempotent: returns the existing key if it exists, generates a new seed and stores it if not. The lens / agent then publishes the corresponding public key to the registry / lens-discovery layer. There is no "no-signing" mode; the substrate's contract assumes every row carries provenance.
 
+   **The same key is the deployment's Reticulum identity** when the `peer-replicate` feature lands (FSD §4.4 / Phase 2.3). Reticulum's destination is `SHA256(public_key)[..16]` — addressing IS identity (PoB §3.2). Persist's `Signer::public_key()` is the source-of-truth that the future Reticulum integration reads to compute the destination. No separate "network address" key; the substrate's signing key is the federation identity.
+
    On the agent (Phase 2+ deployments, FSD §4): persist points at the agent's existing wire-format §8 signing key by id — same key, no new keyring entries. The agent's identity stays single-keyed.
+
+   **One key, three roles** (PoB §3.2 made operational): the same Ed25519 key is *also* the deployment's Reticulum destination address (SHA256-prefix of the public key — addressing IS identity, no translation layer) *and* the public-key entry the deployment publishes to the registry. Compromise the key, you compromise all three roles simultaneously: cryptographic provenance, federation transport address, and registry identity. That tripled cost-asymmetry strengthens the case for hardware-backed keyring entries — the residual on `SoftwareSigner` (named in §3.4 #7 below) is the same residual as "lose your federation standing entirely."
 
    (Secondary mitigation against THREAT_MODEL.md AV-25 "scrub-key compromise"; the `SoftwareSigner` fallback is acceptable for dev / sovereign deployments without hardware backing, and is named as a residual risk in §8 of the threat model.)
 

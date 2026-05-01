@@ -52,6 +52,12 @@ shape, the agent-side persistence service (Phase 2/3). It protects:
   the peer already has" — becomes cryptographically attestable.
   Bilateral cryptography: agent's wire-format §8 signature proves
   authorship, lens's v0.1.3 scrub envelope proves handling.
+- **(NEW v0.1.3) Single-key federation identity**: the scrub-signing
+  key is also the deployment's Reticulum destination
+  (`SHA256(public_key)[..16]`, PoB §3.2 — addressing IS identity)
+  and the registry-published public key. One key, three roles.
+  No separate "network identity" key; no translation layer
+  between cryptographic provenance and federation transport.
 
 ### What CIRISPersist Does NOT Protect (Phase 1)
 
@@ -631,6 +637,20 @@ The Python process never holds the seed bytes; the seed never
 crosses the FFI boundary. Hardware-backed deployments require
 physical access (and on most platforms, exploitation of an
 enclave-grade vulnerability) to extract.
+
+**One key, three roles** (PoB §3.2): the scrub-signing key is
+*also* the deployment's Reticulum destination address (Phase 2.3)
+*and* the registry-published public key. Compromise the key,
+you compromise all three roles simultaneously — cryptographic
+provenance, federation transport address, registry identity.
+This tripled cost-asymmetry is what makes hardware-backed
+keyring entries materially stronger than software-only seeds:
+losing the key isn't just "rows you signed are now suspect" but
+"your peer-to-peer address is now hijacked AND your registry
+entry needs revocation." The federation primitive's
+self-application of risk (PoB §2.1: the cost of being a real
+member is the cost of *being attacked* if your key leaks)
+strengthens the operational case for hardware backing.
 
 **Secondary**: `ciris-keyring`'s `SoftwareSigner` fallback exists
 for dev / sovereign deployments without hardware backing. The
