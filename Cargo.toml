@@ -1,0 +1,52 @@
+[package]
+name = "ciris-persist"
+version = "0.0.1"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Unified Rust persistence for the CIRIS Trinity — signed events, time-series, runtime state."
+repository = "https://github.com/CIRISAI/CIRISPersist"
+authors = ["CIRIS AI <hello@ciris.ai>"]
+rust-version = "1.75"
+publish = false
+
+# Status: pre-implementation. See FSD/CIRIS_PERSIST.md for the spec and
+# delivery plan. Phase 1 implementation lands the dependencies listed below
+# under their respective feature flags; until then this crate compiles as a
+# documentation-only stub.
+
+[features]
+default = []
+
+# Phase 1 features.
+postgres = []                  # tokio-postgres + deadpool-postgres
+server = []                    # axum HTTP listener for /api/v1/accord/events
+pyo3 = []                      # Python bindings for FastAPI / agent in-process
+
+# Phase 2 features.
+sqlite = []                    # rusqlite backend; required by agent + iOS
+c-abi = []                     # C ABI for iOS client (cbindgen-generated header)
+peer-replicate = []            # Reticulum gossip hook for trace replication
+
+[dependencies]
+# Implementation dependencies are added per-phase as the corresponding
+# feature is implemented. The plan, captured here for traceability:
+#
+# Always-on (Phase 1+):
+#   serde, serde_json, ed25519-dalek, sha2, chrono (with serde),
+#   thiserror, tracing, tokio (rt-multi-thread, sync, macros), redb.
+#
+# `postgres`:
+#   tokio-postgres (with-chrono-0_4, with-serde_json-1), deadpool-postgres.
+#
+# `sqlite`:
+#   rusqlite (bundled).
+#
+# `pyo3`:
+#   pyo3 (extension-module, abi3-py311).
+#
+# `server`:
+#   axum, tower.
+
+[lib]
+name = "ciris_persist"
+path = "src/lib.rs"
