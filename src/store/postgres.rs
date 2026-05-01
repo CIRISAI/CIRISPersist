@@ -35,6 +35,7 @@ use base64::Engine;
 use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use ed25519_dalek::VerifyingKey;
 use postgres_types::ToSql;
+#[cfg(not(feature = "tls"))]
 use tokio_postgres::NoTls;
 
 use super::backend::{Backend, InsertReport};
@@ -79,6 +80,38 @@ impl PostgresBackend {
         cfg.dbname = pg_config.get_dbname().map(str::to_owned);
         cfg.manager = Some(mgr_config);
 
+        // THREAT_MODEL.md AV-18: TLS for the Postgres connection
+        // pool, gated on the `tls` feature. Sovereign-mode
+        // deployments with remote DBs (Postgres-over-WAN) MUST
+        // enable this; co-located DBs can leave it off.
+        #[cfg(feature = "tls")]
+        let pool = {
+            use rustls::ClientConfig;
+            use tokio_postgres_rustls::MakeRustlsConnect;
+            let mut roots = rustls::RootCertStore::empty();
+            // rustls-native-certs 0.8 returns CertificateResult with
+            // .certs Vec and .errors Vec; non-fatal individual
+            // failures don't kill the load.
+            let cert_result = rustls_native_certs::load_native_certs();
+            for cert in cert_result.certs {
+                roots.add(cert).map_err(|e| {
+                    Error::Backend(format!("native-cert add: {e}"))
+                })?;
+            }
+            if !cert_result.errors.is_empty() {
+                tracing::warn!(
+                    errors = ?cert_result.errors,
+                    "some native certs failed to load (non-fatal)"
+                );
+            }
+            let tls_config = ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            let connector = MakeRustlsConnect::new(tls_config);
+            cfg.create_pool(Some(Runtime::Tokio1), connector)
+                .map_err(|e| Error::Backend(format!("pool create (tls): {e}")))?
+        };
+        #[cfg(not(feature = "tls"))]
         let pool = cfg
             .create_pool(Some(Runtime::Tokio1), NoTls)
             .map_err(|e| Error::Backend(format!("pool create: {e}")))?;

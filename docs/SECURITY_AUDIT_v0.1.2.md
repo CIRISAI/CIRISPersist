@@ -391,18 +391,36 @@ via Dockerfile multi-stage anyway).
 
 ### 4.12 No PyO3 panic policy at the FFI boundary (P2)
 
-**Gap**: A panic in Rust code called via PyO3 unwinds across the
-FFI boundary, which is undefined behavior. PyO3 wraps panics into
+**Gap (v0.1.2)**: A panic in Rust code called via PyO3 unwinds across
+the FFI boundary, which is undefined behavior. PyO3 wraps panics into
 Python exceptions in most cases, but a panic during the
 *construction* of the panic message (e.g., panic-in-Drop) can
 abort the process from the wrong stack frame.
 
-**Recommended fix**: `std::panic::catch_unwind` wrappers on every
-`#[pymethods]` method, converting panics to `PyRuntimeError`. PyO3
-0.28 has a built-in pattern for this; we currently rely on its
-default behavior.
+**Resolution in v0.1.3**: **Subsumed by §4.2** (`panic = "abort"` on
+the release profile). With panic-abort, there *is no unwind* to
+unwind across the FFI boundary in the first place. A panic in Rust
+code called via PyO3 aborts the process directly; FastAPI worker
+restart semantics + the journal-replay path handle recovery.
 
-v0.1.3 hot-fix scope (cheap; defense in depth).
+The two recommendations are alternatives, not additive:
+
+- Option A (chosen): `panic = "abort"` → process dies fast,
+  supervisor restarts, in-flight queue is replayed from the
+  journal (FSD §3.4 #2). No catch_unwind code anywhere.
+- Option B (rejected): `panic = "unwind"` (default) + explicit
+  `catch_unwind` wrappers on every `#[pymethods]` method
+  converting panics to `PyRuntimeError`. More code; per-method
+  ceremony; allows partial-process recovery from a Rust-side
+  panic (the FastAPI worker survives the bad request).
+
+Option A wins on simplicity *and* on the mission constraint
+"verify-before-persist" — a panic mid-pipeline is a bug, and
+killing the process forces operations to investigate rather than
+silently swallowing the error into a `PyRuntimeError`.
+
+**Status**: ✓ Resolved v0.1.3 via §4.2's profile change. No
+catch_unwind code added.
 
 ### 4.13 No `release-please` / automated release notes (P3)
 

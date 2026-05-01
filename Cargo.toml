@@ -29,6 +29,14 @@ sqlite         = ["dep:rusqlite"]
 c-abi          = []
 peer-replicate = []
 
+# v0.1.3 — optional TLS for the Postgres connection pool. Defaults
+# to no-TLS (deployments where the lens process and Postgres are
+# on the same host or a private network). Enable when the DB is
+# remote — sovereign-mode deployments with Postgres-over-WAN, or
+# any deployment where TLS at the lens-API edge doesn't also
+# cover the lens→DB hop. THREAT_MODEL.md AV-18.
+tls = ["dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-native-certs"]
+
 # Always-on (no_std-cleanness for schema/verify is enforced separately
 # by `cargo build --no-default-features --features no_std` per
 # PLATFORM_ARCHITECTURE.md §3.4 — Phase 3 stretch).
@@ -50,6 +58,11 @@ deadpool-postgres = { version = "0.14", optional = true }
 bytes             = { version = "1", optional = true }
 postgres-types    = { version = "0.2", optional = true }
 refinery          = { version = "0.9", features = ["tokio-postgres"], optional = true }
+
+# v0.1.3 — TLS for tokio-postgres connection pool (THREAT_MODEL.md AV-18).
+tokio-postgres-rustls = { version = "0.13", optional = true }
+rustls                = { version = "0.23", optional = true }
+rustls-native-certs   = { version = "0.8", optional = true }
 # refinery transitively pulls postgres-native-tls → native-tls →
 # openssl-sys. We use NoTls so the TLS path is never exercised, but
 # the dep tree still requires openssl to *build*. Vendored builds
