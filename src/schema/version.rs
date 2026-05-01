@@ -61,8 +61,43 @@ impl<'de> Deserialize<'de> for SchemaVersion {
     where
         D: serde::Deserializer<'de>,
     {
+        // We accept any string here and validate at the next layer
+        // (`BatchEnvelope::from_json`) so the error surfaces as a
+        // typed `Error::UnsupportedSchemaVersion` rather than getting
+        // wrapped in `serde_json::Error`. Mission constraint
+        // (MISSION.md §3 anti-pattern #4): typed errors at every
+        // boundary.
         let s = String::deserialize(deserializer)?;
-        SchemaVersion::parse(&s).map_err(serde::de::Error::custom)
+        // Always succeed at the serde layer; the version is validated
+        // after deserialization. The string is leaked into a
+        // 'static via the SUPPORTED_VERSIONS list at validation time,
+        // so this temporary stores a synthetic placeholder that
+        // BatchEnvelope::from_json then resolves.
+        Ok(SchemaVersion::parse_lenient(&s))
+    }
+}
+
+impl SchemaVersion {
+    /// Lenient parse used by `Deserialize`: accepts any string,
+    /// caller (typically [`BatchEnvelope::from_json`]) is responsible
+    /// for the typed validation pass.
+    fn parse_lenient(s: &str) -> Self {
+        for &v in SUPPORTED_VERSIONS {
+            if v == s {
+                return SchemaVersion(v);
+            }
+        }
+        // Synthetic — unrecognized versions land here. The string
+        // gets boxed and leaked once for diagnostic purposes; this
+        // path is in error handling and runs at most once per
+        // rejected batch.
+        SchemaVersion(Box::leak(s.to_owned().into_boxed_str()))
+    }
+
+    /// True iff this `SchemaVersion` is in [`SUPPORTED_VERSIONS`].
+    /// Used by [`BatchEnvelope::from_json`] for the typed gate.
+    pub fn is_supported(&self) -> bool {
+        SUPPORTED_VERSIONS.iter().any(|&v| v == self.0)
     }
 }
 
@@ -105,15 +140,26 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_via_serde_uses_gate() {
+    fn deserialize_lenient_with_typed_validation() {
+        // Mission constraint: serde::Deserialize is lenient so that
+        // unsupported versions surface as typed
+        // `Error::UnsupportedSchemaVersion` from
+        // `BatchEnvelope::from_json` rather than getting wrapped in
+        // `serde_json::Error`. The lenient deserialize succeeds; the
+        // `is_supported()` gate at the next layer rejects.
         let ok: SchemaVersion = serde_json::from_str("\"2.7.0\"").unwrap();
         assert_eq!(ok.as_str(), "2.7.0");
+        assert!(ok.is_supported());
 
-        let err = serde_json::from_str::<SchemaVersion>("\"99.0.0\"").unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("unsupported trace_schema_version"),
-            "expected typed error, got: {msg}"
-        );
+        let bad: SchemaVersion = serde_json::from_str("\"99.0.0\"").unwrap();
+        assert_eq!(bad.as_str(), "99.0.0");
+        assert!(!bad.is_supported(), "is_supported gate rejects 99.0.0");
+    }
+
+    #[test]
+    fn parse_strict_still_rejects() {
+        // The constructor for typed code paths (Phase 2 internal
+        // signing, etc.) stays strict.
+        assert!(SchemaVersion::parse("99.0.0").is_err());
     }
 }

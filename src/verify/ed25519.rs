@@ -144,19 +144,23 @@ fn format_iso8601(t: &chrono::DateTime<chrono::Utc>) -> String {
 }
 
 /// Verify a `CompleteTrace`'s signature against the canonical bytes
-/// the canonicalizer produces.
+/// the canonicalizer produces, using a pre-fetched verifying key.
 ///
 /// This is the verify-before-persist gate (FSD §3.3 step 2). On
 /// `Ok(())` the caller may persist; on `Err(_)` the caller MUST
 /// reject and emit a structured 422 to the agent.
-pub fn verify_trace<C, K>(
+///
+/// The key lookup is the caller's responsibility (typically via
+/// [`Backend::lookup_public_key`](crate::store::Backend::lookup_public_key))
+/// — keeping verify itself synchronous avoids the async-inside-sync
+/// awkwardness that PublicKeyDirectory.lookup() invited.
+pub fn verify_trace<C>(
     trace: &CompleteTrace,
     canonicalizer: &C,
-    keys: &K,
+    key: &VerifyingKey,
 ) -> Result<(), Error>
 where
     C: Canonicalizer + ?Sized,
-    K: PublicKeyDirectory + ?Sized,
 {
     // 1. Decode signature bytes from base64.
     let sig_bytes = BASE64
@@ -175,22 +179,37 @@ where
             .expect("length-checked above"),
     );
 
-    // 2. Look up the verifying key for the claimed signature_key_id.
-    let key = keys
-        .lookup(&trace.signature_key_id)
-        .map_err(|e| Error::InvalidSignature(format!("key lookup failed: {e}")))?
-        .ok_or_else(|| Error::UnknownKey(trace.signature_key_id.clone()))?;
-
-    // 3. Build the canonical payload value, then canonicalize bytes.
+    // 2. Build the canonical payload value, then canonicalize bytes.
     let payload = canonical_payload_value(trace);
     let bytes = canonicalizer.canonicalize_value(&payload)?;
 
-    // 4. Strict verify — rejects weak keys, malleable signatures,
+    // 3. Strict verify — rejects weak keys, malleable signatures,
     // small-order points. (MISSION.md §2 — verify_strict semantics.)
     key.verify_strict(&bytes, &sig)
         .map_err(|_| Error::SignatureMismatch)?;
 
     Ok(())
+}
+
+/// Convenience wrapper: verify with a [`PublicKeyDirectory`] in front
+/// (looks up the key by id, then defers to [`verify_trace`]). Useful
+/// for the standalone-verifier test path; production ingest looks up
+/// the key from the Backend asynchronously and calls [`verify_trace`]
+/// directly.
+pub fn verify_trace_via_directory<C, K>(
+    trace: &CompleteTrace,
+    canonicalizer: &C,
+    keys: &K,
+) -> Result<(), Error>
+where
+    C: Canonicalizer + ?Sized,
+    K: PublicKeyDirectory + ?Sized,
+{
+    let key = keys
+        .lookup(&trace.signature_key_id)
+        .map_err(|e| Error::InvalidSignature(format!("key lookup failed: {e}")))?
+        .ok_or_else(|| Error::UnknownKey(trace.signature_key_id.clone()))?;
+    verify_trace(trace, canonicalizer, &key)
 }
 
 #[cfg(test)]
@@ -258,7 +277,7 @@ mod tests {
         };
         keys.keys.insert(key_id.to_owned(), sk.verifying_key());
 
-        verify_trace(&trace, &PythonJsonDumpsCanonicalizer, &keys)
+        verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &keys)
             .expect("known-good trace must verify");
     }
 
@@ -277,7 +296,7 @@ mod tests {
         };
         keys.keys.insert(key_id.to_owned(), sk.verifying_key());
 
-        let err = verify_trace(&trace, &PythonJsonDumpsCanonicalizer, &keys)
+        let err = verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &keys)
             .expect_err("tampered trace must be rejected");
         assert!(matches!(err, Error::SignatureMismatch), "got {err:?}");
     }
@@ -292,7 +311,7 @@ mod tests {
         let keys = MemKeys {
             keys: HashMap::new(),
         };
-        let err = verify_trace(&trace, &PythonJsonDumpsCanonicalizer, &keys).unwrap_err();
+        let err = verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &keys).unwrap_err();
         assert!(matches!(err, Error::UnknownKey(_)));
     }
 
@@ -309,7 +328,7 @@ mod tests {
         };
         keys.keys.insert(key_id.to_owned(), sk.verifying_key());
 
-        let err = verify_trace(&trace, &PythonJsonDumpsCanonicalizer, &keys).unwrap_err();
+        let err = verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &keys).unwrap_err();
         assert!(matches!(err, Error::InvalidSignature(_)));
     }
 
@@ -328,7 +347,7 @@ mod tests {
         };
         keys.keys.insert(key_id.to_owned(), sk.verifying_key());
 
-        let err = verify_trace(&trace, &PythonJsonDumpsCanonicalizer, &keys).unwrap_err();
+        let err = verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &keys).unwrap_err();
         assert!(matches!(err, Error::InvalidSignature(_)));
     }
 
@@ -348,7 +367,7 @@ mod tests {
         };
         keys.keys.insert(key_id.to_owned(), sk_other.verifying_key());
 
-        let err = verify_trace(&trace, &PythonJsonDumpsCanonicalizer, &keys).unwrap_err();
+        let err = verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &keys).unwrap_err();
         assert!(matches!(err, Error::SignatureMismatch));
     }
 }

@@ -14,7 +14,9 @@ pub mod canonical;
 pub mod ed25519;
 
 pub use canonical::{Canonicalizer, PythonJsonDumpsCanonicalizer};
-pub use ed25519::{canonical_payload_value, verify_trace, PublicKeyDirectory};
+pub use ed25519::{
+    canonical_payload_value, verify_trace, verify_trace_via_directory, PublicKeyDirectory,
+};
 
 /// Verify-layer errors.
 #[derive(Debug, thiserror::Error)]

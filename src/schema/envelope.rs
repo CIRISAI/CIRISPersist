@@ -118,6 +118,17 @@ impl BatchEnvelope {
     /// only.
     pub fn from_json(bytes: &[u8]) -> Result<Self, super::Error> {
         let env: Self = serde_json::from_slice(bytes)?;
+        // Mission (MISSION.md §3 anti-pattern #4): typed gate.
+        // SchemaVersion::deserialize is lenient so we can return
+        // structured `UnsupportedSchemaVersion` here rather than the
+        // wrapped serde_json::Error a strict deserialize would
+        // produce.
+        if !env.trace_schema_version.is_supported() {
+            return Err(super::Error::UnsupportedSchemaVersion {
+                got: env.trace_schema_version.as_str().to_owned(),
+                supported: super::version::SUPPORTED_VERSIONS,
+            });
+        }
         if env.events.is_empty() {
             return Err(super::Error::MissingField("events"));
         }

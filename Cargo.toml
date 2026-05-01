@@ -18,7 +18,7 @@ publish = false
 default = []
 
 # Phase 1 features.
-postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:bytes", "dep:postgres-types"]
+postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:bytes", "dep:postgres-types", "dep:refinery"]
 server   = ["dep:axum", "dep:tower"]
 pyo3     = ["dep:pyo3"]
 
@@ -47,6 +47,7 @@ tokio-postgres    = { version = "0.7", features = ["with-chrono-0_4", "with-serd
 deadpool-postgres = { version = "0.14", optional = true }
 bytes             = { version = "1", optional = true }
 postgres-types    = { version = "0.2", optional = true }
+refinery          = { version = "0.9", features = ["tokio-postgres"], optional = true }
 
 # Phase 1 — server feature
 axum  = { version = "0.8", optional = true }

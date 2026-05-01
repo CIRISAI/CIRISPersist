@@ -11,11 +11,15 @@
 pub mod backend;
 pub mod decompose;
 pub mod memory;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 pub mod types;
 
 pub use backend::{Backend, InsertReport};
 pub use decompose::{decompose, dedup_key, Decomposed};
 pub use memory::MemoryBackend;
+#[cfg(feature = "postgres")]
+pub use postgres::PostgresBackend;
 pub use types::{
     AuditEntry, ClaimParams, GraphNode, ServiceCorrelation, Task, TraceEventRow, TraceLlmCallRow,
 };

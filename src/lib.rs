@@ -15,12 +15,15 @@
 //! `FSD/PLATFORM_ARCHITECTURE.md` for the layered shape this module
 //! tree implements.
 
+pub mod ingest;
 pub mod schema;
+pub mod scrub;
 pub mod store;
 pub mod verify;
 
+pub use ingest::{BatchSummary, IngestError, IngestPipeline};
+
 // Phase 1 surfaces still pending implementation:
-//   pub mod scrub;
 //   #[cfg(feature = "server")] pub mod server;
 //   #[cfg(feature = "pyo3")]   pub mod ffi;
 
@@ -36,6 +39,9 @@ pub enum Error {
 
     #[error("verify: {0}")]
     Verify(#[from] verify::Error),
+
+    #[error("scrub: {0}")]
+    Scrub(#[from] scrub::ScrubError),
 
     #[error("store: {0}")]
     Store(#[from] store::Error),
