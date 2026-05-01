@@ -700,40 +700,70 @@ mod tests {
         }
     }
 
+    /// RAII guard for env-var test mutation. Saves the prior
+    /// value on construction; restores on drop (including panic
+    /// drop), so test failures don't pollute the env for
+    /// downstream tests in the same process.
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+    impl EnvGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, prev }
+        }
+        fn unset(key: &'static str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, prev }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     /// v0.1.14 — `bootstrap_lock_path` reflects `CIRIS_DATA_DIR`
     /// with the `/tmp` fallback. The cohabitation flock relies on
     /// the path being deterministic across processes on the same
     /// host; drift here breaks the multi-worker serialization.
+    ///
+    /// `serial(env_ciris_data_dir)` keeps env-mutating tests in
+    /// this module from racing — Rust runs tests in parallel by
+    /// default and a leaked `CIRIS_DATA_DIR` can pollute peer tests
+    /// (CI saw `acquire_bootstrap_lock` panic with PermissionDenied
+    /// because a peer test left `/var/lib/cirislens/keyring` set
+    /// and the runner can't write there).
     #[test]
+    #[serial_test::serial(env_ciris_data_dir)]
     fn bootstrap_lock_path_resolution() {
-        let prev = std::env::var("CIRIS_DATA_DIR").ok();
-
-        std::env::set_var("CIRIS_DATA_DIR", "/var/lib/cirislens");
+        let _g = EnvGuard::set("CIRIS_DATA_DIR", "/var/lib/cirislens");
         assert_eq!(
             bootstrap_lock_path(),
             std::path::PathBuf::from("/var/lib/cirislens/.persist-bootstrap.lock")
         );
 
-        std::env::remove_var("CIRIS_DATA_DIR");
+        let _g = EnvGuard::unset("CIRIS_DATA_DIR");
         assert_eq!(
             bootstrap_lock_path(),
             std::path::PathBuf::from("/tmp/ciris-persist-bootstrap.lock")
         );
-
-        match prev {
-            Some(v) => std::env::set_var("CIRIS_DATA_DIR", v),
-            None => std::env::remove_var("CIRIS_DATA_DIR"),
-        }
     }
 
     /// v0.1.14 — `acquire_bootstrap_lock` opens-and-locks an FD;
     /// dropping it releases the lock. Smoke test against a tempdir
     /// path so we don't pollute /tmp on the host.
     #[test]
+    #[serial_test::serial(env_ciris_data_dir)]
     fn bootstrap_lock_acquire_and_release() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let prev = std::env::var("CIRIS_DATA_DIR").ok();
-        std::env::set_var("CIRIS_DATA_DIR", dir.path());
+        let _g = EnvGuard::set("CIRIS_DATA_DIR", dir.path());
 
         let f1 = acquire_bootstrap_lock().expect("first acquire");
         // Path exists; lock is held.
@@ -747,11 +777,9 @@ mod tests {
         drop(f1);
         let f2 = acquire_bootstrap_lock().expect("second acquire");
         drop(f2);
-
-        match prev {
-            Some(v) => std::env::set_var("CIRIS_DATA_DIR", v),
-            None => std::env::remove_var("CIRIS_DATA_DIR"),
-        }
+        // _g (EnvGuard) drops at end of scope; CIRIS_DATA_DIR
+        // restored to its prior value (None or whatever the
+        // outer test process had).
     }
 
     /// v0.1.9 — `storage_kind_token` returns the right discriminant
