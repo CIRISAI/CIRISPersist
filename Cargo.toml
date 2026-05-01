@@ -18,7 +18,7 @@ publish = false
 default = []
 
 # Phase 1 features.
-postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:bytes", "dep:postgres-types", "dep:refinery"]
+postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:bytes", "dep:postgres-types", "dep:refinery", "dep:openssl"]
 server   = ["dep:axum", "dep:tower", "dep:http-body-util"]
 # pyo3 implies postgres — the lens FastAPI integration shape (FSD §3.5)
 # needs the Postgres backend to be available.
@@ -50,6 +50,14 @@ deadpool-postgres = { version = "0.14", optional = true }
 bytes             = { version = "1", optional = true }
 postgres-types    = { version = "0.2", optional = true }
 refinery          = { version = "0.9", features = ["tokio-postgres"], optional = true }
+# refinery transitively pulls postgres-native-tls → native-tls →
+# openssl-sys. We use NoTls so the TLS path is never exercised, but
+# the dep tree still requires openssl to *build*. Vendored builds
+# openssl from source for whatever target arch we're compiling for —
+# no system libssl-dev:<arch> needed. The cost is a few extra seconds
+# of CI compile time; the benefit is arm64/Pi-class cross-compile
+# works without multi-arch apt gymnastics.
+openssl           = { version = "0.10", features = ["vendored"], optional = true }
 
 # Phase 1 — server feature
 axum  = { version = "0.8", optional = true }

@@ -27,7 +27,13 @@ CREATE TABLE IF NOT EXISTS cirislens.trace_events (
     payload         JSONB       NOT NULL,
     cost_llm_calls  INT,
     cost_tokens     INT,
-    cost_usd        NUMERIC(10,6),
+    -- f64-shaped column. Was NUMERIC(10,6) in the lens-side
+    -- 027_trace_events.sql; we use DOUBLE PRECISION so the Rust
+    -- writer can pass `Option<f64>` directly without pulling
+    -- rust_decimal into the dep tree. f64's ~15-17 sig digits is
+    -- ample headroom for USD costs that are already approximate
+    -- (LLM provider invoices round to fractional cents anyway).
+    cost_usd        DOUBLE PRECISION,
     signature       TEXT,
     signing_key_id  TEXT,
     signature_verified BOOLEAN  NOT NULL DEFAULT FALSE,
@@ -85,7 +91,7 @@ CREATE TABLE IF NOT EXISTS cirislens.trace_llm_calls (
     completion_tokens    INT,
     prompt_bytes         INT,
     completion_bytes     INT,
-    cost_usd             NUMERIC(12,8),
+    cost_usd             DOUBLE PRECISION,  -- see trace_events.cost_usd note above
     status               TEXT,
     error_class          TEXT,
     attempt_count        INT,
