@@ -3,6 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
+    # v0.1.12 — also fire on v-prefixed release tags. Without this,
+    # tag pushes don't trigger CI at all and the publish-pypi job
+    # (gated on `refs/tags/v*`) never runs even when the tag exists.
+    tags: ['v*']
   pull_request:
 
 env:
