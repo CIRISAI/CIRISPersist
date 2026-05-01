@@ -201,27 +201,6 @@ jobs:
         with:
           name: ciris_persist-wheel-Linux
           path: dist/wheel
-      - name: secret-presence diagnostic
-        # v0.1.12 — temporary diagnostic. Prints LENGTHS of the
-        # signing secrets to diagnose why earlier runs reported
-        # them empty despite `gh secret list` showing them
-        # populated. Length leaks no key material; GH's secret
-        # masking still fires on the value bytes if any of them
-        # appear in length output (which they don't — `${#var}`
-        # produces only the integer).
-        env:
-          ED25519_LEN: ${{ secrets.CIRIS_BUILD_ED25519_SECRET != '' && 'set' || 'empty' }}
-          MLDSA_LEN: ${{ secrets.CIRIS_BUILD_MLDSA_SECRET != '' && 'set' || 'empty' }}
-          REGISTRY_TOKEN_LEN: ${{ secrets.REGISTRY_ADMIN_TOKEN != '' && 'set' || 'empty' }}
-        run: |
-          echo "CIRIS_BUILD_ED25519_SECRET: ${ED25519_LEN}"
-          echo "CIRIS_BUILD_MLDSA_SECRET: ${MLDSA_LEN}"
-          echo "REGISTRY_ADMIN_TOKEN: ${REGISTRY_TOKEN_LEN}"
-          # Direct env-var check (the one the next step uses):
-          ED_RAW="${{ secrets.CIRIS_BUILD_ED25519_SECRET }}"
-          MLDSA_RAW="${{ secrets.CIRIS_BUILD_MLDSA_SECRET }}"
-          echo "ED25519 raw length: ${#ED_RAW}"
-          echo "MLDSA  raw length: ${#MLDSA_RAW}"
       - name: sign manifest with hybrid Ed25519 + ML-DSA-65
         env:
           # Bridge team uploads these as repo secrets (see
@@ -280,7 +259,7 @@ jobs:
           REGISTRY_URL: ${{ vars.REGISTRY_URL }}
         run: |
           if [ -z "${REGISTRY_URL}" ]; then
-            REGISTRY_URL="https://registry.ciris.ai"
+            REGISTRY_URL="https://api.registry.ciris-services-1.ai"
             echo "::warning::REGISTRY_URL repo variable unset; defaulting to ${REGISTRY_URL}"
           fi
           echo "Registry steward-key snapshot for ${REGISTRY_URL}:"
@@ -300,7 +279,7 @@ jobs:
           REGISTRY_ADMIN_TOKEN: ${{ secrets.REGISTRY_ADMIN_TOKEN }}
         run: |
           if [ -z "${REGISTRY_URL}" ]; then
-            REGISTRY_URL="https://registry.ciris.ai"
+            REGISTRY_URL="https://api.registry.ciris-services-1.ai"
           fi
           if [ -z "${REGISTRY_ADMIN_TOKEN}" ]; then
             echo "::error::REGISTRY_ADMIN_TOKEN repo secret not configured."
@@ -344,7 +323,7 @@ jobs:
           REGISTRY_URL: ${{ vars.REGISTRY_URL }}
         run: |
           if [ -z "${REGISTRY_URL}" ]; then
-            REGISTRY_URL="https://registry.ciris.ai"
+            REGISTRY_URL="https://api.registry.ciris-services-1.ai"
           fi
           VERSION="${{ steps.version.outputs.version }}"
           echo "GET ${REGISTRY_URL}/v1/verify/binary-manifest/${VERSION}?project=ciris-persist"

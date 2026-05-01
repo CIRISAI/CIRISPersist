@@ -27,7 +27,7 @@ Pipeline (`.github/workflows/ci.yml::build-manifest`):
    key_id; ephemeral mode is operationally observable but not gating).
 5. **Register binary manifest** — `POST /v1/verify/binary-manifest` with `project=ciris-persist`,
    admin token via `secrets.REGISTRY_ADMIN_TOKEN`, registry URL via `vars.REGISTRY_URL` (defaults
-   to `https://registry.ciris.ai`).
+   to `https://api.registry.ciris-services-1.ai`).
 6. **Round-trip verify** — `GET /v1/verify/binary-manifest/<version>?project=ciris-persist` and
    diff the binary hash; CI fails if it doesn't round-trip.
 7. **Upload artifacts** — manifest, extras, steward-key snapshot, registry POST response,
@@ -42,7 +42,7 @@ These are the only operational gates left; none are code-side:
   Procedure in `docs/BUILD_SIGNING.md`.
 - **`REGISTRY_ADMIN_TOKEN`** — issued by the registry team; uploaded as a repo secret.
 - **`REGISTRY_URL`** (optional repo variable) — overrides the default
-  `https://registry.ciris.ai` for staging / sovereign-mode deployments.
+  `https://api.registry.ciris-services-1.ai` for staging / sovereign-mode deployments.
 
 When all three are set, the build-manifest job goes green end-to-end and persist issue #2 closes
 on the round-trip evidence.

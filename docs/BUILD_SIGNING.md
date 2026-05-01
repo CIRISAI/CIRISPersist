@@ -167,7 +167,7 @@ registration step needs:
   message pointing here.
 
 - **`REGISTRY_URL`** (repo variable, public). Defaults to
-  `https://registry.ciris.ai` if unset. Override for
+  `https://api.registry.ciris-services-1.ai` if unset. Override for
   staging / sovereign-mode deployments. Variables (not secrets)
   are correct here because the URL is a public service endpoint.
 
