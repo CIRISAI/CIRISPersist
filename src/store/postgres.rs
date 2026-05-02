@@ -974,6 +974,177 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| crate::federation::Error::Backend(format!("revocations_for: {e}")))?;
         Ok(rows.into_iter().map(pg_row_to_revocation).collect())
     }
+
+    async fn attach_key_pqc_signature(
+        &self,
+        key_id: &str,
+        pubkey_ml_dsa_65_base64: &str,
+        scrub_signature_pqc: &str,
+    ) -> Result<(), crate::federation::Error> {
+        // Read row → check hybrid-pending → update + recompute hash.
+        // Single-statement UPDATE with WHERE pqc_completed_at IS NULL
+        // gates against double-fill atomically.
+        let mut row =
+            <Self as crate::federation::FederationDirectory>::lookup_public_key(self, key_id)
+                .await?
+                .ok_or_else(|| {
+                    crate::federation::Error::InvalidArgument(format!(
+                        "federation_keys row {key_id} does not exist"
+                    ))
+                })?;
+        if row.is_pqc_complete() {
+            return Err(crate::federation::Error::Conflict(format!(
+                "federation_keys row {key_id} is already PQC-complete"
+            )));
+        }
+        row.pubkey_ml_dsa_65_base64 = Some(pubkey_ml_dsa_65_base64.to_owned());
+        row.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
+        let now = chrono::Utc::now();
+        row.pqc_completed_at = Some(now);
+        let mut for_hash = row.clone();
+        for_hash.persist_row_hash = String::new();
+        let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let n = client
+            .execute(
+                "UPDATE cirislens.federation_keys \
+                 SET pubkey_ml_dsa_65_base64 = $1, scrub_signature_pqc = $2, \
+                     pqc_completed_at = $3, persist_row_hash = $4 \
+                 WHERE key_id = $5 AND pqc_completed_at IS NULL",
+                &[
+                    &pubkey_ml_dsa_65_base64,
+                    &scrub_signature_pqc,
+                    &now,
+                    &new_hash,
+                    &key_id,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("attach_key_pqc_signature: {e}"))
+            })?;
+        if n == 0 {
+            return Err(crate::federation::Error::Conflict(format!(
+                "federation_keys row {key_id} was concurrently completed"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn attach_attestation_pqc_signature(
+        &self,
+        attestation_id: &str,
+        scrub_signature_pqc: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // Read existing row to recompute the hash with new fields.
+        let row_opt = client
+            .query_opt(
+                "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
+                    weight, asserted_at, expires_at, attestation_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
+                 FROM cirislens.federation_attestations WHERE attestation_id = $1::uuid",
+                &[&attestation_id],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("attach lookup: {e}")))?;
+        let mut row = row_opt.map(pg_row_to_attestation).ok_or_else(|| {
+            crate::federation::Error::InvalidArgument(format!(
+                "federation_attestations row {attestation_id} does not exist"
+            ))
+        })?;
+        if row.is_pqc_complete() {
+            return Err(crate::federation::Error::Conflict(format!(
+                "federation_attestations row {attestation_id} is already PQC-complete"
+            )));
+        }
+        row.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
+        let now = chrono::Utc::now();
+        row.pqc_completed_at = Some(now);
+        let mut for_hash = row.clone();
+        for_hash.persist_row_hash = String::new();
+        let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+        let n = client
+            .execute(
+                "UPDATE cirislens.federation_attestations \
+                 SET scrub_signature_pqc = $1, pqc_completed_at = $2, persist_row_hash = $3 \
+                 WHERE attestation_id = $4::uuid AND pqc_completed_at IS NULL",
+                &[&scrub_signature_pqc, &now, &new_hash, &attestation_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("attach_attestation_pqc_signature: {e}"))
+            })?;
+        if n == 0 {
+            return Err(crate::federation::Error::Conflict(format!(
+                "federation_attestations row {attestation_id} was concurrently completed"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn attach_revocation_pqc_signature(
+        &self,
+        revocation_id: &str,
+        scrub_signature_pqc: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let row_opt = client
+            .query_opt(
+                "SELECT revocation_id::text, revoked_key_id, revoking_key_id, reason, \
+                    revoked_at, effective_at, revocation_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
+                 FROM cirislens.federation_revocations WHERE revocation_id = $1::uuid",
+                &[&revocation_id],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("attach lookup: {e}")))?;
+        let mut row = row_opt.map(pg_row_to_revocation).ok_or_else(|| {
+            crate::federation::Error::InvalidArgument(format!(
+                "federation_revocations row {revocation_id} does not exist"
+            ))
+        })?;
+        if row.is_pqc_complete() {
+            return Err(crate::federation::Error::Conflict(format!(
+                "federation_revocations row {revocation_id} is already PQC-complete"
+            )));
+        }
+        row.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
+        let now = chrono::Utc::now();
+        row.pqc_completed_at = Some(now);
+        let mut for_hash = row.clone();
+        for_hash.persist_row_hash = String::new();
+        let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+        let n = client
+            .execute(
+                "UPDATE cirislens.federation_revocations \
+                 SET scrub_signature_pqc = $1, pqc_completed_at = $2, persist_row_hash = $3 \
+                 WHERE revocation_id = $4::uuid AND pqc_completed_at IS NULL",
+                &[&scrub_signature_pqc, &now, &new_hash, &revocation_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("attach_revocation_pqc_signature: {e}"))
+            })?;
+        if n == 0 {
+            return Err(crate::federation::Error::Conflict(format!(
+                "federation_revocations row {revocation_id} was concurrently completed"
+            )));
+        }
+        Ok(())
+    }
 }
 
 fn pg_row_to_key_record(row: tokio_postgres::Row) -> crate::federation::KeyRecord {

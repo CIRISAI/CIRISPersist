@@ -306,6 +306,89 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         rows.sort_by_key(|a| std::cmp::Reverse(a.effective_at));
         Ok(rows)
     }
+
+    async fn attach_key_pqc_signature(
+        &self,
+        key_id: &str,
+        pubkey_ml_dsa_65_base64: &str,
+        scrub_signature_pqc: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        let row = state.federation_keys.get_mut(key_id).ok_or_else(|| {
+            crate::federation::Error::InvalidArgument(format!(
+                "federation_keys row {key_id} does not exist"
+            ))
+        })?;
+        if row.is_pqc_complete() {
+            return Err(crate::federation::Error::Conflict(format!(
+                "federation_keys row {key_id} is already PQC-complete"
+            )));
+        }
+        row.pubkey_ml_dsa_65_base64 = Some(pubkey_ml_dsa_65_base64.to_owned());
+        row.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
+        row.pqc_completed_at = Some(chrono::Utc::now());
+        // Recompute persist_row_hash since row content changed.
+        let mut for_hash = row.clone();
+        for_hash.persist_row_hash = String::new();
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+        Ok(())
+    }
+
+    async fn attach_attestation_pqc_signature(
+        &self,
+        attestation_id: &str,
+        scrub_signature_pqc: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        let row = state
+            .federation_attestations
+            .iter_mut()
+            .find(|a| a.attestation_id == attestation_id)
+            .ok_or_else(|| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "federation_attestations row {attestation_id} does not exist"
+                ))
+            })?;
+        if row.is_pqc_complete() {
+            return Err(crate::federation::Error::Conflict(format!(
+                "federation_attestations row {attestation_id} is already PQC-complete"
+            )));
+        }
+        row.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
+        row.pqc_completed_at = Some(chrono::Utc::now());
+        let mut for_hash = row.clone();
+        for_hash.persist_row_hash = String::new();
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+        Ok(())
+    }
+
+    async fn attach_revocation_pqc_signature(
+        &self,
+        revocation_id: &str,
+        scrub_signature_pqc: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        let row = state
+            .federation_revocations
+            .iter_mut()
+            .find(|r| r.revocation_id == revocation_id)
+            .ok_or_else(|| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "federation_revocations row {revocation_id} does not exist"
+                ))
+            })?;
+        if row.is_pqc_complete() {
+            return Err(crate::federation::Error::Conflict(format!(
+                "federation_revocations row {revocation_id} is already PQC-complete"
+            )));
+        }
+        row.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
+        row.pqc_completed_at = Some(chrono::Utc::now());
+        let mut for_hash = row.clone();
+        for_hash.persist_row_hash = String::new();
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -807,6 +890,117 @@ mod tests {
         let for_a = backend.list_attestations_for("k-a").await.unwrap();
         assert_eq!(for_a.len(), 1);
         assert_eq!(for_a[0].attestation_id, "att-1");
+    }
+
+    #[tokio::test]
+    async fn attach_pqc_completes_hybrid_pending_key() {
+        let backend = MemoryBackend::new();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("k-pending", "primitive-a", "k-pending"),
+            })
+            .await
+            .unwrap();
+        // Initially hybrid-pending.
+        let row = FederationDirectory::lookup_public_key(&backend, "k-pending")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.is_pqc_pending());
+        assert!(!row.is_pqc_complete());
+
+        // Attach the PQC components.
+        backend
+            .attach_key_pqc_signature("k-pending", "test-mldsa-pubkey", "test-mldsa-sig")
+            .await
+            .unwrap();
+
+        let row = FederationDirectory::lookup_public_key(&backend, "k-pending")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.is_pqc_complete());
+        assert_eq!(
+            row.pubkey_ml_dsa_65_base64.as_deref(),
+            Some("test-mldsa-pubkey")
+        );
+        assert_eq!(row.scrub_signature_pqc.as_deref(), Some("test-mldsa-sig"));
+        assert!(row.pqc_completed_at.is_some());
+        // Hash recomputed.
+        assert_eq!(row.persist_row_hash.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn attach_pqc_rejects_double_fill() {
+        let backend = MemoryBackend::new();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("k-double", "primitive-a", "k-double"),
+            })
+            .await
+            .unwrap();
+        backend
+            .attach_key_pqc_signature("k-double", "mldsa-pk-1", "mldsa-sig-1")
+            .await
+            .unwrap();
+        // Second attach errors with Conflict.
+        let err = backend
+            .attach_key_pqc_signature("k-double", "mldsa-pk-2", "mldsa-sig-2")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::federation::Error::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn attach_pqc_rejects_missing_row() {
+        let backend = MemoryBackend::new();
+        let err = backend
+            .attach_key_pqc_signature("ghost", "mldsa-pk", "mldsa-sig")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::federation::Error::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn attach_pqc_for_attestation_and_revocation() {
+        let backend = MemoryBackend::new();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("steward", "registry", "steward"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("k-target", "primitive-a", "steward"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_attestation("att-1", "steward", "k-target", "steward"),
+            })
+            .await
+            .unwrap();
+        backend
+            .attach_attestation_pqc_signature("att-1", "att-pqc-sig")
+            .await
+            .unwrap();
+        let atts = backend.list_attestations_for("k-target").await.unwrap();
+        assert!(atts[0].is_pqc_complete());
+
+        backend
+            .put_revocation(SignedRevocation {
+                revocation: fix_revocation("rev-1", "k-target", "steward", "steward"),
+            })
+            .await
+            .unwrap();
+        backend
+            .attach_revocation_pqc_signature("rev-1", "rev-pqc-sig")
+            .await
+            .unwrap();
+        let revs = backend.revocations_for("k-target").await.unwrap();
+        assert!(revs[0].is_pqc_complete());
     }
 
     #[tokio::test]

@@ -818,6 +818,196 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
         .map_err(|e| crate::federation::Error::Backend(format!("revocations_for: {e}")))
     }
+
+    async fn attach_key_pqc_signature(
+        &self,
+        key_id: &str,
+        pubkey_ml_dsa_65_base64: &str,
+        scrub_signature_pqc: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row =
+            <Self as crate::federation::FederationDirectory>::lookup_public_key(self, key_id)
+                .await?
+                .ok_or_else(|| {
+                    crate::federation::Error::InvalidArgument(format!(
+                        "federation_keys row {key_id} does not exist"
+                    ))
+                })?;
+        if row.is_pqc_complete() {
+            return Err(crate::federation::Error::Conflict(format!(
+                "federation_keys row {key_id} is already PQC-complete"
+            )));
+        }
+        row.pubkey_ml_dsa_65_base64 = Some(pubkey_ml_dsa_65_base64.to_owned());
+        row.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
+        let now = chrono::Utc::now();
+        row.pqc_completed_at = Some(now);
+        let mut for_hash = row.clone();
+        for_hash.persist_row_hash = String::new();
+        let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+
+        let conn = self.conn.clone();
+        let key_id = key_id.to_owned();
+        let mldsa = pubkey_ml_dsa_65_base64.to_owned();
+        let pqc_sig = scrub_signature_pqc.to_owned();
+        let now_str = now.to_rfc3339();
+        let n = tokio::task::spawn_blocking(move || -> Result<usize, rusqlite::Error> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE federation_keys \
+                 SET pubkey_ml_dsa_65_base64 = ?1, scrub_signature_pqc = ?2, \
+                     pqc_completed_at = ?3, persist_row_hash = ?4 \
+                 WHERE key_id = ?5 AND pqc_completed_at IS NULL",
+                rusqlite::params![mldsa, pqc_sig, now_str, new_hash, key_id],
+            )
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| crate::federation::Error::Backend(format!("attach_key_pqc_signature: {e}")))?;
+        if n == 0 {
+            return Err(crate::federation::Error::Conflict(
+                "federation_keys row was concurrently completed".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn attach_attestation_pqc_signature(
+        &self,
+        attestation_id: &str,
+        scrub_signature_pqc: &str,
+    ) -> Result<(), crate::federation::Error> {
+        // Read existing row to recompute hash + check pending state.
+        let conn_for_read = self.conn.clone();
+        let id = attestation_id.to_owned();
+        let row_opt = tokio::task::spawn_blocking(
+            move || -> Result<Option<crate::federation::Attestation>, rusqlite::Error> {
+                let conn = conn_for_read.blocking_lock();
+                conn.query_row(
+                    "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                        weight, asserted_at, expires_at, attestation_envelope, \
+                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
+                     FROM federation_attestations WHERE attestation_id = ?1",
+                    [&id],
+                    sqlite_row_to_attestation,
+                )
+                .optional()
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| crate::federation::Error::Backend(format!("attach lookup: {e}")))?;
+        let mut row = row_opt.ok_or_else(|| {
+            crate::federation::Error::InvalidArgument(format!(
+                "federation_attestations row {attestation_id} does not exist"
+            ))
+        })?;
+        if row.is_pqc_complete() {
+            return Err(crate::federation::Error::Conflict(format!(
+                "federation_attestations row {attestation_id} is already PQC-complete"
+            )));
+        }
+        row.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
+        let now = chrono::Utc::now();
+        row.pqc_completed_at = Some(now);
+        let mut for_hash = row.clone();
+        for_hash.persist_row_hash = String::new();
+        let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+
+        let conn = self.conn.clone();
+        let attestation_id = attestation_id.to_owned();
+        let pqc_sig = scrub_signature_pqc.to_owned();
+        let now_str = now.to_rfc3339();
+        let n = tokio::task::spawn_blocking(move || -> Result<usize, rusqlite::Error> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE federation_attestations \
+                 SET scrub_signature_pqc = ?1, pqc_completed_at = ?2, persist_row_hash = ?3 \
+                 WHERE attestation_id = ?4 AND pqc_completed_at IS NULL",
+                rusqlite::params![pqc_sig, now_str, new_hash, attestation_id],
+            )
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("attach_attestation_pqc_signature: {e}"))
+        })?;
+        if n == 0 {
+            return Err(crate::federation::Error::Conflict(
+                "federation_attestations row was concurrently completed".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn attach_revocation_pqc_signature(
+        &self,
+        revocation_id: &str,
+        scrub_signature_pqc: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let conn_for_read = self.conn.clone();
+        let id = revocation_id.to_owned();
+        let row_opt = tokio::task::spawn_blocking(
+            move || -> Result<Option<crate::federation::Revocation>, rusqlite::Error> {
+                let conn = conn_for_read.blocking_lock();
+                conn.query_row(
+                    "SELECT revocation_id, revoked_key_id, revoking_key_id, reason, \
+                        revoked_at, effective_at, revocation_envelope, \
+                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
+                     FROM federation_revocations WHERE revocation_id = ?1",
+                    [&id],
+                    sqlite_row_to_revocation,
+                )
+                .optional()
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| crate::federation::Error::Backend(format!("attach lookup: {e}")))?;
+        let mut row = row_opt.ok_or_else(|| {
+            crate::federation::Error::InvalidArgument(format!(
+                "federation_revocations row {revocation_id} does not exist"
+            ))
+        })?;
+        if row.is_pqc_complete() {
+            return Err(crate::federation::Error::Conflict(format!(
+                "federation_revocations row {revocation_id} is already PQC-complete"
+            )));
+        }
+        row.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
+        let now = chrono::Utc::now();
+        row.pqc_completed_at = Some(now);
+        let mut for_hash = row.clone();
+        for_hash.persist_row_hash = String::new();
+        let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+
+        let conn = self.conn.clone();
+        let revocation_id = revocation_id.to_owned();
+        let pqc_sig = scrub_signature_pqc.to_owned();
+        let now_str = now.to_rfc3339();
+        let n = tokio::task::spawn_blocking(move || -> Result<usize, rusqlite::Error> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE federation_revocations \
+                 SET scrub_signature_pqc = ?1, pqc_completed_at = ?2, persist_row_hash = ?3 \
+                 WHERE revocation_id = ?4 AND pqc_completed_at IS NULL",
+                rusqlite::params![pqc_sig, now_str, new_hash, revocation_id],
+            )
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("attach_revocation_pqc_signature: {e}"))
+        })?;
+        if n == 0 {
+            return Err(crate::federation::Error::Conflict(
+                "federation_revocations row was concurrently completed".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn parse_rfc3339(s: &str) -> chrono::DateTime<chrono::Utc> {

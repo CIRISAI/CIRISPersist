@@ -123,6 +123,54 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         revoked_key_id: &str,
     ) -> impl Future<Output = Result<Vec<Revocation>, Error>> + Send;
+
+    // ── Cold-path PQC fill-in (writer contract step 4) ─────────────
+    //
+    // Per `docs/FEDERATION_DIRECTORY.md` §"Trust contract — eventual
+    // consistency as a federation primitive" + §"PQC strategy", the
+    // writer contract is:
+    //   1. Sign canonical with Ed25519 (hot)
+    //   2. Write the row (PQC fields None)
+    //   3. IMMEDIATELY kick off ML-DSA-65 sign on cold path
+    //   4. Call attach_*_pqc_signature once ML-DSA completes
+    //
+    // These three methods implement step 4. They:
+    //   - Reject if the row is already hybrid-complete (no double-fill)
+    //   - Update PQC fields atomically
+    //   - Set pqc_completed_at = NOW()
+    //   - Recompute persist_row_hash since row content changed
+    //
+    // Persist does NOT verify the cryptographic validity of the PQC
+    // signature on attach — that's the writer's responsibility.
+    // Persist verifies on read at the consumer's policy layer.
+
+    /// Attach the PQC components to a hybrid-pending federation_keys row.
+    /// Updates pubkey_ml_dsa_65_base64 + scrub_signature_pqc + pqc_completed_at.
+    /// Errors if the row is already PQC-complete.
+    fn attach_key_pqc_signature(
+        &self,
+        key_id: &str,
+        pubkey_ml_dsa_65_base64: &str,
+        scrub_signature_pqc: &str,
+    ) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// Attach the PQC signature to a hybrid-pending
+    /// `federation_attestations` row. Attestations don't have their
+    /// own pubkey — they reference the existing
+    /// `federation_keys.scrub_key_id`'s pubkey for verification.
+    fn attach_attestation_pqc_signature(
+        &self,
+        attestation_id: &str,
+        scrub_signature_pqc: &str,
+    ) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// Attach the PQC signature to a hybrid-pending
+    /// `federation_revocations` row. Same shape as attestations.
+    fn attach_revocation_pqc_signature(
+        &self,
+        revocation_id: &str,
+        scrub_signature_pqc: &str,
+    ) -> impl Future<Output = Result<(), Error>> + Send;
 }
 
 /// Federation directory errors. Distinct from
