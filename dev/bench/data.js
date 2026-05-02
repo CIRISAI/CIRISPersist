@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777739981221,
+  "lastUpdate": 1777740102926,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -3587,6 +3587,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 19510228,
             "range": "± 24290400",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "c382a6f41211fb12c35b8468299f3933e2e13b21",
+          "message": "v0.2.0 federation directory: memory backend impl\n\nSecond commit in the v0.2.0 federation directory milestone (after\nthe schema + trait + types scaffolding). MemoryBackend now implements\nboth Backend (legacy trace ingest) and FederationDirectory (new\nv0.2.0 substrate) — single struct, two trait surfaces.\n\nImplementation:\n- State struct extended with federation_keys (HashMap<String, KeyRecord>),\n  federation_attestations (Vec<Attestation>), federation_revocations\n  (Vec<Revocation>). Append-only for attestations/revocations matches\n  postgres semantics; HashMap for keys gives O(1) lookup_public_key.\n- put_public_key: idempotent on (key_id, persist_row_hash) match; errors\n  with Conflict on same key_id with differing content. persist_row_hash\n  computed server-side via compute_persist_row_hash() before insert.\n- put_attestation / put_revocation: FK enforcement parity with postgres\n  — both attesting + attested keys (or revoked + revoking) must exist\n  in federation_keys. Returns InvalidArgument otherwise.\n- list_attestations_for / list_attestations_by / revocations_for:\n  filtered + sorted DESC by asserted_at / effective_at to match postgres\n  index order.\n- All read methods return cloned KeyRecord/Attestation/Revocation with\n  persist_row_hash populated server-side — consumers see byte-stable\n  hashes regardless of backend.\n\nTests (7 new):\n- put_and_lookup_public_key — round-trip with server-computed hash\n- lookup_unknown_returns_none — typed None, not panic\n- idempotent_put_same_content — same key + content = no-op\n- put_conflict_different_content — same key, different content = Conflict\n- lookup_keys_for_identity_filters — identity_ref-scoped enumeration\n- put_attestation_requires_both_keys_exist — FK parity\n- list_attestations_for_and_by — bidirectional graph traversal\n- revocation_round_trip — append + query\n\nNaming-collision fix: both Backend and FederationDirectory expose\nlookup_public_key. The two methods return different types (VerifyingKey\nvs KeyRecord) so they don't conflict at the trait level, but at call\nsites Rust can't infer which to dispatch to. The legacy\nBackend::lookup_public_key test in store::memory was disambiguated\nvia fully-qualified syntax; new federation tests use FederationDirectory::\nfully-qualified syntax. Both call patterns are documented inline.\n\n140 tests green (132 lib + 5 + 8 + 9 fixture; +7 federation memory).\nclippy clean across all features. cargo-deny clean.\n\nNext: postgres backend impl + bootstrap migration.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-02T11:35:05-05:00",
+          "tree_id": "b6bf2c783e147374aa093605627095d160cbac2c",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/c382a6f41211fb12c35b8468299f3933e2e13b21"
+        },
+        "date": 1777740102664,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 95378,
+            "range": "± 319",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 236562,
+            "range": "± 8332",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 516402,
+            "range": "± 4092",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1838016,
+            "range": "± 51401",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 381,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1655,
+            "range": "± 23",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 9104,
+            "range": "± 45",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 359,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3085,
+            "range": "± 17",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9535,
+            "range": "± 275",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 40574,
+            "range": "± 211",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 621,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2238574,
+            "range": "± 114447",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6383022,
+            "range": "± 194782",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 22664971,
+            "range": "± 287296",
             "unit": "ns/iter"
           }
         ]
