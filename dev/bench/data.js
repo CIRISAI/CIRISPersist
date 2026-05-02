@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777740102926,
+  "lastUpdate": 1777740675379,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -3701,6 +3701,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 22664971,
             "range": "± 287296",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "c4d43d997a57aebd2a9e04115e7a5ac5af4cfb59",
+          "message": "v0.2.0 federation directory: postgres + sqlite backend impls\n\nThird commit in the v0.2.0 federation directory milestone (after\nschema/trait/types in c5d060f and memory backend in c382a6f).\nPostgresBackend and SqliteBackend now both implement\nFederationDirectory in addition to the existing Backend trait —\nsingle struct, two trait surfaces, parity with MemoryBackend.\n\nPostgres impl (~270 LoC added to src/store/postgres.rs):\n- All 8 trait methods backed by tokio-postgres + deadpool-postgres\n- persist_row_hash computed in Rust via compute_persist_row_hash()\n  before INSERT — postgres sees it as a TEXT column\n- Idempotency: ON CONFLICT (key_id) DO NOTHING + post-insert\n  conflict-check that compares persist_row_hash; same-hash → no-op,\n  different-hash → Error::Conflict\n- FK violation detection: postgres \"foreign key\" string in error →\n  Error::InvalidArgument (matches memory backend's pre-INSERT FK\n  check semantically)\n- BYTEA columns (original_content_hash, scrub_signature) take\n  hex-decoded / base64-decoded raw bytes; pg_row_to_*() helpers\n  re-encode for the wire shape\n- Three reusable row converters: pg_row_to_key_record,\n  pg_row_to_attestation, pg_row_to_revocation\n\nSQLite impl (~370 LoC added to src/store/sqlite.rs):\n- All 8 trait methods backed by rusqlite + tokio::task::spawn_blocking\n- persist_row_hash computed before crossing spawn_blocking\n  boundary so the closure is 'static\n- TIMESTAMPTZ → TEXT (RFC 3339): chrono.to_rfc3339() on write,\n  parse_rfc3339() helper on read\n- JSONB → TEXT: serde_json::to_string on write, from_str on read\n- BLOB columns for original_content_hash + scrub_signature\n- FK violations surface as \"FOREIGN KEY\" string in rusqlite errors\n  (PRAGMA foreign_keys=ON enforces); converted to Error::InvalidArgument\n- Three sqlite_row_to_* converters mirror postgres counterparts\n\n7 new sqlite tests (mirror the memory backend tests):\n- federation_put_and_lookup_round_trip (with persist_row_hash\n  re-computation parity check)\n- federation_idempotent_put\n- federation_conflict_on_different_content\n- federation_lookup_by_identity_filters\n- federation_attestation_round_trip\n- federation_attestation_fk_enforcement\n- federation_revocation_round_trip\n\nPostgres tests are gated behind CIRIS_PERSIST_TEST_PG_URL (matching\nthe existing trace ingest test gate); CI environment will exercise\nthem. Memory + sqlite federation parity establishes the conformance\nbaseline.\n\nDisambiguation: both Backend and FederationDirectory expose\nlookup_public_key (returning VerifyingKey vs KeyRecord). Tests for\nthe legacy Backend shape now use Backend::lookup_public_key(&backend, ...)\nsyntax; federation tests use FederationDirectory::... — both call\npatterns documented inline in the test bodies.\n\n147 lib tests green (+7 sqlite federation, postgres tested via\ngated integration). Clippy clean across postgres + sqlite + server +\npyo3 + tls. cargo-deny clean.\n\nNext:\n- Bootstrap migration helper binary (emit canonical bytes for\n  CIRISCore to sign with the persist-steward Ed25519 secret)\n- V005 bootstrap migration writing self-signed persist-steward row\n  (filled in once CIRISCore returns the signed values)\n- Fixture JSON for registry serde validation\n- Cut v0.2.0-pre1\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-02T11:44:35-05:00",
+          "tree_id": "17f058b51f80a3ace8ebe109b45e043e689ca1e2",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/c4d43d997a57aebd2a9e04115e7a5ac5af4cfb59"
+        },
+        "date": 1777740675055,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 95963,
+            "range": "± 296",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 236494,
+            "range": "± 568",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 516798,
+            "range": "± 1669",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1836503,
+            "range": "± 12319",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 380,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1641,
+            "range": "± 21",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 9103,
+            "range": "± 47",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 362,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3103,
+            "range": "± 26",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9295,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 40498,
+            "range": "± 116",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2336310,
+            "range": "± 161787",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6466448,
+            "range": "± 925904",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 22510239,
+            "range": "± 713366",
             "unit": "ns/iter"
           }
         ]
