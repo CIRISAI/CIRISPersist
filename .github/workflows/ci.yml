@@ -288,27 +288,41 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
-      - name: Install TPM2 TSS runtime libs (ciris-keyring transitive dep)
-        run: |
-          if ! sudo apt-get install -y libtss2-esys0 libtss2-tctildr0 libtss2-mu0; then
-            if ! sudo apt-get install -y libtss2-esys-3.0.2-0 libtss2-tctildr0 libtss2-mu-4.0.1-0; then
-              sudo apt-get install -y libtss2-esys-3.0.2-0t64 libtss2-tctildr0t64 libtss2-mu-4.0.1-0t64
-            fi
-          fi
       - name: extract version from Cargo.toml
         id: version
         run: |
           VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "ciris-persist version: $VERSION"
-      - name: install ciris-build-sign
-        # v1.8.0 ships the CLI in the ciris-build-tool crate. We
-        # `cargo install` from the same git tag we depend on so the
-        # signing tool's BuildManifest shape exactly matches what
-        # our PersistExtrasValidator expects.
+      - name: install ciris-build-sign (prebuilt from CIRISVerify release)
+        # v0.1.15+ — was `cargo install --git ... ciris-build-tool`
+        # which recompiled the entire upstream signing crate + dep
+        # tree (~5min) and required libtss2-dev for the
+        # ciris-keyring link path. Switched to the prebuilt tarball
+        # from CIRISVerify v1.8.0 release assets — same v1.8.0 git
+        # tag we depend on, so the BuildManifest shape exactly
+        # matches what our PersistExtrasValidator expects.
+        #
+        # Sigstore signature + .pem cert are downloaded but not yet
+        # verified (cosign verification is a v0.1.16 follow-up;
+        # tracked under task #81). The release-asset URL itself is
+        # the trust boundary today: GitHub-hosted, served over TLS
+        # against CIRISAI/CIRISVerify, no third-party mirror.
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          cargo install --locked --git https://github.com/CIRISAI/CIRISVerify \
-            --tag v1.8.0 ciris-build-tool
+          cd "$RUNNER_TEMP"
+          gh release download v1.8.0 --repo CIRISAI/CIRISVerify \
+            --pattern 'ciris-verify-v1.8.0-build-tool-linux-x86_64.tar.gz'
+          tar -xzf ciris-verify-v1.8.0-build-tool-linux-x86_64.tar.gz
+          sudo install -m755 ciris-build-sign /usr/local/bin/ciris-build-sign
+          ciris-build-sign --version
+          # Show what dynamic libs the prebuilt links against — if
+          # any libtss2 symbols are needed, this catches it before
+          # we hit them at runtime. With the prebuilt being a
+          # self-contained Rust binary, the only deps should be
+          # libc + libdl + libpthread.
+          ldd "$(command -v ciris-build-sign)" || true
       - name: emit PersistExtras JSON
         # Reads the source tree (migrations/ + cargo tree) and emits
         # the typed extras blob. Deterministic per checkout. Target
