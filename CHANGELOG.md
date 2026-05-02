@@ -5,6 +5,95 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.2.1] — 2026-05-02
+
+Lens-team v0.2.x asks. Three small additions completing the
+federation-cutover surface so lens can actually wire writes
+through persist without the keyring seed crossing the FFI.
+
+### `Engine.sign(message: bytes) -> bytes`
+
+Hot-path Ed25519 sign exposed on the PyO3 surface. Same shape as
+the existing `public_key_b64()`: bytes in, bytes out, no key
+material crossing the boundary. Lens builds a federation envelope,
+hands canonical bytes to persist, gets the 64-byte raw Ed25519
+signature back, embeds in the SignedKeyRecord, submits via
+`put_public_key`.
+
+The cold-path ML-DSA-65 sign happens elsewhere — writer's
+responsibility per the writer contract
+(`docs/FEDERATION_DIRECTORY.md` §"Trust contract"). This method
+returns when Ed25519 sign completes; the writer kicks off the
+cold-path ML-DSA-65 sign immediately afterward (no delay, no
+batching) and calls `attach_key_pqc_signature` once it lands.
+
+### `Engine.canonicalize_envelope(envelope_json: str) -> bytes`
+
+Persist's canonicalizer surface as the lens-team-preferred
+"hide the rules inside persist" shape. Takes a JSON object as a
+string, runs through `PythonJsonDumpsCanonicalizer` (sorted keys,
+no whitespace, `ensure_ascii=True`), returns the exact byte
+sequence that should be signed. Hides the canonicalization rules
+where they live anyway (persist's own scrub-signing already uses
+them) — no drift risk between lens and persist if either side
+touches the rules later.
+
+Workflow:
+```python
+envelope = {"role": "lens-steward", "scope": "..."}
+canonical = engine.canonicalize_envelope(json.dumps(envelope))
+classical_sig = engine.sign(canonical)
+# Cold path: ML-DSA-65 sign over (canonical || classical_sig)
+# happens via the writer's own pipeline; result lands via
+# attach_key_pqc_signature.
+```
+
+### `Backend::lookup_public_key` dual-read migration
+
+The existing trait method (used by trace verify) now reads from
+`federation_keys` first, falls back to `accord_public_keys`
+(legacy) on miss. Lens can now write to the federation surface
+and have the existing trace-verify path find the key
+automatically — no big-bang switchover, no separate cutover
+window for ingest.
+
+Same dual-read in all three backends (memory, postgres, sqlite).
+
+Filter on `federation_keys`: `valid_until IS NULL OR valid_until
+> NOW()`. Filter on `accord_public_keys` retained:
+`revoked_at IS NULL AND (expires_at IS NULL OR expires_at >
+NOW())`. Strict consumers can layer the federation revocation
+check via `revocations_for()` in addition.
+
+The legacy fallback retires at v0.4.0 per the roadmap
+(`docs/ROADMAP.md`). Until then, both tables are load-bearing
+during the migration window.
+
+### Tests + features
+
+154 lib tests green (+2 dual-read parity tests on memory backend);
+clippy clean across `postgres,sqlite,server,pyo3,tls`; cargo-deny
+clean.
+
+### Lens action
+
+`pip install --upgrade ciris-persist==0.2.1`. Federation cutover
+flow now end-to-end without exposing the keyring seed:
+
+```python
+import json
+envelope = {"role": "lens-steward", ...}
+canonical = engine.canonicalize_envelope(json.dumps(envelope))
+classical_sig = engine.sign(canonical)
+# build SignedKeyRecord with classical_sig in
+# scrub_signature_classical, scrub_signature_pqc=None initially
+engine.put_public_key(json.dumps({...record...}))
+# cold path produces ML-DSA-65 sig
+engine.attach_key_pqc_signature(key_id, mldsa_pubkey_b64, mldsa_sig_b64)
+# trace verify (Backend::lookup_public_key in the ingest path) now
+# finds the key in federation_keys without any cutover step
+```
+
 ## [0.2.0] — 2026-05-02
 
 **Federation Directory** (registry-aligned per

@@ -149,7 +149,31 @@ impl Backend for MemoryBackend {
     }
 
     async fn lookup_public_key(&self, key_id: &str) -> Result<Option<VerifyingKey>, Error> {
+        // v0.2.1 — dual-read migration matching postgres + sqlite.
+        // federation_keys first; fall back to legacy `keys` map.
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine as _;
         let state = self.state.lock().expect("memory backend lock");
+        if let Some(rec) = state.federation_keys.get(key_id) {
+            // valid_until check (None means no expiry).
+            let now = chrono::Utc::now();
+            if rec.valid_until.map_or(true, |t| t > now) {
+                let bytes = BASE64
+                    .decode(&rec.pubkey_ed25519_base64)
+                    .map_err(|e| Error::Backend(format!("public_key_base64 decode: {e}")))?;
+                if bytes.len() != 32 {
+                    return Err(Error::Backend(format!(
+                        "public_key_base64 wrong length: got {}, expected 32",
+                        bytes.len()
+                    )));
+                }
+                let arr: [u8; 32] = bytes.as_slice().try_into().expect("length-checked");
+                let key = VerifyingKey::from_bytes(&arr)
+                    .map_err(|e| Error::Backend(format!("public_key parse: {e}")))?;
+                return Ok(Some(key));
+            }
+        }
+        // Fall back to legacy keys map.
         Ok(state.keys.get(key_id).copied())
     }
 
@@ -1001,6 +1025,64 @@ mod tests {
             .unwrap();
         let revs = backend.revocations_for("k-target").await.unwrap();
         assert!(revs[0].is_pqc_complete());
+    }
+
+    /// v0.2.1 — Backend::lookup_public_key dual-read. After
+    /// put_public_key writes to federation_keys, the legacy
+    /// Backend::lookup_public_key trait method (used by trace verify)
+    /// reads back the same key via the federation table.
+    #[tokio::test]
+    async fn backend_lookup_public_key_dual_reads_federation() {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        use ed25519_dalek::SigningKey;
+        let backend = MemoryBackend::new();
+        // Generate a real Ed25519 keypair so VerifyingKey parses.
+        let signing = SigningKey::from_bytes(&[0xAB; 32]);
+        let verifying = signing.verifying_key();
+        let pk_b64 = B64.encode(verifying.to_bytes());
+
+        // Write via federation surface only — no accord_public_keys insert.
+        let mut rec = fix_key("agent-fed-1", "agent-1", "agent-fed-1");
+        rec.pubkey_ed25519_base64 = pk_b64.clone();
+        backend
+            .put_public_key(SignedKeyRecord { record: rec })
+            .await
+            .unwrap();
+
+        // Backend::lookup_public_key (legacy trait method, used by
+        // trace verify) finds the key via federation_keys.
+        let got = Backend::lookup_public_key(&backend, "agent-fed-1")
+            .await
+            .unwrap();
+        assert!(got.is_some());
+        assert_eq!(got.unwrap().to_bytes(), verifying.to_bytes());
+    }
+
+    /// v0.2.1 — When federation_keys has nothing, fall through to
+    /// the legacy `accord_public_keys` map. This is the migration-
+    /// window guarantee: trace verify keeps working against legacy
+    /// rows while lens migrates.
+    #[tokio::test]
+    async fn backend_lookup_public_key_falls_back_to_legacy() {
+        use ed25519_dalek::SigningKey;
+        let backend = MemoryBackend::new();
+        let signing = SigningKey::from_bytes(&[0xCD; 32]);
+        let verifying = signing.verifying_key();
+
+        // Register via legacy add_public_key (mimics
+        // accord_public_keys insert).
+        backend.add_public_key("agent-legacy-1", verifying);
+
+        let got = Backend::lookup_public_key(&backend, "agent-legacy-1")
+            .await
+            .unwrap();
+        assert!(got.is_some());
+        assert_eq!(got.unwrap().to_bytes(), verifying.to_bytes());
+
+        // Unknown key → None (federation empty AND legacy empty).
+        let none = Backend::lookup_public_key(&backend, "ghost").await.unwrap();
+        assert!(none.is_none());
     }
 
     #[tokio::test]

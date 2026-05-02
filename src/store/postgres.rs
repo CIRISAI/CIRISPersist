@@ -500,12 +500,38 @@ impl Backend for PostgresBackend {
     }
 
     async fn lookup_public_key(&self, key_id: &str) -> Result<Option<VerifyingKey>, Error> {
-        // SQL maps the wire-level `signature_key_id` to the lens-
-        // canonical `key_id` column (THREAT_MODEL.md AV-11; v0.1.2
-        // Path B reconciliation). Public-key rows are filtered by
-        // revocation: revoked_at IS NULL AND (expires_at IS NULL OR
-        // expires_at > now()) — both gates the lens already had.
+        // v0.2.1 — dual-read migration. Try federation_keys first
+        // (the v0.2.0 federation directory), fall back to
+        // accord_public_keys (legacy). Lens team's cutover path
+        // requires this: writes flow to federation_keys via the
+        // federation surface; this read site has to find them there.
+        // Once the v0.4.0 read-path migration lands, the legacy
+        // fallback is dropped.
+        //
+        // Filter: federation_keys has no revocation column directly
+        // (revocations live in federation_revocations); for v0.2.x we
+        // accept any unexpired federation_keys row. Strict consumers
+        // can layer on the revocation check via revocations_for().
+        // accord_public_keys retains its existing
+        // revoked_at/expires_at filter (THREAT_MODEL.md AV-11).
         let client = self.get_client().await?;
+
+        // Try federation_keys first.
+        let fed_row = client
+            .query_opt(
+                "SELECT pubkey_ed25519_base64 FROM cirislens.federation_keys \
+                 WHERE key_id = $1 \
+                   AND (valid_until IS NULL OR valid_until > NOW())",
+                &[&key_id],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("lookup_public_key (federation_keys): {e}")))?;
+        if let Some(row) = fed_row {
+            let b64: String = row.get(0);
+            return decode_ed25519_b64(&b64).map(Some);
+        }
+
+        // Fall back to accord_public_keys (legacy).
         let row_opt = client
             .query_opt(
                 "SELECT public_key_base64 FROM cirislens.accord_public_keys \
@@ -520,19 +546,7 @@ impl Backend for PostgresBackend {
             return Ok(None);
         };
         let b64: String = row.get(0);
-        let bytes = BASE64
-            .decode(&b64)
-            .map_err(|e| Error::Backend(format!("public_key_base64 decode: {e}")))?;
-        if bytes.len() != 32 {
-            return Err(Error::Backend(format!(
-                "public_key_base64 wrong length: got {}, expected 32",
-                bytes.len()
-            )));
-        }
-        let arr: [u8; 32] = bytes.as_slice().try_into().expect("length-checked");
-        let key = VerifyingKey::from_bytes(&arr)
-            .map_err(|e| Error::Backend(format!("public_key parse: {e}")))?;
-        Ok(Some(key))
+        decode_ed25519_b64(&b64).map(Some)
     }
 
     async fn sample_public_keys(
@@ -1145,6 +1159,23 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         }
         Ok(())
     }
+}
+
+/// v0.2.1 — Decode a base64 standard-alphabet Ed25519 public key
+/// (32 raw bytes) and parse to VerifyingKey. Shared between the
+/// federation_keys and accord_public_keys lookup paths.
+fn decode_ed25519_b64(b64: &str) -> Result<VerifyingKey, Error> {
+    let bytes = BASE64
+        .decode(b64)
+        .map_err(|e| Error::Backend(format!("public_key_base64 decode: {e}")))?;
+    if bytes.len() != 32 {
+        return Err(Error::Backend(format!(
+            "public_key_base64 wrong length: got {}, expected 32",
+            bytes.len()
+        )));
+    }
+    let arr: [u8; 32] = bytes.as_slice().try_into().expect("length-checked");
+    VerifyingKey::from_bytes(&arr).map_err(|e| Error::Backend(format!("public_key parse: {e}")))
 }
 
 fn pg_row_to_key_record(row: tokio_postgres::Row) -> crate::federation::KeyRecord {

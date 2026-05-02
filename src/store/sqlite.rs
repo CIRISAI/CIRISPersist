@@ -311,21 +311,33 @@ impl Backend for SqliteBackend {
     }
 
     async fn lookup_public_key(&self, key_id: &str) -> Result<Option<VerifyingKey>, Error> {
+        // v0.2.1 — dual-read migration. Try federation_keys first
+        // (v0.2.0 federation directory), fall back to
+        // accord_public_keys (legacy). Same pattern as PostgresBackend.
         let key_id = key_id.to_owned();
         let conn = self.conn.clone();
-        let row_opt =
+        let b64_opt =
             tokio::task::spawn_blocking(move || -> Result<Option<String>, rusqlite::Error> {
                 let conn = conn.blocking_lock();
-                // Filter matches postgres lookup_public_key: unrevoked,
-                // unexpired. SQLite uses CURRENT_TIMESTAMP which emits
-                // ISO-8601 UTC; since we store TIMESTAMPTZ as TEXT in
-                // RFC 3339, lexical comparison on the strings produces
-                // the right ordering for UTC timestamps.
+                // federation_keys first.
+                let fed = conn
+                    .query_row(
+                        "SELECT pubkey_ed25519_base64 FROM federation_keys \
+                         WHERE key_id = ?1 \
+                           AND (valid_until IS NULL OR valid_until > CURRENT_TIMESTAMP)",
+                        [&key_id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?;
+                if fed.is_some() {
+                    return Ok(fed);
+                }
+                // Fall back to accord_public_keys (legacy).
                 conn.query_row(
                     "SELECT public_key_base64 FROM accord_public_keys \
-                 WHERE key_id = ?1 \
-                   AND revoked_at IS NULL \
-                   AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)",
+                     WHERE key_id = ?1 \
+                       AND revoked_at IS NULL \
+                       AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)",
                     [&key_id],
                     |r| r.get::<_, String>(0),
                 )
@@ -335,7 +347,7 @@ impl Backend for SqliteBackend {
             .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
             .map_err(|e| Error::Backend(format!("lookup_public_key: {e}")))?;
 
-        let Some(b64) = row_opt else {
+        let Some(b64) = b64_opt else {
             return Ok(None);
         };
         let bytes = BASE64

@@ -256,6 +256,72 @@ impl PyEngine {
         })
     }
 
+    /// v0.2.1 — Sign arbitrary bytes with the deployment's Ed25519
+    /// signing key (the hot-path signature in the hybrid writer
+    /// contract). Returns the 64-byte raw signature.
+    ///
+    /// Mirrors `public_key_b64()` shape: bytes in, bytes out, no key
+    /// material crossing the FFI. Lets consumers (notably the lens
+    /// team's federation-envelope flow) hand canonical bytes to
+    /// persist and get a signature back without pulling the keyring
+    /// seed across the boundary.
+    ///
+    /// **Hot-path Ed25519 only.** The cold-path ML-DSA-65 sign
+    /// happens elsewhere (writer's responsibility — kicked off
+    /// immediately after this returns, NOT batched). This method
+    /// returns when Ed25519 sign completes; the writer is responsible
+    /// for the cold-path PQC kickoff per
+    /// `docs/FEDERATION_DIRECTORY.md` §"Trust contract".
+    fn sign<'py>(&self, py: Python<'py>, message: &Bound<'py, PyBytes>) -> PyResult<Py<PyBytes>> {
+        let signer = self.signer.clone();
+        let runtime = self.runtime.clone();
+        let msg = message.as_bytes().to_vec();
+        let sig_bytes = py.detach(|| {
+            runtime.block_on(async move {
+                signer
+                    .sign(&msg)
+                    .await
+                    .map_err(|e| PyRuntimeError::new_err(format!("sign: {e}")))
+            })
+        })?;
+        Ok(PyBytes::new(py, &sig_bytes).unbind())
+    }
+
+    /// v0.2.1 — Canonicalize a federation envelope (KeyRecord
+    /// registration_envelope, or any JSON object you intend to sign
+    /// as part of a federation row's scrub envelope) using persist's
+    /// `PythonJsonDumpsCanonicalizer` shape: sorted keys, no
+    /// whitespace, `ensure_ascii=True`. Returns the exact byte
+    /// sequence that should be signed.
+    ///
+    /// Lens team's preferred shape per the v0.2.x ask: hides the
+    /// canonicalization rules inside persist (where they live
+    /// anyway, since persist's own scrub-signing uses them) so
+    /// lens/persist don't drift if either side touches the rules.
+    ///
+    /// Workflow:
+    /// 1. Lens builds a JSON object describing the key role (e.g.
+    ///    `{"role": "lens-steward", "scope": "..."}`).
+    /// 2. `canonical_bytes = engine.canonicalize_envelope(json.dumps(envelope))`
+    /// 3. `classical_sig = engine.sign(canonical_bytes)` — hot path.
+    /// 4. Build the SignedKeyRecord; submit via put_public_key.
+    /// 5. Cold path: ML-DSA-65 sign over (canonical_bytes ||
+    ///    classical_sig); call attach_key_pqc_signature once done.
+    fn canonicalize_envelope<'py>(
+        &self,
+        py: Python<'py>,
+        envelope_json: &str,
+    ) -> PyResult<Py<PyBytes>> {
+        let value: serde_json::Value = serde_json::from_str(envelope_json)
+            .map_err(|e| PyValueError::new_err(format!("envelope JSON decode: {e}")))?;
+        let bytes = <PythonJsonDumpsCanonicalizer as crate::verify::canonical::Canonicalizer>::canonicalize_value(
+            &PythonJsonDumpsCanonicalizer,
+            &value,
+        )
+        .map_err(|e| PyRuntimeError::new_err(format!("canonicalize: {e}")))?;
+        Ok(PyBytes::new(py, &bytes).unbind())
+    }
+
     /// v0.1.18 — debug helper for canonical-byte drift diagnosis
     /// (CIRISPersist#6 follow-up). Pipes a raw HTTP body through
     /// persist's schema parse + canonicalizer and returns BOTH
