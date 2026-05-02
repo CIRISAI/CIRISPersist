@@ -5,6 +5,59 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.2.4] — 2026-05-02
+
+First piece of verify subsumption (CIRISPersist#4) — **pip-install-time
+subsumption**. `pip install ciris-persist==0.2.4` now also installs
+`ciris-verify>=1.8.6,<2` transitively, which puts
+`ciris-build-sign` and `ciris-build-verify` CLIs on PATH alongside
+persist's existing entry points.
+
+### What this unlocks
+
+CIRISAgent / CIRISLens / CIRISBridge release workflows can drop
+the `cargo install --git CIRISVerify` and curl-from-tarball
+workarounds for the build-manifest signing CLIs and use a clean
+`pip install ciris-persist==0.2.4` instead. Single install command
+for the whole verify+persist stack.
+
+CIRISVerify v1.8.6's wheels (linux x86_64/aarch64, macos
+x86_64/arm64, windows x86_64) bring the binary entry points to all
+5 platforms. v1.8.6 is the first version with that coverage —
+hence the `>=1.8.6` floor. Pin upper bound `<2` so a hypothetical
+v2.x verify breaking change doesn't silently propagate.
+
+### What this does NOT do (yet)
+
+The Python *import* surface is unchanged from v0.2.3:
+`ciris-verify` is still a separate import path
+(`from ciris_verify.exceptions import VerificationFailedError`)
+rather than being re-exported through `ciris_persist`. The
+verify-shaped `Engine` proxy methods (`Engine.sign`,
+`Engine.public_key`, `Engine.verify_build_manifest`,
+`Engine.attestation_export`, etc. — see
+`docs/V0.2.0_VERIFY_SUBSUMPTION.md`) land in a follow-on v0.2.x
+release once the engine-side wiring catches up. v0.2.4 is the
+install-shape piece; the import-shape piece is task #82.
+
+`Engine.sign()` and `Engine.steward_sign()` already exist
+(v0.2.1 + v0.2.2) for the federation-keys signing path. The
+build-manifest signing surface is what's queued.
+
+### Tests + features
+
+154 lib + 22 integration tests green; clippy clean across all
+features; cargo-deny clean. PyPI wheel metadata gains a
+`Requires-Dist: ciris-verify>=1.8.6,<2` line; wheel itself is
+unchanged otherwise.
+
+### Consumer action
+
+`pip install --upgrade ciris-persist==0.2.4` — if `ciris-verify`
+isn't already installed in the environment, pip fetches it.
+Existing environments with `ciris-verify==1.8.6` see no behavior
+change beyond the dependency constraint being formally declared.
+
 ## [0.2.3] — 2026-05-02
 
 Patch release. Two doc-only / dep-hygiene fixes off CIRISBridge's

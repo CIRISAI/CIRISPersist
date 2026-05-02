@@ -19,6 +19,24 @@ classifiers = [
     "Topic :: Database",
     "Topic :: System :: Logging",
 ]
+# v0.2.4 — verify subsumption (CIRISPersist#4): pip-install-time
+# subsumption. `pip install ciris-persist` pulls `ciris-verify`
+# transitively, which puts `ciris-build-sign` + `ciris-build-verify`
+# on PATH. Lens / agent / bridge get one install command for the
+# whole verify+persist stack — no separate `pip install ciris-verify`
+# step needed for the build-manifest signing CLIs.
+#
+# Pin to >=1.8.6 because the v1.8.6 wheel is the first that ships
+# the CLI console_scripts on all 5 platforms (linux x86_64/aarch64,
+# macos x86_64/arm64, windows x86_64). Earlier 1.8.x had the source
+# but not the binary entry points on PyPI.
+#
+# Pin to <2 because we expect ciris-verify to follow semver-major
+# on breaking changes; v0.2.x persist consumes v1.x verify. Bump
+# to >=2 when v0.3.x persist coordinates with v2.x verify.
+dependencies = [
+    "ciris-verify>=1.8.6,<2",
+]
 dynamic = ["version"]
 
 [project.urls]

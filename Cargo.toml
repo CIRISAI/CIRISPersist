@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -61,8 +61,8 @@ tls = ["dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-native-certs"]
 # rather than a fix — keeps us on the line for when verify
 # subsumption (CIRISPersist#4 / task #82) lands and we start
 # verifying hybrid sigs.
-ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v1.8.5", version = "1.8" }
-ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v1.8.5", version = "1.8" }
+ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v1.8.6", version = "1.8" }
+ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v1.8.6", version = "1.8" }
 async-trait   = "0.1"
 # v0.1.14 — filesystem advisory locks for the cohabitation
 # bootstrap (docs/COHABITATION.md). POSIX flock cross-process,
