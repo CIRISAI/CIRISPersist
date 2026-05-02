@@ -5,6 +5,115 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.1.16] — 2026-05-02
+
+P0 production fix #2 from the same diagnostic round that produced
+v0.1.15. Closes [`CIRISPersist#5`](https://github.com/CIRISAI/CIRISPersist/issues/5).
+
+### The bug (next layer of AV-4)
+
+v0.1.15 fixed the base64 alphabet mismatch — every batch's
+signature decoded successfully (64 bytes via the alphabet-agnostic
+decoder). But every YO-locale batch still rejected with
+`verify_signature_mismatch`. The bridge's diagnostic capture pinned
+the next layer:
+
+- Decode succeeds (64 bytes)
+- Pubkey lookup succeeds (`accord_public_keys` table populated)
+- `verify_strict` returns false because **persist canonicalizes 9
+  fields per `TRACE_WIRE_FORMAT.md` §8 spec, but the agent fleet
+  signs only 2 fields** (`{components, trace_level}`,
+  post-`strip_empty`).
+
+The agent's signing code (`Ed25519TraceSigner.sign_trace` in
+`CIRISAgent/ciris_adapters/ciris_accord_metrics/services.py`) and
+the lens-legacy verifier (`CIRISLens/api/accord_api.py
+::verify_trace_signature`) both use the 2-field shape. The 9-field
+spec form is the eventual target; agent migration is a separate
+coordinated change.
+
+Bytes diff on a real captured YO-rejected trace:
+
+| canonical | bytes | sha256 prefix |
+|---|---|---|
+| 2-field (agent + lens-legacy actually-signed) | 15,827 | `af847a081ae634d1` |
+| 9-field (spec / persist v0.1.15) | 16,149 | `bd6b48689df8adca` |
+
+Different bytes → different sha256 → `verify_strict` returns false
+on every batch.
+
+### The fix — try-both fallback
+
+Same defensive shape as v0.1.15's base64 fallback, applied at the
+canonical-bytes layer. New `verify_trace`:
+
+```rust
+// 1. Decode signature (alphabet-agnostic per v0.1.15)
+// 2. Try 9-field canonical first (spec target)
+// 3. Fall back to 2-field canonical (agent + lens-legacy)
+// 4. SignatureMismatch only if BOTH fail
+```
+
+The 2-field path uses `canonical_payload_value_legacy(trace)` —
+serializes each component via serde, applies `strip_empty`
+recursion (drops `null`/`""`/`[]`/`{}` at every nesting level)
+to match the agent's pre-signature shape, and wraps in
+`{"components": [...], "trace_level": "..."}`.
+
+### Migration path
+
+The 9-field spec form gains more provenance binding into the
+signed bytes (`trace_id`, `thought_id`, `task_id`, `agent_id_hash`,
+`started_at`, `completed_at`, `trace_schema_version`). When the
+agent migrates to it, persist's primary path verifies cleanly and
+the fallback never fires. Tracking agent-side migration via
+**CIRISAgent issue** (sibling filing alongside this one); persist's
+try-both keeps verifying both shapes through the migration window.
+
+`TRACE_WIRE_FORMAT.md` §8 should split into "current (deprecated,
+accepted through migration window)" and "v2 (target)" sections so
+the spec reflects fleet state, not just the target.
+
+### Regression coverage
+
+3 new unit tests in `src/verify/ed25519.rs::tests`:
+
+- `legacy_two_field_signed_trace_verifies` — sign the 2-field
+  form (production shape), persist verifies via fallback. Pre-
+  v0.1.16 this rejected on every YO-locale batch.
+- `legacy_two_field_tampered_rejected` — tamper after legacy
+  signing, both 9-field AND 2-field verify fail, typed
+  `SignatureMismatch`. Confirms the fallback doesn't widen the
+  security surface.
+- `strip_empty_drops_empties_recursively` — exhaustive coverage
+  of the recursion: null/empty-string/empty-array/empty-object
+  drop at every nesting level; numbers (incl. `0`) and booleans
+  (incl. `false`) are NEVER dropped.
+
+### Tests
+
+11 verify-module tests (3 new); 113 lib total + 5 AV-4 + 8 QA +
+9 fixture = **136 tests** all green.
+
+### Lens action
+
+`pip install --upgrade ciris-persist==0.1.16`. v0.1.15's wheels
+have the base64 fix but reject every real production batch on
+the canonical-shape mismatch. v0.1.16 closes the round-trip;
+PERSIST_DELEGATE_RESULT lines should show
+`signatures_verified == envelopes_processed`,
+`trace_events_inserted > 0`,
+`SELECT count(*) FROM cirislens.trace_events` growing on every
+batch.
+
+### Threat model
+
+`THREAT_MODEL.md` AV-4 promoted from "tracked residual / partial
+mitigation" to "fully closed". Three independent layers — base64
+alphabet (v0.1.15), timestamp drift (v0.1.8), canonical-shape
+fallback (v0.1.16) — together close the entire pre-v0.1.x verify-
+mismatch surface area on real agent traffic.
+
 ## [0.1.15] — 2026-05-01
 
 P0 production fix + cohabitation doctrine refinement.

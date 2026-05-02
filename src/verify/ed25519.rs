@@ -159,6 +159,93 @@ pub fn canonical_payload_value(trace: &CompleteTrace) -> serde_json::Value {
     serde_json::Value::Object(payload)
 }
 
+/// Build the **legacy 2-field** canonical payload — what the
+/// agent fleet actually signs today.
+///
+/// CIRISPersist#5: agent's `Ed25519TraceSigner.sign_trace` (in
+/// `CIRIS_Adapter/ciris_adapters/ciris_accord_metrics/services.py`)
+/// signs:
+///
+/// ```python
+/// components_data = [strip_empty(c.model_dump()) for c in trace.components]
+/// signed_payload = {"components": components_data, "trace_level": trace_level}
+/// message = json.dumps(signed_payload, sort_keys=True, separators=(",", ":"))
+/// ```
+///
+/// Two fields total — `components` (post-`strip_empty`) and
+/// `trace_level`. Matches `CIRISLens/api/accord_api.py::verify_trace_signature`.
+///
+/// `TRACE_WIRE_FORMAT.md` §8 names a 9-field shape as the spec
+/// target ([`canonical_payload_value`] above), but the agent fleet
+/// is shipping 2-field today and will for some time. v0.1.16
+/// closes AV-4 (canonical-shape drift) by accepting both: try
+/// 9-field first, fall back to 2-field.
+///
+/// The agent's wire data is already post-`strip_empty`, but
+/// persist's deserialization re-introduces empties — `Option`s
+/// without `skip_serializing_if` round-trip as `null`, empty
+/// `Vec`s round-trip as `[]`, etc. So persist must re-apply the
+/// strip before canonicalizing the legacy form.
+fn canonical_payload_value_legacy(trace: &CompleteTrace) -> serde_json::Value {
+    let components: Vec<serde_json::Value> = trace
+        .components
+        .iter()
+        .map(|c| {
+            let mut v = serde_json::to_value(c).expect("TraceComponent serializes");
+            strip_empty(&mut v);
+            v
+        })
+        .collect();
+
+    let mut payload = serde_json::Map::new();
+    payload.insert("components".into(), serde_json::Value::Array(components));
+    payload.insert(
+        "trace_level".into(),
+        serde_json::to_value(trace.trace_level).expect("TraceLevel serializes"),
+    );
+    serde_json::Value::Object(payload)
+}
+
+/// Recursively drop `null`, `""`, `[]`, `{}` from a JSON value,
+/// in place. Matches the agent's Python `strip_empty` recursion
+/// (`CIRISAgent/ciris_adapters/ciris_accord_metrics/services.py`).
+///
+/// Used by [`canonical_payload_value_legacy`] to reconstruct the
+/// agent's pre-signature-bytes shape from persist's deserialized
+/// trace. Without this, `Option`-typed fields round-trip as
+/// `null`, breaking byte-equality with the agent's signed input.
+fn strip_empty(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Object(map) => {
+            // Recurse first; keys with empty children are then
+            // dropped by `retain`.
+            for (_, child) in map.iter_mut() {
+                strip_empty(child);
+            }
+            map.retain(|_, child| !is_empty(child));
+        }
+        serde_json::Value::Array(arr) => {
+            for child in arr.iter_mut() {
+                strip_empty(child);
+            }
+            arr.retain(|child| !is_empty(child));
+        }
+        _ => {} // primitives: nothing to recurse into
+    }
+}
+
+fn is_empty(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(s) => s.is_empty(),
+        serde_json::Value::Array(a) => a.is_empty(),
+        serde_json::Value::Object(m) => m.is_empty(),
+        // Numbers and booleans are never "empty" — `false` and
+        // `0` are valid signed values.
+        _ => false,
+    }
+}
+
 /// Verify a `CompleteTrace`'s signature against the canonical bytes
 /// the canonicalizer produces, using a pre-fetched verifying key.
 ///
@@ -196,16 +283,32 @@ where
             .expect("length-checked above"),
     );
 
-    // 2. Build the canonical payload value, then canonicalize bytes.
-    let payload = canonical_payload_value(trace);
-    let bytes = canonicalizer.canonicalize_value(&payload)?;
+    // 2. Try the spec-target 9-field canonical first
+    // (TRACE_WIRE_FORMAT.md §8). This is the eventual shape; agent
+    // fleets that have migrated sign over this directly.
+    let nine_field = canonical_payload_value(trace);
+    let nine_bytes = canonicalizer.canonicalize_value(&nine_field)?;
+    if key.verify_strict(&nine_bytes, &sig).is_ok() {
+        return Ok(());
+    }
 
-    // 3. Strict verify — rejects weak keys, malleable signatures,
-    // small-order points. (MISSION.md §2 — verify_strict semantics.)
-    key.verify_strict(&bytes, &sig)
-        .map_err(|_| Error::SignatureMismatch)?;
+    // 3. Fallback: legacy 2-field canonical
+    // ({components, trace_level}, post-strip_empty). CIRISPersist#5:
+    // the agent fleet today signs this shape per
+    // `Ed25519TraceSigner.sign_trace` and `CIRISLens/api/accord_api.py
+    // ::verify_trace_signature`. Same defensive shape v0.1.15 used
+    // for the base64 alphabet fallback. Migration to 9-field is
+    // tracked agent-side; persist accepts both through the window.
+    let two_field = canonical_payload_value_legacy(trace);
+    let two_bytes = canonicalizer.canonicalize_value(&two_field)?;
+    if key.verify_strict(&two_bytes, &sig).is_ok() {
+        return Ok(());
+    }
 
-    Ok(())
+    // 4. Both shapes failed. Strict verify rejected; typed error.
+    // The signature shape was valid (length + base64 decode both
+    // succeeded) so this is content mismatch, not malformation.
+    Err(Error::SignatureMismatch)
 }
 
 /// Convenience wrapper: verify with a [`PublicKeyDirectory`] in front
@@ -369,6 +472,150 @@ mod tests {
 
         verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &keys)
             .expect("URL-safe-no-pad signature MUST verify post-v0.1.15");
+    }
+
+    /// CIRISPersist#5 (v0.1.16): trace signed with the **legacy
+    /// 2-field canonical** ({components, trace_level}, post-strip)
+    /// verifies via persist's try-both fallback. This is the form
+    /// the agent fleet actually ships today; pre-v0.1.16 every
+    /// real production batch rejected with `verify_signature_mismatch`.
+    #[test]
+    fn legacy_two_field_signed_trace_verifies() {
+        let sk = fixed_signing_key();
+        let key_id = "test-key:42";
+        let mut data = serde_json::Map::new();
+        data.insert("attempt_index".into(), serde_json::json!(0));
+        data.insert("seq".into(), serde_json::json!(1));
+        let trace_unsigned = CompleteTrace {
+            trace_id: "trace-legacy-1".into(),
+            thought_id: "th-1".into(),
+            task_id: None,
+            agent_id_hash: "deadbeef".into(),
+            started_at: "2026-04-30T00:15:53.123456+00:00".parse().unwrap(),
+            completed_at: "2026-04-30T00:16:12.789012+00:00".parse().unwrap(),
+            trace_level: crate::schema::TraceLevel::Generic,
+            trace_schema_version: SchemaVersion::parse("2.7.0").unwrap(),
+            components: vec![crate::schema::TraceComponent {
+                component_type: crate::schema::ComponentType::Conscience,
+                event_type: crate::schema::ReasoningEventType::ConscienceResult,
+                timestamp: "2026-04-30T00:15:53.123456+00:00".parse().unwrap(),
+                data,
+            }],
+            signature: String::new(),
+            signature_key_id: key_id.to_owned(),
+        };
+
+        // Sign the LEGACY 2-field form (what the agent actually does):
+        let legacy_payload = canonical_payload_value_legacy(&trace_unsigned);
+        let bytes = PythonJsonDumpsCanonicalizer
+            .canonicalize_value(&legacy_payload)
+            .unwrap();
+        let sig = sk.sign(&bytes);
+        let trace = CompleteTrace {
+            signature: BASE64.encode(sig.to_bytes()),
+            ..trace_unsigned
+        };
+
+        let mut keys = MemKeys {
+            keys: HashMap::new(),
+        };
+        keys.keys.insert(key_id.to_owned(), sk.verifying_key());
+
+        // Persist's verify tries 9-field first (will fail —
+        // signature is over 2-field), then falls back to 2-field
+        // and succeeds.
+        verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &keys)
+            .expect("legacy 2-field signed trace MUST verify via fallback (CIRISPersist#5)");
+    }
+
+    /// CIRISPersist#5: a trace tampered after legacy-form signing
+    /// must STILL reject (try-both fallback doesn't widen the
+    /// security surface — both shapes have to fail before we
+    /// surface SignatureMismatch).
+    #[test]
+    fn legacy_two_field_tampered_rejected() {
+        let sk = fixed_signing_key();
+        let key_id = "test-key:42";
+        let trace_unsigned = CompleteTrace {
+            trace_id: "trace-legacy-tamp".into(),
+            thought_id: "th-1".into(),
+            task_id: None,
+            agent_id_hash: "deadbeef".into(),
+            started_at: "2026-04-30T00:15:53.123456+00:00".parse().unwrap(),
+            completed_at: "2026-04-30T00:16:12.789012+00:00".parse().unwrap(),
+            trace_level: crate::schema::TraceLevel::Generic,
+            trace_schema_version: SchemaVersion::parse("2.7.0").unwrap(),
+            components: vec![],
+            signature: String::new(),
+            signature_key_id: key_id.to_owned(),
+        };
+
+        // Sign legacy form, then mutate trace_level (which IS in
+        // both canonical forms). Both 9-field AND 2-field verify
+        // must fail.
+        let legacy_payload = canonical_payload_value_legacy(&trace_unsigned);
+        let bytes = PythonJsonDumpsCanonicalizer
+            .canonicalize_value(&legacy_payload)
+            .unwrap();
+        let sig = sk.sign(&bytes);
+        let mut trace = CompleteTrace {
+            signature: BASE64.encode(sig.to_bytes()),
+            ..trace_unsigned
+        };
+        trace.trace_level = crate::schema::TraceLevel::FullTraces;
+
+        let mut keys = MemKeys {
+            keys: HashMap::new(),
+        };
+        keys.keys.insert(key_id.to_owned(), sk.verifying_key());
+
+        let err = verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &keys)
+            .expect_err("tampered trace must reject even with try-both fallback");
+        assert!(matches!(err, Error::SignatureMismatch));
+    }
+
+    /// CIRISPersist#5: `strip_empty` recursion matches the agent's
+    /// Python implementation — drops `null`, `""`, `[]`, `{}` at
+    /// every nesting level, retains numbers and booleans (false /
+    /// 0 are valid signed values).
+    #[test]
+    fn strip_empty_drops_empties_recursively() {
+        let mut v = serde_json::json!({
+            "keep_int": 0,
+            "keep_bool_false": false,
+            "drop_null": null,
+            "drop_empty_string": "",
+            "drop_empty_array": [],
+            "drop_empty_object": {},
+            "keep_string": "x",
+            "keep_array": [1, 2],
+            "nested": {
+                "drop_inner_null": null,
+                "keep_inner": "y",
+                "drop_after_recurse_then_emptied": {
+                    "drop": null,
+                    "drop2": ""
+                }
+            },
+            "array_with_empties": [1, "", null, {}, "ok"]
+        });
+        strip_empty(&mut v);
+
+        // Non-recursive expected after retain:
+        let want = serde_json::json!({
+            "keep_int": 0,
+            "keep_bool_false": false,
+            "keep_string": "x",
+            "keep_array": [1, 2],
+            "nested": {
+                "keep_inner": "y",
+                // drop_after_recurse_then_emptied becomes {} after
+                // recursion clears its contents, then the outer
+                // retain drops it
+            },
+            "array_with_empties": [1, "ok"]
+        });
+        assert_eq!(v, want);
     }
 
     /// Mission category §4 "Verify rejection": tampered bytes →
