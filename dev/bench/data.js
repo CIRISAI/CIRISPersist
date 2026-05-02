@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777742082691,
+  "lastUpdate": 1777742732693,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -3929,6 +3929,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 22509388,
             "range": "± 972112",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "493a6b544d6c9601ba66172f28d4ed51f02d3f9a",
+          "message": "v0.2.0 federation: attach_pqc_signature for cold-path fill-in\n\nThe cold-path PQC fill-in primitive completing the writer contract\ndocumented in docs/FEDERATION_DIRECTORY.md §\"PQC strategy\" + §\"Trust\ncontract\":\n\n  Step 1: Sign canonical with Ed25519 (hot path)\n  Step 2: Write the row (PQC fields None — hybrid-pending)\n  Step 3: IMMEDIATELY kick off ML-DSA-65 sign on cold path\n  Step 4: Call attach_*_pqc_signature once ML-DSA completes  ← this commit\n\nThree new trait methods on FederationDirectory:\n- attach_key_pqc_signature(key_id, mldsa_pubkey, mldsa_sig)\n- attach_attestation_pqc_signature(attestation_id, mldsa_sig)\n- attach_revocation_pqc_signature(revocation_id, mldsa_sig)\n\n(Attestations/revocations don't have their own pubkey to attach —\nthey reference the existing federation_keys.scrub_key_id's pubkey\nfor verification.)\n\nEach backend impl:\n- Verifies the row exists; rejects with InvalidArgument otherwise\n- Verifies the row is currently hybrid-pending; rejects with\n  Conflict if already PQC-complete (no double-fill)\n- Updates PQC fields + pqc_completed_at atomically\n- Recomputes persist_row_hash since row content changed\n- Postgres + sqlite use UPDATE ... WHERE pqc_completed_at IS NULL\n  for atomic concurrent-completion guard\n\nMemory tests (4 new, total memory backend now 20 tests):\n- attach_pqc_completes_hybrid_pending_key — basic round-trip\n- attach_pqc_rejects_double_fill — Conflict on second attach\n- attach_pqc_rejects_missing_row — InvalidArgument on ghost\n- attach_pqc_for_attestation_and_revocation — full FK chain\n  (steward → primitive key → attestation/revocation, all upgraded\n  to hybrid-complete)\n\nNote: Persist does NOT verify the cryptographic validity of the PQC\nsignature on attach. That's the writer's responsibility. Consumers\nverify at read time via their own policy layer (per the trust\ncontract — strict-hybrid policy refuses pending rows; soft-hybrid\n+ freshness accepts within window). This separation keeps persist\nsubstrate-only and aligned with the existing scrub_signature_classical\ncontract.\n\n152 lib + 22 integration tests green; clippy clean across all\nfeatures.\n\nNext: PyO3 surface for the 11 federation methods (8 base + 3\nattach) so the lens team can call them from Python via the wheel.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-02T12:18:27-05:00",
+          "tree_id": "8b2d3c088006527ff3a08bc00ff58b99ca59ef74",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/493a6b544d6c9601ba66172f28d4ed51f02d3f9a"
+        },
+        "date": 1777742732354,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 96004,
+            "range": "± 782",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 239133,
+            "range": "± 1309",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 522514,
+            "range": "± 2499",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1856710,
+            "range": "± 14057",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 383,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1592,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8736,
+            "range": "± 168",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 351,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3036,
+            "range": "± 44",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9451,
+            "range": "± 21",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 40432,
+            "range": "± 180",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2204028,
+            "range": "± 88932",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6457224,
+            "range": "± 204827",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 22601323,
+            "range": "± 933346",
             "unit": "ns/iter"
           }
         ]
