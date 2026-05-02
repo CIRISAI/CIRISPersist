@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777691254180,
+  "lastUpdate": 1777695164218,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -2447,6 +2447,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 21223012,
             "range": "± 348056",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "5907e4cbf58fb96dd3a11613e65a9e56aa0997b2",
+          "message": "0.1.18 — SignatureMismatch breadcrumb + Engine.debug_canonicalize\n\nCIRISPersist#6 follow-up. Mirrors v0.1.17's unknown-key\nbreadcrumb onto the canonicalization-failure branch so the\nbridge can pinpoint canonical-byte drift offline.\n\nThe SignatureMismatch warn surfaces:\n- envelope_signer_id\n- wire_body_sha256              ← joins lens-side body_sha256_prefix\n- canonical_9field_sha256       ← persist's spec-shape canonical\n- canonical_2field_sha256       ← persist's legacy-shape canonical\n- canonical_*_bytes_len\n- signature_b64_prefix\n\nBridge takes any captured prefix → finds the matching body in\nthe agent tee directory → runs offline json.dumps reference →\ndiffs against persist's two hashes. Three branches:\n- Reference matches 9field → 2field branch needs investigation\n- Reference matches 2field → 9field has subtle drift\n- Reference matches neither → agent signs unknown shape\n\nNew PyO3 method Engine.debug_canonicalize(bytes) returns both\ncanonical shapes (sha256 + b64 full bytes + length) for each\nCompleteTrace in the body. Lets bridge pipe any wire body\nthrough persist's canonicalizer without needing logs.\n\nHelpers: canonical_payload_sha256s() returns a CanonicalDiagnostic\ncarrier (used by both breadcrumb and debug_canonicalize).\ncanonical_payload_value_legacy made pub(crate) for re-use.\n\nv0.1.18 also adds wire_body_sha256 to the v0.1.17 unknown-key\nbreadcrumb so all three lens/persist log paths share one\ncorrelation field.\n\n138 tests green; clippy clean. Zero hot-path cost — both\nbreadcrumbs fire only on slow-path errors.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-01T23:06:22-05:00",
+          "tree_id": "3f6ff3cb381e87fc997d4a905f667016b5810e54",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/5907e4cbf58fb96dd3a11613e65a9e56aa0997b2"
+        },
+        "date": 1777695163824,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 78834,
+            "range": "± 278",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 193372,
+            "range": "± 2305",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 420978,
+            "range": "± 1637",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1500162,
+            "range": "± 6340",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 352,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1351,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 6266,
+            "range": "± 103",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 243,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 1947,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 6395,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 27992,
+            "range": "± 61",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 516,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 1965433,
+            "range": "± 155679",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 5442225,
+            "range": "± 392009",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 19059878,
+            "range": "± 1328002",
             "unit": "ns/iter"
           }
         ]
