@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777752214353,
+  "lastUpdate": 1777754127358,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -4499,6 +4499,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 22080593,
             "range": "± 148678",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "f2a57d13a1ef6256d88d48c03cb14255188dd2f0",
+          "message": "0.2.4 — verify subsumption: pip-install-time CLI subsumption\n\nFirst piece of CIRISPersist#4 (verify subsumption). `pip install\nciris-persist==0.2.4` now pulls ciris-verify>=1.8.6,<2 as a\nruntime dep, which puts ciris-build-sign and ciris-build-verify\nCLIs on PATH transitively.\n\nCIRISAgent / CIRISLens / CIRISBridge release workflows can drop\nthe cargo install + curl-from-tarball workarounds for the\nbuild-manifest signing CLIs. One pip install for the whole\nverify+persist stack.\n\n>=1.8.6 floor: that's the first ciris-verify wheel with binary\nentry points on all 5 platforms (linux x86_64/aarch64, macos\nx86_64/arm64, windows x86_64).\n<2 ceiling: semver-major safety; v0.2.x persist consumes v1.x\nverify. Bump when v0.3.x persist coordinates with v2.x verify.\n\nWhat this does NOT do yet: the Python import surface is\nunchanged. Engine.sign()/steward_sign() exist (v0.2.1/v0.2.2) for\nfederation-keys signing. The verify-shaped Engine proxy methods\n(verify_build_manifest, attestation_export, get_license_status,\netc.) per docs/V0.2.0_VERIFY_SUBSUMPTION.md land in a follow-on\nv0.2.x. v0.2.4 is the install-shape piece; import-shape is task\n#82 in flight.\n\n154 lib + 22 integration tests green; clippy clean; cargo-deny\nclean. Wheel metadata gains Requires-Dist: ciris-verify>=1.8.6,<2.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-02T15:28:26-05:00",
+          "tree_id": "0952f233ec4961e9ff227c8a5b1617596972484b",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/f2a57d13a1ef6256d88d48c03cb14255188dd2f0"
+        },
+        "date": 1777754127042,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 115639,
+            "range": "± 342",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 267973,
+            "range": "± 1473",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 570581,
+            "range": "± 1467",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 2002910,
+            "range": "± 6801",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 396,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1594,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8391,
+            "range": "± 104",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 341,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3002,
+            "range": "± 69",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9448,
+            "range": "± 37",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 40794,
+            "range": "± 269",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 637,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2148598,
+            "range": "± 46929",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6559478,
+            "range": "± 650346",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 24086583,
+            "range": "± 442618",
             "unit": "ns/iter"
           }
         ]
