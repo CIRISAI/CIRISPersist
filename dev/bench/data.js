@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777686334008,
+  "lastUpdate": 1777691254180,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -2333,6 +2333,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 21209841,
             "range": "± 236356",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "8fcfd02c576e6f9a96284842202c968991547e2b",
+          "message": "0.1.17 — verify-unknown-key diagnostic breadcrumb (CIRISPersist#6)\n\nBridge's flag-on capture against v0.1.16 surfaced a new universal\nreject: verify_unknown_key on every batch despite the rows being\npresent in cirislens.accord_public_keys, passing the WHERE filter,\nvisible to a same-DSN-same-process Python query, and pubkey\nlookup working in local synthetic repros.\n\nSource review confirms persist's lookup_public_key is a direct\nSQL query (no internal cache; no input transform). So the answer\nlives between persist's pool/connection state and the SQL.\n\nv0.1.17 adds lookup-time observability so the next flag-on\ncapture pinpoints which:\n\n- Backend::sample_public_keys(limit) trait method — returns\n  total count + first N key_ids using the same WHERE clause as\n  lookup_public_key. PostgresBackend impl; default empty.\n- IngestPipeline::verify_complete_trace warn-log on lookup miss\n  surfacing envelope_signer_id / hex bytes / id byte length /\n  accord_public_keys total / accord_public_keys sample.\n\nThree diagnostic outcomes the bridge will see:\n- size differs from external SELECT → different scope\n- size matches AND sample includes target → lookup path bug\n- sample shape differs from envelope_signer_id → id transform\n\nBest-effort: if sample query errors, warn still fires with None\nfor diagnostic fields. Zero hot-path cost on happy-path verifies.\n\n136 tests green; clippy clean. No regression — purely additive\nobservability.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-01T22:00:08-05:00",
+          "tree_id": "418c73e08e120a2e13321c40155f5e052eb9b3ac",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/8fcfd02c576e6f9a96284842202c968991547e2b"
+        },
+        "date": 1777691253635,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 99809,
+            "range": "± 1809",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 235798,
+            "range": "± 639",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 508200,
+            "range": "± 2896",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1793342,
+            "range": "± 23695",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 439,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1635,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8134,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 312,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 2487,
+            "range": "± 49",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 7847,
+            "range": "± 17",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 34647,
+            "range": "± 355",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 627,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2057477,
+            "range": "± 65430",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 5940285,
+            "range": "± 198990",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 21223012,
+            "range": "± 348056",
             "unit": "ns/iter"
           }
         ]
