@@ -1,6 +1,6 @@
 # Federation Directory — persist as substrate, trust as policy
 
-**Status:** architectural contract (v0.2.x track). Companion to
+**Status:** architectural contract (v0.3.x track). Companion to
 `docs/COHABITATION.md` (cohabitation doctrine — persist as the
 runtime keyring authority on a host) and the registry team's
 `docs/FEDERATION_CLIENT.md` (the registry-side complement
@@ -9,10 +9,17 @@ The five open design questions in earlier drafts of this doc
 (schema ownership, write authority, consistency model, fail
 mode, trust-contract impact) were resolved in the
 persist/registry alignment conversation 2026-05; their decisions
-are recorded in §"Resolved decisions" below. **Implementation
-is the v0.2.0 milestone; the schema is experimental during
-v0.2.x per §"v0.2.x experimental schema contract" and
-stabilizes at v0.3.0.**
+are recorded in §"Resolved decisions" below.
+
+**Sequencing:** persist v0.2.0 ships verify subsumption
+(CIRISPersist#4 — `Engine` grows verify-shaped proxy methods so
+lens/agent/bridge drop direct `ciris-verify` imports). The
+federation directory work in this doc lands at **v0.3.0** —
+verify subsumption is a prerequisite because `verify_build_manifest`
+needs the federation directory's `trusted_pubkey` lookup to be
+the bootstrap path. **Implementation is the v0.3.0 milestone;
+the schema is experimental during v0.3.x per §"v0.3.x
+experimental schema contract" and stabilizes at v0.4.0.**
 
 Cross-references:
 - PoB §3.1 — federation as peer consensus
@@ -404,10 +411,11 @@ Each phase is a separate persist version. Rough sequencing:
 
 | Persist version | What lands | Registry-side state |
 |---|---|---|
-| v0.2.0 | `federation_keys` schema + `FederationDirectory` trait + dual-write from existing `accord_public_keys` write paths + write-authority guards (rate limit + quota) | Dual-write peer behind `FEDERATION_DUAL_WRITE_ENABLED` (default off until registry v1.4); experimental schema contract applies |
-| v0.2.x | `federation_attestations` + `federation_revocations` schema + trait methods + bilateral divergence telemetry | Registry begins issuing attestations via `federation_attestations.put` instead of writing keys directly |
-| v0.3.0 | Read-path migration; `lookup_public_key` reads federation table; v0.2.x experimental contract retires (schema becomes stable) | Registry can flip dual-write default to on; v1.5 cache-coherence polish (PG NOTIFY pubsub) becomes a candidate at this point |
-| v0.3.x | `accord_public_keys` deprecated to read-only view over `federation_keys WHERE identity_type='agent'` | Registry's own `trusted_primitive_keys`/`partner_keys`/`registry_signing_keys` become persist consumers; trust-contract diff lands on registry side |
+| v0.2.0 | **Verify subsumption** (CIRISPersist#4) — `Engine` grows verify-shaped proxy methods (`sign`, `public_key`, `attestation_export`, `verify_build_manifest`, etc.). Higher layers drop direct `ciris-verify` imports. **Prerequisite for v0.3.0**: the federation directory's `trusted_pubkey` lookup is the bootstrap target for `verify_build_manifest`. | Registry continues using its existing `trusted_primitive_keys` admin RPC; no federation-directory work yet |
+| v0.3.0 | `federation_keys` schema + `FederationDirectory` trait + dual-write from existing `accord_public_keys` write paths + write-authority guards (rate limit + quota) + bootstrap migration (self-signed `persist-steward` row) | Dual-write peer behind `FEDERATION_DUAL_WRITE_ENABLED` (registry decides their own paired version; default off in registry until both sides are confident); experimental schema contract applies |
+| v0.3.x | `federation_attestations` + `federation_revocations` schema + trait methods + bilateral divergence telemetry | Registry begins issuing attestations via `federation_attestations.put` instead of writing keys directly |
+| v0.4.0 | Read-path migration; `lookup_public_key` reads federation table; v0.3.x experimental contract retires (schema becomes stable) | Registry can flip dual-write default to on; PG NOTIFY pubsub becomes a candidate cache-coherence polish |
+| v0.4.x | `accord_public_keys` deprecated to read-only view over `federation_keys WHERE identity_type='agent'` | Registry's own `trusted_primitive_keys`/`partner_keys`/`registry_signing_keys` become persist consumers; trust-contract diff lands on registry side |
 
 ---
 
@@ -424,7 +432,7 @@ the contract.
 | 2 | Write authority — steward-only or self-publish | **Self-publish + post-hoc attestation.** Each primitive's CI writes its own `federation_keys` row signed by its own steward key. Registry's `RegisterTrustedPrimitiveKey` admin RPC shifts from issuance call to attestation call (writes `federation_attestations` with `attesting_key_id=registry-steward`, `attestation_type="vouches_for"`). |
 | 3 | Consistency model | **Eventually-consistent + TTL.** Cache freshness controlled by consumer-side TTL; matches CIRISVerify's existing pubkey-pinning window. No new contract surface. |
 | 4 | Fail-mode when persist unreachable | **Fail-open from cache by default**, opt-in fail-closed via `PERSIST_REQUIRED=true`, **plus a hard ceiling**: `max_stale_cache_age_seconds=3600` (default) triggers fail-closed regardless of `PERSIST_REQUIRED`. |
-| 5 | Trust contract diff (`docs/TRUST_CONTRACT.md` on registry side) | **At persist v0.3.x.** Path A splits into A1 (registry attests) + A2 (persist witnesses); new Path D for consumer-aggregated multi-peer attestations. Registry team owns the diff. |
+| 5 | Trust contract diff (`docs/TRUST_CONTRACT.md` on registry side) | **At persist v0.4.x.** Path A splits into A1 (registry attests) + A2 (persist witnesses); new Path D for consumer-aggregated multi-peer attestations. Registry team owns the diff. |
 
 ---
 
@@ -432,7 +440,7 @@ the contract.
 
 These are the operational guarantees both sides commit to. They
 sit alongside the schema and trait surface as part of the
-v0.2.x→v0.3.x migration contract.
+v0.3.x→v0.4.x migration contract.
 
 ### Write authority — scrub-signature is auth
 
@@ -460,7 +468,7 @@ Two operational guards on top:
 ### Cache freshness — TTL + invalidate-on-write
 
 Consumers maintain their own cache. Two coherence mechanisms in
-v0.2.x:
+v0.3.x:
 
 - **TTL.** Default 5 minutes. Tunable per consumer; registry
   starts at 5 min as a balance between freshness and load.
@@ -470,9 +478,9 @@ v0.2.x:
   write path. Covers the common
   "RegisterTrustedPrimitiveKey-derived attestation" path.
 
-**Deferred to v1.5 / persist v0.3.x:** PG NOTIFY pubsub channel
+**Deferred to persist v0.4.x:** PG NOTIFY pubsub channel
 on `federation_keys` insert/update so consumers can subscribe to
-peer-published changes without polling. Not in v0.2.x — adds
+peer-published changes without polling. Not in v0.3.x — adds
 infrastructure that makes single-node dev painful, and the
 5-minute TTL lag is operationally tolerable for the migration
 phase.
@@ -499,10 +507,10 @@ page-worthy.
 
 ### Bilateral divergence telemetry
 
-Both sides instrument the dual-write hop during the v0.2.x
+Both sides instrument the dual-write hop during the v0.3.x
 experimental phase. Divergence between persist's
 `federation_keys` row and the consumer's local table on
-read-through is signal we want to see fast, not at v0.3.0
+read-through is signal we want to see fast, not at v0.4.0
 cutover.
 
 | Side | Metric | Increments when |
@@ -510,35 +518,36 @@ cutover.
 | Registry | `federation_dual_write_divergence_total` | Persist's `federation_keys` row differs from registry's local on read-through (e.g., key bytes mismatch, valid_until skew, scrub-signature failure on persist's row) |
 | Persist | `federation_directory_writes_total{outcome="ok\|divergent\|rejected"}` | Every write attempt by outcome; `divergent` covers "row would conflict with existing federation_keys row" |
 
-Both surfaced via `/metrics`. Non-zero divergence in v0.2.x is a
-schema-bug signal; non-zero divergence in v0.3.x+ is a real
+Both surfaced via `/metrics`. Non-zero divergence in v0.3.x is a
+schema-bug signal; non-zero divergence in v0.4.x+ is a real
 incident.
 
 ---
 
-## v0.2.x experimental schema contract
+## v0.3.x experimental schema contract
 
-Persist's `federation_keys` (and v0.2.x `federation_attestations`/
+Persist's `federation_keys` (and v0.3.x `federation_attestations`/
 `federation_revocations`) ships as **experimental but
 production-functional**. The contract:
 
-- **Persist may break the schema during v0.2.x with two-week
+- **Persist may break the schema during v0.3.x with two-week
   written notice** (CHANGELOG entry + GitHub issue tagged
   `federation-schema-break` + proactive notification to known
   consumers).
 - **Registry's dual-write is feature-flagged**
-  (`FEDERATION_DUAL_WRITE_ENABLED`, default off until registry
-  v1.4). Roll-back is unsetting the flag.
+  (`FEDERATION_DUAL_WRITE_ENABLED`, default off; registry
+  decides the paired version on their side). Roll-back is
+  unsetting the flag.
 - **Both sides instrument the divergence counter** (above).
   Non-zero divergence triggers investigation, not silent drift.
-- **At persist v0.3.0 the experimental contract retires** — the
+- **At persist v0.4.0 the experimental contract retires** — the
   schema becomes stable, breaking changes from that point forward
   follow standard semver-major rules.
 
 This arrangement lets real production attestation patterns find
 edge cases during the experimental phase (e.g., "what happens
 when a primitive rotates its steward key while attestations from
-the old key are still in flight") rather than at v0.3.0 cutover
+the old key are still in flight") rather than at v0.4.0 cutover
 with everyone reading.
 
 ---
