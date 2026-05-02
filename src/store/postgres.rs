@@ -667,13 +667,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "original_content_hash hex decode: {e}"
             ))
         })?;
-        let scrub_signature = base64::engine::general_purpose::STANDARD
-            .decode(&row.scrub_signature)
-            .map_err(|e| {
-                crate::federation::Error::InvalidArgument(format!(
-                    "scrub_signature base64 decode: {e}"
-                ))
-            })?;
+        // Reject non-hybrid algorithm values; schema CHECK constraint
+        // enforces this too, but we want a clean federation::Error
+        // shape rather than a backend SQL error string.
+        if row.algorithm != crate::federation::types::algorithm::HYBRID {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "algorithm must be 'hybrid' (got '{}')",
+                row.algorithm
+            )));
+        }
 
         // Idempotent on (key_id, persist_row_hash). DO NOTHING when
         // (key_id, persist_row_hash) match exactly; raise Conflict
@@ -681,15 +683,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let result = client
             .execute(
                 "INSERT INTO cirislens.federation_keys (\
-                    key_id, pubkey_base64, algorithm, identity_type, identity_ref, \
-                    valid_from, valid_until, registration_envelope, \
-                    original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
-                    persist_row_hash\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+                    key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
+                    identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) \
                  ON CONFLICT (key_id) DO NOTHING",
                 &[
                     &row.key_id,
-                    &row.pubkey_base64,
+                    &row.pubkey_ed25519_base64,
+                    &row.pubkey_ml_dsa_65_base64,
                     &row.algorithm,
                     &row.identity_type,
                     &row.identity_ref,
@@ -697,9 +700,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.valid_until,
                     &row.registration_envelope,
                     &original_content_hash,
-                    &scrub_signature,
+                    &row.scrub_signature_classical,
+                    &row.scrub_signature_pqc,
                     &row.scrub_key_id,
                     &row.scrub_timestamp,
+                    &row.pqc_completed_at,
                     &row.persist_row_hash,
                 ],
             )
@@ -740,10 +745,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
         let row_opt = client
             .query_opt(
-                "SELECT key_id, pubkey_base64, algorithm, identity_type, identity_ref, \
-                    valid_from, valid_until, registration_envelope, \
-                    original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
-                    persist_row_hash \
+                "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
+                    identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
                  FROM cirislens.federation_keys WHERE key_id = $1",
                 &[&key_id],
             )
@@ -764,10 +769,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
         let rows = client
             .query(
-                "SELECT key_id, pubkey_base64, algorithm, identity_type, identity_ref, \
-                    valid_from, valid_until, registration_envelope, \
-                    original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
-                    persist_row_hash \
+                "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
+                    identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
                  FROM cirislens.federation_keys WHERE identity_ref = $1",
                 &[&identity_ref],
             )
@@ -795,13 +800,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "original_content_hash hex decode: {e}"
             ))
         })?;
-        let scrub_signature = base64::engine::general_purpose::STANDARD
-            .decode(&row.scrub_signature)
-            .map_err(|e| {
-                crate::federation::Error::InvalidArgument(format!(
-                    "scrub_signature base64 decode: {e}"
-                ))
-            })?;
 
         // postgres-types doesn't have a built-in for f64→NUMERIC; cast
         // weight to f64 and let postgres convert.
@@ -810,9 +808,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "INSERT INTO cirislens.federation_attestations (\
                     attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                     weight, asserted_at, expires_at, attestation_envelope, \
-                    original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
-                    persist_row_hash\
-                 ) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash\
+                 ) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
                 &[
                     &row.attestation_id,
                     &row.attesting_key_id,
@@ -823,9 +821,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.expires_at,
                     &row.attestation_envelope,
                     &original_content_hash,
-                    &scrub_signature,
+                    &row.scrub_signature_classical,
+                    &row.scrub_signature_pqc,
                     &row.scrub_key_id,
                     &row.scrub_timestamp,
+                    &row.pqc_completed_at,
                     &row.persist_row_hash,
                 ],
             )
@@ -856,8 +856,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .query(
                 "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
                     weight, asserted_at, expires_at, attestation_envelope, \
-                    original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
-                    persist_row_hash \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
                  FROM cirislens.federation_attestations \
                  WHERE attested_key_id = $1 \
                  ORDER BY asserted_at DESC",
@@ -882,8 +882,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .query(
                 "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
                     weight, asserted_at, expires_at, attestation_envelope, \
-                    original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
-                    persist_row_hash \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
                  FROM cirislens.federation_attestations \
                  WHERE attesting_key_id = $1 \
                  ORDER BY asserted_at DESC",
@@ -911,22 +911,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "original_content_hash hex decode: {e}"
             ))
         })?;
-        let scrub_signature = base64::engine::general_purpose::STANDARD
-            .decode(&row.scrub_signature)
-            .map_err(|e| {
-                crate::federation::Error::InvalidArgument(format!(
-                    "scrub_signature base64 decode: {e}"
-                ))
-            })?;
 
         client
             .execute(
                 "INSERT INTO cirislens.federation_revocations (\
                     revocation_id, revoked_key_id, revoking_key_id, reason, \
                     revoked_at, effective_at, revocation_envelope, \
-                    original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
-                    persist_row_hash\
-                 ) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash\
+                 ) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
                 &[
                     &row.revocation_id,
                     &row.revoked_key_id,
@@ -936,9 +929,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.effective_at,
                     &row.revocation_envelope,
                     &original_content_hash,
-                    &scrub_signature,
+                    &row.scrub_signature_classical,
+                    &row.scrub_signature_pqc,
                     &row.scrub_key_id,
                     &row.scrub_timestamp,
+                    &row.pqc_completed_at,
                     &row.persist_row_hash,
                 ],
             )
@@ -968,8 +963,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .query(
                 "SELECT revocation_id::text, revoked_key_id, revoking_key_id, reason, \
                     revoked_at, effective_at, revocation_envelope, \
-                    original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
-                    persist_row_hash \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
                  FROM cirislens.federation_revocations \
                  WHERE revoked_key_id = $1 \
                  ORDER BY effective_at DESC",
@@ -983,10 +978,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
 
 fn pg_row_to_key_record(row: tokio_postgres::Row) -> crate::federation::KeyRecord {
     let original_content_hash: Vec<u8> = row.get("original_content_hash");
-    let scrub_signature: Vec<u8> = row.get("scrub_signature");
     crate::federation::KeyRecord {
         key_id: row.get("key_id"),
-        pubkey_base64: row.get("pubkey_base64"),
+        pubkey_ed25519_base64: row.get("pubkey_ed25519_base64"),
+        pubkey_ml_dsa_65_base64: row.get("pubkey_ml_dsa_65_base64"),
         algorithm: row.get("algorithm"),
         identity_type: row.get("identity_type"),
         identity_ref: row.get("identity_ref"),
@@ -994,16 +989,17 @@ fn pg_row_to_key_record(row: tokio_postgres::Row) -> crate::federation::KeyRecor
         valid_until: row.get("valid_until"),
         registration_envelope: row.get("registration_envelope"),
         original_content_hash: hex::encode(&original_content_hash),
-        scrub_signature: BASE64.encode(&scrub_signature),
+        scrub_signature_classical: row.get("scrub_signature_classical"),
+        scrub_signature_pqc: row.get("scrub_signature_pqc"),
         scrub_key_id: row.get("scrub_key_id"),
         scrub_timestamp: row.get("scrub_timestamp"),
+        pqc_completed_at: row.get("pqc_completed_at"),
         persist_row_hash: row.get("persist_row_hash"),
     }
 }
 
 fn pg_row_to_attestation(row: tokio_postgres::Row) -> crate::federation::Attestation {
     let original_content_hash: Vec<u8> = row.get("original_content_hash");
-    let scrub_signature: Vec<u8> = row.get("scrub_signature");
     crate::federation::Attestation {
         attestation_id: row.get("attestation_id"),
         attesting_key_id: row.get("attesting_key_id"),
@@ -1014,16 +1010,17 @@ fn pg_row_to_attestation(row: tokio_postgres::Row) -> crate::federation::Attesta
         expires_at: row.get("expires_at"),
         attestation_envelope: row.get("attestation_envelope"),
         original_content_hash: hex::encode(&original_content_hash),
-        scrub_signature: BASE64.encode(&scrub_signature),
+        scrub_signature_classical: row.get("scrub_signature_classical"),
+        scrub_signature_pqc: row.get("scrub_signature_pqc"),
         scrub_key_id: row.get("scrub_key_id"),
         scrub_timestamp: row.get("scrub_timestamp"),
+        pqc_completed_at: row.get("pqc_completed_at"),
         persist_row_hash: row.get("persist_row_hash"),
     }
 }
 
 fn pg_row_to_revocation(row: tokio_postgres::Row) -> crate::federation::Revocation {
     let original_content_hash: Vec<u8> = row.get("original_content_hash");
-    let scrub_signature: Vec<u8> = row.get("scrub_signature");
     crate::federation::Revocation {
         revocation_id: row.get("revocation_id"),
         revoked_key_id: row.get("revoked_key_id"),
@@ -1033,9 +1030,11 @@ fn pg_row_to_revocation(row: tokio_postgres::Row) -> crate::federation::Revocati
         effective_at: row.get("effective_at"),
         revocation_envelope: row.get("revocation_envelope"),
         original_content_hash: hex::encode(&original_content_hash),
-        scrub_signature: BASE64.encode(&scrub_signature),
+        scrub_signature_classical: row.get("scrub_signature_classical"),
+        scrub_signature_pqc: row.get("scrub_signature_pqc"),
         scrub_key_id: row.get("scrub_key_id"),
         scrub_timestamp: row.get("scrub_timestamp"),
+        pqc_completed_at: row.get("pqc_completed_at"),
         persist_row_hash: row.get("persist_row_hash"),
     }
 }

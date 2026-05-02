@@ -494,13 +494,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 "original_content_hash hex decode: {e}"
             ))
         })?;
-        let scrub_signature = base64::engine::general_purpose::STANDARD
-            .decode(&row.scrub_signature)
-            .map_err(|e| {
-                crate::federation::Error::InvalidArgument(format!(
-                    "scrub_signature base64 decode: {e}"
-                ))
-            })?;
+        if row.algorithm != crate::federation::types::algorithm::HYBRID {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "algorithm must be 'hybrid' (got '{}')",
+                row.algorithm
+            )));
+        }
 
         let registration_envelope_text = serde_json::to_string(&row.registration_envelope)
             .map_err(|e| crate::federation::Error::Backend(format!("envelope serialize: {e}")))?;
@@ -537,14 +536,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             let conn = conn.blocking_lock();
             conn.execute(
                 "INSERT INTO federation_keys (\
-                    key_id, pubkey_base64, algorithm, identity_type, identity_ref, \
-                    valid_from, valid_until, registration_envelope, \
-                    original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
-                    persist_row_hash\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
+                    identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 rusqlite::params![
                     row.key_id,
-                    row.pubkey_base64,
+                    row.pubkey_ed25519_base64,
+                    row.pubkey_ml_dsa_65_base64,
                     row.algorithm,
                     row.identity_type,
                     row.identity_ref,
@@ -552,9 +552,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.valid_until.map(|t| t.to_rfc3339()),
                     registration_envelope_text,
                     original_content_hash,
-                    scrub_signature,
+                    row.scrub_signature_classical,
+                    row.scrub_signature_pqc,
                     row.scrub_key_id,
                     row.scrub_timestamp.to_rfc3339(),
+                    row.pqc_completed_at.map(|t| t.to_rfc3339()),
                     row.persist_row_hash,
                 ],
             )?;
@@ -576,10 +578,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             move || -> Result<Option<crate::federation::KeyRecord>, rusqlite::Error> {
                 let conn = conn.blocking_lock();
                 conn.query_row(
-                    "SELECT key_id, pubkey_base64, algorithm, identity_type, identity_ref, \
-                        valid_from, valid_until, registration_envelope, \
-                        original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
-                        persist_row_hash \
+                    "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
+                        identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
+                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
                      FROM federation_keys WHERE key_id = ?1",
                     [&key_id],
                     sqlite_row_to_key_record,
@@ -602,10 +604,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             move || -> Result<Vec<crate::federation::KeyRecord>, rusqlite::Error> {
                 let conn = conn.blocking_lock();
                 let mut stmt = conn.prepare(
-                    "SELECT key_id, pubkey_base64, algorithm, identity_type, identity_ref, \
-                        valid_from, valid_until, registration_envelope, \
-                        original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
-                        persist_row_hash \
+                    "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
+                        identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
+                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
                      FROM federation_keys WHERE identity_ref = ?1",
                 )?;
                 let rows = stmt.query_map([&identity_ref], sqlite_row_to_key_record)?;
@@ -629,13 +631,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 "original_content_hash hex decode: {e}"
             ))
         })?;
-        let scrub_signature = base64::engine::general_purpose::STANDARD
-            .decode(&row.scrub_signature)
-            .map_err(|e| {
-                crate::federation::Error::InvalidArgument(format!(
-                    "scrub_signature base64 decode: {e}"
-                ))
-            })?;
         let attestation_envelope_text = serde_json::to_string(&row.attestation_envelope)
             .map_err(|e| crate::federation::Error::Backend(format!("envelope serialize: {e}")))?;
 
@@ -646,9 +641,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 "INSERT INTO federation_attestations (\
                     attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                     weight, asserted_at, expires_at, attestation_envelope, \
-                    original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
-                    persist_row_hash\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 rusqlite::params![
                     row.attestation_id,
                     row.attesting_key_id,
@@ -659,9 +654,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.expires_at.map(|t| t.to_rfc3339()),
                     attestation_envelope_text,
                     original_content_hash,
-                    scrub_signature,
+                    row.scrub_signature_classical,
+                    row.scrub_signature_pqc,
                     row.scrub_key_id,
                     row.scrub_timestamp.to_rfc3339(),
+                    row.pqc_completed_at.map(|t| t.to_rfc3339()),
                     row.persist_row_hash,
                 ],
             )?;
@@ -694,8 +691,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 let mut stmt = conn.prepare(
                     "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                         weight, asserted_at, expires_at, attestation_envelope, \
-                        original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
-                        persist_row_hash \
+                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
                      FROM federation_attestations \
                      WHERE attested_key_id = ?1 \
                      ORDER BY asserted_at DESC",
@@ -721,8 +718,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 let mut stmt = conn.prepare(
                     "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                         weight, asserted_at, expires_at, attestation_envelope, \
-                        original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
-                        persist_row_hash \
+                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
                      FROM federation_attestations \
                      WHERE attesting_key_id = ?1 \
                      ORDER BY asserted_at DESC",
@@ -748,13 +745,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 "original_content_hash hex decode: {e}"
             ))
         })?;
-        let scrub_signature = base64::engine::general_purpose::STANDARD
-            .decode(&row.scrub_signature)
-            .map_err(|e| {
-                crate::federation::Error::InvalidArgument(format!(
-                    "scrub_signature base64 decode: {e}"
-                ))
-            })?;
         let revocation_envelope_text = serde_json::to_string(&row.revocation_envelope)
             .map_err(|e| crate::federation::Error::Backend(format!("envelope serialize: {e}")))?;
 
@@ -765,9 +755,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 "INSERT INTO federation_revocations (\
                     revocation_id, revoked_key_id, revoking_key_id, reason, \
                     revoked_at, effective_at, revocation_envelope, \
-                    original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
-                    persist_row_hash\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 rusqlite::params![
                     row.revocation_id,
                     row.revoked_key_id,
@@ -777,9 +767,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.effective_at.to_rfc3339(),
                     revocation_envelope_text,
                     original_content_hash,
-                    scrub_signature,
+                    row.scrub_signature_classical,
+                    row.scrub_signature_pqc,
                     row.scrub_key_id,
                     row.scrub_timestamp.to_rfc3339(),
+                    row.pqc_completed_at.map(|t| t.to_rfc3339()),
                     row.persist_row_hash,
                 ],
             )?;
@@ -812,8 +804,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 let mut stmt = conn.prepare(
                     "SELECT revocation_id, revoked_key_id, revoking_key_id, reason, \
                         revoked_at, effective_at, revocation_envelope, \
-                        original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
-                        persist_row_hash \
+                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
                      FROM federation_revocations \
                      WHERE revoked_key_id = ?1 \
                      ORDER BY effective_at DESC",
@@ -846,13 +838,14 @@ fn sqlite_row_to_key_record(
         )
     })?;
     let original_content_hash: Vec<u8> = row.get("original_content_hash")?;
-    let scrub_signature: Vec<u8> = row.get("scrub_signature")?;
     let valid_from: String = row.get("valid_from")?;
     let valid_until: Option<String> = row.get("valid_until")?;
     let scrub_timestamp: String = row.get("scrub_timestamp")?;
+    let pqc_completed_at: Option<String> = row.get("pqc_completed_at")?;
     Ok(crate::federation::KeyRecord {
         key_id: row.get("key_id")?,
-        pubkey_base64: row.get("pubkey_base64")?,
+        pubkey_ed25519_base64: row.get("pubkey_ed25519_base64")?,
+        pubkey_ml_dsa_65_base64: row.get("pubkey_ml_dsa_65_base64")?,
         algorithm: row.get("algorithm")?,
         identity_type: row.get("identity_type")?,
         identity_ref: row.get("identity_ref")?,
@@ -860,9 +853,11 @@ fn sqlite_row_to_key_record(
         valid_until: valid_until.as_deref().map(parse_rfc3339),
         registration_envelope: envelope,
         original_content_hash: hex::encode(&original_content_hash),
-        scrub_signature: BASE64.encode(&scrub_signature),
+        scrub_signature_classical: row.get("scrub_signature_classical")?,
+        scrub_signature_pqc: row.get("scrub_signature_pqc")?,
         scrub_key_id: row.get("scrub_key_id")?,
         scrub_timestamp: parse_rfc3339(&scrub_timestamp),
+        pqc_completed_at: pqc_completed_at.as_deref().map(parse_rfc3339),
         persist_row_hash: row.get("persist_row_hash")?,
     })
 }
@@ -879,10 +874,10 @@ fn sqlite_row_to_attestation(
         )
     })?;
     let original_content_hash: Vec<u8> = row.get("original_content_hash")?;
-    let scrub_signature: Vec<u8> = row.get("scrub_signature")?;
     let asserted_at: String = row.get("asserted_at")?;
     let expires_at: Option<String> = row.get("expires_at")?;
     let scrub_timestamp: String = row.get("scrub_timestamp")?;
+    let pqc_completed_at: Option<String> = row.get("pqc_completed_at")?;
     Ok(crate::federation::Attestation {
         attestation_id: row.get("attestation_id")?,
         attesting_key_id: row.get("attesting_key_id")?,
@@ -893,9 +888,11 @@ fn sqlite_row_to_attestation(
         expires_at: expires_at.as_deref().map(parse_rfc3339),
         attestation_envelope: envelope,
         original_content_hash: hex::encode(&original_content_hash),
-        scrub_signature: BASE64.encode(&scrub_signature),
+        scrub_signature_classical: row.get("scrub_signature_classical")?,
+        scrub_signature_pqc: row.get("scrub_signature_pqc")?,
         scrub_key_id: row.get("scrub_key_id")?,
         scrub_timestamp: parse_rfc3339(&scrub_timestamp),
+        pqc_completed_at: pqc_completed_at.as_deref().map(parse_rfc3339),
         persist_row_hash: row.get("persist_row_hash")?,
     })
 }
@@ -912,10 +909,10 @@ fn sqlite_row_to_revocation(
         )
     })?;
     let original_content_hash: Vec<u8> = row.get("original_content_hash")?;
-    let scrub_signature: Vec<u8> = row.get("scrub_signature")?;
     let revoked_at: String = row.get("revoked_at")?;
     let effective_at: String = row.get("effective_at")?;
     let scrub_timestamp: String = row.get("scrub_timestamp")?;
+    let pqc_completed_at: Option<String> = row.get("pqc_completed_at")?;
     Ok(crate::federation::Revocation {
         revocation_id: row.get("revocation_id")?,
         revoked_key_id: row.get("revoked_key_id")?,
@@ -925,9 +922,11 @@ fn sqlite_row_to_revocation(
         effective_at: parse_rfc3339(&effective_at),
         revocation_envelope: envelope,
         original_content_hash: hex::encode(&original_content_hash),
-        scrub_signature: BASE64.encode(&scrub_signature),
+        scrub_signature_classical: row.get("scrub_signature_classical")?,
+        scrub_signature_pqc: row.get("scrub_signature_pqc")?,
         scrub_key_id: row.get("scrub_key_id")?,
         scrub_timestamp: parse_rfc3339(&scrub_timestamp),
+        pqc_completed_at: pqc_completed_at.as_deref().map(parse_rfc3339),
         persist_row_hash: row.get("persist_row_hash")?,
     })
 }
@@ -1181,17 +1180,20 @@ mod tests {
     fn fed_key(key_id: &str, identity_ref: &str, scrub_key_id: &str) -> KeyRecord {
         KeyRecord {
             key_id: key_id.into(),
-            pubkey_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
-            algorithm: crate::federation::types::algorithm::ED25519.into(),
+            pubkey_ed25519_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: crate::federation::types::algorithm::HYBRID.into(),
             identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
             identity_ref: identity_ref.into(),
             valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
             valid_until: None,
             registration_envelope: serde_json::json!({"id": key_id}),
             original_content_hash: "deadbeef".into(),
-            scrub_signature: "c2lnbmF0dXJl".into(),
+            scrub_signature_classical: "c2lnbmF0dXJl".into(),
+            scrub_signature_pqc: None,
             scrub_key_id: scrub_key_id.into(),
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
             persist_row_hash: String::new(),
         }
     }
@@ -1212,9 +1214,11 @@ mod tests {
             expires_at: None,
             attestation_envelope: serde_json::json!({"id": id}),
             original_content_hash: "abc123".into(),
-            scrub_signature: "c2ln".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
             scrub_key_id: scrub_key_id.into(),
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
             persist_row_hash: String::new(),
         }
     }
@@ -1229,9 +1233,11 @@ mod tests {
             effective_at: "2026-05-01T00:00:00Z".parse().unwrap(),
             revocation_envelope: serde_json::json!({"id": id}),
             original_content_hash: "abc123".into(),
-            scrub_signature: "c2ln".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
             scrub_key_id: scrub_key_id.into(),
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
             persist_row_hash: String::new(),
         }
     }

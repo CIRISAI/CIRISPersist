@@ -46,6 +46,91 @@ Cross-references:
 
 ---
 
+## Trust contract — eventual consistency as a federation primitive
+
+The federation directory's promise to consumers is **not** "every
+row is hybrid-signed and replicated and attested at all times." It
+is a **layered set of eventual-consistency commitments** that
+compose into a trust contract. Each consumer picks its own
+latency/security trade-off using persist's observability signals.
+
+| Layer | Eventual property | Observability signal |
+|---|---|---|
+| **PQC completion** | Every row will be hybrid-signed (Ed25519 + ML-DSA-65) | `pqc_completed_at IS NULL` → pending; row is hybrid-pending. Telemetry: `federation_pqc_pending_age_seconds_max`. |
+| **Replication** | Every row will reach every region (Spock multi-region) | Replication-lag metrics on persist's Spock subscription. |
+| **Cache freshness** | Every consumer cache will refresh on TTL or invalidate-on-write | `cache_age_seconds` returned in verify responses. |
+| **Peer attestation** | Every legitimate identity will accumulate attestations | `list_attestations_for(K).len()` over time + identity of attesters. |
+| **Revocation propagation** | Every revocation will reach every consumer | `revocations_for(K)` queried at consumer's chosen freshness. |
+
+### What "eventual" means for a consumer
+
+A consumer composes its trust verdict by deciding which of these
+eventual properties have to be **completed** vs **pending** for a
+given decision. Three concrete examples:
+
+**Strict-hybrid policy.** "Don't trust any signature unless PQC has
+landed." Refuses pending rows. Highest assurance; slowest path
+because the PQC sign + replication + cache fill must complete
+before the consumer's verdict is positive.
+
+**Soft-hybrid + freshness policy.** "Trust if Ed25519 verifies and
+the row was written < 30s ago, OR if PQC has landed." Accepts the
+write window where PQC is in flight; refuses old rows that should
+have completed by now. Balances rapid ops with audit eventual.
+
+**Pure attestation-graph policy.** "Trust if K is N-attested by my
+trust roots, regardless of K's own signature status." Defers the
+crypto-strength question entirely to the attestation layer. Useful
+for high-volume, low-stakes paths where any single key's status
+matters less than the network's collective view.
+
+### Why this is OK
+
+The complicated part is real: there is no single "is this trusted?"
+answer. The clear part is also real: every dimension of trust has
+**a publicly observable signal** that consumers can use to compose
+their own answer. Persist commits to:
+
+1. **Every signal is exposed** (no hidden state — `pqc_completed_at`,
+   `cache_age_seconds`, `persist_row_hash` divergence counter,
+   replication-lag metrics, attestation graph reads, revocation
+   reads).
+2. **Every eventual property converges** under non-adversarial
+   conditions (PQC kickoff is contractual; replication is Spock-
+   automatic; attestations land via consumer admin RPCs).
+3. **Every divergence is alarm-able** (telemetry is on the metrics
+   surface; operators can detect "PQC pending too long" /
+   "replication lagging" / "divergence detected" before silent
+   drift becomes a security failure).
+
+What persist does NOT commit to:
+
+- **Strong consistency.** Cross-region reads may serve slightly
+  stale state. Hard-consistency consumers run their cache at
+  TTL=0 and pay the round-trip on every lookup.
+- **Synchronous PQC.** v0.2.0+ writes accept Ed25519-only with
+  PQC kickoff happening on the cold path. Consumers that need
+  synchronous-hybrid wait for `pqc_completed_at IS NOT NULL`.
+- **Single-trust-policy enforcement.** Different consumers compose
+  different policies; persist exposes substrate, not verdicts.
+
+### When the contract changes
+
+When quantum threat materializes:
+- `require_pqc_on_write=true` flips federation-wide.
+- The "eventual-PQC" eventual property becomes "synchronous-PQC".
+- Pre-flip rows still pending get walked through the upgrade
+  pipeline; post-flip rows are hybrid from the start.
+- Trust contract layer "PQC completion" goes from "eventual" to
+  "synchronous" — observable signal stays the same, the gate just
+  closes earlier.
+
+The other eventual layers (replication, cache, attestation,
+revocation) are unaffected; they were already eventual-consistency
+contracts and will remain so.
+
+---
+
 ## TL;DR
 
 Three rules:

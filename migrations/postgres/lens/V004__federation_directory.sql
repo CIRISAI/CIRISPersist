@@ -22,6 +22,53 @@
 -- anchor" attack disappears because consumers walk the FK chain to a
 -- root they have anchored out-of-band, not to a row "Postgres said
 -- exists."
+--
+-- # Post-quantum strategy (v0.2.0): hot-path Ed25519, cold-path ML-DSA-65
+--
+-- Wait-until-everything-is-fast-PQC: ships never, federation stalls.
+-- Ed25519-only: not post-quantum safe.
+-- This design: ship Ed25519-fast on the hot write path while running
+-- ML-DSA-65 immediately afterward on the cold path. The historical
+-- audit chain converges to fully hybrid-signed without ML-DSA latency
+-- ever appearing on the synchronous request path.
+--
+-- # Writer contract — PQC must KICK OFF, not be delayed
+--
+-- This schema's nullable PQC fields are NOT a license to skip PQC.
+-- The architectural contract for any writer to these tables is:
+--
+--   1. Sign canonical_bytes with Ed25519 (synchronous, hot path).
+--   2. Write the row to persist (PQC fields may be NULL at this step).
+--   3. **IMMEDIATELY** kick off ML-DSA-65 signing
+--      (canonical_bytes || classical_sig). Cold path — runs on a
+--      background tokio task, separate worker, async pipeline,
+--      whatever. NOT delayed. NOT batched with other writes.
+--      NOT scheduled. Just off the synchronous path.
+--   4. When ML-DSA-65 sign completes, call `attach_pqc_signature`
+--      to populate the PQC components and mark `pqc_completed_at`.
+--
+-- The window between step 2 and step 4 is the only time a row may
+-- be hybrid-pending. Observability: `pqc_completed_at IS NULL`
+-- rows are pending. Telemetry: `federation_pqc_pending_age_seconds_max`
+-- alarms when any row has been pending too long (kickoff failure).
+--
+-- # Phase transitions
+--
+-- Phase 1 (v0.2.0+): writers kick off PQC immediately per the
+-- contract above. Persist accepts hybrid-pending rows and tracks
+-- pqc_completed_at. Default policy: `require_pqc_on_write=false`.
+--
+-- Phase 2 (when quantum threat materializes): persist's runtime
+-- policy flips (`require_pqc_on_write=true`). Writers must include
+-- both signatures up front; the kickoff step folds into the
+-- synchronous path. Pre-flip rows that are still pending get walked
+-- through the upgrade pipeline; post-flip rows are hybrid from the
+-- start.
+--
+-- Net property: every row in the historical audit chain ends up
+-- hybrid-signed (post-quantum safe). Federation speed at write
+-- time is Ed25519 latency, not Ed25519+ML-DSA-65 latency. PQC is
+-- never delayed beyond "as soon as the cold path can run".
 
 CREATE SCHEMA IF NOT EXISTS cirislens;
 
@@ -41,15 +88,25 @@ CREATE TABLE IF NOT EXISTS cirislens.federation_keys (
     -- for trace verification (continuity with accord_public_keys).
     key_id                TEXT PRIMARY KEY,
 
-    -- Pubkey bytes, base64 standard alphabet (matches
-    -- accord_public_keys.public_key_base64 shape).
-    pubkey_base64         TEXT NOT NULL,
+    -- v0.2.0 PQC strategy (see file header for full architectural
+    -- rationale). Ed25519 components REQUIRED at write; ML-DSA-65
+    -- components nullable (filled in by writer's cold-path PQC sign,
+    -- which the writer contract requires to kick off IMMEDIATELY
+    -- after Ed25519 sign — not delayed, not batched).
+    --
+    -- Per CIRISVerify `StewardPublicKey`:
+    --   - ed25519: 32 raw bytes, base64 standard → 44 chars (REQUIRED)
+    --   - ml_dsa_65: 1952 raw bytes, base64 standard → ~2604 chars (filled in via attach_pqc_signature)
+    pubkey_ed25519_base64    TEXT NOT NULL,
+    pubkey_ml_dsa_65_base64  TEXT,
 
-    -- "ed25519" | "ml-dsa-65" | "hybrid"
-    -- (Ed25519+ML-DSA-65 separator-encoded). String-typed (not enum)
-    -- for forward compat — new algorithms added by either side
-    -- without a schema break.
-    algorithm             TEXT NOT NULL,
+    -- Algorithm identifier. v0.2.0+ writes declare intent = "hybrid";
+    -- the row IS hybrid-pending ONLY when pubkey_ml_dsa_65_base64 IS
+    -- NULL, in which case the writer's cold-path PQC sign is in
+    -- flight. The column exists for forward compat against future PQC
+    -- schemes (ML-DSA-87, ML-DSA + ML-KEM) that may emerge as the
+    -- federation evolves.
+    algorithm             TEXT NOT NULL CHECK (algorithm = 'hybrid'),
 
     -- "agent" | "primitive" | "steward" | "partner"
     -- See docs/FEDERATION_DIRECTORY.md §"Schema sketch" for semantics.
@@ -70,14 +127,30 @@ CREATE TABLE IF NOT EXISTS cirislens.federation_keys (
     -- registered. Stored verbatim for forensic reconstruction.
     registration_envelope JSONB NOT NULL,
 
-    -- v0.1.3 scrub envelope four-tuple. Every row carries its own
-    -- cryptographic provenance. Bootstrap rows have
+    -- v0.1.3 scrub envelope (PQC-bound signature). Every row carries
+    -- its own cryptographic provenance. Bootstrap rows have
     -- scrub_key_id = key_id (self-signed); all others chain to a
     -- key that exists in this table.
-    original_content_hash BYTEA NOT NULL,
-    scrub_signature       BYTEA NOT NULL,
-    scrub_key_id          TEXT NOT NULL,
-    scrub_timestamp       TIMESTAMPTZ NOT NULL,
+    --
+    -- Hybrid signature protocol per CIRISVerify `ManifestSignature` +
+    -- bound signature pattern (`HybridSignature` in
+    -- `ciris-crypto/types.rs`):
+    --   1. classical_sig = Ed25519.sign(canonical_bytes)            REQUIRED
+    --   2. pqc_sig = ML-DSA-65.sign(canonical_bytes || classical_sig) OPTIONAL until hard-PQC
+    --
+    -- Verification (when PQC is present) requires BOTH; PQC covers the
+    -- classical signature to prevent stripping attacks. PQC null →
+    -- the row is "hybrid-pending"; verifying-time policy decides
+    -- whether to accept it.
+    original_content_hash      BYTEA NOT NULL,  -- sha256 of canonical envelope
+    scrub_signature_classical  TEXT  NOT NULL,  -- base64 Ed25519 sig (88 chars)
+    scrub_signature_pqc        TEXT,            -- base64 ML-DSA-65 sig; NULL until PQC fills in
+    scrub_key_id               TEXT  NOT NULL,
+    scrub_timestamp            TIMESTAMPTZ NOT NULL,
+    -- When the PQC components were attached. NULL until both
+    -- pubkey_ml_dsa_65_base64 AND scrub_signature_pqc are populated.
+    -- Auditable signal for "when did this row become hybrid-secure".
+    pqc_completed_at           TIMESTAMPTZ,
 
     -- v0.2.0: server-computed canonical hash, hex-encoded. Returned
     -- on read responses so consumers (per FEDERATION_CLIENT.md
@@ -149,12 +222,15 @@ CREATE TABLE IF NOT EXISTS cirislens.federation_attestations (
     -- (FEDERATION_CLIENT.md §"Audit-log").
     attestation_envelope  JSONB NOT NULL,
 
-    -- v0.1.3 scrub envelope (every row carries provenance).
-    original_content_hash BYTEA NOT NULL,
-    scrub_signature       BYTEA NOT NULL,
-    scrub_key_id          TEXT NOT NULL
+    -- v0.1.3 scrub envelope (PQC-bound; see federation_keys note).
+    -- scrub_signature_pqc nullable until PQC fills in.
+    original_content_hash      BYTEA NOT NULL,
+    scrub_signature_classical  TEXT  NOT NULL,
+    scrub_signature_pqc        TEXT,
+    scrub_key_id               TEXT  NOT NULL
         REFERENCES cirislens.federation_keys(key_id),
-    scrub_timestamp       TIMESTAMPTZ NOT NULL,
+    scrub_timestamp            TIMESTAMPTZ NOT NULL,
+    pqc_completed_at           TIMESTAMPTZ,
 
     -- v0.2.0: server-computed canonical hash (see federation_keys).
     persist_row_hash      TEXT NOT NULL
@@ -195,12 +271,15 @@ CREATE TABLE IF NOT EXISTS cirislens.federation_revocations (
 
     revocation_envelope   JSONB NOT NULL,
 
-    -- v0.1.3 scrub envelope.
-    original_content_hash BYTEA NOT NULL,
-    scrub_signature       BYTEA NOT NULL,
-    scrub_key_id          TEXT NOT NULL
+    -- v0.1.3 scrub envelope (PQC-bound; see federation_keys note).
+    -- scrub_signature_pqc nullable until PQC fills in.
+    original_content_hash      BYTEA NOT NULL,
+    scrub_signature_classical  TEXT  NOT NULL,
+    scrub_signature_pqc        TEXT,
+    scrub_key_id               TEXT  NOT NULL
         REFERENCES cirislens.federation_keys(key_id),
-    scrub_timestamp       TIMESTAMPTZ NOT NULL,
+    scrub_timestamp            TIMESTAMPTZ NOT NULL,
+    pqc_completed_at           TIMESTAMPTZ,
 
     persist_row_hash      TEXT NOT NULL
 );

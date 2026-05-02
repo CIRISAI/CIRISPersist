@@ -25,21 +25,32 @@
 -- ─── federation_keys ───────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS federation_keys (
-    key_id                TEXT PRIMARY KEY,
-    pubkey_base64         TEXT NOT NULL,
-    algorithm             TEXT NOT NULL,
-    identity_type         TEXT NOT NULL,
-    identity_ref          TEXT NOT NULL,
-    valid_from            TEXT NOT NULL,
-    valid_until           TEXT,
-    registration_envelope TEXT NOT NULL,
+    key_id                    TEXT PRIMARY KEY,
+    -- v0.2.0 soft-PQC / hard-PQC strategy (see postgres V004 header
+    -- for the full architectural rationale). Ed25519 components are
+    -- always required; ML-DSA-65 components are populated either
+    -- at write or asynchronously via attach_pqc_signature.
+    pubkey_ed25519_base64     TEXT NOT NULL,
+    pubkey_ml_dsa_65_base64   TEXT,           -- NULL = hybrid-pending
+    algorithm                 TEXT NOT NULL CHECK (algorithm = 'hybrid'),
+    identity_type             TEXT NOT NULL,
+    identity_ref              TEXT NOT NULL,
+    valid_from                TEXT NOT NULL,
+    valid_until               TEXT,
+    registration_envelope     TEXT NOT NULL,
 
-    original_content_hash BLOB NOT NULL,
-    scrub_signature       BLOB NOT NULL,
-    scrub_key_id          TEXT NOT NULL,
-    scrub_timestamp       TEXT NOT NULL,
+    -- Hybrid signature (PQC-bound when complete). Per CIRISVerify
+    -- `ManifestSignature` + bound signature pattern:
+    --   classical_sig = Ed25519.sign(canonical)                   REQUIRED
+    --   pqc_sig = ML-DSA-65.sign(canonical || classical_sig)      OPTIONAL until hard-PQC
+    original_content_hash      BLOB NOT NULL,
+    scrub_signature_classical  TEXT NOT NULL,
+    scrub_signature_pqc        TEXT,            -- NULL = hybrid-pending
+    scrub_key_id               TEXT NOT NULL,
+    scrub_timestamp            TEXT NOT NULL,
+    pqc_completed_at           TEXT,            -- timestamp when row became hybrid-secure
 
-    persist_row_hash      TEXT NOT NULL,
+    persist_row_hash           TEXT NOT NULL,
 
     -- DEFERRABLE INITIALLY DEFERRED so the bootstrap (self-signed)
     -- row INSERT doesn't violate the FK at row-write time. Constraint
@@ -64,12 +75,14 @@ CREATE TABLE IF NOT EXISTS federation_attestations (
     expires_at            TEXT,
     attestation_envelope  TEXT NOT NULL,
 
-    original_content_hash BLOB NOT NULL,
-    scrub_signature       BLOB NOT NULL,
-    scrub_key_id          TEXT NOT NULL REFERENCES federation_keys(key_id),
-    scrub_timestamp       TEXT NOT NULL,
+    original_content_hash      BLOB NOT NULL,
+    scrub_signature_classical  TEXT NOT NULL,
+    scrub_signature_pqc        TEXT,            -- NULL = hybrid-pending
+    scrub_key_id               TEXT NOT NULL REFERENCES federation_keys(key_id),
+    scrub_timestamp            TEXT NOT NULL,
+    pqc_completed_at           TEXT,
 
-    persist_row_hash      TEXT NOT NULL
+    persist_row_hash           TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS federation_attestations_attested
@@ -88,12 +101,14 @@ CREATE TABLE IF NOT EXISTS federation_revocations (
     effective_at          TEXT NOT NULL,
     revocation_envelope   TEXT NOT NULL,
 
-    original_content_hash BLOB NOT NULL,
-    scrub_signature       BLOB NOT NULL,
-    scrub_key_id          TEXT NOT NULL REFERENCES federation_keys(key_id),
-    scrub_timestamp       TEXT NOT NULL,
+    original_content_hash      BLOB NOT NULL,
+    scrub_signature_classical  TEXT NOT NULL,
+    scrub_signature_pqc        TEXT,            -- NULL = hybrid-pending
+    scrub_key_id               TEXT NOT NULL REFERENCES federation_keys(key_id),
+    scrub_timestamp            TEXT NOT NULL,
+    pqc_completed_at           TEXT,
 
-    persist_row_hash      TEXT NOT NULL
+    persist_row_hash           TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS federation_revocations_revoked

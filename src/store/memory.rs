@@ -559,17 +559,20 @@ mod tests {
     fn fix_key(key_id: &str, identity_ref: &str, scrub_key_id: &str) -> KeyRecord {
         KeyRecord {
             key_id: key_id.into(),
-            pubkey_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
-            algorithm: crate::federation::types::algorithm::ED25519.into(),
+            pubkey_ed25519_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: crate::federation::types::algorithm::HYBRID.into(),
             identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
             identity_ref: identity_ref.into(),
             valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
             valid_until: None,
             registration_envelope: serde_json::json!({"id": key_id}),
             original_content_hash: "deadbeef".into(),
-            scrub_signature: "c2lnbmF0dXJl".into(),
+            scrub_signature_classical: "c2lnbmF0dXJl".into(),
+            scrub_signature_pqc: None,
             scrub_key_id: scrub_key_id.into(),
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
             persist_row_hash: String::new(),
         }
     }
@@ -590,9 +593,11 @@ mod tests {
             expires_at: None,
             attestation_envelope: serde_json::json!({"id": id}),
             original_content_hash: "abc123".into(),
-            scrub_signature: "c2ln".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
             scrub_key_id: scrub_key_id.into(),
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
             persist_row_hash: String::new(),
         }
     }
@@ -607,9 +612,11 @@ mod tests {
             effective_at: "2026-05-01T00:00:00Z".parse().unwrap(),
             revocation_envelope: serde_json::json!({"id": id}),
             original_content_hash: "abc123".into(),
-            scrub_signature: "c2ln".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
             scrub_key_id: scrub_key_id.into(),
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
             persist_row_hash: String::new(),
         }
     }
