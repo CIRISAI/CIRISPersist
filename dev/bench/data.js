@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777746908543,
+  "lastUpdate": 1777752214353,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -4385,6 +4385,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 21352833,
             "range": "± 95393",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "e51fb6d6afd605ed4e08d0855785e0f103cfa881",
+          "message": "0.2.3 — ML-DSA-65 sig size doc fix + CIRISVerify v1.8.5 hygiene bump\n\nCIRISPersist#8: src/federation/types.rs:166 doc said \"~4396 chars\nfor 3293-byte sig\" — wrong. FIPS 204 final is 3309 bytes / 4412\nb64 chars. CIRISBridge's lens-steward bootstrap empirically\nproduced 4412-char signatures via dilithium-py. Pure docstring\nfix; persist v0.2.x has no ML-DSA verifier and no schema capacity\ncheck (TEXT column), so no behavior change.\n\nCIRISVerify pin: v1.8.0 → v1.8.5. Hygiene bump for the same FIPS\n204 final size fix in ciris-crypto::PqcAlgorithm::MlDsa65.signature_size().\nPersist doesn't use that constant directly today (we use\nVerifyError, BuildPrimitive, ExtrasValidator from\nciris-verify-core; HardwareSigner from ciris-keyring), but keeps\nthe pin current for when verify subsumption (CIRISPersist#4) lands.\n\nCIRISPersist#6: closing pending CIRISBridge confirmation. v0.1.17\nadded the breadcrumb diagnostic; v0.1.18-v0.1.20 closed the\nunderlying canonical-bytes drift (CIRISPersist#7) that was being\nmisclassified as verify_unknown_key in the v0.1.16 window. v0.2.x\nfederation directory + dual-read fundamentally changes the lookup\npath. Will reopen with current-version evidence if reproduces.\n\n154 lib + 22 integration tests green; clippy clean; cargo-deny\nclean.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-02T14:56:26-05:00",
+          "tree_id": "0c4888044e9d2ff3f31f80d96612181719f5cae2",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/e51fb6d6afd605ed4e08d0855785e0f103cfa881"
+        },
+        "date": 1777752214074,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 96403,
+            "range": "± 508",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 238063,
+            "range": "± 946",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 520038,
+            "range": "± 2981",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1850021,
+            "range": "± 27337",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 378,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1652,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 9115,
+            "range": "± 39",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 351,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3104,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9277,
+            "range": "± 45",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 40197,
+            "range": "± 194",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 623,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2145972,
+            "range": "± 39933",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6236733,
+            "range": "± 72749",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 22080593,
+            "range": "± 148678",
             "unit": "ns/iter"
           }
         ]
