@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777700045761,
+  "lastUpdate": 1777700438030,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -3017,6 +3017,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 22500048,
             "range": "± 346191",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "8d4da637767765ed159a594858e9673311611139",
+          "message": "docs(roadmap): re-sequence — v0.2.0 verify subsumption, v0.3.0 federation directory\n\nVerify subsumption (CIRISPersist#4) is the v0.2.0 milestone, not the\nfederation directory. Sequence-correctness reason: federation\ndirectory's primary read consumer is verify_build_manifest, so\nshipping verify subsumption first means consumers migrate once\n(rather than once to plumb the pubkey lookup, then again to drop\nit when v0.3.0 makes the lookup implicit).\n\nNew: docs/V0.2.0_VERIFY_SUBSUMPTION.md\n  - Implementation plan for CIRISPersist#4\n  - Engine grows verify-shaped proxy methods (sign, public_key,\n    attestation_export, storage_descriptor, get_license_status,\n    check_capability, check_agent_integrity, verify_build_manifest,\n    get_signed_function_manifest, hybrid_sign_build_manifest)\n  - Higher layers (lens, agent, bridge) drop direct ciris-verify\n    Python imports\n  - Pin ciris-verify-core v1.8.0 → v1.8.4 (cohabitation contract\n    documented version)\n  - verify_build_manifest keeps trusted_pubkey caller-arg in\n    v0.2.0; v0.3.0 federation directory replaces with implicit\n    lookup\n  - 10-day single-developer schedule sketch\n  - Closes CIRISVerify AV-14 by construction in persist-bearing\n    stacks\n\nUpdated: docs/FEDERATION_DIRECTORY.md\n  - Migration table pushed back one major version: v0.2.0 (verify\n    subsumption) → v0.3.0 (federation_keys + FederationDirectory)\n    → v0.3.x (attestations + revocations) → v0.4.0 (read-path\n    migration) → v0.4.x (accord_public_keys deprecation)\n  - Status line updated to v0.3.x track\n  - Experimental schema contract section renamed v0.3.x; the\n    two-week deprecation notice clock starts at persist v0.3.0\n    final\n  - Registry-side coordination notes updated: registry decides\n    their paired version on their own side (no longer assumed\n    \"v1.4 paired with persist v0.2.0\"); both sides re-pair when\n    persist v0.3.0 is close\n  - Trust contract diff (Q5) target moved from persist v0.3.x to\n    persist v0.4.x (matches the new schema-stabilization point)\n  - Cache-coherence PG NOTIFY pubsub deferred to persist v0.4.x\n    (matches the new schema-stabilization point)\n\nNo code changes; doc-only. Task tracking:\n  - #82 v0.2.0 verify subsumption (CIRISPersist#4) — was always\n    queued; now has a concrete implementation plan\n  - #88 v0.3.0 federation directory (key storage for lens) —\n    new task tracking the work pushed back from v0.2.0\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-02T00:34:33-05:00",
+          "tree_id": "2fbfb8ff6491fca6335d5c1e23875cc07509ec06",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/8d4da637767765ed159a594858e9673311611139"
+        },
+        "date": 1777700437704,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 95943,
+            "range": "± 627",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 235787,
+            "range": "± 1247",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 515317,
+            "range": "± 3672",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1831597,
+            "range": "± 10664",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 377,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1717,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 9015,
+            "range": "± 232",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 350,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3112,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9206,
+            "range": "± 78",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 40164,
+            "range": "± 648",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 640,
+            "range": "± 43",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2205752,
+            "range": "± 104190",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6371698,
+            "range": "± 154326",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 22626913,
+            "range": "± 422870",
             "unit": "ns/iter"
           }
         ]
