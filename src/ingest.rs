@@ -330,14 +330,47 @@ where
     }
 
     async fn verify_complete_trace(&self, trace: &CompleteTrace) -> Result<(), IngestError> {
-        let key = self
+        let key_id = &trace.signature_key_id;
+        let lookup = self
             .backend
-            .lookup_public_key(&trace.signature_key_id)
+            .lookup_public_key(key_id)
             .await
-            .map_err(IngestError::Store)?
-            .ok_or_else(|| {
-                IngestError::Verify(VerifyError::UnknownKey(trace.signature_key_id.clone()))
-            })?;
+            .map_err(IngestError::Store)?;
+
+        let key = match lookup {
+            Some(k) => k,
+            None => {
+                // v0.1.17 — verify-unknown-key breadcrumb
+                // (CIRISPersist#6). When the backend reports
+                // `Ok(None)` for a key the agent claims to have
+                // signed under, surface lookup-time observables to
+                // diagnose without source-level instrumentation:
+                //
+                // - `envelope_signer_id`: what the agent sent
+                // - `looked_up_id_bytes_hex`: the same value as
+                //   raw bytes (catches invisible-char drift)
+                // - `accord_public_keys_size`: total valid rows the
+                //   backend can see at this moment
+                // - `accord_public_keys_sample`: first N key_ids by
+                //   stable order, lets bridge correlate against the
+                //   external SELECT
+                //
+                // The sample query is best-effort; if it fails (e.g.
+                // backend transient), we still emit the warn with
+                // None for the diagnostic fields and return the
+                // typed UnknownKey error.
+                let sample = self.backend.sample_public_keys(5).await.ok();
+                tracing::warn!(
+                    envelope_signer_id = %key_id,
+                    looked_up_id_bytes_hex = %hex::encode(key_id.as_bytes()),
+                    looked_up_id_byte_len = key_id.len(),
+                    accord_public_keys_size = ?sample.as_ref().map(|s| s.size),
+                    accord_public_keys_sample = ?sample.as_ref().map(|s| &s.sample),
+                    "ciris-persist: verify_unknown_key — lookup miss"
+                );
+                return Err(IngestError::Verify(VerifyError::UnknownKey(key_id.clone())));
+            }
+        };
         verify_trace(trace, self.canonicalizer, &key)?;
         Ok(())
     }

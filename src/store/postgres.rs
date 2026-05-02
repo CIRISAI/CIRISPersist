@@ -535,6 +535,46 @@ impl Backend for PostgresBackend {
         Ok(Some(key))
     }
 
+    async fn sample_public_keys(
+        &self,
+        limit: usize,
+    ) -> Result<super::backend::PublicKeySample, Error> {
+        // v0.1.17 — diagnostic for CIRISPersist#6 verify-unknown-key
+        // breadcrumb. Same filter as `lookup_public_key`'s WHERE
+        // (unrevoked + unexpired), so the sample reflects exactly
+        // what the runtime lookup is querying against. ORDER BY
+        // key_id for stable cross-call ordering.
+        let client = self.get_client().await?;
+        let count_row = client
+            .query_one(
+                "SELECT COUNT(*)::BIGINT FROM cirislens.accord_public_keys \
+                 WHERE revoked_at IS NULL \
+                   AND (expires_at IS NULL OR expires_at > NOW())",
+                &[],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("count_public_keys: {e}")))?;
+        let total: i64 = count_row.get(0);
+
+        let lim = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = client
+            .query(
+                "SELECT key_id FROM cirislens.accord_public_keys \
+                 WHERE revoked_at IS NULL \
+                   AND (expires_at IS NULL OR expires_at > NOW()) \
+                 ORDER BY key_id LIMIT $1",
+                &[&lim],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("sample_public_keys: {e}")))?;
+        let sample: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+
+        Ok(super::backend::PublicKeySample {
+            size: total.max(0) as usize,
+            sample,
+        })
+    }
+
     async fn run_migrations(&self) -> Result<(), Error> {
         // v0.1.5 — multi-worker boot race fix. Before this, two
         // workers calling `run_migrations` concurrently against the

@@ -15,7 +15,7 @@ pub mod memory;
 pub mod postgres;
 pub mod types;
 
-pub use backend::{Backend, InsertReport};
+pub use backend::{Backend, InsertReport, PublicKeySample};
 pub use decompose::{decompose, dedup_key, Decomposed};
 pub use memory::MemoryBackend;
 #[cfg(feature = "postgres")]

@@ -63,6 +63,36 @@ pub trait Backend: Send + Sync {
         key_id: &str,
     ) -> impl Future<Output = Result<Option<VerifyingKey>, Error>> + Send;
 
+    /// v0.1.17 — backend-side diagnostic for the verify-unknown-key
+    /// breadcrumb (CIRISPersist#6). Returns total count of valid
+    /// (unrevoked, unexpired) public-key rows + a sample of up to
+    /// `limit` `key_id` values.
+    ///
+    /// Used ONLY by the `IngestPipeline` warn-log emitted when
+    /// `lookup_public_key` returns `Ok(None)` — surfaces "what does
+    /// the backend actually see at lookup time" so a verify miss can
+    /// be triaged without source-level instrumentation. Default impl
+    /// returns an empty sample (the Memory backend doesn't run a real
+    /// query); the Postgres impl runs `SELECT COUNT(*) ... + LIMIT N`
+    /// against `cirislens.accord_public_keys` with the same filter
+    /// the runtime lookup applies.
+    ///
+    /// **Not part of the public ingest contract.** Don't make
+    /// production decisions on this method's output; it's a
+    /// diagnostic-only escape hatch.
+    fn sample_public_keys(
+        &self,
+        limit: usize,
+    ) -> impl Future<Output = Result<PublicKeySample, Error>> + Send {
+        let _ = limit;
+        async {
+            Ok(PublicKeySample {
+                size: 0,
+                sample: Vec::new(),
+            })
+        }
+    }
+
     /// Run pending migrations against the backend's schema. Phase 1
     /// migrations live in `migrations/postgres/lens/` and
     /// `migrations/sqlite/lens/`; the runner is `refinery`.
@@ -133,4 +163,21 @@ impl InsertReport {
     pub fn total_seen(&self) -> usize {
         self.inserted + self.conflicted
     }
+}
+
+/// v0.1.17 — diagnostic snapshot of `accord_public_keys` for the
+/// verify-unknown-key breadcrumb. See [`Backend::sample_public_keys`].
+///
+/// Mission constraint: this is observability scaffolding, not a
+/// production data path. The `sample` is bounded by the caller's
+/// `limit` and is whatever the backend orders the rows by (no
+/// stability guarantee across calls).
+#[derive(Debug, Clone, Default)]
+pub struct PublicKeySample {
+    /// Total count of valid (unrevoked, unexpired) public-key rows
+    /// the backend can see at the time of the call.
+    pub size: usize,
+    /// First N `key_id` values per the backend's natural ordering
+    /// (typically primary-key order on Postgres).
+    pub sample: Vec<String>,
 }

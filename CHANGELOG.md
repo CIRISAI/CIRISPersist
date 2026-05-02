@@ -5,6 +5,86 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.1.17] — 2026-05-02
+
+Diagnostic breadcrumb for [`CIRISPersist#6`](https://github.com/CIRISAI/CIRISPersist/issues/6) —
+the bridge's flag-on capture against v0.1.16 surfaced a new
+universal reject (`verify_unknown_key`) that doesn't fit any of
+the four hypothesis classes a non-persist-side observer can
+falsify. Source review confirms persist's `lookup_public_key` is
+a direct SQL query (no internal cache, no input transform), so
+the answer lives somewhere between persist's pool/connection
+state and the actual SQL it's running.
+
+This release adds **lookup-time observability** so the next
+flag-on capture pinpoints which.
+
+### What's new
+
+- **`Backend::sample_public_keys(limit) -> PublicKeySample`** —
+  new trait method returning total count of valid (unrevoked,
+  unexpired) `accord_public_keys` rows + a stable-ordered sample
+  of the first `limit` `key_id` values. Default impl is empty
+  (memory backend); `PostgresBackend` runs `SELECT COUNT(*)` +
+  `LIMIT N` against the same WHERE clause as
+  `lookup_public_key` — so what the diagnostic sees is exactly
+  what the runtime lookup is querying against.
+- **`PublicKeySample`** struct re-exported from `crate::store`
+  for diagnostic use. Not part of the production ingest contract.
+- **`tracing::warn!` breadcrumb in `IngestPipeline::verify_complete_trace`**
+  fires when `lookup_public_key` returns `Ok(None)`. Surfaces:
+  - `envelope_signer_id`: the agent's claimed `signature_key_id`
+  - `looked_up_id_bytes_hex`: same value as raw bytes (catches
+    invisible-char drift)
+  - `looked_up_id_byte_len`: integer length, easy grep
+  - `accord_public_keys_size`: total valid rows persist sees
+  - `accord_public_keys_sample`: first 5 `key_id` values in
+    backend order
+
+### Three diagnostic outcomes the bridge will see
+
+| Observation | Conclusion |
+|---|---|
+| `accord_public_keys_size` differs from external `SELECT COUNT(*)` | Persist queries a different scope than the external check |
+| `accord_public_keys_size` matches AND sample includes the target id | Lookup path has a bug; the rows ARE visible to persist |
+| Sample shape (length / chars) differs from `envelope_signer_id` | Id transform somewhere in the deserialization path |
+
+### Implementation notes
+
+- Sample query uses the exact same WHERE clause as
+  `lookup_public_key` — same connection from the same deadpool,
+  same MVCC view per `tokio-postgres` autocommit semantics. If
+  there's a pool-state weirdness causing the lookup miss, the
+  sample will reflect the same weirdness (which is actually what
+  we want for diagnosis — same weirdness, same blind spot).
+- Best-effort: if `sample_public_keys` itself errors, the warn
+  still fires with `None` for the diagnostic fields, and the
+  typed `UnknownKey` error returns normally.
+- Zero hot-path cost for happy-path verifies: the breadcrumb only
+  fires when lookup misses.
+
+### Tests
+
+136 tests green (no regression); clippy clean. No new test —
+breadcrumb effect is observable only against a real Postgres
+backend with rows the lookup misses, which is exactly the
+scenario the bridge will capture.
+
+### What this doesn't fix yet
+
+The actual lookup miss. v0.1.17 is purely diagnostic — once
+bridge captures the warn output against a flag-on run, the next
+patch (v0.1.18 or v0.1.x.y depending on root cause) closes
+whichever of the three diagnostic outcomes lands.
+
+### Notes for the bridge team
+
+Flip the persist flag on for one capture window with
+`RUST_LOG=ciris_persist=warn` (or wider if useful). Capture the
+single `verify_unknown_key` warn for any rejected batch and ship
+it back. Three lines of structured fields will pinpoint the root
+cause class.
+
 ## [0.1.16] — 2026-05-02
 
 P0 production fix #2 from the same diagnostic round that produced
