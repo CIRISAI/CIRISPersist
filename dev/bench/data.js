@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777696607704,
+  "lastUpdate": 1777698320594,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -2675,6 +2675,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 22064946,
             "range": "± 247822",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "208a1c0c953a119ffcee1ddf92077c1443f41a56",
+          "message": "0.1.20 — preserve agent's wire tokens (P0 #3, second attempt)\n\nv0.1.19's lexical-core approach didn't close CIRISPersist#7. Bridge\nre-ran debug_canonicalize: same divergence on the same fixture.\nThe plan was wrong: lexical-core (and ryu, and every \"shortest\nround-trip\" library that's not CPython) picks a different tie-break\nthan CPython's Py_dg_dtoa. More fundamentally: by the time we have\na Rust f64, the original token is gone — 0.003199200000000001 and\n0.0031992000000000006 parse to identical bits.\n\nv0.1.20: don't reproduce, preserve. Enable serde_json's\n`arbitrary_precision` feature. Number is internally a String — the\nparsed wire token. Display emits it verbatim. We never re-format\nduring the verify path; we always parse and walk the parsed Value.\n\nEmpirically verified:\n  in : {\"x\":0.0031992000000000006}\n  out: {\"x\":0.0031992000000000006}\n  in : {\"x\":1e-05}     out: {\"x\":1e-05}\n  in : {\"x\":1e+16}     out: {\"x\":1e+16}\n  in : {\"x\":1.7976931348623157e+308}\n  out: {\"x\":1.7976931348623157e+308}\n\nAll Python format variants (scientific threshold, exponent padding,\nsigned-positive exponent, large/small extremes) round-trip\nbyte-identical because we don't re-format.\n\nCode changes:\n- write_number: 30 LoC → 1 LoC (just `write!(buf, \"{n}\")`)\n- write_python_float: deleted (~80 LoC)\n- v0.1.19 tests using json!(divergent_double) removed (premise was\n  false — can't recover Python's bytes from a Rust f64)\n- 4 new wire-byte preservation tests using from_str on the bridge's\n  YO captures + 14 Python format variants\n\nDeps:\n- serde_json gets `arbitrary_precision` feature\n- lexical-core (added v0.1.19) removed\n\nTrade-off: arbitrary_precision unifies across the dep tree. Stable\nserde_json API behavior unchanged (Number::as_f64, etc. still work).\nOnly private-variant pattern-matchers would break, which no stable\ncode does.\n\n143 tests green; clippy clean; cargo-deny clean.\n\nLens action: pip install --upgrade ciris-persist==0.1.20.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-01T23:58:12-05:00",
+          "tree_id": "b90510f1fb72b2ce466ec3a7c381b2abdad47ae5",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/208a1c0c953a119ffcee1ddf92077c1443f41a56"
+        },
+        "date": 1777698320054,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 89853,
+            "range": "± 377",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 232281,
+            "range": "± 452",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 512848,
+            "range": "± 4575",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1965236,
+            "range": "± 44707",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 328,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1254,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7718,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 302,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3243,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9525,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 43698,
+            "range": "± 118",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 539,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 1950439,
+            "range": "± 41882",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 5974360,
+            "range": "± 55611",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 21947728,
+            "range": "± 206224",
             "unit": "ns/iter"
           }
         ]
