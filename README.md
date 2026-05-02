@@ -1,6 +1,6 @@
 # CIRISPersist
 
-Unified Rust persistence for the CIRIS Trinity — signed events, time-series, runtime state.
+Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state.
 
 **Status: 0.1.0 — Phase 1 lens-ready.** The Phase 1 ingest pipeline is end-to-end testable
 and lands the lens cutover from `accord_traces` (per-thought row collapse) to

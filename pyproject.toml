@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "ciris-persist"
-description = "Unified Rust persistence for the CIRIS Trinity — signed events, time-series, runtime state."
+description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
 readme = "README.md"
 license = { text = "AGPL-3.0-or-later" }
 authors = [{ name = "CIRIS AI", email = "hello@ciris.ai" }]

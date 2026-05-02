@@ -481,7 +481,7 @@ jobs:
               'version': '${{ steps.version.outputs.version }}',
               'binaries': binaries,
               'generated_at': '${GENERATED_AT}',
-              'notes': 'CIRIS Trinity persist substrate; manifest signed via ciris-build-sign --primitive persist (CIRISVerify v1.8.0). Multi-arch publish: linux x86_64 + aarch64, darwin arm64. (darwin x86_64 omitted — GH Actions Intel runner capacity issues; matches CIRISAgent matrix.)',
+              'notes': 'CIRIS federation persist substrate; manifest signed via ciris-build-sign --primitive persist (CIRISVerify v1.8.0). Multi-arch publish: linux x86_64 + aarch64, darwin arm64. (darwin x86_64 omitted — GH Actions Intel runner capacity issues; matches CIRISAgent matrix.)',
           }))
           " "${BINARIES_JSON}")
           echo "POST ${REGISTRY_URL}/v1/verify/binary-manifest"

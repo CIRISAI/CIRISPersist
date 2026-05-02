@@ -1,4 +1,4 @@
-# FSD: CIRISPersist — Unified Rust persistence for the CIRIS Trinity
+# FSD: CIRISPersist — Unified Rust persistence for the CIRIS federation
 
 **Status:** Proposed
 **Author:** Eric Moore (CIRIS Team) with Claude Opus 4.7
@@ -369,7 +369,7 @@ We do not start Phase 3 because the architecture wants it. We start when there i
 | 5.5 Thoughts (hot path) | weeks | 5.4 stable |
 | 5.6 Remove Python DAO shims; remove dialect adapter; remove iOS Python persistence | days | 5.5 stable |
 
-End-state: `ciris_engine/logic/persistence/` directory contains a Rust-binding shim file and nothing else. The CIRIS Trinity (Agent, Manager, Lens) shares one persistence binary.
+End-state: `ciris_engine/logic/persistence/` directory contains a Rust-binding shim file and nothing else. Every CIRIS federation primitive that needs durable state — agent, lens, registry, bridge, and any future peer — shares this one persistence binary. (Originally framed as the "CIRIS Trinity" of agent + manager + lens; the federation has since grown past three primitives, and persist's substrate role is the shared property.)
 
 ## 6. Non-goals
 
@@ -430,4 +430,4 @@ Phase 1 is committed work for this cycle. Phase 2 items are individually opt-in 
 
 ## 10. Closing note
 
-The agent already has a hash chain. The lens already has a Rust ingest edge. The wire format already carries the chain anchor on every action. **The work this FSD specifies is recognition of a structural alignment, not new construction.** Phase 1 is the lens cutover we have on the runway tonight, written into a crate that has the right shape from the start. Phase 2 is the §3.1 collapse made operational on the agent's signed-events and TSDB tables, no flag-day in sight. Phase 3 carries the collapse all the way through the agent's runtime-state, memory-graph, and governance tables — the architectural endpoint where the CIRIS Trinity (Agent, Manager, Lens) shares one persistence binary. We commit to the destination; we sequence the work so each phase stands on its own; we start Phase 3 only when there's a named operational reason that justifies the migration risk.
+The agent already has a hash chain. The lens already has a Rust ingest edge. The wire format already carries the chain anchor on every action. **The work this FSD specifies is recognition of a structural alignment, not new construction.** Phase 1 is the lens cutover we have on the runway tonight, written into a crate that has the right shape from the start. Phase 2 is the §3.1 collapse made operational on the agent's signed-events and TSDB tables, no flag-day in sight. Phase 3 carries the collapse all the way through the agent's runtime-state, memory-graph, and governance tables — the architectural endpoint where every CIRIS federation primitive that needs durable state shares one persistence binary. We commit to the destination; we sequence the work so each phase stands on its own; we start Phase 3 only when there's a named operational reason that justifies the migration risk.

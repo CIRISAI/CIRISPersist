@@ -12,7 +12,7 @@
 // require digging through the migration SQL alongside the source.
 #![deny(missing_docs)]
 
-//! ciris-persist — unified Rust persistence for the CIRIS Trinity.
+//! ciris-persist — unified Rust persistence for the CIRIS federation.
 //!
 //! Mission: see [`MISSION.md`](https://github.com/CIRISAI/CIRISPersist/blob/main/MISSION.md).
 //! `ciris-persist` is the substrate on which CIRIS Accord Meta-Goal M-1
