@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777754127358,
+  "lastUpdate": 1777761596861,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -4613,6 +4613,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 24086583,
             "range": "± 442618",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "52c2df436f0a52b0cb29d07ed2b7c5d61cdc100f",
+          "message": "0.3.0 — wire format 2.7.9 (deterministic dispatch by trace_schema_version)\n\nLocked against CIRISAgent/FSD/TRACE_WIRE_FORMAT.md @ cc41f315f\n(release/2.7.9 HEAD; will be byte-identical at v2.7.9-stable tag).\nQA runner cuts release/2.7.9 signed build today; persist v0.3.0\nmust be on PyPI before that build deploys.\n\nSchema:\n- SUPPORTED_VERSIONS = [\"2.7.0\", \"2.7.9\"] (dual-window)\n- TraceComponent gets agent_id_hash: Option<String>\n  - None at 2.7.0 (cross-shape injection defense per §3.1)\n  - Some(envelope_hash) at 2.7.9 (denormalized from envelope, agents\n    emit locked-equal)\n- New verify::Error::UnsupportedSchemaVersion variant\n  (kind=\"verify_unsupported_schema_version\") for the dispatch-table\n  miss\n\nVerify dispatch — DETERMINISTIC by trace_schema_version, NOT iterative:\n- \"2.7.0\" → canonical_payload_value (4-field per-component)\n- \"2.7.9\" → canonical_payload_value_v279 (5-field per-component\n  with agent_id_hash)\n- \"2.7.legacy\" → canonical_payload_value_legacy (2-field, explicit\n  opt-in only — not in SUPPORTED_VERSIONS by default)\n\nWhy deterministic vs try-three:\n- trace_schema_version is in the signed canonical bytes →\n  self-authenticating dispatch key, attacker cannot forge without\n  breaking signature\n- No shape-shopping attack surface\n- No spurious-sig-fail SHA-256+verify latency multiplier\n- Stable telemetry buckets (each trace contributes to exactly one\n  shape's verify path)\n\nCross-shape injection defense (§3.1):\n- At \"2.7.0\", canonical_payload_value ignores per-component\n  agent_id_hash even if present on the wire\n- Only envelope value is authoritative\n- Test: v270_ignores_per_component_agent_id_hash_injection\n  asserts byte-identical canonical bytes whether per-component is\n  None or Some(\"attacker_smuggled_hash\")\n\ncontext/TRACE_WIRE_FORMAT.md replaced with single-line pointer to\nCIRISAgent/FSD/TRACE_WIRE_FORMAT.md @ cc41f315f. Eliminates the\nspec-vendor-drift class that produced v0.1.18 → v0.1.20 float\ncanonicalization break.\n\nTests: 157 lib tests green (+2 new):\n- v279_signed_trace_verifies_via_deterministic_dispatch\n- v270_ignores_per_component_agent_id_hash_injection\n- legacy_two_field_canonical_dispatch_via_explicit_opt_in\n  (renamed from legacy_two_field_signed_trace_verifies; tests\n  explicit \"2.7.legacy\" opt-in, not silent fallback)\n\nClippy clean across all features. cargo-deny clean.\n\nDeferred to v0.3.x (per hand-off note action items):\n- Telemetry counters (federation_canonical_attempts_total +\n  federation_canonical_match_total)\n- LLMCallEvent parent_event_type/parent_attempt_index parse-time\n  enforcement at 2.7.9 (currently caught downstream at trace_llm_calls\n  insert NOT NULL or verify-canonical-mismatch)\n- VERB_SECOND_PASS_RESULT verb closed-enum parse validation\n- FEDERATION_THREAT_MODELS refresh\n- 2.7.9 fixtures from agent QA runner\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-02T17:33:06-05:00",
+          "tree_id": "721690d1d9303694cd5b20ca50482405d9703e63",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/52c2df436f0a52b0cb29d07ed2b7c5d61cdc100f"
+        },
+        "date": 1777761595985,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 79632,
+            "range": "± 918",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 197194,
+            "range": "± 638",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 430581,
+            "range": "± 9695",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1533404,
+            "range": "± 14178",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 304,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1212,
+            "range": "± 20",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 6479,
+            "range": "± 141",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 273,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 2484,
+            "range": "± 16",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 7390,
+            "range": "± 63",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 31656,
+            "range": "± 109",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 520,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2070264,
+            "range": "± 448432",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 5465794,
+            "range": "± 2314774",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 18928463,
+            "range": "± 20809324",
             "unit": "ns/iter"
           }
         ]
