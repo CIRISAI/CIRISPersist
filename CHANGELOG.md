@@ -5,6 +5,63 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.2.3] — 2026-05-02
+
+Patch release. Two doc-only / dep-hygiene fixes off CIRISBridge's
+lens-steward bootstrap finding.
+
+### CIRISPersist#8 — ML-DSA-65 signature size doc
+
+`src/federation/types.rs:166` doc said "~4396 chars for 3293-byte
+sig". The 3293 figure was round-3 era; FIPS 204 final (the version
+the live `ml-dsa = 0.1.0-rc.3` and `dilithium-py` both emit) is
+3309 bytes / 4412 base64 chars. Empirically confirmed by
+CIRISBridge's bootstrap: `length(scrub_signature_pqc) = 4412` for
+the persisted lens-steward row. Pure docstring fix; persist v0.2.x
+has no ML-DSA verifier and no schema capacity check (column type
+is `TEXT`), so no behavior change.
+
+### CIRISVerify pin: v1.8.0 → v1.8.5
+
+Hygiene bump. CIRISVerify v1.8.5 fixed the same FIPS 204 final
+size constant in `ciris-crypto/src/types.rs:86`
+(`PqcAlgorithm::MlDsa65.signature_size()`). Persist v0.2.x doesn't
+use that constant directly — we use `VerifyError`,
+`BuildPrimitive`, `ExtrasValidator`, and `register_extras_validator`
+from ciris-verify-core, plus `HardwareSigner` /
+`Ed25519SoftwareSigner` / `HardwareType` from ciris-keyring — but
+keeping the pin current means when verify subsumption lands
+(CIRISPersist#4 / task #82) we're already on the FIPS-correct line.
+
+### CIRISPersist#6 — verify_unknown_key (closed pending confirmation)
+
+The v0.1.16 universal `verify_unknown_key` issue. Resolution
+trajectory:
+
+| Version | What landed |
+|---|---|
+| v0.1.17 | `sample_public_keys` breadcrumb on the `lookup_public_key` Ok(None) path (the diagnostic CIRISBridge requested) |
+| v0.1.18 | SignatureMismatch breadcrumb + `Engine.debug_canonicalize` |
+| v0.1.19 | (lexical-core float fix attempt — superseded) |
+| v0.1.20 | `arbitrary_precision` wire-token preservation — closed CIRISPersist#7 (the underlying canonical-bytes drift the verify-mismatch path was actually surfacing) |
+
+Reading the issue body in retrospect: the v0.1.16 era was a window
+where MULTIPLE verify-mismatch paths were misclassified as
+`verify_unknown_key`. The breadcrumb (v0.1.17) gave us the
+diagnostic surface to distinguish; v0.1.18-v0.1.20 closed the
+underlying drift sources (base64 alphabet, canonical shape, float
+formatting). With v0.2.x federation directory + dual-read, the
+lookup path is fundamentally different.
+
+Will close after CIRISBridge confirms no v0.2.x reproduction. If
+they see `Ok(None) for rows that exist` in v0.2.x, the issue
+re-opens with current-version evidence.
+
+### Tests
+
+154 lib + 22 integration tests green; clippy clean across all
+features; cargo-deny clean.
+
 ## [0.2.2] — 2026-05-02
 
 Lens v0.2.x ask round 2. v0.2.1 landed `Engine.sign()` keyed to

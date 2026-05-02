@@ -163,7 +163,12 @@ pub struct KeyRecord {
     pub scrub_signature_classical: String,
     /// PQC ML-DSA-65 signature: `ML-DSA-65.sign(canonical || classical_sig)`.
     /// Bound to the classical signature to prevent stripping attacks.
-    /// Base64-encoded (~4396 chars for 3293-byte sig).
+    /// Base64-encoded (~4412 chars for 3309-byte sig — FIPS 204 final,
+    /// `c_tilde_bytes=48`; closes CIRISPersist#8). The pre-FIPS-204-final
+    /// figure of 3293 bytes was the round-3 era size; live `ml-dsa = 0.1.0-rc.3`
+    /// and CIRISVerify v1.8.5 both emit 3309. Empirically confirmed by
+    /// CIRISBridge's lens-steward bootstrap producing 4412-char base64
+    /// signatures via `dilithium-py.ML_DSA_65.sign`.
     /// `None` until the cold-path PQC sign completes via
     /// `attach_pqc_signature`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
