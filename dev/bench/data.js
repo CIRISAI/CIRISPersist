@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777742732693,
+  "lastUpdate": 1777742960241,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -4043,6 +4043,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 22601323,
             "range": "± 933346",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "bec5cd3bbcc00e48d89f7c43b23a4d5ec3656677",
+          "message": "0.2.0 — federation directory (registry-aligned, lens-cutover-ready)\n\nThe v0.2.0 milestone the registry team's v1.4 scaffolding has been\nwaiting for and the lens team's pubkey-storage cutover target.\n\nFederation directory:\n- Schema (V004 postgres + sqlite): federation_keys + _attestations\n  + _revocations. Hybrid Ed25519 + ML-DSA-65 only\n  (CHECK algorithm = 'hybrid'). Every row carries v0.1.3 scrub\n  envelope + persist_row_hash (server-computed canonical hash for\n  cache-divergence detection) + pqc_completed_at.\n- FederationDirectory trait: 8 base methods (CRUD over the three\n  tables) + 3 cold-path attach_*_pqc_signature methods. No\n  policy-bearing methods (no is_trusted, no trust_score,\n  no trust_path).\n- Backends: MemoryBackend + PostgresBackend + SqliteBackend all\n  implement the trait. Same conformance.\n- PyO3 surface: 11 Engine methods exposing the trait through to\n  Python. JSON-string payload shape for complex types (lens calls\n  json.dumps once before / json.loads once after). Errors map\n  caller-fault → ValueError, server-fault → RuntimeError.\n\nPQC strategy: hot-Ed25519 + cold-ML-DSA-65\n- Writer contract: sign Ed25519 (hot, synchronous); write the row\n  (PQC fields None); IMMEDIATELY kick off ML-DSA-65 sign on cold\n  path (no delay, no batching, just off the synchronous path);\n  call attach_*_pqc_signature once cold path completes\n- Persist tracks via pqc_completed_at; doesn't enforce timing\n  (writer contract); telemetry surfaces stale-pending rows for\n  alarm\n- Bound signature: PQC covers (canonical || classical_sig) per\n  CIRISVerify ManifestSignature + HybridSignature spec\n- When quantum threat materializes, runtime flips\n  require_pqc_on_write=true; pre-flip pending rows walk through\n  the upgrade pipeline; post-flip rows are hybrid from the start\n- Net property: every row in the historical audit chain ends up\n  hybrid-signed without ML-DSA latency in the synchronous path\n\nTrust contract: eventual consistency as a federation primitive\n(docs/FEDERATION_DIRECTORY.md). Layered eventual-consistency\ncommitments — PQC completion, replication, cache freshness, peer\nattestation, revocation propagation — each with an observability\nsignal. Consumers compose their own trust verdict (strict-hybrid /\nsoft-hybrid+freshness / pure-attestation-graph / Coherence Stake)\nusing persist's signals. Persist exposes substrate, never\nverdicts.\n\nLens cutover: install ciris-persist==0.2.0, run migrations, write\nself-signed lens-steward row, migrate accord_public_keys ->\nfederation_keys via put_public_key, validate parity via\nlookup_public_key, cut new writes to the federation surface.\nHybrid-pending rows allowed for soft-PQC; cold-path PQC fill via\nattach_key_pqc_signature.\n\nRegistry: their v1.4 scaffolding (CIRISRegistry/docs/\nFEDERATION_CLIENT.md) is unblocked. Their vendored types in\nrust-registry/src/federation/types.rs need follow-up to match the\nhybrid shape (will flag in FEDERATION_CLIENT.md after wheel is on\nPyPI).\n\n154+ tests green; clippy clean; cargo-deny clean.\n\nDeferred to v0.2.x:\n- persist-steward bootstrap V005 (pending CIRISCore keypair)\n- Helper binary update for hybrid handoff\n- Fixture JSON\n- Telemetry counter\n- Verify subsumption (CIRISPersist#4)\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-02T12:22:12-05:00",
+          "tree_id": "f745e441b9fec242661ac125d1dcd250bb3cfb10",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/bec5cd3bbcc00e48d89f7c43b23a4d5ec3656677"
+        },
+        "date": 1777742959261,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 95924,
+            "range": "± 254",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 237549,
+            "range": "± 2981",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 518291,
+            "range": "± 9316",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1844044,
+            "range": "± 21556",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 378,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1714,
+            "range": "± 45",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 9071,
+            "range": "± 40",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 354,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3021,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9063,
+            "range": "± 24",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 39709,
+            "range": "± 295",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2162360,
+            "range": "± 82589",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6340439,
+            "range": "± 160929",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 22503903,
+            "range": "± 206158",
             "unit": "ns/iter"
           }
         ]
