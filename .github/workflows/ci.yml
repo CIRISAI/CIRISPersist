@@ -315,7 +315,9 @@ jobs:
           gh release download v1.8.0 --repo CIRISAI/CIRISVerify \
             --pattern 'ciris-verify-v1.8.0-build-tool-linux-x86_64.tar.gz'
           tar -xzf ciris-verify-v1.8.0-build-tool-linux-x86_64.tar.gz
-          sudo install -m755 ciris-build-sign /usr/local/bin/ciris-build-sign
+          # Tarball layout: build-tool/{ciris-build-sign,ciris-build-verify}
+          sudo install -m755 build-tool/ciris-build-sign /usr/local/bin/ciris-build-sign
+          sudo install -m755 build-tool/ciris-build-verify /usr/local/bin/ciris-build-verify
           ciris-build-sign --version
           # Show what dynamic libs the prebuilt links against — if
           # any libtss2 symbols are needed, this catches it before
