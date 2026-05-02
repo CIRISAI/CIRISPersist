@@ -256,6 +256,76 @@ impl PyEngine {
         })
     }
 
+    /// v0.1.18 — debug helper for canonical-byte drift diagnosis
+    /// (CIRISPersist#6 follow-up). Pipes a raw HTTP body through
+    /// persist's schema parse + canonicalizer and returns BOTH
+    /// canonical shapes — sha256 + base64-encoded full bytes — for
+    /// each `CompleteTrace` in the envelope. Lets the bridge
+    /// diff persist's canonicalization against an offline
+    /// `python -c "import json, sys; ..."` reference without
+    /// needing to interpret production verify-failure logs.
+    ///
+    /// Returns a Python list (one entry per CompleteTrace event in
+    /// the body):
+    ///
+    /// ```python
+    /// [
+    ///   {
+    ///     "trace_id": "trace-...",
+    ///     "signature_key_id": "agent-...",
+    ///     "signature": "...",                  # b64-encoded as on the wire
+    ///     "canonical_9field_sha256": "abc123...",
+    ///     "canonical_9field_b64": "Cgo...",    # full canonical bytes, base64
+    ///     "canonical_9field_bytes_len": 16149,
+    ///     "canonical_2field_sha256": "def456...",
+    ///     "canonical_2field_b64": "ZGVm...",
+    ///     "canonical_2field_bytes_len": 15827,
+    ///   },
+    ///   ...
+    /// ]
+    /// ```
+    ///
+    /// **Diagnostic-only**. Production code paths should use
+    /// `receive_and_persist`; this method is a debug-print escape
+    /// hatch. Doesn't verify signatures, doesn't write to the
+    /// backend, doesn't increment any metric. Bypass-safe.
+    fn debug_canonicalize<'py>(
+        &self,
+        py: Python<'py>,
+        body: &Bound<'py, PyBytes>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyList>> {
+        use crate::schema::{BatchEnvelope, BatchEvent};
+        use crate::verify::ed25519::canonical_payload_sha256s;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine as _;
+
+        let bytes = body.as_bytes();
+        let env =
+            BatchEnvelope::from_json(bytes).map_err(|e| PyValueError::new_err(format!("{e}")))?;
+
+        let result = pyo3::types::PyList::empty(py);
+        for event in &env.events {
+            let BatchEvent::CompleteTrace { trace, .. } = event;
+            let diag = canonical_payload_sha256s(trace, &PythonJsonDumpsCanonicalizer)
+                .map_err(|e| PyRuntimeError::new_err(format!("canonicalize: {e}")))?;
+            let entry = PyDict::new(py);
+            entry.set_item("trace_id", trace.trace_id.as_str())?;
+            entry.set_item("signature_key_id", trace.signature_key_id.as_str())?;
+            entry.set_item("signature", trace.signature.as_str())?;
+            entry.set_item("canonical_9field_sha256", diag.nine_field_sha256.as_str())?;
+            entry.set_item(
+                "canonical_9field_b64",
+                BASE64.encode(&diag.nine_field_bytes),
+            )?;
+            entry.set_item("canonical_9field_bytes_len", diag.nine_field_bytes.len())?;
+            entry.set_item("canonical_2field_sha256", diag.two_field_sha256.as_str())?;
+            entry.set_item("canonical_2field_b64", BASE64.encode(&diag.two_field_bytes))?;
+            entry.set_item("canonical_2field_bytes_len", diag.two_field_bytes.len())?;
+            result.append(entry)?;
+        }
+        Ok(result)
+    }
+
     /// Register the agent's Ed25519 public key for verification.
     ///
     /// Maps the wire-level `signature_key_id` to the lens-canonical

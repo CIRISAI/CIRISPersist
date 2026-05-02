@@ -186,7 +186,7 @@ pub fn canonical_payload_value(trace: &CompleteTrace) -> serde_json::Value {
 /// without `skip_serializing_if` round-trip as `null`, empty
 /// `Vec`s round-trip as `[]`, etc. So persist must re-apply the
 /// strip before canonicalizing the legacy form.
-fn canonical_payload_value_legacy(trace: &CompleteTrace) -> serde_json::Value {
+pub(crate) fn canonical_payload_value_legacy(trace: &CompleteTrace) -> serde_json::Value {
     let components: Vec<serde_json::Value> = trace
         .components
         .iter()
@@ -244,6 +244,53 @@ fn is_empty(v: &serde_json::Value) -> bool {
         // `0` are valid signed values.
         _ => false,
     }
+}
+
+/// v0.1.18 — produce the canonical-bytes diagnostic for the
+/// `SignatureMismatch` breadcrumb (CIRISPersist#6 follow-up).
+/// Returns `(nine_field_sha256_hex, two_field_sha256_hex,
+/// nine_field_bytes, two_field_bytes)` so the caller can both log
+/// hashes and (optionally) base64-expose the full bytes for an
+/// out-of-band diff against the reference Python
+/// `json.dumps(canonical, sort_keys=True, separators=(",",":"))`.
+///
+/// Re-canonicalizes both shapes; cheap (microseconds). Only called
+/// on the `SignatureMismatch` slow path. The Sha256 + hex_encode
+/// are constant-time wrt the input data; logged sha256s leak no
+/// signature material.
+pub(crate) fn canonical_payload_sha256s<C>(
+    trace: &CompleteTrace,
+    canonicalizer: &C,
+) -> Result<CanonicalDiagnostic, super::Error>
+where
+    C: super::canonical::Canonicalizer + ?Sized,
+{
+    use sha2::{Digest, Sha256};
+    let nine_field = canonical_payload_value(trace);
+    let nine_bytes = canonicalizer.canonicalize_value(&nine_field)?;
+    let two_field = canonical_payload_value_legacy(trace);
+    let two_bytes = canonicalizer.canonicalize_value(&two_field)?;
+    Ok(CanonicalDiagnostic {
+        nine_field_sha256: hex::encode(Sha256::digest(&nine_bytes)),
+        two_field_sha256: hex::encode(Sha256::digest(&two_bytes)),
+        nine_field_bytes: nine_bytes,
+        two_field_bytes: two_bytes,
+    })
+}
+
+/// Diagnostic carrier for v0.1.18 breadcrumbs +
+/// `Engine.debug_canonicalize`. See [`canonical_payload_sha256s`].
+pub(crate) struct CanonicalDiagnostic {
+    /// Hex sha256 of the spec 9-field canonical form.
+    pub(crate) nine_field_sha256: String,
+    /// Hex sha256 of the legacy 2-field canonical form.
+    pub(crate) two_field_sha256: String,
+    /// Raw 9-field canonical bytes (for `Engine.debug_canonicalize`
+    /// to base64-expose). Not logged.
+    pub(crate) nine_field_bytes: Vec<u8>,
+    /// Raw 2-field canonical bytes (for `Engine.debug_canonicalize`
+    /// to base64-expose). Not logged.
+    pub(crate) two_field_bytes: Vec<u8>,
 }
 
 /// Verify a `CompleteTrace`'s signature against the canonical bytes

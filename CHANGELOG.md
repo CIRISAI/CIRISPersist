@@ -5,6 +5,104 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.1.18] — 2026-05-02
+
+Diagnostic round 2 for [`CIRISPersist#6`](https://github.com/CIRISAI/CIRISPersist/issues/6) — extending v0.1.17's
+unknown-key breadcrumb onto the `SignatureMismatch` path so the
+bridge can pinpoint canonical-byte drift without source-level
+instrumentation. Plus an optional `Engine.debug_canonicalize()`
+PyO3 method for offline diff against a Python reference.
+
+### What's new
+
+- **`tracing::warn!` breadcrumb on the `SignatureMismatch` branch**
+  in `IngestPipeline::verify_complete_trace`. Fires after
+  `verify_trace` has tried both 9-field (spec) and 2-field
+  (legacy) canonicals and neither verified. Surfaces:
+
+  ```
+  envelope_signer_id           agent-…
+  wire_body_sha256             …                ← joins lens-side body_sha256_prefix
+  canonical_9field_sha256      …                ← persist's 9-field canonical bytes
+  canonical_2field_sha256      …                ← persist's 2-field canonical bytes
+  canonical_9field_bytes_len   N
+  canonical_2field_bytes_len   M
+  signature_b64_prefix         first 16 chars   ← cross-check on which sig
+  ```
+
+  Three diagnostic outcomes the bridge can resolve offline:
+
+  | Bridge's offline `json.dumps(canonical, sort_keys=True, separators=(",",":")).hash()` matches | Diagnosis | Fix |
+  |---|---|---|
+  | `canonical_9field_sha256` | Persist's 9-field canonicalizer is byte-correct; agent signed 2-field | Check why 2-field fallback didn't match — agent's `strip_empty` differs |
+  | `canonical_2field_sha256` | Persist's 2-field canonicalizer is byte-correct; agent signed 9-field but persist's 9-field has subtle drift | Persist 9-field bytes diverge from spec |
+  | Neither | Agent signs over a third shape we haven't enumerated | Agent-side investigation |
+
+- **`Engine.debug_canonicalize(body: bytes) -> list[dict]`** — new
+  PyO3 method. Runs body through schema parse + canonicalizer,
+  returns BOTH canonical shapes (sha256 + base64-encoded full
+  bytes + length) for each `CompleteTrace` in the body. Lets the
+  bridge pipe any captured wire body through persist's
+  canonicalizer offline:
+
+  ```python
+  result = engine.debug_canonicalize(body_bytes)
+  # [
+  #   {
+  #     "trace_id": "trace-...",
+  #     "signature_key_id": "agent-...",
+  #     "signature": "<wire b64>",
+  #     "canonical_9field_sha256": "...",
+  #     "canonical_9field_b64": "...",       # full bytes, b64
+  #     "canonical_9field_bytes_len": 16149,
+  #     "canonical_2field_sha256": "...",
+  #     "canonical_2field_b64": "...",
+  #     "canonical_2field_bytes_len": 15827,
+  #   }
+  # ]
+  ```
+
+  Diagnostic-only. Doesn't verify, doesn't write, doesn't
+  increment metrics. Future-proof for any future schema-version
+  / canonicalization tweaks.
+
+- **`pub(crate)` exposure of `canonical_payload_value_legacy`** so
+  the breadcrumb + `debug_canonicalize` can re-canonicalize on
+  the slow path without duplicating code.
+
+- **`canonical_payload_sha256s(trace, canonicalizer)` helper** in
+  `verify::ed25519` returning a `CanonicalDiagnostic` carrier
+  (sha256s + raw bytes for both shapes). Used by both the
+  breadcrumb and `debug_canonicalize`.
+
+### Implementation notes
+
+- v0.1.18 also adds **`wire_body_sha256`** to v0.1.17's
+  `verify_unknown_key` breadcrumb so unknown-key + signature-
+  mismatch logs share the same correlation field with the
+  lens's POST-receipt log.
+- Diagnostic computation is best-effort. If canonicalization
+  itself fails (which can't happen if `verify_trace` just
+  exercised the same code path and bubbled `SignatureMismatch`),
+  the warn fires with `None` for the canonical fields and the
+  typed error returns normally.
+- Zero hot-path cost on happy-path verifies. Both breadcrumbs
+  fire only in the slow paths (`Ok(None)` lookup or
+  `SignatureMismatch`).
+
+### Tests
+
+138 tests green (116 lib + 5 AV-4 + 8 QA + 9 fixture); clippy
+clean. No new test for the breadcrumb itself — its effect is
+observable only against a real production rejection capture.
+
+### What this doesn't fix yet
+
+The actual canonical-bytes drift. v0.1.18 is purely diagnostic.
+Once bridge captures the SignatureMismatch warn against a flag-
+on run, the next patch closes whichever of the three diagnostic
+outcomes lands.
+
 ## [0.1.17] — 2026-05-02
 
 Diagnostic breadcrumb for [`CIRISPersist#6`](https://github.com/CIRISAI/CIRISPersist/issues/6) —

@@ -177,6 +177,14 @@ where
     /// agent-shipped bytes; scrub mutates after), decompose fourth,
     /// store last.
     pub async fn receive_and_persist(&self, bytes: &[u8]) -> Result<BatchSummary, IngestError> {
+        // v0.1.18 — wire-body sha256 for the SignatureMismatch
+        // breadcrumb, computed once per call so the lens-side
+        // body_sha256_prefix in their POST-receipt log joins
+        // persist's verify-failure log on the same hex prefix.
+        // Cheap (microseconds for a typical batch); only used in
+        // the diagnostic warn, not the hot verify path.
+        let body_sha256 = hex::encode(sha2::Sha256::digest(bytes));
+
         // 1. Schema parse — typed envelope. Schema-version gate fires
         //    here.
         let mut env = BatchEnvelope::from_json(bytes)?;
@@ -188,7 +196,7 @@ where
         for event in &env.events {
             match event {
                 BatchEvent::CompleteTrace { trace, .. } => {
-                    self.verify_complete_trace(trace).await?;
+                    self.verify_complete_trace(trace, &body_sha256).await?;
                     signatures_verified += 1;
                 }
             }
@@ -329,7 +337,11 @@ where
         Ok(envelopes)
     }
 
-    async fn verify_complete_trace(&self, trace: &CompleteTrace) -> Result<(), IngestError> {
+    async fn verify_complete_trace(
+        &self,
+        trace: &CompleteTrace,
+        body_sha256: &str,
+    ) -> Result<(), IngestError> {
         let key_id = &trace.signature_key_id;
         let lookup = self
             .backend
@@ -343,27 +355,13 @@ where
                 // v0.1.17 — verify-unknown-key breadcrumb
                 // (CIRISPersist#6). When the backend reports
                 // `Ok(None)` for a key the agent claims to have
-                // signed under, surface lookup-time observables to
-                // diagnose without source-level instrumentation:
-                //
-                // - `envelope_signer_id`: what the agent sent
-                // - `looked_up_id_bytes_hex`: the same value as
-                //   raw bytes (catches invisible-char drift)
-                // - `accord_public_keys_size`: total valid rows the
-                //   backend can see at this moment
-                // - `accord_public_keys_sample`: first N key_ids by
-                //   stable order, lets bridge correlate against the
-                //   external SELECT
-                //
-                // The sample query is best-effort; if it fails (e.g.
-                // backend transient), we still emit the warn with
-                // None for the diagnostic fields and return the
-                // typed UnknownKey error.
+                // signed under, surface lookup-time observables.
                 let sample = self.backend.sample_public_keys(5).await.ok();
                 tracing::warn!(
                     envelope_signer_id = %key_id,
                     looked_up_id_bytes_hex = %hex::encode(key_id.as_bytes()),
                     looked_up_id_byte_len = key_id.len(),
+                    wire_body_sha256 = %body_sha256,
                     accord_public_keys_size = ?sample.as_ref().map(|s| s.size),
                     accord_public_keys_sample = ?sample.as_ref().map(|s| &s.sample),
                     "ciris-persist: verify_unknown_key — lookup miss"
@@ -371,8 +369,46 @@ where
                 return Err(IngestError::Verify(VerifyError::UnknownKey(key_id.clone())));
             }
         };
-        verify_trace(trace, self.canonicalizer, &key)?;
-        Ok(())
+
+        // v0.1.18 — verify_signature_mismatch breadcrumb. Mirrors
+        // the v0.1.17 unknown-key breadcrumb on the canonicalization-
+        // failure branch. Both 9-field spec AND 2-field legacy were
+        // tried in `verify_trace` and neither verified. Surfaces:
+        //
+        // - wire_body_sha256: joins lens-side body_sha256_prefix
+        // - canonical_9field_sha256 / canonical_2field_sha256: hex
+        //   sha256 of each canonical-bytes shape persist computed
+        // - canonical_*_bytes_len: length, easy eyeball
+        // - signature_b64_prefix: first 16 chars of the agent's
+        //   signature for cross-correlation against capture logs
+        //
+        // The diagnostic computation is best-effort. If
+        // canonicalization itself fails (which is essentially
+        // impossible — same code path verify_trace just exercised
+        // and bubbled SignatureMismatch from), we still emit the
+        // warn with `None` for the canonical fields and return
+        // the typed SignatureMismatch error.
+        match verify_trace(trace, self.canonicalizer, &key) {
+            Ok(()) => Ok(()),
+            Err(VerifyError::SignatureMismatch) => {
+                let diag =
+                    crate::verify::ed25519::canonical_payload_sha256s(trace, self.canonicalizer)
+                        .ok();
+                let sig_b64_prefix: String = trace.signature.chars().take(16).collect();
+                tracing::warn!(
+                    envelope_signer_id = %key_id,
+                    wire_body_sha256 = %body_sha256,
+                    canonical_9field_sha256 = ?diag.as_ref().map(|d| &d.nine_field_sha256),
+                    canonical_2field_sha256 = ?diag.as_ref().map(|d| &d.two_field_sha256),
+                    canonical_9field_bytes_len = ?diag.as_ref().map(|d| d.nine_field_bytes.len()),
+                    canonical_2field_bytes_len = ?diag.as_ref().map(|d| d.two_field_bytes.len()),
+                    signature_b64_prefix = %sig_b64_prefix,
+                    "ciris-persist: verify_signature_mismatch — both canonical forms tried, neither verified"
+                );
+                Err(IngestError::Verify(VerifyError::SignatureMismatch))
+            }
+            Err(other) => Err(IngestError::Verify(other)),
+        }
     }
 }
 
