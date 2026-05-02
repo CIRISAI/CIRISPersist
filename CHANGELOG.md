@@ -5,6 +5,137 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.2.2] — 2026-05-02
+
+Lens v0.2.x ask round 2. v0.2.1 landed `Engine.sign()` keyed to
+the scrub-envelope identity (`signing_key_id`, P-256 via
+ciris-keyring). Bridge correctly identified that `lens-scrub-v1 ≠
+lens-steward` — the steward identity is Ed25519, separate keypair
+generated externally (by bridge). v0.2.2 adds the steward signing
+surface as a separate FFI-boundary-clean primitive.
+
+### What ships
+
+**Constructor params** (both optional, both-or-neither):
+
+```python
+engine = Engine(
+    dsn=...,
+    signing_key_id="lens-scrub-v1",          # P-256 — scrub envelopes (existing)
+    scrubber=...,
+    steward_key_id="lens-steward",            # NEW — Ed25519 federation steward
+    steward_key_path="/etc/ciris/lens-steward.seed",  # 32-byte raw seed file
+)
+```
+
+The lens-steward keypair is generated externally (CIRIS bridge in
+the lens deployment story); the 32-byte raw Ed25519 seed lives at
+`steward_key_path` (chmod 600 expected). Persist reads the seed at
+constructor time and holds the `SigningKey` privately. The lens
+process never sees the seed bytes after construction.
+
+**Three new methods** on `Engine`:
+
+```python
+engine.steward_public_key_b64() -> str   # 44-char Ed25519 pubkey base64
+engine.steward_key_id() -> str           # the configured "lens-steward" identifier
+engine.steward_sign(message: bytes) -> bytes   # 64-byte raw Ed25519 signature
+```
+
+Same FFI-boundary discipline as v0.2.1's `Engine.sign()`: bytes
+in, bytes out, no key material crossing the boundary. All three
+raise `ValueError` if the Engine wasn't constructed with both
+`steward_key_id` and `steward_key_path`.
+
+### Why a second identity, not just one signing key
+
+Two roles, two algorithm requirements:
+
+| Role | Identity | Algorithm | Used for |
+|---|---|---|---|
+| Scrub envelope | `signing_key_id` (e.g. `lens-scrub-v1`) | P-256 via ciris-keyring (hardware-backed where available) | Per-row scrub_signature on `trace_events`, AV-24 cryptographic provenance |
+| Federation steward | `steward_key_id` (e.g. `lens-steward`) | Ed25519 (file-backed seed) | `federation_keys` rows the lens publishes — schema requires Ed25519 |
+
+The federation_keys schema is Ed25519+ML-DSA-65 hybrid. The
+existing scrub-signing identity is P-256 — wrong shape for
+federation. Conflating them ("one key, three roles") was the
+v0.2.1 framing error. v0.2.2 separates them explicitly.
+
+The cold-path ML-DSA-65 sign for federation rows still happens
+externally (lens runs ML-DSA-65 sign over `(canonical ||
+classical_sig)` via its own pipeline) and lands via
+`attach_key_pqc_signature()`. v0.2.2 covers the hot Ed25519 path;
+ML-DSA-65 cold path may land as a steward_pqc_sign() in v0.2.x if
+operationally justified.
+
+### Lens cutover flow (end-to-end with v0.2.2)
+
+```python
+import json
+import os
+
+engine = Engine(
+    dsn=DSN,
+    signing_key_id="lens-scrub-v1",
+    scrubber=lens_scrubber,
+    steward_key_id="lens-steward",
+    steward_key_path=os.environ["CIRISLENS_STEWARD_KEY_PATH"],
+)
+
+# Bootstrap: bridge ran the offline bootstrap script once,
+# inserting the lens-steward self-signed federation_keys row.
+# Verify it's there:
+assert engine.lookup_public_key("lens-steward") is not None
+
+# Per-agent register_public_key handler (the lens fleet hot path):
+def register_public_key_federation_mirror(agent_key_id, agent_pubkey_b64):
+    envelope = {
+        "key_id": agent_key_id,
+        "identity_type": "agent",
+        "identity_ref": agent_key_id,
+        # ... whatever the lens normally records about an agent key
+    }
+    canonical = engine.canonicalize_envelope(json.dumps(envelope))
+    classical_sig = engine.steward_sign(canonical)
+    record = {
+        "key_id": agent_key_id,
+        "pubkey_ed25519_base64": agent_pubkey_b64,
+        "pubkey_ml_dsa_65_base64": None,  # cold-path attaches later
+        "algorithm": "hybrid",
+        "identity_type": "agent",
+        "identity_ref": agent_key_id,
+        "valid_from": now_iso(),
+        "valid_until": None,
+        "registration_envelope": envelope,
+        "original_content_hash": sha256_hex(canonical),
+        "scrub_signature_classical": base64.b64encode(classical_sig).decode(),
+        "scrub_signature_pqc": None,
+        "scrub_key_id": engine.steward_key_id(),  # "lens-steward"
+        "scrub_timestamp": now_iso(),
+        "pqc_completed_at": None,
+        "persist_row_hash": "",  # server-computed
+    }
+    engine.put_public_key(json.dumps({"record": record}))
+    # Cold path (lens's own pipeline) runs ML-DSA-65 sign over
+    # canonical || classical_sig and calls
+    # engine.attach_key_pqc_signature(...) when it lands.
+```
+
+### Tests + features
+
+154 lib + 22 integration tests green; clippy clean across
+`postgres,sqlite,server,pyo3,tls`; cargo-deny clean. The v0.2.2
+adds are PyO3-surface only — no schema changes, no Backend trait
+changes, fully backwards-compatible (unchanged behavior when
+`steward_key_id`/`steward_key_path` are unset).
+
+### Lens action
+
+`pip install --upgrade ciris-persist==0.2.2`. Update the Engine
+constructor call to pass the two new optional params; the rest of
+the v0.2.1 surface stays as-is. Full federation cutover flow now
+end-to-end without the lens-steward seed crossing the FFI.
+
 ## [0.2.1] — 2026-05-02
 
 Lens-team v0.2.x asks. Three small additions completing the

@@ -48,6 +48,30 @@ pub struct PyEngine {
     scrubber: Arc<dyn Scrubber>,
     signer: Arc<dyn HardwareSigner>,
     signer_key_id: String,
+    /// v0.2.2 — Federation steward Ed25519 signing key.
+    ///
+    /// Distinct from `signer` (which is the scrub-envelope identity,
+    /// `signing_key_id` — typically P-256 via ciris-keyring) — the
+    /// steward identity is Ed25519 (matching the federation_keys
+    /// schema) and used to sign federation envelopes for keys/
+    /// attestations/revocations the lens publishes to persist's
+    /// federation directory.
+    ///
+    /// Loaded from a 32-byte raw seed file at constructor time when
+    /// both `steward_key_id` and `steward_key_path` are provided.
+    /// `None` when the federation steward role isn't configured for
+    /// this Engine instance — the `steward_*` methods return
+    /// ValueError in that case.
+    ///
+    /// Lens process never sees the seed bytes after construction;
+    /// signing happens via `steward_sign(message)` which returns the
+    /// 64-byte raw signature, matching the FFI-boundary discipline of
+    /// `Engine.sign()`.
+    steward_signing_key: Option<ed25519_dalek::SigningKey>,
+    /// Identifier for the steward identity. Used as the `key_id` of
+    /// the lens-steward `federation_keys` row and as the `scrub_key_id`
+    /// for federation rows the lens publishes.
+    steward_key_id: Option<String>,
 }
 
 #[pymethods]
@@ -69,15 +93,32 @@ impl PyEngine {
     /// also the deployment's Reticulum destination address (when
     /// Phase 2.3 lands) and the registry-published public key.
     ///
+    /// **v0.2.2** — optional `steward_key_id` + `steward_key_path`
+    /// configure a SECOND identity for federation-directory signing
+    /// (`engine.steward_sign()`, `engine.steward_public_key_b64()`).
+    /// This identity is Ed25519 (matching the federation_keys schema),
+    /// distinct from `signing_key_id` (which is the scrub-envelope
+    /// identity, typically P-256 via ciris-keyring). The lens-steward
+    /// keypair is generated externally (e.g., by CIRIS bridge); the
+    /// 32-byte raw Ed25519 seed is stored in `steward_key_path`. The
+    /// lens process never touches the seed bytes after construction —
+    /// signing happens via `steward_sign(message)`.
+    ///
     /// Raises `RuntimeError` if Postgres is unreachable, migrations
-    /// fail, or the keyring is inaccessible.
+    /// fail, or the keyring is inaccessible. Raises `ValueError` if
+    /// only one of `steward_key_id`/`steward_key_path` is provided
+    /// (must be both-or-neither), or if the steward seed file is
+    /// missing/wrong-size.
     #[new]
-    #[pyo3(signature = (dsn, signing_key_id, scrubber=None))]
+    #[pyo3(signature = (dsn, signing_key_id, scrubber=None,
+                        steward_key_id=None, steward_key_path=None))]
     fn new(
         py: Python<'_>,
         dsn: &str,
         signing_key_id: &str,
         scrubber: Option<Py<PyAny>>,
+        steward_key_id: Option<String>,
+        steward_key_path: Option<String>,
     ) -> PyResult<Self> {
         // Build a multi-thread runtime once per Engine instance.
         let runtime =
@@ -184,12 +225,53 @@ impl PyEngine {
             }),
         };
 
+        // v0.2.2 — optional steward identity for federation-directory
+        // signing. Both-or-neither: passing one without the other is
+        // a config error. When configured, load the 32-byte raw
+        // Ed25519 seed from `steward_key_path` (chmod 600 expected;
+        // OS handles the permission check on read).
+        let (steward_key_id_owned, steward_signing_key) = match (steward_key_id, steward_key_path) {
+            (None, None) => (None, None),
+            (Some(id), Some(path)) => {
+                let seed = std::fs::read(&path).map_err(|e| {
+                    PyRuntimeError::new_err(format!("steward seed read ({path}): {e}"))
+                })?;
+                if seed.len() != 32 {
+                    return Err(PyValueError::new_err(format!(
+                        "steward seed wrong length: got {} bytes from {path}, \
+                             expected 32 raw Ed25519 bytes",
+                        seed.len()
+                    )));
+                }
+                let arr: [u8; 32] = seed.as_slice().try_into().expect("length-checked");
+                let signing = ed25519_dalek::SigningKey::from_bytes(&arr);
+                tracing::info!(
+                    steward_key_id = id.as_str(),
+                    steward_pubkey_b64 = %{
+                        use base64::engine::general_purpose::STANDARD as B64;
+                        use base64::Engine as _;
+                        B64.encode(signing.verifying_key().to_bytes())
+                    },
+                    "ciris-persist: steward identity loaded"
+                );
+                (Some(id), Some(signing))
+            }
+            _ => {
+                return Err(PyValueError::new_err(
+                    "steward_key_id and steward_key_path must both be provided \
+                         or both omitted",
+                ));
+            }
+        };
+
         Ok(PyEngine {
             backend,
             runtime,
             scrubber,
             signer,
             signer_key_id: signing_key_id.to_owned(),
+            steward_signing_key,
+            steward_key_id: steward_key_id_owned,
         })
     }
 
@@ -320,6 +402,72 @@ impl PyEngine {
         )
         .map_err(|e| PyRuntimeError::new_err(format!("canonicalize: {e}")))?;
         Ok(PyBytes::new(py, &bytes).unbind())
+    }
+
+    /// v0.2.2 — Return the steward Ed25519 public key (base64) for
+    /// publishing to consumers (registry pinning, lens-steward
+    /// fingerprint, federation_keys.pubkey_ed25519_base64). Distinct
+    /// from `public_key_b64()` (which returns the scrub-envelope
+    /// identity's pubkey).
+    ///
+    /// Raises `ValueError` if the Engine wasn't constructed with
+    /// `steward_key_id` + `steward_key_path` (the federation steward
+    /// role isn't configured).
+    fn steward_public_key_b64(&self, _py: Python<'_>) -> PyResult<String> {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        let key = self.steward_signing_key.as_ref().ok_or_else(|| {
+            PyValueError::new_err(
+                "no steward key configured (pass steward_key_id + steward_key_path \
+                 to the Engine constructor)",
+            )
+        })?;
+        Ok(B64.encode(key.verifying_key().to_bytes()))
+    }
+
+    /// v0.2.2 — Return the configured `steward_key_id` (the lens-
+    /// steward identifier — used as `key_id` in the lens-steward
+    /// federation_keys row, and as `scrub_key_id` for federation
+    /// rows the lens publishes).
+    ///
+    /// Raises `ValueError` if no steward identity is configured.
+    fn steward_key_id(&self, _py: Python<'_>) -> PyResult<String> {
+        self.steward_key_id.clone().ok_or_else(|| {
+            PyValueError::new_err(
+                "no steward key configured (pass steward_key_id + steward_key_path \
+                 to the Engine constructor)",
+            )
+        })
+    }
+
+    /// v0.2.2 — Sign arbitrary bytes with the steward Ed25519 signing
+    /// key. Returns the 64-byte raw signature.
+    ///
+    /// Same FFI-boundary discipline as `Engine.sign()`: bytes in,
+    /// bytes out, no key material crossing the boundary. The lens
+    /// process never sees the seed.
+    ///
+    /// **Hot-path Ed25519 only.** The cold-path ML-DSA-65 sign
+    /// happens elsewhere — lens runs ML-DSA-65 sign over
+    /// `(canonical || classical_sig)` via its own pipeline and
+    /// fills in via `attach_key_pqc_signature()` per the writer
+    /// contract (`docs/FEDERATION_DIRECTORY.md` §"Trust contract").
+    ///
+    /// Raises `ValueError` if no steward key is configured.
+    fn steward_sign<'py>(
+        &self,
+        py: Python<'py>,
+        message: &Bound<'py, PyBytes>,
+    ) -> PyResult<Py<PyBytes>> {
+        use ed25519_dalek::Signer;
+        let key = self.steward_signing_key.as_ref().ok_or_else(|| {
+            PyValueError::new_err(
+                "no steward key configured (pass steward_key_id + steward_key_path \
+                 to the Engine constructor)",
+            )
+        })?;
+        let sig = key.sign(message.as_bytes());
+        Ok(PyBytes::new(py, &sig.to_bytes()).unbind())
     }
 
     /// v0.1.18 — debug helper for canonical-byte drift diagnosis
