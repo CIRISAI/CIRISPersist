@@ -45,29 +45,15 @@ jobs:
       - name: cargo test (default — fixture suite)
         run: cargo test --test wire_format_fixtures
 
-  # Mission category §4 "Backend parity": cross-compile to arm64 to
-  # catch arch-specific issues before they hit Pi-class deployments
-  # (PLATFORM_ARCHITECTURE.md §3.3).
-  linux-aarch64-build:
-    name: linux-aarch64 (cross-compile)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@v2
-      - name: install cross-compile toolchain
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
-      - name: cargo build (postgres + server)
-        # openssl is built from source via the `vendored` feature
-        # (declared as a direct dep in Cargo.toml), so no system
-        # libssl-dev:arm64 is needed. The `cc` build-script picks up
-        # the aarch64 cross-compiler from CARGO_TARGET_*_LINKER.
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-        run: cargo build --target aarch64-unknown-linux-gnu --features "postgres server"
+  # NOTE: the prior `linux-aarch64-build` cross-compile job was removed
+  # in v0.1.15. Its purpose ("prove the crate cross-compiles to arm64
+  # from an x86_64 host") is fully subsumed by the native arm64 wheel
+  # build on `ubuntu-24.04-arm` (see `pyo3-wheel` matrix), which has
+  # been GA + free for public repos since 2025-01. The cross-compile
+  # job had become pure churn — it required a fragile apt install of
+  # gcc-aarch64-linux-gnu (Azure mirror flakiness) without producing a
+  # consumable artifact.
+
 
   # Mission alignment: macOS dev path (PLATFORM_ARCHITECTURE.md §1).
   darwin-aarch64-test:
