@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777745829872,
+  "lastUpdate": 1777746908543,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -4271,6 +4271,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 22162300,
             "range": "± 531696",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "dd7107841c672dd7403308c04efa777e9de2e88c",
+          "message": "0.2.2 — steward_sign separate keyring identity\n\nLens v0.2.x round 2. v0.2.1's Engine.sign() is keyed to the\nscrub-envelope identity (signing_key_id, P-256 via ciris-keyring)\n— wrong key for the federation_keys schema (Ed25519). The\nlens-steward keypair is a separate Ed25519 keypair generated\nexternally (CIRIS bridge in the lens deployment story). v0.2.2\nadds the steward signing surface as a distinct FFI-boundary-clean\nprimitive.\n\nPyEngine constructor:\n- steward_key_id: Optional[str] — federation steward identifier\n- steward_key_path: Optional[str] — file path holding 32-byte raw\n  Ed25519 seed\nBoth-or-neither; mismatch raises ValueError. When configured, the\nseed is loaded at constructor time and held as\ned25519_dalek::SigningKey privately. Lens process never sees the\nseed bytes after construction.\n\nThree new methods:\n- steward_public_key_b64() -> str (44-char Ed25519 pubkey base64)\n- steward_key_id() -> str (the configured identifier)\n- steward_sign(message: bytes) -> bytes (64-byte raw Ed25519 sig)\n\nAll three raise ValueError if no steward identity configured.\nSame FFI-boundary discipline as Engine.sign(): bytes in, bytes\nout, no key material crossing.\n\nCold-path ML-DSA-65 sign deferred — lens runs it via its own\npipeline and lands via attach_key_pqc_signature().\n\n154 lib + 22 integration tests green; clippy clean; cargo-deny\nclean. PyO3-surface only — no schema changes, fully backwards\ncompatible (unchanged behavior when steward params unset).\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-02T13:28:48-05:00",
+          "tree_id": "6a5c23c8670828560ae43c8784701d8553913645",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/dd7107841c672dd7403308c04efa777e9de2e88c"
+        },
+        "date": 1777746908047,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 90502,
+            "range": "± 5392",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 233831,
+            "range": "± 594",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 516251,
+            "range": "± 1373",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1920517,
+            "range": "± 20019",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 330,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1271,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7724,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 303,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3063,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9589,
+            "range": "± 28",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 43442,
+            "range": "± 549",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 537,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 1893424,
+            "range": "± 22390",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 5863860,
+            "range": "± 30853",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 21352833,
+            "range": "± 95393",
             "unit": "ns/iter"
           }
         ]
