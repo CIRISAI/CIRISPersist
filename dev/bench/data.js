@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777695164218,
+  "lastUpdate": 1777696607704,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -2561,6 +2561,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 19059878,
             "range": "± 1328002",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "755c240f7499d60922165e9d9383e25788754c2f",
+          "message": "0.1.19 — Python-compat float formatter (P0 production fix #3)\n\nCloses CIRISPersist#7. Bridge's v0.1.18 capture pinned canonical-\nbytes drift to float formatting: Rust's ryu (via serde_json) and\nPython's float.__repr__ (Gay's dtoa) disagree on shortest-round-\ntrip output for ambiguous doubles. Universal verify_signature_\nmismatch root cause across all YO-locale traffic.\n\nConcrete divergence:\n- ryu:    0.003199200000000001    Python: 0.0031992000000000006\n- ryu:    1433.2029819488523       Python: 1433.2029819488525\n\nBoth valid; both shortest-round-trip; tie-break differs.\n\nFix: route Value::Number through write_python_float in\nsrc/verify/canonical.rs:\n- lexical-core PYTHON_LITERAL format\n- negative_exponent_break(-4) + positive_exponent_break(15)\n  match Python's [1e-4, 1e16) decimal range\n- Post-process scientific output:\n  - Strip .0 from 1.0eN → 1eN\n  - Add + sign for non-negative exponents → 1e+16\n  - Pad single-digit exponent magnitude → 1e-05, 1.5e-06\n- Integer fast-path preserved (i64/u64 → bare digits, no .0)\n\n4 new unit tests:\n- bridge_captured_divergent_floats_match_python (exact YO floats)\n- production_range_floats_match_python_repr (22 cases)\n- integers_render_bare_no_decimal_point\n- llm_call_data_blob_matches_python (end-to-end dict shape)\n\nThree independent layers now cover verify-mismatch on real agent\ntraffic:\n- v0.1.8  timestamp drift           WireDateTime\n- v0.1.15 base64 alphabet           decode_signature\n- v0.1.16 canonical-shape           try-both 9/2-field\n- v0.1.19 float formatting          write_python_float ← THIS\n\nThe v0.1.16 try-both fallback now works as designed: both 9-field\nand 2-field byte-match the agent because float bytes finally\nmatch.\n\nKnown limit: rare shortest-round-trip ties beyond threshold +\npost-process can still diverge. 22 production-range tests pass;\nif bridge surfaces a new edge case, v0.1.x ships a vendored\nGay's-dtoa port. Tracked v0.2.x.\n\nNew dep: lexical-core 1.0.6 (format + write-floats features).\n142 tests green; clippy clean; cargo-deny clean.\n\nLens action: pip install --upgrade ciris-persist==0.1.19. Bridge\nflag-on capture should finally show signatures_verified ==\nenvelopes_processed.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-01T23:30:48-05:00",
+          "tree_id": "825ce482ad8fccb49c1736bce453fdcca4b5c066",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/755c240f7499d60922165e9d9383e25788754c2f"
+        },
+        "date": 1777696607367,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 94745,
+            "range": "± 2018",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 234328,
+            "range": "± 6312",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 506035,
+            "range": "± 7722",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1799176,
+            "range": "± 42741",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 453,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1661,
+            "range": "± 49",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8903,
+            "range": "± 47",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 312,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 2536,
+            "range": "± 34",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 7702,
+            "range": "± 40",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 35043,
+            "range": "± 312",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 621,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2110446,
+            "range": "± 58340",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6177223,
+            "range": "± 99385",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 22064946,
+            "range": "± 247822",
             "unit": "ns/iter"
           }
         ]
