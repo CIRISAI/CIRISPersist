@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "0.1.19"
+version = "0.1.20"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS Trinity — signed events, time-series, runtime state."
@@ -51,16 +51,6 @@ tls = ["dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-native-certs"]
 ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v1.8.0", version = "1.8" }
 ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v1.8.0", version = "1.8" }
 async-trait   = "0.1"
-# v0.1.19 — Python-compatible float formatter for the canonicalizer
-# (CIRISPersist#7). Rust's ryu (via serde_json's Display impl on
-# Number) and Python's float.__repr__ (Gay's dtoa) disagree on
-# shortest-round-trip output for ambiguous doubles, breaking
-# byte-equality with the agent's signed canonical bytes. lexical-core
-# with PYTHON_LITERAL format + threshold-tuned WriteFloatOptions +
-# our scientific-form post-process matches Python's repr byte-for-
-# byte for the floats production traffic actually emits (and most
-# edge cases).
-lexical-core  = { version = "1", features = ["format", "write-floats"] }
 # v0.1.14 — filesystem advisory locks for the cohabitation
 # bootstrap (docs/COHABITATION.md). POSIX flock cross-process,
 # auto-releases on FD close (including panic). Used to serialize
@@ -69,7 +59,20 @@ lexical-core  = { version = "1", features = ["format", "write-floats"] }
 # to 0.x because the API is stable but pre-1.0.
 fs4           = "0.13"
 serde         = { version = "1", features = ["derive"] }
-serde_json    = "1"
+# v0.1.20 — `arbitrary_precision` preserves the agent's wire number
+# tokens verbatim through deserialize → serialize. Closes
+# CIRISPersist#7 by NOT re-formatting floats: the agent emitted
+# `0.0031992000000000006` (CPython `Py_dg_dtoa`'s pick); v0.1.19
+# tried to reproduce that by routing f64 through lexical-core and
+# missed because lexical-core (and ryu, and most "shortest round-
+# trip" libraries) emit `0.003199200000000001` for that double — the
+# original token is not recoverable from a Rust f64. arbitrary_
+# precision stores Number as the original parsed string, so re-
+# emission is byte-equal to the wire input. Trade-off: feature
+# unifies across the dep tree (any crate touching serde_json sees
+# string-backed Number internally). Externally observable behavior
+# is unchanged for code using stable APIs (Number::as_f64 etc.).
+serde_json    = { version = "1", features = ["arbitrary_precision"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 sha2          = "0.10"
 chrono        = { version = "0.4", features = ["serde"] }

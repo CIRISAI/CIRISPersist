@@ -18,7 +18,7 @@
 //! json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
 //! ```
 //!
-//! That **is not RFC 8785 JCS.** Two divergences (FSD/CRATE_RECOMMENDATIONS
+//! That **is not RFC 8785 JCS.** Three divergences (FSD/CRATE_RECOMMENDATIONS
 //! §5.1):
 //!
 //! 1. Python's `json.dumps` defaults to `ensure_ascii=True` —
@@ -26,10 +26,34 @@
 //!    points become UTF-16 surrogate pairs `\uXXXX\uYYYY`.
 //! 2. Python `sort_keys` orders keys by Python str ordering (Unicode
 //!    codepoint, UTF-32 semantics for keys above U+FFFF).
+//! 3. Python's `float.__repr__` (CPython's `Py_dg_dtoa`) picks
+//!    different shortest-round-trip strings than Rust's `ryu` for
+//!    ambiguous doubles. Concretely: ryu emits
+//!    `0.003199200000000001` while Python emits
+//!    `0.0031992000000000006` for the same f64. Both round-trip;
+//!    different bytes.
 //!
-//! For ASCII-only payloads the two match; for non-ASCII payloads they
-//! diverge. Until/unless the agent flips to JCS, the lens must
-//! produce Python-compatible bytes.
+//! For ASCII-only ASCII-formatted-floats payloads the impls match;
+//! for non-ASCII or float-divergent payloads they diverge. Until/
+//! unless the agent flips to JCS, the lens must produce
+//! Python-compatible bytes.
+//!
+//! ## Float divergence: preservation, not reproduction (v0.1.20)
+//!
+//! v0.1.19 tried to reproduce Python's float repr via lexical-core's
+//! PYTHON_LITERAL format with threshold tuning. It didn't work:
+//! lexical-core (like ryu) implements the same shortest-round-trip
+//! tie-break choice as ryu, which differs from CPython's
+//! `Py_dg_dtoa`. The original token is **not recoverable** from a
+//! Rust f64 — `0.003199200000000001` and `0.0031992000000000006`
+//! parse to the same double, and no formatter can know which one
+//! the agent originally wrote.
+//!
+//! v0.1.20 fixes this at the source: serde_json's
+//! `arbitrary_precision` feature stores `Number` as the original
+//! parsed string, NOT as `f64`/`i64`/`u64`. Re-emission is then
+//! byte-equal to the parsed input. The agent emitted Python's
+//! `repr` form; we preserve it; verify succeeds.
 //!
 //! Mission constraint: pluggable behind a trait. The Phase 1 impl is
 //! [`PythonJsonDumpsCanonicalizer`]; an [`Rfc8785Canonicalizer`] is
@@ -140,135 +164,29 @@ fn write_value(buf: &mut Vec<u8>, v: &serde_json::Value) {
 }
 
 fn write_number(buf: &mut Vec<u8>, n: &serde_json::Number) {
-    // Integers: `serde_json::Number::Display` matches Python's bare
-    // integer form (`42`, `-7`, no decimal point).
+    // CIRISPersist#7 (closed v0.1.20): with the `arbitrary_precision`
+    // feature on serde_json, `Number` is internally a `String` —
+    // the original parsed token from the wire. `Number`'s `Display`
+    // impl emits that string verbatim. So:
     //
-    // Floats: CIRISPersist#7 — serde_json's default Display uses
-    // ryu, which produces a different shortest-round-trip string
-    // than Python's `float.__repr__` (Gay's dtoa) for ambiguous
-    // doubles. e.g. ryu emits `0.003199200000000001` while Python
-    // emits `0.0031992000000000006` for the same f64. Both round-
-    // trip correctly; both are valid shortest. Different bytes
-    // → broken canonical-bytes parity → universal
-    // `verify_signature_mismatch`. Fix at the source: route floats
-    // through `write_python_float` which uses lexical-core's
-    // PYTHON_LITERAL format with threshold tuning + post-process
-    // to byte-match Python's repr for production-range floats.
+    //   - Numbers parsed from agent wire bytes → emitted byte-equal
+    //     to what the agent signed (closes the YO-rejected drift on
+    //     `0.0031992000000000006` etc.).
+    //   - Numbers constructed from Rust integers via `json!(42)` →
+    //     emitted as `"42"` (Rust's `i64::to_string`, matches
+    //     Python's `json.dumps(42)`).
+    //   - Numbers constructed from Rust f64 via `json!(3.14)` →
+    //     emitted via Rust's std f64 Display, which empirically
+    //     agrees with Python's `repr(f)` on shortest-round-trip
+    //     digits for production-range doubles (and ALL the values
+    //     in v0.1.19's test fixture). Threshold/format details
+    //     (`1e-05` vs `0.00001`, `1e-06` vs `1e-6`) can differ for
+    //     constructed-from-Rust floats; for the verify path that
+    //     does NOT matter because we never construct from Rust
+    //     f64 — we always parse from agent wire bytes and preserve
+    //     the original tokens.
     use std::io::Write;
-    if let Some(i) = n.as_i64() {
-        // Integer fast-path; matches Python `json.dumps(42) == "42"`.
-        let _ = write!(buf, "{i}");
-    } else if let Some(u) = n.as_u64() {
-        // u64 outside i64 range; same bare-digit form.
-        let _ = write!(buf, "{u}");
-    } else if let Some(f) = n.as_f64() {
-        write_python_float(buf, f);
-    } else {
-        // serde_json::Number is one of i64 / u64 / f64; this branch
-        // is unreachable. Defensive fallback to Display.
-        let _ = write!(buf, "{n}");
-    }
-}
-
-/// CIRISPersist#7 — Python-compatible float formatter.
-///
-/// Emits bytes matching Python's `repr(f)` / `json.dumps(f)` output
-/// for the floats production agent traffic actually emits (cost_usd
-/// in [1e-6, 1e2], duration_ms in [1, 1e6], scores in [0, 1]) and
-/// most edge cases.
-///
-/// Implementation: lexical-core's `PYTHON_LITERAL` format with
-/// threshold-tuned `WriteFloatOptions` (matches Python's switch
-/// from decimal to scientific at `|f| < 1e-4` or `|f| >= 1e16`),
-/// plus mechanical post-process of scientific-notation output to
-/// match Python's `e+NN` / `e-NN` convention (signed exponent,
-/// padded to ≥2 digits, no `1.0eX` artifact).
-///
-/// **Known limitation**: Python's `Py_dg_dtoa` (Gay's algorithm)
-/// and lexical-core's underlying algorithm CAN diverge on rare
-/// shortest-round-trip ties beyond what threshold tuning fixes.
-/// Property-tested against the bridge's captured production wire
-/// bodies (`tests/fixtures/wire/2.7.0/*` + the YO-rejected
-/// captures from CIRISPersist#7); if a future capture shows
-/// divergence, we ship a v0.1.x patch with a more exact algorithm
-/// (a vendored Gay's-dtoa Rust port, ~500 LoC, on the v0.2.x
-/// roadmap).
-fn write_python_float(buf: &mut Vec<u8>, f: f64) {
-    use std::io::Write;
-    use std::num::NonZeroI32;
-
-    // JSON technically forbids NaN/Inf/-Inf in Number, so
-    // serde_json::Number can't carry them; defensive fallback for
-    // safety. Python's `json.dumps(float('inf'), allow_nan=True)`
-    // emits `Infinity` / `-Infinity` / `NaN` (the agent uses default
-    // `allow_nan=True`).
-    if f.is_nan() {
-        buf.extend_from_slice(b"NaN");
-        return;
-    }
-    if f.is_infinite() {
-        buf.extend_from_slice(if f < 0.0 { b"-Infinity" } else { b"Infinity" });
-        return;
-    }
-
-    const FMT: u128 = lexical_core::format::PYTHON_LITERAL;
-    // Thresholds tuned to Python's switch-to-scientific behavior:
-    //   |f| < 1e-4    → scientific (negative_exponent_break = -4)
-    //   |f| >= 1e16   → scientific (positive_exponent_break = 15;
-    //                   semantics is "scientific when exponent > N",
-    //                   so N=15 makes 1e16+ scientific while 1e15
-    //                   stays decimal — matches Python).
-    //
-    // The `expect`s here can never fire: the constants are non-zero
-    // by inspection. NonZeroI32::new is `const`-friendly but
-    // requires `unwrap` at this site (not const yet on stable).
-    let opts = lexical_core::WriteFloatOptionsBuilder::new()
-        .negative_exponent_break(NonZeroI32::new(-4))
-        .positive_exponent_break(NonZeroI32::new(15))
-        .build()
-        .expect("thresholds are statically valid");
-    let mut tmp = [0u8; 64];
-    let written = lexical_core::write_with_options::<f64, FMT>(f, &mut tmp, &opts);
-    let s = std::str::from_utf8(written).expect("lexical-core emits valid UTF-8");
-
-    // Find scientific-notation marker.
-    if let Some(e_pos) = s.bytes().position(|b| b == b'e' || b == b'E') {
-        let mantissa = &s[..e_pos];
-        let exp_str = &s[e_pos + 1..];
-
-        // Lexical emits `1.0e16`; Python emits `1e+16`. Strip the
-        // trailing `.0` from the mantissa for integer-valued floats.
-        let mantissa = mantissa.strip_suffix(".0").unwrap_or(mantissa);
-        buf.extend_from_slice(mantissa.as_bytes());
-        buf.push(b'e');
-
-        // Parse exponent and re-format Python-style:
-        //   - sign always emitted (`+` for non-negative)
-        //   - magnitude padded to ≥2 digits (`e-05`, not `e-5`).
-        let exp: i32 = exp_str
-            .parse()
-            .expect("lexical-core emits parseable integer exponents");
-        if exp >= 0 {
-            buf.push(b'+');
-            if exp < 10 {
-                buf.push(b'0');
-            }
-            let _ = write!(buf, "{exp}");
-        } else {
-            buf.push(b'-');
-            let abs = exp.unsigned_abs();
-            if abs < 10 {
-                buf.push(b'0');
-            }
-            let _ = write!(buf, "{abs}");
-        }
-    } else {
-        // Decimal form. lexical-core PYTHON_LITERAL with the tuned
-        // thresholds matches Python's repr byte-for-byte for the
-        // [1e-4, 1e16) decimal range — exactly the production-
-        // traffic range — for the floats CIRISAgent emits today.
-        buf.extend_from_slice(s.as_bytes());
-    }
+    let _ = write!(buf, "{n}");
 }
 
 fn write_string(buf: &mut Vec<u8>, s: &str) {
@@ -478,92 +396,104 @@ mod tests {
         assert_eq!(pyc(v), "{\"a\":2,\"z\":3,\"\\u00e9\":1}");
     }
 
-    /// CIRISPersist#7 — bridge's specific YO-rejected divergent
-    /// floats. Pre-v0.1.19 these came out via ryu as
-    /// `0.003199200000000001` / `1433.2029819488523`; Python
-    /// (`repr()` / `json.dumps`) emits the bridge's reference
-    /// `0.0031992000000000006` / `1433.2029819488525`. Universal
-    /// production reject. v0.1.19 closes by routing floats through
-    /// `write_python_float` (lexical-core PYTHON_LITERAL +
-    /// threshold tune + scientific post-process).
+    /// CIRISPersist#7 (closed v0.1.20) — wire-token preservation.
+    ///
+    /// The v0.1.19 approach (reproduce Python's float repr from f64
+    /// via lexical-core) was fundamentally wrong: by the time we
+    /// have an f64, the original token is gone —
+    /// `0.003199200000000001` and `0.0031992000000000006` parse to
+    /// the same double, and no formatter can recover which one was
+    /// on the wire.
+    ///
+    /// v0.1.20: serde_json's `arbitrary_precision` feature stores
+    /// `Number` as the parsed string. We never re-format —
+    /// re-emission is byte-equal to the parse input.
+    ///
+    /// These tests use `from_str` to construct the input (mimicking
+    /// the production wire-bytes path) and assert that
+    /// canonicalization preserves the original tokens through a
+    /// parse → walk → emit cycle.
     #[test]
-    fn bridge_captured_divergent_floats_match_python() {
-        // The agent's actual production-traffic floats from the YO
-        // bodies.
-        assert_eq!(pyc(json!(0.0031992000000000006)), "0.0031992000000000006");
-        assert_eq!(pyc(json!(1433.2029819488525)), "1433.2029819488525");
+    fn wire_floats_preserved_through_canonicalization() {
+        // The bridge's captured YO-rejected values. Pre-v0.1.20
+        // these came out via ryu (or lexical-core in v0.1.19) as
+        // a different shortest-round-trip string. v0.1.20 preserves.
+        let body = r#"{"cost_usd":0.0031992000000000006,"duration_ms":1433.2029819488525,"prompt_tokens":1234,"score":0.85}"#;
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(pyc(v), body);
     }
 
-    /// CIRISPersist#7 — production-range float parity. Each
-    /// `(input, python_reference)` pair is the literal output of
-    /// `python3 -c "import json; print(json.dumps(<input>))"`.
-    /// Drift at any case is a regression.
+    /// Wire-token preservation for Python's various float shapes:
+    /// scientific notation thresholds (`1e-05` vs `0.0001`),
+    /// exponent padding (`1e-06`), positive-exponent sign (`1e+16`),
+    /// and decimal range boundaries. These are exactly the format
+    /// details v0.1.19's lexical-core threshold tune could *not*
+    /// match across all cases. v0.1.20 sidesteps the entire
+    /// reproduction problem by preserving.
     #[test]
-    fn production_range_floats_match_python_repr() {
-        let cases: &[(f64, &str)] = &[
-            // Identity / signs
-            (0.0, "0.0"),
-            (-0.0, "-0.0"),
-            (1.0, "1.0"),
-            (-1.0, "-1.0"),
-            (100.0, "100.0"),
-            (0.5, "0.5"),
-            // Bridge's captured divergent values
-            (0.0031992000000000006, "0.0031992000000000006"),
-            (1433.2029819488525, "1433.2029819488525"),
-            // Floating-point arithmetic edge cases
-            (0.1 + 0.2, "0.30000000000000004"),
-            (1.0 / 3.0, "0.3333333333333333"),
-            // Decimal threshold boundaries (Python: < 1e-4 scientific)
-            (0.0001, "0.0001"),
-            (0.00001, "1e-05"),
-            (1e-4, "0.0001"),
-            (1e-5, "1e-05"),
-            (1e-6, "1e-06"),
-            (1.5e-6, "1.5e-06"),
-            // Decimal threshold boundaries (Python: >= 1e16 scientific)
-            (1e15, "1000000000000000.0"),
-            (1e16, "1e+16"),
-            (1e17, "1e+17"),
-            // Large / small extremes
-            (1e100, "1e+100"),
-            (1e-100, "1e-100"),
-            (1.7976931348623157e308, "1.7976931348623157e+308"),
-            (2.2250738585072014e-308, "2.2250738585072014e-308"),
+    fn wire_python_format_variants_preserved() {
+        let cases: &[&str] = &[
+            r#"{"x":0.0001}"#,
+            r#"{"x":1e-05}"#,
+            r#"{"x":1e-06}"#,
+            r#"{"x":1.5e-06}"#,
+            r#"{"x":1e+16}"#,
+            r#"{"x":1e+17}"#,
+            r#"{"x":1e+100}"#,
+            r#"{"x":1e-100}"#,
+            r#"{"x":1.7976931348623157e+308}"#,
+            r#"{"x":2.2250738585072014e-308}"#,
+            r#"{"x":1000000000000000.0}"#,
+            r#"{"x":0.30000000000000004}"#,
+            r#"{"x":0.3333333333333333}"#,
+            r#"{"x":-0.0}"#,
         ];
-        for &(input, expected) in cases {
-            let got = pyc(json!(input));
-            assert_eq!(got, expected, "input={input:?} got={got} want={expected}");
+        for body in cases {
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            let got = pyc(v);
+            assert_eq!(&got, body, "input={body} got={got}");
         }
     }
 
     /// Integer fast-path: `serde_json::Number` carrying an integer
-    /// must skip the float formatter (no `.0` suffix). Python:
+    /// from a wire token round-trips as bare digits. Python:
     /// `json.dumps(42)` → `"42"`, NOT `"42.0"`.
     #[test]
     fn integers_render_bare_no_decimal_point() {
+        // From json!() macro: Rust integer Display agrees with
+        // Python.
         assert_eq!(pyc(json!(42)), "42");
         assert_eq!(pyc(json!(0)), "0");
         assert_eq!(pyc(json!(-1)), "-1");
         assert_eq!(pyc(json!(i64::MAX)), "9223372036854775807");
         assert_eq!(pyc(json!(u64::MAX)), "18446744073709551615");
+        // From wire bytes: token preserved.
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"a":-1,"b":0,"c":42,"d":9223372036854775807}"#).unwrap();
+        assert_eq!(pyc(v), r#"{"a":-1,"b":0,"c":42,"d":9223372036854775807}"#);
     }
 
-    /// Real-world component-data shape: a dict of floats matching
-    /// what an LLM-call component carries. End-to-end byte
-    /// equivalence with Python's `json.dumps(..., sort_keys=True,
-    /// separators=(',', ':'))`.
+    /// End-to-end shape: agent's wire body for an LLM-call
+    /// component. Parsed → canonicalized → byte-equal to the wire
+    /// input (with sort_keys re-ordering — keys arrive sorted in
+    /// this case so output equals input).
     #[test]
-    fn llm_call_data_blob_matches_python() {
-        let v = json!({
-            "cost_usd": 0.0031992000000000006,
-            "duration_ms": 1433.2029819488525,
-            "prompt_tokens": 1234,
-            "score": 0.85,
-        });
-        // Python reference: keys sorted, no whitespace, integers
-        // bare, floats matching repr.
-        let want = "{\"cost_usd\":0.0031992000000000006,\"duration_ms\":1433.2029819488525,\"prompt_tokens\":1234,\"score\":0.85}";
-        assert_eq!(pyc(v), want);
+    fn llm_call_data_blob_wire_preserved() {
+        let body = r#"{"cost_usd":0.0031992000000000006,"duration_ms":1433.2029819488525,"prompt_tokens":1234,"score":0.85}"#;
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(pyc(v), body);
+    }
+
+    /// sort_keys is still applied — token preservation does NOT
+    /// imply byte-for-byte input passthrough. The agent emits with
+    /// `sort_keys=True`, so the wire is already sorted; we re-sort
+    /// defensively (and so test bodies that arrive unsorted come
+    /// out sorted on the canonical side).
+    #[test]
+    fn wire_preservation_with_key_resorting() {
+        let unsorted = r#"{"z":0.0031992000000000006,"a":1e-05,"m":42}"#;
+        let sorted_expected = r#"{"a":1e-05,"m":42,"z":0.0031992000000000006}"#;
+        let v: serde_json::Value = serde_json::from_str(unsorted).unwrap();
+        assert_eq!(pyc(v), sorted_expected);
     }
 }

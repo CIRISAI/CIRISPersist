@@ -5,9 +5,174 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.1.20] — 2026-05-02
+
+P0 production fix #3, **second attempt** — v0.1.19 didn't close
+the drift it claimed to.
+Closes [`CIRISPersist#7`](https://github.com/CIRISAI/CIRISPersist/issues/7).
+
+### Why v0.1.19 failed
+
+Bridge re-ran `Engine.debug_canonicalize` against v0.1.19 with the
+same `agent-62593bcd5a47__detailed__YO-REJECTED.json` body that
+diagnosed the drift originally:
+
+```
+v0.1.19 emit: ..._usd":0.003199200000000001 ,"duration_ms":1433.2029819488523,...
+python json:  ..._usd":0.0031992000000000006,"duration_ms":1433.2029819488525,...
+sha256: e36f43dfba2bb1f6 (lens) vs af847a081ae634d1 (agent's signed)
+```
+
+Same drift, same fixtures. v0.1.19's plan was to *reproduce*
+Python's `repr` from a Rust f64 via lexical-core's
+`PYTHON_LITERAL` format with threshold tuning. That plan was
+fundamentally wrong: lexical-core (like ryu, like every "shortest
+round-trip" library that's not CPython itself) picks the same
+shortest-form tie-break as ryu. **CPython's `Py_dg_dtoa` picks
+differently** at representation boundaries — it adds one extra
+digit (17-char form) where shortest would be 16 chars. Both
+round-trip; both valid; different bytes.
+
+More importantly: **the original token is not recoverable from a
+Rust f64**. `0.003199200000000001` and `0.0031992000000000006`
+parse to the same f64 bits. By the time we have a Rust `f64`,
+the digits the agent originally wrote are gone.
+
+### v0.1.20: preserve, don't reproduce
+
+Enable `serde_json`'s `arbitrary_precision` feature. With it,
+`serde_json::Number` is internally a `String` — the original
+parsed wire token. `Number`'s `Display` impl emits that string
+verbatim. Result:
+
+| Path | Behavior |
+|---|---|
+| Wire bytes → parse → canonical bytes | byte-equal token preservation |
+| `json!(42)` → canonical bytes | `"42"` (Rust integer Display, agrees with Python) |
+| `json!(3.14)` → canonical bytes | Rust f64 Display (empirically agrees with Python on shortest-round-trip digits for production-range doubles, including the bridge's YO captures) |
+
+For the verify path — the path that matters — we never construct
+Numbers from Rust f64s. We always parse from agent wire bytes
+and walk the parsed `Value` to canonicalize. With
+`arbitrary_precision`, that walk preserves the agent's tokens
+byte-exact.
+
+### Empirical proof of the fix
+
+Pre-feature-flag: parsing `0.0031992000000000006`, the f64 bits
+get `Display`'d via ryu to `"0.003199200000000001"` — drift.
+
+With `arbitrary_precision`:
+```
+in : {"x":0.0031992000000000006}
+out: {"x":0.0031992000000000006}
+in : {"x":1e-05}
+out: {"x":1e-05}
+in : {"x":1.7976931348623157e+308}
+out: {"x":1.7976931348623157e+308}
+```
+
+All Python format variants (scientific threshold `1e-05` vs
+`0.0001`, exponent padding `1e-06`, signed-positive exponent
+`1e+16`) round-trip byte-identical because we never re-format —
+we preserve the parsed token.
+
+### What changed in code
+
+`src/verify/canonical.rs`:
+
+- `write_number` collapsed from 30 lines (i64/u64/f64 dispatch
+  through `write_python_float`) to a single
+  `write!(buf, "{n}")` call.
+- `write_python_float` deleted (~80 lines).
+- Module docstring updated to call out the v0.1.20 approach
+  ("preserve, don't reproduce") and explicitly retire v0.1.19's
+  reproduction plan.
+
+`src/verify/canonical.rs` tests:
+
+- `bridge_captured_divergent_floats_match_python` (v0.1.19) →
+  removed; the test was constructed via `json!(0.003199...)`
+  which goes through ryu before our writer ever sees it. With
+  `arbitrary_precision`, Rust's std f64 Display happens to agree
+  with Python on these specific values, but the test's
+  *premise* (we can recover Python's bytes from a Rust f64) was
+  false.
+- `production_range_floats_match_python_repr` (v0.1.19) →
+  removed; same premise problem.
+- `wire_floats_preserved_through_canonicalization` (new) →
+  parse the bridge's exact YO byte sequence; assert canonical
+  bytes are byte-equal.
+- `wire_python_format_variants_preserved` (new) → 14 Python
+  format variants (scientific thresholds, exponent padding,
+  signed-positive exponent, large/small extremes) — each parsed
+  as wire bytes and asserted byte-equal through canonicalization.
+- `llm_call_data_blob_wire_preserved` (new) → end-to-end
+  parse-then-emit on the LLM-call dict shape from the bridge's
+  capture.
+- `wire_preservation_with_key_resorting` (new) → token
+  preservation does not skip `sort_keys=True`; bodies arrive
+  unsorted come out sorted with tokens preserved.
+
+`Cargo.toml`:
+
+- `serde_json` gets `arbitrary_precision` feature.
+- `lexical-core` (added v0.1.19) removed.
+
+### Trade-off: feature unification
+
+`arbitrary_precision` is a serde_json feature flag. Cargo
+unifies features across the dep tree, so any crate that pulls
+ciris-persist transitively also gets `arbitrary_precision` on
+its serde_json. Externally observable behavior under stable
+serde_json APIs (`Number::as_f64`, `as_i64`, `as_u64`, Value
+serialization, etc.) is unchanged. The only difference: code
+that pattern-matched on `Number`'s private internal variants
+(`Number::F64`, `Number::U64`) would break — but no stable code
+does that. Safe.
+
+### What this closes
+
+| Layer | Closed by |
+|---|---|
+| Timestamp drift | v0.1.8 (`WireDateTime`) |
+| Base64 alphabet | v0.1.15 (`decode_signature` URL-safe fallback) |
+| Canonical-shape (9-field vs 2-field) | v0.1.16 (try-both) |
+| Float formatting (preserve, not reproduce) | **v0.1.20** (`arbitrary_precision`) |
+
+The v0.1.16 try-both-canonical now works as designed: both
+9-field and 2-field shapes byte-match the agent because float
+bytes finally match. Bridge's flag-on capture against v0.1.20
+should show `signatures_verified == envelopes_processed` and
+table rowcount growing.
+
+### Tests
+
+143 tests green (121 lib + 22 integration); clippy clean
+across all feature combos; cargo-deny clean.
+
+### Lens action
+
+`pip install --upgrade ciris-persist==0.1.20`. v0.1.18's
+diagnostic surfaces remain in place; v0.1.20 closes the
+underlying canonical-byte drift end-to-end.
+
+### What this did NOT close (but agent did)
+
+CIRIS-Agent 2.7.8.12 (today) closes the **tee/wire byte-equality**
+bug — agent's local-tee was writing
+`json.dumps(..., ensure_ascii=False, separators=(",",":"))` while
+aiohttp's `json=payload` path used Python's defaults
+(`ensure_ascii=True`). Pre-2.7.8.12, lens-side
+`body_sha256_prefix` from PERSIST_DELEGATE_REJECT couldn't match
+any local-tee file. Separate fix; both must be true for clean
+forensic correlation.
+
 ## [0.1.19] — 2026-05-02
 
-P0 production fix #3 from the same diagnostic round.
+P0 production fix #3 from the same diagnostic round (**superseded
+by v0.1.20** — the lexical-core approach didn't actually close
+the drift). Kept in this changelog for the diagnostic record.
 Closes [`CIRISPersist#7`](https://github.com/CIRISAI/CIRISPersist/issues/7).
 The bridge's v0.1.18 capture pinned the canonical-bytes drift to
 **float formatting**: Rust's `ryu` (via `serde_json`'s default
