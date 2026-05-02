@@ -29,6 +29,7 @@
 //! `FSD/PLATFORM_ARCHITECTURE.md` for the layered shape this module
 //! tree implements.
 
+pub mod federation;
 pub mod ffi;
 pub mod ingest;
 pub mod journal;
