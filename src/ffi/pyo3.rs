@@ -476,6 +476,274 @@ impl PyEngine {
             }
         }
     }
+
+    // ── v0.2.0 — FederationDirectory surface ───────────────────────
+    //
+    // Lens team's pubkey-storage cutover target. Wire shape: JSON
+    // strings in/out for complex types (KeyRecord, Attestation,
+    // Revocation, Signed* wrappers); primitive types (key_id, etc.)
+    // as direct &str args. Lens calls json.dumps before passing in,
+    // json.loads on receiving back — adds a serde round-trip on
+    // each call but keeps the API uniform across complex shapes.
+    //
+    // See docs/FEDERATION_DIRECTORY.md for the architectural
+    // contract and types::SignedKeyRecord / Attestation / Revocation
+    // for the JSON shape.
+
+    /// Federation directory: register a public key.
+    ///
+    /// `signed_key_record_json` is a JSON string of `SignedKeyRecord`
+    /// (`{"record": {...KeyRecord fields...}}`). The PQC fields
+    /// (`pubkey_ml_dsa_65_base64`, `scrub_signature_pqc`) may be
+    /// absent or null on initial write — the writer kicks off ML-DSA-65
+    /// signing on the cold path and calls `attach_key_pqc_signature`
+    /// to fill them in. `algorithm` MUST be `"hybrid"`.
+    fn put_public_key(&self, py: Python<'_>, signed_key_record_json: &str) -> PyResult<()> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let record: crate::federation::SignedKeyRecord =
+            serde_json::from_str(signed_key_record_json)
+                .map_err(|e| PyValueError::new_err(format!("SignedKeyRecord JSON decode: {e}")))?;
+        py.detach(|| {
+            runtime.block_on(async move {
+                use crate::federation::FederationDirectory;
+                backend
+                    .put_public_key(record)
+                    .await
+                    .map_err(federation_err_to_py)
+            })
+        })
+    }
+
+    /// Federation directory: lookup a public key by `key_id`.
+    /// Returns the JSON-encoded `KeyRecord` string, or `None`.
+    fn lookup_public_key(&self, py: Python<'_>, key_id: &str) -> PyResult<Option<String>> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let key_id = key_id.to_owned();
+        py.detach(|| {
+            runtime.block_on(async move {
+                let opt =
+                    <PostgresBackend as crate::federation::FederationDirectory>::lookup_public_key(
+                        &backend, &key_id,
+                    )
+                    .await
+                    .map_err(federation_err_to_py)?;
+                match opt {
+                    None => Ok(None),
+                    Some(rec) => Ok(Some(serde_json::to_string(&rec).map_err(|e| {
+                        PyRuntimeError::new_err(format!("KeyRecord JSON encode: {e}"))
+                    })?)),
+                }
+            })
+        })
+    }
+
+    /// Federation directory: lookup all public keys for an identity_ref.
+    /// Returns a JSON array string of `KeyRecord` objects.
+    fn lookup_keys_for_identity(&self, py: Python<'_>, identity_ref: &str) -> PyResult<String> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let identity_ref = identity_ref.to_owned();
+        py.detach(|| {
+            runtime.block_on(async move {
+                use crate::federation::FederationDirectory;
+                let rows = backend
+                    .lookup_keys_for_identity(&identity_ref)
+                    .await
+                    .map_err(federation_err_to_py)?;
+                serde_json::to_string(&rows).map_err(|e| {
+                    PyRuntimeError::new_err(format!("Vec<KeyRecord> JSON encode: {e}"))
+                })
+            })
+        })
+    }
+
+    /// Federation directory: write an attestation.
+    fn put_attestation(&self, py: Python<'_>, signed_attestation_json: &str) -> PyResult<()> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let att: crate::federation::SignedAttestation =
+            serde_json::from_str(signed_attestation_json).map_err(|e| {
+                PyValueError::new_err(format!("SignedAttestation JSON decode: {e}"))
+            })?;
+        py.detach(|| {
+            runtime.block_on(async move {
+                use crate::federation::FederationDirectory;
+                backend
+                    .put_attestation(att)
+                    .await
+                    .map_err(federation_err_to_py)
+            })
+        })
+    }
+
+    /// Federation directory: list attestations targeting `attested_key_id`.
+    fn list_attestations_for(&self, py: Python<'_>, attested_key_id: &str) -> PyResult<String> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let attested_key_id = attested_key_id.to_owned();
+        py.detach(|| {
+            runtime.block_on(async move {
+                use crate::federation::FederationDirectory;
+                let rows = backend
+                    .list_attestations_for(&attested_key_id)
+                    .await
+                    .map_err(federation_err_to_py)?;
+                serde_json::to_string(&rows).map_err(|e| {
+                    PyRuntimeError::new_err(format!("Vec<Attestation> JSON encode: {e}"))
+                })
+            })
+        })
+    }
+
+    /// Federation directory: list attestations issued by `attesting_key_id`.
+    fn list_attestations_by(&self, py: Python<'_>, attesting_key_id: &str) -> PyResult<String> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let attesting_key_id = attesting_key_id.to_owned();
+        py.detach(|| {
+            runtime.block_on(async move {
+                use crate::federation::FederationDirectory;
+                let rows = backend
+                    .list_attestations_by(&attesting_key_id)
+                    .await
+                    .map_err(federation_err_to_py)?;
+                serde_json::to_string(&rows).map_err(|e| {
+                    PyRuntimeError::new_err(format!("Vec<Attestation> JSON encode: {e}"))
+                })
+            })
+        })
+    }
+
+    /// Federation directory: write a revocation.
+    fn put_revocation(&self, py: Python<'_>, signed_revocation_json: &str) -> PyResult<()> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let rev: crate::federation::SignedRevocation = serde_json::from_str(signed_revocation_json)
+            .map_err(|e| PyValueError::new_err(format!("SignedRevocation JSON decode: {e}")))?;
+        py.detach(|| {
+            runtime.block_on(async move {
+                use crate::federation::FederationDirectory;
+                backend
+                    .put_revocation(rev)
+                    .await
+                    .map_err(federation_err_to_py)
+            })
+        })
+    }
+
+    /// Federation directory: list revocations targeting `revoked_key_id`.
+    fn revocations_for(&self, py: Python<'_>, revoked_key_id: &str) -> PyResult<String> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let revoked_key_id = revoked_key_id.to_owned();
+        py.detach(|| {
+            runtime.block_on(async move {
+                use crate::federation::FederationDirectory;
+                let rows = backend
+                    .revocations_for(&revoked_key_id)
+                    .await
+                    .map_err(federation_err_to_py)?;
+                serde_json::to_string(&rows).map_err(|e| {
+                    PyRuntimeError::new_err(format!("Vec<Revocation> JSON encode: {e}"))
+                })
+            })
+        })
+    }
+
+    /// Federation directory: attach the cold-path PQC signature to a
+    /// hybrid-pending federation_keys row. See docs/FEDERATION_DIRECTORY.md
+    /// §"Trust contract" for the writer contract — this is step 4
+    /// (called once the cold-path ML-DSA-65 sign completes).
+    fn attach_key_pqc_signature(
+        &self,
+        py: Python<'_>,
+        key_id: &str,
+        pubkey_ml_dsa_65_base64: &str,
+        scrub_signature_pqc: &str,
+    ) -> PyResult<()> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let key_id = key_id.to_owned();
+        let mldsa_pk = pubkey_ml_dsa_65_base64.to_owned();
+        let pqc_sig = scrub_signature_pqc.to_owned();
+        py.detach(|| {
+            runtime.block_on(async move {
+                use crate::federation::FederationDirectory;
+                backend
+                    .attach_key_pqc_signature(&key_id, &mldsa_pk, &pqc_sig)
+                    .await
+                    .map_err(federation_err_to_py)
+            })
+        })
+    }
+
+    /// Federation directory: attach PQC signature to a hybrid-pending
+    /// federation_attestations row.
+    fn attach_attestation_pqc_signature(
+        &self,
+        py: Python<'_>,
+        attestation_id: &str,
+        scrub_signature_pqc: &str,
+    ) -> PyResult<()> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let attestation_id = attestation_id.to_owned();
+        let pqc_sig = scrub_signature_pqc.to_owned();
+        py.detach(|| {
+            runtime.block_on(async move {
+                use crate::federation::FederationDirectory;
+                backend
+                    .attach_attestation_pqc_signature(&attestation_id, &pqc_sig)
+                    .await
+                    .map_err(federation_err_to_py)
+            })
+        })
+    }
+
+    /// Federation directory: attach PQC signature to a hybrid-pending
+    /// federation_revocations row.
+    fn attach_revocation_pqc_signature(
+        &self,
+        py: Python<'_>,
+        revocation_id: &str,
+        scrub_signature_pqc: &str,
+    ) -> PyResult<()> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let revocation_id = revocation_id.to_owned();
+        let pqc_sig = scrub_signature_pqc.to_owned();
+        py.detach(|| {
+            runtime.block_on(async move {
+                use crate::federation::FederationDirectory;
+                backend
+                    .attach_revocation_pqc_signature(&revocation_id, &pqc_sig)
+                    .await
+                    .map_err(federation_err_to_py)
+            })
+        })
+    }
+}
+
+/// Bridge `federation::Error` → `PyErr` at the FFI boundary.
+/// Mission constraint (THREAT_MODEL.md AV-15): structured detail
+/// goes to tracing; the Python exception carries the stable kind
+/// token. Lens HTTP layer maps token → status code.
+fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
+    let kind = e.kind();
+    tracing::warn!(error = %e, kind = kind, "federation error");
+    match e {
+        // Caller-fault → ValueError (4xx).
+        crate::federation::Error::InvalidArgument(_)
+        | crate::federation::Error::SignatureInvalid(_) => PyValueError::new_err(kind),
+        // Conflict → ValueError too; lens-side maps to 409.
+        crate::federation::Error::Conflict(_) => PyValueError::new_err(kind),
+        // Rate-limit → RuntimeError; lens maps to 429.
+        crate::federation::Error::RateLimited { .. } => PyRuntimeError::new_err(kind),
+        // Server-fault → RuntimeError (5xx).
+        crate::federation::Error::Backend(_) => PyRuntimeError::new_err(kind),
+    }
 }
 
 /// Scrubber bridge: wraps a Python callable in the [`Scrubber`]

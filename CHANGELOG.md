@@ -5,6 +5,180 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.2.0] — 2026-05-02
+
+**Federation Directory** (registry-aligned per
+`CIRISRegistry/docs/FEDERATION_CLIENT.md`). Lens-team-ready wheel
+for cutting public key storage over to persist's federation
+substrate. PoB §3.1 federation primitives land as the v0.2.x track.
+
+### What ships
+
+**Schema** — three tables with cryptographic provenance on every
+row:
+
+- `federation_keys` — pubkey rows (agent, primitive, steward,
+  partner). Hybrid Ed25519 + ML-DSA-65 only;
+  `algorithm = 'hybrid'` CHECK-enforced.
+- `federation_attestations` — many-to-many "key A vouches for /
+  witnesses / referred / delegated_to key B". Append-only.
+- `federation_revocations` — append-only revocation log. Consumers
+  compute "is K revoked?" by their own policy.
+
+Every row carries the v0.1.3 four-tuple
+(`original_content_hash`, `scrub_signature_classical`,
+`scrub_key_id`, `scrub_timestamp`) plus PQC components
+(`scrub_signature_pqc`) and `pqc_completed_at`. FK chain
+terminates at out-of-band-anchored stewards.
+
+**Trait** — `FederationDirectory` (8 base methods + 3 cold-path
+attach methods, 11 total):
+
+```rust
+trait FederationDirectory {
+    // Public keys
+    fn put_public_key(&self, record: SignedKeyRecord) -> Result<()>;
+    fn lookup_public_key(&self, key_id: &str) -> Result<Option<KeyRecord>>;
+    fn lookup_keys_for_identity(&self, identity_ref: &str) -> Result<Vec<KeyRecord>>;
+    // Attestations
+    fn put_attestation(&self, attestation: SignedAttestation) -> Result<()>;
+    fn list_attestations_for(&self, attested_key_id: &str) -> Result<Vec<Attestation>>;
+    fn list_attestations_by(&self, attesting_key_id: &str) -> Result<Vec<Attestation>>;
+    // Revocations
+    fn put_revocation(&self, revocation: SignedRevocation) -> Result<()>;
+    fn revocations_for(&self, revoked_key_id: &str) -> Result<Vec<Revocation>>;
+    // Cold-path PQC fill-in
+    fn attach_key_pqc_signature(&self, key_id, mldsa_pubkey, mldsa_sig) -> Result<()>;
+    fn attach_attestation_pqc_signature(&self, attestation_id, mldsa_sig) -> Result<()>;
+    fn attach_revocation_pqc_signature(&self, revocation_id, mldsa_sig) -> Result<()>;
+}
+```
+
+No `is_trusted()`, `trust_score()`, `trust_path()`, or any
+policy-bearing method. Consumers compose policy by walking the
+attestation graph.
+
+**Backends** — all three implement `FederationDirectory`:
+`MemoryBackend`, `PostgresBackend`, `SqliteBackend`. Same
+contract; same conformance suite.
+
+**PyO3 surface** — 11 `Engine` methods exposed to Python with
+JSON-string payload shape (lens calls `json.dumps`/`json.loads`
+once per call):
+
+```python
+engine.put_public_key(json.dumps({"record": {...}}))
+record_json = engine.lookup_public_key("agent-key-id")
+# Optional[str]; None when missing
+record = json.loads(record_json) if record_json else None
+```
+
+Same shape for attestations, revocations, attach_*_pqc_signature.
+Errors translate: caller-fault → `ValueError` (4xx),
+server-fault → `RuntimeError` (5xx). `Conflict` (e.g. on
+double-PQC-fill) → `ValueError`.
+
+### PQC strategy: hot Ed25519, cold ML-DSA-65
+
+**Hybrid Ed25519 + ML-DSA-65 is the only signing scheme across
+the federation.** Per CIRISVerify `ManifestSignature` +
+`HybridSignature` (`function_integrity.rs:149`,
+`ciris-crypto/types.rs:156`). Bound signature pattern: PQC
+covers `data || classical_sig` to prevent stripping.
+
+But waiting until everything is fast PQC ships nothing. So:
+
+| Step | Path |
+|---|---|
+| 1. Sign canonical with Ed25519 | hot, synchronous |
+| 2. Write the row (PQC fields None) | hot |
+| 3. **IMMEDIATELY** kick off ML-DSA-65 sign on cold path | cold, no delay, no batching |
+| 4. Call `attach_*_pqc_signature` once cold path completes | cold |
+
+Writers commit to the contract; persist tracks via
+`pqc_completed_at`. Telemetry signal:
+`pqc_completed_at IS NULL` rows are pending; alarm if pending
+too long. When quantum threat materializes, runtime policy
+flips (`require_pqc_on_write=true`), step 3 folds into the
+synchronous path, and post-flip rows are hybrid from the start.
+Pre-flip pending rows walk through the upgrade pipeline.
+
+Net property: every row in the historical audit chain ends up
+hybrid-signed (post-quantum safe). Federation speed at write
+time is Ed25519 latency, not Ed25519+ML-DSA-65 latency.
+
+### Trust contract — eventual consistency as a federation primitive
+
+Persist's promise to consumers is a **layered set of
+eventual-consistency commitments** (PQC completion, replication,
+cache freshness, peer attestation, revocation propagation), each
+with an observability signal. Consumers compose their own trust
+verdict — strict-hybrid / soft-hybrid+freshness / pure-attestation-
+graph / coherence-stake — using persist's signals. Persist
+exposes substrate, never verdicts.
+
+See `docs/FEDERATION_DIRECTORY.md` §"Trust contract — eventual
+consistency as a federation primitive" for the full architectural
+treatment.
+
+### Registry coordination
+
+CIRISRegistry's v1.4 scaffolding (vendored types,
+FederationDirectory trait, migration 024 cache columns, dual-write
+feature flag, telemetry counters, audit-log envelope_hash
+metadata) is unblocked by this release. Their R_BACKFILL can
+begin.
+
+Their vendored types in
+`rust-registry/src/federation/types.rs` will need a follow-up to
+match v0.2.0's hybrid shape (split `pubkey_base64` →
+`pubkey_ed25519_base64` + `pubkey_ml_dsa_65_base64` Optional;
+split `scrub_signature` → `scrub_signature_classical` +
+`scrub_signature_pqc` Optional; add `pqc_completed_at`
+Optional). I'll flag in their FEDERATION_CLIENT.md once the
+v0.2.0 wheel is on PyPI.
+
+### Tests + features
+
+154+ tests green (152 lib + ≥22 integration); clippy clean
+across `postgres,sqlite,server,pyo3,tls`; cargo-deny clean.
+
+### Lens action
+
+`pip install --upgrade ciris-persist==0.2.0`. The wheel exposes
+the 11 federation methods on the existing `Engine`. Cutover
+suggestion:
+
+1. Run `Engine.run_migrations()` — V004 applies, federation
+   tables exist alongside the existing `accord_public_keys`.
+2. Write a self-signed `lens-steward` row to bootstrap the trust
+   chain.
+3. Migrate existing pubkeys from `accord_public_keys` → call
+   `put_public_key` for each (with `scrub_key_id = lens-steward`).
+4. Validate parity by reading back via `lookup_public_key`.
+5. Cut new pubkey writes over to the federation surface;
+   `accord_public_keys` becomes legacy for the duration of the
+   migration window.
+
+PQC: lens may write Ed25519-only initially (PQC fields None),
+then call `attach_key_pqc_signature` once cold path completes.
+The contract is PQC kickoff is immediate-not-batched; persist
+tracks but doesn't enforce. Stricter consumers that need
+hybrid-complete-only refuse pending rows at read time per their
+own policy.
+
+### Deferred to v0.2.x
+
+- `persist-steward` bootstrap row (V005 migration) — pending
+  CIRISCore Ed25519 + ML-DSA-65 keypair handoff.
+- Helper binary updates for hybrid handoff protocol
+  (`derive_persist_steward_bootstrap.rs`).
+- Fixture JSON for registry serde validation.
+- Telemetry: `federation_pqc_pending_age_seconds_max`.
+- Verify subsumption (CIRISPersist#4 — `Engine` grows
+  `sign`/`public_key`/`verify_build_manifest`/etc. proxy methods
+  so lens/agent/bridge drop direct `ciris-verify` imports).
+
 ## [0.1.21] — 2026-05-02
 
 SQLite Backend Phase 1 parity. Sovereign-mode + Pi-class
