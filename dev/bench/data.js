@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777698320594,
+  "lastUpdate": 1777699450934,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -2789,6 +2789,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 21947728,
             "range": "± 206224",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "1d87b329f5a66533a1d52756957e228af51462c9",
+          "message": "docs: federation framing — persist substrate, trust as policy\n\nThe CIRIS roster has grown past the original Trinity (agent + manager\n+ lens). Today it's a federation of primitives — agent, lens,\nregistry, persist, node, bridge — and persist sits below all of them\nas the shared durability + cryptographic-provenance substrate. Update\ncrate metadata + lead docs to reflect the federation framing.\n\nReplace \"CIRIS Trinity\" → \"CIRIS federation\" in:\n- README.md, Cargo.toml, pyproject.toml, src/lib.rs (one-line\n  description that ships in the crate metadata)\n- FSD/CIRIS_PERSIST.md title + closing notes (with a parenthetical\n  preserving the Trinity origin for historic continuity)\n- .github/workflows/ci.yml manifest notes\n\nAdd docs/FEDERATION_DIRECTORY.md — architectural sketch for the\nv0.2.x federation directory surface (public_keys + attestations +\nrevocations) under PoB §3.1. Establishes the boundary that came out\nof the registry conversation:\n\n  - Persist stores; consumers compute.\n  - Trust is the consumer's policy.\n  - Trait surface stays narrow (CRUD + range queries).\n  - No `is_trusted()` / `trust_score()` / `evaluate_policy()` —\n    those locks consumers into a specific trust model and break\n    the federation flexibility PoB §3.1 needs.\n\nThree example consumer policies (direct trust, referrer chain,\nscore-weighted Coherence Stake) sketched in the doc to demonstrate\nthe same persist substrate supporting radically different trust\nmodels. Migration path through v0.2.x → v0.3.x. Open design\nquestions enumerated for the persist/registry/lens alignment\nconversation.\n\nNo code changes; doc-only. v0.1.20 (just shipped) remains the active\nversion on PyPI.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-02T00:18:23-05:00",
+          "tree_id": "a56362e814cbf1cae288d1ec7cbe8523c8a45e60",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/1d87b329f5a66533a1d52756957e228af51462c9"
+        },
+        "date": 1777699450611,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 95259,
+            "range": "± 589",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 235143,
+            "range": "± 623",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 515310,
+            "range": "± 1198",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1832095,
+            "range": "± 19411",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 379,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1667,
+            "range": "± 16",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 9052,
+            "range": "± 126",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 368,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 2969,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9189,
+            "range": "± 31",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 40262,
+            "range": "± 236",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2152491,
+            "range": "± 83861",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6280832,
+            "range": "± 160197",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 22621670,
+            "range": "± 361305",
             "unit": "ns/iter"
           }
         ]
