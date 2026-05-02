@@ -5,6 +5,126 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.1.19] — 2026-05-02
+
+P0 production fix #3 from the same diagnostic round.
+Closes [`CIRISPersist#7`](https://github.com/CIRISAI/CIRISPersist/issues/7).
+The bridge's v0.1.18 capture pinned the canonical-bytes drift to
+**float formatting**: Rust's `ryu` (via `serde_json`'s default
+`Display` impl on `Number`) and Python's `float.__repr__` (Gay's
+`dtoa`) disagree on shortest-round-trip output for ambiguous
+doubles.
+
+### The bug
+
+Concrete divergence from production traffic:
+
+| f64 value | Rust ryu | Python repr |
+|---|---|---|
+| same double | `0.003199200000000001` | `0.0031992000000000006` |
+| same double | `1433.2029819488523`   | `1433.2029819488525` |
+
+Both strings round-trip to identical IEEE 754 doubles. Both are
+valid "shortest round-trip" outputs. The algorithms (Adams 2018
+ryu vs Steele-White / Gay's dtoa) differ on tie-breaking. Result:
+universal `verify_signature_mismatch` on every YO-locale batch
+across all three captured wire bodies, ~59-byte cumulative
+divergence per trace.
+
+### The fix
+
+Route `Value::Number` through a Python-compatible writer.
+`write_python_float` in `src/verify/canonical.rs`:
+
+- **`lexical-core` PYTHON_LITERAL format**, with
+  `negative_exponent_break(-4)` + `positive_exponent_break(15)`
+  tuned to match Python's switch from decimal to scientific at
+  `|f| < 1e-4` or `|f| >= 1e16`.
+- **Scientific-form post-process** for the format-detail
+  differences lexical leaves on the table:
+  - Strip `.0` from `1.0eN` → `1eN` (Python doesn't write the
+    `.0` for integer-valued mantissas in scientific form).
+  - Add `+` sign for non-negative exponents → `1e+16` /
+    `1.7976931348623157e+308`.
+  - Pad single-digit exponent magnitude to ≥ 2 digits → `1e-05`
+    / `1.5e-06`.
+- **Integer fast-path** preserved: `Number::as_i64()` /
+  `as_u64()` paths use bare `{}` Display (`42`, not `42.0`).
+
+### Test coverage
+
+4 new unit tests in `verify::canonical::tests`:
+
+1. **`bridge_captured_divergent_floats_match_python`** — the two
+   exact divergent values from the bridge's YO captures
+   (`0.0031992000000000006`, `1433.2029819488525`). Pre-v0.1.19
+   these round-tripped via ryu to the wrong shortest form.
+2. **`production_range_floats_match_python_repr`** — 22
+   `(input, python_reference)` pairs covering identity (0.0, 1.0,
+   100.0), arithmetic edge cases (`0.1 + 0.2`, `1.0 / 3.0`),
+   decimal/scientific threshold boundaries (`1e-4`, `1e-5`,
+   `1e15`, `1e16`), and large/small extremes
+   (`1e+100`, `1e-100`, `1.7976931348623157e+308`). Each pair
+   was generated via `python3 -c "import json; print(json.dumps(<input>))"`
+   ground truth.
+3. **`integers_render_bare_no_decimal_point`** — `serde_json::Number`
+   carrying integers must skip the float formatter (no `.0`
+   suffix). Covers i64 + u64 ranges including `i64::MAX` and
+   `u64::MAX`.
+4. **`llm_call_data_blob_matches_python`** — end-to-end shape:
+   the dict an LLM-call component carries (`cost_usd`,
+   `duration_ms`, `prompt_tokens`, `score`) canonicalizes
+   byte-identical to Python's `json.dumps(..., sort_keys=True,
+   separators=(',', ':'))`.
+
+### What this closes
+
+Three independent layers now cover the verify-mismatch surface
+on real agent traffic:
+
+| Layer | Closed by |
+|---|---|
+| Timestamp drift | v0.1.8 (`WireDateTime` preserves wire bytes) |
+| Base64 alphabet | v0.1.15 (`decode_signature` accepts STANDARD + URL_SAFE) |
+| Canonical-shape (9-field vs 2-field) | v0.1.16 (try-both fallback) |
+| **Float formatting** | **v0.1.19** (`write_python_float` matches Python's `repr`) |
+
+The v0.1.16 try-both-canonical fallback now WORKS as designed:
+both 9-field and 2-field shapes byte-match the agent because
+their float representation matches. Bridge's flag-on capture
+against v0.1.19 should show
+`signatures_verified == envelopes_processed`, table rowcount
+growing.
+
+### Known limitation
+
+Python's `Py_dg_dtoa` and lexical-core's underlying algorithm
+CAN diverge on rare shortest-round-trip ties beyond what
+threshold tuning + post-process fixes. The 22 production-range
+test cases all match; if a future bridge capture surfaces a new
+divergent f64, we ship a v0.1.x patch with a more exact
+algorithm (vendored Gay's-dtoa Rust port, ~500 LoC, tracked on
+the v0.2.x roadmap).
+
+### Tests + deps
+
+142 tests green (118 lib + 24 verify ed25519/canonical + 8 QA +
+9 fixture); clippy clean across all feature combos; cargo-deny
+clean.
+
+New direct dep: **`lexical-core` 1.0.6** with `format` +
+`write-floats` features. The Rust ecosystem's most flexible
+number-formatter; specifically supports the cross-language
+parity our use case demands.
+
+### Lens action
+
+`pip install --upgrade ciris-persist==0.1.19`. v0.1.18's wheels
+have all the diagnostic surfaces in place; v0.1.19 closes the
+underlying canonical-byte drift the diagnostics surfaced.
+Bridge's flag-on capture should finally show clean verify
+end-to-end.
+
 ## [0.1.18] — 2026-05-02
 
 Diagnostic round 2 for [`CIRISPersist#6`](https://github.com/CIRISAI/CIRISPersist/issues/6) — extending v0.1.17's

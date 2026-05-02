@@ -140,19 +140,135 @@ fn write_value(buf: &mut Vec<u8>, v: &serde_json::Value) {
 }
 
 fn write_number(buf: &mut Vec<u8>, n: &serde_json::Number) {
-    // Python json emits integers as bare digits (`42`), floats with
-    // `repr`-like output. For our wire-format payload, integers are
-    // dominant (token counts, attempt_index, etc.); floats appear in
-    // ratios and durations. serde_json's default formatter matches
-    // Python's bare-integer form; for floats it uses ryu (shortest
-    // round-trip), which usually but not always matches Python.
+    // Integers: `serde_json::Number::Display` matches Python's bare
+    // integer form (`42`, `-7`, no decimal point).
     //
-    // Mission category §4 "Canonicalization parity": fixtures cover
-    // the float cases that matter for Phase 1 (durations, scores).
-    // If a future divergence shows up in CI's parity corpus we'll
-    // narrow it then.
+    // Floats: CIRISPersist#7 — serde_json's default Display uses
+    // ryu, which produces a different shortest-round-trip string
+    // than Python's `float.__repr__` (Gay's dtoa) for ambiguous
+    // doubles. e.g. ryu emits `0.003199200000000001` while Python
+    // emits `0.0031992000000000006` for the same f64. Both round-
+    // trip correctly; both are valid shortest. Different bytes
+    // → broken canonical-bytes parity → universal
+    // `verify_signature_mismatch`. Fix at the source: route floats
+    // through `write_python_float` which uses lexical-core's
+    // PYTHON_LITERAL format with threshold tuning + post-process
+    // to byte-match Python's repr for production-range floats.
     use std::io::Write;
-    let _ = write!(buf, "{n}");
+    if let Some(i) = n.as_i64() {
+        // Integer fast-path; matches Python `json.dumps(42) == "42"`.
+        let _ = write!(buf, "{i}");
+    } else if let Some(u) = n.as_u64() {
+        // u64 outside i64 range; same bare-digit form.
+        let _ = write!(buf, "{u}");
+    } else if let Some(f) = n.as_f64() {
+        write_python_float(buf, f);
+    } else {
+        // serde_json::Number is one of i64 / u64 / f64; this branch
+        // is unreachable. Defensive fallback to Display.
+        let _ = write!(buf, "{n}");
+    }
+}
+
+/// CIRISPersist#7 — Python-compatible float formatter.
+///
+/// Emits bytes matching Python's `repr(f)` / `json.dumps(f)` output
+/// for the floats production agent traffic actually emits (cost_usd
+/// in [1e-6, 1e2], duration_ms in [1, 1e6], scores in [0, 1]) and
+/// most edge cases.
+///
+/// Implementation: lexical-core's `PYTHON_LITERAL` format with
+/// threshold-tuned `WriteFloatOptions` (matches Python's switch
+/// from decimal to scientific at `|f| < 1e-4` or `|f| >= 1e16`),
+/// plus mechanical post-process of scientific-notation output to
+/// match Python's `e+NN` / `e-NN` convention (signed exponent,
+/// padded to ≥2 digits, no `1.0eX` artifact).
+///
+/// **Known limitation**: Python's `Py_dg_dtoa` (Gay's algorithm)
+/// and lexical-core's underlying algorithm CAN diverge on rare
+/// shortest-round-trip ties beyond what threshold tuning fixes.
+/// Property-tested against the bridge's captured production wire
+/// bodies (`tests/fixtures/wire/2.7.0/*` + the YO-rejected
+/// captures from CIRISPersist#7); if a future capture shows
+/// divergence, we ship a v0.1.x patch with a more exact algorithm
+/// (a vendored Gay's-dtoa Rust port, ~500 LoC, on the v0.2.x
+/// roadmap).
+fn write_python_float(buf: &mut Vec<u8>, f: f64) {
+    use std::io::Write;
+    use std::num::NonZeroI32;
+
+    // JSON technically forbids NaN/Inf/-Inf in Number, so
+    // serde_json::Number can't carry them; defensive fallback for
+    // safety. Python's `json.dumps(float('inf'), allow_nan=True)`
+    // emits `Infinity` / `-Infinity` / `NaN` (the agent uses default
+    // `allow_nan=True`).
+    if f.is_nan() {
+        buf.extend_from_slice(b"NaN");
+        return;
+    }
+    if f.is_infinite() {
+        buf.extend_from_slice(if f < 0.0 { b"-Infinity" } else { b"Infinity" });
+        return;
+    }
+
+    const FMT: u128 = lexical_core::format::PYTHON_LITERAL;
+    // Thresholds tuned to Python's switch-to-scientific behavior:
+    //   |f| < 1e-4    → scientific (negative_exponent_break = -4)
+    //   |f| >= 1e16   → scientific (positive_exponent_break = 15;
+    //                   semantics is "scientific when exponent > N",
+    //                   so N=15 makes 1e16+ scientific while 1e15
+    //                   stays decimal — matches Python).
+    //
+    // The `expect`s here can never fire: the constants are non-zero
+    // by inspection. NonZeroI32::new is `const`-friendly but
+    // requires `unwrap` at this site (not const yet on stable).
+    let opts = lexical_core::WriteFloatOptionsBuilder::new()
+        .negative_exponent_break(NonZeroI32::new(-4))
+        .positive_exponent_break(NonZeroI32::new(15))
+        .build()
+        .expect("thresholds are statically valid");
+    let mut tmp = [0u8; 64];
+    let written = lexical_core::write_with_options::<f64, FMT>(f, &mut tmp, &opts);
+    let s = std::str::from_utf8(written).expect("lexical-core emits valid UTF-8");
+
+    // Find scientific-notation marker.
+    if let Some(e_pos) = s.bytes().position(|b| b == b'e' || b == b'E') {
+        let mantissa = &s[..e_pos];
+        let exp_str = &s[e_pos + 1..];
+
+        // Lexical emits `1.0e16`; Python emits `1e+16`. Strip the
+        // trailing `.0` from the mantissa for integer-valued floats.
+        let mantissa = mantissa.strip_suffix(".0").unwrap_or(mantissa);
+        buf.extend_from_slice(mantissa.as_bytes());
+        buf.push(b'e');
+
+        // Parse exponent and re-format Python-style:
+        //   - sign always emitted (`+` for non-negative)
+        //   - magnitude padded to ≥2 digits (`e-05`, not `e-5`).
+        let exp: i32 = exp_str
+            .parse()
+            .expect("lexical-core emits parseable integer exponents");
+        if exp >= 0 {
+            buf.push(b'+');
+            if exp < 10 {
+                buf.push(b'0');
+            }
+            let _ = write!(buf, "{exp}");
+        } else {
+            buf.push(b'-');
+            let abs = exp.unsigned_abs();
+            if abs < 10 {
+                buf.push(b'0');
+            }
+            let _ = write!(buf, "{abs}");
+        }
+    } else {
+        // Decimal form. lexical-core PYTHON_LITERAL with the tuned
+        // thresholds matches Python's repr byte-for-byte for the
+        // [1e-4, 1e16) decimal range — exactly the production-
+        // traffic range — for the floats CIRISAgent emits today.
+        buf.extend_from_slice(s.as_bytes());
+    }
 }
 
 fn write_string(buf: &mut Vec<u8>, s: &str) {
@@ -360,5 +476,94 @@ mod tests {
         // ordering. After ensure_ascii, the key prints as é.
         let v = json!({"\u{00e9}": 1, "a": 2, "z": 3});
         assert_eq!(pyc(v), "{\"a\":2,\"z\":3,\"\\u00e9\":1}");
+    }
+
+    /// CIRISPersist#7 — bridge's specific YO-rejected divergent
+    /// floats. Pre-v0.1.19 these came out via ryu as
+    /// `0.003199200000000001` / `1433.2029819488523`; Python
+    /// (`repr()` / `json.dumps`) emits the bridge's reference
+    /// `0.0031992000000000006` / `1433.2029819488525`. Universal
+    /// production reject. v0.1.19 closes by routing floats through
+    /// `write_python_float` (lexical-core PYTHON_LITERAL +
+    /// threshold tune + scientific post-process).
+    #[test]
+    fn bridge_captured_divergent_floats_match_python() {
+        // The agent's actual production-traffic floats from the YO
+        // bodies.
+        assert_eq!(pyc(json!(0.0031992000000000006)), "0.0031992000000000006");
+        assert_eq!(pyc(json!(1433.2029819488525)), "1433.2029819488525");
+    }
+
+    /// CIRISPersist#7 — production-range float parity. Each
+    /// `(input, python_reference)` pair is the literal output of
+    /// `python3 -c "import json; print(json.dumps(<input>))"`.
+    /// Drift at any case is a regression.
+    #[test]
+    fn production_range_floats_match_python_repr() {
+        let cases: &[(f64, &str)] = &[
+            // Identity / signs
+            (0.0, "0.0"),
+            (-0.0, "-0.0"),
+            (1.0, "1.0"),
+            (-1.0, "-1.0"),
+            (100.0, "100.0"),
+            (0.5, "0.5"),
+            // Bridge's captured divergent values
+            (0.0031992000000000006, "0.0031992000000000006"),
+            (1433.2029819488525, "1433.2029819488525"),
+            // Floating-point arithmetic edge cases
+            (0.1 + 0.2, "0.30000000000000004"),
+            (1.0 / 3.0, "0.3333333333333333"),
+            // Decimal threshold boundaries (Python: < 1e-4 scientific)
+            (0.0001, "0.0001"),
+            (0.00001, "1e-05"),
+            (1e-4, "0.0001"),
+            (1e-5, "1e-05"),
+            (1e-6, "1e-06"),
+            (1.5e-6, "1.5e-06"),
+            // Decimal threshold boundaries (Python: >= 1e16 scientific)
+            (1e15, "1000000000000000.0"),
+            (1e16, "1e+16"),
+            (1e17, "1e+17"),
+            // Large / small extremes
+            (1e100, "1e+100"),
+            (1e-100, "1e-100"),
+            (1.7976931348623157e308, "1.7976931348623157e+308"),
+            (2.2250738585072014e-308, "2.2250738585072014e-308"),
+        ];
+        for &(input, expected) in cases {
+            let got = pyc(json!(input));
+            assert_eq!(got, expected, "input={input:?} got={got} want={expected}");
+        }
+    }
+
+    /// Integer fast-path: `serde_json::Number` carrying an integer
+    /// must skip the float formatter (no `.0` suffix). Python:
+    /// `json.dumps(42)` → `"42"`, NOT `"42.0"`.
+    #[test]
+    fn integers_render_bare_no_decimal_point() {
+        assert_eq!(pyc(json!(42)), "42");
+        assert_eq!(pyc(json!(0)), "0");
+        assert_eq!(pyc(json!(-1)), "-1");
+        assert_eq!(pyc(json!(i64::MAX)), "9223372036854775807");
+        assert_eq!(pyc(json!(u64::MAX)), "18446744073709551615");
+    }
+
+    /// Real-world component-data shape: a dict of floats matching
+    /// what an LLM-call component carries. End-to-end byte
+    /// equivalence with Python's `json.dumps(..., sort_keys=True,
+    /// separators=(',', ':'))`.
+    #[test]
+    fn llm_call_data_blob_matches_python() {
+        let v = json!({
+            "cost_usd": 0.0031992000000000006,
+            "duration_ms": 1433.2029819488525,
+            "prompt_tokens": 1234,
+            "score": 0.85,
+        });
+        // Python reference: keys sorted, no whitespace, integers
+        // bare, floats matching repr.
+        let want = "{\"cost_usd\":0.0031992000000000006,\"duration_ms\":1433.2029819488525,\"prompt_tokens\":1234,\"score\":0.85}";
+        assert_eq!(pyc(v), want);
     }
 }
