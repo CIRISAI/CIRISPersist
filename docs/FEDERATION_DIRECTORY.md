@@ -1,6 +1,6 @@
 # Federation Directory — persist as substrate, trust as policy
 
-**Status:** architectural contract (v0.3.x track). Companion to
+**Status:** architectural contract (v0.2.x track). Companion to
 `docs/COHABITATION.md` (cohabitation doctrine — persist as the
 runtime keyring authority on a host) and the registry team's
 `docs/FEDERATION_CLIENT.md` (the registry-side complement
@@ -11,15 +11,28 @@ mode, trust-contract impact) were resolved in the
 persist/registry alignment conversation 2026-05; their decisions
 are recorded in §"Resolved decisions" below.
 
-**Sequencing:** persist v0.2.0 ships verify subsumption
+**Sequencing (re-sequenced 2026-05-02):** persist v0.2.0 ships
+the federation directory schema + `FederationDirectory` trait +
+bootstrap (self-signed `persist-steward` row) + per-backend
+implementations (memory + postgres + sqlite). Verify subsumption
 (CIRISPersist#4 — `Engine` grows verify-shaped proxy methods so
-lens/agent/bridge drop direct `ciris-verify` imports). The
-federation directory work in this doc lands at **v0.3.0** —
-verify subsumption is a prerequisite because `verify_build_manifest`
-needs the federation directory's `trusted_pubkey` lookup to be
-the bootstrap path. **Implementation is the v0.3.0 milestone;
-the schema is experimental during v0.3.x per §"v0.3.x
-experimental schema contract" and stabilizes at v0.4.0.**
+lens/agent/bridge drop direct `ciris-verify` imports) ships at
+v0.2.x as the immediate follow-on; the verify-subsumption
+`verify_build_manifest` proxy ships with implicit `trusted_pubkey`
+lookup against `federation_keys` from day one because the
+federation directory is already live.
+
+**Why the re-sequence**: CIRISRegistry's v1.4 work has already
+shipped scaffolding (vendored types, FederationDirectory trait,
+migration 024 cache columns, FEDERATION_DUAL_WRITE_ENABLED feature
+flag, telemetry counters, audit-log envelope_hash metadata) against
+the original v0.2.0-pre1 expectation. R_BACKFILL is blocked on
+persist publishing schema + trait + bootstrap. Shipping verify
+subsumption first would have left the registry team blocked for
+an entire major version cycle on otherwise-orthogonal work.
+
+**Schema is experimental during v0.2.x** per §"v0.2.x experimental
+schema contract" and stabilizes at v0.4.0 (read-path migration).
 
 Cross-references:
 - PoB §3.1 — federation as peer consensus
@@ -137,7 +150,29 @@ their local verifier, etc.).
 **Bootstrap:** the row that holds the steward's own key is
 self-signed (scrub_key_id = key_id). Consumers anchor "trust
 the steward" out-of-band (DNS validation, baked-in default,
-manual override).
+manual override). At persist v0.2.0 deploy, the migration creates
+the self-signed `persist-steward` row as a constant; the steward
+fingerprint is published in `CHANGELOG.md` v0.2.0 entry for
+out-of-band pinning.
+
+### `persist_row_hash` — server-computed for cache divergence
+
+Every `KeyRecord`, `Attestation`, and `Revocation` returned by
+read methods carries a `persist_row_hash: String` (hex-encoded
+SHA-256 over the row's canonical bytes). **Persist computes this
+server-side** so consumers can detect cache divergence (per
+`CIRISRegistry/docs/FEDERATION_CLIENT.md` §"Cache shape"
+`persist_row_hash` column) without reproducing persist's
+canonicalizer.
+
+The canonical bytes hashed are
+`PythonJsonDumpsCanonicalizer::canonicalize_value(&row_as_value)` —
+sorted keys, no whitespace, `ensure_ascii=True`, the Python-compat
+shape persist already uses for trace canonical bytes. Consumers
+do **not** need to know this — they store the hex string verbatim
+and compare string-equal on read-through. This avoids the
+"different shortest-round-trip" class of bugs that plagued the
+trace verify path through v0.1.20 (CIRISPersist#7).
 
 ### `federation_attestations`
 
@@ -411,11 +446,12 @@ Each phase is a separate persist version. Rough sequencing:
 
 | Persist version | What lands | Registry-side state |
 |---|---|---|
-| v0.2.0 | **Verify subsumption** (CIRISPersist#4) — `Engine` grows verify-shaped proxy methods (`sign`, `public_key`, `attestation_export`, `verify_build_manifest`, etc.). Higher layers drop direct `ciris-verify` imports. **Prerequisite for v0.3.0**: the federation directory's `trusted_pubkey` lookup is the bootstrap target for `verify_build_manifest`. | Registry continues using its existing `trusted_primitive_keys` admin RPC; no federation-directory work yet |
-| v0.3.0 | `federation_keys` schema + `FederationDirectory` trait + dual-write from existing `accord_public_keys` write paths + write-authority guards (rate limit + quota) + bootstrap migration (self-signed `persist-steward` row) | Dual-write peer behind `FEDERATION_DUAL_WRITE_ENABLED` (registry decides their own paired version; default off in registry until both sides are confident); experimental schema contract applies |
-| v0.3.x | `federation_attestations` + `federation_revocations` schema + trait methods + bilateral divergence telemetry | Registry begins issuing attestations via `federation_attestations.put` instead of writing keys directly |
-| v0.4.0 | Read-path migration; `lookup_public_key` reads federation table; v0.3.x experimental contract retires (schema becomes stable) | Registry can flip dual-write default to on; PG NOTIFY pubsub becomes a candidate cache-coherence polish |
-| v0.4.x | `accord_public_keys` deprecated to read-only view over `federation_keys WHERE identity_type='agent'` | Registry's own `trusted_primitive_keys`/`partner_keys`/`registry_signing_keys` become persist consumers; trust-contract diff lands on registry side |
+| v0.2.0-pre1 | `federation_keys` schema + `FederationDirectory` trait + serde types + at least one backend (postgres) + bootstrap migration (self-signed `persist-steward` row) + persist-steward fingerprint published + fixture JSON for serde validation. **Registry-unblock milestone** — R_BACKFILL can begin. | Backfill script unblocked; v1.4.0-rc1 work converges. |
+| v0.2.0 final | Memory + postgres + sqlite backends complete; write-authority guards (rate limit + per-primitive quota); `persist_row_hash` populated server-side on all read responses. **Two-week experimental-schema notice clock starts.** | Registry v1.4.0-rc1 cuts; staging soak begins. |
+| v0.2.x | **Verify subsumption** (CIRISPersist#4) — `Engine` grows verify-shaped proxy methods (`sign`, `public_key`, `attestation_export`, `verify_build_manifest`, etc.). Higher layers drop direct `ciris-verify` imports. `verify_build_manifest` proxy ships with implicit `trusted_pubkey` lookup against `federation_keys` from day one (federation directory is already live by this point). | Lens / agent / bridge migrate from direct `ciris-verify` imports to persist's API. |
+| v0.3.0 | `federation_attestations` + `federation_revocations` schema + trait methods + bilateral divergence telemetry + `as_of: Option<DateTime>` on read methods (Policy B substrate). Production-traffic schema soak with registry's dual-write integration. | Registry begins issuing attestations via `federation_attestations.put` instead of writing keys directly; v1.4.0 GA candidate. |
+| v0.4.0 | Read-path migration: `lookup_public_key` reads `federation_keys` first; backfill from `accord_public_keys`. v0.2.x/v0.3.x experimental schema contract retires (schema becomes stable; semver-major from here). | Registry can flip `FEDERATION_DUAL_WRITE_ENABLED` default to on; PG NOTIFY pubsub becomes a candidate cache-coherence polish. |
+| v0.4.x | `accord_public_keys` deprecated to read-only view over `federation_keys WHERE identity_type='agent'` | Registry's own `trusted_primitive_keys`/`partner_keys`/`registry_signing_keys` become persist consumers; trust-contract diff lands on registry side. |
 
 ---
 
@@ -440,7 +476,7 @@ the contract.
 
 These are the operational guarantees both sides commit to. They
 sit alongside the schema and trait surface as part of the
-v0.3.x→v0.4.x migration contract.
+v0.2.x→v0.4.x migration contract.
 
 ### Write authority — scrub-signature is auth
 
@@ -468,7 +504,7 @@ Two operational guards on top:
 ### Cache freshness — TTL + invalidate-on-write
 
 Consumers maintain their own cache. Two coherence mechanisms in
-v0.3.x:
+v0.2.x:
 
 - **TTL.** Default 5 minutes. Tunable per consumer; registry
   starts at 5 min as a balance between freshness and load.
@@ -480,7 +516,7 @@ v0.3.x:
 
 **Deferred to persist v0.4.x:** PG NOTIFY pubsub channel
 on `federation_keys` insert/update so consumers can subscribe to
-peer-published changes without polling. Not in v0.3.x — adds
+peer-published changes without polling. Not in v0.2.x — adds
 infrastructure that makes single-node dev painful, and the
 5-minute TTL lag is operationally tolerable for the migration
 phase.
@@ -507,7 +543,7 @@ page-worthy.
 
 ### Bilateral divergence telemetry
 
-Both sides instrument the dual-write hop during the v0.3.x
+Both sides instrument the dual-write hop during the v0.2.x/v0.3.x
 experimental phase. Divergence between persist's
 `federation_keys` row and the consumer's local table on
 read-through is signal we want to see fast, not at v0.4.0
@@ -518,22 +554,22 @@ cutover.
 | Registry | `federation_dual_write_divergence_total` | Persist's `federation_keys` row differs from registry's local on read-through (e.g., key bytes mismatch, valid_until skew, scrub-signature failure on persist's row) |
 | Persist | `federation_directory_writes_total{outcome="ok\|divergent\|rejected"}` | Every write attempt by outcome; `divergent` covers "row would conflict with existing federation_keys row" |
 
-Both surfaced via `/metrics`. Non-zero divergence in v0.3.x is a
-schema-bug signal; non-zero divergence in v0.4.x+ is a real
+Both surfaced via `/metrics`. Non-zero divergence during v0.2.x/v0.3.x
+is a schema-bug signal; non-zero divergence in v0.4.x+ is a real
 incident.
 
 ---
 
-## v0.3.x experimental schema contract
+## v0.2.x/v0.3.x experimental schema contract
 
-Persist's `federation_keys` (and v0.3.x `federation_attestations`/
-`federation_revocations`) ships as **experimental but
-production-functional**. The contract:
+Persist's `federation_keys` (v0.2.0) and v0.3.x
+`federation_attestations`/`federation_revocations` ship as
+**experimental but production-functional**. The contract:
 
-- **Persist may break the schema during v0.3.x with two-week
-  written notice** (CHANGELOG entry + GitHub issue tagged
+- **Persist may break the schema during v0.2.x or v0.3.x with
+  two-week written notice** (CHANGELOG entry + GitHub issue tagged
   `federation-schema-break` + proactive notification to known
-  consumers).
+  consumers). The notice clock starts at v0.2.0 final.
 - **Registry's dual-write is feature-flagged**
   (`FEDERATION_DUAL_WRITE_ENABLED`, default off; registry
   decides the paired version on their side). Roll-back is
