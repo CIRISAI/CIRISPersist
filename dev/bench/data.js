@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777700656955,
+  "lastUpdate": 1777701176033,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -3245,6 +3245,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 22496304,
             "range": "± 464246",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "6c89db988bf67d151d899fad8e9c6538df64184c",
+          "message": "0.1.21 — SQLite Backend Phase 1 parity\n\nLens team requested SQLite parity before v0.2.0. SQLite was a\ndeclared-but-stubbed feature since v0.1.9 (rusqlite pinned, sqlite\nfeature flag declared, empty migrations/sqlite/, no SqliteBackend).\nv0.1.21 makes it real.\n\nSchema (migrations/sqlite/lens/):\n- V001 — translates postgres V001: BIGSERIAL→INTEGER PRIMARY KEY\n  AUTOINCREMENT, TIMESTAMPTZ→TEXT (RFC 3339), JSONB→TEXT,\n  BOOLEAN→INTEGER, DOUBLE PRECISION→REAL. Drops CREATE SCHEMA +\n  cirislens. namespace, TimescaleDB hypertables, IS DISTINCT FROM\n  (→ IS NOT). Same dedup index shape (THREAT_MODEL.md AV-9).\n- V003 — straightforward ALTER TABLE ADD COLUMN translation.\n\nSqliteBackend (src/store/sqlite.rs, ~580 LoC):\n- Backend trait Phase 1 surface: insert_trace_events_batch,\n  insert_trace_llm_calls_batch, lookup_public_key,\n  sample_public_keys, run_migrations.\n- Arc<Mutex<Connection>> + tokio::task::spawn_blocking adapter.\n- Boot pragmas: foreign_keys=ON, journal_mode=WAL, synchronous=NORMAL.\n- File-backed via SqliteBackend::open(path); :memory: via\n  open_in_memory() for tests.\n\nCargo.toml:\n- sqlite = [\"dep:rusqlite\", \"dep:refinery\", \"refinery/rusqlite\"]\n- rusqlite 0.31 (pin held from v0.1.9) with bundled + chrono +\n  serde_json features.\n- refinery already in postgres; sqlite adds the rusqlite feature.\n\nTests (7 new):\n- migrations_run_clean_in_memory\n- insert_idempotent (mirror of postgres test)\n- distinct_attempts_both_land (FSD §3.4 #4)\n- llm_calls_batch_insert\n- empty_batches_are_noops\n- lookup_public_key_round_trip (base64 → 32-byte VerifyingKey)\n- revoked_keys_filtered (lookup + sample both)\n\nSubstrate matrix after v0.1.21: MemoryBackend (Phase 1), PostgresBackend\n(Phase 1), SqliteBackend (Phase 1, NEW). All three implement the same\ntrait surface; lens ingest path is substrate-agnostic.\n\n150 tests green (128 lib + 22 integration; +7 sqlite). Clippy clean\nacross postgres + sqlite + server + pyo3 + tls. cargo-deny clean.\n\nv0.2.0 unblocked per the v0.1.21 → v0.2.0 → v0.3.0 sequencing in\ndocs/ROADMAP.md.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-02T00:46:49-05:00",
+          "tree_id": "089072c8b164be4baba91a7304f82e30600ebdfe",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/6c89db988bf67d151d899fad8e9c6538df64184c"
+        },
+        "date": 1777701175602,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 90595,
+            "range": "± 440",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 233383,
+            "range": "± 429",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 517317,
+            "range": "± 3395",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 2019220,
+            "range": "± 46678",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 328,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1272,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7740,
+            "range": "± 16",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 305,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3289,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9533,
+            "range": "± 18",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 43851,
+            "range": "± 165",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 543,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2166015,
+            "range": "± 62808",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6366512,
+            "range": "± 78520",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 22497626,
+            "range": "± 485894",
             "unit": "ns/iter"
           }
         ]
