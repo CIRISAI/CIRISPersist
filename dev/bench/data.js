@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777740675379,
+  "lastUpdate": 1777742082691,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -3815,6 +3815,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 22510239,
             "range": "± 713366",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "978dc59276654f2c2208a07d3116b090ef634a7a",
+          "message": "v0.2.0 federation: hybrid PQC schema (hot Ed25519 + cold ML-DSA-65)\n\nUser directive: hybrid Ed25519 + ML-DSA-65 is the ONLY signing scheme\nacross the federation, period. Anything less and we're retroactively\ncompromised when quantum spins.\n\nBut wait-until-everything-is-fast-PQC ships never. So:\n**hot-path Ed25519 + cold-path ML-DSA-65 = post-quantum safe history,\nfederation speed at write time.**\n\nWriter contract:\n  1. Sign canonical with Ed25519 (hot, synchronous)\n  2. Write the row (PQC fields may be None at this step)\n  3. IMMEDIATELY kick off ML-DSA-65 sign on cold path (no delay,\n     no batching, just off the synchronous request path)\n  4. Call attach_pqc_signature once cold path completes;\n     pqc_completed_at timestamps the moment the row became\n     hybrid-secure\n\nSchema (V004 postgres + sqlite):\n- pubkey_ed25519_base64: TEXT NOT NULL (32 raw bytes, base64)\n- pubkey_ml_dsa_65_base64: TEXT (1952 raw bytes, base64; nullable\n  during cold-path window)\n- algorithm: TEXT NOT NULL CHECK (algorithm = 'hybrid') — schema-\n  enforced; persist runtime also checks before writes\n- scrub_signature_classical: TEXT NOT NULL (Ed25519 sig over\n  canonical)\n- scrub_signature_pqc: TEXT (ML-DSA-65 sig over canonical ||\n  classical_sig — bound to prevent stripping; nullable until cold\n  path completes)\n- pqc_completed_at: TIMESTAMPTZ (timestamp when row became hybrid-\n  secure; observability + telemetry surface)\n\nSame schema shape on federation_attestations + federation_revocations.\n\nTypes (src/federation/types.rs):\n- KeyRecord/Attestation/Revocation: pubkey_base64 → pubkey_ed25519_\n  base64 + Option<pubkey_ml_dsa_65_base64>; scrub_signature →\n  scrub_signature_classical + Option<scrub_signature_pqc>; new\n  Option<pqc_completed_at>\n- algorithm constants: dropped ED25519 + ML_DSA_65 (only HYBRID\n  remains; consumers using the old constants now compile-error)\n- Per-type is_pqc_complete()/is_pqc_pending() helpers for\n  consumers composing soft-hybrid + freshness policies\n\nPer CIRISVerify spec\n(ciris-verify-core/src/security/function_integrity.rs:149\nManifestSignature, ciris-crypto/src/types.rs:156 HybridSignature,\ndocs/BUILD_MANIFEST.md L104). Bound signature pattern: PQC covers\ndata || classical_signature, prevents stripping when classical\nbreaks.\n\nBackends (memory, postgres, sqlite):\n- All three updated for the new shape\n- Memory backend's put_public_key validates algorithm = \"hybrid\"\n  before any other check\n- Postgres + sqlite use the schema CHECK constraint as defense in\n  depth on top of the runtime check\n- pg_row_to_*/sqlite_row_to_* converters carry pqc_completed_at\n  through\n\nTrust contract section added to docs/FEDERATION_DIRECTORY.md:\n- \"Eventual consistency as a federation primitive\" — layered\n  eventual-consistency commitments (PQC completion, replication,\n  cache freshness, peer attestation, revocation propagation) with\n  observability signals for each\n- Strict-hybrid / soft-hybrid+freshness / pure-attestation-graph\n  policy examples\n- What persist commits to (every signal exposed, eventual property\n  converges, divergence alarm-able) vs what it explicitly does NOT\n  (strong consistency, synchronous PQC, single-policy enforcement)\n- Phase transition: when require_pqc_on_write flips, \"PQC\n  completion\" eventual property becomes synchronous; all other\n  eventual layers stay as they were\n\nTests:\n- pqc_complete_vs_pending in types.rs (4 cases)\n- All federation memory + sqlite tests still pass with the new\n  shape (most use the hybrid-pending fixture variant)\n- 148 lib tests green; clippy clean across all features\n\nHelper binary (src/bin/derive_persist_steward_bootstrap.rs)\nneeds updating for the new bound-signature handoff protocol +\nML-DSA-65 input — that's the next commit.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-02T12:07:56-05:00",
+          "tree_id": "5373272c7d9b1bf70e921d19dac7795f82d32a06",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/978dc59276654f2c2208a07d3116b090ef634a7a"
+        },
+        "date": 1777742082190,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 96054,
+            "range": "± 878",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 236908,
+            "range": "± 810",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 518196,
+            "range": "± 1881",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1845478,
+            "range": "± 17625",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 378,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1587,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 9072,
+            "range": "± 79",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 378,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3177,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9330,
+            "range": "± 40",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 40427,
+            "range": "± 119",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2191871,
+            "range": "± 73628",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6353310,
+            "range": "± 154161",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 22509388,
+            "range": "± 972112",
             "unit": "ns/iter"
           }
         ]
