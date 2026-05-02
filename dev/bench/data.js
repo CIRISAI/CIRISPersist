@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777700438030,
+  "lastUpdate": 1777700656955,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -3131,6 +3131,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 22626913,
             "range": "± 422870",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "fdc7047f8a8b901c4f6ef0b6a311831c6c24fbe5",
+          "message": "docs(roadmap): waterfall + Gantt; remove delivery-timeline references\n\nUser wanted the roadmap re-shaped: drop calendar/schedule\nestimates, lay it out as a dependency waterfall with explicit\nparallelizability, and visualize as a Gantt where positions\nindicate sequence (not delivery dates).\n\nNew: docs/ROADMAP.md\n  - Unified Mermaid Gantt covering v0.2.0 → v0.4.x\n  - Phase-by-phase waterfall with explicit dependency arrows\n    (sequential `→` and parallel `║`)\n  - Critical-path section identifying the strict dependency\n    chain vs items that can slip within a phase\n  - Explicit \"what this roadmap does NOT promise\" disclaimer:\n    no delivery dates, no work-effort estimates, no commitment\n    that every v0.3.x item ships in a single release\n  - Cross-references to V0.2.0_VERIFY_SUBSUMPTION.md (v0.2.0\n    plan) and FEDERATION_DIRECTORY.md (v0.3.0+ contract)\n\nUpdated: docs/V0.2.0_VERIFY_SUBSUMPTION.md\n  - \"Sequencing within v0.2.0\" section (Day-1-2 / Day-3-5 / ...\n    table) replaced with \"Work breakdown — dependencies, no\n    timeline\"\n  - Inline Mermaid Gantt for the v0.2.0 phase\n  - Explicit dependency-rule list (`v20a → v20b → v20c* → v20d\n    → v20e → v20f`) showing where the four proxy method groups\n    parallelize\n  - Pointer to docs/ROADMAP.md for the full v0.2.0 → v0.4.x\n    graph\n\nBoth Gantts use Mermaid `dateFormat X` (numeric position, not\ncalendar dates). Surrounding text disclaims the dates: \"positions\nare dependency sequence, not delivery dates.\"\n\nThe v0.3.x→v0.4.x experimental-contract clauses keep the\n\"two-week written notice\" language because that's a\nbreaking-change notification commitment in a contract, not a\nproject timeline. The \"10 keys per primitive identity per day\"\nwrite quota is an operational rate-limit, not a delivery\nschedule. Both intentionally retained.\n\nNo code changes; doc-only.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-02T00:38:09-05:00",
+          "tree_id": "0414a69003129d22440322b3814203ced603c8dd",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/fdc7047f8a8b901c4f6ef0b6a311831c6c24fbe5"
+        },
+        "date": 1777700656108,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 95422,
+            "range": "± 2693",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 235588,
+            "range": "± 1341",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 514925,
+            "range": "± 3320",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1831224,
+            "range": "± 21675",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 380,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1569,
+            "range": "± 45",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 9050,
+            "range": "± 183",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 364,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3046,
+            "range": "± 17",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9192,
+            "range": "± 248",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 40030,
+            "range": "± 231",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2156004,
+            "range": "± 197599",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6317224,
+            "range": "± 170221",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 22496304,
+            "range": "± 464246",
             "unit": "ns/iter"
           }
         ]
