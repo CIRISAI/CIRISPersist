@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777701176033,
+  "lastUpdate": 1777739782686,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -3359,6 +3359,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 22497626,
             "range": "± 485894",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "9a5c97e9490b05873a0d15c5a30b57b61f8bf9cc",
+          "message": "docs(roadmap): re-sequence — v0.2.0 federation directory, v0.2.x verify subsumption\n\nPer registry-team alignment: CIRISRegistry's v1.4 scaffolding has\nalready shipped against the original v0.2.0-pre1 expectation\n(vendored types matching FEDERATION_DIRECTORY.md, FederationDirectory\ntrait, migration 024 cache columns, FEDERATION_DUAL_WRITE_ENABLED\nflag, telemetry counters, audit-log envelope_hash metadata; see\nCIRISRegistry/docs/FEDERATION_CLIENT.md). R_BACKFILL is blocked on\npersist publishing schema + trait + bootstrap.\n\nThe previous re-sequence (v0.2.0 verify subsumption, v0.3.0\nfederation directory) would have left the registry team blocked\nfor an entire major version cycle on otherwise-orthogonal work.\nThe two milestones are independent — verify subsumption is a\nPyO3 proxy expansion (Python wheel side), federation directory is\na schema + trait + backend impls (Rust crate side). Shipping\nfederation directory first means:\n\n- Registry's R_BACKFILL unblocks at v0.2.0-pre1\n- v0.2.x verify_build_manifest proxy ships with implicit\n  trusted_pubkey lookup from day one (no v0.2.0 caller-provides\n  / v0.3.0 dropped-arg shuffle)\n- Consumers migrate once\n\nUpdates:\n\ndocs/ROADMAP.md\n- v0.2.0 = federation directory schema + trait + bootstrap +\n  per-backend impls (memory + postgres + sqlite) + persist-steward\n  fingerprint + fixture JSON + write-authority guards\n- v0.2.0-pre1 milestone = registry-unblock minimum (schema +\n  trait + at least one backend + bootstrap + fingerprint +\n  fixtures)\n- v0.2.x = verify subsumption (CIRISPersist#4)\n- v0.3.0 = federation_attestations + federation_revocations +\n  divergence telemetry + as_of: Option<DateTime>\n- v0.4.0 = read-path migration (unchanged)\n- v0.4.x = deprecation + polish (unchanged)\n- Critical path updated to reflect new dependency chain\n- Cross-references in TL;DR updated\n\ndocs/FEDERATION_DIRECTORY.md\n- Status changed from v0.3.x track to v0.2.x track\n- Added \"Sequencing (re-sequenced 2026-05-02)\" section with\n  rationale\n- New §\"persist_row_hash — server-computed for cache divergence\"\n  section: persist canonicalizes via PythonJsonDumpsCanonicalizer\n  and ships hex-encoded hash on every read response. Consumers\n  store + string-compare; no client-side canonicalizer needed.\n  Closes the canonical-hash divergence risk identified in the\n  registry's vendored types.rs\n- Migration table reshaped: v0.2.0-pre1 (registry-unblock) →\n  v0.2.0 final → v0.2.x → v0.3.0 → v0.4.0 → v0.4.x\n- Operational contract section: experimental schema clock starts\n  at v0.2.0 final (was v0.3.0 final)\n- Telemetry section + experimental schema contract updated to\n  v0.2.x/v0.3.x cadence\n\ndocs/V0.2.0_VERIFY_SUBSUMPTION.md\n- Title and TL;DR updated to v0.2.x\n- \"Why verify subsumption first\" → \"Why verify subsumption\n  follows federation directory\" with re-sequence rationale\n- verify_build_manifest signature simplified: takes (bytes,\n  primitive) only; trusted_pubkey lookup is implicit via\n  federation directory which is live by v0.2.x\n- Doc filename retained for git-history continuity\n\nTask tracking:\n- #82 v0.2.0 → v0.2.x verify subsumption\n- #88 v0.3.0 → v0.2.0 federation directory (now in_progress)\n\nNo code changes; doc-only.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-02T11:28:16-05:00",
+          "tree_id": "83d2c10e52571ef2466e232020a4c5f377c755ca",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/9a5c97e9490b05873a0d15c5a30b57b61f8bf9cc"
+        },
+        "date": 1777739781890,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 89877,
+            "range": "± 1172",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 232304,
+            "range": "± 1248",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 513561,
+            "range": "± 7638",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 2033961,
+            "range": "± 49909",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 329,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1274,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7722,
+            "range": "± 18",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 310,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3201,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9752,
+            "range": "± 39",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 43911,
+            "range": "± 200",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 538,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2138219,
+            "range": "± 114206",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6285668,
+            "range": "± 136738",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 22449358,
+            "range": "± 263717",
             "unit": "ns/iter"
           }
         ]
