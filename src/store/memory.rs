@@ -45,8 +45,18 @@ struct State {
     llm_calls: Vec<TraceLlmCallRow>,
     /// Monotonic event_id counter (mimics Postgres BIGSERIAL).
     next_event_id: i64,
-    /// Public-key directory.
+    /// Public-key directory (legacy `accord_public_keys` shape; used
+    /// by the trace-verify path).
     keys: HashMap<String, VerifyingKey>,
+    /// v0.2.0 — Federation directory `federation_keys` rows,
+    /// keyed by `key_id`.
+    federation_keys: HashMap<String, crate::federation::KeyRecord>,
+    /// v0.2.0 — Federation `federation_attestations` rows,
+    /// append-only.
+    federation_attestations: Vec<crate::federation::Attestation>,
+    /// v0.2.0 — Federation `federation_revocations` rows,
+    /// append-only.
+    federation_revocations: Vec<crate::federation::Revocation>,
 }
 
 impl Default for MemoryBackend {
@@ -57,6 +67,9 @@ impl Default for MemoryBackend {
                 llm_calls: Vec::new(),
                 next_event_id: 1,
                 keys: HashMap::new(),
+                federation_keys: HashMap::new(),
+                federation_attestations: Vec::new(),
+                federation_revocations: Vec::new(),
             }),
         }
     }
@@ -143,6 +156,155 @@ impl Backend for MemoryBackend {
     async fn run_migrations(&self) -> Result<(), Error> {
         // Memory backend has no schema to migrate.
         Ok(())
+    }
+}
+
+// ─── FederationDirectory impl (v0.2.0) ─────────────────────────────
+//
+// In-process maps mirror the postgres tables. No FK enforcement
+// (postgres + sqlite enforce; tests against the memory backend run
+// against the same logical contract via the `FederationDirectory`
+// trait). `persist_row_hash` is computed on every put per the
+// architectural contract — consumers see the canonical hash even
+// against the in-memory backend.
+
+impl crate::federation::FederationDirectory for MemoryBackend {
+    async fn put_public_key(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = record.record;
+        // Server-computed hash (excludes the field itself).
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let mut state = self.state.lock().expect("memory backend lock");
+        // Idempotent on key_id collision with matching content.
+        if let Some(existing) = state.federation_keys.get(&row.key_id) {
+            if existing.persist_row_hash == row.persist_row_hash {
+                return Ok(()); // exact duplicate — no-op
+            }
+            return Err(crate::federation::Error::Conflict(format!(
+                "key_id {} already exists with different content",
+                row.key_id
+            )));
+        }
+        state.federation_keys.insert(row.key_id.clone(), row);
+        Ok(())
+    }
+
+    async fn lookup_public_key(
+        &self,
+        key_id: &str,
+    ) -> Result<Option<crate::federation::KeyRecord>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(state.federation_keys.get(key_id).cloned())
+    }
+
+    async fn lookup_keys_for_identity(
+        &self,
+        identity_ref: &str,
+    ) -> Result<Vec<crate::federation::KeyRecord>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(state
+            .federation_keys
+            .values()
+            .filter(|k| k.identity_ref == identity_ref)
+            .cloned()
+            .collect())
+    }
+
+    async fn put_attestation(
+        &self,
+        attestation: crate::federation::SignedAttestation,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = attestation.attestation;
+        let mut state = self.state.lock().expect("memory backend lock");
+        // FK enforcement parity with postgres: both attesting_key_id
+        // and attested_key_id must exist in federation_keys.
+        if !state.federation_keys.contains_key(&row.attesting_key_id) {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "attesting_key_id {} does not exist in federation_keys",
+                row.attesting_key_id
+            )));
+        }
+        if !state.federation_keys.contains_key(&row.attested_key_id) {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "attested_key_id {} does not exist in federation_keys",
+                row.attested_key_id
+            )));
+        }
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        state.federation_attestations.push(row);
+        Ok(())
+    }
+
+    async fn list_attestations_for(
+        &self,
+        attested_key_id: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_attestations
+            .iter()
+            .filter(|a| a.attested_key_id == attested_key_id)
+            .cloned()
+            .collect();
+        // Match postgres ORDER BY asserted_at DESC.
+        rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
+        Ok(rows)
+    }
+
+    async fn list_attestations_by(
+        &self,
+        attesting_key_id: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_attestations
+            .iter()
+            .filter(|a| a.attesting_key_id == attesting_key_id)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
+        Ok(rows)
+    }
+
+    async fn put_revocation(
+        &self,
+        revocation: crate::federation::SignedRevocation,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = revocation.revocation;
+        let mut state = self.state.lock().expect("memory backend lock");
+        if !state.federation_keys.contains_key(&row.revoked_key_id) {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "revoked_key_id {} does not exist in federation_keys",
+                row.revoked_key_id
+            )));
+        }
+        if !state.federation_keys.contains_key(&row.revoking_key_id) {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "revoking_key_id {} does not exist in federation_keys",
+                row.revoking_key_id
+            )));
+        }
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        state.federation_revocations.push(row);
+        Ok(())
+    }
+
+    async fn revocations_for(
+        &self,
+        revoked_key_id: &str,
+    ) -> Result<Vec<crate::federation::Revocation>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_revocations
+            .iter()
+            .filter(|r| r.revoked_key_id == revoked_key_id)
+            .cloned()
+            .collect();
+        // Match postgres ORDER BY effective_at DESC.
+        rows.sort_by_key(|a| std::cmp::Reverse(a.effective_at));
+        Ok(rows)
     }
 }
 
@@ -262,15 +424,17 @@ mod tests {
         let vkey = signing.verifying_key();
 
         // Lookup with no entry → None (typed; not panic).
-        assert!(backend
-            .lookup_public_key("missing")
+        // Disambiguate: both Backend and FederationDirectory traits
+        // expose `lookup_public_key` post-v0.2.0; this test exercises
+        // the legacy Backend (VerifyingKey) shape used by the trace
+        // verify path.
+        assert!(Backend::lookup_public_key(&backend, "missing")
             .await
             .unwrap()
             .is_none());
 
         backend.add_public_key("key-id-1", vkey);
-        let got = backend
-            .lookup_public_key("key-id-1")
+        let got = Backend::lookup_public_key(&backend, "key-id-1")
             .await
             .unwrap()
             .expect("registered key returns Some");
@@ -383,5 +547,290 @@ mod tests {
         };
         let err = backend.append_audit_entry(&entry).await.unwrap_err();
         assert!(matches!(err, Error::NotImplemented(_)));
+    }
+
+    // ─── FederationDirectory tests ─────────────────────────────────
+
+    use crate::federation::{
+        Attestation, FederationDirectory, KeyRecord, Revocation, SignedAttestation,
+        SignedKeyRecord, SignedRevocation,
+    };
+
+    fn fix_key(key_id: &str, identity_ref: &str, scrub_key_id: &str) -> KeyRecord {
+        KeyRecord {
+            key_id: key_id.into(),
+            pubkey_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            algorithm: crate::federation::types::algorithm::ED25519.into(),
+            identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
+            identity_ref: identity_ref.into(),
+            valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
+            valid_until: None,
+            registration_envelope: serde_json::json!({"id": key_id}),
+            original_content_hash: "deadbeef".into(),
+            scrub_signature: "c2lnbmF0dXJl".into(),
+            scrub_key_id: scrub_key_id.into(),
+            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            persist_row_hash: String::new(),
+        }
+    }
+
+    fn fix_attestation(
+        id: &str,
+        attesting: &str,
+        attested: &str,
+        scrub_key_id: &str,
+    ) -> Attestation {
+        Attestation {
+            attestation_id: id.into(),
+            attesting_key_id: attesting.into(),
+            attested_key_id: attested.into(),
+            attestation_type: crate::federation::types::attestation_type::VOUCHES_FOR.into(),
+            weight: Some(1.0),
+            asserted_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+            expires_at: None,
+            attestation_envelope: serde_json::json!({"id": id}),
+            original_content_hash: "abc123".into(),
+            scrub_signature: "c2ln".into(),
+            scrub_key_id: scrub_key_id.into(),
+            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            persist_row_hash: String::new(),
+        }
+    }
+
+    fn fix_revocation(id: &str, revoked: &str, revoking: &str, scrub_key_id: &str) -> Revocation {
+        Revocation {
+            revocation_id: id.into(),
+            revoked_key_id: revoked.into(),
+            revoking_key_id: revoking.into(),
+            reason: Some("test".into()),
+            revoked_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+            effective_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+            revocation_envelope: serde_json::json!({"id": id}),
+            original_content_hash: "abc123".into(),
+            scrub_signature: "c2ln".into(),
+            scrub_key_id: scrub_key_id.into(),
+            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            persist_row_hash: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn put_and_lookup_public_key() {
+        let backend = MemoryBackend::new();
+        let key = fix_key("persist-steward", "persist", "persist-steward");
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: key.clone(),
+            })
+            .await
+            .unwrap();
+
+        // Disambiguate: both Backend and FederationDirectory traits
+        // expose `lookup_public_key`; here we want the federation
+        // KeyRecord shape, not the legacy VerifyingKey.
+        let got = FederationDirectory::lookup_public_key(&backend, "persist-steward")
+            .await
+            .unwrap();
+        assert!(got.is_some());
+        let got = got.unwrap();
+        assert_eq!(got.key_id, "persist-steward");
+        assert_eq!(got.identity_ref, "persist");
+        // persist_row_hash is server-computed.
+        assert_eq!(got.persist_row_hash.len(), 64);
+        assert_ne!(got.persist_row_hash, key.persist_row_hash);
+    }
+
+    #[tokio::test]
+    async fn lookup_unknown_returns_none() {
+        let backend = MemoryBackend::new();
+        let got = FederationDirectory::lookup_public_key(&backend, "missing")
+            .await
+            .unwrap();
+        assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn idempotent_put_same_content() {
+        let backend = MemoryBackend::new();
+        let key = fix_key("persist-steward", "persist", "persist-steward");
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: key.clone(),
+            })
+            .await
+            .unwrap();
+        // Same content — idempotent no-op.
+        backend
+            .put_public_key(SignedKeyRecord { record: key })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn put_conflict_different_content() {
+        let backend = MemoryBackend::new();
+        let mut key1 = fix_key("k1", "primitive-a", "k1");
+        key1.identity_type = "primitive".into();
+        let mut key2 = fix_key("k1", "primitive-b", "k1");
+        key2.identity_type = "primitive".into();
+        backend
+            .put_public_key(SignedKeyRecord { record: key1 })
+            .await
+            .unwrap();
+        let err = backend
+            .put_public_key(SignedKeyRecord { record: key2 })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::federation::Error::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn lookup_keys_for_identity_filters() {
+        let backend = MemoryBackend::new();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("k-persist-1", "persist", "k-persist-1"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("k-persist-2", "persist", "k-persist-2"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("k-other", "lens", "k-other"),
+            })
+            .await
+            .unwrap();
+        let persist_keys = backend.lookup_keys_for_identity("persist").await.unwrap();
+        assert_eq!(persist_keys.len(), 2);
+        let lens_keys = backend.lookup_keys_for_identity("lens").await.unwrap();
+        assert_eq!(lens_keys.len(), 1);
+        let none = backend.lookup_keys_for_identity("missing").await.unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn put_attestation_requires_both_keys_exist() {
+        let backend = MemoryBackend::new();
+        // Neither key exists yet — should fail with InvalidArgument.
+        let att = fix_attestation("a-1", "registry-steward", "primitive-a", "registry-steward");
+        let err = backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::federation::Error::InvalidArgument(_)));
+
+        // Add the keys; retry succeeds.
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("registry-steward", "registry", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("primitive-a", "primitive-a", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        let att = fix_attestation("a-1", "registry-steward", "primitive-a", "registry-steward");
+        backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_attestations_for_and_by() {
+        let backend = MemoryBackend::new();
+        // Bootstrap: registry-steward, two primitives, three attestations.
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("registry-steward", "registry", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("k-a", "primitive-a", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("k-b", "primitive-b", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_attestation(
+                    "att-1",
+                    "registry-steward",
+                    "k-a",
+                    "registry-steward",
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_attestation(
+                    "att-2",
+                    "registry-steward",
+                    "k-b",
+                    "registry-steward",
+                ),
+            })
+            .await
+            .unwrap();
+
+        // Two attestations from registry-steward.
+        let by = backend
+            .list_attestations_by("registry-steward")
+            .await
+            .unwrap();
+        assert_eq!(by.len(), 2);
+
+        // One attestation FOR k-a.
+        let for_a = backend.list_attestations_for("k-a").await.unwrap();
+        assert_eq!(for_a.len(), 1);
+        assert_eq!(for_a[0].attestation_id, "att-1");
+    }
+
+    #[tokio::test]
+    async fn revocation_round_trip() {
+        let backend = MemoryBackend::new();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("registry-steward", "registry", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("k-bad", "primitive-bad", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_revocation(SignedRevocation {
+                revocation: fix_revocation(
+                    "rev-1",
+                    "k-bad",
+                    "registry-steward",
+                    "registry-steward",
+                ),
+            })
+            .await
+            .unwrap();
+        let revs = backend.revocations_for("k-bad").await.unwrap();
+        assert_eq!(revs.len(), 1);
+        assert_eq!(revs[0].revocation_id, "rev-1");
+        assert_eq!(revs[0].persist_row_hash.len(), 64);
     }
 }
