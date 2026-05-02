@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777699450934,
+  "lastUpdate": 1777700045761,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -2903,6 +2903,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 22621670,
             "range": "± 361305",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "df73e73598b40fb2774cd374af1babd9ac4fe4eb",
+          "message": "docs(federation): fold registry sign-off into FEDERATION_DIRECTORY.md\n\nRegistry team signed off on Q4 ceiling, v0.2.x dual-write contract,\nand the two raised questions (cache invalidation + write authority).\nUpdate the doc to reflect the resolved positions — the Open design\nquestions section becomes Resolved decisions; new Operational\ncontract section captures the concrete guarantees both sides commit\nto; new v0.2.x experimental schema contract section spells out the\n2-week deprecation arrangement.\n\nResolved (5 questions):\n  Q1 — Separate federation_keys table (no schema churn on\n       accord_public_keys).\n  Q2 — Self-publish + post-hoc attestation. Registry's\n       RegisterTrustedPrimitiveKey RPC shifts from issuance\n       to attestation call (writes federation_attestations\n       with attesting_key_id=registry-steward).\n  Q3 — Eventually-consistent + TTL. Matches CIRISVerify's\n       existing pubkey-pinning window.\n  Q4 — Fail-open from cache by default; PERSIST_REQUIRED=true\n       opt-in fail-closed; max_stale_cache_age_seconds=3600\n       hard ceiling regardless of mode (closes deliberate-outage\n       attack on revoked-key replay).\n  Q5 — TRUST_CONTRACT.md diff at persist v0.3.x. Path A\n       splits into A1+A2; Path D for multi-peer aggregation.\n       Registry team owns the diff.\n\nOperational contract:\n  - Write authority: scrub-signature is auth. No per-primitive\n    API keys. Per-source-IP rate limit (60/min default) +\n    per-primitive write quota (10 keys/day default).\n  - Cache: TTL (5 min default) + invalidate-on-write.\n    PG NOTIFY pubsub deferred to v1.5 / persist v0.3.x.\n  - Fail-mode: fail-open default + PERSIST_REQUIRED opt-in +\n    max_stale_cache_age_seconds=3600 hard ceiling.\n    cache_age_seconds always emitted in verify response.\n  - Bilateral telemetry: registry's\n    federation_dual_write_divergence_total mirrored by persist's\n    federation_directory_writes_total{outcome=...}. Non-zero\n    divergence in v0.2.x is a schema-bug signal; in v0.3.x+\n    is a real incident.\n\nv0.2.x experimental contract:\n  - Persist may break the schema during v0.2.x with two-week\n    written notice (CHANGELOG + GitHub issue tagged\n    federation-schema-break + proactive consumer notification).\n  - Registry's dual-write feature-flagged\n    (FEDERATION_DUAL_WRITE_ENABLED, default off until registry\n    v1.4). Roll-back is unsetting the flag.\n  - Schema stabilizes at persist v0.3.0; semver-major from then.\n\nMigration table updated to show registry-side state alongside\npersist version (v0.2.0 dual-write peer; v0.3.0 read-path\nmigration; v0.3.x deprecation).\n\nNo code changes; doc-only.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-02T00:27:54-05:00",
+          "tree_id": "c65485414dadfb5d589a5ecdd6804eb9c8fb06ed",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/df73e73598b40fb2774cd374af1babd9ac4fe4eb"
+        },
+        "date": 1777700044883,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 95462,
+            "range": "± 743",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 236185,
+            "range": "± 28942",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 514952,
+            "range": "± 1342",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1838706,
+            "range": "± 9351",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 377,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1566,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 9846,
+            "range": "± 117",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 359,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 2988,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9112,
+            "range": "± 23",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 40034,
+            "range": "± 105",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 633,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2216848,
+            "range": "± 104602",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6383347,
+            "range": "± 192209",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 22500048,
+            "range": "± 346191",
             "unit": "ns/iter"
           }
         ]
