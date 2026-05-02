@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777742960241,
+  "lastUpdate": 1777745829872,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -4157,6 +4157,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 22503903,
             "range": "± 206158",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "b0a3a8dcc7795c79fe72f59445c482f6905c39ce",
+          "message": "0.2.1 — lens federation-cutover surface (sign + canonicalize + dual-read)\n\nThree small adds completing the lens v0.2.x ask. Lens can now wire\nwrites through persist's federation directory end-to-end without\nthe keyring seed crossing the FFI, and the trace-verify read path\nfinds the keys automatically without a separate cutover step.\n\nEngine.sign(message: bytes) -> bytes (PyO3):\n  Hot-path Ed25519 sign exposed on the wheel. Same shape as\n  public_key_b64(): bytes in, bytes out, no key material crossing\n  the boundary. Lens builds federation envelope, gets signature,\n  embeds in SignedKeyRecord, submits via put_public_key.\n\nEngine.canonicalize_envelope(json_str) -> bytes (PyO3):\n  Persist's PythonJsonDumpsCanonicalizer exposed for lens\n  consumption. Takes a JSON object string, returns canonical bytes\n  to sign. Hides canonicalization rules inside persist where they\n  live anyway — eliminates the drift risk if either side touches\n  the rules later.\n\nBackend::lookup_public_key dual-read migration:\n  The existing trait method (used by trace verify) now reads from\n  federation_keys first, falls back to accord_public_keys (legacy)\n  on miss. Lens writes via the federation surface; the existing\n  trace verify path finds the keys without a separate cutover. No\n  big-bang switchover.\n\n  All three backends (memory, postgres, sqlite) updated.\n\n  Filter on federation_keys: valid_until IS NULL OR valid_until >\n  NOW(). Filter on accord_public_keys retained:\n  revoked_at IS NULL AND (expires_at IS NULL OR expires_at > NOW()).\n  Strict consumers can layer federation revocation checks via\n  revocations_for() on top.\n\n  The legacy fallback retires at v0.4.0 per the roadmap. Until\n  then, both tables are load-bearing during the migration window.\n\nTests:\n- backend_lookup_public_key_dual_reads_federation — write via\n  federation surface only, read back via legacy Backend trait\n- backend_lookup_public_key_falls_back_to_legacy — federation\n  empty, legacy populated, fallback works\n\n154 lib tests green; clippy clean; cargo-deny clean.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-02T13:10:21-05:00",
+          "tree_id": "12b30fb86095e853971d706c3b2a1573a9314e1f",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/b0a3a8dcc7795c79fe72f59445c482f6905c39ce"
+        },
+        "date": 1777745828865,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 95814,
+            "range": "± 700",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 236892,
+            "range": "± 823",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 517869,
+            "range": "± 16888",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1846178,
+            "range": "± 14156",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 338,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1534,
+            "range": "± 20",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7395,
+            "range": "± 99",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 363,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3131,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9155,
+            "range": "± 56",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 40954,
+            "range": "± 143",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 632,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2191491,
+            "range": "± 89961",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6325434,
+            "range": "± 265960",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 22162300,
+            "range": "± 531696",
             "unit": "ns/iter"
           }
         ]
