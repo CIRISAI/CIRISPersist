@@ -1,4 +1,4 @@
-# Roadmap — v0.2.0 → v0.4.x
+# Roadmap — v0.1.21 → v0.4.x
 
 **Status:** dependency waterfall. Positions in the Gantt below
 indicate **sequence**, not delivery dates. Each milestone ships
@@ -20,8 +20,19 @@ gantt
     dateFormat X
     axisFormat %s
 
+    section v0.1.21 — SQLite Backend Phase 1 parity
+    Translate migrations/sqlite/lens/V001 + V003 (postgres → sqlite)  :v121a, 0, 1
+    SqliteBackend skeleton (rusqlite + spawn_blocking adapter)        :v121b, after v121a, 1
+    insert_trace_events_batch (ON CONFLICT DO NOTHING)                :v121c1, after v121b, 1
+    insert_trace_llm_calls_batch                                      :v121c2, after v121b, 1
+    lookup_public_key + sample_public_keys                            :v121c3, after v121b, 1
+    run_migrations (refinery sqlite)                                  :v121c4, after v121b, 1
+    Mirror postgres test suite against SqliteBackend                  :v121d, after v121c1 v121c2 v121c3 v121c4, 1
+    Cargo.toml feature wiring + store/mod.rs export                   :v121e, after v121d, 1
+    CHANGELOG + v0.1.21 release                                       :v121f, after v121e, 1
+
     section v0.2.0 — Verify Subsumption (CIRISPersist#4)
-    Pin bump ciris-verify-core 1.8.0 → 1.8.4              :v20a, 0, 1
+    Pin bump ciris-verify-core 1.8.0 → 1.8.4              :v20a, after v121f, 1
     Existing test suite green vs new pin                  :v20b, after v20a, 1
     Cryptographic proxies (sign / public_key / attest)    :v20c1, after v20b, 1
     License + integrity proxies                           :v20c2, after v20b, 1
@@ -63,6 +74,52 @@ gantt
 ---
 
 ## Phase-by-phase waterfall
+
+### v0.1.21 — SQLite Backend Phase 1 parity
+
+**Gates next phase on:** SQLite is a declared-but-stubbed
+feature today (rusqlite pinned since v0.1.9, sqlite feature
+flag declared, empty `migrations/sqlite/`). v0.1.21 makes it
+real — sovereign-mode (single-node, no Postgres) and Pi-class
+deployments per FSD §7 #7 become viable. Lens team requested
+parity before v0.2.0.
+
+**Sequential dependencies:**
+
+```
+v121a (migrations translated)
+  → v121b (SqliteBackend skeleton with rusqlite + spawn_blocking)
+  → [v121c1 ║ v121c2 ║ v121c3 ║ v121c4]   (parallel: independent
+                                            trait methods)
+  → v121d (test parity vs postgres)
+  → v121e (Cargo wiring + export)
+  → v121f (release)
+```
+
+**Parallelizable inside the phase:** the four trait methods
+(`v121c1`–`v121c4`) — independent, share only the connection
+pool. Memory backend's parity test suite is the spec; SQLite
+must produce identical insert / lookup / sample results given
+identical inputs.
+
+**Schema translation gotchas (V001):**
+
+- `BIGSERIAL` → `INTEGER PRIMARY KEY AUTOINCREMENT` (single-col
+  PK; postgres' composite PK on `(event_id, ts)` collapses to
+  `event_id` since SQLite uses rowid for ordering)
+- `TIMESTAMPTZ` → `TEXT` (ISO-8601 with timezone — wire-format
+  preservation matters per v0.1.8's WireDateTime doctrine)
+- `JSONB` → `TEXT` (SQLite has json1 extension for queries; we
+  store payload verbatim either way)
+- `BOOLEAN` → `INTEGER` (0/1; SQLite has no native bool)
+- `DOUBLE PRECISION` / `NUMERIC(10,6)` → `REAL`
+- `CREATE SCHEMA cirislens` + `cirislens.table` → drop schema
+  prefix; SQLite has no schemas
+- `IS DISTINCT FROM` → `IS NOT`
+- TimescaleDB hypertable creation → skip entirely
+- `DEFAULT NOW()` → `DEFAULT CURRENT_TIMESTAMP`
+
+---
 
 ### v0.2.0 — Verify Subsumption
 
@@ -196,7 +253,8 @@ The strict dependency chain — where any delay propagates to the
 final milestone:
 
 ```
-v20a → v20b → v20c* → v20d → v20e → v20f
+v121a → v121b → v121c* → v121d → v121e → v121f
+  → v20a → v20b → v20c* → v20d → v20e → v20f
   → v30a/b → v30c → v30d/e/f → v30g → v30h
   → v3xa/b/c → v3xd → v3xe
   → v40a → v40b → v40c → v40d

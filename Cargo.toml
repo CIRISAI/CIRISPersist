@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "0.1.20"
+version = "0.1.21"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -24,8 +24,15 @@ server   = ["dep:axum", "dep:tower", "dep:http-body-util"]
 # needs the Postgres backend to be available.
 pyo3     = ["dep:pyo3", "postgres"]
 
+# v0.1.21 — SQLite backend Phase 1 parity (sovereign-mode + Pi-class
+# deployments per FSD §7 #7). Opens `dep:rusqlite` plus the rusqlite
+# feature on refinery for embedded migrations. Refinery is also
+# imported by the postgres feature; cargo unifies them when both are
+# on (refinery built with both `tokio-postgres` and `rusqlite`
+# features).
+sqlite         = ["dep:rusqlite", "dep:refinery", "refinery/rusqlite"]
+
 # Phase 2 features (declared now; impls land later — MISSION.md §2 / FSD §4).
-sqlite         = ["dep:rusqlite"]
 c-abi          = []
 peer-replicate = []
 
@@ -109,12 +116,14 @@ http-body-util = { version = "0.1", optional = true }
 # Phase 1 — pyo3 feature
 pyo3 = { version = "0.28", features = ["extension-module", "abi3-py311"], optional = true }
 
-# Phase 2 — sqlite feature (declared; impl in Phase 2 cutover)
+# v0.1.21 — sqlite backend (Phase 1 parity).
 # v0.1.9 — pinned to 0.31 to match ciris-verify-core's transitive
 # rusqlite. Both crates declare `links = "sqlite3"`, so cargo's
 # resolver requires a single libsqlite3-sys version across the
-# workspace. We have no SQLite code yet (Phase 2 stub); when
-# we ship the SQLite backend the upstream pin can move with us.
+# workspace. The `bundled` feature builds libsqlite3 from source so
+# manylinux wheels don't need a system libsqlite3-dev; `chrono` adds
+# DateTime<Utc> ToSql/FromSql impls (TEXT round-trip via RFC 3339);
+# `serde_json` adds Value ToSql for the payload JSONB-as-TEXT column.
 rusqlite = { version = "0.31", features = ["bundled", "chrono", "serde_json"], optional = true }
 
 # Phase 1 robustness — local journal for outage tolerance (FSD §3.4)

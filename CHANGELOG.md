@@ -5,6 +5,116 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.1.21] — 2026-05-02
+
+SQLite Backend Phase 1 parity. Sovereign-mode + Pi-class
+deployments per FSD §7 #7. Lens team requested before v0.2.0.
+
+Closes the long-standing gap between
+"`Backend` trait sealed Phase 1 to support every substrate" and
+"only postgres + memory implementations exist". With v0.1.21 the
+substrate matrix matches the trait surface — same lens ingest
+path runs against postgres in datacenter deployments and SQLite
+on a Pi-class node, no rewrites in between.
+
+### What ships
+
+**Migrations** (`migrations/sqlite/lens/`):
+- `V001__trace_events.sql` — translates the postgres V001 schema
+  to SQLite types: `BIGSERIAL` → `INTEGER PRIMARY KEY
+  AUTOINCREMENT`, `TIMESTAMPTZ` → `TEXT` (RFC 3339), `JSONB` →
+  `TEXT`, `BOOLEAN` → `INTEGER`, `DOUBLE PRECISION` → `REAL`. Drops
+  postgres-isms not portable to SQLite: `CREATE SCHEMA cirislens`,
+  the `cirislens.` namespace prefix, TimescaleDB hypertable
+  creation, `IS DISTINCT FROM` (replaced with `IS NOT`). Same
+  dedup index shape (`agent_id_hash, trace_id, thought_id,
+  event_type, attempt_index, ts`) — THREAT_MODEL.md AV-9 protection
+  is identical.
+- `V003__scrub_envelope.sql` — translates the v0.1.3 ALTER TABLE
+  ADD COLUMN. SQLite 3.2+ supports the ADD COLUMN form natively.
+
+**SqliteBackend** (`src/store/sqlite.rs`, ~580 LoC):
+- `Backend` trait Phase 1 surface implemented:
+  `insert_trace_events_batch`, `insert_trace_llm_calls_batch`,
+  `lookup_public_key`, `sample_public_keys`, `run_migrations`.
+- Phase 2/3 inherit the trait `NotImplemented` defaults.
+- Connection model: `Arc<Mutex<rusqlite::Connection>>`. Phase 1's
+  single-ingest-writer-per-process shape (FSD §3.4 robustness
+  primitive #1) means contention on the mutex is structurally
+  negligible.
+- Async adapter: every SQL call wrapped in
+  `tokio::task::spawn_blocking`. rusqlite is sync; spawn_blocking
+  moves the work to a tokio worker thread.
+- File-backed and `:memory:` constructors:
+  `SqliteBackend::open(path)` and `SqliteBackend::open_in_memory()`.
+- Boot pragmas: `foreign_keys = ON`, `journal_mode = WAL`,
+  `synchronous = NORMAL`. WAL gives concurrent readers without
+  blocking the single writer; NORMAL durability is the right
+  trade for the lens use case (durability via the v0.1.7 journal
+  is the recovery primitive, not fsync-per-write).
+
+**Cargo.toml** — `sqlite` feature is now real:
+- `sqlite = ["dep:rusqlite", "dep:refinery", "refinery/rusqlite"]`
+- `rusqlite` 0.31 (pinned since v0.1.9 to match
+  `ciris-verify-core`'s transitive dep) with `bundled` + `chrono`
+  + `serde_json` features.
+- `refinery` already in postgres feature; `sqlite` adds the
+  `rusqlite` feature on it for embedded-migration support.
+- Cargo unifies cleanly when both `postgres` and `sqlite` are
+  on (refinery built with both `tokio-postgres` and `rusqlite`
+  features).
+
+**Tests** — 7 new unit tests in `src/store/sqlite::tests`:
+- `migrations_run_clean_in_memory` — refinery applies V001 + V003
+  to a fresh DB; re-running is a no-op.
+- `insert_idempotent` — second insert of the same row hits ON
+  CONFLICT DO NOTHING (mirrors postgres test).
+- `distinct_attempts_both_land` — different attempt_index → two
+  rows (FSD §3.4 #4 per-attempt dedup).
+- `llm_calls_batch_insert` — batch insert into trace_llm_calls.
+- `empty_batches_are_noops` — zero-row batches return without
+  touching the DB.
+- `lookup_public_key_round_trip` — base64 → 32-byte VerifyingKey
+  parsing matches postgres impl.
+- `revoked_keys_filtered` — `revoked_at IS NOT NULL` filters out
+  of both `lookup_public_key` and `sample_public_keys`.
+
+### What this enables
+
+- **Sovereign-mode lens** — single agent + lens on a Pi-class node
+  lands traces directly into a SQLite file. No Postgres
+  infrastructure needed.
+- **Local dev** — tests can run against in-memory SQLite without
+  Docker compose for postgres. Already shipped: 7 sqlite tests
+  use `:memory:` and are part of the default test suite.
+- **Pi-class deployments** — FSD §7 #7's "4GB-RAM solar-LoRa
+  node" deployment shape becomes viable; the same crate API the
+  multi-tenant lens uses serves the sovereign deployment.
+
+### Substrate matrix after v0.1.21
+
+| Backend | Use case | Status |
+|---|---|---|
+| `MemoryBackend` | Tests, parity-check fixtures | Phase 1 ✓ |
+| `PostgresBackend` | Multi-tenant lens, datacenter | Phase 1 ✓ |
+| `SqliteBackend` | Sovereign-mode, Pi-class | Phase 1 ✓ (NEW) |
+
+All three implement the same `Backend` trait Phase 1 surface;
+all three pass the same parity expectations. Phase 2/3 surfaces
+land per the roadmap (`docs/ROADMAP.md`).
+
+### Tests + features
+
+150 tests green (128 lib + 22 integration; +7 sqlite). Clippy
+clean across the full feature matrix
+(postgres + sqlite + server + pyo3 + tls). cargo-deny clean.
+
+### v0.2.0 unblocked
+
+This was the gate the lens team requested before persist v0.2.0
+(verify subsumption, CIRISPersist#4). With v0.1.21 in place, v0.2.0
+ships next per `docs/V0.2.0_VERIFY_SUBSUMPTION.md`.
+
 ## [0.1.20] — 2026-05-02
 
 P0 production fix #3, **second attempt** — v0.1.19 didn't close

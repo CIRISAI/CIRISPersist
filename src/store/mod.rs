@@ -13,6 +13,8 @@ pub mod decompose;
 pub mod memory;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
 pub mod types;
 
 pub use backend::{Backend, InsertReport, PublicKeySample};
@@ -20,6 +22,8 @@ pub use decompose::{decompose, dedup_key, Decomposed};
 pub use memory::MemoryBackend;
 #[cfg(feature = "postgres")]
 pub use postgres::PostgresBackend;
+#[cfg(feature = "sqlite")]
+pub use sqlite::SqliteBackend;
 pub use types::{
     AuditEntry, ClaimParams, GraphNode, ServiceCorrelation, Task, TraceEventRow, TraceLlmCallRow,
 };
