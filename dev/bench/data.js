@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777739782686,
+  "lastUpdate": 1777739981221,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -3473,6 +3473,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 22449358,
             "range": "± 263717",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "c5d060fa4a55b280c21fb2a7d9b10f66059a833b",
+          "message": "v0.2.0 federation directory: schema + trait + types\n\nFirst chunk of v0.2.0 federation directory work\n(docs/FEDERATION_DIRECTORY.md, registry-aligned per FEDERATION_CLIENT.md).\nBackend implementations (memory, postgres, sqlite) follow in subsequent\ncommits; this commit establishes the contract surface so the registry\nteam's vendored types can be validated against persist's authoritative\nshape.\n\nSchema:\n- migrations/postgres/lens/V004__federation_directory.sql:\n  federation_keys (pubkey rows with v0.1.3 scrub envelope +\n  server-computed persist_row_hash + DEFERRABLE INITIALLY DEFERRED FK\n  for self-signed bootstrap rows), federation_attestations (many-to-many\n  signed-by attester), federation_revocations (append-only signed-by\n  revoker). All three tables FK-chain back to federation_keys.scrub_key_id\n  so the trust chain terminates at out-of-band-anchored stewards, not\n  at row existence.\n- migrations/sqlite/lens/V004__federation_directory.sql: SQLite type\n  translations (TIMESTAMPTZ→TEXT RFC 3339, JSONB→TEXT, BYTEA→BLOB,\n  UUID→TEXT, gen_random_uuid()→caller-generates).\n\nRust:\n- src/federation/mod.rs: FederationDirectory trait with 8 methods\n  matching CIRISRegistry's vendored shape exactly. Explicit non-goals\n  documented (no is_trusted, no trust_score, no trust_path — those\n  are consumer policy, not substrate). New federation::Error type\n  with kind() string-tokens for telemetry.\n- src/federation/types.rs: KeyRecord, Attestation, Revocation +\n  Signed* wrappers. identity_type, algorithm, attestation_type\n  string constants matching the registry's vendored\n  /rust-registry/src/federation/types.rs field-for-field.\n- compute_persist_row_hash() helper: server-computed canonical hash\n  via PythonJsonDumpsCanonicalizer (sorted keys, no whitespace,\n  ensure_ascii=True). Excludes the persist_row_hash field itself\n  from the hash input so the field doesn't depend on its own value.\n  Closes the canonical-hash divergence risk from registry's vendored\n  types.rs (which uses default serde_json::to_vec — not canonical).\n  Consumers store + string-compare the hex string; they don't\n  reproduce the canonicalizer.\n\nTests: 4 passing (deterministic hashing, self-exclusion, content\nsensitivity, serde round-trip). Total project test count now 132 lib\n+ 22 integration; clippy clean with all features.\n\nNext commits:\n- Memory backend impl (smallest scope, validates trait shape works\n  end-to-end without DB infrastructure)\n- Postgres backend impl + bootstrap migration writing self-signed\n  persist-steward row\n- SQLite backend impl\n- Then: cut v0.2.0-pre1 (registry-unblock milestone per ROADMAP.md)\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-02T11:31:58-05:00",
+          "tree_id": "ae34364ad8cb860862215c15879905e550dc4cc9",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/c5d060fa4a55b280c21fb2a7d9b10f66059a833b"
+        },
+        "date": 1777739980778,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 79429,
+            "range": "± 585",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 196499,
+            "range": "± 309",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 429745,
+            "range": "± 4459",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1536995,
+            "range": "± 11675",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 295,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1269,
+            "range": "± 32",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 6440,
+            "range": "± 34",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 270,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 2376,
+            "range": "± 33",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 7372,
+            "range": "± 98",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 31668,
+            "range": "± 262",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 539,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2212240,
+            "range": "± 69712030",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 5677691,
+            "range": "± 34565101",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 19510228,
+            "range": "± 24290400",
             "unit": "ns/iter"
           }
         ]
