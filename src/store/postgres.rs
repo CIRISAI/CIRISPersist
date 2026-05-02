@@ -635,6 +635,411 @@ impl Backend for PostgresBackend {
     }
 }
 
+// ─── FederationDirectory impl (v0.2.0) ─────────────────────────────
+//
+// Postgres-backed federation directory. Same logical surface as the
+// memory backend; differences are postgres-isms:
+//   - persist_row_hash is computed in Rust (server-side, before
+//     INSERT) — postgres sees it as a TEXT column.
+//   - FK constraints (DEFERRABLE INITIALLY DEFERRED for self-signed
+//     bootstrap row) enforced at COMMIT time.
+//   - JSONB columns serialize Value via postgres-types' built-in
+//     ToSql impl.
+//   - BYTEA columns for original_content_hash + scrub_signature take
+//     hex-decoded raw bytes; the wire shape uses hex/base64 strings,
+//     decoded at the persist boundary.
+
+impl crate::federation::FederationDirectory for PostgresBackend {
+    async fn put_public_key(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = record.record;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+
+        let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!(
+                "original_content_hash hex decode: {e}"
+            ))
+        })?;
+        let scrub_signature = base64::engine::general_purpose::STANDARD
+            .decode(&row.scrub_signature)
+            .map_err(|e| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "scrub_signature base64 decode: {e}"
+                ))
+            })?;
+
+        // Idempotent on (key_id, persist_row_hash). DO NOTHING when
+        // (key_id, persist_row_hash) match exactly; raise Conflict
+        // when key_id matches but content differs.
+        let result = client
+            .execute(
+                "INSERT INTO cirislens.federation_keys (\
+                    key_id, pubkey_base64, algorithm, identity_type, identity_ref, \
+                    valid_from, valid_until, registration_envelope, \
+                    original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
+                    persist_row_hash\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+                 ON CONFLICT (key_id) DO NOTHING",
+                &[
+                    &row.key_id,
+                    &row.pubkey_base64,
+                    &row.algorithm,
+                    &row.identity_type,
+                    &row.identity_ref,
+                    &row.valid_from,
+                    &row.valid_until,
+                    &row.registration_envelope,
+                    &original_content_hash,
+                    &scrub_signature,
+                    &row.scrub_key_id,
+                    &row.scrub_timestamp,
+                    &row.persist_row_hash,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("insert federation_keys: {e}"))
+            })?;
+
+        if result == 0 {
+            // ON CONFLICT triggered — check if hash matches.
+            let existing: Option<String> = client
+                .query_opt(
+                    "SELECT persist_row_hash FROM cirislens.federation_keys WHERE key_id = $1",
+                    &[&row.key_id],
+                )
+                .await
+                .map_err(|e| crate::federation::Error::Backend(format!("conflict check: {e}")))?
+                .map(|r| r.get(0));
+            if let Some(existing_hash) = existing {
+                if existing_hash != row.persist_row_hash {
+                    return Err(crate::federation::Error::Conflict(format!(
+                        "key_id {} already exists with different content",
+                        row.key_id
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn lookup_public_key(
+        &self,
+        key_id: &str,
+    ) -> Result<Option<crate::federation::KeyRecord>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let row_opt = client
+            .query_opt(
+                "SELECT key_id, pubkey_base64, algorithm, identity_type, identity_ref, \
+                    valid_from, valid_until, registration_envelope, \
+                    original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
+                    persist_row_hash \
+                 FROM cirislens.federation_keys WHERE key_id = $1",
+                &[&key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("lookup federation_keys: {e}"))
+            })?;
+        Ok(row_opt.map(pg_row_to_key_record))
+    }
+
+    async fn lookup_keys_for_identity(
+        &self,
+        identity_ref: &str,
+    ) -> Result<Vec<crate::federation::KeyRecord>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT key_id, pubkey_base64, algorithm, identity_type, identity_ref, \
+                    valid_from, valid_until, registration_envelope, \
+                    original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
+                    persist_row_hash \
+                 FROM cirislens.federation_keys WHERE identity_ref = $1",
+                &[&identity_ref],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("lookup_keys_for_identity: {e}"))
+            })?;
+        Ok(rows.into_iter().map(pg_row_to_key_record).collect())
+    }
+
+    async fn put_attestation(
+        &self,
+        attestation: crate::federation::SignedAttestation,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = attestation.attestation;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+
+        let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!(
+                "original_content_hash hex decode: {e}"
+            ))
+        })?;
+        let scrub_signature = base64::engine::general_purpose::STANDARD
+            .decode(&row.scrub_signature)
+            .map_err(|e| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "scrub_signature base64 decode: {e}"
+                ))
+            })?;
+
+        // postgres-types doesn't have a built-in for f64→NUMERIC; cast
+        // weight to f64 and let postgres convert.
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_attestations (\
+                    attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                    weight, asserted_at, expires_at, attestation_envelope, \
+                    original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
+                    persist_row_hash\
+                 ) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                &[
+                    &row.attestation_id,
+                    &row.attesting_key_id,
+                    &row.attested_key_id,
+                    &row.attestation_type,
+                    &row.weight,
+                    &row.asserted_at,
+                    &row.expires_at,
+                    &row.attestation_envelope,
+                    &original_content_hash,
+                    &scrub_signature,
+                    &row.scrub_key_id,
+                    &row.scrub_timestamp,
+                    &row.persist_row_hash,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                let msg = e.to_string();
+                // FK violation → InvalidArgument (matches memory shape).
+                if msg.contains("foreign key") {
+                    crate::federation::Error::InvalidArgument(format!(
+                        "FK constraint violated on attestation insert: {msg}"
+                    ))
+                } else {
+                    crate::federation::Error::Backend(format!("insert attestation: {msg}"))
+                }
+            })?;
+        Ok(())
+    }
+
+    async fn list_attestations_for(
+        &self,
+        attested_key_id: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
+                    weight, asserted_at, expires_at, attestation_envelope, \
+                    original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
+                    persist_row_hash \
+                 FROM cirislens.federation_attestations \
+                 WHERE attested_key_id = $1 \
+                 ORDER BY asserted_at DESC",
+                &[&attested_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_attestations_for: {e}"))
+            })?;
+        Ok(rows.into_iter().map(pg_row_to_attestation).collect())
+    }
+
+    async fn list_attestations_by(
+        &self,
+        attesting_key_id: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
+                    weight, asserted_at, expires_at, attestation_envelope, \
+                    original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
+                    persist_row_hash \
+                 FROM cirislens.federation_attestations \
+                 WHERE attesting_key_id = $1 \
+                 ORDER BY asserted_at DESC",
+                &[&attesting_key_id],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_by: {e}")))?;
+        Ok(rows.into_iter().map(pg_row_to_attestation).collect())
+    }
+
+    async fn put_revocation(
+        &self,
+        revocation: crate::federation::SignedRevocation,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = revocation.revocation;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+
+        let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!(
+                "original_content_hash hex decode: {e}"
+            ))
+        })?;
+        let scrub_signature = base64::engine::general_purpose::STANDARD
+            .decode(&row.scrub_signature)
+            .map_err(|e| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "scrub_signature base64 decode: {e}"
+                ))
+            })?;
+
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_revocations (\
+                    revocation_id, revoked_key_id, revoking_key_id, reason, \
+                    revoked_at, effective_at, revocation_envelope, \
+                    original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
+                    persist_row_hash\
+                 ) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                &[
+                    &row.revocation_id,
+                    &row.revoked_key_id,
+                    &row.revoking_key_id,
+                    &row.reason,
+                    &row.revoked_at,
+                    &row.effective_at,
+                    &row.revocation_envelope,
+                    &original_content_hash,
+                    &scrub_signature,
+                    &row.scrub_key_id,
+                    &row.scrub_timestamp,
+                    &row.persist_row_hash,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("foreign key") {
+                    crate::federation::Error::InvalidArgument(format!(
+                        "FK constraint violated on revocation insert: {msg}"
+                    ))
+                } else {
+                    crate::federation::Error::Backend(format!("insert revocation: {msg}"))
+                }
+            })?;
+        Ok(())
+    }
+
+    async fn revocations_for(
+        &self,
+        revoked_key_id: &str,
+    ) -> Result<Vec<crate::federation::Revocation>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT revocation_id::text, revoked_key_id, revoking_key_id, reason, \
+                    revoked_at, effective_at, revocation_envelope, \
+                    original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
+                    persist_row_hash \
+                 FROM cirislens.federation_revocations \
+                 WHERE revoked_key_id = $1 \
+                 ORDER BY effective_at DESC",
+                &[&revoked_key_id],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("revocations_for: {e}")))?;
+        Ok(rows.into_iter().map(pg_row_to_revocation).collect())
+    }
+}
+
+fn pg_row_to_key_record(row: tokio_postgres::Row) -> crate::federation::KeyRecord {
+    let original_content_hash: Vec<u8> = row.get("original_content_hash");
+    let scrub_signature: Vec<u8> = row.get("scrub_signature");
+    crate::federation::KeyRecord {
+        key_id: row.get("key_id"),
+        pubkey_base64: row.get("pubkey_base64"),
+        algorithm: row.get("algorithm"),
+        identity_type: row.get("identity_type"),
+        identity_ref: row.get("identity_ref"),
+        valid_from: row.get("valid_from"),
+        valid_until: row.get("valid_until"),
+        registration_envelope: row.get("registration_envelope"),
+        original_content_hash: hex::encode(&original_content_hash),
+        scrub_signature: BASE64.encode(&scrub_signature),
+        scrub_key_id: row.get("scrub_key_id"),
+        scrub_timestamp: row.get("scrub_timestamp"),
+        persist_row_hash: row.get("persist_row_hash"),
+    }
+}
+
+fn pg_row_to_attestation(row: tokio_postgres::Row) -> crate::federation::Attestation {
+    let original_content_hash: Vec<u8> = row.get("original_content_hash");
+    let scrub_signature: Vec<u8> = row.get("scrub_signature");
+    crate::federation::Attestation {
+        attestation_id: row.get("attestation_id"),
+        attesting_key_id: row.get("attesting_key_id"),
+        attested_key_id: row.get("attested_key_id"),
+        attestation_type: row.get("attestation_type"),
+        weight: row.get("weight"),
+        asserted_at: row.get("asserted_at"),
+        expires_at: row.get("expires_at"),
+        attestation_envelope: row.get("attestation_envelope"),
+        original_content_hash: hex::encode(&original_content_hash),
+        scrub_signature: BASE64.encode(&scrub_signature),
+        scrub_key_id: row.get("scrub_key_id"),
+        scrub_timestamp: row.get("scrub_timestamp"),
+        persist_row_hash: row.get("persist_row_hash"),
+    }
+}
+
+fn pg_row_to_revocation(row: tokio_postgres::Row) -> crate::federation::Revocation {
+    let original_content_hash: Vec<u8> = row.get("original_content_hash");
+    let scrub_signature: Vec<u8> = row.get("scrub_signature");
+    crate::federation::Revocation {
+        revocation_id: row.get("revocation_id"),
+        revoked_key_id: row.get("revoked_key_id"),
+        revoking_key_id: row.get("revoking_key_id"),
+        reason: row.get("reason"),
+        revoked_at: row.get("revoked_at"),
+        effective_at: row.get("effective_at"),
+        revocation_envelope: row.get("revocation_envelope"),
+        original_content_hash: hex::encode(&original_content_hash),
+        scrub_signature: BASE64.encode(&scrub_signature),
+        scrub_key_id: row.get("scrub_key_id"),
+        scrub_timestamp: row.get("scrub_timestamp"),
+        persist_row_hash: row.get("persist_row_hash"),
+    }
+}
+
 fn trace_level_str(t: crate::schema::TraceLevel) -> &'static str {
     match t {
         crate::schema::TraceLevel::Generic => "generic",

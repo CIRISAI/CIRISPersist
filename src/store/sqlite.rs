@@ -468,6 +468,470 @@ fn llm_status_str(s: crate::schema::LlmCallStatus) -> &'static str {
     }
 }
 
+// ─── FederationDirectory impl (v0.2.0) ─────────────────────────────
+//
+// SQLite-backed federation directory. Same logical surface as the
+// memory + postgres backends; differences are sqlite-isms:
+//   - Timestamps are TEXT (RFC 3339) — chrono's ToSql/FromSql via the
+//     rusqlite chrono feature handles this transparently.
+//   - JSONB → TEXT — we serialize the Value before INSERT and parse
+//     on read.
+//   - BLOB columns for original_content_hash + scrub_signature take
+//     raw bytes; the wire shape uses hex/base64 strings, decoded at
+//     the persist boundary.
+//   - UUID columns are TEXT — rusqlite passes UUID strings as TEXT.
+
+impl crate::federation::FederationDirectory for SqliteBackend {
+    async fn put_public_key(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = record.record;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+
+        let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!(
+                "original_content_hash hex decode: {e}"
+            ))
+        })?;
+        let scrub_signature = base64::engine::general_purpose::STANDARD
+            .decode(&row.scrub_signature)
+            .map_err(|e| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "scrub_signature base64 decode: {e}"
+                ))
+            })?;
+
+        let registration_envelope_text = serde_json::to_string(&row.registration_envelope)
+            .map_err(|e| crate::federation::Error::Backend(format!("envelope serialize: {e}")))?;
+
+        let conn = self.conn.clone();
+        let key_id = row.key_id.clone();
+        let row_hash = row.persist_row_hash.clone();
+        let conflict_check =
+            tokio::task::spawn_blocking(move || -> Result<Option<String>, rusqlite::Error> {
+                let conn = conn.blocking_lock();
+                conn.query_row(
+                    "SELECT persist_row_hash FROM federation_keys WHERE key_id = ?1",
+                    [&key_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+            })
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+            .map_err(|e| crate::federation::Error::Backend(format!("conflict check: {e}")))?;
+
+        if let Some(existing_hash) = conflict_check {
+            if existing_hash == row_hash {
+                return Ok(()); // exact duplicate — idempotent no-op
+            }
+            return Err(crate::federation::Error::Conflict(format!(
+                "key_id {} already exists with different content",
+                row.key_id
+            )));
+        }
+
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO federation_keys (\
+                    key_id, pubkey_base64, algorithm, identity_type, identity_ref, \
+                    valid_from, valid_until, registration_envelope, \
+                    original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
+                    persist_row_hash\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    row.key_id,
+                    row.pubkey_base64,
+                    row.algorithm,
+                    row.identity_type,
+                    row.identity_ref,
+                    row.valid_from.to_rfc3339(),
+                    row.valid_until.map(|t| t.to_rfc3339()),
+                    registration_envelope_text,
+                    original_content_hash,
+                    scrub_signature,
+                    row.scrub_key_id,
+                    row.scrub_timestamp.to_rfc3339(),
+                    row.persist_row_hash,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| crate::federation::Error::Backend(format!("insert federation_keys: {e}")))?;
+        Ok(())
+    }
+
+    async fn lookup_public_key(
+        &self,
+        key_id: &str,
+    ) -> Result<Option<crate::federation::KeyRecord>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let key_id = key_id.to_owned();
+        tokio::task::spawn_blocking(
+            move || -> Result<Option<crate::federation::KeyRecord>, rusqlite::Error> {
+                let conn = conn.blocking_lock();
+                conn.query_row(
+                    "SELECT key_id, pubkey_base64, algorithm, identity_type, identity_ref, \
+                        valid_from, valid_until, registration_envelope, \
+                        original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
+                        persist_row_hash \
+                     FROM federation_keys WHERE key_id = ?1",
+                    [&key_id],
+                    sqlite_row_to_key_record,
+                )
+                .optional()
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| crate::federation::Error::Backend(format!("lookup federation_keys: {e}")))
+    }
+
+    async fn lookup_keys_for_identity(
+        &self,
+        identity_ref: &str,
+    ) -> Result<Vec<crate::federation::KeyRecord>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let identity_ref = identity_ref.to_owned();
+        tokio::task::spawn_blocking(
+            move || -> Result<Vec<crate::federation::KeyRecord>, rusqlite::Error> {
+                let conn = conn.blocking_lock();
+                let mut stmt = conn.prepare(
+                    "SELECT key_id, pubkey_base64, algorithm, identity_type, identity_ref, \
+                        valid_from, valid_until, registration_envelope, \
+                        original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
+                        persist_row_hash \
+                     FROM federation_keys WHERE identity_ref = ?1",
+                )?;
+                let rows = stmt.query_map([&identity_ref], sqlite_row_to_key_record)?;
+                rows.collect()
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| crate::federation::Error::Backend(format!("lookup_keys_for_identity: {e}")))
+    }
+
+    async fn put_attestation(
+        &self,
+        attestation: crate::federation::SignedAttestation,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = attestation.attestation;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+
+        let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!(
+                "original_content_hash hex decode: {e}"
+            ))
+        })?;
+        let scrub_signature = base64::engine::general_purpose::STANDARD
+            .decode(&row.scrub_signature)
+            .map_err(|e| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "scrub_signature base64 decode: {e}"
+                ))
+            })?;
+        let attestation_envelope_text = serde_json::to_string(&row.attestation_envelope)
+            .map_err(|e| crate::federation::Error::Backend(format!("envelope serialize: {e}")))?;
+
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO federation_attestations (\
+                    attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                    weight, asserted_at, expires_at, attestation_envelope, \
+                    original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
+                    persist_row_hash\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    row.attestation_id,
+                    row.attesting_key_id,
+                    row.attested_key_id,
+                    row.attestation_type,
+                    row.weight,
+                    row.asserted_at.to_rfc3339(),
+                    row.expires_at.map(|t| t.to_rfc3339()),
+                    attestation_envelope_text,
+                    original_content_hash,
+                    scrub_signature,
+                    row.scrub_key_id,
+                    row.scrub_timestamp.to_rfc3339(),
+                    row.persist_row_hash,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("FOREIGN KEY") {
+                crate::federation::Error::InvalidArgument(format!(
+                    "FK constraint violated on attestation insert: {msg}"
+                ))
+            } else {
+                crate::federation::Error::Backend(format!("insert attestation: {msg}"))
+            }
+        })?;
+        Ok(())
+    }
+
+    async fn list_attestations_for(
+        &self,
+        attested_key_id: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let key = attested_key_id.to_owned();
+        tokio::task::spawn_blocking(
+            move || -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+                let conn = conn.blocking_lock();
+                let mut stmt = conn.prepare(
+                    "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                        weight, asserted_at, expires_at, attestation_envelope, \
+                        original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
+                        persist_row_hash \
+                     FROM federation_attestations \
+                     WHERE attested_key_id = ?1 \
+                     ORDER BY asserted_at DESC",
+                )?;
+                let rows = stmt.query_map([&key], sqlite_row_to_attestation)?;
+                rows.collect()
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_for: {e}")))
+    }
+
+    async fn list_attestations_by(
+        &self,
+        attesting_key_id: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let key = attesting_key_id.to_owned();
+        tokio::task::spawn_blocking(
+            move || -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+                let conn = conn.blocking_lock();
+                let mut stmt = conn.prepare(
+                    "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                        weight, asserted_at, expires_at, attestation_envelope, \
+                        original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
+                        persist_row_hash \
+                     FROM federation_attestations \
+                     WHERE attesting_key_id = ?1 \
+                     ORDER BY asserted_at DESC",
+                )?;
+                let rows = stmt.query_map([&key], sqlite_row_to_attestation)?;
+                rows.collect()
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_by: {e}")))
+    }
+
+    async fn put_revocation(
+        &self,
+        revocation: crate::federation::SignedRevocation,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = revocation.revocation;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+
+        let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!(
+                "original_content_hash hex decode: {e}"
+            ))
+        })?;
+        let scrub_signature = base64::engine::general_purpose::STANDARD
+            .decode(&row.scrub_signature)
+            .map_err(|e| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "scrub_signature base64 decode: {e}"
+                ))
+            })?;
+        let revocation_envelope_text = serde_json::to_string(&row.revocation_envelope)
+            .map_err(|e| crate::federation::Error::Backend(format!("envelope serialize: {e}")))?;
+
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO federation_revocations (\
+                    revocation_id, revoked_key_id, revoking_key_id, reason, \
+                    revoked_at, effective_at, revocation_envelope, \
+                    original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
+                    persist_row_hash\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                rusqlite::params![
+                    row.revocation_id,
+                    row.revoked_key_id,
+                    row.revoking_key_id,
+                    row.reason,
+                    row.revoked_at.to_rfc3339(),
+                    row.effective_at.to_rfc3339(),
+                    revocation_envelope_text,
+                    original_content_hash,
+                    scrub_signature,
+                    row.scrub_key_id,
+                    row.scrub_timestamp.to_rfc3339(),
+                    row.persist_row_hash,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("FOREIGN KEY") {
+                crate::federation::Error::InvalidArgument(format!(
+                    "FK constraint violated on revocation insert: {msg}"
+                ))
+            } else {
+                crate::federation::Error::Backend(format!("insert revocation: {msg}"))
+            }
+        })?;
+        Ok(())
+    }
+
+    async fn revocations_for(
+        &self,
+        revoked_key_id: &str,
+    ) -> Result<Vec<crate::federation::Revocation>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let key = revoked_key_id.to_owned();
+        tokio::task::spawn_blocking(
+            move || -> Result<Vec<crate::federation::Revocation>, rusqlite::Error> {
+                let conn = conn.blocking_lock();
+                let mut stmt = conn.prepare(
+                    "SELECT revocation_id, revoked_key_id, revoking_key_id, reason, \
+                        revoked_at, effective_at, revocation_envelope, \
+                        original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
+                        persist_row_hash \
+                     FROM federation_revocations \
+                     WHERE revoked_key_id = ?1 \
+                     ORDER BY effective_at DESC",
+                )?;
+                let rows = stmt.query_map([&key], sqlite_row_to_revocation)?;
+                rows.collect()
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| crate::federation::Error::Backend(format!("revocations_for: {e}")))
+    }
+}
+
+fn parse_rfc3339(s: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|t| t.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| chrono::Utc::now())
+}
+
+fn sqlite_row_to_key_record(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::KeyRecord> {
+    let envelope_text: String = row.get("registration_envelope")?;
+    let envelope: serde_json::Value = serde_json::from_str(&envelope_text).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            7,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        )
+    })?;
+    let original_content_hash: Vec<u8> = row.get("original_content_hash")?;
+    let scrub_signature: Vec<u8> = row.get("scrub_signature")?;
+    let valid_from: String = row.get("valid_from")?;
+    let valid_until: Option<String> = row.get("valid_until")?;
+    let scrub_timestamp: String = row.get("scrub_timestamp")?;
+    Ok(crate::federation::KeyRecord {
+        key_id: row.get("key_id")?,
+        pubkey_base64: row.get("pubkey_base64")?,
+        algorithm: row.get("algorithm")?,
+        identity_type: row.get("identity_type")?,
+        identity_ref: row.get("identity_ref")?,
+        valid_from: parse_rfc3339(&valid_from),
+        valid_until: valid_until.as_deref().map(parse_rfc3339),
+        registration_envelope: envelope,
+        original_content_hash: hex::encode(&original_content_hash),
+        scrub_signature: BASE64.encode(&scrub_signature),
+        scrub_key_id: row.get("scrub_key_id")?,
+        scrub_timestamp: parse_rfc3339(&scrub_timestamp),
+        persist_row_hash: row.get("persist_row_hash")?,
+    })
+}
+
+fn sqlite_row_to_attestation(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::Attestation> {
+    let envelope_text: String = row.get("attestation_envelope")?;
+    let envelope: serde_json::Value = serde_json::from_str(&envelope_text).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            7,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        )
+    })?;
+    let original_content_hash: Vec<u8> = row.get("original_content_hash")?;
+    let scrub_signature: Vec<u8> = row.get("scrub_signature")?;
+    let asserted_at: String = row.get("asserted_at")?;
+    let expires_at: Option<String> = row.get("expires_at")?;
+    let scrub_timestamp: String = row.get("scrub_timestamp")?;
+    Ok(crate::federation::Attestation {
+        attestation_id: row.get("attestation_id")?,
+        attesting_key_id: row.get("attesting_key_id")?,
+        attested_key_id: row.get("attested_key_id")?,
+        attestation_type: row.get("attestation_type")?,
+        weight: row.get("weight")?,
+        asserted_at: parse_rfc3339(&asserted_at),
+        expires_at: expires_at.as_deref().map(parse_rfc3339),
+        attestation_envelope: envelope,
+        original_content_hash: hex::encode(&original_content_hash),
+        scrub_signature: BASE64.encode(&scrub_signature),
+        scrub_key_id: row.get("scrub_key_id")?,
+        scrub_timestamp: parse_rfc3339(&scrub_timestamp),
+        persist_row_hash: row.get("persist_row_hash")?,
+    })
+}
+
+fn sqlite_row_to_revocation(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::Revocation> {
+    let envelope_text: String = row.get("revocation_envelope")?;
+    let envelope: serde_json::Value = serde_json::from_str(&envelope_text).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            6,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        )
+    })?;
+    let original_content_hash: Vec<u8> = row.get("original_content_hash")?;
+    let scrub_signature: Vec<u8> = row.get("scrub_signature")?;
+    let revoked_at: String = row.get("revoked_at")?;
+    let effective_at: String = row.get("effective_at")?;
+    let scrub_timestamp: String = row.get("scrub_timestamp")?;
+    Ok(crate::federation::Revocation {
+        revocation_id: row.get("revocation_id")?,
+        revoked_key_id: row.get("revoked_key_id")?,
+        revoking_key_id: row.get("revoking_key_id")?,
+        reason: row.get("reason")?,
+        revoked_at: parse_rfc3339(&revoked_at),
+        effective_at: parse_rfc3339(&effective_at),
+        revocation_envelope: envelope,
+        original_content_hash: hex::encode(&original_content_hash),
+        scrub_signature: BASE64.encode(&scrub_signature),
+        scrub_key_id: row.get("scrub_key_id")?,
+        scrub_timestamp: parse_rfc3339(&scrub_timestamp),
+        persist_row_hash: row.get("persist_row_hash")?,
+    })
+}
+
 // ─── Tests ─────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -646,12 +1110,20 @@ mod tests {
             .unwrap();
         }
 
-        let got = backend.lookup_public_key("key-test").await.unwrap();
+        // Disambiguate: both Backend and FederationDirectory traits
+        // expose `lookup_public_key` post-v0.2.0. This test exercises
+        // the legacy Backend (VerifyingKey) shape used by the trace
+        // verify path.
+        let got = Backend::lookup_public_key(&backend, "key-test")
+            .await
+            .unwrap();
         assert!(got.is_some());
         assert_eq!(got.unwrap().to_bytes(), verifying.to_bytes());
 
         // Unknown key returns None.
-        let none = backend.lookup_public_key("key-missing").await.unwrap();
+        let none = Backend::lookup_public_key(&backend, "key-missing")
+            .await
+            .unwrap();
         assert!(none.is_none());
     }
 
@@ -685,13 +1157,11 @@ mod tests {
             .unwrap();
         }
 
-        assert!(backend
-            .lookup_public_key("key-active")
+        assert!(Backend::lookup_public_key(&backend, "key-active")
             .await
             .unwrap()
             .is_some());
-        assert!(backend
-            .lookup_public_key("key-revoked")
+        assert!(Backend::lookup_public_key(&backend, "key-revoked")
             .await
             .unwrap()
             .is_none());
@@ -699,5 +1169,248 @@ mod tests {
         let sample = backend.sample_public_keys(10).await.unwrap();
         assert_eq!(sample.size, 1);
         assert_eq!(sample.sample, vec!["key-active".to_owned()]);
+    }
+
+    // ─── FederationDirectory tests ─────────────────────────────────
+
+    use crate::federation::{
+        Attestation, FederationDirectory, KeyRecord, Revocation, SignedAttestation,
+        SignedKeyRecord, SignedRevocation,
+    };
+
+    fn fed_key(key_id: &str, identity_ref: &str, scrub_key_id: &str) -> KeyRecord {
+        KeyRecord {
+            key_id: key_id.into(),
+            pubkey_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            algorithm: crate::federation::types::algorithm::ED25519.into(),
+            identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
+            identity_ref: identity_ref.into(),
+            valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
+            valid_until: None,
+            registration_envelope: serde_json::json!({"id": key_id}),
+            original_content_hash: "deadbeef".into(),
+            scrub_signature: "c2lnbmF0dXJl".into(),
+            scrub_key_id: scrub_key_id.into(),
+            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            persist_row_hash: String::new(),
+        }
+    }
+
+    fn fed_attestation(
+        id: &str,
+        attesting: &str,
+        attested: &str,
+        scrub_key_id: &str,
+    ) -> Attestation {
+        Attestation {
+            attestation_id: id.into(),
+            attesting_key_id: attesting.into(),
+            attested_key_id: attested.into(),
+            attestation_type: crate::federation::types::attestation_type::VOUCHES_FOR.into(),
+            weight: Some(1.0),
+            asserted_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+            expires_at: None,
+            attestation_envelope: serde_json::json!({"id": id}),
+            original_content_hash: "abc123".into(),
+            scrub_signature: "c2ln".into(),
+            scrub_key_id: scrub_key_id.into(),
+            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            persist_row_hash: String::new(),
+        }
+    }
+
+    fn fed_revocation(id: &str, revoked: &str, revoking: &str, scrub_key_id: &str) -> Revocation {
+        Revocation {
+            revocation_id: id.into(),
+            revoked_key_id: revoked.into(),
+            revoking_key_id: revoking.into(),
+            reason: Some("test".into()),
+            revoked_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+            effective_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+            revocation_envelope: serde_json::json!({"id": id}),
+            original_content_hash: "abc123".into(),
+            scrub_signature: "c2ln".into(),
+            scrub_key_id: scrub_key_id.into(),
+            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            persist_row_hash: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn federation_put_and_lookup_round_trip() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let key = fed_key("persist-steward", "persist", "persist-steward");
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: key.clone(),
+            })
+            .await
+            .unwrap();
+
+        let got = FederationDirectory::lookup_public_key(&backend, "persist-steward")
+            .await
+            .unwrap();
+        assert!(got.is_some());
+        let got = got.unwrap();
+        assert_eq!(got.key_id, "persist-steward");
+        assert_eq!(got.identity_ref, "persist");
+        assert_eq!(got.persist_row_hash.len(), 64);
+        // Server-computed hash matches what compute_persist_row_hash
+        // gives — round-trip via SQLite did not corrupt the field.
+        let mut for_hash = got.clone();
+        for_hash.persist_row_hash = String::new();
+        let recomputed = crate::federation::types::compute_persist_row_hash(&for_hash).unwrap();
+        assert_eq!(got.persist_row_hash, recomputed);
+    }
+
+    #[tokio::test]
+    async fn federation_idempotent_put() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let key = fed_key("k1", "primitive-a", "k1");
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: key.clone(),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord { record: key })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn federation_conflict_on_different_content() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let key1 = fed_key("k1", "primitive-a", "k1");
+        let key2 = fed_key("k1", "primitive-b", "k1");
+        backend
+            .put_public_key(SignedKeyRecord { record: key1 })
+            .await
+            .unwrap();
+        let err = backend
+            .put_public_key(SignedKeyRecord { record: key2 })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::federation::Error::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn federation_lookup_by_identity_filters() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-1", "persist", "k-1"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-2", "persist", "k-2"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-3", "lens", "k-3"),
+            })
+            .await
+            .unwrap();
+        let persist_keys = backend.lookup_keys_for_identity("persist").await.unwrap();
+        assert_eq!(persist_keys.len(), 2);
+        let lens_keys = backend.lookup_keys_for_identity("lens").await.unwrap();
+        assert_eq!(lens_keys.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn federation_attestation_round_trip() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        // Bootstrap two keys first (FK requirement).
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("registry-steward", "registry", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-a", "primitive-a", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fed_attestation(
+                    "att-1",
+                    "registry-steward",
+                    "k-a",
+                    "registry-steward",
+                ),
+            })
+            .await
+            .unwrap();
+
+        let by = backend
+            .list_attestations_by("registry-steward")
+            .await
+            .unwrap();
+        assert_eq!(by.len(), 1);
+        let for_a = backend.list_attestations_for("k-a").await.unwrap();
+        assert_eq!(for_a.len(), 1);
+        assert_eq!(for_a[0].attestation_id, "att-1");
+        assert_eq!(for_a[0].persist_row_hash.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn federation_attestation_fk_enforcement() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        // Insert an attestation referencing a non-existent key — FK
+        // violation surfaces as InvalidArgument (matches memory shape).
+        let att = fed_attestation("att-1", "ghost-steward", "ghost-key", "ghost-steward");
+        let err = backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::federation::Error::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn federation_revocation_round_trip() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("registry-steward", "registry", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-bad", "primitive-bad", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_revocation(SignedRevocation {
+                revocation: fed_revocation(
+                    "rev-1",
+                    "k-bad",
+                    "registry-steward",
+                    "registry-steward",
+                ),
+            })
+            .await
+            .unwrap();
+        let revs = backend.revocations_for("k-bad").await.unwrap();
+        assert_eq!(revs.len(), 1);
+        assert_eq!(revs[0].revocation_id, "rev-1");
+        assert_eq!(revs[0].persist_row_hash.len(), 64);
     }
 }
