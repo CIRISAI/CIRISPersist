@@ -39,6 +39,20 @@ pub struct TraceComponent {
     /// the typed accessors below to extract specific fields with
     /// schema validation.
     pub data: serde_json::Map<String, serde_json::Value>,
+    /// v0.3.0 / TRACE_WIRE_FORMAT.md §4 (cc41f315f) — wire format
+    /// 2.7.9 promoted `agent_id_hash` to a per-component required field
+    /// (denormalized from the parent CompleteTrace envelope; agents
+    /// emit them locked-equal). Optional in the struct because:
+    ///   - 2.7.0 traces don't have it (must be `None` post-parse)
+    ///   - 2.7.9 traces always have it (parser-rejected if missing —
+    ///     enforced at the canonical reconstruction step)
+    ///
+    /// Cross-shape field injection defense (§3.1): at
+    /// `trace_schema_version "2.7.0"`, the canonical reconstruction
+    /// MUST IGNORE this field even if present on the wire. Only the
+    /// envelope `agent_id_hash` is authoritative at 2.7.0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id_hash: Option<String>,
 }
 
 impl TraceComponent {
@@ -249,6 +263,7 @@ mod tests {
             event_type,
             timestamp: "2026-04-30T00:16:00Z".parse().unwrap(),
             data: map,
+            agent_id_hash: None,
         }
     }
 

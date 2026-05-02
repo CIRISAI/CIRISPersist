@@ -462,6 +462,7 @@ mod tests {
                         m.insert("attempt_index".into(), 0.into());
                         m
                     },
+                    agent_id_hash: None,
                 },
                 crate::schema::TraceComponent {
                     component_type: crate::schema::ComponentType::Action,
@@ -478,6 +479,7 @@ mod tests {
                         m.insert("cost_cents".into(), serde_json::json!(0.1));
                         m
                     },
+                    agent_id_hash: None,
                 },
             ],
             signature: String::new(),

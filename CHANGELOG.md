@@ -5,6 +5,76 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.3.0] — 2026-05-02
+
+**Wire format 2.7.9 — locked against `CIRISAgent/FSD/TRACE_WIRE_FORMAT.md @ cc41f315f`** (release/2.7.9 HEAD; byte-identical at v2.7.9-stable). QA runner cuts a `release/2.7.9` signed build today; persist v0.3.0 must be on PyPI before that build deploys, or persist v0.2.x will fail to verify the new shape.
+
+### What changed
+
+| Surface | v0.2.x | v0.3.0 |
+|---|---|---|
+| `SUPPORTED_VERSIONS` | `["2.7.0"]` | `["2.7.0", "2.7.9"]` |
+| `TraceComponent` fields | 4 (component_type, event_type, timestamp, data) | 5 (above + `agent_id_hash`) — `Option<String>`; `None` at 2.7.0 (cross-shape injection defense), `Some(envelope_hash)` at 2.7.9 |
+| Canonical-shape dispatch | try-9-field-then-2-field (silent fallback) | **deterministic by `trace_schema_version`** — NOT iterative. Per spec §8 |
+| Per-component canonical | always 4 fields | 4 at "2.7.0", 5 at "2.7.9" (adds `agent_id_hash`) |
+| Legacy 2-field canonical | silent fallback on mismatch | reserved behind explicit `"2.7.legacy"` opt-in (not in `SUPPORTED_VERSIONS` by default) |
+| `verify::Error` variants | 5 (Mismatch / Canonicalization / UnknownKey / InvalidSignature / Internal) | 6 (above + `UnsupportedSchemaVersion` for the dispatch-table miss) |
+
+### Why deterministic dispatch (not try-three)
+
+The pre-v0.3.0 try-9-field-then-2-field-on-mismatch fallback worked but had three structural problems:
+
+1. **Shape-shopping attack surface**. An attacker who could craft canonical-bytes collisions on one shape might escape rejection on the other.
+2. **Spurious-sig-fail latency multiplier**. Under load, every successful verify for the second shape paid one wasted SHA-256 + Ed25519 verify.
+3. **Telemetry noise**. "Verified on second try" doesn't tell you which shape the agent fleet is actually on.
+
+`trace_schema_version` is part of the signed canonical bytes — self-authenticating. An attacker cannot forge the dispatch key without breaking the signature. Each trace contributes to exactly one canonical shape's verify path. Per cc41f315f hand-off note.
+
+### Cross-shape field injection defense (§3.1)
+
+At `trace_schema_version "2.7.0"`, canonical reconstruction MUST IGNORE per-component `agent_id_hash` even if present on the wire. Only the envelope value is authoritative. An attacker stuffing per-component `agent_id_hash` into a 2.7.0 trace cannot influence dedup or signing.
+
+Test: `v270_ignores_per_component_agent_id_hash_injection` — builds the same trace with `agent_id_hash: None` vs `agent_id_hash: Some("attacker_smuggled_hash")`; the canonical bytes are byte-identical.
+
+### `context/TRACE_WIRE_FORMAT.md` is now a pointer
+
+Replaces the vendored copy with a single-line pointer to `CIRISAgent/FSD/TRACE_WIRE_FORMAT.md @ cc41f315f`. Eliminates the spec-vendor-drift class that produced the v0.1.18 → v0.1.20 float-canonicalization break.
+
+When the agent introduces a future schema version (`2.8.0`, etc.), the pointer's pinned commit reference updates paired with a persist version bump — consumers always have a coherent (spec, persist code) pair.
+
+### Sunset markers (telemetry-driven, not date-committed)
+
+- Drop "2.7.0" once `federation_canonical_match_total{wire="2.7.0"}` stays at zero through a soak window.
+- "2.7.legacy" — reserved sentinel for the pre-2.7.8.9 2-field shape; deployments opt-in by adding to `SUPPORTED_VERSIONS`. Never silent fallback for unrecognized versions.
+
+### Threat-model closures (per cc41f315f hand-off note)
+
+| Concern | Mechanism | Spec ref |
+|---|---|---|
+| AV-9 cross-agent pre-claim | `agent_id_hash` binds dedup tuple, denormalized per-component on the wire | §3.1, §4, §9.1 |
+| LLM_CALL parent forgeability | `parent_event_type` + `parent_attempt_index` in signed canonical | §5.10 |
+| VERB_SECOND_PASS dispatch ambiguity | Closed enum `{"tool", "defer"}` + extension policy | §5.7 |
+| Cross-shape field injection at 2.7.0 | Canonical-reconstruction ignore-rule + test | §3.1 |
+| Verifier dispatch ambiguity | Deterministic by `trace_schema_version`, NOT iterative | §8 |
+
+Residual: `agent_id_hash` is 64-bit (8 bytes) — anti-DOS at federation scale, not a confidentiality boundary. Same trade-off PoB §3.2 made for Reticulum addressing.
+
+### Tests
+
+157 lib tests green (+2 new: `v279_signed_trace_verifies_via_deterministic_dispatch` and `v270_ignores_per_component_agent_id_hash_injection`); the v0.1.16 try-both fallback test renamed/refactored to `legacy_two_field_canonical_dispatch_via_explicit_opt_in` (now tests the explicit `"2.7.legacy"` opt-in path, not silent fallback). Clippy clean across all features. cargo-deny clean.
+
+### Lens action
+
+`pip install --upgrade ciris-persist==0.3.0`. The trace-verify path now dispatches by `trace_schema_version` automatically — no lens-side changes required for the wire-format bump itself. Lens's existing engine.receive_and_persist() flow handles 2.7.0 and 2.7.9 traces transparently.
+
+### Deferred to v0.3.x
+
+- Telemetry counters: `federation_canonical_attempts_total{shape, wire}` + `federation_canonical_match_total{shape, wire}` (each trace contributes to exactly one bucket given deterministic dispatch).
+- LLMCallEvent required-field enforcement at parse layer for 2.7.9 (parent_event_type + parent_attempt_index). The fields land in `trace_llm_calls` correctly via the existing decompose path; what's deferred is the explicit parse-time rejection if absent at 2.7.9. Until v0.3.x, missing fields are caught downstream at trace_llm_calls insert NOT NULL constraint or at verify-canonical-mismatch.
+- VERB_SECOND_PASS_RESULT closed verb enum validation at parse (current shape: parses any string in `verb_second_pass_data.verb`; spec requires `{"tool", "defer"}`). Caught at verify-canonical-mismatch indirectly today.
+- Threat model refresh in `FEDERATION_THREAT_MODELS/CIRISPersist_THREAT_MODEL.md` per the hand-off note.
+- Fixture regen for "2.7.9" — current fixtures cover 2.7.0; 2.7.9 fixtures land in v0.3.x once we have a real signed-by-agent fixture from the QA runner.
+
 ## [0.2.4] — 2026-05-02
 
 First piece of verify subsumption (CIRISPersist#4) — **pip-install-time

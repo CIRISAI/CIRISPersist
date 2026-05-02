@@ -54,6 +54,7 @@ pub fn build_signed_batch(
                 .parse()
                 .unwrap(),
             data,
+            agent_id_hash: None,
         });
     }
 

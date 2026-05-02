@@ -45,6 +45,15 @@ pub enum Error {
     /// JSON serialization for canonical bytes failed.
     #[error("internal: {0}")]
     Internal(#[from] serde_json::Error),
+
+    /// v0.3.0 — `trace_schema_version` is in
+    /// [`crate::schema::SUPPORTED_VERSIONS`] but the verify dispatch
+    /// table doesn't have a canonical-shape arm for it. Should be
+    /// impossible at runtime; belt-and-braces typed error so a future
+    /// SUPPORTED_VERSIONS expansion that forgets to add the dispatch
+    /// arm fails loud instead of silently returning Ok().
+    #[error("unsupported schema version for verify dispatch: {0}")]
+    UnsupportedSchemaVersion(String),
 }
 
 impl Error {
@@ -57,6 +66,7 @@ impl Error {
             Error::UnknownKey(_) => "verify_unknown_key",
             Error::InvalidSignature(_) => "verify_invalid_signature",
             Error::Internal(_) => "verify_internal",
+            Error::UnsupportedSchemaVersion(_) => "verify_unsupported_schema_version",
         }
     }
 }

@@ -67,6 +67,7 @@ fn build_signed_batch(
                 .parse()
                 .unwrap(),
             data,
+            agent_id_hash: None,
         });
     }
 
@@ -463,6 +464,7 @@ async fn av17_attempt_index_out_of_range() {
         event_type: ReasoningEventType::ConscienceResult,
         timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
         data,
+        agent_id_hash: None,
     };
     let mut trace = CompleteTrace {
         trace_id: "trace-av17".into(),

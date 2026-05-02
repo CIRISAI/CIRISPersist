@@ -16,15 +16,31 @@ use serde::{Deserialize, Serialize};
 
 /// Wire-format schema versions this build accepts.
 ///
-/// Currently `"2.7.0"` — agent 2.7.8 ships this version
-/// (TRACE_WIRE_FORMAT.md §3 / §6).
+/// v0.3.0 dual-window (per `release/2.7.9` cc41f315f hand-off note):
+///   - `"2.7.0"` — agent 2.7.8 ships this; 4-field per-component
+///     canonical (no per-component `agent_id_hash`).
+///   - `"2.7.9"` — agent 2.7.9 fleet; 5-field per-component
+///     canonical (per-component `agent_id_hash` denormalized from
+///     envelope, LLMCallEvent gets `parent_event_type` + `parent_attempt_index`
+///     required, VERB_SECOND_PASS_RESULT.verb closed enum).
 ///
-/// Phase 2 may add a `"2.8.0"` entry once the per-event chain
-/// extension (FSD §4.5) lands; Phase 3 may add `"3.0.0"` for the
-/// schema bump named in TRACE_EVENT_LOG_PERSISTENCE.md §8. Adding
-/// a version is paired with writing a migrator from the old version
-/// to the canonical internal shape.
-pub const SUPPORTED_VERSIONS: &[&str] = &["2.7.0"];
+/// Verifier dispatches by `trace_schema_version` deterministically
+/// (TRACE_WIRE_FORMAT.md §8) — NOT iterative try-all. Each trace
+/// contributes to exactly one canonical shape's verify path.
+///
+/// Cross-shape field injection defense (§3.1): at `"2.7.0"`,
+/// canonical reconstruction MUST IGNORE per-component `agent_id_hash`
+/// even if present on the wire — only the envelope `agent_id_hash`
+/// is authoritative at 2.7.0.
+///
+/// Sunset markers — telemetry-driven, not date-committed:
+///   - Drop "2.7.0" once `federation_canonical_match_total{wire="2.7.0"}`
+///     stays at zero through a soak window.
+///   - Reserved sentinel `"2.7.legacy"` for the pre-2.7.8.9 2-field
+///     `{components, trace_level}` shape — accepted only via
+///     explicit version opt-in, never silent fallback for
+///     unrecognized versions.
+pub const SUPPORTED_VERSIONS: &[&str] = &["2.7.0", "2.7.9"];
 
 /// Type-checked wrapper around a schema version string.
 ///
@@ -129,13 +145,21 @@ mod tests {
         assert!(v.is_supported());
     }
 
+    /// v0.3.0 — accept 2.7.9 wire format.
+    #[test]
+    fn parse_accepts_2_7_9() {
+        let v = SchemaVersion::parse("2.7.9").expect("2.7.9 is supported");
+        assert_eq!(v.as_str(), "2.7.9");
+        assert!(v.is_supported());
+    }
+
     #[test]
     fn parse_rejects_old_version() {
         let err = SchemaVersion::parse("2.6.0").unwrap_err();
         match err {
             super::super::Error::UnsupportedSchemaVersion { got, supported } => {
                 assert_eq!(got, "2.6.0");
-                assert_eq!(supported, &["2.7.0"]);
+                assert_eq!(supported, &["2.7.0", "2.7.9"]);
             }
             _ => panic!("expected UnsupportedSchemaVersion, got {err:?}"),
         }

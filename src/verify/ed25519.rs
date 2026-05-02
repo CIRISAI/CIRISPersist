@@ -94,12 +94,19 @@ pub trait PublicKeyDirectory {
 /// microseconds when zero" rule and breaking signature verify on
 /// every batch with a `.000000`-shaped agent timestamp.
 pub fn canonical_payload_value(trace: &CompleteTrace) -> serde_json::Value {
-    // Per §8, the canonical fields are:
+    // Per §8 at `trace_schema_version "2.7.0"`, the canonical fields are:
     //   trace_id, thought_id, task_id, agent_id_hash, started_at,
     //   completed_at, trace_level, trace_schema_version, components.
     //
-    // Each component contributes:
+    // Each component contributes 4 fields:
     //   component_type, data (post-_strip_empty), event_type, timestamp.
+    //
+    // **Cross-shape field injection defense (§3.1)**: at `"2.7.0"`,
+    // canonical reconstruction MUST IGNORE per-component
+    // `agent_id_hash` even if present on the wire — only the envelope
+    // `agent_id_hash` is authoritative at 2.7.0. The TraceComponent's
+    // `agent_id_hash` field stays `None` here regardless of whether
+    // the wire bytes carried it; that's a feature, not a bug.
     //
     // The agent stripped empties before signing; what arrives over
     // the wire IS post-strip. The component `data` field on
@@ -127,6 +134,96 @@ pub fn canonical_payload_value(trace: &CompleteTrace) -> serde_json::Value {
         serde_json::Value::String(trace.thought_id.clone()),
     );
     // task_id may be null per the wire-format spec.
+    payload.insert(
+        "task_id".into(),
+        match &trace.task_id {
+            Some(t) => serde_json::Value::String(t.clone()),
+            None => serde_json::Value::Null,
+        },
+    );
+    payload.insert(
+        "agent_id_hash".into(),
+        serde_json::Value::String(trace.agent_id_hash.clone()),
+    );
+    payload.insert(
+        "started_at".into(),
+        serde_json::Value::String(trace.started_at.wire().to_owned()),
+    );
+    payload.insert(
+        "completed_at".into(),
+        serde_json::Value::String(trace.completed_at.wire().to_owned()),
+    );
+    payload.insert(
+        "trace_level".into(),
+        serde_json::to_value(trace.trace_level).expect("TraceLevel serializes"),
+    );
+    payload.insert(
+        "trace_schema_version".into(),
+        serde_json::Value::String(trace.trace_schema_version.as_str().to_owned()),
+    );
+    payload.insert("components".into(), serde_json::Value::Array(components));
+
+    serde_json::Value::Object(payload)
+}
+
+/// v0.3.0 — Build the canonical payload for `trace_schema_version "2.7.9"`.
+///
+/// Per TRACE_WIRE_FORMAT.md §3.1 + §4 + §8 at cc41f315f
+/// (release/2.7.9 HEAD): same 9-field envelope as
+/// [`canonical_payload_value`], but each component contributes 5
+/// fields instead of 4 — `agent_id_hash` is denormalized from the
+/// envelope onto every TraceComponent. Agents emit them locked-equal
+/// at build time; persistence MAY reject mismatches but the
+/// canonical reconstruction here trusts the wire value.
+///
+/// Component shape (alphabetical, matches Python `json.dumps(...,
+/// sort_keys=True)`):
+/// ```text
+///   agent_id_hash, component_type, data, event_type, timestamp
+/// ```
+///
+/// **Required at 2.7.9 — no transition.** A 2.7.9 trace whose
+/// component is missing `agent_id_hash` is malformed; canonical
+/// reconstruction here would substitute the envelope value, but the
+/// agent's wire bytes wouldn't have had a substitution, so the
+/// signature mismatches and verify fails. That's the right outcome:
+/// 2.7.9 spec is "MUST emit per-component", verify enforces.
+pub fn canonical_payload_value_v279(trace: &CompleteTrace) -> serde_json::Value {
+    let components: Vec<serde_json::Value> = trace
+        .components
+        .iter()
+        .map(|c| {
+            // Use the per-component agent_id_hash if present (the
+            // 2.7.9 wire shape); fall back to envelope value if the
+            // wire was malformed (component sans agent_id_hash). The
+            // fallback path produces a trace that can never verify
+            // because the agent's signed bytes had a real per-component
+            // value or would be rejected agent-side. Belt-and-braces
+            // shape: doesn't crash on malformed input, fails verify
+            // honestly.
+            let aih = c
+                .agent_id_hash
+                .as_deref()
+                .unwrap_or(trace.agent_id_hash.as_str());
+            serde_json::json!({
+                "agent_id_hash": aih,
+                "component_type": c.component_type,
+                "data": serde_json::Value::Object(c.data.clone()),
+                "event_type": c.event_type,
+                "timestamp": c.timestamp.wire(),
+            })
+        })
+        .collect();
+
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "trace_id".into(),
+        serde_json::Value::String(trace.trace_id.clone()),
+    );
+    payload.insert(
+        "thought_id".into(),
+        serde_json::Value::String(trace.thought_id.clone()),
+    );
     payload.insert(
         "task_id".into(),
         match &trace.task_id {
@@ -330,31 +427,44 @@ where
             .expect("length-checked above"),
     );
 
-    // 2. Try the spec-target 9-field canonical first
-    // (TRACE_WIRE_FORMAT.md §8). This is the eventual shape; agent
-    // fleets that have migrated sign over this directly.
-    let nine_field = canonical_payload_value(trace);
-    let nine_bytes = canonicalizer.canonicalize_value(&nine_field)?;
-    if key.verify_strict(&nine_bytes, &sig).is_ok() {
+    // 2. v0.3.0 — deterministic dispatch by `trace_schema_version`
+    // (TRACE_WIRE_FORMAT.md §8 at cc41f315f). NOT iterative try-all.
+    // `trace_schema_version` is part of the signed canonical bytes,
+    // so the dispatch key is self-authenticating: an attacker cannot
+    // forge it without breaking the signature.
+    //
+    // Each trace contributes to exactly one canonical-shape verify
+    // path. No shape-shopping attack surface; no spurious-sig-fail
+    // SHA-256+verify latency multiplier under load.
+    //
+    // Pre-v0.3.0 try-9-field-then-2-field fallback is retired: the
+    // legacy 2-field shape is reserved behind explicit
+    // `"2.7.legacy"` opt-in (not currently in SUPPORTED_VERSIONS;
+    // would need to be added to enable), never silent fallback for
+    // unrecognized versions.
+    let canonical = match trace.trace_schema_version.as_str() {
+        "2.7.0" => canonical_payload_value(trace),
+        "2.7.9" => canonical_payload_value_v279(trace),
+        "2.7.legacy" => canonical_payload_value_legacy(trace),
+        other => {
+            // Should be impossible — schema parse already gates on
+            // SUPPORTED_VERSIONS. Belt-and-braces typed error here so
+            // a future SUPPORTED_VERSIONS expansion that forgets to
+            // add the dispatch arm fails loud.
+            return Err(Error::UnsupportedSchemaVersion(other.to_owned()));
+        }
+    };
+    let canonical_bytes = canonicalizer.canonicalize_value(&canonical)?;
+    if key.verify_strict(&canonical_bytes, &sig).is_ok() {
         return Ok(());
     }
 
-    // 3. Fallback: legacy 2-field canonical
-    // ({components, trace_level}, post-strip_empty). CIRISPersist#5:
-    // the agent fleet today signs this shape per
-    // `Ed25519TraceSigner.sign_trace` and `CIRISLens/api/accord_api.py
-    // ::verify_trace_signature`. Same defensive shape v0.1.15 used
-    // for the base64 alphabet fallback. Migration to 9-field is
-    // tracked agent-side; persist accepts both through the window.
-    let two_field = canonical_payload_value_legacy(trace);
-    let two_bytes = canonicalizer.canonicalize_value(&two_field)?;
-    if key.verify_strict(&two_bytes, &sig).is_ok() {
-        return Ok(());
-    }
-
-    // 4. Both shapes failed. Strict verify rejected; typed error.
-    // The signature shape was valid (length + base64 decode both
-    // succeeded) so this is content mismatch, not malformation.
+    // 3. Strict verify rejected; typed error. The signature shape
+    // was valid (length + base64 decode both succeeded) so this is
+    // content mismatch, not malformation. Diagnostic surfaces
+    // (canonical_payload_sha256s + Engine.debug_canonicalize) cover
+    // the v0.1.18 follow-on path for triaging which canonical shape
+    // would have produced the agent's signed bytes.
     Err(Error::SignatureMismatch)
 }
 
@@ -521,13 +631,26 @@ mod tests {
             .expect("URL-safe-no-pad signature MUST verify post-v0.1.15");
     }
 
-    /// CIRISPersist#5 (v0.1.16): trace signed with the **legacy
-    /// 2-field canonical** ({components, trace_level}, post-strip)
-    /// verifies via persist's try-both fallback. This is the form
-    /// the agent fleet actually ships today; pre-v0.1.16 every
-    /// real production batch rejected with `verify_signature_mismatch`.
+    /// v0.3.0 — legacy 2-field canonical via explicit opt-in
+    /// `"2.7.legacy"` version sentinel.
+    ///
+    /// Pre-v0.3.0 (`v0.1.16`-`v0.2.x`) tried 9-field first then fell
+    /// back to 2-field on mismatch — silent. Per
+    /// `TRACE_WIRE_FORMAT.md §8 at cc41f315f`: deterministic dispatch
+    /// by `trace_schema_version`, no silent fallback. The 2-field
+    /// canonical is reserved behind explicit `"2.7.legacy"` opt-in.
+    /// SUPPORTED_VERSIONS doesn't include `"2.7.legacy"` by default
+    /// — adding it is a deployment-side decision, not a runtime
+    /// fallback. Test directly invokes `canonical_payload_value_legacy`
+    /// to confirm the dispatch arm produces the right bytes.
     #[test]
-    fn legacy_two_field_signed_trace_verifies() {
+    fn legacy_two_field_canonical_dispatch_via_explicit_opt_in() {
+        // This test bypasses the schema parse gate (which would
+        // reject "2.7.legacy" without explicit SUPPORTED_VERSIONS
+        // opt-in) and directly exercises the canonical reconstruction.
+        // verify_trace's dispatch arm for "2.7.legacy" exists; whether
+        // a deployment turns it on by adding to SUPPORTED_VERSIONS is
+        // a separate operational decision.
         let sk = fixed_signing_key();
         let key_id = "test-key:42";
         let mut data = serde_json::Map::new();
@@ -541,18 +664,21 @@ mod tests {
             started_at: "2026-04-30T00:15:53.123456+00:00".parse().unwrap(),
             completed_at: "2026-04-30T00:16:12.789012+00:00".parse().unwrap(),
             trace_level: crate::schema::TraceLevel::Generic,
-            trace_schema_version: SchemaVersion::parse("2.7.0").unwrap(),
+            // Lenient parse path for the sentinel; production gate
+            // would require SUPPORTED_VERSIONS opt-in at parse layer.
+            trace_schema_version: serde_json::from_str("\"2.7.legacy\"").unwrap(),
             components: vec![crate::schema::TraceComponent {
                 component_type: crate::schema::ComponentType::Conscience,
                 event_type: crate::schema::ReasoningEventType::ConscienceResult,
                 timestamp: "2026-04-30T00:15:53.123456+00:00".parse().unwrap(),
                 data,
+                agent_id_hash: None,
             }],
             signature: String::new(),
             signature_key_id: key_id.to_owned(),
         };
 
-        // Sign the LEGACY 2-field form (what the agent actually does):
+        // Sign the LEGACY 2-field form:
         let legacy_payload = canonical_payload_value_legacy(&trace_unsigned);
         let bytes = PythonJsonDumpsCanonicalizer
             .canonicalize_value(&legacy_payload)
@@ -568,11 +694,10 @@ mod tests {
         };
         keys.keys.insert(key_id.to_owned(), sk.verifying_key());
 
-        // Persist's verify tries 9-field first (will fail —
-        // signature is over 2-field), then falls back to 2-field
-        // and succeeds.
+        // verify_trace dispatches by trace_schema_version. With
+        // "2.7.legacy" sentinel, it routes to canonical_payload_value_legacy.
         verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &keys)
-            .expect("legacy 2-field signed trace MUST verify via fallback (CIRISPersist#5)");
+            .expect("explicit 2.7.legacy opt-in MUST verify via 2-field canonical");
     }
 
     /// CIRISPersist#5: a trace tampered after legacy-form signing
@@ -619,6 +744,106 @@ mod tests {
         let err = verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &keys)
             .expect_err("tampered trace must reject even with try-both fallback");
         assert!(matches!(err, Error::SignatureMismatch));
+    }
+
+    /// v0.3.0 — trace_schema_version "2.7.9" verifies via the new
+    /// 5-field-per-component canonical (with denormalized
+    /// agent_id_hash on each component). Per-component agent_id_hash
+    /// MUST equal the envelope value (agents emit them locked-equal).
+    #[test]
+    fn v279_signed_trace_verifies_via_deterministic_dispatch() {
+        let sk = fixed_signing_key();
+        let key_id = "test-key:42";
+        let mut data = serde_json::Map::new();
+        data.insert("attempt_index".into(), serde_json::json!(0));
+        let trace_unsigned = CompleteTrace {
+            trace_id: "trace-279-1".into(),
+            thought_id: "th-1".into(),
+            task_id: None,
+            agent_id_hash: "7c3f8e2b1d9a4f60".into(),
+            started_at: "2026-04-30T00:15:53.123456+00:00".parse().unwrap(),
+            completed_at: "2026-04-30T00:16:12.789012+00:00".parse().unwrap(),
+            trace_level: crate::schema::TraceLevel::Generic,
+            trace_schema_version: SchemaVersion::parse("2.7.9").unwrap(),
+            components: vec![crate::schema::TraceComponent {
+                component_type: crate::schema::ComponentType::Conscience,
+                event_type: crate::schema::ReasoningEventType::ConscienceResult,
+                timestamp: "2026-04-30T00:15:53.123456+00:00".parse().unwrap(),
+                data,
+                // 2.7.9 wire shape: per-component agent_id_hash, locked
+                // equal to the envelope value.
+                agent_id_hash: Some("7c3f8e2b1d9a4f60".into()),
+            }],
+            signature: String::new(),
+            signature_key_id: key_id.to_owned(),
+        };
+
+        let payload = canonical_payload_value_v279(&trace_unsigned);
+        let bytes = PythonJsonDumpsCanonicalizer
+            .canonicalize_value(&payload)
+            .unwrap();
+        let sig = sk.sign(&bytes);
+        let trace = CompleteTrace {
+            signature: BASE64.encode(sig.to_bytes()),
+            ..trace_unsigned
+        };
+
+        let mut keys = MemKeys {
+            keys: HashMap::new(),
+        };
+        keys.keys.insert(key_id.to_owned(), sk.verifying_key());
+
+        verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &keys)
+            .expect("2.7.9 trace MUST verify via deterministic dispatch to v279 canonical");
+    }
+
+    /// v0.3.0 — Cross-shape field injection defense (§3.1):
+    /// at trace_schema_version "2.7.0", canonical reconstruction
+    /// MUST IGNORE per-component agent_id_hash even if present on
+    /// the wire. An attacker stuffing per-component agent_id_hash
+    /// into a 2.7.0 trace cannot influence the canonical bytes.
+    #[test]
+    fn v270_ignores_per_component_agent_id_hash_injection() {
+        // Build the same trace twice: once with per-component
+        // agent_id_hash = None, once with Some(...). At "2.7.0",
+        // the canonical bytes MUST be identical (the per-component
+        // agent_id_hash is stripped at canonicalization).
+        fn build(per_comp_aih: Option<String>) -> CompleteTrace {
+            let mut data = serde_json::Map::new();
+            data.insert("attempt_index".into(), serde_json::json!(0));
+            CompleteTrace {
+                trace_id: "trace-270-injection".into(),
+                thought_id: "th-1".into(),
+                task_id: None,
+                agent_id_hash: "envelope_hash".into(),
+                started_at: "2026-04-30T00:00:00+00:00".parse().unwrap(),
+                completed_at: "2026-04-30T00:01:00+00:00".parse().unwrap(),
+                trace_level: crate::schema::TraceLevel::Generic,
+                trace_schema_version: SchemaVersion::parse("2.7.0").unwrap(),
+                components: vec![crate::schema::TraceComponent {
+                    component_type: crate::schema::ComponentType::Conscience,
+                    event_type: crate::schema::ReasoningEventType::ConscienceResult,
+                    timestamp: "2026-04-30T00:00:00+00:00".parse().unwrap(),
+                    data,
+                    agent_id_hash: per_comp_aih,
+                }],
+                signature: String::new(),
+                signature_key_id: "k".into(),
+            }
+        }
+        let no_inject = build(None);
+        let with_inject = build(Some("attacker_smuggled_hash".into()));
+
+        let no_bytes = PythonJsonDumpsCanonicalizer
+            .canonicalize_value(&canonical_payload_value(&no_inject))
+            .unwrap();
+        let with_bytes = PythonJsonDumpsCanonicalizer
+            .canonicalize_value(&canonical_payload_value(&with_inject))
+            .unwrap();
+        assert_eq!(
+            no_bytes, with_bytes,
+            "2.7.0 canonical MUST ignore per-component agent_id_hash injection"
+        );
     }
 
     /// CIRISPersist#5: `strip_empty` recursion matches the agent's

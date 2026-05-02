@@ -232,6 +232,7 @@ mod tests {
             event_type,
             timestamp: ts("2026-04-30T00:16:00Z"),
             data,
+            agent_id_hash: None,
         }
     }
 

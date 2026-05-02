@@ -573,6 +573,7 @@ mod tests {
                         m.insert("attempt_index".into(), 0.into());
                         m
                     },
+                    agent_id_hash: None,
                 },
                 crate::schema::TraceComponent {
                     component_type: ComponentType::LlmCall,
@@ -588,6 +589,7 @@ mod tests {
                         m.insert("status".into(), "ok".into());
                         m
                     },
+                    agent_id_hash: None,
                 },
                 crate::schema::TraceComponent {
                     component_type: ComponentType::Action,
@@ -601,6 +603,7 @@ mod tests {
                         m.insert("cost_cents".into(), serde_json::json!(0.5));
                         m
                     },
+                    agent_id_hash: None,
                 },
             ],
             signature: "AAAA".into(),
