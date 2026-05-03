@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777837321038,
+  "lastUpdate": 1777837805036,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -5981,6 +5981,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 22456939,
             "range": "± 260285",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "fd914936694ea666a2b21225c15c6af040ba1547",
+          "message": "0.4.0 — federation substrate cut: outbound queue + verify surface + drop legacy fallback\n\nThree architectural deliverables shipped together. Closes\nCIRISPersist#16 (CIRISEdge OQ-09) + CIRISLens#8 ASK 2 +\nCIRISLens#8 verify-surface request. Schema-stabilization release.\n\n## CIRISPersist#16 — edge_outbound_queue (CIRISEdge OQ-09)\n\nDurable substrate for CIRISEdge::send_durable(). Closed in\ncheckpoint commit (880aafa); this release ships it as the v0.4.0\ncut alongside two other commitments.\n\n## Drop accord_public_keys dual-read fallback (lens#8 ASK 2)\n\nBackend::lookup_public_key on postgres + memory + sqlite reads\nonly from federation_keys. The v0.2.1 fallback to\naccord_public_keys retired this release, coordinated with lens\ndropping its direct INSERT into accord_public_keys the same\nrelease.\n\nThe legacy table stays in the schema for historical reads via\ncirislens_reader (V005 read-only role) but the verify path no\nlonger touches it. sample_public_keys diagnostic reads\nfederation_keys so the verify-unknown-key breadcrumb sample\nmatches the actual lookup query.\n\nTests: lookup_public_key_round_trip + revoked_keys_filtered\nrewritten to use federation_keys (the latter renamed to\nexpired_keys_filtered — federation revocations are a separate\nconcern in federation_revocations post-v0.2.0).\n\n## Full verify surface for agent cutover\n\nFive new Engine verify methods so agent runtime verify can cut\nover to persist exclusively when brought in via lenscore:\n\n- engine.verify_trace(complete_trace_json) -> dict\n  Full CompleteTrace verify with internal directory lookup;\n  deterministic dispatch by trace_schema_version.\n\n- engine.verify_hybrid_via_directory(canonical_bytes,\n  signature_key_id, ed25519_sig_b64, ml_dsa_65_sig_b64, policy,\n  soft_freshness_window_seconds, row_age_seconds) -> dict\n  Convenience wrapper around verify_hybrid + lookup_public_key.\n\n- engine.verify_signed_key_record(json, policy, ...) -> dict\n- engine.verify_signed_attestation(json, policy, ...) -> dict\n- engine.verify_signed_revocation(json, policy, ...) -> dict\n  Federation directory row verify (verify-without-store) for\n  consumer-side dry-runs / trust-graph audits.\n\nThe agent's runtime verify needs (CompleteTrace, peer-message\nenvelopes, federation directory rows, ACK envelopes, arbitrary\ncanonical bytes) all map onto Engine methods. No federation peer\nneeds to call ciris_crypto::HybridVerifier directly —\nverify-via-persist is the single-source-of-truth (CIRISPersist#7\narchitectural closure repeated for the verify path).\n\n## Threat model updates\n\nAV-40 (outbound queue disk exhaustion) + AV-41 (spoofed\nin_reply_to ACK matching) added to docs/THREAT_MODEL.md §3.11.\nMitigation matrix updated. Status header bumped to v0.4.0.\n\n## Tests\n\n177 lib tests pass; clippy clean across all features; cargo-deny\nclean. The fallback retirement broke 2 tests targeting legacy\naccord_public_keys round-trip; rewritten to exercise federation_keys.\n\n## Bridge action\n\nciris-persist==0.3.6 → 0.4.0\n\nLens drops direct INSERT into accord_public_keys this release\n(v0.3.x fallback path is gone). DSAR handler folds onto\nengine.delete_traces_for_agent(agent_id_hash, signature_key_id)\nper v0.3.6's per-key contract. Agent runtime verify can now\ncut over to persist exclusively.\n\n## Schema\n\nV007 (postgres + sqlite): cirislens.edge_outbound_queue +\n6 partial indexes. accord_public_keys table NOT dropped —\nhistorical reads work; only the runtime fallback path is\nretired. v0.5.0 may drop the table itself once historical-reads\nconsumers migrate.\n\n## Deps\n\nNo version changes (ciris-keyring / ciris-verify-core /\nciris-crypto v1.9.0).\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-03T14:43:51-05:00",
+          "tree_id": "d7b4871f080ef2189c4db116b576c427355312ae",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/fd914936694ea666a2b21225c15c6af040ba1547"
+        },
+        "date": 1777837804724,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 108647,
+            "range": "± 821",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 258921,
+            "range": "± 608",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 558743,
+            "range": "± 1470",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1983302,
+            "range": "± 4111",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 323,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1394,
+            "range": "± 18",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 6583,
+            "range": "± 34",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 361,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3069,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9628,
+            "range": "± 59",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42214,
+            "range": "± 1825",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2243740,
+            "range": "± 116804",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7015937,
+            "range": "± 639228",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25931686,
+            "range": "± 182268",
             "unit": "ns/iter"
           }
         ]
