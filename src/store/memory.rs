@@ -57,6 +57,11 @@ struct State {
     /// v0.2.0 — Federation `federation_revocations` rows,
     /// append-only.
     federation_revocations: Vec<crate::federation::Revocation>,
+    /// v0.4.0 — Edge outbound queue (CIRISPersist#16). Same logical
+    /// surface as `cirislens.edge_outbound_queue`. Keyed by
+    /// queue_id. State-machine integrity enforced by the impl,
+    /// matching the postgres CHECK constraints.
+    outbound_queue: HashMap<String, crate::outbound::OutboundRow>,
 }
 
 impl Default for MemoryBackend {
@@ -70,6 +75,7 @@ impl Default for MemoryBackend {
                 federation_keys: HashMap::new(),
                 federation_attestations: Vec::new(),
                 federation_revocations: Vec::new(),
+                outbound_queue: HashMap::new(),
             }),
         }
     }
@@ -594,6 +600,447 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 classical_sig_b64: r.scrub_signature_classical,
             })
             .collect())
+    }
+}
+
+// ─── OutboundQueue impl (v0.4.0, CIRISPersist#16) ──────────────────
+//
+// In-process map mirroring the postgres edge_outbound_queue table.
+// State-machine invariants enforced by the impl (matches postgres
+// CHECK constraints + transaction semantics). Single-mutex; fine
+// for tests.
+
+impl crate::outbound::OutboundQueue for MemoryBackend {
+    async fn enqueue_outbound(
+        &self,
+        sender_key_id: &str,
+        destination_key_id: &str,
+        message_type: &str,
+        edge_schema_version: &str,
+        envelope_bytes: &[u8],
+        body_sha256: &[u8; 32],
+        body_size_bytes: i32,
+        requires_ack: bool,
+        ack_timeout_seconds: Option<i64>,
+        max_attempts: i32,
+        ttl_seconds: i64,
+        initial_next_attempt_after: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::outbound::QueueId, crate::outbound::Error> {
+        // Local invariant gate (matches CHECK constraints; cleaner
+        // error than waiting for SQL roundtrip).
+        if max_attempts <= 0 {
+            return Err(crate::outbound::Error::InvalidArgument(
+                "max_attempts must be > 0".into(),
+            ));
+        }
+        if ttl_seconds <= 0 {
+            return Err(crate::outbound::Error::InvalidArgument(
+                "ttl_seconds must be > 0".into(),
+            ));
+        }
+        if !(1..=8 * 1024 * 1024).contains(&body_size_bytes) {
+            return Err(crate::outbound::Error::InvalidArgument(format!(
+                "body_size_bytes out of range: {body_size_bytes}"
+            )));
+        }
+        if requires_ack && ack_timeout_seconds.is_none_or_zero() {
+            return Err(crate::outbound::Error::InvalidArgument(
+                "ack_timeout_seconds required when requires_ack=true".into(),
+            ));
+        }
+        let queue_id = format!("{:x}-{:x}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), uuid_like_counter());
+        let row = crate::outbound::OutboundRow {
+            queue_id: queue_id.clone(),
+            sender_key_id: sender_key_id.into(),
+            destination_key_id: destination_key_id.into(),
+            message_type: message_type.into(),
+            edge_schema_version: edge_schema_version.into(),
+            envelope_bytes: envelope_bytes.to_vec(),
+            body_sha256: *body_sha256,
+            body_size_bytes,
+            status: crate::outbound::OutboundStatus::Pending,
+            enqueued_at: chrono::Utc::now(),
+            next_attempt_after: initial_next_attempt_after,
+            last_attempt_at: None,
+            transport_delivered_at: None,
+            delivered_at: None,
+            abandoned_at: None,
+            abandoned_reason: None,
+            attempt_count: 0,
+            max_attempts,
+            ttl_seconds,
+            last_error_class: None,
+            last_error_detail: None,
+            last_transport: None,
+            requires_ack,
+            ack_timeout_seconds,
+            ack_envelope_bytes: None,
+            ack_received_at: None,
+            claimed_until: None,
+            claimed_by: None,
+        };
+        let mut state = self.state.lock().expect("memory backend lock");
+        state.outbound_queue.insert(queue_id.clone(), row);
+        Ok(queue_id)
+    }
+
+    async fn claim_pending_outbound(
+        &self,
+        batch_size: i64,
+        claim_duration_seconds: i64,
+        claimed_by: &str,
+    ) -> Result<Vec<crate::outbound::OutboundRow>, crate::outbound::Error> {
+        let now = chrono::Utc::now();
+        let claim_until = now + chrono::Duration::seconds(claim_duration_seconds);
+        let mut state = self.state.lock().expect("memory backend lock");
+        // Pick eligible rows ordered by next_attempt_after ASC.
+        let mut candidates: Vec<String> = state
+            .outbound_queue
+            .iter()
+            .filter(|(_, r)| {
+                r.status == crate::outbound::OutboundStatus::Pending
+                    && r.next_attempt_after <= now
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        candidates.sort_by_key(|k| {
+            state
+                .outbound_queue
+                .get(k)
+                .map(|r| r.next_attempt_after)
+                .unwrap_or(now)
+        });
+        candidates.truncate(batch_size.max(0) as usize);
+
+        let mut claimed = Vec::with_capacity(candidates.len());
+        for k in candidates {
+            if let Some(r) = state.outbound_queue.get_mut(&k) {
+                r.status = crate::outbound::OutboundStatus::Sending;
+                r.last_attempt_at = Some(now);
+                r.attempt_count += 1;
+                r.claimed_until = Some(claim_until);
+                r.claimed_by = Some(claimed_by.into());
+                claimed.push(r.clone());
+            }
+        }
+        Ok(claimed)
+    }
+
+    async fn mark_transport_delivered(
+        &self,
+        queue_id: &crate::outbound::QueueId,
+        transport: &str,
+    ) -> Result<(), crate::outbound::Error> {
+        let now = chrono::Utc::now();
+        let mut state = self.state.lock().expect("memory backend lock");
+        let r = state.outbound_queue.get_mut(queue_id).ok_or_else(|| {
+            crate::outbound::Error::NotFound(queue_id.clone())
+        })?;
+        if r.status != crate::outbound::OutboundStatus::Sending {
+            return Err(crate::outbound::Error::InvalidTransition(format!(
+                "queue_id {queue_id} not in 'sending'"
+            )));
+        }
+        r.transport_delivered_at = Some(now);
+        r.last_transport = Some(transport.into());
+        r.claimed_until = None;
+        r.claimed_by = None;
+        if r.requires_ack {
+            r.status = crate::outbound::OutboundStatus::AwaitingAck;
+        } else {
+            r.status = crate::outbound::OutboundStatus::Delivered;
+            r.delivered_at = Some(now);
+        }
+        Ok(())
+    }
+
+    async fn mark_transport_failed(
+        &self,
+        queue_id: &crate::outbound::QueueId,
+        error_class: &str,
+        error_detail: &str,
+        transport: &str,
+        next_attempt_after: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::outbound::OutboundFailureOutcome, crate::outbound::Error> {
+        let now = chrono::Utc::now();
+        let mut state = self.state.lock().expect("memory backend lock");
+        let r = state.outbound_queue.get_mut(queue_id).ok_or_else(|| {
+            crate::outbound::Error::NotFound(queue_id.clone())
+        })?;
+        if r.status != crate::outbound::OutboundStatus::Sending {
+            return Err(crate::outbound::Error::InvalidTransition(format!(
+                "queue_id {queue_id} not in 'sending'"
+            )));
+        }
+        r.last_error_class = Some(error_class.into());
+        r.last_error_detail = Some(error_detail.into());
+        r.last_transport = Some(transport.into());
+        r.claimed_until = None;
+        r.claimed_by = None;
+
+        let ttl_expired = (now - r.enqueued_at)
+            > chrono::Duration::seconds(r.ttl_seconds);
+        let attempts_exhausted = r.attempt_count >= r.max_attempts;
+        if ttl_expired || attempts_exhausted {
+            r.status = crate::outbound::OutboundStatus::Abandoned;
+            r.abandoned_at = Some(now);
+            r.abandoned_reason = Some(if ttl_expired {
+                crate::outbound::AbandonedReason::TtlExpired
+            } else {
+                crate::outbound::AbandonedReason::MaxAttempts
+            });
+            Ok(crate::outbound::OutboundFailureOutcome::Abandoned)
+        } else {
+            r.status = crate::outbound::OutboundStatus::Pending;
+            r.next_attempt_after = next_attempt_after;
+            Ok(crate::outbound::OutboundFailureOutcome::Retrying {
+                attempt: r.attempt_count,
+            })
+        }
+    }
+
+    async fn mark_replay_resolved(
+        &self,
+        queue_id: &crate::outbound::QueueId,
+    ) -> Result<(), crate::outbound::Error> {
+        let now = chrono::Utc::now();
+        let mut state = self.state.lock().expect("memory backend lock");
+        if let Some(r) = state.outbound_queue.get_mut(queue_id) {
+            if !r.status.is_terminal() {
+                r.status = crate::outbound::OutboundStatus::Delivered;
+                r.delivered_at = Some(now);
+                r.claimed_until = None;
+                r.claimed_by = None;
+            }
+        }
+        Ok(())
+    }
+
+    async fn match_ack_to_outbound(
+        &self,
+        in_reply_to_sha256: &[u8; 32],
+    ) -> Result<Option<crate::outbound::OutboundRow>, crate::outbound::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(state
+            .outbound_queue
+            .values()
+            .find(|r| {
+                r.status == crate::outbound::OutboundStatus::AwaitingAck
+                    && r.body_sha256 == *in_reply_to_sha256
+            })
+            .cloned())
+    }
+
+    async fn mark_ack_received(
+        &self,
+        queue_id: &crate::outbound::QueueId,
+        ack_envelope_bytes: &[u8],
+    ) -> Result<(), crate::outbound::Error> {
+        let now = chrono::Utc::now();
+        let mut state = self.state.lock().expect("memory backend lock");
+        let r = state.outbound_queue.get_mut(queue_id).ok_or_else(|| {
+            crate::outbound::Error::NotFound(queue_id.clone())
+        })?;
+        if r.status != crate::outbound::OutboundStatus::AwaitingAck {
+            return Err(crate::outbound::Error::InvalidTransition(format!(
+                "queue_id {queue_id} not in 'awaiting_ack'"
+            )));
+        }
+        r.status = crate::outbound::OutboundStatus::Delivered;
+        r.ack_envelope_bytes = Some(ack_envelope_bytes.to_vec());
+        r.ack_received_at = Some(now);
+        r.delivered_at = Some(now);
+        Ok(())
+    }
+
+    async fn sweep_ack_timeouts(&self) -> Result<i64, crate::outbound::Error> {
+        let now = chrono::Utc::now();
+        let mut state = self.state.lock().expect("memory backend lock");
+        let mut count = 0i64;
+        let queue_ids: Vec<String> = state
+            .outbound_queue
+            .iter()
+            .filter(|(_, r)| {
+                if r.status != crate::outbound::OutboundStatus::AwaitingAck {
+                    return false;
+                }
+                let Some(t) = r.transport_delivered_at else {
+                    return false;
+                };
+                let Some(timeout) = r.ack_timeout_seconds else {
+                    return false;
+                };
+                (now - t) > chrono::Duration::seconds(timeout)
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in queue_ids {
+            if let Some(r) = state.outbound_queue.get_mut(&k) {
+                let ttl_expired = (now - r.enqueued_at)
+                    > chrono::Duration::seconds(r.ttl_seconds);
+                let attempts_exhausted = r.attempt_count >= r.max_attempts;
+                r.last_error_class = Some("ack_timeout".into());
+                r.last_error_detail =
+                    Some("no ACK before ack_timeout_seconds expired".into());
+                if ttl_expired || attempts_exhausted {
+                    r.status = crate::outbound::OutboundStatus::Abandoned;
+                    r.abandoned_at = Some(now);
+                    r.abandoned_reason = Some(if ttl_expired {
+                        crate::outbound::AbandonedReason::TtlExpired
+                    } else {
+                        crate::outbound::AbandonedReason::MaxAttempts
+                    });
+                } else {
+                    r.status = crate::outbound::OutboundStatus::Pending;
+                    r.next_attempt_after = now + chrono::Duration::seconds(60);
+                }
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    async fn sweep_ttl_expired(&self) -> Result<i64, crate::outbound::Error> {
+        let now = chrono::Utc::now();
+        let mut state = self.state.lock().expect("memory backend lock");
+        let mut count = 0i64;
+        for r in state.outbound_queue.values_mut() {
+            if r.status.is_terminal() {
+                continue;
+            }
+            if (now - r.enqueued_at) > chrono::Duration::seconds(r.ttl_seconds) {
+                r.status = crate::outbound::OutboundStatus::Abandoned;
+                r.abandoned_at = Some(now);
+                r.abandoned_reason = Some(crate::outbound::AbandonedReason::TtlExpired);
+                r.claimed_until = None;
+                r.claimed_by = None;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    async fn sweep_expired_claims(&self) -> Result<i64, crate::outbound::Error> {
+        let now = chrono::Utc::now();
+        let mut state = self.state.lock().expect("memory backend lock");
+        let mut count = 0i64;
+        for r in state.outbound_queue.values_mut() {
+            if r.status == crate::outbound::OutboundStatus::Sending
+                && r.claimed_until.map(|t| t < now).unwrap_or(false)
+            {
+                r.status = crate::outbound::OutboundStatus::Pending;
+                r.claimed_until = None;
+                r.claimed_by = None;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    async fn outbound_status(
+        &self,
+        queue_id: &crate::outbound::QueueId,
+    ) -> Result<Option<crate::outbound::OutboundRow>, crate::outbound::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(state.outbound_queue.get(queue_id).cloned())
+    }
+
+    async fn list_outbound(
+        &self,
+        filter: crate::outbound::OutboundFilter,
+        limit: i64,
+    ) -> Result<Vec<crate::outbound::OutboundRow>, crate::outbound::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .outbound_queue
+            .values()
+            .filter(|r| {
+                filter.status.map_or(true, |s| r.status == s)
+                    && filter
+                        .destination_key_id
+                        .as_ref()
+                        .map_or(true, |d| r.destination_key_id == *d)
+                    && filter
+                        .sender_key_id
+                        .as_ref()
+                        .map_or(true, |s| r.sender_key_id == *s)
+                    && filter
+                        .message_type
+                        .as_ref()
+                        .map_or(true, |m| r.message_type == *m)
+                    && filter
+                        .enqueued_after
+                        .map_or(true, |t| r.enqueued_at >= t)
+            })
+            .cloned()
+            .collect();
+        rows.sort_by_key(|r| r.enqueued_at);
+        rows.truncate(limit.max(0) as usize);
+        Ok(rows)
+    }
+
+    async fn cancel_outbound(
+        &self,
+        queue_id: &crate::outbound::QueueId,
+    ) -> Result<(), crate::outbound::Error> {
+        let now = chrono::Utc::now();
+        let mut state = self.state.lock().expect("memory backend lock");
+        if let Some(r) = state.outbound_queue.get_mut(queue_id) {
+            if !r.status.is_terminal() {
+                r.status = crate::outbound::OutboundStatus::Abandoned;
+                r.abandoned_at = Some(now);
+                r.abandoned_reason =
+                    Some(crate::outbound::AbandonedReason::OperatorCancel);
+                r.claimed_until = None;
+                r.claimed_by = None;
+            }
+        }
+        Ok(())
+    }
+
+    async fn replay_abandoned(
+        &self,
+        queue_id: &crate::outbound::QueueId,
+    ) -> Result<(), crate::outbound::Error> {
+        let now = chrono::Utc::now();
+        let mut state = self.state.lock().expect("memory backend lock");
+        let r = state.outbound_queue.get_mut(queue_id).ok_or_else(|| {
+            crate::outbound::Error::NotFound(queue_id.clone())
+        })?;
+        if r.status != crate::outbound::OutboundStatus::Abandoned {
+            return Err(crate::outbound::Error::InvalidTransition(format!(
+                "queue_id {queue_id} not in 'abandoned'"
+            )));
+        }
+        r.status = crate::outbound::OutboundStatus::Pending;
+        r.attempt_count = 0;
+        r.next_attempt_after = now;
+        r.abandoned_at = None;
+        r.abandoned_reason = None;
+        r.last_error_class = None;
+        r.last_error_detail = None;
+        Ok(())
+    }
+}
+
+/// Helper: monotonic counter for memory-backend queue_id generation.
+/// Postgres uses gen_random_uuid(); the memory backend just needs
+/// uniqueness within the in-process map. Ten-digit hex is plenty.
+fn uuid_like_counter() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Helper trait for None-or-zero check used by the memory backend's
+/// invariant gate.
+trait IsNoneOrZero {
+    fn is_none_or_zero(&self) -> bool;
+}
+
+impl IsNoneOrZero for Option<i64> {
+    fn is_none_or_zero(&self) -> bool {
+        matches!(self, None | Some(0))
     }
 }
 

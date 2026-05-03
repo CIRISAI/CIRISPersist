@@ -1452,6 +1452,661 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     }
 }
 
+// ─── OutboundQueue impl (v0.4.0, CIRISPersist#16) ──────────────────
+//
+// Postgres-backed durable substrate for CIRISEdge::send_durable().
+// State-machine + ACK-matching + sweep primitives. Same architectural
+// shape as FederationDirectory: trait carries the contract, this
+// impl provides the postgres-specific queries.
+
+impl crate::outbound::OutboundQueue for PostgresBackend {
+    async fn enqueue_outbound(
+        &self,
+        sender_key_id: &str,
+        destination_key_id: &str,
+        message_type: &str,
+        edge_schema_version: &str,
+        envelope_bytes: &[u8],
+        body_sha256: &[u8; 32],
+        body_size_bytes: i32,
+        requires_ack: bool,
+        ack_timeout_seconds: Option<i64>,
+        max_attempts: i32,
+        ttl_seconds: i64,
+        initial_next_attempt_after: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::outbound::QueueId, crate::outbound::Error> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
+        let body_sha256_vec: Vec<u8> = body_sha256.to_vec();
+        let row = client
+            .query_one(
+                "INSERT INTO cirislens.edge_outbound_queue (\
+                    sender_key_id, destination_key_id, message_type, \
+                    edge_schema_version, envelope_bytes, body_sha256, \
+                    body_size_bytes, status, next_attempt_after, \
+                    max_attempts, ttl_seconds, requires_ack, \
+                    ack_timeout_seconds\
+                 ) VALUES (\
+                    $1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9, $10, $11, $12\
+                 ) RETURNING queue_id::text",
+                &[
+                    &sender_key_id,
+                    &destination_key_id,
+                    &message_type,
+                    &edge_schema_version,
+                    &envelope_bytes,
+                    &body_sha256_vec,
+                    &body_size_bytes,
+                    &initial_next_attempt_after,
+                    &max_attempts,
+                    &ttl_seconds,
+                    &requires_ack,
+                    &ack_timeout_seconds,
+                ],
+            )
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("enqueue_outbound: {e}")))?;
+        Ok(row.get(0))
+    }
+
+    async fn claim_pending_outbound(
+        &self,
+        batch_size: i64,
+        claim_duration_seconds: i64,
+        claimed_by: &str,
+    ) -> Result<Vec<crate::outbound::OutboundRow>, crate::outbound::Error> {
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("begin tx: {e}")))?;
+
+        // FOR UPDATE SKIP LOCKED is the multi-instance dispatch
+        // primitive — concurrent workers see disjoint batches
+        // (CIRISEdge OQ-06). Subquery picks claim candidates;
+        // outer UPDATE marks them sending + writes claim metadata.
+        let now = chrono::Utc::now();
+        let claim_until = now + chrono::Duration::seconds(claim_duration_seconds);
+        let rows = tx
+            .query(
+                "WITH picked AS (\
+                    SELECT queue_id FROM cirislens.edge_outbound_queue \
+                     WHERE status = 'pending' AND next_attempt_after <= $1 \
+                     ORDER BY next_attempt_after ASC \
+                     LIMIT $2 \
+                     FOR UPDATE SKIP LOCKED\
+                 ) \
+                 UPDATE cirislens.edge_outbound_queue q \
+                 SET status = 'sending', \
+                     last_attempt_at = $1, \
+                     attempt_count = attempt_count + 1, \
+                     claimed_until = $3, claimed_by = $4 \
+                 FROM picked \
+                 WHERE q.queue_id = picked.queue_id \
+                 RETURNING q.queue_id::text, sender_key_id, destination_key_id, \
+                          message_type, edge_schema_version, envelope_bytes, \
+                          body_sha256, body_size_bytes, status, enqueued_at, \
+                          next_attempt_after, last_attempt_at, transport_delivered_at, \
+                          delivered_at, abandoned_at, abandoned_reason, attempt_count, \
+                          max_attempts, ttl_seconds, last_error_class, last_error_detail, \
+                          last_transport, requires_ack, ack_timeout_seconds, \
+                          ack_envelope_bytes, ack_received_at, claimed_until, claimed_by",
+                &[&now, &batch_size, &claim_until, &claimed_by],
+            )
+            .await
+            .map_err(|e| {
+                crate::outbound::Error::Backend(format!("claim_pending_outbound: {e}"))
+            })?;
+        tx.commit()
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("commit claim: {e}")))?;
+
+        rows.into_iter().map(pg_row_to_outbound_row).collect()
+    }
+
+    async fn mark_transport_delivered(
+        &self,
+        queue_id: &crate::outbound::QueueId,
+        transport: &str,
+    ) -> Result<(), crate::outbound::Error> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
+        let now = chrono::Utc::now();
+        // Branch on requires_ack within the SQL: 'delivered' immediately
+        // when no ACK required; 'awaiting_ack' otherwise. CHECK
+        // constraints enforce delivered_at correctness on terminal.
+        let n = client
+            .execute(
+                "UPDATE cirislens.edge_outbound_queue \
+                 SET status = CASE WHEN requires_ack THEN 'awaiting_ack' ELSE 'delivered' END, \
+                     transport_delivered_at = $1, \
+                     delivered_at = CASE WHEN requires_ack THEN NULL ELSE $1 END, \
+                     last_transport = $2, \
+                     claimed_until = NULL, claimed_by = NULL \
+                 WHERE queue_id = $3::uuid AND status = 'sending'",
+                &[&now, &transport, &queue_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::outbound::Error::Backend(format!("mark_transport_delivered: {e}"))
+            })?;
+        if n == 0 {
+            return Err(crate::outbound::Error::InvalidTransition(format!(
+                "queue_id {queue_id} not in 'sending'"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn mark_transport_failed(
+        &self,
+        queue_id: &crate::outbound::QueueId,
+        error_class: &str,
+        error_detail: &str,
+        transport: &str,
+        next_attempt_after: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::outbound::OutboundFailureOutcome, crate::outbound::Error> {
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("begin tx: {e}")))?;
+
+        // Read current state to decide retry vs abandon. Lock the
+        // row so concurrent dispatcher workers can't race.
+        let row = tx
+            .query_opt(
+                "SELECT attempt_count, max_attempts, enqueued_at, ttl_seconds \
+                 FROM cirislens.edge_outbound_queue \
+                 WHERE queue_id = $1::uuid AND status = 'sending' \
+                 FOR UPDATE",
+                &[&queue_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::outbound::Error::Backend(format!("mark_transport_failed lookup: {e}"))
+            })?
+            .ok_or_else(|| {
+                crate::outbound::Error::InvalidTransition(format!(
+                    "queue_id {queue_id} not in 'sending'"
+                ))
+            })?;
+
+        let attempt_count: i32 = row.get(0);
+        let max_attempts: i32 = row.get(1);
+        let enqueued_at: chrono::DateTime<chrono::Utc> = row.get(2);
+        let ttl_seconds: i64 = row.get(3);
+
+        let now = chrono::Utc::now();
+        let ttl_expired =
+            (now - enqueued_at) > chrono::Duration::seconds(ttl_seconds);
+        let attempts_exhausted = attempt_count >= max_attempts;
+
+        let outcome = if ttl_expired || attempts_exhausted {
+            let reason = if ttl_expired { "ttl_expired" } else { "max_attempts" };
+            tx.execute(
+                "UPDATE cirislens.edge_outbound_queue \
+                 SET status = 'abandoned', \
+                     abandoned_at = $1, abandoned_reason = $2, \
+                     last_error_class = $3, last_error_detail = $4, \
+                     last_transport = $5, \
+                     claimed_until = NULL, claimed_by = NULL \
+                 WHERE queue_id = $6::uuid",
+                &[&now, &reason, &error_class, &error_detail, &transport, &queue_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::outbound::Error::Backend(format!("mark abandoned: {e}"))
+            })?;
+            crate::outbound::OutboundFailureOutcome::Abandoned
+        } else {
+            tx.execute(
+                "UPDATE cirislens.edge_outbound_queue \
+                 SET status = 'pending', \
+                     next_attempt_after = $1, \
+                     last_error_class = $2, last_error_detail = $3, \
+                     last_transport = $4, \
+                     claimed_until = NULL, claimed_by = NULL \
+                 WHERE queue_id = $5::uuid",
+                &[&next_attempt_after, &error_class, &error_detail, &transport, &queue_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::outbound::Error::Backend(format!("mark retrying: {e}"))
+            })?;
+            crate::outbound::OutboundFailureOutcome::Retrying { attempt: attempt_count }
+        };
+
+        tx.commit().await.map_err(|e| {
+            crate::outbound::Error::Backend(format!("commit mark_transport_failed: {e}"))
+        })?;
+        Ok(outcome)
+    }
+
+    async fn mark_replay_resolved(
+        &self,
+        queue_id: &crate::outbound::QueueId,
+    ) -> Result<(), crate::outbound::Error> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
+        let now = chrono::Utc::now();
+        // Treat as delivered — receiver already accepted the body
+        // (replay window expired before our ACK arrived). Idempotent
+        // across non-terminal states.
+        client
+            .execute(
+                "UPDATE cirislens.edge_outbound_queue \
+                 SET status = 'delivered', delivered_at = $1, \
+                     claimed_until = NULL, claimed_by = NULL \
+                 WHERE queue_id = $2::uuid AND status NOT IN ('delivered', 'abandoned')",
+                &[&now, &queue_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::outbound::Error::Backend(format!("mark_replay_resolved: {e}"))
+            })?;
+        Ok(())
+    }
+
+    async fn match_ack_to_outbound(
+        &self,
+        in_reply_to_sha256: &[u8; 32],
+    ) -> Result<Option<crate::outbound::OutboundRow>, crate::outbound::Error> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
+        let hash_vec: Vec<u8> = in_reply_to_sha256.to_vec();
+        let row_opt = client
+            .query_opt(
+                "SELECT queue_id::text, sender_key_id, destination_key_id, \
+                        message_type, edge_schema_version, envelope_bytes, \
+                        body_sha256, body_size_bytes, status, enqueued_at, \
+                        next_attempt_after, last_attempt_at, transport_delivered_at, \
+                        delivered_at, abandoned_at, abandoned_reason, attempt_count, \
+                        max_attempts, ttl_seconds, last_error_class, last_error_detail, \
+                        last_transport, requires_ack, ack_timeout_seconds, \
+                        ack_envelope_bytes, ack_received_at, claimed_until, claimed_by \
+                 FROM cirislens.edge_outbound_queue \
+                 WHERE body_sha256 = $1 AND status = 'awaiting_ack' \
+                 LIMIT 1",
+                &[&hash_vec],
+            )
+            .await
+            .map_err(|e| {
+                crate::outbound::Error::Backend(format!("match_ack_to_outbound: {e}"))
+            })?;
+        match row_opt {
+            None => Ok(None),
+            Some(row) => Ok(Some(pg_row_to_outbound_row(row)?)),
+        }
+    }
+
+    async fn mark_ack_received(
+        &self,
+        queue_id: &crate::outbound::QueueId,
+        ack_envelope_bytes: &[u8],
+    ) -> Result<(), crate::outbound::Error> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
+        let now = chrono::Utc::now();
+        let n = client
+            .execute(
+                "UPDATE cirislens.edge_outbound_queue \
+                 SET status = 'delivered', \
+                     ack_envelope_bytes = $1, ack_received_at = $2, \
+                     delivered_at = $2 \
+                 WHERE queue_id = $3::uuid AND status = 'awaiting_ack'",
+                &[&ack_envelope_bytes, &now, &queue_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::outbound::Error::Backend(format!("mark_ack_received: {e}"))
+            })?;
+        if n == 0 {
+            return Err(crate::outbound::Error::InvalidTransition(format!(
+                "queue_id {queue_id} not in 'awaiting_ack'"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn sweep_ack_timeouts(&self) -> Result<i64, crate::outbound::Error> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
+        let now = chrono::Utc::now();
+        // Walk awaiting_ack rows where the ack_timeout has expired.
+        // Treat each as a transport failure (attempt_count++,
+        // retry-or-abandon). Reschedule next_attempt_after to now +
+        // 60s baseline; the retry policy is otherwise driven by
+        // attempt_count vs max_attempts and enqueued_at vs ttl.
+        let n = client.execute(
+            "WITH timed_out AS (\
+                SELECT queue_id, attempt_count, max_attempts, enqueued_at, ttl_seconds \
+                FROM cirislens.edge_outbound_queue \
+                WHERE status = 'awaiting_ack' \
+                  AND transport_delivered_at + (ack_timeout_seconds || ' seconds')::interval < $1 \
+                FOR UPDATE\
+             ), \
+             abandoned AS (\
+                UPDATE cirislens.edge_outbound_queue q \
+                SET status = 'abandoned', \
+                    abandoned_at = $1, \
+                    abandoned_reason = CASE \
+                        WHEN ($1 - q.enqueued_at) > (q.ttl_seconds || ' seconds')::interval THEN 'ttl_expired' \
+                        ELSE 'max_attempts' END, \
+                    last_error_class = 'ack_timeout', \
+                    last_error_detail = 'no ACK before ack_timeout_seconds expired' \
+                FROM timed_out t \
+                WHERE q.queue_id = t.queue_id \
+                  AND (t.attempt_count >= t.max_attempts \
+                       OR ($1 - t.enqueued_at) > (t.ttl_seconds || ' seconds')::interval) \
+                RETURNING q.queue_id\
+             ), \
+             retried AS (\
+                UPDATE cirislens.edge_outbound_queue q \
+                SET status = 'pending', \
+                    next_attempt_after = $1 + interval '60 seconds', \
+                    last_error_class = 'ack_timeout', \
+                    last_error_detail = 'no ACK before ack_timeout_seconds expired' \
+                FROM timed_out t \
+                WHERE q.queue_id = t.queue_id \
+                  AND t.attempt_count < t.max_attempts \
+                  AND ($1 - t.enqueued_at) <= (t.ttl_seconds || ' seconds')::interval \
+                RETURNING q.queue_id\
+             ) \
+             SELECT (SELECT COUNT(*) FROM abandoned) + (SELECT COUNT(*) FROM retried)",
+            &[&now],
+        )
+        .await
+        .map_err(|e| crate::outbound::Error::Backend(format!("sweep_ack_timeouts: {e}")))?;
+        Ok(n as i64)
+    }
+
+    async fn sweep_ttl_expired(&self) -> Result<i64, crate::outbound::Error> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
+        let now = chrono::Utc::now();
+        let n = client
+            .execute(
+                "UPDATE cirislens.edge_outbound_queue \
+                 SET status = 'abandoned', \
+                     abandoned_at = $1, \
+                     abandoned_reason = 'ttl_expired', \
+                     claimed_until = NULL, claimed_by = NULL \
+                 WHERE status NOT IN ('delivered', 'abandoned') \
+                   AND ($1 - enqueued_at) > (ttl_seconds || ' seconds')::interval",
+                &[&now],
+            )
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("sweep_ttl_expired: {e}")))?;
+        Ok(n as i64)
+    }
+
+    async fn sweep_expired_claims(&self) -> Result<i64, crate::outbound::Error> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
+        let now = chrono::Utc::now();
+        let n = client
+            .execute(
+                "UPDATE cirislens.edge_outbound_queue \
+                 SET status = 'pending', \
+                     claimed_until = NULL, claimed_by = NULL \
+                 WHERE status = 'sending' AND claimed_until < $1",
+                &[&now],
+            )
+            .await
+            .map_err(|e| {
+                crate::outbound::Error::Backend(format!("sweep_expired_claims: {e}"))
+            })?;
+        Ok(n as i64)
+    }
+
+    async fn outbound_status(
+        &self,
+        queue_id: &crate::outbound::QueueId,
+    ) -> Result<Option<crate::outbound::OutboundRow>, crate::outbound::Error> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
+        let row_opt = client
+            .query_opt(
+                "SELECT queue_id::text, sender_key_id, destination_key_id, \
+                        message_type, edge_schema_version, envelope_bytes, \
+                        body_sha256, body_size_bytes, status, enqueued_at, \
+                        next_attempt_after, last_attempt_at, transport_delivered_at, \
+                        delivered_at, abandoned_at, abandoned_reason, attempt_count, \
+                        max_attempts, ttl_seconds, last_error_class, last_error_detail, \
+                        last_transport, requires_ack, ack_timeout_seconds, \
+                        ack_envelope_bytes, ack_received_at, claimed_until, claimed_by \
+                 FROM cirislens.edge_outbound_queue \
+                 WHERE queue_id = $1::uuid",
+                &[&queue_id],
+            )
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("outbound_status: {e}")))?;
+        match row_opt {
+            None => Ok(None),
+            Some(row) => Ok(Some(pg_row_to_outbound_row(row)?)),
+        }
+    }
+
+    async fn list_outbound(
+        &self,
+        filter: crate::outbound::OutboundFilter,
+        limit: i64,
+    ) -> Result<Vec<crate::outbound::OutboundRow>, crate::outbound::Error> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
+        // Build the WHERE clause dynamically. Bind each filter param;
+        // skip when None. Order by enqueued_at ASC so oldest pending
+        // surfaces first.
+        let mut sql = String::from(
+            "SELECT queue_id::text, sender_key_id, destination_key_id, \
+                    message_type, edge_schema_version, envelope_bytes, \
+                    body_sha256, body_size_bytes, status, enqueued_at, \
+                    next_attempt_after, last_attempt_at, transport_delivered_at, \
+                    delivered_at, abandoned_at, abandoned_reason, attempt_count, \
+                    max_attempts, ttl_seconds, last_error_class, last_error_detail, \
+                    last_transport, requires_ack, ack_timeout_seconds, \
+                    ack_envelope_bytes, ack_received_at, claimed_until, claimed_by \
+             FROM cirislens.edge_outbound_queue WHERE 1=1",
+        );
+        let mut params: Vec<Box<dyn ToSql + Sync + Send>> = Vec::new();
+        let mut idx = 1usize;
+        let status_str = filter.status.map(|s| s.as_str().to_string());
+        if let Some(s) = status_str.as_ref() {
+            sql.push_str(&format!(" AND status = ${idx}"));
+            params.push(Box::new(s.clone()));
+            idx += 1;
+        }
+        if let Some(ref dst) = filter.destination_key_id {
+            sql.push_str(&format!(" AND destination_key_id = ${idx}"));
+            params.push(Box::new(dst.clone()));
+            idx += 1;
+        }
+        if let Some(ref src) = filter.sender_key_id {
+            sql.push_str(&format!(" AND sender_key_id = ${idx}"));
+            params.push(Box::new(src.clone()));
+            idx += 1;
+        }
+        if let Some(ref mt) = filter.message_type {
+            sql.push_str(&format!(" AND message_type = ${idx}"));
+            params.push(Box::new(mt.clone()));
+            idx += 1;
+        }
+        if let Some(ts) = filter.enqueued_after {
+            sql.push_str(&format!(" AND enqueued_at >= ${idx}"));
+            params.push(Box::new(ts));
+            idx += 1;
+        }
+        sql.push_str(&format!(" ORDER BY enqueued_at ASC LIMIT ${idx}"));
+        params.push(Box::new(limit));
+
+        let params_refs: Vec<&(dyn ToSql + Sync)> = params
+            .iter()
+            .map(|b| b.as_ref() as &(dyn ToSql + Sync))
+            .collect();
+        let rows = client
+            .query(&sql, &params_refs)
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("list_outbound: {e}")))?;
+        rows.into_iter().map(pg_row_to_outbound_row).collect()
+    }
+
+    async fn cancel_outbound(
+        &self,
+        queue_id: &crate::outbound::QueueId,
+    ) -> Result<(), crate::outbound::Error> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
+        let now = chrono::Utc::now();
+        client
+            .execute(
+                "UPDATE cirislens.edge_outbound_queue \
+                 SET status = 'abandoned', \
+                     abandoned_at = $1, abandoned_reason = 'operator_cancel', \
+                     claimed_until = NULL, claimed_by = NULL \
+                 WHERE queue_id = $2::uuid AND status NOT IN ('delivered', 'abandoned')",
+                &[&now, &queue_id],
+            )
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("cancel_outbound: {e}")))?;
+        Ok(())
+    }
+
+    async fn replay_abandoned(
+        &self,
+        queue_id: &crate::outbound::QueueId,
+    ) -> Result<(), crate::outbound::Error> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
+        let now = chrono::Utc::now();
+        let n = client
+            .execute(
+                "UPDATE cirislens.edge_outbound_queue \
+                 SET status = 'pending', \
+                     attempt_count = 0, \
+                     next_attempt_after = $1, \
+                     abandoned_at = NULL, abandoned_reason = NULL, \
+                     last_error_class = NULL, last_error_detail = NULL \
+                 WHERE queue_id = $2::uuid AND status = 'abandoned'",
+                &[&now, &queue_id],
+            )
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("replay_abandoned: {e}")))?;
+        if n == 0 {
+            return Err(crate::outbound::Error::InvalidTransition(format!(
+                "queue_id {queue_id} not in 'abandoned'"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// v0.4.0 (CIRISPersist#16) — Convert a postgres row from
+/// `cirislens.edge_outbound_queue` to OutboundRow. Used by every
+/// read path (claim, status, list, match_ack).
+fn pg_row_to_outbound_row(
+    row: tokio_postgres::Row,
+) -> Result<crate::outbound::OutboundRow, crate::outbound::Error> {
+    use crate::outbound::{AbandonedReason, OutboundStatus};
+    let status_str: String = row.get("status");
+    let status = OutboundStatus::from_str(&status_str).ok_or_else(|| {
+        crate::outbound::Error::Backend(format!(
+            "unknown status in edge_outbound_queue: {status_str}"
+        ))
+    })?;
+    let abandoned_reason_str: Option<String> = row.get("abandoned_reason");
+    let abandoned_reason = match abandoned_reason_str.as_deref() {
+        Some(s) => Some(AbandonedReason::from_str(s).ok_or_else(|| {
+            crate::outbound::Error::Backend(format!("unknown abandoned_reason: {s}"))
+        })?),
+        None => None,
+    };
+    let body_sha256_vec: Vec<u8> = row.get("body_sha256");
+    if body_sha256_vec.len() != 32 {
+        return Err(crate::outbound::Error::Backend(format!(
+            "body_sha256 wrong length: {} (expected 32)",
+            body_sha256_vec.len()
+        )));
+    }
+    let mut body_sha256 = [0u8; 32];
+    body_sha256.copy_from_slice(&body_sha256_vec);
+
+    Ok(crate::outbound::OutboundRow {
+        queue_id: row.get("queue_id"),
+        sender_key_id: row.get("sender_key_id"),
+        destination_key_id: row.get("destination_key_id"),
+        message_type: row.get("message_type"),
+        edge_schema_version: row.get("edge_schema_version"),
+        envelope_bytes: row.get("envelope_bytes"),
+        body_sha256,
+        body_size_bytes: row.get("body_size_bytes"),
+        status,
+        enqueued_at: row.get("enqueued_at"),
+        next_attempt_after: row.get("next_attempt_after"),
+        last_attempt_at: row.get("last_attempt_at"),
+        transport_delivered_at: row.get("transport_delivered_at"),
+        delivered_at: row.get("delivered_at"),
+        abandoned_at: row.get("abandoned_at"),
+        abandoned_reason,
+        attempt_count: row.get("attempt_count"),
+        max_attempts: row.get("max_attempts"),
+        ttl_seconds: row.get("ttl_seconds"),
+        last_error_class: row.get("last_error_class"),
+        last_error_detail: row.get("last_error_detail"),
+        last_transport: row.get("last_transport"),
+        requires_ack: row.get("requires_ack"),
+        ack_timeout_seconds: row.get("ack_timeout_seconds"),
+        ack_envelope_bytes: row.get("ack_envelope_bytes"),
+        ack_received_at: row.get("ack_received_at"),
+        claimed_until: row.get("claimed_until"),
+        claimed_by: row.get("claimed_by"),
+    })
+}
+
 /// v0.2.1 — Decode a base64 standard-alphabet Ed25519 public key
 /// (32 raw bytes) and parse to VerifyingKey. Shared between the
 /// federation_keys and accord_public_keys lookup paths.

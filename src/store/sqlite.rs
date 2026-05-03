@@ -1340,6 +1340,684 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     }
 }
 
+// ─── OutboundQueue impl (v0.4.0, CIRISPersist#16) ──────────────────
+//
+// SQLite-backed durable substrate. Same logical surface as the
+// postgres impl; differences are sqlite-isms:
+//
+//   - No UUID type; queue_id is TEXT.
+//   - No FOR UPDATE SKIP LOCKED; WAL mode + writer-serialization
+//     on file lock means single-writer dispatch is correct without
+//     row-level locks. Multi-instance dispatch on sqlite is rare
+//     (sovereign-mode is typically single-process).
+//   - No interval arithmetic in SQL; per-row TTL/timeout checks
+//     happen in Rust after row read.
+//   - All ops wrapped in spawn_blocking + Mutex like other sqlite
+//     impls in this file.
+
+impl crate::outbound::OutboundQueue for SqliteBackend {
+    async fn enqueue_outbound(
+        &self,
+        sender_key_id: &str,
+        destination_key_id: &str,
+        message_type: &str,
+        edge_schema_version: &str,
+        envelope_bytes: &[u8],
+        body_sha256: &[u8; 32],
+        body_size_bytes: i32,
+        requires_ack: bool,
+        ack_timeout_seconds: Option<i64>,
+        max_attempts: i32,
+        ttl_seconds: i64,
+        initial_next_attempt_after: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::outbound::QueueId, crate::outbound::Error> {
+        if max_attempts <= 0 || ttl_seconds <= 0 {
+            return Err(crate::outbound::Error::InvalidArgument(
+                "max_attempts + ttl_seconds must be > 0".into(),
+            ));
+        }
+        if !(1..=8 * 1024 * 1024).contains(&body_size_bytes) {
+            return Err(crate::outbound::Error::InvalidArgument(format!(
+                "body_size_bytes out of range: {body_size_bytes}"
+            )));
+        }
+        if requires_ack && ack_timeout_seconds.unwrap_or(0) <= 0 {
+            return Err(crate::outbound::Error::InvalidArgument(
+                "ack_timeout_seconds required when requires_ack=true".into(),
+            ));
+        }
+        let queue_id = format!(
+            "{:x}-{:x}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            std::process::id()
+        );
+        let conn = self.conn.clone();
+        let qid = queue_id.clone();
+        let sender = sender_key_id.to_owned();
+        let dest = destination_key_id.to_owned();
+        let mt = message_type.to_owned();
+        let esv = edge_schema_version.to_owned();
+        let env_bytes = envelope_bytes.to_vec();
+        let hash_vec = body_sha256.to_vec();
+        let now = chrono::Utc::now();
+        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO edge_outbound_queue (\
+                    queue_id, sender_key_id, destination_key_id, message_type, \
+                    edge_schema_version, envelope_bytes, body_sha256, \
+                    body_size_bytes, status, enqueued_at, next_attempt_after, \
+                    max_attempts, ttl_seconds, requires_ack, ack_timeout_seconds\
+                 ) VALUES (\
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9, ?10, ?11, ?12, ?13, ?14\
+                 )",
+                rusqlite::params![
+                    qid,
+                    sender,
+                    dest,
+                    mt,
+                    esv,
+                    env_bytes,
+                    hash_vec,
+                    body_size_bytes,
+                    now.to_rfc3339(),
+                    initial_next_attempt_after.to_rfc3339(),
+                    max_attempts,
+                    ttl_seconds,
+                    if requires_ack { 1i64 } else { 0i64 },
+                    ack_timeout_seconds,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
+        .map_err(|e| crate::outbound::Error::Backend(format!("enqueue_outbound: {e}")))?;
+        Ok(queue_id)
+    }
+
+    async fn claim_pending_outbound(
+        &self,
+        batch_size: i64,
+        claim_duration_seconds: i64,
+        claimed_by: &str,
+    ) -> Result<Vec<crate::outbound::OutboundRow>, crate::outbound::Error> {
+        let conn = self.conn.clone();
+        let now = chrono::Utc::now();
+        let claim_until = now + chrono::Duration::seconds(claim_duration_seconds);
+        let claimed_by = claimed_by.to_owned();
+        let rows = tokio::task::spawn_blocking(move || -> Result<Vec<crate::outbound::OutboundRow>, rusqlite::Error> {
+            let mut conn = conn.blocking_lock();
+            let tx = conn.transaction()?;
+            let queue_ids: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT queue_id FROM edge_outbound_queue \
+                     WHERE status = 'pending' AND next_attempt_after <= ?1 \
+                     ORDER BY next_attempt_after ASC LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(
+                    rusqlite::params![now.to_rfc3339(), batch_size],
+                    |r| r.get::<_, String>(0),
+                )?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            let now_str = now.to_rfc3339();
+            let claim_until_str = claim_until.to_rfc3339();
+            for qid in &queue_ids {
+                tx.execute(
+                    "UPDATE edge_outbound_queue \
+                     SET status = 'sending', last_attempt_at = ?1, \
+                         attempt_count = attempt_count + 1, \
+                         claimed_until = ?2, claimed_by = ?3 \
+                     WHERE queue_id = ?4",
+                    rusqlite::params![now_str, claim_until_str, claimed_by, qid],
+                )?;
+            }
+            let claimed: Vec<crate::outbound::OutboundRow> = {
+                let mut out = Vec::with_capacity(queue_ids.len());
+                let mut stmt = tx.prepare(SQLITE_OUTBOUND_SELECT_BY_ID)?;
+                for qid in &queue_ids {
+                    let row = stmt.query_row([qid], sqlite_row_to_outbound_row)?;
+                    out.push(row);
+                }
+                out
+            };
+            tx.commit()?;
+            Ok(claimed)
+        })
+        .await
+        .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
+        .map_err(|e| crate::outbound::Error::Backend(format!("claim_pending_outbound: {e}")))?;
+        Ok(rows)
+    }
+
+    async fn mark_transport_delivered(
+        &self,
+        queue_id: &crate::outbound::QueueId,
+        transport: &str,
+    ) -> Result<(), crate::outbound::Error> {
+        let conn = self.conn.clone();
+        let qid = queue_id.clone();
+        let transport = transport.to_owned();
+        let now_str = chrono::Utc::now().to_rfc3339();
+        let n = tokio::task::spawn_blocking(move || -> rusqlite::Result<usize> {
+            let conn = conn.blocking_lock();
+            // CASE branch on requires_ack: !requires_ack → delivered;
+            // requires_ack → awaiting_ack.
+            conn.execute(
+                "UPDATE edge_outbound_queue \
+                 SET status = CASE WHEN requires_ack THEN 'awaiting_ack' ELSE 'delivered' END, \
+                     transport_delivered_at = ?1, \
+                     delivered_at = CASE WHEN requires_ack THEN NULL ELSE ?1 END, \
+                     last_transport = ?2, claimed_until = NULL, claimed_by = NULL \
+                 WHERE queue_id = ?3 AND status = 'sending'",
+                rusqlite::params![now_str, transport, qid],
+            )
+        })
+        .await
+        .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
+        .map_err(|e| crate::outbound::Error::Backend(format!("mark_transport_delivered: {e}")))?;
+        if n == 0 {
+            return Err(crate::outbound::Error::InvalidTransition(format!(
+                "queue_id {queue_id} not in 'sending'"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn mark_transport_failed(
+        &self,
+        queue_id: &crate::outbound::QueueId,
+        error_class: &str,
+        error_detail: &str,
+        transport: &str,
+        next_attempt_after: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::outbound::OutboundFailureOutcome, crate::outbound::Error> {
+        let conn = self.conn.clone();
+        let qid = queue_id.clone();
+        let error_class = error_class.to_owned();
+        let error_detail = error_detail.to_owned();
+        let transport = transport.to_owned();
+        let now = chrono::Utc::now();
+        let next_str = next_attempt_after.to_rfc3339();
+        let outcome = tokio::task::spawn_blocking(move || -> Result<crate::outbound::OutboundFailureOutcome, rusqlite::Error> {
+            let mut conn = conn.blocking_lock();
+            let tx = conn.transaction()?;
+            let (attempt_count, max_attempts, enqueued_at_str, ttl_seconds): (i32, i32, String, i64) = tx
+                .query_row(
+                    "SELECT attempt_count, max_attempts, enqueued_at, ttl_seconds \
+                     FROM edge_outbound_queue \
+                     WHERE queue_id = ?1 AND status = 'sending'",
+                    [&qid],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                ).map_err(|e| {
+                    if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
+                        // surface a sentinel error so the caller can map to InvalidTransition
+                        rusqlite::Error::QueryReturnedNoRows
+                    } else { e }
+                })?;
+            let enqueued_at = parse_rfc3339(&enqueued_at_str);
+            let ttl_expired = (now - enqueued_at) > chrono::Duration::seconds(ttl_seconds);
+            let attempts_exhausted = attempt_count >= max_attempts;
+            let outcome = if ttl_expired || attempts_exhausted {
+                let reason = if ttl_expired { "ttl_expired" } else { "max_attempts" };
+                tx.execute(
+                    "UPDATE edge_outbound_queue \
+                     SET status = 'abandoned', abandoned_at = ?1, abandoned_reason = ?2, \
+                         last_error_class = ?3, last_error_detail = ?4, last_transport = ?5, \
+                         claimed_until = NULL, claimed_by = NULL \
+                     WHERE queue_id = ?6",
+                    rusqlite::params![now.to_rfc3339(), reason, error_class, error_detail, transport, qid],
+                )?;
+                crate::outbound::OutboundFailureOutcome::Abandoned
+            } else {
+                tx.execute(
+                    "UPDATE edge_outbound_queue \
+                     SET status = 'pending', next_attempt_after = ?1, \
+                         last_error_class = ?2, last_error_detail = ?3, last_transport = ?4, \
+                         claimed_until = NULL, claimed_by = NULL \
+                     WHERE queue_id = ?5",
+                    rusqlite::params![next_str, error_class, error_detail, transport, qid],
+                )?;
+                crate::outbound::OutboundFailureOutcome::Retrying { attempt: attempt_count }
+            };
+            tx.commit()?;
+            Ok(outcome)
+        })
+        .await
+        .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => {
+                crate::outbound::Error::InvalidTransition(format!(
+                    "queue_id {queue_id} not in 'sending'"
+                ))
+            }
+            other => crate::outbound::Error::Backend(format!("mark_transport_failed: {other}")),
+        })?;
+        Ok(outcome)
+    }
+
+    async fn mark_replay_resolved(
+        &self,
+        queue_id: &crate::outbound::QueueId,
+    ) -> Result<(), crate::outbound::Error> {
+        let conn = self.conn.clone();
+        let qid = queue_id.clone();
+        let now_str = chrono::Utc::now().to_rfc3339();
+        tokio::task::spawn_blocking(move || -> rusqlite::Result<()> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE edge_outbound_queue \
+                 SET status = 'delivered', delivered_at = ?1, \
+                     claimed_until = NULL, claimed_by = NULL \
+                 WHERE queue_id = ?2 AND status NOT IN ('delivered', 'abandoned')",
+                rusqlite::params![now_str, qid],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
+        .map_err(|e| crate::outbound::Error::Backend(format!("mark_replay_resolved: {e}")))?;
+        Ok(())
+    }
+
+    async fn match_ack_to_outbound(
+        &self,
+        in_reply_to_sha256: &[u8; 32],
+    ) -> Result<Option<crate::outbound::OutboundRow>, crate::outbound::Error> {
+        let conn = self.conn.clone();
+        let hash_vec = in_reply_to_sha256.to_vec();
+        tokio::task::spawn_blocking(move || -> rusqlite::Result<Option<crate::outbound::OutboundRow>> {
+            let conn = conn.blocking_lock();
+            let sql = format!(
+                "{SQLITE_OUTBOUND_SELECT_PREFIX} WHERE body_sha256 = ?1 AND status = 'awaiting_ack' LIMIT 1"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            stmt.query_row([&hash_vec as &dyn rusqlite::ToSql], sqlite_row_to_outbound_row)
+                .optional()
+        })
+        .await
+        .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
+        .map_err(|e| crate::outbound::Error::Backend(format!("match_ack_to_outbound: {e}")))
+    }
+
+    async fn mark_ack_received(
+        &self,
+        queue_id: &crate::outbound::QueueId,
+        ack_envelope_bytes: &[u8],
+    ) -> Result<(), crate::outbound::Error> {
+        let conn = self.conn.clone();
+        let qid = queue_id.clone();
+        let ack_bytes = ack_envelope_bytes.to_vec();
+        let now_str = chrono::Utc::now().to_rfc3339();
+        let n = tokio::task::spawn_blocking(move || -> rusqlite::Result<usize> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE edge_outbound_queue \
+                 SET status = 'delivered', \
+                     ack_envelope_bytes = ?1, ack_received_at = ?2, delivered_at = ?2 \
+                 WHERE queue_id = ?3 AND status = 'awaiting_ack'",
+                rusqlite::params![ack_bytes, now_str, qid],
+            )
+        })
+        .await
+        .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
+        .map_err(|e| crate::outbound::Error::Backend(format!("mark_ack_received: {e}")))?;
+        if n == 0 {
+            return Err(crate::outbound::Error::InvalidTransition(format!(
+                "queue_id {queue_id} not in 'awaiting_ack'"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn sweep_ack_timeouts(&self) -> Result<i64, crate::outbound::Error> {
+        let conn = self.conn.clone();
+        let now = chrono::Utc::now();
+        tokio::task::spawn_blocking(move || -> rusqlite::Result<i64> {
+            let mut conn = conn.blocking_lock();
+            let tx = conn.transaction()?;
+            // Walk awaiting_ack rows; per-row TTL/timeout checks in Rust
+            // (sqlite has no interval arithmetic).
+            let candidates: Vec<(String, String, Option<i64>, i32, i32, String, i64)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT queue_id, transport_delivered_at, ack_timeout_seconds, \
+                            attempt_count, max_attempts, enqueued_at, ttl_seconds \
+                     FROM edge_outbound_queue WHERE status = 'awaiting_ack'",
+                )?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            let mut count = 0i64;
+            for (qid, transport_delivered_str, ack_timeout, attempt, max_attempts, enqueued_str, ttl) in candidates {
+                let transport_delivered = parse_rfc3339(&transport_delivered_str);
+                let Some(timeout) = ack_timeout else { continue };
+                if (now - transport_delivered) <= chrono::Duration::seconds(timeout) {
+                    continue;
+                }
+                let enqueued = parse_rfc3339(&enqueued_str);
+                let ttl_expired = (now - enqueued) > chrono::Duration::seconds(ttl);
+                let attempts_exhausted = attempt >= max_attempts;
+                if ttl_expired || attempts_exhausted {
+                    let reason = if ttl_expired { "ttl_expired" } else { "max_attempts" };
+                    tx.execute(
+                        "UPDATE edge_outbound_queue \
+                         SET status = 'abandoned', abandoned_at = ?1, abandoned_reason = ?2, \
+                             last_error_class = 'ack_timeout', \
+                             last_error_detail = 'no ACK before ack_timeout_seconds expired' \
+                         WHERE queue_id = ?3",
+                        rusqlite::params![now.to_rfc3339(), reason, qid],
+                    )?;
+                } else {
+                    let next = (now + chrono::Duration::seconds(60)).to_rfc3339();
+                    tx.execute(
+                        "UPDATE edge_outbound_queue \
+                         SET status = 'pending', next_attempt_after = ?1, \
+                             last_error_class = 'ack_timeout', \
+                             last_error_detail = 'no ACK before ack_timeout_seconds expired' \
+                         WHERE queue_id = ?2",
+                        rusqlite::params![next, qid],
+                    )?;
+                }
+                count += 1;
+            }
+            tx.commit()?;
+            Ok(count)
+        })
+        .await
+        .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
+        .map_err(|e| crate::outbound::Error::Backend(format!("sweep_ack_timeouts: {e}")))
+    }
+
+    async fn sweep_ttl_expired(&self) -> Result<i64, crate::outbound::Error> {
+        let conn = self.conn.clone();
+        let now = chrono::Utc::now();
+        tokio::task::spawn_blocking(move || -> rusqlite::Result<i64> {
+            let mut conn = conn.blocking_lock();
+            let tx = conn.transaction()?;
+            // Pull non-terminal rows; check ttl in Rust.
+            let candidates: Vec<(String, String, i64)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT queue_id, enqueued_at, ttl_seconds \
+                     FROM edge_outbound_queue \
+                     WHERE status NOT IN ('delivered', 'abandoned')",
+                )?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            let mut count = 0i64;
+            for (qid, enqueued_str, ttl) in candidates {
+                let enqueued = parse_rfc3339(&enqueued_str);
+                if (now - enqueued) > chrono::Duration::seconds(ttl) {
+                    tx.execute(
+                        "UPDATE edge_outbound_queue \
+                         SET status = 'abandoned', abandoned_at = ?1, \
+                             abandoned_reason = 'ttl_expired', \
+                             claimed_until = NULL, claimed_by = NULL \
+                         WHERE queue_id = ?2",
+                        rusqlite::params![now.to_rfc3339(), qid],
+                    )?;
+                    count += 1;
+                }
+            }
+            tx.commit()?;
+            Ok(count)
+        })
+        .await
+        .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
+        .map_err(|e| crate::outbound::Error::Backend(format!("sweep_ttl_expired: {e}")))
+    }
+
+    async fn sweep_expired_claims(&self) -> Result<i64, crate::outbound::Error> {
+        let conn = self.conn.clone();
+        let now_str = chrono::Utc::now().to_rfc3339();
+        tokio::task::spawn_blocking(move || -> rusqlite::Result<i64> {
+            let conn = conn.blocking_lock();
+            let n = conn.execute(
+                "UPDATE edge_outbound_queue \
+                 SET status = 'pending', claimed_until = NULL, claimed_by = NULL \
+                 WHERE status = 'sending' AND claimed_until < ?1",
+                rusqlite::params![now_str],
+            )?;
+            Ok(n as i64)
+        })
+        .await
+        .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
+        .map_err(|e| crate::outbound::Error::Backend(format!("sweep_expired_claims: {e}")))
+    }
+
+    async fn outbound_status(
+        &self,
+        queue_id: &crate::outbound::QueueId,
+    ) -> Result<Option<crate::outbound::OutboundRow>, crate::outbound::Error> {
+        let conn = self.conn.clone();
+        let qid = queue_id.clone();
+        tokio::task::spawn_blocking(move || -> rusqlite::Result<Option<crate::outbound::OutboundRow>> {
+            let conn = conn.blocking_lock();
+            let sql = format!("{SQLITE_OUTBOUND_SELECT_PREFIX} WHERE queue_id = ?1");
+            let mut stmt = conn.prepare(&sql)?;
+            stmt.query_row([&qid], sqlite_row_to_outbound_row)
+                .optional()
+        })
+        .await
+        .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
+        .map_err(|e| crate::outbound::Error::Backend(format!("outbound_status: {e}")))
+    }
+
+    async fn list_outbound(
+        &self,
+        filter: crate::outbound::OutboundFilter,
+        limit: i64,
+    ) -> Result<Vec<crate::outbound::OutboundRow>, crate::outbound::Error> {
+        let conn = self.conn.clone();
+        // Pre-compute filter conditions + bind values. SQLite has
+        // params_from_iter for dynamic argument lists.
+        let mut where_clauses: Vec<String> = vec!["1=1".into()];
+        let mut binds: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(s) = filter.status {
+            where_clauses.push(format!("status = ?{}", binds.len() + 1));
+            binds.push(s.as_str().to_string().into());
+        }
+        if let Some(d) = filter.destination_key_id.clone() {
+            where_clauses.push(format!("destination_key_id = ?{}", binds.len() + 1));
+            binds.push(d.into());
+        }
+        if let Some(s) = filter.sender_key_id.clone() {
+            where_clauses.push(format!("sender_key_id = ?{}", binds.len() + 1));
+            binds.push(s.into());
+        }
+        if let Some(m) = filter.message_type.clone() {
+            where_clauses.push(format!("message_type = ?{}", binds.len() + 1));
+            binds.push(m.into());
+        }
+        if let Some(t) = filter.enqueued_after {
+            where_clauses.push(format!("enqueued_at >= ?{}", binds.len() + 1));
+            binds.push(t.to_rfc3339().into());
+        }
+        binds.push(limit.into());
+        let limit_idx = binds.len();
+        let sql = format!(
+            "{SQLITE_OUTBOUND_SELECT_PREFIX} WHERE {} ORDER BY enqueued_at ASC LIMIT ?{}",
+            where_clauses.join(" AND "),
+            limit_idx,
+        );
+        tokio::task::spawn_blocking(move || -> rusqlite::Result<Vec<crate::outbound::OutboundRow>> {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(binds.iter()), sqlite_row_to_outbound_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
+        .map_err(|e| crate::outbound::Error::Backend(format!("list_outbound: {e}")))
+    }
+
+    async fn cancel_outbound(
+        &self,
+        queue_id: &crate::outbound::QueueId,
+    ) -> Result<(), crate::outbound::Error> {
+        let conn = self.conn.clone();
+        let qid = queue_id.clone();
+        let now_str = chrono::Utc::now().to_rfc3339();
+        tokio::task::spawn_blocking(move || -> rusqlite::Result<()> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE edge_outbound_queue \
+                 SET status = 'abandoned', abandoned_at = ?1, \
+                     abandoned_reason = 'operator_cancel', \
+                     claimed_until = NULL, claimed_by = NULL \
+                 WHERE queue_id = ?2 AND status NOT IN ('delivered', 'abandoned')",
+                rusqlite::params![now_str, qid],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
+        .map_err(|e| crate::outbound::Error::Backend(format!("cancel_outbound: {e}")))?;
+        Ok(())
+    }
+
+    async fn replay_abandoned(
+        &self,
+        queue_id: &crate::outbound::QueueId,
+    ) -> Result<(), crate::outbound::Error> {
+        let conn = self.conn.clone();
+        let qid = queue_id.clone();
+        let now_str = chrono::Utc::now().to_rfc3339();
+        let n = tokio::task::spawn_blocking(move || -> rusqlite::Result<usize> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE edge_outbound_queue \
+                 SET status = 'pending', attempt_count = 0, \
+                     next_attempt_after = ?1, \
+                     abandoned_at = NULL, abandoned_reason = NULL, \
+                     last_error_class = NULL, last_error_detail = NULL \
+                 WHERE queue_id = ?2 AND status = 'abandoned'",
+                rusqlite::params![now_str, qid],
+            )
+        })
+        .await
+        .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
+        .map_err(|e| crate::outbound::Error::Backend(format!("replay_abandoned: {e}")))?;
+        if n == 0 {
+            return Err(crate::outbound::Error::InvalidTransition(format!(
+                "queue_id {queue_id} not in 'abandoned'"
+            )));
+        }
+        Ok(())
+    }
+}
+
+const SQLITE_OUTBOUND_SELECT_PREFIX: &str =
+    "SELECT queue_id, sender_key_id, destination_key_id, message_type, \
+            edge_schema_version, envelope_bytes, body_sha256, body_size_bytes, \
+            status, enqueued_at, next_attempt_after, last_attempt_at, \
+            transport_delivered_at, delivered_at, abandoned_at, abandoned_reason, \
+            attempt_count, max_attempts, ttl_seconds, last_error_class, \
+            last_error_detail, last_transport, requires_ack, ack_timeout_seconds, \
+            ack_envelope_bytes, ack_received_at, claimed_until, claimed_by \
+     FROM edge_outbound_queue";
+
+const SQLITE_OUTBOUND_SELECT_BY_ID: &str =
+    "SELECT queue_id, sender_key_id, destination_key_id, message_type, \
+            edge_schema_version, envelope_bytes, body_sha256, body_size_bytes, \
+            status, enqueued_at, next_attempt_after, last_attempt_at, \
+            transport_delivered_at, delivered_at, abandoned_at, abandoned_reason, \
+            attempt_count, max_attempts, ttl_seconds, last_error_class, \
+            last_error_detail, last_transport, requires_ack, ack_timeout_seconds, \
+            ack_envelope_bytes, ack_received_at, claimed_until, claimed_by \
+     FROM edge_outbound_queue WHERE queue_id = ?1";
+
+/// v0.4.0 (CIRISPersist#16) — sqlite row → OutboundRow. Mirrors the
+/// postgres `pg_row_to_outbound_row` field set + ordering. Unknown
+/// status / abandoned_reason / wrong-length body_sha256 surface as
+/// `rusqlite::Error::FromSqlConversionFailure` so the rusqlite
+/// `query_row` / `query_map` `?` operator handles them naturally;
+/// the OutboundQueue impl maps the outer Backend variant at the
+/// async boundary.
+fn sqlite_row_to_outbound_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::outbound::OutboundRow> {
+    use crate::outbound::{AbandonedReason, OutboundStatus};
+    let status_str: String = row.get("status")?;
+    let status = OutboundStatus::from_str(&status_str).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            8,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::other(format!("unknown status: {status_str}"))),
+        )
+    })?;
+    let abandoned_reason_str: Option<String> = row.get("abandoned_reason")?;
+    let abandoned_reason = match abandoned_reason_str.as_deref() {
+        Some(s) => Some(AbandonedReason::from_str(s).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                15,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::other(format!("unknown abandoned_reason: {s}"))),
+            )
+        })?),
+        None => None,
+    };
+    let body_sha256_vec: Vec<u8> = row.get("body_sha256")?;
+    if body_sha256_vec.len() != 32 {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            6,
+            rusqlite::types::Type::Blob,
+            Box::new(std::io::Error::other(format!(
+                "body_sha256 wrong length: {}",
+                body_sha256_vec.len()
+            ))),
+        ));
+    }
+    let mut body_sha256 = [0u8; 32];
+    body_sha256.copy_from_slice(&body_sha256_vec);
+
+    let enqueued_at_str: String = row.get("enqueued_at")?;
+    let next_attempt_after_str: String = row.get("next_attempt_after")?;
+    let last_attempt_at_str: Option<String> = row.get("last_attempt_at")?;
+    let transport_delivered_at_str: Option<String> = row.get("transport_delivered_at")?;
+    let delivered_at_str: Option<String> = row.get("delivered_at")?;
+    let abandoned_at_str: Option<String> = row.get("abandoned_at")?;
+    let ack_received_at_str: Option<String> = row.get("ack_received_at")?;
+    let claimed_until_str: Option<String> = row.get("claimed_until")?;
+    let requires_ack_i: i64 = row.get("requires_ack")?;
+
+    Ok(crate::outbound::OutboundRow {
+        queue_id: row.get("queue_id")?,
+        sender_key_id: row.get("sender_key_id")?,
+        destination_key_id: row.get("destination_key_id")?,
+        message_type: row.get("message_type")?,
+        edge_schema_version: row.get("edge_schema_version")?,
+        envelope_bytes: row.get("envelope_bytes")?,
+        body_sha256,
+        body_size_bytes: row.get("body_size_bytes")?,
+        status,
+        enqueued_at: parse_rfc3339(&enqueued_at_str),
+        next_attempt_after: parse_rfc3339(&next_attempt_after_str),
+        last_attempt_at: last_attempt_at_str.as_deref().map(parse_rfc3339),
+        transport_delivered_at: transport_delivered_at_str.as_deref().map(parse_rfc3339),
+        delivered_at: delivered_at_str.as_deref().map(parse_rfc3339),
+        abandoned_at: abandoned_at_str.as_deref().map(parse_rfc3339),
+        abandoned_reason,
+        attempt_count: row.get("attempt_count")?,
+        max_attempts: row.get("max_attempts")?,
+        ttl_seconds: row.get("ttl_seconds")?,
+        last_error_class: row.get("last_error_class")?,
+        last_error_detail: row.get("last_error_detail")?,
+        last_transport: row.get("last_transport")?,
+        requires_ack: requires_ack_i != 0,
+        ack_timeout_seconds: row.get("ack_timeout_seconds")?,
+        ack_envelope_bytes: row.get("ack_envelope_bytes")?,
+        ack_received_at: ack_received_at_str.as_deref().map(parse_rfc3339),
+        claimed_until: claimed_until_str.as_deref().map(parse_rfc3339),
+        claimed_by: row.get("claimed_by")?,
+    })
+}
+
 fn parse_rfc3339(s: &str) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::parse_from_rfc3339(s)
         .map(|t| t.with_timezone(&chrono::Utc))

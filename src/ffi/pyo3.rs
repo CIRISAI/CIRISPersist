@@ -1652,6 +1652,492 @@ impl PyEngine {
         }
         Ok(dict)
     }
+
+    // ─── Edge outbound queue (v0.4.0, CIRISPersist#16) ──────────
+
+    /// v0.4.0 (CIRISPersist#16) — Enqueue an outbound row in
+    /// `pending` state. Returns the server-generated `queue_id` the
+    /// caller stores in its `DurableHandle`.
+    ///
+    /// `body_sha256` MUST be exactly 32 bytes (sha256 digest).
+    /// `body_size_bytes` is bounded 1..=8 MiB by the schema CHECK.
+    /// `requires_ack=True` requires `ack_timeout_seconds > 0`.
+    #[pyo3(signature = (
+        sender_key_id,
+        destination_key_id,
+        message_type,
+        edge_schema_version,
+        envelope_bytes,
+        body_sha256,
+        body_size_bytes,
+        requires_ack,
+        max_attempts,
+        ttl_seconds,
+        initial_next_attempt_after_rfc3339,
+        ack_timeout_seconds=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_outbound(
+        &self,
+        py: Python<'_>,
+        sender_key_id: &str,
+        destination_key_id: &str,
+        message_type: &str,
+        edge_schema_version: &str,
+        envelope_bytes: &[u8],
+        body_sha256: &[u8],
+        body_size_bytes: i32,
+        requires_ack: bool,
+        max_attempts: i32,
+        ttl_seconds: i64,
+        initial_next_attempt_after_rfc3339: &str,
+        ack_timeout_seconds: Option<i64>,
+    ) -> PyResult<String> {
+        if body_sha256.len() != 32 {
+            return Err(PyValueError::new_err(format!(
+                "body_sha256 must be 32 bytes, got {}",
+                body_sha256.len()
+            )));
+        }
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(body_sha256);
+        let initial_next: chrono::DateTime<chrono::Utc> = initial_next_attempt_after_rfc3339
+            .parse()
+            .map_err(|e| {
+                PyValueError::new_err(format!(
+                    "initial_next_attempt_after_rfc3339 parse: {e}"
+                ))
+            })?;
+
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let sender = sender_key_id.to_owned();
+        let dest = destination_key_id.to_owned();
+        let mt = message_type.to_owned();
+        let esv = edge_schema_version.to_owned();
+        let env_bytes = envelope_bytes.to_vec();
+        py.detach(move || {
+            runtime.block_on(async move {
+                use crate::outbound::OutboundQueue;
+                backend
+                    .enqueue_outbound(
+                        &sender,
+                        &dest,
+                        &mt,
+                        &esv,
+                        &env_bytes,
+                        &hash,
+                        body_size_bytes,
+                        requires_ack,
+                        ack_timeout_seconds,
+                        max_attempts,
+                        ttl_seconds,
+                        initial_next,
+                    )
+                    .await
+            })
+        })
+        .map_err(outbound_err_to_py)
+    }
+
+    /// v0.4.0 — Atomic claim of up to `batch_size` pending rows.
+    /// Returns a list of dicts (one per claimed row).
+    #[pyo3(signature = (batch_size, claim_duration_seconds, claimed_by))]
+    fn claim_pending_outbound<'py>(
+        &self,
+        py: Python<'py>,
+        batch_size: i64,
+        claim_duration_seconds: i64,
+        claimed_by: &str,
+    ) -> PyResult<pyo3::Bound<'py, pyo3::types::PyList>> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let claimed_by_owned = claimed_by.to_owned();
+        let rows = py
+            .detach(move || {
+                runtime.block_on(async move {
+                    use crate::outbound::OutboundQueue;
+                    backend
+                        .claim_pending_outbound(
+                            batch_size,
+                            claim_duration_seconds,
+                            &claimed_by_owned,
+                        )
+                        .await
+                })
+            })
+            .map_err(outbound_err_to_py)?;
+        outbound_rows_to_pylist(py, rows)
+    }
+
+    /// v0.4.0 — Transport reports successful delivery. Transitions
+    /// the row to `delivered` (no ACK) or `awaiting_ack` (ACK
+    /// required).
+    fn mark_transport_delivered(
+        &self,
+        py: Python<'_>,
+        queue_id: &str,
+        transport: &str,
+    ) -> PyResult<()> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let qid = queue_id.to_owned();
+        let transport = transport.to_owned();
+        py.detach(move || {
+            runtime.block_on(async move {
+                use crate::outbound::OutboundQueue;
+                backend.mark_transport_delivered(&qid, &transport).await
+            })
+        })
+        .map_err(outbound_err_to_py)
+    }
+
+    /// v0.4.0 — Transport reports failure. Returns a dict shaped
+    /// `{"outcome": "retrying"|"abandoned", "attempt": int|None}`.
+    fn mark_transport_failed<'py>(
+        &self,
+        py: Python<'py>,
+        queue_id: &str,
+        error_class: &str,
+        error_detail: &str,
+        transport: &str,
+        next_attempt_after_rfc3339: &str,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let next_attempt_after: chrono::DateTime<chrono::Utc> =
+            next_attempt_after_rfc3339.parse().map_err(|e| {
+                PyValueError::new_err(format!("next_attempt_after_rfc3339 parse: {e}"))
+            })?;
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let qid = queue_id.to_owned();
+        let ec = error_class.to_owned();
+        let ed = error_detail.to_owned();
+        let transport = transport.to_owned();
+        let outcome = py
+            .detach(move || {
+                runtime.block_on(async move {
+                    use crate::outbound::OutboundQueue;
+                    backend
+                        .mark_transport_failed(&qid, &ec, &ed, &transport, next_attempt_after)
+                        .await
+                })
+            })
+            .map_err(outbound_err_to_py)?;
+        let dict = PyDict::new(py);
+        match outcome {
+            crate::outbound::OutboundFailureOutcome::Retrying { attempt } => {
+                dict.set_item("outcome", "retrying")?;
+                dict.set_item("attempt", attempt)?;
+            }
+            crate::outbound::OutboundFailureOutcome::Abandoned => {
+                dict.set_item("outcome", "abandoned")?;
+                dict.set_item("attempt", py.None())?;
+            }
+        }
+        Ok(dict)
+    }
+
+    /// v0.4.0 — Treat a previously-sent row as delivered (the
+    /// receiver replied `replay_detected`; the original send already
+    /// landed before the ACK could arrive).
+    fn mark_replay_resolved(&self, py: Python<'_>, queue_id: &str) -> PyResult<()> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let qid = queue_id.to_owned();
+        py.detach(move || {
+            runtime.block_on(async move {
+                use crate::outbound::OutboundQueue;
+                backend.mark_replay_resolved(&qid).await
+            })
+        })
+        .map_err(outbound_err_to_py)
+    }
+
+    /// v0.4.0 — Look up an `awaiting_ack` row by the receiver's
+    /// `in_reply_to` hash. Returns the row dict or `None`.
+    fn match_ack_to_outbound<'py>(
+        &self,
+        py: Python<'py>,
+        in_reply_to_sha256: &[u8],
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        if in_reply_to_sha256.len() != 32 {
+            return Err(PyValueError::new_err(format!(
+                "in_reply_to_sha256 must be 32 bytes, got {}",
+                in_reply_to_sha256.len()
+            )));
+        }
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(in_reply_to_sha256);
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let row_opt = py
+            .detach(move || {
+                runtime.block_on(async move {
+                    use crate::outbound::OutboundQueue;
+                    backend.match_ack_to_outbound(&hash).await
+                })
+            })
+            .map_err(outbound_err_to_py)?;
+        match row_opt {
+            None => Ok(None),
+            Some(r) => Ok(Some(outbound_row_to_pydict(py, &r)?)),
+        }
+    }
+
+    /// v0.4.0 — Record the receiver's ACK envelope on a matched
+    /// `awaiting_ack` row and transition to `delivered`.
+    fn mark_ack_received(
+        &self,
+        py: Python<'_>,
+        queue_id: &str,
+        ack_envelope_bytes: &[u8],
+    ) -> PyResult<()> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let qid = queue_id.to_owned();
+        let ack = ack_envelope_bytes.to_vec();
+        py.detach(move || {
+            runtime.block_on(async move {
+                use crate::outbound::OutboundQueue;
+                backend.mark_ack_received(&qid, &ack).await
+            })
+        })
+        .map_err(outbound_err_to_py)
+    }
+
+    /// v0.4.0 — Sweep ACK timeouts. Returns the count of rows
+    /// touched (retried or abandoned).
+    fn sweep_ack_timeouts(&self, py: Python<'_>) -> PyResult<i64> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        py.detach(move || {
+            runtime.block_on(async move {
+                use crate::outbound::OutboundQueue;
+                backend.sweep_ack_timeouts().await
+            })
+        })
+        .map_err(outbound_err_to_py)
+    }
+
+    /// v0.4.0 — Sweep TTL-expired rows.
+    fn sweep_ttl_expired(&self, py: Python<'_>) -> PyResult<i64> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        py.detach(move || {
+            runtime.block_on(async move {
+                use crate::outbound::OutboundQueue;
+                backend.sweep_ttl_expired().await
+            })
+        })
+        .map_err(outbound_err_to_py)
+    }
+
+    /// v0.4.0 — Sweep expired claims (revert sending → pending for
+    /// rows whose claimed_until elapsed).
+    fn sweep_expired_claims(&self, py: Python<'_>) -> PyResult<i64> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        py.detach(move || {
+            runtime.block_on(async move {
+                use crate::outbound::OutboundQueue;
+                backend.sweep_expired_claims().await
+            })
+        })
+        .map_err(outbound_err_to_py)
+    }
+
+    /// v0.4.0 — Look up a row by queue_id. Returns the row dict or
+    /// `None`. Used by `DurableHandle::status()`.
+    fn outbound_status<'py>(
+        &self,
+        py: Python<'py>,
+        queue_id: &str,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let qid = queue_id.to_owned();
+        let row_opt = py
+            .detach(move || {
+                runtime.block_on(async move {
+                    use crate::outbound::OutboundQueue;
+                    backend.outbound_status(&qid).await
+                })
+            })
+            .map_err(outbound_err_to_py)?;
+        match row_opt {
+            None => Ok(None),
+            Some(r) => Ok(Some(outbound_row_to_pydict(py, &r)?)),
+        }
+    }
+
+    /// v0.4.0 — List outbound rows with optional filters. Returns
+    /// a list of dicts. All filter parameters are optional;
+    /// combine with AND.
+    #[pyo3(signature = (
+        limit=100,
+        status=None,
+        destination_key_id=None,
+        sender_key_id=None,
+        message_type=None,
+        enqueued_after_rfc3339=None,
+    ))]
+    fn list_outbound<'py>(
+        &self,
+        py: Python<'py>,
+        limit: i64,
+        status: Option<&str>,
+        destination_key_id: Option<&str>,
+        sender_key_id: Option<&str>,
+        message_type: Option<&str>,
+        enqueued_after_rfc3339: Option<&str>,
+    ) -> PyResult<pyo3::Bound<'py, pyo3::types::PyList>> {
+        let status_parsed = match status {
+            Some(s) => Some(crate::outbound::OutboundStatus::from_str(s).ok_or_else(|| {
+                PyValueError::new_err(format!("unknown status: {s}"))
+            })?),
+            None => None,
+        };
+        let enqueued_after = match enqueued_after_rfc3339 {
+            Some(s) => Some(s.parse::<chrono::DateTime<chrono::Utc>>().map_err(|e| {
+                PyValueError::new_err(format!("enqueued_after_rfc3339 parse: {e}"))
+            })?),
+            None => None,
+        };
+        let filter = crate::outbound::OutboundFilter {
+            status: status_parsed,
+            destination_key_id: destination_key_id.map(str::to_owned),
+            sender_key_id: sender_key_id.map(str::to_owned),
+            message_type: message_type.map(str::to_owned),
+            enqueued_after,
+        };
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let rows = py
+            .detach(move || {
+                runtime.block_on(async move {
+                    use crate::outbound::OutboundQueue;
+                    backend.list_outbound(filter, limit).await
+                })
+            })
+            .map_err(outbound_err_to_py)?;
+        outbound_rows_to_pylist(py, rows)
+    }
+
+    /// v0.4.0 — Operator-driven cancellation. Idempotent.
+    fn cancel_outbound(&self, py: Python<'_>, queue_id: &str) -> PyResult<()> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let qid = queue_id.to_owned();
+        py.detach(move || {
+            runtime.block_on(async move {
+                use crate::outbound::OutboundQueue;
+                backend.cancel_outbound(&qid).await
+            })
+        })
+        .map_err(outbound_err_to_py)
+    }
+
+    /// v0.4.0 — Operator-driven replay. Resets attempt_count=0 and
+    /// requeues an abandoned row.
+    fn replay_abandoned(&self, py: Python<'_>, queue_id: &str) -> PyResult<()> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let qid = queue_id.to_owned();
+        py.detach(move || {
+            runtime.block_on(async move {
+                use crate::outbound::OutboundQueue;
+                backend.replay_abandoned(&qid).await
+            })
+        })
+        .map_err(outbound_err_to_py)
+    }
+}
+
+/// v0.4.0 — outbound::Error → PyErr at the FFI boundary. Same
+/// discipline as federation_err_to_py: stable kind tokens cross
+/// boundary, structured detail goes to tracing.
+fn outbound_err_to_py(e: crate::outbound::Error) -> PyErr {
+    let kind = e.kind();
+    tracing::warn!(error = %e, kind = kind, "outbound error");
+    match e {
+        crate::outbound::Error::InvalidArgument(_) => PyValueError::new_err(kind),
+        crate::outbound::Error::NotFound(_) => PyValueError::new_err(kind),
+        crate::outbound::Error::InvalidTransition(_) => PyValueError::new_err(kind),
+        crate::outbound::Error::Backend(_) => PyRuntimeError::new_err(kind),
+    }
+}
+
+/// v0.4.0 — OutboundRow → Python dict. Mirrors the column set on
+/// `cirislens.edge_outbound_queue` 1:1; bytes columns return as
+/// Python bytes.
+fn outbound_row_to_pydict<'py>(
+    py: Python<'py>,
+    row: &crate::outbound::OutboundRow,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("queue_id", &row.queue_id)?;
+    d.set_item("sender_key_id", &row.sender_key_id)?;
+    d.set_item("destination_key_id", &row.destination_key_id)?;
+    d.set_item("message_type", &row.message_type)?;
+    d.set_item("edge_schema_version", &row.edge_schema_version)?;
+    d.set_item(
+        "envelope_bytes",
+        pyo3::types::PyBytes::new(py, &row.envelope_bytes),
+    )?;
+    d.set_item(
+        "body_sha256",
+        pyo3::types::PyBytes::new(py, &row.body_sha256),
+    )?;
+    d.set_item("body_size_bytes", row.body_size_bytes)?;
+    d.set_item("status", row.status.as_str())?;
+    d.set_item("enqueued_at", row.enqueued_at.to_rfc3339())?;
+    d.set_item("next_attempt_after", row.next_attempt_after.to_rfc3339())?;
+    d.set_item(
+        "last_attempt_at",
+        row.last_attempt_at.map(|t| t.to_rfc3339()),
+    )?;
+    d.set_item(
+        "transport_delivered_at",
+        row.transport_delivered_at.map(|t| t.to_rfc3339()),
+    )?;
+    d.set_item("delivered_at", row.delivered_at.map(|t| t.to_rfc3339()))?;
+    d.set_item("abandoned_at", row.abandoned_at.map(|t| t.to_rfc3339()))?;
+    d.set_item(
+        "abandoned_reason",
+        row.abandoned_reason.map(|r| r.as_str()),
+    )?;
+    d.set_item("attempt_count", row.attempt_count)?;
+    d.set_item("max_attempts", row.max_attempts)?;
+    d.set_item("ttl_seconds", row.ttl_seconds)?;
+    d.set_item("last_error_class", row.last_error_class.as_deref())?;
+    d.set_item("last_error_detail", row.last_error_detail.as_deref())?;
+    d.set_item("last_transport", row.last_transport.as_deref())?;
+    d.set_item("requires_ack", row.requires_ack)?;
+    d.set_item("ack_timeout_seconds", row.ack_timeout_seconds)?;
+    d.set_item(
+        "ack_envelope_bytes",
+        row.ack_envelope_bytes
+            .as_deref()
+            .map(|b| pyo3::types::PyBytes::new(py, b)),
+    )?;
+    d.set_item(
+        "ack_received_at",
+        row.ack_received_at.map(|t| t.to_rfc3339()),
+    )?;
+    d.set_item("claimed_until", row.claimed_until.map(|t| t.to_rfc3339()))?;
+    d.set_item("claimed_by", row.claimed_by.as_deref())?;
+    Ok(d)
+}
+
+fn outbound_rows_to_pylist<'py>(
+    py: Python<'py>,
+    rows: Vec<crate::outbound::OutboundRow>,
+) -> PyResult<pyo3::Bound<'py, pyo3::types::PyList>> {
+    let list = pyo3::types::PyList::empty(py);
+    for r in rows {
+        list.append(outbound_row_to_pydict(py, &r)?)?;
+    }
+    Ok(list)
 }
 
 /// v0.3.5 — TraceLevel → wire-format string. Same shape as the
