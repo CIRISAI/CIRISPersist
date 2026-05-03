@@ -181,6 +181,106 @@ impl Backend for MemoryBackend {
         // Memory backend has no schema to migrate.
         Ok(())
     }
+
+    async fn delete_traces_for_agent(
+        &self,
+        agent_id_hash: &str,
+        include_federation_key: bool,
+    ) -> Result<super::types::DeleteSummary, Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        // Step 1: collect trace_ids of the agent's events.
+        let target_trace_ids: HashSet<String> = state
+            .events
+            .values()
+            .filter(|(_, row)| row.agent_id_hash == agent_id_hash)
+            .map(|(_, row)| row.trace_id.clone())
+            .collect();
+
+        let trace_events_before = state.events.len();
+        state
+            .events
+            .retain(|_, (_, row)| row.agent_id_hash != agent_id_hash);
+        let trace_events_deleted = (trace_events_before - state.events.len()) as u64;
+
+        let llm_calls_before = state.llm_calls.len();
+        state
+            .llm_calls
+            .retain(|row| !target_trace_ids.contains(&row.trace_id));
+        let trace_llm_calls_deleted = (llm_calls_before - state.llm_calls.len()) as u64;
+
+        let mut federation_keys_deleted = 0u64;
+        let mut federation_attestations_deleted = 0u64;
+        let mut federation_revocations_deleted = 0u64;
+
+        if include_federation_key {
+            // Find every key_id where identity_type='agent' AND
+            // identity_ref=agent_id_hash. May be multiple if the agent
+            // rotated keys.
+            let target_key_ids: HashSet<String> = state
+                .federation_keys
+                .values()
+                .filter(|rec| rec.identity_type == "agent" && rec.identity_ref == agent_id_hash)
+                .map(|rec| rec.key_id.clone())
+                .collect();
+
+            // FK-cascade: revocations + attestations referencing those
+            // keys (as attesting/attested/revoking/revoked/scrub_key_id)
+            // must go before the federation_keys delete.
+            let revs_before = state.federation_revocations.len();
+            state.federation_revocations.retain(|r| {
+                !(target_key_ids.contains(&r.revoked_key_id)
+                    || target_key_ids.contains(&r.revoking_key_id)
+                    || target_key_ids.contains(&r.scrub_key_id))
+            });
+            federation_revocations_deleted =
+                (revs_before - state.federation_revocations.len()) as u64;
+
+            let atts_before = state.federation_attestations.len();
+            state.federation_attestations.retain(|a| {
+                !(target_key_ids.contains(&a.attesting_key_id)
+                    || target_key_ids.contains(&a.attested_key_id)
+                    || target_key_ids.contains(&a.scrub_key_id))
+            });
+            federation_attestations_deleted =
+                (atts_before - state.federation_attestations.len()) as u64;
+
+            // Now safe to delete the federation_keys rows.
+            let keys_before = state.federation_keys.len();
+            state
+                .federation_keys
+                .retain(|k, _| !target_key_ids.contains(k));
+            federation_keys_deleted = (keys_before - state.federation_keys.len()) as u64;
+        }
+
+        Ok(super::types::DeleteSummary {
+            trace_events_deleted,
+            trace_llm_calls_deleted,
+            federation_keys_deleted,
+            federation_attestations_deleted,
+            federation_revocations_deleted,
+            deleted_at: chrono::Utc::now(),
+        })
+    }
+
+    async fn fetch_trace_events_page(
+        &self,
+        after_event_id: i64,
+        limit: i64,
+        agent_id_hash: Option<&str>,
+    ) -> Result<Vec<(i64, TraceEventRow)>, Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<(i64, TraceEventRow)> = state
+            .events
+            .values()
+            .filter(|(eid, row)| {
+                *eid > after_event_id && agent_id_hash.map_or(true, |h| row.agent_id_hash == h)
+            })
+            .map(|(eid, row)| (*eid, row.clone()))
+            .collect();
+        rows.sort_by_key(|(eid, _)| *eid);
+        rows.truncate(limit.max(0) as usize);
+        Ok(rows)
+    }
 }
 
 // ─── FederationDirectory impl (v0.2.0) ─────────────────────────────
@@ -1207,6 +1307,167 @@ mod tests {
             assert!(!row.classical_sig_b64.is_empty());
             assert!(row.envelope.is_object());
         }
+    }
+
+    /// v0.3.5 (CIRISLens#8 ASK 1) — DSAR primitive deletes the agent's
+    /// trace_events + trace_llm_calls atomically. Returns the row
+    /// counts for the lens-side audit ledger. Idempotent.
+    #[tokio::test]
+    async fn dsar_deletes_trace_data_for_agent() {
+        use crate::store::Backend;
+        let backend = MemoryBackend::new();
+        // Insert traces for two agents; only one is the DSAR target.
+        let target_aih = "agent-target-hash";
+        let other_aih = "agent-other-hash";
+        for (aih, trace_suffix) in &[(target_aih, "t1"), (target_aih, "t2"), (other_aih, "o1")] {
+            let row = TraceEventRow {
+                trace_id: format!("trace-{trace_suffix}"),
+                thought_id: format!("th-{trace_suffix}"),
+                task_id: None,
+                step_point: None,
+                event_type: ReasoningEventType::ThoughtStart,
+                attempt_index: 0,
+                ts: "2026-04-30T00:00:00Z".parse().unwrap(),
+                agent_name: None,
+                agent_id_hash: (*aih).to_owned(),
+                cognitive_state: None,
+                trace_level: TraceLevel::Generic,
+                payload: serde_json::Map::new(),
+                cost_llm_calls: None,
+                cost_tokens: None,
+                cost_usd: None,
+                signature: "AAAA".into(),
+                signing_key_id: "k".into(),
+                signature_verified: true,
+                schema_version: "2.7.0".into(),
+                pii_scrubbed: false,
+                original_content_hash: None,
+                scrub_signature: None,
+                scrub_key_id: None,
+                scrub_timestamp: None,
+                agent_role: None,
+                agent_template: None,
+                deployment_domain: None,
+                deployment_type: None,
+                deployment_region: None,
+                deployment_trust_mode: None,
+            };
+            backend.insert_trace_events_batch(&[row]).await.unwrap();
+        }
+        // Add an LLM call for the target's trace t1.
+        let llm = TraceLlmCallRow {
+            trace_id: "trace-t1".into(),
+            thought_id: "th-t1".into(),
+            task_id: None,
+            parent_event_id: None,
+            parent_event_type: ReasoningEventType::ThoughtStart,
+            parent_attempt_index: 0,
+            attempt_index: 0,
+            ts: "2026-04-30T00:00:00Z".parse().unwrap(),
+            duration_ms: 0.0,
+            handler_name: "h".into(),
+            service_name: "s".into(),
+            model: None,
+            base_url: None,
+            response_model: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            prompt_bytes: None,
+            completion_bytes: None,
+            cost_usd: None,
+            status: crate::schema::LlmCallStatus::Ok,
+            error_class: None,
+            attempt_count: None,
+            retry_count: None,
+            prompt_hash: None,
+            prompt: None,
+            response_text: None,
+        };
+        backend.insert_trace_llm_calls_batch(&[llm]).await.unwrap();
+
+        // First DSAR: deletes the target's 2 events + 1 llm call.
+        let summary = backend
+            .delete_traces_for_agent(target_aih, false)
+            .await
+            .unwrap();
+        assert_eq!(summary.trace_events_deleted, 2);
+        assert_eq!(summary.trace_llm_calls_deleted, 1);
+        assert_eq!(summary.federation_keys_deleted, 0);
+
+        // Other agent's row is untouched.
+        let remaining = backend.snapshot_events();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].agent_id_hash, other_aih);
+
+        // Idempotent: re-invocation returns all-zero.
+        let summary2 = backend
+            .delete_traces_for_agent(target_aih, false)
+            .await
+            .unwrap();
+        assert_eq!(summary2.trace_events_deleted, 0);
+        assert_eq!(summary2.trace_llm_calls_deleted, 0);
+    }
+
+    /// v0.3.5 (CIRISLens#8 ASK 3) — fetch_trace_events_page returns
+    /// rows in event_id order, respects the cursor, respects the limit.
+    #[tokio::test]
+    async fn fetch_trace_events_page_cursors_correctly() {
+        use crate::store::Backend;
+        let backend = MemoryBackend::new();
+        for i in 0..5 {
+            let row = TraceEventRow {
+                trace_id: format!("trace-{i}"),
+                thought_id: format!("th-{i}"),
+                task_id: None,
+                step_point: None,
+                event_type: ReasoningEventType::ThoughtStart,
+                attempt_index: 0,
+                ts: "2026-04-30T00:00:00Z".parse().unwrap(),
+                agent_name: None,
+                agent_id_hash: format!("agent-{}", i % 2),
+                cognitive_state: None,
+                trace_level: TraceLevel::Generic,
+                payload: serde_json::Map::new(),
+                cost_llm_calls: None,
+                cost_tokens: None,
+                cost_usd: None,
+                signature: "AAAA".into(),
+                signing_key_id: "k".into(),
+                signature_verified: true,
+                schema_version: "2.7.0".into(),
+                pii_scrubbed: false,
+                original_content_hash: None,
+                scrub_signature: None,
+                scrub_key_id: None,
+                scrub_timestamp: None,
+                agent_role: None,
+                agent_template: None,
+                deployment_domain: None,
+                deployment_type: None,
+                deployment_region: None,
+                deployment_trust_mode: None,
+            };
+            backend.insert_trace_events_batch(&[row]).await.unwrap();
+        }
+        // Page 1: limit=2 returns first 2 by event_id.
+        let page1 = backend.fetch_trace_events_page(0, 2, None).await.unwrap();
+        assert_eq!(page1.len(), 2);
+        let last_eid = page1.last().unwrap().0;
+        // Page 2: cursor = last from page 1.
+        let page2 = backend
+            .fetch_trace_events_page(last_eid, 2, None)
+            .await
+            .unwrap();
+        assert_eq!(page2.len(), 2);
+        assert!(page2.iter().all(|(eid, _)| *eid > last_eid));
+        // Filtered by agent_id_hash.
+        let filtered = backend
+            .fetch_trace_events_page(0, 100, Some("agent-0"))
+            .await
+            .unwrap();
+        assert!(filtered
+            .iter()
+            .all(|(_, row)| row.agent_id_hash == "agent-0"));
     }
 
     /// v0.2.1 — Backend::lookup_public_key dual-read. After

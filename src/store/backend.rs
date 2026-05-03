@@ -19,7 +19,8 @@ use std::future::Future;
 use ed25519_dalek::VerifyingKey;
 
 use super::types::{
-    AuditEntry, ClaimParams, GraphNode, ServiceCorrelation, Task, TraceEventRow, TraceLlmCallRow,
+    AuditEntry, ClaimParams, DeleteSummary, GraphNode, ServiceCorrelation, Task, TraceEventRow,
+    TraceLlmCallRow,
 };
 use super::Error;
 
@@ -97,6 +98,66 @@ pub trait Backend: Send + Sync {
     /// migrations live in `migrations/postgres/lens/` and
     /// `migrations/sqlite/lens/`; the runner is `refinery`.
     fn run_migrations(&self) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// v0.3.5 (CIRISLens#8 ASK 1) — GDPR Article 17 / DSAR primitive.
+    /// Delete every persist-substrate row for `agent_id_hash`:
+    ///
+    /// - `trace_events` rows where `agent_id_hash` matches
+    /// - `trace_llm_calls` rows joined by `trace_id` from the deleted
+    ///   trace_events set (LLM call rows don't carry agent_id_hash
+    ///   directly per V001 schema)
+    ///
+    /// When `include_federation_key=true`, additionally:
+    ///
+    /// - `federation_keys` rows where `identity_type='agent'` AND
+    ///   `identity_ref=agent_id_hash`. May be >1 if the agent rotated
+    ///   keys.
+    /// - FK-cascade: `federation_attestations` rows referencing those
+    ///   key_ids (attesting / attested / scrub_key_id) deleted first
+    /// - FK-cascade: `federation_revocations` rows referencing those
+    ///   key_ids deleted before the federation_keys delete
+    ///
+    /// All deletes happen in a single transaction. The caller's
+    /// `agent_id_hash` is not validated against any signing-key
+    /// proof — that's the lens's DSAR-orchestration responsibility.
+    /// Persist owns the substrate row delete; lens owns the audit +
+    /// signature verification of the request envelope.
+    ///
+    /// Idempotent: re-invocation on an already-deleted agent returns
+    /// a `DeleteSummary` with all counts zero.
+    fn delete_traces_for_agent(
+        &self,
+        agent_id_hash: &str,
+        include_federation_key: bool,
+    ) -> impl Future<Output = Result<DeleteSummary, Error>> + Send;
+
+    /// v0.3.5 (CIRISLens#8 ASK 3) — Page-cursor read primitive for
+    /// analytical streaming. Returns up to `limit` `trace_events` rows
+    /// where `event_id > after_event_id`, ordered ascending by
+    /// `event_id` (the BIGSERIAL primary key). Optional
+    /// `agent_id_hash` filter.
+    ///
+    /// Caller orchestrates the cursor — track the max returned
+    /// `event_id` between calls, pass it as `after_event_id` for the
+    /// next page, stop when the result set is empty.
+    ///
+    /// Cleaner than a callback-style `iterate_trace_events(filter, cb)`
+    /// across PyO3: callers pull pages on their own pace, no FFI
+    /// re-entry per row, no shared-state synchronization. Same shape
+    /// `Engine.run_pqc_sweep` uses (cursor at the trait boundary,
+    /// caller drives).
+    ///
+    /// `event_id` is internal to the row but is returned in the
+    /// `TraceEventRow` indirectly via the row's serialized form;
+    /// the PyO3 surface (`Engine.fetch_trace_events_page`) returns
+    /// dicts that include `event_id` so callers can extract the
+    /// cursor without parsing further.
+    fn fetch_trace_events_page(
+        &self,
+        after_event_id: i64,
+        limit: i64,
+        agent_id_hash: Option<&str>,
+    ) -> impl Future<Output = Result<Vec<(i64, TraceEventRow)>, Error>> + Send;
 
     // ─── Phase 2 — agent signed-events + TSDB (FSD §4) ─────────────
 

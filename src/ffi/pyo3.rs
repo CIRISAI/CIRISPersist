@@ -1346,6 +1346,186 @@ impl PyEngine {
         dict.set_item("by_table", by_table)?;
         Ok(dict)
     }
+
+    /// v0.3.5 (CIRISLens#8 ASK 1) — GDPR Article 17 / DSAR primitive.
+    /// Delete every persist-substrate row for `agent_id_hash`.
+    ///
+    /// Always deletes:
+    /// - `cirislens.trace_events` rows where `agent_id_hash` matches
+    /// - `cirislens.trace_llm_calls` rows joined by `trace_id` from
+    ///   the deleted trace_events set
+    ///
+    /// When `include_federation_key=True`, additionally:
+    /// - `cirislens.federation_keys` rows where
+    ///   `identity_type='agent'` AND `identity_ref=agent_id_hash`
+    ///   (may be >1 if the agent rotated keys)
+    /// - FK-cascade: `federation_attestations` and
+    ///   `federation_revocations` rows referencing those key_ids
+    ///   (deleted before the federation_keys delete to satisfy FK
+    ///   integrity — persist's federation FKs are not ON DELETE
+    ///   CASCADE)
+    ///
+    /// All deletes happen in a single transaction. Returns a dict:
+    ///
+    /// ```text
+    /// {
+    ///   "trace_events_deleted":           int,
+    ///   "trace_llm_calls_deleted":        int,
+    ///   "federation_keys_deleted":        int,  # 0 unless include_federation_key=True
+    ///   "federation_attestations_deleted": int,  # 0 unless include_federation_key=True
+    ///   "federation_revocations_deleted":  int,  # 0 unless include_federation_key=True
+    ///   "deleted_at":                     str,  # ISO-8601 UTC
+    /// }
+    /// ```
+    ///
+    /// Idempotent: re-invocation on an already-deleted agent returns
+    /// all-zero counts.
+    ///
+    /// **Persist owns the substrate row delete; lens orchestrates the
+    /// DSAR audit + signature verification.** This method does not
+    /// validate the caller's authority to delete the agent's data —
+    /// that's lens-side policy. Persist is the substrate; lens is the
+    /// policy layer.
+    #[pyo3(signature = (agent_id_hash, include_federation_key=false))]
+    fn delete_traces_for_agent<'py>(
+        &self,
+        py: Python<'py>,
+        agent_id_hash: &str,
+        include_federation_key: bool,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let agent_id_hash = agent_id_hash.to_owned();
+
+        let summary = py.detach(move || {
+            runtime.block_on(async move {
+                use crate::store::Backend;
+                backend
+                    .delete_traces_for_agent(&agent_id_hash, include_federation_key)
+                    .await
+            })
+        });
+        let summary = summary.map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+
+        let dict = PyDict::new(py);
+        dict.set_item("trace_events_deleted", summary.trace_events_deleted)?;
+        dict.set_item("trace_llm_calls_deleted", summary.trace_llm_calls_deleted)?;
+        dict.set_item("federation_keys_deleted", summary.federation_keys_deleted)?;
+        dict.set_item(
+            "federation_attestations_deleted",
+            summary.federation_attestations_deleted,
+        )?;
+        dict.set_item(
+            "federation_revocations_deleted",
+            summary.federation_revocations_deleted,
+        )?;
+        dict.set_item("deleted_at", summary.deleted_at.to_rfc3339())?;
+        Ok(dict)
+    }
+
+    /// v0.3.5 (CIRISLens#8 ASK 3) — Page-cursor read primitive for
+    /// analytical streaming. Returns up to `limit` `trace_events` rows
+    /// where `event_id > after_event_id`, ordered ascending by
+    /// `event_id` (the `BIGSERIAL` primary key). Optional
+    /// `agent_id_hash` filter.
+    ///
+    /// **Caller orchestrates the cursor**: track the max returned
+    /// `event_id` between calls, pass it as `after_event_id` for the
+    /// next page, stop when the result set is empty.
+    ///
+    /// Returns a list of dicts. Each dict carries the
+    /// `cirislens.trace_events` columns (one-to-one with
+    /// `TraceEventRow` Rust struct), plus an explicit `event_id` field
+    /// for cursor extraction.
+    ///
+    /// Use this when:
+    /// - Lens wants typed Rust-shape rows rather than raw SQL
+    /// - The caller is out-of-process and can't take cirislens_reader
+    ///   role for direct SQL
+    /// - Streaming over a >>memory result set (cursor pattern handles
+    ///   arbitrary corpus size)
+    ///
+    /// For ad-hoc analytical queries inside lens-core, the
+    /// `cirislens_reader` role + direct SQL is still the recommended
+    /// shape — this primitive is for cross-process consumers.
+    #[pyo3(signature = (after_event_id=0, limit=1000, agent_id_hash=None))]
+    fn fetch_trace_events_page<'py>(
+        &self,
+        py: Python<'py>,
+        after_event_id: i64,
+        limit: i64,
+        agent_id_hash: Option<&str>,
+    ) -> PyResult<pyo3::Bound<'py, pyo3::types::PyList>> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let agent_filter = agent_id_hash.map(str::to_owned);
+
+        let rows: Vec<(i64, crate::store::types::TraceEventRow)> = py
+            .detach(move || {
+                runtime.block_on(async move {
+                    use crate::store::Backend;
+                    backend
+                        .fetch_trace_events_page(after_event_id, limit, agent_filter.as_deref())
+                        .await
+                })
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+
+        let list = pyo3::types::PyList::empty(py);
+        for (event_id, row) in rows {
+            let d = PyDict::new(py);
+            d.set_item("event_id", event_id)?;
+            d.set_item("trace_id", &row.trace_id)?;
+            d.set_item("thought_id", &row.thought_id)?;
+            d.set_item("task_id", row.task_id.as_deref())?;
+            d.set_item("step_point", row.step_point.as_deref())?;
+            d.set_item("event_type", row.event_type.as_str())?;
+            d.set_item("attempt_index", row.attempt_index)?;
+            d.set_item("ts", row.ts.to_rfc3339())?;
+            d.set_item("agent_name", row.agent_name.as_deref())?;
+            d.set_item("agent_id_hash", &row.agent_id_hash)?;
+            d.set_item("cognitive_state", row.cognitive_state.as_deref())?;
+            d.set_item("trace_level", trace_level_str(row.trace_level))?;
+            d.set_item(
+                "payload",
+                pyo3::types::PyString::new(
+                    py,
+                    &serde_json::to_string(&serde_json::Value::Object(row.payload))
+                        .unwrap_or_default(),
+                ),
+            )?;
+            d.set_item("cost_llm_calls", row.cost_llm_calls)?;
+            d.set_item("cost_tokens", row.cost_tokens)?;
+            d.set_item("cost_usd", row.cost_usd)?;
+            d.set_item("signature", &row.signature)?;
+            d.set_item("signing_key_id", &row.signing_key_id)?;
+            d.set_item("signature_verified", row.signature_verified)?;
+            d.set_item("schema_version", &row.schema_version)?;
+            d.set_item("pii_scrubbed", row.pii_scrubbed)?;
+            d.set_item("agent_role", row.agent_role.as_deref())?;
+            d.set_item("agent_template", row.agent_template.as_deref())?;
+            d.set_item("deployment_domain", row.deployment_domain.as_deref())?;
+            d.set_item("deployment_type", row.deployment_type.as_deref())?;
+            d.set_item("deployment_region", row.deployment_region.as_deref())?;
+            d.set_item(
+                "deployment_trust_mode",
+                row.deployment_trust_mode.as_deref(),
+            )?;
+            list.append(d)?;
+        }
+        Ok(list)
+    }
+}
+
+/// v0.3.5 — TraceLevel → wire-format string. Same shape as the
+/// trace_level_str helper in `src/store/postgres.rs` but free-standing
+/// for use from this FFI module without re-exposing storage internals.
+fn trace_level_str(t: crate::schema::TraceLevel) -> &'static str {
+    match t {
+        crate::schema::TraceLevel::Generic => "generic",
+        crate::schema::TraceLevel::Detailed => "detailed",
+        crate::schema::TraceLevel::FullTraces => "full_traces",
+    }
 }
 
 /// Bridge `federation::Error` → `PyErr` at the FFI boundary.

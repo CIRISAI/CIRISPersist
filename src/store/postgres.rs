@@ -656,6 +656,182 @@ impl Backend for PostgresBackend {
         tracing::info!("ciris-persist: migration phase complete");
         Ok(())
     }
+
+    async fn delete_traces_for_agent(
+        &self,
+        agent_id_hash: &str,
+        include_federation_key: bool,
+    ) -> Result<super::types::DeleteSummary, Error> {
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| Error::Backend(format!("begin tx: {e}")))?;
+
+        // Step 1: collect agent's trace_ids so we can join the LLM
+        // call delete (trace_llm_calls has no agent_id_hash column;
+        // FK is on trace_id alone).
+        let trace_ids: Vec<String> = tx
+            .query(
+                "SELECT DISTINCT trace_id FROM cirislens.trace_events \
+                 WHERE agent_id_hash = $1",
+                &[&agent_id_hash],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("collect trace_ids: {e}")))?
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect();
+
+        // Step 2: delete LLM call rows joined by trace_id.
+        let trace_llm_calls_deleted = if trace_ids.is_empty() {
+            0u64
+        } else {
+            tx.execute(
+                "DELETE FROM cirislens.trace_llm_calls \
+                 WHERE trace_id = ANY($1::text[])",
+                &[&trace_ids],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("delete trace_llm_calls: {e}")))?
+        };
+
+        // Step 3: delete trace_events rows.
+        let trace_events_deleted = tx
+            .execute(
+                "DELETE FROM cirislens.trace_events WHERE agent_id_hash = $1",
+                &[&agent_id_hash],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("delete trace_events: {e}")))?;
+
+        // Step 4 (optional): federation key cascade. Find target key_ids,
+        // delete cascading attestation/revocation rows, then the keys.
+        let mut federation_keys_deleted = 0u64;
+        let mut federation_attestations_deleted = 0u64;
+        let mut federation_revocations_deleted = 0u64;
+
+        if include_federation_key {
+            let target_key_ids: Vec<String> = tx
+                .query(
+                    "SELECT key_id FROM cirislens.federation_keys \
+                     WHERE identity_type = 'agent' AND identity_ref = $1",
+                    &[&agent_id_hash],
+                )
+                .await
+                .map_err(|e| Error::Backend(format!("collect target_key_ids: {e}")))?
+                .into_iter()
+                .map(|row| row.get::<_, String>(0))
+                .collect();
+
+            if !target_key_ids.is_empty() {
+                federation_revocations_deleted = tx
+                    .execute(
+                        "DELETE FROM cirislens.federation_revocations \
+                         WHERE revoked_key_id = ANY($1::text[]) \
+                            OR revoking_key_id = ANY($1::text[]) \
+                            OR scrub_key_id    = ANY($1::text[])",
+                        &[&target_key_ids],
+                    )
+                    .await
+                    .map_err(|e| Error::Backend(format!("delete federation_revocations: {e}")))?;
+
+                federation_attestations_deleted = tx
+                    .execute(
+                        "DELETE FROM cirislens.federation_attestations \
+                         WHERE attesting_key_id = ANY($1::text[]) \
+                            OR attested_key_id  = ANY($1::text[]) \
+                            OR scrub_key_id     = ANY($1::text[])",
+                        &[&target_key_ids],
+                    )
+                    .await
+                    .map_err(|e| Error::Backend(format!("delete federation_attestations: {e}")))?;
+
+                federation_keys_deleted = tx
+                    .execute(
+                        "DELETE FROM cirislens.federation_keys \
+                         WHERE key_id = ANY($1::text[])",
+                        &[&target_key_ids],
+                    )
+                    .await
+                    .map_err(|e| Error::Backend(format!("delete federation_keys: {e}")))?;
+            }
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| Error::Backend(format!("commit dsar tx: {e}")))?;
+
+        Ok(super::types::DeleteSummary {
+            trace_events_deleted,
+            trace_llm_calls_deleted,
+            federation_keys_deleted,
+            federation_attestations_deleted,
+            federation_revocations_deleted,
+            deleted_at: chrono::Utc::now(),
+        })
+    }
+
+    async fn fetch_trace_events_page(
+        &self,
+        after_event_id: i64,
+        limit: i64,
+        agent_id_hash: Option<&str>,
+    ) -> Result<Vec<(i64, TraceEventRow)>, Error> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+
+        // Branch on filter so the no-filter case skips the optional
+        // WHERE-clause bind. Same shape Postgres planners optimize
+        // either way; the bind-arity branch is the simplest readable form.
+        let rows = match agent_id_hash {
+            Some(h) => client
+                .query(
+                    "SELECT event_id, trace_id, thought_id, task_id, step_point, event_type, \
+                            attempt_index, ts, agent_name, agent_id_hash, cognitive_state, \
+                            trace_level, payload, cost_llm_calls, cost_tokens, cost_usd, \
+                            signature, signing_key_id, signature_verified, schema_version, \
+                            pii_scrubbed, audit_sequence_number, audit_entry_hash, \
+                            audit_signature, original_content_hash, scrub_signature, \
+                            scrub_key_id, scrub_timestamp, agent_role, agent_template, \
+                            deployment_domain, deployment_type, deployment_region, \
+                            deployment_trust_mode \
+                     FROM cirislens.trace_events \
+                     WHERE event_id > $1 AND agent_id_hash = $2 \
+                     ORDER BY event_id ASC LIMIT $3",
+                    &[&after_event_id, &h, &limit],
+                )
+                .await
+                .map_err(|e| Error::Backend(format!("fetch_trace_events_page: {e}")))?,
+            None => client
+                .query(
+                    "SELECT event_id, trace_id, thought_id, task_id, step_point, event_type, \
+                            attempt_index, ts, agent_name, agent_id_hash, cognitive_state, \
+                            trace_level, payload, cost_llm_calls, cost_tokens, cost_usd, \
+                            signature, signing_key_id, signature_verified, schema_version, \
+                            pii_scrubbed, audit_sequence_number, audit_entry_hash, \
+                            audit_signature, original_content_hash, scrub_signature, \
+                            scrub_key_id, scrub_timestamp, agent_role, agent_template, \
+                            deployment_domain, deployment_type, deployment_region, \
+                            deployment_trust_mode \
+                     FROM cirislens.trace_events \
+                     WHERE event_id > $1 \
+                     ORDER BY event_id ASC LIMIT $2",
+                    &[&after_event_id, &limit],
+                )
+                .await
+                .map_err(|e| Error::Backend(format!("fetch_trace_events_page: {e}")))?,
+        };
+
+        rows.into_iter().map(pg_row_to_event_row).collect()
+    }
 }
 
 // ─── FederationDirectory impl (v0.2.0) ─────────────────────────────
@@ -1343,6 +1519,77 @@ fn pg_row_to_revocation(row: tokio_postgres::Row) -> crate::federation::Revocati
         pqc_completed_at: row.get("pqc_completed_at"),
         persist_row_hash: row.get("persist_row_hash"),
     }
+}
+
+/// v0.3.5 (CIRISLens#8 ASK 3) — Convert a postgres row from
+/// `cirislens.trace_events` to `(event_id, TraceEventRow)`. Used by
+/// `Backend::fetch_trace_events_page`. Column order MUST match the
+/// SELECT clause; we read by name here to make additions safer.
+fn pg_row_to_event_row(row: tokio_postgres::Row) -> Result<(i64, TraceEventRow), Error> {
+    use crate::schema::{ReasoningEventType, TraceLevel};
+    let event_type_str: String = row.get("event_type");
+    let event_type = ReasoningEventType::from_wire_str(&event_type_str).ok_or_else(|| {
+        Error::Backend(format!(
+            "unknown event_type in trace_events row: {event_type_str}"
+        ))
+    })?;
+    let trace_level_str: String = row.get("trace_level");
+    let trace_level = match trace_level_str.as_str() {
+        "generic" => TraceLevel::Generic,
+        "detailed" => TraceLevel::Detailed,
+        "full_traces" => TraceLevel::FullTraces,
+        other => {
+            return Err(Error::Backend(format!("unknown trace_level: {other}")));
+        }
+    };
+    let attempt_index_i32: i32 = row.get("attempt_index");
+    let attempt_index = u32::try_from(attempt_index_i32).map_err(|_| {
+        Error::Backend(format!(
+            "attempt_index {attempt_index_i32} negative — schema CHECK should have rejected"
+        ))
+    })?;
+    let payload_value: serde_json::Value = row.get("payload");
+    let payload = match payload_value {
+        serde_json::Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+
+    let event_id: i64 = row.get("event_id");
+    Ok((
+        event_id,
+        TraceEventRow {
+            trace_id: row.get("trace_id"),
+            thought_id: row.get("thought_id"),
+            task_id: row.get("task_id"),
+            step_point: row.get("step_point"),
+            event_type,
+            attempt_index,
+            ts: row.get("ts"),
+            agent_name: row.get("agent_name"),
+            agent_id_hash: row.get("agent_id_hash"),
+            cognitive_state: row.get("cognitive_state"),
+            trace_level,
+            payload,
+            cost_llm_calls: row.get("cost_llm_calls"),
+            cost_tokens: row.get("cost_tokens"),
+            cost_usd: row.get("cost_usd"),
+            signature: row.get("signature"),
+            signing_key_id: row.get("signing_key_id"),
+            signature_verified: row.get("signature_verified"),
+            schema_version: row.get("schema_version"),
+            pii_scrubbed: row.get("pii_scrubbed"),
+            original_content_hash: row.get("original_content_hash"),
+            scrub_signature: row.get("scrub_signature"),
+            scrub_key_id: row.get("scrub_key_id"),
+            scrub_timestamp: row.get("scrub_timestamp"),
+            agent_role: row.get("agent_role"),
+            agent_template: row.get("agent_template"),
+            deployment_domain: row.get("deployment_domain"),
+            deployment_type: row.get("deployment_type"),
+            deployment_region: row.get("deployment_region"),
+            deployment_trust_mode: row.get("deployment_trust_mode"),
+        },
+    ))
 }
 
 fn trace_level_str(t: crate::schema::TraceLevel) -> &'static str {

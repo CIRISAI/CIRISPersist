@@ -210,6 +210,41 @@ pub struct TraceLlmCallRow {
     pub response_text: Option<String>,
 }
 
+/// v0.3.5 (CIRISLens#8 ASK 1) — Result of `Engine.delete_traces_for_agent`.
+/// Counts every row removed by the GDPR Article 17 / DSAR primitive
+/// across persist's substrate tables. Lens consumes this for its own
+/// DSAR audit ledger; persist returns the row counts, lens records
+/// the request envelope + signature.
+///
+/// Federation-key counts are zero unless `include_federation_key=true`
+/// was passed. When set, the agent's federation_keys row(s) are
+/// removed AND FK-cascade rows in federation_attestations +
+/// federation_revocations are removed too — required for FK integrity
+/// since persist's federation FKs are not ON DELETE CASCADE.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeleteSummary {
+    /// Rows removed from `cirislens.trace_events`.
+    pub trace_events_deleted: u64,
+    /// Rows removed from `cirislens.trace_llm_calls` (joined by
+    /// trace_id from the deleted trace_events set).
+    pub trace_llm_calls_deleted: u64,
+    /// Rows removed from `cirislens.federation_keys`. Always 0 unless
+    /// `include_federation_key=true`. May be >1 if the agent rotated
+    /// keys (multiple federation_keys rows with
+    /// `identity_type='agent'` + `identity_ref=<agent_id_hash>`).
+    pub federation_keys_deleted: u64,
+    /// FK-cascade: rows removed from `cirislens.federation_attestations`
+    /// where the agent's key was attesting_key_id, attested_key_id,
+    /// or scrub_key_id. Always 0 unless `include_federation_key=true`.
+    pub federation_attestations_deleted: u64,
+    /// FK-cascade: rows removed from `cirislens.federation_revocations`
+    /// referencing the agent's key. Always 0 unless
+    /// `include_federation_key=true`.
+    pub federation_revocations_deleted: u64,
+    /// Wall-clock when the delete transaction committed.
+    pub deleted_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Phase 2 stub — agent audit-log entry shape (FSD §4.1).
 ///
 /// Carried as a placeholder type so the Backend trait surface can

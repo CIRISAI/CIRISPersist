@@ -5,6 +5,142 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.3.5] — 2026-05-03
+
+**DSAR primitive + page-cursor read primitive for analytical streaming.**
+Closes [CIRISLens#8](https://github.com/CIRISAI/CIRISLens/issues/8) ASKs
+1 + 3. ASK 2 (v0.4.0 timing for `accord_public_keys` dual-read
+retirement) answered via comment on lens#8.
+
+### ASK 1 — `Engine.delete_traces_for_agent` (GDPR Article 17)
+
+```python
+summary = engine.delete_traces_for_agent(
+    agent_id_hash,
+    include_federation_key=False,  # default — only trace data
+)
+# {
+#   "trace_events_deleted":           int,
+#   "trace_llm_calls_deleted":        int,
+#   "federation_keys_deleted":        int,  # 0 unless include_federation_key=True
+#   "federation_attestations_deleted": int,  # 0 unless include_federation_key=True
+#   "federation_revocations_deleted":  int,  # 0 unless include_federation_key=True
+#   "deleted_at":                     str,  # ISO-8601 UTC
+# }
+```
+
+Always deletes `cirislens.trace_events` rows where `agent_id_hash`
+matches + `cirislens.trace_llm_calls` rows joined by `trace_id` from
+the deleted set. All in a single transaction.
+
+When `include_federation_key=True`, additionally deletes
+`federation_keys` rows where `identity_type='agent'` AND
+`identity_ref=agent_id_hash` (may be >1 if the agent rotated keys),
+plus FK-cascade rows in `federation_attestations` +
+`federation_revocations` referencing those key_ids. FK-cascade is
+explicit because persist's federation FKs are not `ON DELETE
+CASCADE` — deleting in dependency order is what makes the
+operation safe.
+
+Idempotent: re-invocation on an already-deleted agent returns
+all-zero counts.
+
+**Persist owns the substrate row delete; lens orchestrates the DSAR
+audit + signature verification.** This method does NOT validate the
+caller's authority to delete the agent's data — that's lens-side
+policy, same separation as the rest of the federation directory's
+write surface.
+
+### ASK 3 — `Engine.fetch_trace_events_page` (page-cursor read)
+
+```python
+page = engine.fetch_trace_events_page(
+    after_event_id=0,
+    limit=1000,
+    agent_id_hash=None,  # or "<hash>" to filter
+)
+# list of dicts; each dict carries trace_events column → value pairs
+# plus an explicit "event_id" field for cursor extraction
+```
+
+Caller orchestrates the cursor: track the max returned `event_id`
+between calls, pass it as `after_event_id` for the next page, stop
+when the result set is empty.
+
+Cleaner than a callback-style `iterate_trace_events(filter, cb)`
+across PyO3: callers pull pages on their own pace, no FFI re-entry
+per row, no shared-state synchronization. Same shape as
+`Engine.run_pqc_sweep` (cursor at the trait boundary, caller drives).
+
+Use this when:
+- Lens wants typed Rust-shape rows rather than raw SQL
+- The caller is out-of-process and can't take `cirislens_reader`
+  role for direct SQL
+- Streaming over a >>memory result set (cursor pattern handles
+  arbitrary corpus size)
+
+For ad-hoc analytical queries inside lens-core, the
+`cirislens_reader` role + direct SQL is still the recommended shape
+— this primitive is for cross-process consumers (per lens#8's
+rationale).
+
+### ASK 2 — v0.4.0 timing (`accord_public_keys` dual-read retirement)
+
+Answered via comment on lens#8. Persist will drop the
+`Backend::lookup_public_key` accord_public_keys fallback in v0.4.0;
+lens-core can drop its direct INSERT into `accord_public_keys` the
+same release. No change to v0.3.x.
+
+### Backend trait additions
+
+Two new methods on `Backend` (memory + postgres + sqlite impls):
+
+```rust
+fn delete_traces_for_agent(
+    &self,
+    agent_id_hash: &str,
+    include_federation_key: bool,
+) -> impl Future<Output = Result<DeleteSummary, Error>> + Send;
+
+fn fetch_trace_events_page(
+    &self,
+    after_event_id: i64,
+    limit: i64,
+    agent_id_hash: Option<&str>,
+) -> impl Future<Output = Result<Vec<(i64, TraceEventRow)>, Error>> + Send;
+```
+
+`DeleteSummary` lands in `src/store/types.rs`. New `from_wire_str`
+inverse on `ReasoningEventType` for the postgres + sqlite
+row-to-struct conversions (`pg_row_to_event_row` /
+`sqlite_row_to_event_row`).
+
+### Tests
+
+168 lib (166 + 2 new memory-backend tests) + 22 integration tests
+pass; clippy clean across all features; cargo-deny clean. New
+tests:
+
+- DSAR deletes target agent's trace_events + trace_llm_calls
+  atomically; other agents' data untouched; idempotent on
+  re-invocation
+- fetch_trace_events_page returns rows in event_id order, respects
+  cursor + limit, filters by agent_id_hash
+
+### Bridge action
+
+Bump `ciris-persist==0.3.4 → 0.3.5` in `api/requirements.txt`.
+
+Lens DSAR handler at `accord_api.py:2880,2891` (per lens#8 inventory)
+folds onto `engine.delete_traces_for_agent(agent_id_hash)` — drops
+the direct DELETE on `accord_traces`. The `partner_access` /
+`public_sample` UPDATE moves to a lens-derived schema (out of scope
+for persist; tracked on lens#8).
+
+### Deps
+
+No version changes (`ciris-keyring` / `ciris-verify-core` v1.9.0).
+
 ## [0.3.4] — 2026-05-03
 
 **Deployment-profile block at trace_schema_version 2.7.9 — cohort

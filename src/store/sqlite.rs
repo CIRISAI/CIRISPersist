@@ -439,6 +439,164 @@ impl Backend for SqliteBackend {
         })?;
         Ok(())
     }
+
+    async fn delete_traces_for_agent(
+        &self,
+        agent_id_hash: &str,
+        include_federation_key: bool,
+    ) -> Result<super::types::DeleteSummary, Error> {
+        let agent = agent_id_hash.to_owned();
+        let conn = self.conn.clone();
+        let summary = tokio::task::spawn_blocking(
+            move || -> Result<super::types::DeleteSummary, rusqlite::Error> {
+                let mut conn = conn.blocking_lock();
+                let tx = conn.transaction()?;
+                // Step 1: collect trace_ids of the agent's events.
+                let trace_ids: Vec<String> = {
+                    let mut stmt = tx.prepare(
+                        "SELECT DISTINCT trace_id FROM trace_events WHERE agent_id_hash = ?1",
+                    )?;
+                    let rows = stmt.query_map([&agent], |r| r.get::<_, String>(0))?;
+                    rows.collect::<Result<Vec<_>, _>>()?
+                };
+
+                // Step 2: delete LLM call rows joined by trace_id.
+                let mut trace_llm_calls_deleted = 0u64;
+                if !trace_ids.is_empty() {
+                    let mut stmt = tx.prepare("DELETE FROM trace_llm_calls WHERE trace_id = ?1")?;
+                    for tid in &trace_ids {
+                        trace_llm_calls_deleted += stmt.execute([tid])? as u64;
+                    }
+                }
+
+                // Step 3: delete trace_events rows.
+                let trace_events_deleted = tx.execute(
+                    "DELETE FROM trace_events WHERE agent_id_hash = ?1",
+                    [&agent],
+                )? as u64;
+
+                let mut federation_keys_deleted = 0u64;
+                let mut federation_attestations_deleted = 0u64;
+                let mut federation_revocations_deleted = 0u64;
+
+                if include_federation_key {
+                    let target_key_ids: Vec<String> = {
+                        let mut stmt = tx.prepare(
+                            "SELECT key_id FROM federation_keys \
+                             WHERE identity_type = 'agent' AND identity_ref = ?1",
+                        )?;
+                        let rows = stmt.query_map([&agent], |r| r.get::<_, String>(0))?;
+                        rows.collect::<Result<Vec<_>, _>>()?
+                    };
+
+                    if !target_key_ids.is_empty() {
+                        // Per-key DELETE (sqlite doesn't have ANY/array
+                        // params; iterate). Same row-count-summing
+                        // shape as the trace_llm_calls loop above.
+                        let mut rev_stmt = tx.prepare(
+                            "DELETE FROM federation_revocations \
+                             WHERE revoked_key_id = ?1 \
+                                OR revoking_key_id = ?1 \
+                                OR scrub_key_id    = ?1",
+                        )?;
+                        let mut att_stmt = tx.prepare(
+                            "DELETE FROM federation_attestations \
+                             WHERE attesting_key_id = ?1 \
+                                OR attested_key_id  = ?1 \
+                                OR scrub_key_id     = ?1",
+                        )?;
+                        let mut key_stmt =
+                            tx.prepare("DELETE FROM federation_keys WHERE key_id = ?1")?;
+                        for kid in &target_key_ids {
+                            federation_revocations_deleted += rev_stmt.execute([kid])? as u64;
+                            federation_attestations_deleted += att_stmt.execute([kid])? as u64;
+                            federation_keys_deleted += key_stmt.execute([kid])? as u64;
+                        }
+                    }
+                }
+
+                tx.commit()?;
+                Ok(super::types::DeleteSummary {
+                    trace_events_deleted,
+                    trace_llm_calls_deleted,
+                    federation_keys_deleted,
+                    federation_attestations_deleted,
+                    federation_revocations_deleted,
+                    deleted_at: chrono::Utc::now(),
+                })
+            },
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| Error::Backend(format!("dsar tx: {e}")))?;
+        Ok(summary)
+    }
+
+    async fn fetch_trace_events_page(
+        &self,
+        after_event_id: i64,
+        limit: i64,
+        agent_id_hash: Option<&str>,
+    ) -> Result<Vec<(i64, TraceEventRow)>, Error> {
+        let agent = agent_id_hash.map(str::to_owned);
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<(i64, TraceEventRow)>, Error> {
+            let conn = conn.blocking_lock();
+            let cols = "event_id, trace_id, thought_id, task_id, step_point, event_type, \
+                        attempt_index, ts, agent_name, agent_id_hash, cognitive_state, \
+                        trace_level, payload, cost_llm_calls, cost_tokens, cost_usd, \
+                        signature, signing_key_id, signature_verified, schema_version, \
+                        pii_scrubbed, audit_sequence_number, audit_entry_hash, \
+                        audit_signature, original_content_hash, scrub_signature, \
+                        scrub_key_id, scrub_timestamp, agent_role, agent_template, \
+                        deployment_domain, deployment_type, deployment_region, \
+                        deployment_trust_mode";
+            let (sql, rows) = match agent {
+                Some(h) => {
+                    let sql = format!(
+                        "SELECT {cols} FROM trace_events \
+                         WHERE event_id > ?1 AND agent_id_hash = ?2 \
+                         ORDER BY event_id ASC LIMIT ?3"
+                    );
+                    let mut stmt = conn
+                        .prepare(&sql)
+                        .map_err(|e| Error::Backend(format!("prepare: {e}")))?;
+                    let rows = stmt
+                        .query_map(
+                            rusqlite::params![after_event_id, h, limit],
+                            sqlite_row_to_event_row,
+                        )
+                        .map_err(|e| Error::Backend(format!("query_map: {e}")))?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| Error::Backend(format!("row map: {e}")))?;
+                    (sql, rows)
+                }
+                None => {
+                    let sql = format!(
+                        "SELECT {cols} FROM trace_events \
+                         WHERE event_id > ?1 \
+                         ORDER BY event_id ASC LIMIT ?2"
+                    );
+                    let mut stmt = conn
+                        .prepare(&sql)
+                        .map_err(|e| Error::Backend(format!("prepare: {e}")))?;
+                    let rows = stmt
+                        .query_map(
+                            rusqlite::params![after_event_id, limit],
+                            sqlite_row_to_event_row,
+                        )
+                        .map_err(|e| Error::Backend(format!("query_map: {e}")))?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| Error::Backend(format!("row map: {e}")))?;
+                    (sql, rows)
+                }
+            };
+            let _ = sql; // hold for diagnostics if needed
+            Ok(rows)
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+    }
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────
@@ -1175,6 +1333,102 @@ fn parse_rfc3339(s: &str) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::parse_from_rfc3339(s)
         .map(|t| t.with_timezone(&chrono::Utc))
         .unwrap_or_else(|_| chrono::Utc::now())
+}
+
+/// v0.3.5 (CIRISLens#8 ASK 3) — sqlite row → (event_id, TraceEventRow).
+/// Used by `Backend::fetch_trace_events_page`. Mirrors the postgres
+/// counterpart `pg_row_to_event_row` field set + ordering.
+fn sqlite_row_to_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, TraceEventRow)> {
+    use crate::schema::{ReasoningEventType, TraceLevel};
+    let event_id: i64 = row.get("event_id")?;
+    let event_type_str: String = row.get("event_type")?;
+    let event_type = ReasoningEventType::from_wire_str(&event_type_str).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            5,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::other(format!(
+                "unknown event_type: {event_type_str}"
+            ))),
+        )
+    })?;
+    let trace_level_str: String = row.get("trace_level")?;
+    let trace_level = match trace_level_str.as_str() {
+        "generic" => TraceLevel::Generic,
+        "detailed" => TraceLevel::Detailed,
+        "full_traces" => TraceLevel::FullTraces,
+        other => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                11,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::other(format!(
+                    "unknown trace_level: {other}"
+                ))),
+            ));
+        }
+    };
+    let attempt_index_i64: i64 = row.get("attempt_index")?;
+    let attempt_index = u32::try_from(attempt_index_i64).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            6,
+            rusqlite::types::Type::Integer,
+            Box::new(std::io::Error::other(format!(
+                "attempt_index out of range: {attempt_index_i64}"
+            ))),
+        )
+    })?;
+    let payload_text: String = row.get("payload")?;
+    let payload_value: serde_json::Value = serde_json::from_str(&payload_text).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            12,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::other(e)),
+        )
+    })?;
+    let payload = match payload_value {
+        serde_json::Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    let ts_str: String = row.get("ts")?;
+    let ts = parse_rfc3339(&ts_str);
+    let scrub_ts: Option<String> = row.get("scrub_timestamp")?;
+    let scrub_timestamp = scrub_ts.as_deref().map(parse_rfc3339);
+    let signature_verified_i: i64 = row.get("signature_verified")?;
+    let pii_scrubbed_i: i64 = row.get("pii_scrubbed")?;
+    Ok((
+        event_id,
+        TraceEventRow {
+            trace_id: row.get("trace_id")?,
+            thought_id: row.get("thought_id")?,
+            task_id: row.get("task_id")?,
+            step_point: row.get("step_point")?,
+            event_type,
+            attempt_index,
+            ts,
+            agent_name: row.get("agent_name")?,
+            agent_id_hash: row.get("agent_id_hash")?,
+            cognitive_state: row.get("cognitive_state")?,
+            trace_level,
+            payload,
+            cost_llm_calls: row.get("cost_llm_calls")?,
+            cost_tokens: row.get("cost_tokens")?,
+            cost_usd: row.get("cost_usd")?,
+            signature: row.get("signature")?,
+            signing_key_id: row.get("signing_key_id")?,
+            signature_verified: signature_verified_i != 0,
+            schema_version: row.get("schema_version")?,
+            pii_scrubbed: pii_scrubbed_i != 0,
+            original_content_hash: row.get("original_content_hash")?,
+            scrub_signature: row.get("scrub_signature")?,
+            scrub_key_id: row.get("scrub_key_id")?,
+            scrub_timestamp,
+            agent_role: row.get("agent_role")?,
+            agent_template: row.get("agent_template")?,
+            deployment_domain: row.get("deployment_domain")?,
+            deployment_type: row.get("deployment_type")?,
+            deployment_region: row.get("deployment_region")?,
+            deployment_trust_mode: row.get("deployment_trust_mode")?,
+        },
+    ))
 }
 
 fn sqlite_row_to_key_record(

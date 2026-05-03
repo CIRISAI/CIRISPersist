@@ -108,6 +108,27 @@ impl ReasoningEventType {
             Self::RoundComplete => "ROUND_COMPLETE",
         }
     }
+
+    /// v0.3.5 (CIRISLens#8 ASK 3) — Inverse of `as_str`. Used by
+    /// backend row→struct conversions in `fetch_trace_events_page`.
+    /// Returns `None` for unknown wire strings; callers surface as
+    /// a typed `Error::Backend` rather than panic.
+    pub fn from_wire_str(s: &str) -> Option<Self> {
+        match s {
+            "THOUGHT_START" => Some(Self::ThoughtStart),
+            "SNAPSHOT_AND_CONTEXT" => Some(Self::SnapshotAndContext),
+            "DMA_RESULTS" => Some(Self::DmaResults),
+            "IDMA_RESULT" => Some(Self::IdmaResult),
+            "ASPDMA_RESULT" => Some(Self::AspdmaResult),
+            "TSASPDMA_RESULT" => Some(Self::TsaspdmaResult),
+            "VERB_SECOND_PASS_RESULT" => Some(Self::VerbSecondPassResult),
+            "CONSCIENCE_RESULT" => Some(Self::ConscienceResult),
+            "ACTION_RESULT" => Some(Self::ActionResult),
+            "LLM_CALL" => Some(Self::LlmCall),
+            "ROUND_COMPLETE" => Some(Self::RoundComplete),
+            _ => None,
+        }
+    }
 }
 
 /// Audit anchor extracted from an `ACTION_RESULT` component
