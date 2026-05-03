@@ -53,6 +53,28 @@ pub fn decompose(trace: &CompleteTrace) -> Result<Decomposed, Error> {
     let agent_name = pluck_string_from_first(trace, "agent_name");
     let cognitive_state = pluck_string_from_first(trace, "cognitive_state");
 
+    // v0.3.4 (CIRISPersist#13) — deployment_profile denormalization.
+    // Per-trace constants extracted once and copied onto every event
+    // row, same shape as agent_name/cognitive_state above.
+    let (
+        agent_role,
+        agent_template,
+        deployment_domain,
+        deployment_type,
+        deployment_region,
+        deployment_trust_mode,
+    ) = match trace.deployment_profile.as_ref() {
+        Some(p) => (
+            Some(p.agent_role.clone()),
+            Some(p.agent_template.clone()),
+            Some(p.deployment_domain.clone()),
+            Some(p.deployment_type.clone()),
+            p.deployment_region.clone(),
+            Some(p.deployment_trust_mode.clone()),
+        ),
+        None => (None, None, None, None, None, None),
+    };
+
     let mut events = Vec::with_capacity(trace.components.len());
     let mut llm_calls = Vec::new();
 
@@ -91,6 +113,12 @@ pub fn decompose(trace: &CompleteTrace) -> Result<Decomposed, Error> {
             signature_verified: true,
             schema_version: trace.trace_schema_version.as_str().to_owned(),
             pii_scrubbed: false,
+            agent_role: agent_role.clone(),
+            agent_template: agent_template.clone(),
+            deployment_domain: deployment_domain.clone(),
+            deployment_type: deployment_type.clone(),
+            deployment_region: deployment_region.clone(),
+            deployment_trust_mode: deployment_trust_mode.clone(),
             // FSD §3.7 envelope fields. decompose itself doesn't sign;
             // the IngestPipeline (step 3.5) populates these per-row
             // after this function returns. Pure-decomposition callers
@@ -328,6 +356,7 @@ mod tests {
                     }),
                 ),
             ],
+            deployment_profile: None,
             signature: "AAAA".into(),
             signature_key_id: "ciris-agent-key:dead".into(),
         }
@@ -505,6 +534,67 @@ mod tests {
         match err {
             Error::Schema(crate::schema::Error::MissingField("data.parent_attempt_index")) => {}
             other => panic!("expected MissingField(data.parent_attempt_index), got {other:?}"),
+        }
+    }
+
+    /// v0.3.4 (CIRISPersist#13) — Decompose denormalizes the 2.7.9
+    /// deployment_profile block onto every event row of the trace
+    /// (same shape as agent_name / agent_id_hash). 2.7.0 traces stay
+    /// All-NULL across the 6 columns.
+    #[test]
+    fn deployment_profile_denormalizes_onto_every_event_row() {
+        use crate::schema::DeploymentProfile;
+        let mut trace = fixture_trace();
+        trace.trace_schema_version = SchemaVersion::parse("2.7.9").unwrap();
+        // v0.3.3 strict-parse: 2.7.9 LLM_CALL components MUST carry
+        // parent_event_type + parent_attempt_index. Inject them so
+        // decompose passes.
+        let llm_data = &mut trace.components[1].data;
+        llm_data.insert(
+            "parent_event_type".to_owned(),
+            serde_json::json!("ASPDMA_RESULT"),
+        );
+        llm_data.insert("parent_attempt_index".to_owned(), serde_json::json!(0));
+        trace.deployment_profile = Some(DeploymentProfile {
+            agent_role: "ally".into(),
+            agent_template: "ally-v3-default".into(),
+            deployment_domain: "general".into(),
+            deployment_type: "production".into(),
+            deployment_region: Some("US".into()),
+            deployment_trust_mode: "federated_peer".into(),
+        });
+        let d = decompose(&trace).unwrap();
+        // Every event row carries the profile, copied from the trace
+        // envelope. Per-trace constants — same shape as agent_name,
+        // agent_id_hash, cognitive_state.
+        for ev in &d.events {
+            assert_eq!(ev.agent_role.as_deref(), Some("ally"), "event {ev:?}");
+            assert_eq!(ev.agent_template.as_deref(), Some("ally-v3-default"));
+            assert_eq!(ev.deployment_domain.as_deref(), Some("general"));
+            assert_eq!(ev.deployment_type.as_deref(), Some("production"));
+            assert_eq!(ev.deployment_region.as_deref(), Some("US"));
+            assert_eq!(ev.deployment_trust_mode.as_deref(), Some("federated_peer"));
+        }
+    }
+
+    /// v0.3.4 (CIRISPersist#13) — 2.7.0 traces (no profile on the
+    /// envelope) decompose to All-NULL across the 6 deployment_profile
+    /// columns. Lens queries filtering on these columns get NULL for
+    /// pre-v0.3.4 traffic, which is correct.
+    #[test]
+    fn deployment_profile_columns_null_for_2_7_0_traces() {
+        let trace = fixture_trace();
+        // 2.7.0 fixture has no deployment_profile.
+        assert_eq!(trace.trace_schema_version.as_str(), "2.7.0");
+        assert!(trace.deployment_profile.is_none());
+        let d = decompose(&trace).unwrap();
+        for ev in &d.events {
+            assert!(ev.agent_role.is_none());
+            assert!(ev.agent_template.is_none());
+            assert!(ev.deployment_domain.is_none());
+            assert!(ev.deployment_type.is_none());
+            assert!(ev.deployment_region.is_none());
+            assert!(ev.deployment_trust_mode.is_none());
         }
     }
 

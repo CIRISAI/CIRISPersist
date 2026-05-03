@@ -285,8 +285,10 @@ impl Backend for PostgresBackend {
                             trace_level, payload, cost_llm_calls, cost_tokens, cost_usd, \
                             signature, signing_key_id, signature_verified, schema_version, \
                             pii_scrubbed, audit_sequence_number, audit_entry_hash, audit_signature, \
-                            original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp";
-        const N_COLS: usize = 27;
+                            original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
+                            agent_role, agent_template, deployment_domain, \
+                            deployment_type, deployment_region, deployment_trust_mode";
+        const N_COLS: usize = 33;
 
         let mut sql = String::with_capacity(2048);
         sql.push_str("INSERT INTO cirislens.trace_events (");
@@ -370,6 +372,13 @@ impl Backend for PostgresBackend {
             params.push(Box::new(row.scrub_signature.clone()));
             params.push(Box::new(row.scrub_key_id.clone()));
             params.push(Box::new(row.scrub_timestamp));
+            // v0.3.4 deployment_profile columns (V006).
+            params.push(Box::new(row.agent_role.clone()));
+            params.push(Box::new(row.agent_template.clone()));
+            params.push(Box::new(row.deployment_domain.clone()));
+            params.push(Box::new(row.deployment_type.clone()));
+            params.push(Box::new(row.deployment_region.clone()));
+            params.push(Box::new(row.deployment_trust_mode.clone()));
         }
         // THREAT_MODEL.md AV-9: dedup-key target now includes
         // agent_id_hash so a malicious agent reusing another agent's
@@ -1427,6 +1436,12 @@ mod tests {
             scrub_signature: None,
             scrub_key_id: None,
             scrub_timestamp: None,
+            agent_role: None,
+            agent_template: None,
+            deployment_domain: None,
+            deployment_type: None,
+            deployment_region: None,
+            deployment_trust_mode: None,
         };
 
         let r1 = backend

@@ -145,10 +145,13 @@ impl Backend for SqliteBackend {
                 trace_level, payload, cost_llm_calls, cost_tokens, cost_usd, \
                 signature, signing_key_id, signature_verified, schema_version, \
                 pii_scrubbed, audit_sequence_number, audit_entry_hash, audit_signature, \
-                original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp\
+                original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
+                agent_role, agent_template, deployment_domain, \
+                deployment_type, deployment_region, deployment_trust_mode\
                 ) VALUES (\
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
-                ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27\
+                ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, \
+                ?28, ?29, ?30, ?31, ?32, ?33\
                 ) ON CONFLICT (agent_id_hash, trace_id, thought_id, event_type, \
                 attempt_index, ts) DO NOTHING";
 
@@ -189,7 +192,7 @@ impl Backend for SqliteBackend {
 
                     let attempt_index_i64 = i64::from(row.attempt_index);
 
-                    let params: [SqlValue; 27] = [
+                    let params: [SqlValue; 33] = [
                         SqlValue::Text(row.trace_id.clone()),
                         SqlValue::Text(row.thought_id.clone()),
                         opt_text(row.task_id.as_deref()),
@@ -222,6 +225,13 @@ impl Backend for SqliteBackend {
                                 .map(|t| t.to_rfc3339())
                                 .as_deref(),
                         ),
+                        // v0.3.4 deployment_profile (V006).
+                        opt_text(row.agent_role.as_deref()),
+                        opt_text(row.agent_template.as_deref()),
+                        opt_text(row.deployment_domain.as_deref()),
+                        opt_text(row.deployment_type.as_deref()),
+                        opt_text(row.deployment_region.as_deref()),
+                        opt_text(row.deployment_trust_mode.as_deref()),
                     ];
 
                     let n = stmt.execute(params_from_iter(params.iter()))?;
@@ -1306,6 +1316,12 @@ mod tests {
             scrub_signature: Some("sig-scrub".to_owned()),
             scrub_key_id: Some("scrub-key-1".to_owned()),
             scrub_timestamp: Some(Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 1).unwrap()),
+            agent_role: None,
+            agent_template: None,
+            deployment_domain: None,
+            deployment_type: None,
+            deployment_region: None,
+            deployment_trust_mode: None,
         }
     }
 

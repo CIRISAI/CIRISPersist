@@ -253,6 +253,21 @@ pub fn canonical_payload_value_v279(trace: &CompleteTrace) -> serde_json::Value 
     );
     payload.insert("components".into(), serde_json::Value::Array(components));
 
+    // v0.3.4 (CIRISPersist#13) — deployment_profile is the 10th key
+    // in the 2.7.9 outer canonical, between `completed_at` and
+    // `started_at` alphabetically (c < d < s). Required-on-wire at
+    // 2.7.9 per FSD §3.2 + §8; the validate pass in
+    // `BatchEnvelope::from_json` rejects 2.7.9 traces missing the
+    // block. Expanded here only when present so verify-test fixtures
+    // synthesizing a 2.7.9 trace without the block see the 9-key
+    // shape and verify-fail honestly, rather than panic.
+    if let Some(profile) = trace.deployment_profile.as_ref() {
+        payload.insert(
+            "deployment_profile".into(),
+            serde_json::to_value(profile).expect("DeploymentProfile serializes"),
+        );
+    }
+
     serde_json::Value::Object(payload)
 }
 
@@ -526,6 +541,7 @@ mod tests {
             trace_level: crate::schema::TraceLevel::Generic,
             trace_schema_version: SchemaVersion::parse("2.7.0").unwrap(),
             components: vec![],
+            deployment_profile: None,
             signature: String::new(),
             signature_key_id: key_id.to_owned(),
         };
@@ -608,6 +624,7 @@ mod tests {
             trace_level: crate::schema::TraceLevel::Generic,
             trace_schema_version: SchemaVersion::parse("2.7.0").unwrap(),
             components: vec![],
+            deployment_profile: None,
             signature: String::new(),
             signature_key_id: key_id.to_owned(),
         };
@@ -674,6 +691,7 @@ mod tests {
                 data,
                 agent_id_hash: None,
             }],
+            deployment_profile: None,
             signature: String::new(),
             signature_key_id: key_id.to_owned(),
         };
@@ -718,6 +736,7 @@ mod tests {
             trace_level: crate::schema::TraceLevel::Generic,
             trace_schema_version: SchemaVersion::parse("2.7.0").unwrap(),
             components: vec![],
+            deployment_profile: None,
             signature: String::new(),
             signature_key_id: key_id.to_owned(),
         };
@@ -774,6 +793,7 @@ mod tests {
                 // equal to the envelope value.
                 agent_id_hash: Some("7c3f8e2b1d9a4f60".into()),
             }],
+            deployment_profile: None,
             signature: String::new(),
             signature_key_id: key_id.to_owned(),
         };
@@ -827,6 +847,7 @@ mod tests {
                     data,
                     agent_id_hash: per_comp_aih,
                 }],
+                deployment_profile: None,
                 signature: String::new(),
                 signature_key_id: "k".into(),
             }
@@ -961,6 +982,124 @@ mod tests {
         let err =
             verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &keys).unwrap_err();
         assert!(matches!(err, Error::InvalidSignature(_)));
+    }
+
+    /// v0.3.4 (CIRISPersist#13) — At 2.7.9, `deployment_profile` is
+    /// the 10th key of the outer canonical, sorted alphabetically
+    /// between `completed_at` and `started_at` (c < d < s). A trace
+    /// with the block produces canonical bytes that include the 6
+    /// fields. The Python json.dumps(sort_keys=True, separators=...)
+    /// shape produces specific known bytes — we assert byte-exact
+    /// against the expected substring.
+    #[test]
+    fn v279_canonical_includes_deployment_profile() {
+        use crate::schema::{
+            ComponentType, DeploymentProfile, ReasoningEventType, SchemaVersion, TraceLevel,
+        };
+        let mut data = serde_json::Map::new();
+        data.insert("attempt_index".into(), serde_json::json!(0));
+        let trace = CompleteTrace {
+            trace_id: "trace-279-dp".into(),
+            thought_id: "th-1".into(),
+            task_id: None,
+            agent_id_hash: "abcd".into(),
+            started_at: "2026-04-30T00:00:00+00:00".parse().unwrap(),
+            completed_at: "2026-04-30T00:01:00+00:00".parse().unwrap(),
+            trace_level: TraceLevel::Generic,
+            trace_schema_version: SchemaVersion::parse("2.7.9").unwrap(),
+            components: vec![crate::schema::TraceComponent {
+                component_type: ComponentType::Conscience,
+                event_type: ReasoningEventType::ConscienceResult,
+                timestamp: "2026-04-30T00:00:30+00:00".parse().unwrap(),
+                data,
+                agent_id_hash: Some("abcd".into()),
+            }],
+            deployment_profile: Some(DeploymentProfile {
+                agent_role: "ally".into(),
+                agent_template: "ally-v3-default".into(),
+                deployment_domain: "general".into(),
+                deployment_type: "production".into(),
+                deployment_region: None,
+                deployment_trust_mode: "federated_peer".into(),
+            }),
+            signature: String::new(),
+            signature_key_id: "k".into(),
+        };
+        let payload = canonical_payload_value_v279(&trace);
+        let bytes = PythonJsonDumpsCanonicalizer
+            .canonicalize_value(&payload)
+            .unwrap();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        // sort_keys=True ordering: agent_id_hash, completed_at,
+        // components, deployment_profile, started_at, task_id,
+        // thought_id, trace_id, trace_level, trace_schema_version.
+        // (`completed_at` < `components` because 'l' < 'o' at the 5th
+        // char; `components` < `deployment_profile` because 'c' < 'd';
+        // `deployment_profile` < `started_at` because 'd' < 's'.)
+        // Field order inside the block is sort_keys=True too.
+        assert!(
+            s.contains(
+                r#""deployment_profile":{"agent_role":"ally","agent_template":"ally-v3-default","deployment_domain":"general","deployment_region":null,"deployment_trust_mode":"federated_peer","deployment_type":"production"},"started_at""#
+            ),
+            "canonical bytes don't carry deployment_profile in expected sorted position; got:\n{s}"
+        );
+        // 10-key outer canonical (was 9 pre-v0.3.4).
+        assert!(s.contains(r#""started_at":"2026-04-30T00:00:00+00:00""#));
+    }
+
+    /// v0.3.4 (CIRISPersist#13) — Cross-shape rule: at 2.7.0, a
+    /// deployment_profile field in the wire JSON does NOT enter
+    /// canonical bytes. Two traces — one without the block, one with
+    /// — produce byte-identical 2.7.0 canonical bytes. Mirrors the
+    /// existing per-component agent_id_hash injection test.
+    #[test]
+    fn v270_ignores_deployment_profile_injection() {
+        use crate::schema::{
+            ComponentType, DeploymentProfile, ReasoningEventType, SchemaVersion, TraceLevel,
+        };
+        fn build(profile: Option<DeploymentProfile>) -> CompleteTrace {
+            let mut data = serde_json::Map::new();
+            data.insert("attempt_index".into(), serde_json::json!(0));
+            CompleteTrace {
+                trace_id: "trace-270-dp-injection".into(),
+                thought_id: "th-1".into(),
+                task_id: None,
+                agent_id_hash: "envelope".into(),
+                started_at: "2026-04-30T00:00:00+00:00".parse().unwrap(),
+                completed_at: "2026-04-30T00:01:00+00:00".parse().unwrap(),
+                trace_level: TraceLevel::Generic,
+                trace_schema_version: SchemaVersion::parse("2.7.0").unwrap(),
+                components: vec![crate::schema::TraceComponent {
+                    component_type: ComponentType::Conscience,
+                    event_type: ReasoningEventType::ConscienceResult,
+                    timestamp: "2026-04-30T00:00:30+00:00".parse().unwrap(),
+                    data,
+                    agent_id_hash: None,
+                }],
+                deployment_profile: profile,
+                signature: String::new(),
+                signature_key_id: "k".into(),
+            }
+        }
+        let no_profile = build(None);
+        let with_profile = build(Some(DeploymentProfile {
+            agent_role: "smuggled".into(),
+            agent_template: "smuggled".into(),
+            deployment_domain: "smuggled".into(),
+            deployment_type: "smuggled".into(),
+            deployment_region: Some("attacker".into()),
+            deployment_trust_mode: "smuggled".into(),
+        }));
+        let bytes_a = PythonJsonDumpsCanonicalizer
+            .canonicalize_value(&canonical_payload_value(&no_profile))
+            .unwrap();
+        let bytes_b = PythonJsonDumpsCanonicalizer
+            .canonicalize_value(&canonical_payload_value(&with_profile))
+            .unwrap();
+        assert_eq!(
+            bytes_a, bytes_b,
+            "2.7.0 canonical MUST NOT include deployment_profile, even when wire injects it"
+        );
     }
 
     /// Wrong key in the directory → signature mismatch.

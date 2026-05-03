@@ -5,6 +5,170 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.3.4] — 2026-05-03
+
+**Deployment-profile block at trace_schema_version 2.7.9 — cohort
+identity on the wire.** Closes
+[CIRISPersist#13](https://github.com/CIRISAI/CIRISPersist/issues/13).
+Companion to CIRISAgent's
+[`431b0e0ae`](https://github.com/CIRISAI/CIRISAgent/commit/431b0e0ae)
+([CIRISAgent#718](https://github.com/CIRISAI/CIRISAgent/issues/718))
+which added the 6-field block to every `CompleteTrace` envelope at
+2.7.9.
+
+### What ships
+
+**`DeploymentProfile` struct on `CompleteTrace`** (`src/schema/trace.rs`):
+
+```rust
+pub struct DeploymentProfile {
+    pub agent_role: String,            // "ally", "scout", "echo-core", ...
+    pub agent_template: String,        // "ally-v3-default", ...
+    pub deployment_domain: String,     // "general", "healthcare", "legal", ...
+    pub deployment_type: String,       // "production", "staging", "development", ...
+    pub deployment_region: Option<String>,  // "US", "GB", "global", null
+    pub deployment_trust_mode: String, // "sovereign", "limited_trust", "federated_peer"
+}
+
+pub struct CompleteTrace {
+    // ...existing fields...
+    pub deployment_profile: Option<DeploymentProfile>,  // NEW
+    // ...
+}
+```
+
+`Option<>` so 2.7.0 traces continue to deserialize cleanly. The
+2.7.9-strict requirement fires at parse, not in serde — see below.
+
+Persist accepts the agent's declared values verbatim — closed-enum
+constraints live in the agent-side spec; persist's role is
+ingest + verify, not enum-value gatekeeping. New enum values land
+via spec PR without persist version bumps.
+
+### Strict-parse + cross-shape gates
+
+**At 2.7.9** (in `BatchEnvelope::from_json`): `deployment_profile` is
+REQUIRED on the wire per FSD §3.2; absence surfaces as
+`Error::MissingField("deployment_profile")`. The "required at 2.7.9"
+contract now enforces *semantic* requirement, not just *presence*
+(same gate-style as v0.3.3's parent_event_type fix).
+
+**At 2.7.0** (cross-shape rule): a 2.7.0 envelope carrying a
+`deployment_profile` field parses cleanly — but the field does NOT
+enter the 2.7.0 canonical bytes. Mirrors the per-component
+`agent_id_hash` cross-shape rule. Two traces (with vs. without the
+block) at 2.7.0 produce byte-identical canonical bytes; tested by
+`v270_ignores_deployment_profile_injection`.
+
+### Updated 2.7.9 canonical signed bytes
+
+10-key outer canonical (was 9 pre-v0.3.4). `deployment_profile`
+sorts between `components` and `started_at` alphabetically (`c` <
+`d` < `s`). Inside the block, the 6 fields sort
+alphabetically too (Python `json.dumps(sort_keys=True)`):
+
+```text
+{
+  "agent_id_hash": ...,
+  "completed_at": ...,
+  "components": [...],
+  "deployment_profile": {
+    "agent_role": ...,
+    "agent_template": ...,
+    "deployment_domain": ...,
+    "deployment_region": ...,
+    "deployment_trust_mode": ...,
+    "deployment_type": ...
+  },
+  "started_at": ...,
+  "task_id": ...,
+  "thought_id": ...,
+  "trace_id": ...,
+  "trace_level": ...,
+  "trace_schema_version": "2.7.9"
+}
+```
+
+Byte-identical to the agent-side fixture at
+`tests/adapters/accord_metrics/test_trace_signature_canonical.py::test_deployment_profile_canonical_byte_for_byte_pinning`.
+
+### Denormalization onto trace_events (Option B)
+
+V006 migration (postgres + sqlite) adds 6 columns to
+`cirislens.trace_events`:
+
+```sql
+ALTER TABLE cirislens.trace_events
+    ADD COLUMN agent_role            TEXT,
+    ADD COLUMN agent_template        TEXT,
+    ADD COLUMN deployment_domain     TEXT,
+    ADD COLUMN deployment_type       TEXT,
+    ADD COLUMN deployment_region     TEXT,
+    ADD COLUMN deployment_trust_mode TEXT;
+```
+
+Plus 4 partial indexes on the high-cardinality cohort axes
+(`deployment_domain`, `deployment_type`, `agent_role`,
+`deployment_trust_mode`) — each `WHERE <col> IS NOT NULL` so the
+indexes only carry post-2.7.9 traffic, keeping size proportional to
+the corpus that actually has the labels.
+
+`decompose.rs` copies the 6 fields onto every event row of the
+trace, same shape as `agent_name` / `agent_id_hash` /
+`cognitive_state` already do. Lens analytical paths (Coherence
+Ratchet, capacity scoring, manifold-conformity) group/filter
+without JSONB extracts.
+
+Architectural note: this is denormalization tech-debt — the same
+labels live both in `trace_events.payload` JSONB and in 6 dedicated
+columns. The alternative (lens-side `trace_context` table fed by a
+separate write path) re-introduces the architectural problem
+CIRISPersist#10 closed: one substrate, N consumers; reimplementation
+drift is the failure mode. Persist owns the denormalization.
+
+### Tests
+
+166 lib (162 + 4 new) + 22 integration tests pass; clippy clean;
+cargo-deny clean. New regression tests:
+
+- 2.7.9 missing `deployment_profile` → `MissingField` rejection
+- 2.7.9 with the block parses cleanly (including
+  `deployment_region: null` as valid declaration)
+- 2.7.0 with the block parses cleanly (cross-shape ignore)
+- 2.7.9 canonical bytes carry `deployment_profile` in expected
+  sorted position
+- 2.7.0 canonical bytes byte-identical with vs. without injected
+  block (cross-shape rule enforced)
+- 2.7.9 trace decomposes to event rows carrying all 6 columns
+- 2.7.0 trace decomposes to All-NULL across the 6 columns
+
+### Bridge action
+
+Bump `ciris-persist==0.3.3 → 0.3.4` in `api/requirements.txt` and
+deploy alongside agent `431b0e0ae`. Both must be live for the
+end-to-end linkage to work — agent emits the block, persist verifies
+the 2.7.9 canonical including the block, denormalized columns
+populate every event row.
+
+Validation query post-deploy:
+
+```sql
+SELECT deployment_domain, deployment_type, deployment_trust_mode,
+       COUNT(*)
+FROM cirislens.trace_events
+WHERE schema_version = '2.7.9'
+  AND ts > '<deploy-time>'
+GROUP BY 1, 2, 3
+ORDER BY 4 DESC;
+```
+
+Pre-fix the columns would all be NULL. Post-fix the breakdown
+matches the 2.7.9 fleet's deployment_profile distribution.
+
+### Deps
+
+No version changes (`ciris-keyring` / `ciris-verify-core` v1.9.0).
+
 ## [0.3.3] — 2026-05-03
 
 **LLM_CALL parent linkage — wire-format compliance at 2.7.9.**

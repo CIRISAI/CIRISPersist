@@ -482,6 +482,7 @@ mod tests {
                     agent_id_hash: None,
                 },
             ],
+            deployment_profile: None,
             signature: String::new(),
             signature_key_id: key_id.into(),
         };
@@ -766,6 +767,7 @@ mod tests {
             trace_level: crate::schema::TraceLevel::Generic,
             trace_schema_version: SchemaVersion::parse("2.7.0").unwrap(),
             components: vec![],
+            deployment_profile: None,
             signature: "AAAA".into(),
             signature_key_id: "k".into(),
         };

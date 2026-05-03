@@ -31,7 +31,7 @@ pub use envelope::{BatchEnvelope, BatchEvent, CorrelationMetadata, TraceLevel};
 pub use events::{
     AuditAnchor, ComponentType, CostSummary, LlmCallStatus, LlmCallSummary, ReasoningEventType,
 };
-pub use trace::{CompleteTrace, TraceComponent};
+pub use trace::{CompleteTrace, DeploymentProfile, TraceComponent};
 pub use version::{SchemaVersion, SUPPORTED_VERSIONS};
 pub use wire_datetime::WireDateTime;
 

@@ -159,6 +159,18 @@ impl BatchEnvelope {
                     for component in &trace.components {
                         super::check_data_depth(&component.data)?;
                     }
+                    // v0.3.4 (CIRISPersist#13) — schema-version-aware
+                    // validation. At 2.7.9, deployment_profile is
+                    // REQUIRED on the wire per FSD §3.2; absence
+                    // surfaces as a typed MissingField rather than
+                    // sneaking through as None. 2.7.0 envelopes
+                    // silently ignore the block per the cross-shape
+                    // rule (mirrors per-component agent_id_hash).
+                    if trace.trace_schema_version.as_str() == "2.7.9"
+                        && trace.deployment_profile.is_none()
+                    {
+                        return Err(super::Error::MissingField("deployment_profile"));
+                    }
                 }
             }
         }
@@ -346,6 +358,139 @@ mod tests {
           "trace_schema_version": "2.7.0"
         });
         BatchEnvelope::from_json(body.to_string().as_bytes()).expect("shallow blob parses");
+    }
+
+    /// v0.3.4 (CIRISPersist#13) — At trace_schema_version 2.7.9, the
+    /// `deployment_profile` block is REQUIRED on the wire per
+    /// FSD §3.2. Absence is a typed `MissingField`, not silent
+    /// acceptance.
+    #[test]
+    fn reject_2_7_9_trace_missing_deployment_profile() {
+        let body = serde_json::json!({
+          "events": [{
+            "event_type": "complete_trace",
+            "trace_level": "generic",
+            "trace": {
+              "trace_id": "trace-279",
+              "thought_id": "th-279",
+              "agent_id_hash": "deadbeef",
+              "started_at": "2026-04-30T00:00:00Z",
+              "completed_at": "2026-04-30T00:01:00Z",
+              "trace_level": "generic",
+              "trace_schema_version": "2.7.9",
+              "components": [],
+              "signature": "AAAA",
+              "signature_key_id": "k"
+            }
+          }],
+          "batch_timestamp": "2026-04-30T00:00:00Z",
+          "consent_timestamp": "2025-01-01T00:00:00Z",
+          "trace_level": "generic",
+          "trace_schema_version": "2.7.9"
+        });
+        let err = BatchEnvelope::from_json(body.to_string().as_bytes())
+            .expect_err("2.7.9 without deployment_profile must reject");
+        assert!(
+            matches!(err, super::super::Error::MissingField("deployment_profile")),
+            "got: {err:?}"
+        );
+    }
+
+    /// v0.3.4 (CIRISPersist#13) — A 2.7.9 trace with the
+    /// deployment_profile block (all 6 fields populated) parses
+    /// cleanly. `deployment_region` MAY be `null` — that's a valid
+    /// declaration of "not disclosed", distinct from absence.
+    #[test]
+    fn accept_2_7_9_trace_with_deployment_profile() {
+        let body = serde_json::json!({
+          "events": [{
+            "event_type": "complete_trace",
+            "trace_level": "generic",
+            "trace": {
+              "trace_id": "trace-279-ok",
+              "thought_id": "th-279",
+              "agent_id_hash": "deadbeef",
+              "started_at": "2026-04-30T00:00:00Z",
+              "completed_at": "2026-04-30T00:01:00Z",
+              "trace_level": "generic",
+              "trace_schema_version": "2.7.9",
+              "components": [],
+              "deployment_profile": {
+                "agent_role": "ally",
+                "agent_template": "ally-v3-default",
+                "deployment_domain": "general",
+                "deployment_type": "production",
+                "deployment_region": null,
+                "deployment_trust_mode": "federated_peer"
+              },
+              "signature": "AAAA",
+              "signature_key_id": "k"
+            }
+          }],
+          "batch_timestamp": "2026-04-30T00:00:00Z",
+          "consent_timestamp": "2025-01-01T00:00:00Z",
+          "trace_level": "generic",
+          "trace_schema_version": "2.7.9"
+        });
+        let env = BatchEnvelope::from_json(body.to_string().as_bytes())
+            .expect("2.7.9 with deployment_profile parses");
+        match &env.events[0] {
+            BatchEvent::CompleteTrace { trace, .. } => {
+                let prof = trace.deployment_profile.as_ref().expect("profile present");
+                assert_eq!(prof.agent_role, "ally");
+                assert_eq!(prof.deployment_domain, "general");
+                assert!(prof.deployment_region.is_none());
+                assert_eq!(prof.deployment_trust_mode, "federated_peer");
+            }
+        }
+    }
+
+    /// v0.3.4 (CIRISPersist#13) — Cross-shape rule: a 2.7.0 envelope
+    /// that carries a deployment_profile field is malformed-but-safe.
+    /// Persist parses it (the field rides in the JSON shape) but
+    /// MUST NOT enter it into the 2.7.0 canonical reconstruction.
+    /// Same closure pattern as per-component agent_id_hash at 2.7.0.
+    /// Concretely: a 2.7.0 trace with the block parses cleanly (no
+    /// MissingField rejection — that gate fires only at 2.7.9).
+    #[test]
+    fn accept_2_7_0_trace_with_deployment_profile_block_ignored() {
+        let body = serde_json::json!({
+          "events": [{
+            "event_type": "complete_trace",
+            "trace_level": "generic",
+            "trace": {
+              "trace_id": "trace-270",
+              "thought_id": "th-270",
+              "agent_id_hash": "deadbeef",
+              "started_at": "2026-04-30T00:00:00Z",
+              "completed_at": "2026-04-30T00:01:00Z",
+              "trace_level": "generic",
+              "trace_schema_version": "2.7.0",
+              "components": [],
+              "deployment_profile": {
+                "agent_role": "scout",
+                "agent_template": "scout-v1",
+                "deployment_domain": "research_scientific",
+                "deployment_type": "research",
+                "deployment_region": "US",
+                "deployment_trust_mode": "limited_trust"
+              },
+              "signature": "AAAA",
+              "signature_key_id": "k"
+            }
+          }],
+          "batch_timestamp": "2026-04-30T00:00:00Z",
+          "consent_timestamp": "2025-01-01T00:00:00Z",
+          "trace_level": "generic",
+          "trace_schema_version": "2.7.0"
+        });
+        // 2.7.0 with the block parses cleanly — the 2.7.9 strict
+        // gate does not fire at 2.7.0. The block IS deserialized
+        // onto CompleteTrace.deployment_profile, but
+        // canonical_payload_value (the 2.7.0 path) ignores it; that
+        // half is tested in src/verify/ed25519.rs.
+        BatchEnvelope::from_json(body.to_string().as_bytes())
+            .expect("2.7.0 with deployment_profile parses cleanly");
     }
 
     #[test]

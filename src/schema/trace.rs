@@ -189,6 +189,44 @@ impl TraceComponent {
     }
 }
 
+/// v0.3.4 (CIRISPersist#13) — Deployment-profile block on the
+/// `CompleteTrace` envelope. Required at `trace_schema_version 2.7.9`
+/// per CIRISAgent FSD/TRACE_WIRE_FORMAT.md @ v2.7.9-stable §3.2,
+/// included in the signed canonical bytes (§8) so values are
+/// non-forgeable post-emission.
+///
+/// All 6 fields are required-on-the-wire at 2.7.9. `deployment_region`
+/// MAY have value `null` (a valid declaration of "not disclosed",
+/// distinct from absence-of-field which is malformed).
+///
+/// Persist accepts the agent's declared values verbatim — the closed-
+/// enum constraints (`deployment_domain`, `deployment_type`,
+/// `deployment_trust_mode`) live in the agent-side spec; persist's
+/// role is ingest + verify, not enum-value gatekeeping. New enum
+/// values land via spec PR without persist version bumps.
+///
+/// Cross-shape rule: 2.7.0 envelopes carrying a `deployment_profile`
+/// field are silently ignored (the field doesn't enter the 2.7.0
+/// canonical reconstruction). Same closure pattern as the per-component
+/// `agent_id_hash` at 2.7.0.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeploymentProfile {
+    /// Agent persona role (e.g. `ally`, `scout`, `echo-core`).
+    pub agent_role: String,
+    /// Agent code template ID (e.g. `ally-v3-default`).
+    pub agent_template: String,
+    /// What the agent is deployed for. Closed enum per spec §3.2.
+    pub deployment_domain: String,
+    /// Lifecycle stage (`development` / `test` / `staging` /
+    /// `production` / `research` / `decommissioned`).
+    pub deployment_type: String,
+    /// ISO-3166-1 alpha-2, `global`, or `null` (not disclosed).
+    pub deployment_region: Option<String>,
+    /// Federation participation intent (`sovereign` / `limited_trust` /
+    /// `federated_peer`).
+    pub deployment_trust_mode: String,
+}
+
 /// `CompleteTrace` envelope (TRACE_WIRE_FORMAT.md §3).
 ///
 /// Mission alignment (MISSION.md §2 — `verify/`): the signature is
@@ -225,6 +263,16 @@ pub struct CompleteTrace {
 
     /// Sequence of components making up the trace.
     pub components: Vec<TraceComponent>,
+
+    /// v0.3.4 (CIRISPersist#13) — Deployment-profile block. Required
+    /// at `trace_schema_version 2.7.9` (validated post-parse via
+    /// `BatchEnvelope::from_json`); ignored at 2.7.0 per the
+    /// cross-shape rule. Optional in the struct because the field is
+    /// absent from 2.7.0 envelopes. Included in the 2.7.9 signed
+    /// canonical bytes (§8) between `completed_at` and `started_at`
+    /// alphabetically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_profile: Option<DeploymentProfile>,
 
     /// Base64-encoded Ed25519 signature over the canonical bytes
     /// (TRACE_WIRE_FORMAT.md §8).

@@ -87,6 +87,36 @@ pub struct TraceEventRow {
     /// True after the scrubber pass ran.
     pub pii_scrubbed: bool,
 
+    // ─── v0.3.4 deployment_profile denormalization (CIRISPersist#13).
+    // Per-trace constants copied onto every event row of the trace,
+    // same shape as `agent_name` / `agent_id_hash` / `cognitive_state`
+    // already do. Lens-side analytical paths group/filter on these
+    // for cohort routing without needing JSONB extracts.
+    //
+    // Populated when `CompleteTrace.deployment_profile` is `Some` —
+    // i.e., 2.7.9 traces (where the block is required-on-wire) and
+    // any future 2.7.0 trace that opts in (the cross-shape rule
+    // ignores the block from the *canonical*, not from the column
+    // copy — copying it lets lens query 2.7.0+block traffic uniformly
+    // even though canonical bytes don't include it). All `None` for
+    // 2.7.0 traces with no block.
+    /// Agent persona role declared by the trace's deployment_profile.
+    pub agent_role: Option<String>,
+    /// Agent code template ID declared by the trace's deployment_profile.
+    pub agent_template: Option<String>,
+    /// Deployment domain (`healthcare` / `legal` / ...) declared by
+    /// the trace's deployment_profile.
+    pub deployment_domain: Option<String>,
+    /// Deployment lifecycle stage (`production` / `staging` / ...)
+    /// declared by the trace's deployment_profile.
+    pub deployment_type: Option<String>,
+    /// ISO-3166-1 alpha-2, `global`, or null (not disclosed) declared
+    /// by the trace's deployment_profile.
+    pub deployment_region: Option<String>,
+    /// Federation participation intent (`sovereign` / `limited_trust` /
+    /// `federated_peer`) declared by the trace's deployment_profile.
+    pub deployment_trust_mode: Option<String>,
+
     // ─── v0.1.3 scrub envelope columns (FSD §3.7; THREAT_MODEL.md
     // AV-24/25). Always populated on rows produced by the v0.1.3+
     // pipeline; pre-v0.1.3 rows have these as None.

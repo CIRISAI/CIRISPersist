@@ -68,6 +68,7 @@ pub fn build_signed_batch(
         trace_level: TraceLevel::Generic,
         trace_schema_version: SchemaVersion::parse("2.7.0").unwrap(),
         components,
+        deployment_profile: None,
         signature: String::new(),
         signature_key_id: key_id.into(),
     };

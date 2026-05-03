@@ -520,6 +520,14 @@ mod tests {
             scrub_signature: None,
             scrub_key_id: None,
             scrub_timestamp: None,
+            // v0.3.4 deployment_profile columns. Test fixture stays
+            // 2.7.0-shape (no profile) — None across the board.
+            agent_role: None,
+            agent_template: None,
+            deployment_domain: None,
+            deployment_type: None,
+            deployment_region: None,
+            deployment_trust_mode: None,
         }
     }
 
@@ -675,6 +683,7 @@ mod tests {
                     agent_id_hash: None,
                 },
             ],
+            deployment_profile: None,
             signature: "AAAA".into(),
             signature_key_id: "ciris-agent-key:dead".into(),
         };
