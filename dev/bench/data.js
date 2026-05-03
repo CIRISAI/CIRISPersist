@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777819558606,
+  "lastUpdate": 1777820828901,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -5297,6 +5297,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 22196109,
             "range": "± 287708",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "3d5ce52206a59e221334efbdb05bb4ab230ea348",
+          "message": "scripts: bench_trend.py — pull/summarize/plot gh-pages bench history\n\nPulls https://cirisai.github.io/CIRISPersist/dev/bench/data.js (the\nfile github-action-benchmark publishes from the Bench workflow),\ncomputes per-bench summary stats, optionally renders a per-bench\ntime-series plot or markdown report.\n\nStats include:\n- first vs last value, % change\n- min/max + noise% (max-min spread relative to median) — when noise\n  exceeds 2× the delta, flag as *noisy because the change is\n  indistinguishable from runner jitter on shared GH Actions hardware\n- alert flag matching the bench workflow's 110% threshold\n\nUsage:\n  python3 scripts/bench_trend.py                # text table\n  python3 scripts/bench_trend.py --plot out.png # PNG plot\n  python3 scripts/bench_trend.py --md report.md # MD report\n  python3 scripts/bench_trend.py --since 2026-05-02\n  python3 scripts/bench_trend.py --json         # machine-readable\n\nStandard-library only (matplotlib for --plot only).\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-03T10:00:38-05:00",
+          "tree_id": "e2601729520ce788113506599d8988775366c0db",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/3d5ce52206a59e221334efbdb05bb4ab230ea348"
+        },
+        "date": 1777820827983,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 103644,
+            "range": "± 252",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 245156,
+            "range": "± 1239",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 526042,
+            "range": "± 2052",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1846948,
+            "range": "± 26292",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 378,
+            "range": "± 26",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1631,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 9533,
+            "range": "± 215",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 344,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3004,
+            "range": "± 16",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9257,
+            "range": "± 72",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 40596,
+            "range": "± 89",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 631,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2167217,
+            "range": "± 174251",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6249238,
+            "range": "± 297216",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 22197790,
+            "range": "± 724582",
             "unit": "ns/iter"
           }
         ]
