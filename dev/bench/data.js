@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777774423406,
+  "lastUpdate": 1777819558606,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -5183,6 +5183,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 21969019,
             "range": "± 401247",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "84e529b80e9869696234dc2938759af0797349da",
+          "message": "0.3.3 — LLM_CALL parent linkage at 2.7.9 (CIRISPersist#12)\n\nCloses CIRISPersist#12. Paired with CIRISAgent's e714ff3c4 fix that\nwires parent_event_type + parent_attempt_index into the agent's\nLLM_CALL emission. Together they close the regression CIRISLens#5\nsurfaced: 100% of trace_llm_calls rows in the first 2.7.9 corpus\nexport carried parent_event_type='LLM_CALL' instead of the spec-\nmandated upstream-step taxonomy.\n\nTwo interlocking gaps in v0.3.0–v0.3.2:\n\n1. LlmCallSummary schema didn't model parent_event_type /\n   parent_attempt_index. Agent fix at e714ff3c4 wires the fields,\n   but persist's serde would have dropped them on parse.\n2. decompose.rs substituted component.event_type (always LlmCall for\n   an LLM_CALL component) into parent_event_type. v0.3.0's \"required\n   at 2.7.9\" deploy validation reported without_parent=0 because\n   every row had the field set — to LLM_CALL. Presence, not validity.\n\nv0.3.3:\n\n- LlmCallSummary adds parent_event_type: Option<ReasoningEventType>\n  and parent_attempt_index: Option<u32>. Option<> so 2.7.0 traces\n  continue to deserialize cleanly.\n- decompose.rs build_llm_call_row schema-version-aware sourcing:\n  - 2.7.9: BOTH fields REQUIRED. Missing → Error::Schema(\n    MissingField(\"data.parent_event_type\")) or\n    MissingField(\"data.parent_attempt_index\"). The \"required at\n    2.7.9\" claim now enforces semantic correctness.\n  - 2.7.0 and other: prefer wire value when present; fall back to\n    historical component.event_type / attempt_index substitution.\n    Existing 2.7.0 traffic continues to land. Pre-fix\n    parent_event_type='LLM_CALL' rows unrecoverable from persist\n    alone; RATCHET uses handler_name as workaround per\n    CIRISLens#5.\n\nTests:\n- 2.7.9 with both fields → wire values land on row\n- 2.7.9 missing parent_event_type → MissingField rejection\n- 2.7.9 missing parent_attempt_index → MissingField rejection\n- 2.7.0 with no parent fields → historical substitution preserved\n\n159 lib + 22 integration tests pass; clippy clean; cargo-deny clean.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-03T09:38:23-05:00",
+          "tree_id": "49e9fdd6f6803467d8ba3de881eb9d97c6f3fd9a",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/84e529b80e9869696234dc2938759af0797349da"
+        },
+        "date": 1777819557612,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 95261,
+            "range": "± 702",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 237760,
+            "range": "± 1106",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 519759,
+            "range": "± 1709",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 2014374,
+            "range": "± 45439",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 330,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1269,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7718,
+            "range": "± 22",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 299,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3266,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9534,
+            "range": "± 16",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 44225,
+            "range": "± 411",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 541,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2143806,
+            "range": "± 56460",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6261892,
+            "range": "± 137671",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 22196109,
+            "range": "± 287708",
             "unit": "ns/iter"
           }
         ]
