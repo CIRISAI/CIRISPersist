@@ -5,6 +5,85 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.3.3] — 2026-05-03
+
+**LLM_CALL parent linkage — wire-format compliance at 2.7.9.**
+Closes [CIRISPersist#12](https://github.com/CIRISAI/CIRISPersist/issues/12).
+Paired with CIRISAgent's e714ff3c4 fix that wires
+`parent_event_type` + `parent_attempt_index` into the agent's LLM_CALL
+emission. Together they close the regression that
+[CIRISLens#5](https://github.com/CIRISAI/CIRISLens/issues/5) surfaced:
+100% of `trace_llm_calls` rows in the first 2.7.9 corpus export carried
+`parent_event_type='LLM_CALL'` instead of the spec-mandated upstream-
+step taxonomy.
+
+### Root cause (v0.3.0 → v0.3.2)
+
+Two interlocking gaps:
+
+1. **`LlmCallSummary` schema** didn't model `parent_event_type` /
+   `parent_attempt_index`. Even after the agent fix landed at
+   e714ff3c4, persist's serde would have dropped both fields on
+   parse — they'd never have reached the column.
+2. **`decompose.rs` substituted** `component.event_type` (always
+   `LlmCall` for an LLM_CALL component) into `parent_event_type`. The
+   v0.3.0 "required at 2.7.9" deploy validation reported
+   `without_parent = 0` because every row had the field set — to
+   `LLM_CALL`. The check was for *presence*, not *validity*.
+
+### What ships
+
+**`LlmCallSummary` adds two fields**:
+
+```rust
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub parent_event_type: Option<ReasoningEventType>,
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub parent_attempt_index: Option<u32>,
+```
+
+`Option<>` so 2.7.0 traces continue to deserialize cleanly. The
+2.7.9-strict requirement fires at decompose, not parse — see below.
+
+**`decompose.rs` schema-version-aware sourcing** in
+`build_llm_call_row`:
+
+- **`trace_schema_version == "2.7.9"`**: BOTH fields REQUIRED. Missing
+  → `Error::Schema(MissingField("data.parent_event_type"))` or
+  `MissingField("data.parent_attempt_index")`. The v0.3.0 "required at
+  2.7.9" claim now actually enforces semantic correctness.
+- **`"2.7.0"` and other**: prefer wire-provided value when present
+  (forward-compat); fall back to the historical
+  `component.event_type` / `attempt_index` substitution otherwise.
+  Existing 2.7.0 traffic continues to land. Pre-fix
+  `trace_llm_calls.parent_event_type='LLM_CALL'` rows are
+  unrecoverable from persist alone — RATCHET uses `handler_name` as
+  the upstream-step linkage workaround per CIRISLens#5.
+
+### Tests
+
+159 lib (155 + 4 new) + 22 integration tests pass; clippy clean
+across all features; cargo-deny clean. New tests cover:
+
+- 2.7.9 trace with both fields → wire values land on row (not
+  substitution)
+- 2.7.9 missing `parent_event_type` → MissingField rejection
+- 2.7.9 missing `parent_attempt_index` → MissingField rejection
+- 2.7.0 trace with no parent fields → historical substitution preserved
+
+### Cross-repo
+
+- **CIRISAgent**: agent#715 fixed at e714ff3c4. Deploying agent +
+  persist v0.3.3 together closes the linkage end-to-end.
+- **CIRISLens**: lens#5 closes when v0.3.3 is on PyPI and bridge
+  redeploys. Lens analytical paths can drop the `handler_name`
+  workaround once enough 2.7.9 traffic with correctly-populated
+  `parent_event_type` accumulates.
+
+### Deps
+
+No version changes (`ciris-keyring` / `ciris-verify-core` v1.9.0).
+
 ## [0.3.2] — 2026-05-02
 
 **Cold-path PQC sweep + read-only role for analytical consumers.**

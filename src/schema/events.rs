@@ -237,6 +237,27 @@ pub struct LlmCallSummary {
     /// Monotonic per `(thought_id, event_type)` — TRACE_WIRE_FORMAT.md §6.
     pub attempt_index: u32,
 
+    /// v0.3.3 (CIRISPersist#12) — Parent event type (the upstream
+    /// trace step that issued this LLM call). REQUIRED at
+    /// `trace_schema_version >= 2.7.9` per
+    /// `CIRISAgent/FSD/TRACE_WIRE_FORMAT.md @ v2.7.9-stable §5.10`;
+    /// `None` for legacy 2.7.0 traces (no transition window — the
+    /// agent emits both fields starting at 2.7.9).
+    ///
+    /// Stored on `trace_llm_calls.parent_event_type`. v0.3.0–v0.3.2
+    /// silently substituted the outer component's `event_type`
+    /// (always `LLM_CALL`) into the column when the wire didn't
+    /// carry the field; v0.3.3 reads the wire-provided value at
+    /// 2.7.9 and rejects the trace when it's missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_event_type: Option<ReasoningEventType>,
+
+    /// v0.3.3 (CIRISPersist#12) — Parent event's `attempt_index`.
+    /// REQUIRED at `trace_schema_version >= 2.7.9`. See
+    /// `parent_event_type` for the semantics + spec citation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_attempt_index: Option<u32>,
+
     /// DETAILED+: SHA-256 hex of the prompt (for dedup analysis).
     pub prompt_hash: Option<String>,
     /// FULL only: full prompt verbatim.

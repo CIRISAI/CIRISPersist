@@ -106,7 +106,7 @@ pub fn decompose(trace: &CompleteTrace) -> Result<Decomposed, Error> {
         // LLM_CALL → sibling row.
         if component.event_type == ReasoningEventType::LlmCall {
             if let Some(call) = component.llm_call().map_err(Error::Schema)? {
-                let row = build_llm_call_row(trace, component, &call, attempt_index);
+                let row = build_llm_call_row(trace, component, &call, attempt_index)?;
                 llm_calls.push(row);
             }
         }
@@ -120,14 +120,52 @@ fn build_llm_call_row(
     component: &TraceComponent,
     call: &crate::schema::LlmCallSummary,
     attempt_index: u32,
-) -> TraceLlmCallRow {
-    TraceLlmCallRow {
+) -> Result<TraceLlmCallRow, Error> {
+    // v0.3.3 (CIRISPersist#12) — parent_event_type / parent_attempt_index
+    // sourcing rule. Per CIRISAgent/FSD/TRACE_WIRE_FORMAT.md @
+    // v2.7.9-stable §5.10:
+    //   - 2.7.9+: BOTH fields REQUIRED on the wire. Reject the trace
+    //     if either is missing — the v0.3.0 "required at 2.7.9" claim
+    //     should have enforced this. v0.3.0–v0.3.2 silently substituted
+    //     `component.event_type` (always `LLM_CALL`) into the column,
+    //     defeating the AV-9 dedup tuple's parent-path identity and
+    //     RATCHET H3's parent-topology clustering. Substantive code
+    //     drift caught by lens's first 2.7.9 corpus export.
+    //   - 2.7.0 (legacy): the spec didn't carry these fields. Use the
+    //     wire value if present (forward-compat with mixed-version
+    //     fleets); fall back to the historical substitution otherwise.
+    //     Pre-fix `trace_llm_calls.parent_event_type='LLM_CALL'` rows
+    //     are unrecoverable from persist alone — RATCHET uses
+    //     `handler_name` as the upstream-step linkage workaround
+    //     (CIRISLens#5).
+    let (parent_event_type, parent_attempt_index_resolved) =
+        match trace.trace_schema_version.as_str() {
+            "2.7.9" => {
+                let pet = call.parent_event_type.ok_or(Error::Schema(
+                    crate::schema::Error::MissingField("data.parent_event_type"),
+                ))?;
+                let pai = call.parent_attempt_index.ok_or(Error::Schema(
+                    crate::schema::Error::MissingField("data.parent_attempt_index"),
+                ))?;
+                (pet, pai)
+            }
+            // 2.7.0 + future versions not yet wired: prefer wire field,
+            // fall back to historical substitution. The substitution is
+            // semantically wrong (it writes `LLM_CALL` for an LLM_CALL
+            // component) but matches v0.3.0–v0.3.2 behavior so
+            // existing 2.7.0 traffic continues to land.
+            _ => (
+                call.parent_event_type.unwrap_or(component.event_type),
+                call.parent_attempt_index.unwrap_or(attempt_index),
+            ),
+        };
+    Ok(TraceLlmCallRow {
         trace_id: trace.trace_id.clone(),
         thought_id: trace.thought_id.clone(),
         task_id: trace.task_id.clone(),
         parent_event_id: None,
-        parent_event_type: component.event_type,
-        parent_attempt_index: attempt_index,
+        parent_event_type,
+        parent_attempt_index: parent_attempt_index_resolved,
         attempt_index: call.attempt_index,
         // Spec §5.10 puts timestamp inside data; release/2.7.8 emits
         // it at the component level only. Fall back to the component
@@ -153,7 +191,7 @@ fn build_llm_call_row(
         prompt_hash: call.prompt_hash.clone(),
         prompt: call.prompt.clone(),
         response_text: call.response_text.clone(),
-    }
+    })
 }
 
 /// Pluck a string field from the first component whose `data`
@@ -405,5 +443,88 @@ mod tests {
             Error::Schema(crate::schema::Error::MissingField("attempt_index")) => {}
             other => panic!("expected MissingField(attempt_index), got {other:?}"),
         }
+    }
+
+    /// v0.3.3 (CIRISPersist#12) — at trace_schema_version 2.7.9, the
+    /// LLM_CALL component data MUST carry parent_event_type +
+    /// parent_attempt_index (CIRISAgent FSD/TRACE_WIRE_FORMAT.md
+    /// @v2.7.9-stable §5.10). When present, decompose lands them on
+    /// the typed row directly — no longer substituting outer
+    /// component.event_type (which was the v0.3.0–v0.3.2 bug).
+    #[test]
+    fn llm_call_2_7_9_uses_wire_parent_fields() {
+        let mut trace = fixture_trace();
+        trace.trace_schema_version = SchemaVersion::parse("2.7.9").unwrap();
+        // Inject the 2.7.9-required fields into the LLM_CALL data.
+        let llm_data = &mut trace.components[1].data;
+        llm_data.insert(
+            "parent_event_type".to_owned(),
+            serde_json::json!("ASPDMA_RESULT"),
+        );
+        llm_data.insert("parent_attempt_index".to_owned(), serde_json::json!(2));
+
+        let d = decompose(&trace).unwrap();
+        assert_eq!(d.llm_calls.len(), 1);
+        let call = &d.llm_calls[0];
+        // Wire-provided values land on the row — NOT the outer
+        // component.event_type (`LLM_CALL`) substitution.
+        assert_eq!(call.parent_event_type, ReasoningEventType::AspdmaResult);
+        assert_eq!(call.parent_attempt_index, 2);
+    }
+
+    /// v0.3.3 (CIRISPersist#12) — 2.7.9 LLM_CALL missing
+    /// parent_event_type rejects with MissingField at decompose. v0.3.0
+    /// silently substituted; v0.3.3 enforces the spec.
+    #[test]
+    fn llm_call_2_7_9_missing_parent_event_type_rejects() {
+        let mut trace = fixture_trace();
+        trace.trace_schema_version = SchemaVersion::parse("2.7.9").unwrap();
+        // Provide parent_attempt_index but NOT parent_event_type.
+        trace.components[1]
+            .data
+            .insert("parent_attempt_index".to_owned(), serde_json::json!(0));
+        let err = decompose(&trace).unwrap_err();
+        match err {
+            Error::Schema(crate::schema::Error::MissingField("data.parent_event_type")) => {}
+            other => panic!("expected MissingField(data.parent_event_type), got {other:?}"),
+        }
+    }
+
+    /// v0.3.3 (CIRISPersist#12) — 2.7.9 LLM_CALL missing
+    /// parent_attempt_index rejects with MissingField at decompose.
+    #[test]
+    fn llm_call_2_7_9_missing_parent_attempt_index_rejects() {
+        let mut trace = fixture_trace();
+        trace.trace_schema_version = SchemaVersion::parse("2.7.9").unwrap();
+        // Provide parent_event_type but NOT parent_attempt_index.
+        trace.components[1].data.insert(
+            "parent_event_type".to_owned(),
+            serde_json::json!("CONSCIENCE_RESULT"),
+        );
+        let err = decompose(&trace).unwrap_err();
+        match err {
+            Error::Schema(crate::schema::Error::MissingField("data.parent_attempt_index")) => {}
+            other => panic!("expected MissingField(data.parent_attempt_index), got {other:?}"),
+        }
+    }
+
+    /// v0.3.3 (CIRISPersist#12) — 2.7.0 traces (no spec for parent
+    /// fields on the wire) keep the historical substitution path so
+    /// existing 2.7.0 traffic continues to land. The substitution is
+    /// semantically wrong (writes `LLM_CALL` for an LLM_CALL component)
+    /// but the AV-9 dedup tuple's collision-free property is unchanged
+    /// at 2.7.0; consumers reading 2.7.0 rows know to use
+    /// `handler_name` for parent-step taxonomy.
+    #[test]
+    fn llm_call_2_7_0_falls_back_to_substitution() {
+        let trace = fixture_trace();
+        // 2.7.0 fixture has no parent_event_type/parent_attempt_index
+        // on the wire.
+        assert_eq!(trace.trace_schema_version.as_str(), "2.7.0");
+        let d = decompose(&trace).unwrap();
+        let call = &d.llm_calls[0];
+        // Historical substitution — same as v0.3.0–v0.3.2 behavior at 2.7.0.
+        assert_eq!(call.parent_event_type, ReasoningEventType::LlmCall);
+        assert_eq!(call.parent_attempt_index, 0);
     }
 }
