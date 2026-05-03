@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777832430724,
+  "lastUpdate": 1777833981062,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -5639,6 +5639,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 24227435,
             "range": "± 1335245",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "5be19242509fd62012db51ae71c935f0b05cbc8c",
+          "message": "0.3.6 — verify_hybrid primitive (#14) + per-key DSAR (#15 BREAKING)\n\nCloses CIRISPersist#14 (CIRISEdge OQ-11 day-1 hybrid posture) and\nCIRISPersist#15 (per-key DSAR authorization scope).\n\n## Engine.verify_hybrid (#14)\n\nHybrid Ed25519 + ML-DSA-65 verify for arbitrary canonical bytes.\nWraps ciris_crypto::HybridVerifier with policy machinery + PyO3\nsurface. verify-via-persist stays the federation's single-source-\nof-truth (CIRISPersist#7) — edge calling ciris_crypto directly\nwould fork canonicalization expectations + bypass policy.\n\nHybridPolicy variants:\n- Strict: reject hybrid-pending rows\n- SoftFreshness { window }: accept hybrid-pending if row_age < window\n  (V004's eventual-consistency contract; row_age caller-supplied)\n- Ed25519Fallback: always accept Ed25519-only\n\nPyO3: engine.verify_hybrid(canonical_bytes, ed25519_sig_b64,\nml_dsa_65_sig_b64, ed25519_pubkey_b64, ml_dsa_65_pubkey_b64,\npolicy=\"strict|ed25519_fallback|soft_freshness\",\nsoft_freshness_window_seconds=None, row_age_seconds=None).\n\nStable error tokens (verify_hybrid_pending_rejected,\nverify_hybrid_soft_freshness_expired, verify_hybrid_pqc_fields_mismatch,\nverify_hybrid_base64, verify_hybrid_invalid_length,\nverify_hybrid_crypto) cross PyO3 boundary as ValueError messages.\n\n## Per-key DSAR scope (#15) — BREAKING\n\nEngine.delete_traces_for_agent now REQUIRES signature_key_id.\n\nv0.3.5 took only agent_id_hash and broadened scope to all keys for\nthe agent. That's wrong: signature_key_id is the AUTHORIZATION\nSCOPE of the DSAR, not just an identity filter. A request signed\nby key A is only authorized to delete traces signed by key A.\n\nThe Option<&str> shape from #15's original ask was a footgun —\nNone would have been a forensic-deletion backdoor, and those\nbelong in standard privileged CRUD, not this primitive. v0.3.6\nmakes per-key absolute.\n\nCascade (per-key throughout):\n- trace_events: WHERE agent_id_hash AND signing_key_id\n- trace_llm_calls: joined by trace_id from deleted set\n- federation_keys (when include_federation_key=true): only the one\n  row matching (agent_id_hash, signature_key_id); other rotated keys\n  stay alive\n- FK-cascade attestations + revocations: only the one key\n\n## Deps\n\nciris-crypto added as direct dep (git v1.9.0, ed25519 + pqc-ml-dsa\nfeatures) for HybridVerifier types.\n\n## Tests\n\n177 lib (+9 new) + 22 integration green; clippy clean.\n\nverify::hybrid suite: strict / fallback / soft_freshness window\nchecks, PQC sig-without-pubkey rejection, full hybrid round-trip,\ntampered canonical rejection.\n\nDSAR: per-key scoping correct (cross-key + cross-agent rows\nsurvive), per-key LLM call cascade.\n\n## Lens action\n\nPin bump 0.3.5 → 0.3.6. DSAR handler folds onto\nengine.delete_traces_for_agent(agent_id_hash, signature_key_id) —\npreserves the per-(agent_id_hash, signature_key_id) scope lens\nalready enforces on legacy tables.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-03T13:39:05-05:00",
+          "tree_id": "c48f4b6c83b4f629dc5382a2cdda09397d71243e",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/5be19242509fd62012db51ae71c935f0b05cbc8c"
+        },
+        "date": 1777833980588,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 79678,
+            "range": "± 321",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 197265,
+            "range": "± 442",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 430407,
+            "range": "± 3240",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1535878,
+            "range": "± 8033",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 251,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1101,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 5063,
+            "range": "± 150",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 320,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 2397,
+            "range": "± 41",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 7608,
+            "range": "± 16",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 32646,
+            "range": "± 108",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 512,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2091315,
+            "range": "± 34573698",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 5623885,
+            "range": "± 48203766",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 19453194,
+            "range": "± 95882435",
             "unit": "ns/iter"
           }
         ]
