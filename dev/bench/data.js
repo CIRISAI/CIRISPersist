@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777770787297,
+  "lastUpdate": 1777774423406,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -5069,6 +5069,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 22283852,
             "range": "± 222355",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "335beb97d237249b6413d45cc85c61a218d9e227",
+          "message": "ci: gate publish-pypi on every quality job, not just wheel build\n\nv0.3.2's tag run shipped wheels to PyPI despite a cargo fmt --check\nfailure in the lint job. publish-pypi's needs: clause only required\npyo3-wheel + build-manifest, so wheels were uploaded while clippy +\nfmt + audit was still failing.\n\nSubstantive code in v0.3.2 was unchanged (fmt-only diff caught after\npublish), so the released wheels are correct. But the gate ordering\nis wrong on principle: presence-of-wheel doesn't enforce that the\ncodebase passed lint, license-audit, integration tests, or\nplatform-specific build sanity.\n\nAdd lint + license-audit + linux-x86_64-test + darwin-aarch64-test +\nios-build to publish-pypi.needs. From v0.3.3 forward, any single\nquality-gate failure blocks the publish step.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-02T21:07:19-05:00",
+          "tree_id": "2f38b9601e219d6e35fecdd137461595882ed006",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/335beb97d237249b6413d45cc85c61a218d9e227"
+        },
+        "date": 1777774422542,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 95061,
+            "range": "± 2582",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 238278,
+            "range": "± 797",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 521381,
+            "range": "± 2800",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1996314,
+            "range": "± 41443",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 311,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1221,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 6878,
+            "range": "± 45",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 293,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3113,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9366,
+            "range": "± 128",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 43392,
+            "range": "± 196",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 561,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2042516,
+            "range": "± 115083",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6089359,
+            "range": "± 98075",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 21969019,
+            "range": "± 401247",
             "unit": "ns/iter"
           }
         ]
