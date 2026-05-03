@@ -1,8 +1,14 @@
 # CIRISPersist Threat Model
 
-**Status:** v0.1.2 baseline (5 of 5 known integration-blocking
-exposures from v0.1.1 mitigated). Updated each minor release.
-**Audience:** lens team integrators, federation peers, security reviewers.
+**Status:** v0.3.6 — adds federation directory (v0.2.0), hybrid
+Ed25519+ML-DSA-65 PQC posture (v0.2.0), 2.7.9 wire-format
+extensions (v0.3.0–v0.3.4), per-key DSAR primitive (v0.3.6),
+`verify_hybrid` arbitrary-canonical-bytes surface (v0.3.6).
+**v0.1.2 baseline** (AV-1..AV-26) preserved verbatim;
+v0.2.0–v0.3.6 attack surface in §3.7..§3.10 (AV-28..AV-39).
+Updated each minor release.
+**Audience:** lens / edge / registry / partner-site integrators,
+federation peers, security reviewers.
 **Companion:** [`MISSION.md`](../MISSION.md), [`FSD/CIRIS_PERSIST.md`](../FSD/CIRIS_PERSIST.md).
 **Inspired by:** [`CIRISVerify/docs/THREAT_MODEL.md`](https://github.com/CIRISAI/CIRISVerify/blob/main/docs/THREAT_MODEL.md) — the structural template.
 
@@ -58,6 +64,57 @@ shape, the agent-side persistence service (Phase 2/3). It protects:
   and the registry-published public key. One key, three roles.
   No separate "network identity" key; no translation layer
   between cryptographic provenance and federation transport.
+- **(NEW v0.2.0) Federation directory substrate**: `federation_keys`
+  + `federation_attestations` + `federation_revocations` provide a
+  shared pubkey + attestation + revocation directory across the
+  federation. Persist holds the substrate; consumers compose
+  policy. No `is_trusted()` / `trust_score()` methods; consumers
+  walk the attestation graph however they want
+  (`docs/FEDERATION_DIRECTORY.md` §"Explicit non-goals").
+- **(NEW v0.2.0) Hybrid Ed25519 + ML-DSA-65 signing**: every
+  federation row carries a four-tuple bound signature — Ed25519
+  classical (always present), ML-DSA-65 PQC (cold-path filled).
+  PQC signs `(canonical || classical_sig)` so an attacker who
+  breaks Ed25519 cannot strip-and-replace the PQC component.
+  Persist owns the cold-path tokio task (v0.3.1) + the sweep
+  primitive (v0.3.2) so consumers can't drift on the bound-
+  signature contract.
+- **(NEW v0.3.0) Deterministic dispatch by `trace_schema_version`**:
+  canonical reconstruction picks exactly one path based on the
+  signed `trace_schema_version` field. No iterative try-N-shapes
+  fallback; no shape-shopping attack surface; no spurious-sig-fail
+  SHA-256+verify latency multiplier under load. The dispatch key
+  is part of the signed canonical bytes, so an attacker cannot
+  forge it without breaking the signature.
+- **(NEW v0.3.0) Cross-shape field injection defense**: per-component
+  `agent_id_hash` (v0.3.0) and `deployment_profile` (v0.3.4) are
+  silently ignored at `trace_schema_version "2.7.0"` — they don't
+  enter the 2.7.0 canonical reconstruction even if present on the
+  wire. An attacker injecting future-shape fields into a 2.7.0
+  envelope produces byte-identical canonical bytes vs no-injection;
+  the injection has no effect on signed verification or dedup.
+- **(NEW v0.3.4) deployment_profile cohort identity in canonical
+  bytes**: `agent_role` / `agent_template` / `deployment_domain` /
+  `deployment_type` / `deployment_region` / `deployment_trust_mode`
+  ride in the 2.7.9 signed canonical bytes. Cohort labels are
+  non-forgeable post-emission; the agent's signature commits to
+  them. Lens cohort routing reads denormalized columns on
+  `trace_events` with cryptographic provenance.
+- **(NEW v0.3.6) Per-key DSAR authorization scope**:
+  `Engine.delete_traces_for_agent(agent_id_hash, signature_key_id)`
+  scopes deletion to `(agent_id_hash, signing_key_id)`. The
+  signature_key_id is the *authorization scope* of the DSAR
+  (a request signed by key A is only authorized to delete traces
+  signed by key A) — not just an identity filter. No `Option<>`
+  back-compat shim; per-key is the only contract.
+- **(NEW v0.3.6) verify-via-persist single-source-of-truth**:
+  `Engine.verify_hybrid` exposes hybrid Ed25519+ML-DSA-65 verify
+  for arbitrary canonical bytes via persist's policy machinery
+  (`HybridPolicy::Strict` / `SoftFreshness { window }` /
+  `Ed25519Fallback`). Federation peers consume verify through
+  persist, not via direct `ciris_crypto` access — the architectural
+  closure CIRISPersist#7 named (one canonicalization expectation,
+  one policy machinery, no drift across N consumers).
 
 ### What CIRISPersist Does NOT Protect (Phase 1)
 
@@ -143,9 +200,14 @@ The adversary is assumed to NOT have:
 
 ## 3. Attack Vectors
 
-Sixteen attack vectors organized by adversary goal. Each lists the
-attack, the primary mitigation present in v0.1.1, the secondary
-mitigation, and the residual risk.
+Thirty-nine attack vectors organized by adversary goal. AV-1..AV-26
+are the v0.1.x baseline (preserved verbatim from the v0.1.2 doc).
+AV-27 covers v0.1.7..v0.1.9 keyring-storage hardening. AV-28..AV-39
+cover the v0.2.0..v0.3.6 surface (federation directory, hybrid PQC,
+cross-shape injection, cohort identity, per-key DSAR,
+`verify_hybrid` arbitrary-canonical-bytes). Each AV lists the
+attack, the primary mitigation, the secondary mitigation, and the
+residual risk.
 
 ### 3.1 Forgery — adversary wants their bytes counted as real evidence
 
@@ -757,6 +819,440 @@ summary. Briefly:
 - **AV-22** — no clock-skew validation (P2). Track for v0.2.x.
 - **AV-23** — `consent_timestamp` range unconstrained (P3). Track.
 
+### 3.7 Federation directory (v0.2.0+)
+
+These vectors emerge from the federation directory schema
+(`federation_keys`, `federation_attestations`, `federation_revocations`)
+introduced in v0.2.0. The directory provides the substrate consumers
+compose policy over (per `docs/FEDERATION_DIRECTORY.md` §"Explicit
+non-goals"), so attacks here target either the substrate's integrity
+or the consumer's policy assumptions about it.
+
+#### AV-28: Federation_keys directory pubkey poisoning
+
+**Attack**: An attacker with write access to `federation_keys`
+submits a `SignedKeyRecord` with a `key_id` that collides with an
+existing legitimate registration but a different
+`pubkey_ed25519_base64` / `pubkey_ml_dsa_65_base64`. Same-shape as
+AV-11 but for the v0.2.0+ federation directory (which is the
+authoritative source post-v0.2.0; `accord_public_keys` is dual-read
+fallback retiring at v0.4.0).
+
+**Mitigation v0.2.0**: idempotent on `(key_id, persist_row_hash)`.
+INSERT with `ON CONFLICT (key_id) DO NOTHING` followed by a
+post-insert hash check: if the existing `persist_row_hash` differs
+from the submitted record's hash, persist returns
+`Error::Conflict("key_id ... already exists with different content")`.
+Re-submission of *identical* content is a no-op; submission of
+*different* content under the same key_id is a typed Conflict — never
+a silent overwrite.
+
+**Secondary**: every row carries its own `scrub_signature_classical`
+(+ `scrub_signature_pqc` once cold-path fills). Consumers verify the
+scrub envelope against the row's `scrub_key_id` before trusting the
+row. A poisoned row with a malformed signature fails consumer-side
+verify before the policy layer trusts it.
+
+**Residual**: an attacker who legitimately holds `key_id`'s
+scrub-signing key (same trust boundary as AV-2) can mint
+apparently-valid envelopes. PoB §6 statistical drift detection is
+the federation-level mitigation; persist's substrate cannot
+distinguish forged-but-valid signatures pointwise.
+
+#### AV-29: Attestation graph poisoning
+
+**Attack**: An attacker submits attestations or revocations crafted
+to mislead consumer-side trust traversal — e.g., circular
+`vouches_for` chains, attestations with futures-dated `expires_at`
+to claim long-lived trust, revocations with retroactive
+`effective_at` to invalidate historical traces.
+
+**Mitigation v0.2.0**: persist exposes the edges, never the
+traversal. There is no `is_trusted()` / `trust_score()` /
+`trust_path()` method; consumers compose whatever policy they want
+(majority-attestation, weighted-graph-walk, score-weighted, etc.).
+A compromised attestation does not directly cause persist to flip
+any consumer's trust state; it adds an edge consumers walk under
+their own policy.
+
+**Secondary**: every attestation row carries its own scrub envelope.
+Consumers verify per-row before counting the edge. The graph itself
+is append-only — revocations are observed, not retroactive deletes —
+so poisoning is additive, not destructive.
+
+**Residual**: a consumer with naïve traversal policy
+("any-attestation-counts") is exploitable; a consumer with
+score-weighted policy that requires N independent attestations is
+not. Per the architectural non-goals: *policy is consumer-side*.
+Persist's residual is "we expose the edges honestly; bad policies
+get bad answers."
+
+#### AV-30: Federation_keys self-FK integrity
+
+**Attack surface (operational, not adversarial)**: the
+`federation_keys` table's `scrub_key_id` references
+`federation_keys.key_id` — a self-reference. A bootstrap row
+references itself before the row physically exists in the table.
+Standard `REFERENCES` would reject the INSERT.
+
+**Pre-v0.2.0 failure**: bootstrap impossible without the FK constraint
+relaxed.
+
+**Mitigation v0.2.0**: `DEFERRABLE INITIALLY DEFERRED` on the
+self-FK. Bootstrap row INSERTs successfully; the constraint check
+runs at COMMIT, by which time `scrub_key_id` resolves (the row
+exists). Non-bootstrap rows reference an already-committed key,
+so the deferred check is no-op.
+
+**Residual**: a malicious operator with DBA-level access could
+deferrable-defer-then-rollback to leak intermediate state, but
+the trust boundary at that level is "Postgres compromised" (out of
+scope per §1) — the substrate cannot defend against the operator
+running it. Standard FK semantics resume at COMMIT.
+
+### 3.8 Hybrid PQC posture (v0.2.0+)
+
+These vectors emerge from the hybrid Ed25519 + ML-DSA-65 signing
+scheme. The federation's design accepts Ed25519-only rows initially
+(hot path), with ML-DSA-65 attached on the cold path
+(`docs/FEDERATION_DIRECTORY.md` §"PQC strategy"). The window between
+hot-path commit and cold-path PQC fill-in is the hybrid-pending
+interval — load-bearing for the trust contract.
+
+#### AV-31: Hybrid-pending exploitation
+
+**Attack**: An attacker who breaks Ed25519 (post-quantum future, or
+hypothetical pre-quantum break) forges a row with valid Ed25519 but
+no PQC component. Consumers running `HybridPolicy::Ed25519Fallback`
+or `SoftFreshness { window: long }` accept the row.
+
+**Mitigation v0.3.6**: `Engine.verify_hybrid` exposes three
+explicit policies:
+- `Strict` — rejects hybrid-pending rows; requires both signatures.
+  Production posture for high-stakes domains.
+- `SoftFreshness { window }` — accepts only if `row_age < window`.
+  Window is caller-supplied (caller looks up `pqc_completed_at` /
+  `created_at` and computes age externally). Bounds the
+  acceptance window to the federation's eventual-consistency contract.
+- `Ed25519Fallback` — always accepts. Development / sovereign-mode
+  posture; NOT for federation production.
+
+The `policy` parameter is per-call; consumers configure per-peer
+trust. A peer in a high-stakes domain runs `Strict`; a peer in
+general-purpose runs `SoftFreshness` with a window that matches its
+sweep cadence (typically 5 min).
+
+**Secondary**: bound signature pattern (PQC over `(canonical ||
+classical_sig)`) means breaking Ed25519 alone is insufficient to
+forge a fully hybrid-verified row — the attacker would also need to
+break ML-DSA-65 OR exploit the hybrid-pending acceptance window.
+Strict policy closes both branches.
+
+**Residual**: a peer running `Ed25519Fallback` in production has
+no PQC protection. Named residual; deployment-level mitigation is
+"don't run Ed25519Fallback in production." Persist's
+`verify_hybrid` requires the policy to be passed explicitly — no
+silent default — so misconfiguration surfaces in audit.
+
+#### AV-32: Cold-path PQC denial-of-completion
+
+**Attack**: An attacker disrupts the cold-path PQC sweep so rows
+stay hybrid-pending longer than the federation's SoftFreshness
+window — pushing them into Strict-rejection territory and degrading
+availability. Mechanisms: starve the tokio runtime, kill the
+cold-path tokio task before completion, deny network to the PQC
+signing service, fill the disk so `attach_*_pqc_signature` fails.
+
+**Mitigation v0.3.1+v0.3.2**: per-write cold-path is
+fire-and-forget on the engine's tokio runtime — no external
+network dependency, no separate signing service, no network blip
+to deny. The runtime is the same one serving `receive_and_persist`,
+so denying it denies write-path entirely (the attacker can DoS
+ingest, but they can't selectively deny PQC fill-in while keeping
+hot-path alive).
+
+The v0.3.2 sweep primitive (`Engine.run_pqc_sweep`) provides the
+recovery path: any row that misses the per-write cold-path (process
+restart, transient sign failure, runtime starvation) is filled by
+the next sweep. The `pqc_sweep_on_init=True` constructor default
+runs a sweep at boot; production deployments running the sweep
+periodically (e.g., once per minute via cron) bound the
+hybrid-pending window operationally.
+
+**Secondary**: writer contract documented in
+`migrations/postgres/lens/V004__federation_directory.sql` header:
+"kick off IMMEDIATELY after Ed25519 sign, not delayed/batched/
+scheduled." The contract is enforced by persist owning the
+implementation (CIRISPersist#10 closure) — consumers can't
+accidentally drop it.
+
+**Residual**: a deployment that runs persist with no cold-path
+sweep cadence AND a long SoftFreshness window has a soft window of
+acceptance for hybrid-pending rows. Operational concern, not
+substrate. Logs (`tracing::info` after each sweep) surface
+sweep-completion frequency for ops monitoring.
+
+#### AV-33: Bound-signature stripping
+
+**Attack**: An attacker who breaks Ed25519 strips an existing valid
+PQC signature off a legitimate row, replaces with their own
+ML-DSA-65 signature over canonical-only bytes (without the
+classical sig append), and forges a new row with their fake
+classical + their fake PQC.
+
+**Mitigation v0.2.0**: bound signature pattern. PQC signs
+`(canonical || classical_sig)`, not just `canonical`. Persist's
+`HybridVerifier` rebuilds the bound payload before PQC verify and
+rejects if PQC was signed over canonical-only. The attacker who
+breaks Ed25519 can produce a valid classical sig, but the PQC
+component must be over the *concatenation* — an attacker who
+hasn't broken ML-DSA-65 cannot produce that.
+
+**Secondary**: matches CIRISVerify's `HybridSignature` spec
+(`ciris-crypto/src/hybrid.rs:191`) and the `ManifestSignature`
+shape used by `ciris-build-sign`. Persist consumes the upstream
+primitive; bound-signature semantics are enforced at the
+ciris-crypto layer, not reimplemented persist-side.
+
+**Residual**: an attacker who breaks BOTH Ed25519 and ML-DSA-65
+can mint arbitrary hybrid signatures. That's the "all-quantum-in-
+one" scenario; post-quantum-cryptanalysis on ML-DSA is at least as
+hard as breaking the underlying lattice problem (PoB §6). The
+hybrid scheme bounds the attacker to "break BOTH or break NEITHER"
+in the typical case; bound signatures close the AND-instead-of-OR
+branch.
+
+### 3.9 Wire-format extensions (v0.3.0..v0.3.4)
+
+These vectors emerge from the 2.7.9 wire-format additions
+(per-component `agent_id_hash`, `parent_event_type` /
+`parent_attempt_index` on LLM_CALL, `deployment_profile` on the
+trace envelope). All are signed canonical fields; cross-shape
+injection at the older `2.7.0` version is the structural concern.
+
+#### AV-34: Cross-shape canonical injection
+
+**Attack**: An attacker submits a `2.7.0` envelope that carries
+`2.7.9`-shape fields (per-component `agent_id_hash`, or a top-level
+`deployment_profile` block). The attacker hopes the lens persists
+a row with cohort labels or denormalized agent_id_hash values that
+were never part of what the agent signed — corrupting downstream
+analytics or AV-9 dedup-tuple identity.
+
+**Mitigation v0.3.0/v0.3.4**: deterministic dispatch by
+`trace_schema_version`. At `2.7.0`, the canonical reconstruction
+runs the 9-key 2.7.0 path (`canonical_payload_value`); the
+per-component `agent_id_hash` field and the `deployment_profile`
+block are silently ignored — they don't enter canonical bytes,
+don't affect signature verify, don't affect dedup. Two traces (one
+without the injected fields, one with) at `2.7.0` produce
+byte-identical canonical bytes.
+
+Schema-version-aware decompose at `2.7.9` requires the shape:
+`MissingField("deployment_profile")` rejects an envelope claiming
+`2.7.9` without the block. Cross-shape injection at the wrong
+version is therefore a no-op (2.7.0 ignores the future fields) or
+a typed rejection (2.7.9 requires them).
+
+**Secondary**: regression tests
+(`v270_ignores_per_component_agent_id_hash_injection`,
+`v270_ignores_deployment_profile_injection`) assert byte-identical
+canonical bytes with vs. without injection at 2.7.0. Spec
+hardening ([CIRISAgent#712](https://github.com/CIRISAI/CIRISAgent/issues/712)
+#714) binds the shapes structurally so the agent and lens agree on
+which fields belong at which version.
+
+**Residual**: a future schema version that adds a field which IS
+honored at `2.7.0` would re-open this surface. The version-bump
+review process (per §10 update cadence) catches such changes.
+
+#### AV-35: Schema-version dispatch attack
+
+**Attack** (pre-v0.3.0 / closed retroactively): the pre-v0.3.0
+verify path tried multiple canonical shapes in sequence (try-9-field-
+then-2-field). An attacker could craft canonical bytes that match
+*both* shapes' verify path but mean different things at the dedup
+or denormalization layer — getting a trace counted as 2-field for
+verify but interpreted as 9-field for storage.
+
+**Mitigation v0.3.0**: deterministic dispatch by
+`trace_schema_version` (the field is part of signed canonical
+bytes, so an attacker cannot forge it without breaking the
+signature). Each trace contributes to exactly one canonical-shape
+verify path. No shape-shopping; no spurious-sig-fail latency
+multiplier. The 2-field legacy path is reserved behind explicit
+`"2.7.legacy"` opt-in (not in `SUPPORTED_VERSIONS`); never silent
+fallback for unrecognized versions.
+
+**Secondary**: typed `Error::UnsupportedSchemaVersion` from the
+schema-parse layer rejects out-of-allowlist versions before the
+verify dispatch runs (AV-12 mitigation overlap).
+
+**Residual**: when `SUPPORTED_VERSIONS` legitimately holds multiple
+versions during a rollout window, both dispatch arms are live.
+Each is independent (no cross-version field reuse); the per-version
+review (§10) ensures shape independence.
+
+#### AV-36: LLM_CALL parent-linkage substitution
+
+**Attack** (pre-v0.3.3 / closed retroactively): the pre-v0.3.3
+decompose substituted the outer LLM_CALL component's `event_type`
+(always `LLM_CALL`) into `trace_llm_calls.parent_event_type` when
+the wire-shipped fields were missing. Result: 100% of pre-v0.3.3
+2.7.9 corpus rows had `parent_event_type='LLM_CALL'` instead of
+the spec-mandated upstream-step taxonomy
+(`ASPDMA_RESULT`, `IDMA_RESULT`, `CONSCIENCE_RESULT`, etc.). This
+defeated the AV-9 dedup-tuple parent-path identity and RATCHET H3
+parent-topology clustering.
+
+**Mitigation v0.3.3**: 2.7.9 strict-parse for the LLM_CALL
+component. Missing `parent_event_type` or `parent_attempt_index` →
+typed `Error::Schema(MissingField("data.parent_event_type"))`.
+Decompose reads from the wire-provided values directly; no
+substitution at 2.7.9. At 2.7.0, the historical substitution path
+is preserved for backward compatibility (the spec didn't carry the
+fields at 2.7.0; substitution is documented as semantically wrong
+but operationally equivalent for AV-9 dedup at that version).
+
+**Residual**: pre-v0.3.3 rows in production tables retain the
+`parent_event_type='LLM_CALL'` label; RATCHET uses `handler_name`
+as the upstream-step linkage workaround per CIRISLens#5. New
+traffic post-v0.3.3 + agent `e714ff3c4` lands with the spec-correct
+parent linkage.
+
+#### AV-37: deployment_profile cohort-identity injection
+
+**Attack**: An agent declares false `deployment_profile` labels
+(`agent_role`, `deployment_domain`, `deployment_type`,
+`deployment_trust_mode`) to evade RATCHET cohort routing.
+Examples: a high-stakes deployment declares `deployment_domain:
+"general"` to avoid the more rigorous detection thresholds applied
+to `healthcare` / `legal` / `financial`. A production deployment
+declares `deployment_type: "research"` to claim the lower bar that
+research applies. A federated peer declares
+`deployment_trust_mode: "federated_peer"` while running sovereign-
+isolated.
+
+**Mitigation v0.3.4**: `deployment_profile` rides in the 2.7.9
+signed canonical bytes (CIRISAgent FSD/TRACE_WIRE_FORMAT.md §3.2 +
+§8). The agent's signature commits to the declared labels; an
+attacker can't post-hoc rewrite the labels on a row that's already
+signed. This is the same authenticity floor as `agent_id_hash`:
+the labels are non-forgeable post-emission.
+
+The v0.3.4 strict-parse at 2.7.9 rejects envelopes missing the
+block (the v0.3.5 `MissingField("deployment_profile")` gate). All
+6 fields are required-on-the-wire — missing fields can't be
+"silently defaulted" to evade label rigor.
+
+**Secondary**: lens-side cohort routing applies *behavioral*
+detection on top of declared labels — e.g., a row claiming
+`deployment_resourcing: scarcity` whose `cost_usd` says
+`abundance` is flagged. Persist denormalizes the declared labels
+into queryable columns; lens runs cross-checks against the cost
+columns the agent also signed.
+
+The `deployment_resourcing` field is intentionally NOT
+agent-declared (per CIRISAgent#718 design): it's lens-computed from
+`cost_usd` / `tokens` / `model` observation. Agents can lie about
+declarative labels but not about emergent operational reality —
+the cost columns show what they paid.
+
+**Residual**: an attacker willing to *actually* run high-stakes
+behavior under a declared low-stakes label, paying the real cost,
+faces the cost-asymmetry PoB §2.1 names. Detection is statistical
+over time (lens cohort cross-validation against behavioral
+observation); persist's substrate provides the cryptographic floor
+that makes the cohort-correctness claim measurable in the first
+place.
+
+### 3.10 DSAR + verify primitives (v0.3.6)
+
+These vectors emerge from v0.3.6's per-key DSAR primitive
+(`Engine.delete_traces_for_agent`) and the `verify_hybrid`
+arbitrary-canonical-bytes surface that closes CIRISEdge OQ-11.
+
+#### AV-38: Per-key DSAR scope violation
+
+**Attack** (closed by v0.3.6 BREAKING change vs v0.3.5): a DSAR
+request signed by key A is used to delete traces signed by key B
+under the same `agent_id_hash`. v0.3.5's
+`Engine.delete_traces_for_agent(agent_id_hash, include_federation_key)`
+broadened scope to all keys for that agent — any one valid key
+could file a DSAR deleting traces from other agent instances
+claiming the same logical identity (separate deployments of the
+same template with different signing keys).
+
+**Mitigation v0.3.6**: `signature_key_id` is a REQUIRED parameter
+(no `Option<>` back-compat shim). Deletion is scoped to
+`(agent_id_hash, signing_key_id)` at all three substrate layers:
+- `trace_events`: `WHERE agent_id_hash = $1 AND signing_key_id = $2`
+- `trace_llm_calls` cascade: joined by `trace_id` from the matching
+  `trace_events` set (cross-key traces under the same agent only
+  cascade for this DSAR's key)
+- `federation_keys` (when `include_federation_key=True`): only the
+  one row matching `(agent_id_hash, signature_key_id)` cascades;
+  the agent's other registered keys (rotation history) stay alive
+
+The per-key contract is the authorization model itself, not a
+filter parameter. CIRISPersist#15 named the gap; v0.3.6's BREAKING
+change is the closure. Admin / forensic deletions belong in
+standard privileged CRUD, not this primitive — there is no soft
+escape hatch.
+
+**Secondary**: lens-side DSAR audit ledger captures the request
+envelope + signature verification independent of persist. Persist
+returns the row counts; lens persists who-requested-what-when.
+
+**Residual**: if an attacker compromises both `agent_id_hash`'s
+specific signing key AND the lens's DSAR-orchestration layer, they
+can issue authorized-looking DSAR requests for that one key's
+traces. That's compounded compromise (two trust boundaries
+breached at once); the per-key contract bounds the blast radius
+to the single compromised key, not the agent's entire history.
+
+#### AV-39: verify-via-persist bypass
+
+**Attack** (architectural, addressed by API design): a federation
+peer (edge / lens / partner site) calls `ciris_crypto::HybridVerifier`
+directly instead of `Engine.verify_hybrid`. Drift surface:
+- Different canonicalization expectations (the `data` argument to
+  HybridVerifier::verify must match what persist canonicalizes;
+  if the peer canonicalizes differently, signatures verify
+  differently across peers).
+- Bypass of the policy machinery (`HybridPolicy::Strict` /
+  `SoftFreshness` / `Ed25519Fallback` enforcement happens
+  persist-side; direct ciris_crypto usage skips it).
+- Per-deployment policy configuration scattered across N consumer
+  codebases instead of localized at persist's API surface.
+
+Same drift surface CIRISPersist#7 closed for canonicalization;
+applied to the verify path.
+
+**Mitigation v0.3.6**: `Engine.verify_hybrid` is the federation's
+single-source-of-truth for hybrid verify, exposed via PyO3 and
+via the underlying `crate::verify::verify_hybrid` Rust function.
+Federation peers consume verify through persist; the API design
+does not require nor reward direct `ciris_crypto` usage.
+Architectural closure (CIRISPersist#7 pattern); not a runtime
+gate, but the path of least resistance is verify-via-persist.
+
+The `verify_hybrid` surface accepts arbitrary canonical bytes —
+not just CompleteTrace shapes — so peers don't need direct
+`ciris_crypto` access for non-trace verify needs (build-manifest
+verification, cross-component signing, etc.).
+
+**Secondary**: documented as the closure pattern in
+`docs/V0.2.0_VERIFY_SUBSUMPTION.md`. CIRISEdge OQ-11 closure
+explicitly cites verify-via-persist as the integration discipline.
+
+**Residual**: a peer that nevertheless implements its own verify
+path skips persist's policy machinery. This is a consumer-side
+discipline issue, not a substrate enforcement; persist cannot
+prevent a determined consumer from forking the code. The
+architectural cost (drift, per-consumer policy maintenance) is the
+incentive against doing so.
+
 ---
 
 ## 4. Mitigation Matrix
@@ -790,6 +1286,18 @@ summary. Briefly:
 | AV-25 | Scrub-key compromise | Hardware-backed `ciris-keyring` (TPM / Secure Enclave / StrongBox / DPAPI) — seed never leaves the keyring; never crosses the FFI boundary | `SoftwareSigner` fallback for hardware-less deployments (named residual) | ✓ Mitigated where hardware available; ⚠ residual on software-fallback | CIRISVerify hardware-attestation tier governs |
 | AV-26 | Multi-worker migration race | Session-scoped `pg_advisory_lock(0x6369_7269_7370_7372)` on dedicated single-use connection in `run_migrations()` — workers serialize on cold-boot, lock auto-releases on session close (incl. panic) | `Error::Migration { sqlstate, detail }` surfaces SQLSTATE for lens-side retry policy | **✓ Mitigated v0.1.5** | — |
 | AV-27 | Identity churn via ephemeral keyring storage | Boot-time check via authoritative `HardwareSigner::storage_descriptor()` (ciris-keyring v1.8.0). Typed dispatch: `SoftwareFile` ⇒ ephemeral-path heuristic; `SoftwareOsKeyring{User}` ⇒ logout-bound warn; `InMemory` ⇒ hard warn. `Engine.keyring_path()` + `Engine.keyring_storage_kind()` expose authoritative path / classifier for `/health` | Suppression via `CIRIS_PERSIST_KEYRING_PATH_OK=1` after operator audit; `INTEGRATION_LENS.md §11.5` deployment template guidance | **✓ Mitigated v0.1.7 (predicted) / v0.1.9 (authoritative via upstream trait method)** | — |
+| AV-28 | Federation_keys directory pubkey poisoning | Idempotent on `(key_id, persist_row_hash)` — INSERT ON CONFLICT DO NOTHING + post-insert hash check returns typed `Error::Conflict` on key_id collision with differing content; never silent overwrite | Per-row scrub envelope verified consumer-side; PoB §6 statistical drift detection at federation level | **✓ Mitigated v0.2.0** | — |
+| AV-29 | Attestation graph poisoning | Persist exposes edges only — no `is_trusted()` / `trust_score()` / `trust_path()`. Consumers compose policy; per-row scrub-envelope verify before counting any edge | Append-only graph (revocations observed, not retroactive deletes); poisoning is additive | ✓ Mitigated by architectural non-goal — consumer-side policy required | — |
+| AV-30 | Federation_keys self-FK integrity | `DEFERRABLE INITIALLY DEFERRED` on the self-reference; constraint check at COMMIT, not row insert; bootstrap rows resolve their own FK by transaction commit | Standard FK semantics for non-bootstrap rows | **✓ Mitigated v0.2.0** | — |
+| AV-31 | Hybrid-pending exploitation (Ed25519 break + soft-PQC window) | `HybridPolicy::Strict` rejects hybrid-pending; `SoftFreshness { window }` bounds acceptance to `row_age < window`; policy is per-call, no silent default | Bound signature pattern (PQC over `canonical \|\| classical_sig`) requires breaking BOTH algorithms to forge fully-verified rows | **✓ Mitigated v0.3.6** (Strict / Fallback are explicit; SoftFreshness window is caller-supplied) | — |
+| AV-32 | Cold-path PQC denial-of-completion | Per-write cold-path on engine's tokio runtime (no external network/service to deny); v0.3.2 sweep primitive (`Engine.run_pqc_sweep`) provides recovery; `pqc_sweep_on_init=True` constructor default runs sweep at boot | Writer contract documented in V004 schema header; persist owns the implementation (CIRISPersist#10) | **✓ Mitigated v0.3.1+v0.3.2** | — |
+| AV-33 | Bound-signature stripping (PQC over classical-only) | Hybrid scheme signs PQC over `(canonical \|\| classical_sig)`; persist's `HybridVerifier` rebuilds bound payload before PQC verify and rejects PQC-over-canonical-only | Matches CIRISVerify `HybridSignature` spec; primitive enforced at ciris-crypto layer, not reimplemented persist-side | **✓ Mitigated v0.2.0** | — |
+| AV-34 | Cross-shape canonical injection at 2.7.0 | Deterministic dispatch by `trace_schema_version`; per-component `agent_id_hash` (v0.3.0) and `deployment_profile` (v0.3.4) silently ignored at 2.7.0 — don't enter canonical bytes, don't affect dedup; byte-identical canonical with vs. without injection at 2.7.0 | Schema-version-aware decompose at 2.7.9 requires the shape (typed `MissingField` on absence); regression tests assert byte-identity | **✓ Mitigated v0.3.0+v0.3.4** | — |
+| AV-35 | Schema-version dispatch attack (try-N-shapes) | v0.3.0 deterministic dispatch — each trace contributes to exactly one canonical-shape verify path; no shape-shopping; no spurious-sig-fail latency multiplier | Typed `Error::UnsupportedSchemaVersion` rejects out-of-allowlist versions before dispatch (AV-12 overlap) | **✓ Mitigated v0.3.0** | — |
+| AV-36 | LLM_CALL parent-linkage substitution | v0.3.3 strict-parse at 2.7.9 — `MissingField("data.parent_event_type")` / `parent_attempt_index` rejects envelopes missing the wire fields; no substitution at 2.7.9 | Pre-v0.3.3 `parent_event_type='LLM_CALL'` rows tagged for RATCHET workaround via `handler_name`; new traffic post-v0.3.3 lands with spec-correct linkage | **✓ Mitigated v0.3.3** | — |
+| AV-37 | deployment_profile cohort-identity injection | `deployment_profile` rides in 2.7.9 signed canonical bytes; agent's signature commits to declared labels; strict-parse at 2.7.9 rejects missing block (`MissingField("deployment_profile")`) | `deployment_resourcing` is intentionally lens-computed from cost/tokens/model observation, not agent-declared — labels can lie but emergent operational reality cannot | **✓ Mitigated v0.3.4** | — |
+| AV-38 | Per-key DSAR scope violation | v0.3.6 BREAKING: `signature_key_id` is REQUIRED on `delete_traces_for_agent`; deletion is scoped to `(agent_id_hash, signing_key_id)` at all three substrate layers (trace_events, trace_llm_calls cascade, federation_keys cascade); no `Option<>` back-compat shim | Lens-side DSAR audit ledger captures request envelope + signature verification independent of persist | **✓ Mitigated v0.3.6** (broke v0.3.5 shape; v0.3.5 yanked from PyPI) | — |
+| AV-39 | verify-via-persist bypass (consumer calls ciris_crypto direct) | `Engine.verify_hybrid` is the federation's single-source-of-truth — accepts arbitrary canonical bytes (not just CompleteTrace shapes), exposes the policy machinery (Strict / SoftFreshness / Ed25519Fallback), is the path of least resistance | Documented as the closure pattern (CIRISPersist#7); `docs/V0.2.0_VERIFY_SUBSUMPTION.md` carries the architectural reasoning | ✓ Architectural closure — not a runtime gate but the design path | — |
 
 ---
 
@@ -842,6 +1350,35 @@ model breaks.
 7. **Wire-format spec stability**: agents and lens agree on
    TRACE_WIRE_FORMAT.md §8 canonicalization conventions. Drift
    between the two is the AV-4 attack vector.
+8. **(v0.2.0+) Federation directory write authorization**: only
+   authorized federation peers can call `Engine.put_public_key` /
+   `put_attestation` / `put_revocation`. Persist accepts what's
+   signed; lens orchestrates which federation membership requests
+   reach the substrate. Compromised federation directory writes
+   are AV-28 / AV-29 blast-radius bounded by per-row scrub envelope
+   verification.
+9. **(v0.2.0+) Federation steward key isolation**: deployments
+   running federation-mirroring (lens, registry, partner sites)
+   hold an Ed25519 + ML-DSA-65 steward keypair. Same trust
+   boundary as the scrub-signing key (AV-25); compromised steward
+   key allows federation-wide minting of apparently-valid
+   federation rows.
+10. **(v0.3.6+) DSAR signature verification consumer-side**: lens
+    verifies the DSAR request envelope's signature against the
+    agent's `signature_key_id` BEFORE calling
+    `Engine.delete_traces_for_agent`. Persist owns the substrate
+    delete; lens owns the audit + signature verification.
+    Misconfigured lens-side verify is AV-38 blast-radius bounded
+    by per-key scope.
+11. **(v0.3.6+) verify-via-persist API discipline**: federation
+    peers consume hybrid verify via `Engine.verify_hybrid`, not
+    via direct `ciris_crypto::HybridVerifier` access. Architectural
+    rather than runtime; AV-39 names the residual.
+12. **(v0.3.0+) Clock skew bounded for SoftFreshness**: peers
+    running `HybridPolicy::SoftFreshness { window }` need clock
+    accuracy within `window/2` to avoid spurious freshness-window
+    rejections OR spurious acceptances of overdue rows. Standard
+    NTP synchronization at the deployment level.
 
 ---
 
@@ -924,25 +1461,86 @@ Risks CIRISPersist mitigates but cannot fully eliminate.
     decidability — a property that cannot be achieved at the
     persistence layer alone.
 
+11. **(v0.2.0+) Compromised federation steward key** (AV-28/29
+    via authorized-but-malicious writes). Same trust boundary as
+    AV-25; deployment-level mitigation is hardware-backed steward
+    keyring + revocation through the federation directory's
+    `federation_revocations` channel.
+
+12. **(v0.3.0+) Hybrid-pending acceptance window**. Peers running
+    `HybridPolicy::SoftFreshness` accept rows that haven't yet
+    completed cold-path PQC fill-in. Window size is a per-peer
+    operational decision; mismatched (window vs. sweep cadence)
+    yields either spurious rejections (window too short) or
+    extended hybrid-pending acceptance (window too long).
+    `Engine.run_pqc_sweep` summary logs surface sweep cadence;
+    operators tune window accordingly.
+
+13. **(v0.3.4+) deployment_profile self-classification mismatch
+    with behavior**. Agents declare cohort labels in the signed
+    canonical bytes; an agent willing to *actually* run high-stakes
+    behavior under a low-stakes label faces the cost-asymmetry
+    PoB §2.1 names. Detection is statistical (lens cohort cross-
+    validation against `cost_usd` / `tokens` / `model`); persist's
+    substrate provides cryptographic provenance, not behavioral
+    inference.
+
+14. **(v0.3.6+) verify-via-persist consumer discipline**. A
+    determined consumer can fork the verify path and use
+    `ciris_crypto::HybridVerifier` directly, skipping persist's
+    policy machinery. Architectural cost (drift, per-consumer
+    policy maintenance) is the disincentive; not a runtime gate.
+
 ---
 
-## 9. v0.1.2 Threat Posture Summary
+## 9. v0.3.6 Threat Posture Summary
 
 ```
-v0.1.1 INTEGRATION-BLOCKING EXPOSURES → all closed in v0.1.2
+v0.1.1 INTEGRATION-BLOCKING EXPOSURES → closed in v0.1.2
   ✓ AV-5  schema-version flood mem leak  (Cow<'static, str>)
   ✓ AV-6  data-blob recursion uncapped   (MAX_DATA_DEPTH=32 walker)
   ✓ AV-7  no crate-level body size limit (DefaultBodyLimit::max(8 MiB))
   ✓ AV-9  dedup key cross-agent collision (agent_id_hash in UNIQUE index)
   ✓ AV-15 error messages leaking verbatim (kind() tokens at FFI boundary)
 
+POST-v0.1.2 OPERATIONAL HARDENING (v0.1.3..v0.1.5)
+  ✓ AV-17 attempt_index integer truncation (MAX_ATTEMPT_INDEX=1024)
+  ✓ AV-18 plaintext Postgres connection (optional tls feature)
+  ✓ AV-19 lost in-flight commits on shutdown (drain protocol)
+  ✓ AV-24 lens-scrub bypass / forgery (scrub-envelope contract)
+  ✓ AV-25 scrub-key compromise (hardware-backed ciris-keyring)
+  ✓ AV-26 multi-worker migration race (advisory lock)
+  ✓ AV-27 ephemeral keyring storage (boot-time check + storage_kind classifier)
+
+v0.2.0 FEDERATION DIRECTORY
+  ✓ AV-28 federation_keys directory pubkey poisoning (idempotent + hash check)
+  ✓ AV-29 attestation graph poisoning (architectural non-goal — consumer policy)
+  ✓ AV-30 federation_keys self-FK integrity (DEFERRABLE INITIALLY DEFERRED)
+
+v0.2.0 HYBRID PQC POSTURE
+  ✓ AV-31 hybrid-pending exploitation (HybridPolicy enforced per-call)
+  ✓ AV-32 cold-path PQC denial-of-completion (per-write spawn + sweep recovery)
+  ✓ AV-33 bound-signature stripping (PQC over canonical || classical_sig)
+
+v0.3.0..v0.3.4 WIRE-FORMAT EXTENSIONS
+  ✓ AV-34 cross-shape canonical injection (deterministic dispatch + cross-shape ignore)
+  ✓ AV-35 schema-version dispatch attack (closed by v0.3.0 deterministic dispatch)
+  ✓ AV-36 LLM_CALL parent-linkage substitution (v0.3.3 strict-parse at 2.7.9)
+  ✓ AV-37 deployment_profile cohort-identity injection (signed in 2.7.9 canonical)
+
+v0.3.6 DSAR + VERIFY PRIMITIVES
+  ✓ AV-38 per-key DSAR scope violation (BREAKING: signature_key_id required)
+  ✓ AV-39 verify-via-persist bypass (architectural closure via Engine.verify_hybrid)
+
 PHASE-2-CLOSES (architecturally deferred)
   ⚠ AV-2  stolen-key forgery (peer-replicate audit chain)
   ⚠ AV-10 audit anchor capture without verification
 
-V0.2.X TRACK
+v0.4.x TRACK
   ⚠ AV-11 explicit rotate_public_key(rotation_proof) API
   ⚠ AV-16 side-channel timing on key-directory enumeration
+  ⚠ AV-20..AV-23 (statement_timeout, per-agent rate limiting,
+                   clock-skew validation, consent_timestamp range)
 
 DESIGN-DECISIONS-PER-MISSION (intentional, not defects)
   ✓ AV-1  identity gating via public-key directory
@@ -952,16 +1550,42 @@ DESIGN-DECISIONS-PER-MISSION (intentional, not defects)
   ✓ AV-12 strict schema-version allowlist
   ✓ AV-13 parameterized binding only
   ✓ AV-14 scrubber-output schema gates
+  ✓ AV-29 attestation graph: persist exposes edges, consumers compose policy
+  ✓ AV-39 verify-via-persist single-source-of-truth (CIRISPersist#7 pattern)
 
 CARGO AUDIT
-  ✓ 0 vulnerabilities across 299 dependencies as of 2026-05-01
+  ✓ 0 vulnerabilities across deps as of v0.3.6
 ```
 
-All five integration-blocking exposures from the v0.1.1 baseline
-are closed. Phase 2 (audit-chain peer-replicate) closes AV-2 and
-AV-10 architecturally; v0.2.x track has explicit-rotation API and
-timing-oracle hardening. Lens integration can proceed against
-v0.1.2 with no known integration-blocker.
+**Twelve v0.2.0..v0.3.6 attack vectors closed**: federation
+directory integrity (AV-28..AV-30), hybrid PQC posture
+(AV-31..AV-33), wire-format extensions (AV-34..AV-37), DSAR + verify
+primitives (AV-38..AV-39).
+
+Three architectural-closure patterns repeated across the surface:
+
+1. **Single-source-of-truth substrate** — canonicalization
+   (CIRISPersist#7), DSAR primitive (CIRISPersist#10),
+   verify_hybrid (CIRISPersist#14). Federation peers consume
+   through persist's API; no parallel implementation paths
+   to drift across.
+2. **Per-key authorization scope** — DSAR (AV-38) and federation
+   directory writes (AV-28). The signing key IS the authorization
+   scope, not a filter parameter.
+3. **Substrate exposes edges; consumer composes policy** —
+   attestation graph (AV-29), verify policy (AV-31, AV-39).
+   Persist doesn't ship `is_trusted()`; consumers walk the graph
+   and pick `HybridPolicy` per-peer.
+
+Phase 2 (peer-replicate audit-chain validation) closes AV-2 / AV-10
+architecturally; v0.4.x track holds the residual P2 hardening from
+the original v0.1.2 baseline plus the v0.4.0
+`accord_public_keys` retirement coordinated with lens.
+
+Federation peers (CIRISEdge, CIRISLens, future partner sites) can
+integrate against v0.3.6 with no known integration-blocker. The
+breaking change vs v0.3.5 (per-key DSAR) is yanked-and-replaced at
+PyPI; only consumer pinning to a yanked v0.3.5 sees breakage.
 
 ---
 
@@ -975,6 +1599,21 @@ This document is updated:
   added for the new trait surfaces.
 - On every wire-format schema-version bump: AV-4 / AV-12 review.
 
-Last updated: 2026-05-01 (v0.1.2 — AV-5/6/7/9/15 closed; Path B
-schema reconciliation against the lens-canonical accord_public_keys
-shape complete).
+Last updated: 2026-05-03 (v0.3.6 — AV-28..AV-39 added covering
+federation directory, hybrid PQC, wire-format extensions, per-key
+DSAR, verify_hybrid surface). Previous landmarks:
+
+- 2026-05-01: v0.1.2 baseline — AV-5 / AV-6 / AV-7 / AV-9 / AV-15
+  closed; Path B schema reconciliation complete.
+- 2026-05-01: v0.1.5 — AV-26 multi-worker migration race closed.
+- 2026-05-02: v0.1.7..v0.1.9 — AV-27 keyring storage hardening.
+- 2026-05-02: v0.2.0 — federation directory + hybrid PQC scheme
+  (AV-28..AV-33).
+- 2026-05-02: v0.3.0 — deterministic dispatch, cross-shape
+  injection defense (AV-34..AV-35).
+- 2026-05-02: v0.3.1..v0.3.2 — cold-path PQC fill-in + sweep
+  primitive.
+- 2026-05-03: v0.3.3 — LLM_CALL parent-linkage strict-parse (AV-36).
+- 2026-05-03: v0.3.4 — deployment_profile cohort identity (AV-37).
+- 2026-05-03: v0.3.5 — DSAR primitive (per-agent shape; YANKED).
+- 2026-05-03: v0.3.6 — per-key DSAR (AV-38) + `verify_hybrid` (AV-39).
