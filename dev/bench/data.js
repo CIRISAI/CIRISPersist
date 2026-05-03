@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777829909515,
+  "lastUpdate": 1777832430724,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -5525,6 +5525,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 22544245,
             "range": "± 247061",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "abc684c1a0afff6c57a74ac95fd27118dfc40b41",
+          "message": "0.3.5 — DSAR primitive + page-cursor read primitive (CIRISLens#8)\n\nCloses CIRISLens#8 ASKs 1 + 3. ASK 2 (v0.4.0 timing for accord_public_keys\ndual-read retirement) answered via lens#8 comment.\n\nASK 1 — Engine.delete_traces_for_agent(agent_id_hash, include_federation_key=False):\nGDPR Article 17 / DSAR primitive. Always deletes trace_events +\ntrace_llm_calls (joined by trace_id from deleted set) atomically.\ninclude_federation_key=True additionally cascades federation_keys\n+ FK-cascade attestations/revocations. Persist's federation FKs\naren't ON DELETE CASCADE; ordered delete is what makes it safe.\nIdempotent. Persist owns substrate; lens owns the DSAR audit +\nsignature verification of the request envelope.\n\nASK 3 — Engine.fetch_trace_events_page(after_event_id, limit,\nagent_id_hash=None): page-cursor read primitive. Returns up to\nlimit rows where event_id > after_event_id. Caller orchestrates\nthe cursor (no FFI re-entry per row, no callback synchronization).\nSame shape as run_pqc_sweep: cursor at trait boundary, caller\ndrives. For cross-process consumers; lens-core analytical queries\nstay on cirislens_reader + direct SQL.\n\nBackend trait additions on memory + postgres + sqlite:\n- delete_traces_for_agent(agent_id_hash, include_federation_key)\n  -> DeleteSummary\n- fetch_trace_events_page(after_event_id, limit, agent_id_hash)\n  -> Vec<(i64, TraceEventRow)>\n\nDeleteSummary in src/store/types.rs (5 u64 counts + DateTime<Utc>).\nReasoningEventType::from_wire_str inverse for row-to-struct\nconversions (pg_row_to_event_row / sqlite_row_to_event_row).\n\nTests: 168 lib (+2 new memory-backend tests) + 22 integration\ngreen; clippy clean; cargo-deny clean.\n\nBridge: bump 0.3.4 → 0.3.5 in api/requirements.txt. Lens DSAR\nhandler folds onto engine.delete_traces_for_agent — drops the\ndirect DELETE on accord_traces.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-03T13:14:13-05:00",
+          "tree_id": "a161efd09d9d3cdc223ddc44f62708e0087b409b",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/abc684c1a0afff6c57a74ac95fd27118dfc40b41"
+        },
+        "date": 1777832430436,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 104062,
+            "range": "± 1467",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 263507,
+            "range": "± 2096",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 577787,
+            "range": "± 2587",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 2073194,
+            "range": "± 8839",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 388,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1644,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8359,
+            "range": "± 36",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 362,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3155,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9686,
+            "range": "± 21",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42296,
+            "range": "± 119",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 632,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2158419,
+            "range": "± 230484",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6680250,
+            "range": "± 559918",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 24227435,
+            "range": "± 1335245",
             "unit": "ns/iter"
           }
         ]
