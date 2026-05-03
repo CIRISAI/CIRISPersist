@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777837805036,
+  "lastUpdate": 1777841732295,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -6095,6 +6095,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25931686,
             "range": "± 182268",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "bbdd76710643a77f4837fbfc1d52a500cb4e51c1",
+          "message": "0.4.1 — Rust-side verify primitives + curated prelude (CIRISEdge ask)\n\nThree asks from CIRISEdge to eliminate cross-repo drift surfaces in\nedge's verify pipeline. All non-breaking; new public Rust API surface\nonly.\n\n## verify::verify_hybrid_via_directory (Rust free function)\n\n```rust\npub async fn verify_hybrid_via_directory<F: FederationDirectory>(\n    directory: &F,\n    canonical_bytes: &[u8],\n    signing_key_id: &str,\n    ed25519_sig_b64: &str,\n    ml_dsa_65_sig_b64: Option<&str>,\n    policy: HybridPolicy,\n    row_age: Option<Duration>,\n) -> Result<VerifyOutcome, VerifyError>;\n```\n\nPyO3 Engine.verify_hybrid_via_directory now backs onto this Rust\nfree function — one implementation, both surfaces (CIRISPersist#7\nsingle-source-of-truth pattern). Same shape parse_hybrid_policy\nhelper extracted; verify_hybrid PyO3 path simplified to call it.\n\n## verify::canonicalize_envelope_for_signing (Rust free function)\n\nStrips top-level signature + signature_pqc fields, applies\nPythonJsonDumpsCanonicalizer. Closes AV-5 class drift surface\n(canonicalization mismatch between sender and verifier) by making\nthe strip rule single-source-of-truth.\n\nPyO3: engine.canonicalize_envelope_for_signing(envelope_json) -> bytes\n\n## verify::body_sha256 (Rust free function)\n\nSHA-256 of body verbatim wire bytes. Used by body_sha256_prefix\nforensic join key + in_reply_to ACK matching. Takes &RawValue so\ncallers hash bytes they received, not re-serialized form.\n\nserde_json features adds raw_value (already had arbitrary_precision).\n\nPyO3: engine.body_sha256(body_bytes) -> bytes\n\n## ciris_persist::prelude\n\nCurated re-exports for federation peers:\n- Trait surfaces: FederationDirectory, OutboundQueue, Backend\n- Verify primitives: verify_hybrid_via_directory + via_directory\n  variants, canonicalize_envelope_for_signing, body_sha256, etc.\n- Outbound types: AbandonedReason, OutboundFailureOutcome,\n  OutboundFilter, OutboundRow, OutboundStatus, QueueId\n- Federation types: Attestation, HybridPendingRow, KeyRecord,\n  Revocation, SignedAttestation, SignedKeyRecord, SignedRevocation\n\n`use ciris_persist::prelude::*` covers the substrate surface in\none import. Curated (not glob re-export); internal types stay\nsub-module-imported.\n\n## Tests\n\n179 lib (+2 new) + 22 integration green; clippy clean; cargo-deny\nclean. Tests verify:\n- canonicalize_envelope_for_signing strips signature fields →\n  signed and unsigned envelopes produce byte-identical canonical\n- body_sha256 == sha256(body.get().as_bytes()) directly\n\nEdge's verify pipeline collapses from ~150 lines hand-rolled to\n~30 lines composed against persist's prelude.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-03T15:47:56-05:00",
+          "tree_id": "eb9a7e1e9d9a5afd3b78e74460b0111dbf9538a2",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/bbdd76710643a77f4837fbfc1d52a500cb4e51c1"
+        },
+        "date": 1777841731762,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 109000,
+            "range": "± 361",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 260542,
+            "range": "± 9461",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 563478,
+            "range": "± 5818",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1998706,
+            "range": "± 147062",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 343,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1342,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8218,
+            "range": "± 310",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 358,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3281,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9806,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42166,
+            "range": "± 95",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 649,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2248358,
+            "range": "± 121535",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7011603,
+            "range": "± 147435",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25855154,
+            "range": "± 502984",
             "unit": "ns/iter"
           }
         ]
