@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777770388419,
+  "lastUpdate": 1777770787297,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -4955,6 +4955,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 24019043,
             "range": "± 202768",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "9d207f9450303522fb4d28eba8f7247a788acb21",
+          "message": "fmt: apply rustfmt to v0.3.2 sweep additions\n\nCI fmt-check caught three rustfmt-prefers-tighter-grouping diffs in\nthe v0.3.2 sweep code:\n- pyo3.rs:350 — single-line let summary = ...\n- pyo3.rs:1313 — single-line fn run_pqc_sweep<'py>(&self, py, batch_size)\n- pyo3.rs:1328 — block_on closure formatting\n- sqlite.rs:1048 — map_err one-liner\n\nNo semantic change. v0.3.2 wheels already published to PyPI; this\nkeeps main's clippy+fmt+audit job green for future commits.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-02T20:06:39-05:00",
+          "tree_id": "b417fcaf9e75b4e282cbeb06c382fcec493ac2ae",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/9d207f9450303522fb4d28eba8f7247a788acb21"
+        },
+        "date": 1777770786698,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 96116,
+            "range": "± 5347",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 237736,
+            "range": "± 882",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 520931,
+            "range": "± 132760",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1848932,
+            "range": "± 19840",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 342,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1457,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7544,
+            "range": "± 91",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 353,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 2926,
+            "range": "± 18",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 8975,
+            "range": "± 66",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 40148,
+            "range": "± 231",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 622,
+            "range": "± 16",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2172939,
+            "range": "± 75431",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6337359,
+            "range": "± 257374",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 22283852,
+            "range": "± 222355",
             "unit": "ns/iter"
           }
         ]
