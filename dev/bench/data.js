@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777835615607,
+  "lastUpdate": 1777837321038,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -5867,6 +5867,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 22673056,
             "range": "± 454224",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "880aafa30c457a929204a3cabc9fe7fe828f3512",
+          "message": "v0.4.0 [WIP]: edge_outbound_queue substrate (CIRISPersist#16)\n\nV007 migration (postgres + sqlite): new cirislens.edge_outbound_queue\ntable. 5-state machine (pending → sending → awaiting_ack → delivered\n| abandoned). Per-row policy copied at enqueue (max_attempts,\nttl_seconds, ack_timeout_seconds — message-type policy changes don't\nretroactively break in-flight rows). Optimistic claim\n(claimed_until + claimed_by) for multi-instance dispatch (CIRISEdge\nOQ-06).\n\nsrc/outbound/ — new module:\n- mod.rs: OutboundQueue trait (15 methods) + Error + types re-export\n- types.rs: OutboundRow, QueueId, OutboundStatus, AbandonedReason,\n  OutboundFailureOutcome, OutboundFilter\n\nBackend impls (memory + postgres + sqlite):\n- enqueue_outbound, claim_pending_outbound (FOR UPDATE SKIP LOCKED\n  on postgres), mark_transport_delivered, mark_transport_failed\n  (retry-vs-abandon decision in-transaction), mark_replay_resolved\n  (idempotent recovery), match_ack_to_outbound (content-derived\n  via body_sha256), mark_ack_received, sweep_ack_timeouts,\n  sweep_ttl_expired, sweep_expired_claims, outbound_status,\n  list_outbound (filter-paginated), cancel_outbound, replay_abandoned\n\nPyO3 surface:\n- engine.enqueue_outbound(...) -> queue_id\n- engine.claim_pending_outbound(batch_size, claim_duration_seconds,\n  claimed_by) -> list[dict]\n- engine.mark_transport_delivered/failed/replay_resolved\n- engine.match_ack_to_outbound(in_reply_to_sha256) -> dict|None\n- engine.mark_ack_received(queue_id, ack_envelope_bytes)\n- engine.sweep_ack_timeouts/ttl_expired/expired_claims -> int\n- engine.outbound_status(queue_id) -> dict|None\n- engine.list_outbound(filter args) -> list[dict]\n- engine.cancel_outbound/replay_abandoned\n\nStable error tokens via outbound_err_to_py: outbound_invalid_argument,\noutbound_not_found, outbound_invalid_transition, outbound_backend.\n\n177 lib tests still pass; all 3 backends compile across feature\ncombos. Outbound queue tests + drop-fallback + verify surface\nexpansion + bump + ship in followup commits.\n\nWIP for v0.4.0; not for tag yet.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-03T14:35:41-05:00",
+          "tree_id": "4f793f1e40023a78b9a2fd775f19faa23f20174b",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/880aafa30c457a929204a3cabc9fe7fe828f3512"
+        },
+        "date": 1777837320673,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 95961,
+            "range": "± 1511",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 237289,
+            "range": "± 709",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 519040,
+            "range": "± 2460",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1848351,
+            "range": "± 15130",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 343,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1507,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7518,
+            "range": "± 102",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 377,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3089,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9496,
+            "range": "± 56",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41741,
+            "range": "± 297",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 621,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2179674,
+            "range": "± 90577",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6334790,
+            "range": "± 362910",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 22456939,
+            "range": "± 260285",
             "unit": "ns/iter"
           }
         ]
