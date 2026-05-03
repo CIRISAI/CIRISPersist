@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777841732295,
+  "lastUpdate": 1777847936644,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -6209,6 +6209,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25855154,
             "range": "± 502984",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "b0f6fa4bb321ed65a32b268be9b842c11be2814b",
+          "message": "0.4.2 — Rust-public StewardSigner (CIRISPersist#17, CIRISLensCore)\n\nCloses CIRISPersist#17. CIRISLensCore (rlib path, never PyO3) needs\nto sign detection events via persist's steward identity per its\nmission lock-in. v0.4.2 lifts the construction + sign primitives\nto a Rust-public struct and refactors PyO3 Engine to back onto it\n— one implementation, both surfaces (CIRISPersist#7 pattern).\n\n## signing::StewardSigner (Rust public API)\n\n- StewardSignerConfig: key_id + key_path + optional pqc_key_id +\n  pqc_key_path. Both-or-neither PQC pair validated at construction.\n- StewardSigner::from_config — mirrors PyO3 Engine ctor steward\n  wiring exactly (32-byte raw Ed25519 seed + MlDsa65SoftwareSigner\n  from_seed_file). Same tracing::info observability shape.\n- sign_ed25519(message) -> [u8; 64] — hot path; sync.\n- sign_ml_dsa_65(message) -> Vec<u8> — cold path; async (PqcSigner\n  trait async; HW signers may dispatch async I/O).\n- sign_hybrid(message) -> HybridSignature — Ed25519 + ML-DSA-65\n  over `(message || classical_sig)` (bound signature) returning\n  ciris_crypto::HybridSignature shape.\n- Accessors: key_id, pqc_key_id, public_key_b64,\n  pqc_public_key_b64 (async).\n\nConstruction errors typed: SeedRead, SeedLength,\nPqcConfigInconsistent, PqcSeedLoad. Sign errors typed:\nPqcNotConfigured, PqcSign.\n\n## PyO3 refactor — single-source-of-truth\n\nPyEngine previously held 4 steward fields (steward_signing_key,\nsteward_key_id, steward_pqc_signer, steward_pqc_key_id). v0.4.2\ncollapses to one Option<Arc<StewardSigner>>; PyO3 methods are now\nthin wrappers:\n\n- engine.steward_sign → signer.sign_ed25519\n- engine.steward_pqc_sign → signer.sign_ml_dsa_65\n- engine.steward_public_key_b64 → signer.public_key_b64\n- engine.steward_pqc_public_key_b64 → signer.pqc_public_key_b64\n- engine.steward_key_id → signer.key_id\n- engine.steward_pqc_key_id → signer.pqc_key_id\n\nCold-path PQC fill-in spawns capture signer.pqc_signer_arc()\ninstead of the old direct steward_pqc_signer.clone().\n\nPython contract is unchanged — error tokens, return shapes,\nboth-or-neither validation all match v0.4.1 byte-for-byte. The\ninline seed-load logic moved to StewardSigner::from_config; PyO3\ncalls it.\n\n## Prelude\n\nprelude::* now also includes StewardSigner, StewardSignerConfig,\nStewardSignerError.\n\n## Tests\n\n183 lib (+4 new signing tests) + 22 integration green; clippy\nclean; cargo-deny clean.\n\nCIRISLensCore Phase 1 detection-event signing (LC-AV-2, LC-AV-11,\nLC-AV-18) can now compose against StewardSigner directly.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-03T17:32:20-05:00",
+          "tree_id": "c5e821c9c4ff8724aee99089a45c3403ff88bc26",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/b0f6fa4bb321ed65a32b268be9b842c11be2814b"
+        },
+        "date": 1777847936144,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101625,
+            "range": "± 2178",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 242304,
+            "range": "± 1787",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 525785,
+            "range": "± 23586",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1853552,
+            "range": "± 24769",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 374,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1515,
+            "range": "± 33",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8707,
+            "range": "± 680",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 360,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3012,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9399,
+            "range": "± 32",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41465,
+            "range": "± 1277",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 625,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2271632,
+            "range": "± 113411",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6632747,
+            "range": "± 68553",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23681042,
+            "range": "± 217014",
             "unit": "ns/iter"
           }
         ]
