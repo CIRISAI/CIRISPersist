@@ -5,6 +5,134 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.3.1] — 2026-05-02
+
+**Persist-owned cold-path PQC fill-in.** Closes
+[CIRISPersist#10](https://github.com/CIRISAI/CIRISPersist/issues/10).
+Built on top of CIRISVerify v1.9.0's new `PqcSigner` trait +
+`MlDsa65SoftwareSigner` (CIRISVerify#5).
+
+### What ships
+
+**Two new constructor params on `Engine`** (both optional, both-or-neither):
+
+```python
+engine = Engine(
+    dsn=...,
+    signing_key_id="lens-scrub-v1",          # P-256 scrub envelopes
+    scrubber=...,
+    steward_key_id="lens-steward",            # Ed25519 federation steward
+    steward_key_path="/app/keys/lens-steward.seed",
+    steward_pqc_key_id="lens-steward-pqc",    # NEW — ML-DSA-65 federation steward
+    steward_pqc_key_path="/app/keys/lens-steward.mldsa.seed",  # NEW — 32B raw seed
+)
+```
+
+The 32-byte seed is loaded via `ciris_keyring::MlDsa65SoftwareSigner::from_seed_file`
+at constructor time. Seed bytes never enter the Python process —
+same FFI-boundary discipline as Ed25519. HW acceleration when
+post-quantum HSMs land is verify's responsibility (PqcSigner trait
+is the dispatch surface).
+
+**Three new `Engine` methods**:
+
+```python
+engine.steward_pqc_public_key_b64() -> str   # 1952B raw → ~2604 chars
+engine.steward_pqc_key_id() -> str            # the configured identifier
+engine.steward_pqc_sign(message: bytes) -> bytes   # 3309-byte raw sig (FIPS 204 final)
+```
+
+All three raise `ValueError` if no PQC steward identity configured —
+unchanged behavior for v0.3.0 callers, fully backwards-compatible.
+
+**Auto-fire after federation writes**. When `steward_pqc_*` is
+configured, persist automatically:
+
+1. Captures the row's `registration_envelope` (or attestation /
+   revocation envelope) + `scrub_signature_classical` BEFORE the
+   synchronous put consumes the record.
+2. Awaits the synchronous put — Python returns once the row lands
+   hybrid-pending.
+3. `tokio::spawn`s a fire-and-forget cold-path task that:
+   - Canonicalizes the envelope via `PythonJsonDumpsCanonicalizer`
+   - Decodes `classical_sig` from base64
+   - Concatenates `(canonical || classical_sig)` — bound signature
+     pattern matching CIRISVerify's `HybridSignature` spec
+   - Signs with ML-DSA-65 via `PqcSigner::sign`
+   - Calls `attach_*_pqc_signature` to populate the PQC fields and
+     timestamp `pqc_completed_at`
+
+Per the writer contract in `migrations/postgres/lens/V004__federation_directory.sql`:
+"kick off IMMEDIATELY after Ed25519 sign, not delayed/batched/scheduled,
+just off the synchronous request path." The `tokio::spawn` post-put
+matches that exactly — synchronous Python returns once the row
+commits; PQC catches up within seconds.
+
+Failure mode: if cold-path sign or attach fails, the row stays
+hybrid-pending. `tracing::warn!` surfaces the failure in operator
+logs; consumers can fill in via the v0.2.0 `attach_*_pqc_signature`
+escape hatch on their own schedule.
+
+### Why persist owns the cold-path
+
+Per CIRISPersist#10:
+
+1. The writer contract LIVES in persist's V004 schema header. Persist
+   owns the schema and the contract; persist owns making the contract
+   happen.
+2. "One substrate, N consumers" — each consumer reimplementing cold-
+   path drifts (Python ML-DSA library choice, retry policy, byte
+   concat handling, failure semantics). Same drift surface
+   CIRISPersist#7 burned us with on canonicalization; same mitigation
+   pattern (`engine.canonicalize_envelope`, `engine.steward_sign`,
+   now `engine` auto-fires the cold-path).
+3. The cryptographic primitive is in `ciris-keyring v1.9.0+` — the
+   right architectural home (HW acceleration, storage descriptor,
+   lifecycle), not raw `ml-dsa` direct dep.
+4. The seed-management pattern already exists for Ed25519
+   (`steward_key_path`); ML-DSA counterpart is the same shape, second
+   algorithm.
+
+### Bridge action
+
+Bridge mounts the ML-DSA-65 seed file alongside the existing
+Ed25519 seed:
+
+```yaml
+# production.yml
+volumes:
+  - /opt/ciris/keys/lens-steward.seed:/app/keys/lens-steward.seed:ro
+  - /opt/ciris/keys/lens-steward.mldsa.seed:/app/keys/lens-steward.mldsa.seed:ro  # NEW
+```
+
+Lens `Engine(...)` constructor adds the two new params. From that
+point forward, every `engine.put_public_key`/`put_attestation`/`put_revocation`
+auto-fires cold-path PQC; pqc_completed_at populates within seconds
+of the hot-path write.
+
+### Bridge's 648 hybrid-pending rows
+
+Run the existing migrator script (or any read-and-republish loop
+that calls `engine.put_public_key` for each pending row) — auto-
+fire kicks in for each, draining the queue. Or call
+`engine.attach_key_pqc_signature` manually with bridge-side
+ML-DSA signatures for the one-shot backfill. Same effect; same
+schema state at the end.
+
+### Tests
+
+157 lib + 22 integration tests green; clippy clean across all
+features; cargo-deny clean. New tests covering auto-fire end-to-end
+land in v0.3.x as production traffic patterns surface.
+
+### Deps
+
+- `ciris-keyring v1.8.6 → v1.9.0` (adds `pqc-ml-dsa` feature →
+  `MlDsa65SoftwareSigner`, `PqcSigner` trait, `get_platform_pqc_signer`
+  factory; closes CIRISVerify#5)
+- `ciris-verify-core v1.8.6 → v1.9.0` (no behavior change for persist
+  beyond pulling the same workspace's ml-dsa-rc.3)
+
 ## [0.3.0] — 2026-05-02
 
 **Wire format 2.7.9 — locked against `CIRISAgent/FSD/TRACE_WIRE_FORMAT.md @ cc41f315f`** (release/2.7.9 HEAD; byte-identical at v2.7.9-stable). QA runner cuts a `release/2.7.9` signed build today; persist v0.3.0 must be on PyPI before that build deploys, or persist v0.2.x will fail to verify the new shape.

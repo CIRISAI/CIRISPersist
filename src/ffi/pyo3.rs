@@ -22,7 +22,8 @@
 use std::sync::Arc;
 
 use ciris_keyring::{
-    get_platform_signer, is_hardware_available, HardwareSigner, KeyringScope, StorageDescriptor,
+    get_platform_signer, is_hardware_available, HardwareSigner, KeyringScope,
+    MlDsa65SoftwareSigner, PqcSigner, StorageDescriptor,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -72,6 +73,36 @@ pub struct PyEngine {
     /// the lens-steward `federation_keys` row and as the `scrub_key_id`
     /// for federation rows the lens publishes.
     steward_key_id: Option<String>,
+    /// v0.3.1 — Steward ML-DSA-65 signer for cold-path PQC fill-in
+    /// (CIRISPersist#10). Loaded from a 32-byte raw seed file at
+    /// constructor time when both `steward_pqc_key_id` and
+    /// `steward_pqc_key_path` are provided. Held as `Arc<dyn PqcSigner>`
+    /// so the auto-fire tokio task in `put_public_key` /
+    /// `put_attestation` / `put_revocation` can clone and own its own
+    /// reference for the duration of the cold-path sign.
+    ///
+    /// Persist owns the cold-path so consumers (lens, registry,
+    /// partner sites) don't reimplement it independently and drift —
+    /// same lesson as `canonicalize_envelope` post-CIRISPersist#7.
+    /// Per the writer contract in V004 schema header: kick off
+    /// IMMEDIATELY after Ed25519 sign, not delayed/batched/scheduled,
+    /// just off the synchronous request path. `tokio::spawn` post-put
+    /// matches that intent — the row lands hybrid-pending, classical
+    /// sig is on it, PQC catches up within seconds.
+    ///
+    /// `None` when no PQC steward key is configured — the auto-fire
+    /// path no-ops and the row stays hybrid-pending until a writer
+    /// fills it via `attach_*_pqc_signature` (the v0.2.0 escape hatch
+    /// for importing rows signed elsewhere).
+    steward_pqc_signer: Option<std::sync::Arc<dyn PqcSigner>>,
+    /// Identifier for the PQC steward identity (e.g.,
+    /// `lens-steward-pqc`). Distinct from `steward_key_id` (the
+    /// Ed25519 identity) because in deployments where the keys live
+    /// in different storage backends (Ed25519 in
+    /// ciris-keyring's classical signer, ML-DSA-65 in
+    /// `MlDsa65SoftwareSigner`'s file-backed seed) the alias spaces
+    /// don't have to match. Most deployments will pin them equal.
+    steward_pqc_key_id: Option<String>,
 }
 
 #[pymethods]
@@ -111,7 +142,9 @@ impl PyEngine {
     /// missing/wrong-size.
     #[new]
     #[pyo3(signature = (dsn, signing_key_id, scrubber=None,
-                        steward_key_id=None, steward_key_path=None))]
+                        steward_key_id=None, steward_key_path=None,
+                        steward_pqc_key_id=None, steward_pqc_key_path=None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         dsn: &str,
@@ -119,6 +152,8 @@ impl PyEngine {
         scrubber: Option<Py<PyAny>>,
         steward_key_id: Option<String>,
         steward_key_path: Option<String>,
+        steward_pqc_key_id: Option<String>,
+        steward_pqc_key_path: Option<String>,
     ) -> PyResult<Self> {
         // Build a multi-thread runtime once per Engine instance.
         let runtime =
@@ -264,6 +299,40 @@ impl PyEngine {
             }
         };
 
+        // v0.3.1 — Optional ML-DSA-65 steward signer for cold-path
+        // PQC fill-in (CIRISPersist#10). Same both-or-neither
+        // construction shape as the Ed25519 steward identity.
+        // ciris-keyring v1.9.0's MlDsa65SoftwareSigner reads a 32-byte
+        // raw seed file (parallel to Ed25519SoftwareSigner / the
+        // existing steward_key_path); the seed bytes never enter the
+        // Python process. HW acceleration when post-quantum HSMs land
+        // is verify's responsibility (PqcSigner trait is the
+        // dispatch surface).
+        let (steward_pqc_key_id_owned, steward_pqc_signer): (
+            Option<String>,
+            Option<std::sync::Arc<dyn PqcSigner>>,
+        ) = match (steward_pqc_key_id, steward_pqc_key_path) {
+            (None, None) => (None, None),
+            (Some(id), Some(path)) => {
+                let signer = MlDsa65SoftwareSigner::from_seed_file(&path, &id).map_err(|e| {
+                    PyRuntimeError::new_err(format!("ML-DSA-65 steward seed load ({path}): {e}"))
+                })?;
+                tracing::info!(
+                    steward_pqc_key_id = id.as_str(),
+                    seed_path = path.as_str(),
+                    "ciris-persist: PQC steward identity loaded (ML-DSA-65, software)"
+                );
+                let arc: std::sync::Arc<dyn PqcSigner> = std::sync::Arc::new(signer);
+                (Some(id), Some(arc))
+            }
+            _ => {
+                return Err(PyValueError::new_err(
+                    "steward_pqc_key_id and steward_pqc_key_path must both be provided \
+                     or both omitted",
+                ));
+            }
+        };
+
         Ok(PyEngine {
             backend,
             runtime,
@@ -272,6 +341,8 @@ impl PyEngine {
             signer_key_id: signing_key_id.to_owned(),
             steward_signing_key,
             steward_key_id: steward_key_id_owned,
+            steward_pqc_signer,
+            steward_pqc_key_id: steward_pqc_key_id_owned,
         })
     }
 
@@ -468,6 +539,93 @@ impl PyEngine {
         })?;
         let sig = key.sign(message.as_bytes());
         Ok(PyBytes::new(py, &sig.to_bytes()).unbind())
+    }
+
+    /// v0.3.1 — Return the steward ML-DSA-65 public key (base64) for
+    /// publishing to consumers (federation_keys.pubkey_ml_dsa_65_base64,
+    /// peer pinning, fingerprint registries). Distinct from
+    /// `steward_public_key_b64()` (the Ed25519 steward identity).
+    ///
+    /// 1952-byte raw ML-DSA-65 public key per FIPS 204 final, base64
+    /// standard alphabet → ~2604 chars.
+    ///
+    /// Raises `ValueError` if the Engine wasn't constructed with both
+    /// `steward_pqc_key_id` + `steward_pqc_key_path` (the cold-path
+    /// PQC role isn't configured).
+    fn steward_pqc_public_key_b64(&self, py: Python<'_>) -> PyResult<String> {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        let signer = self.steward_pqc_signer.clone().ok_or_else(|| {
+            PyValueError::new_err(
+                "no PQC steward key configured (pass steward_pqc_key_id + \
+                 steward_pqc_key_path to the Engine constructor)",
+            )
+        })?;
+        let runtime = self.runtime.clone();
+        let bytes = py.detach(|| {
+            runtime.block_on(async move {
+                signer
+                    .public_key()
+                    .await
+                    .map_err(|e| PyRuntimeError::new_err(format!("PQC public_key: {e}")))
+            })
+        })?;
+        Ok(B64.encode(&bytes))
+    }
+
+    /// v0.3.1 — Return the configured `steward_pqc_key_id`. Distinct
+    /// from `steward_key_id` (the Ed25519 identity); deployments will
+    /// typically pin them equal but the alias spaces don't have to
+    /// match.
+    fn steward_pqc_key_id(&self, _py: Python<'_>) -> PyResult<String> {
+        self.steward_pqc_key_id.clone().ok_or_else(|| {
+            PyValueError::new_err(
+                "no PQC steward key configured (pass steward_pqc_key_id + \
+                 steward_pqc_key_path to the Engine constructor)",
+            )
+        })
+    }
+
+    /// v0.3.1 — Sign arbitrary bytes with the steward ML-DSA-65
+    /// signing key. Returns the 3309-byte raw signature (FIPS 204
+    /// final).
+    ///
+    /// Same FFI-boundary discipline as `steward_sign()`: bytes in,
+    /// bytes out, no key material crossing the boundary. Persist
+    /// owns the cold-path PQC sign automatically after federation
+    /// writes (CIRISPersist#10) — this method is the explicit-call
+    /// escape hatch for consumers that need a one-off sign outside
+    /// the auto-fire flow.
+    ///
+    /// Per the writer contract in V004 schema header, cold-path
+    /// signs over `(canonical_envelope_bytes || classical_sig_bytes)`
+    /// — the bound-signature pattern matching CIRISVerify's
+    /// `HybridSignature` shape (`ciris-crypto/src/types.rs:156`).
+    /// Callers concatenate the two byte sequences before calling.
+    ///
+    /// Raises `ValueError` if no PQC steward key is configured.
+    fn steward_pqc_sign<'py>(
+        &self,
+        py: Python<'py>,
+        message: &Bound<'py, PyBytes>,
+    ) -> PyResult<Py<PyBytes>> {
+        let signer = self.steward_pqc_signer.clone().ok_or_else(|| {
+            PyValueError::new_err(
+                "no PQC steward key configured (pass steward_pqc_key_id + \
+                 steward_pqc_key_path to the Engine constructor)",
+            )
+        })?;
+        let runtime = self.runtime.clone();
+        let msg = message.as_bytes().to_vec();
+        let sig_bytes = py.detach(|| {
+            runtime.block_on(async move {
+                signer
+                    .sign(&msg)
+                    .await
+                    .map_err(|e| PyRuntimeError::new_err(format!("PQC sign: {e}")))
+            })
+        })?;
+        Ok(PyBytes::new(py, &sig_bytes).unbind())
     }
 
     /// v0.1.18 — debug helper for canonical-byte drift diagnosis
@@ -718,13 +876,62 @@ impl PyEngine {
         let record: crate::federation::SignedKeyRecord =
             serde_json::from_str(signed_key_record_json)
                 .map_err(|e| PyValueError::new_err(format!("SignedKeyRecord JSON decode: {e}")))?;
+
+        // v0.3.1 — cold-path PQC fill-in (CIRISPersist#10). Capture
+        // the inputs the auto-fire task needs BEFORE backend consumes
+        // the record. Cold-path skips when no PQC steward configured;
+        // row stays hybrid-pending and consumers can fill via the
+        // attach_*_pqc_signature escape hatch on their own schedule.
+        let cold_path_inputs = self.steward_pqc_signer.clone().map(|signer| {
+            (
+                signer,
+                record.record.key_id.clone(),
+                record.record.registration_envelope.clone(),
+                record.record.scrub_signature_classical.clone(),
+            )
+        });
+
         py.detach(|| {
             runtime.block_on(async move {
                 use crate::federation::FederationDirectory;
                 backend
                     .put_public_key(record)
                     .await
-                    .map_err(federation_err_to_py)
+                    .map_err(federation_err_to_py)?;
+
+                // Cold-path fire-and-forget. We're already inside
+                // tokio::Runtime::block_on, so tokio::spawn here
+                // schedules the task without waiting. The synchronous
+                // Python call returns as soon as the put commits;
+                // PQC catches up within seconds.
+                if let Some((signer, key_id, envelope, classical_sig_b64)) = cold_path_inputs {
+                    let backend = backend.clone();
+                    tokio::spawn(async move {
+                        match cold_path_pqc_sign(&*signer, &envelope, &classical_sig_b64).await {
+                            Ok((pubkey_b64, pqc_sig_b64)) => {
+                                if let Err(e) = backend
+                                    .attach_key_pqc_signature(&key_id, &pubkey_b64, &pqc_sig_b64)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        key_id = key_id.as_str(),
+                                        error = %e,
+                                        "cold-path PQC attach_key_pqc_signature failed; \
+                                         row stays hybrid-pending"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    key_id = key_id.as_str(),
+                                    error = %e,
+                                    "cold-path PQC sign failed; row stays hybrid-pending"
+                                );
+                            }
+                        }
+                    });
+                }
+                Ok(())
             })
         })
     }
@@ -781,13 +988,58 @@ impl PyEngine {
             serde_json::from_str(signed_attestation_json).map_err(|e| {
                 PyValueError::new_err(format!("SignedAttestation JSON decode: {e}"))
             })?;
+
+        // v0.3.1 — cold-path PQC fill-in (CIRISPersist#10).
+        let cold_path_inputs = self.steward_pqc_signer.clone().map(|signer| {
+            (
+                signer,
+                att.attestation.attestation_id.clone(),
+                att.attestation.attestation_envelope.clone(),
+                att.attestation.scrub_signature_classical.clone(),
+            )
+        });
+
         py.detach(|| {
             runtime.block_on(async move {
                 use crate::federation::FederationDirectory;
                 backend
                     .put_attestation(att)
                     .await
-                    .map_err(federation_err_to_py)
+                    .map_err(federation_err_to_py)?;
+                if let Some((signer, attestation_id, envelope, classical_sig_b64)) =
+                    cold_path_inputs
+                {
+                    let backend = backend.clone();
+                    tokio::spawn(async move {
+                        match cold_path_pqc_sign(&*signer, &envelope, &classical_sig_b64).await {
+                            Ok((_pubkey_b64, pqc_sig_b64)) => {
+                                // Attestations don't carry their own pubkey
+                                // (they reference scrub_key_id's federation_keys
+                                // pubkey for verification); only the PQC
+                                // signature attaches.
+                                if let Err(e) = backend
+                                    .attach_attestation_pqc_signature(&attestation_id, &pqc_sig_b64)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        attestation_id = attestation_id.as_str(),
+                                        error = %e,
+                                        "cold-path PQC attach_attestation_pqc_signature failed; \
+                                         row stays hybrid-pending"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    attestation_id = attestation_id.as_str(),
+                                    error = %e,
+                                    "cold-path PQC sign failed; row stays hybrid-pending"
+                                );
+                            }
+                        }
+                    });
+                }
+                Ok(())
             })
         })
     }
@@ -836,13 +1088,53 @@ impl PyEngine {
         let runtime = self.runtime.clone();
         let rev: crate::federation::SignedRevocation = serde_json::from_str(signed_revocation_json)
             .map_err(|e| PyValueError::new_err(format!("SignedRevocation JSON decode: {e}")))?;
+
+        // v0.3.1 — cold-path PQC fill-in (CIRISPersist#10).
+        let cold_path_inputs = self.steward_pqc_signer.clone().map(|signer| {
+            (
+                signer,
+                rev.revocation.revocation_id.clone(),
+                rev.revocation.revocation_envelope.clone(),
+                rev.revocation.scrub_signature_classical.clone(),
+            )
+        });
+
         py.detach(|| {
             runtime.block_on(async move {
                 use crate::federation::FederationDirectory;
                 backend
                     .put_revocation(rev)
                     .await
-                    .map_err(federation_err_to_py)
+                    .map_err(federation_err_to_py)?;
+                if let Some((signer, revocation_id, envelope, classical_sig_b64)) = cold_path_inputs
+                {
+                    let backend = backend.clone();
+                    tokio::spawn(async move {
+                        match cold_path_pqc_sign(&*signer, &envelope, &classical_sig_b64).await {
+                            Ok((_pubkey_b64, pqc_sig_b64)) => {
+                                if let Err(e) = backend
+                                    .attach_revocation_pqc_signature(&revocation_id, &pqc_sig_b64)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        revocation_id = revocation_id.as_str(),
+                                        error = %e,
+                                        "cold-path PQC attach_revocation_pqc_signature failed; \
+                                         row stays hybrid-pending"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    revocation_id = revocation_id.as_str(),
+                                    error = %e,
+                                    "cold-path PQC sign failed; row stays hybrid-pending"
+                                );
+                            }
+                        }
+                    });
+                }
+                Ok(())
             })
         })
     }
@@ -958,6 +1250,52 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // Server-fault → RuntimeError (5xx).
         crate::federation::Error::Backend(_) => PyRuntimeError::new_err(kind),
     }
+}
+
+/// v0.3.1 — Cold-path PQC sign helper for the auto-fire flow after
+/// federation writes (CIRISPersist#10). Computes the bound-signature
+/// input (canonical_envelope_bytes || classical_sig_bytes), invokes
+/// the steward's ML-DSA-65 signer, and returns base64-encoded
+/// (pubkey, signature) ready for `attach_*_pqc_signature`.
+///
+/// Per the writer contract in `migrations/postgres/lens/V004__federation_directory.sql`:
+/// "kick off IMMEDIATELY after Ed25519 sign, not delayed/batched/scheduled,
+/// just off the synchronous request path." This helper runs on the
+/// tokio task spawned by put_public_key / put_attestation /
+/// put_revocation; the synchronous Python call has already returned.
+async fn cold_path_pqc_sign(
+    signer: &dyn PqcSigner,
+    envelope: &serde_json::Value,
+    classical_sig_b64: &str,
+) -> Result<(String, String), String> {
+    use crate::verify::canonical::Canonicalizer;
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+
+    let canonical = PythonJsonDumpsCanonicalizer
+        .canonicalize_value(envelope)
+        .map_err(|e| format!("canonicalize: {e}"))?;
+    let classical_sig = B64
+        .decode(classical_sig_b64)
+        .map_err(|e| format!("classical_sig base64 decode: {e}"))?;
+
+    // Bound signature: PQC covers (data || classical_sig). Same shape
+    // as CIRISVerify's HybridSignature spec — prevents stripping
+    // attacks where an attacker who breaks Ed25519 could otherwise
+    // replace the PQC signature with their own.
+    let mut input = Vec::with_capacity(canonical.len() + classical_sig.len());
+    input.extend_from_slice(&canonical);
+    input.extend_from_slice(&classical_sig);
+
+    let pqc_sig = signer
+        .sign(&input)
+        .await
+        .map_err(|e| format!("sign: {e}"))?;
+    let pubkey = signer
+        .public_key()
+        .await
+        .map_err(|e| format!("public_key: {e}"))?;
+    Ok((B64.encode(&pubkey), B64.encode(&pqc_sig)))
 }
 
 /// Scrubber bridge: wraps a Python callable in the [`Scrubber`]
