@@ -22,8 +22,8 @@
 use std::sync::Arc;
 
 use ciris_keyring::{
-    get_platform_signer, is_hardware_available, HardwareSigner, KeyringScope,
-    MlDsa65SoftwareSigner, PqcSigner, StorageDescriptor,
+    get_platform_signer, is_hardware_available, HardwareSigner, KeyringScope, PqcSigner,
+    StorageDescriptor,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -49,60 +49,29 @@ pub struct PyEngine {
     scrubber: Arc<dyn Scrubber>,
     signer: Arc<dyn HardwareSigner>,
     signer_key_id: String,
-    /// v0.2.2 — Federation steward Ed25519 signing key.
+    /// v0.4.2 (CIRISPersist#17) — Federation steward signer. One
+    /// struct now holds the Ed25519 + optional ML-DSA-65 identities
+    /// that the pre-v0.4.2 PyEngine carried as four separate fields
+    /// (`steward_signing_key`, `steward_key_id`, `steward_pqc_signer`,
+    /// `steward_pqc_key_id`). The PyO3 surface methods
+    /// (`steward_sign`, `steward_pqc_sign`, accessors) are now thin
+    /// wrappers over [`crate::signing::StewardSigner`] —
+    /// CIRISPersist#7 single-source-of-truth pattern repeated for
+    /// signing.
     ///
-    /// Distinct from `signer` (which is the scrub-envelope identity,
-    /// `signing_key_id` — typically P-256 via ciris-keyring) — the
-    /// steward identity is Ed25519 (matching the federation_keys
-    /// schema) and used to sign federation envelopes for keys/
-    /// attestations/revocations the lens publishes to persist's
-    /// federation directory.
-    ///
-    /// Loaded from a 32-byte raw seed file at constructor time when
-    /// both `steward_key_id` and `steward_key_path` are provided.
     /// `None` when the federation steward role isn't configured for
     /// this Engine instance — the `steward_*` methods return
     /// ValueError in that case.
     ///
     /// Lens process never sees the seed bytes after construction;
-    /// signing happens via `steward_sign(message)` which returns the
-    /// 64-byte raw signature, matching the FFI-boundary discipline of
-    /// `Engine.sign()`.
-    steward_signing_key: Option<ed25519_dalek::SigningKey>,
-    /// Identifier for the steward identity. Used as the `key_id` of
-    /// the lens-steward `federation_keys` row and as the `scrub_key_id`
-    /// for federation rows the lens publishes.
-    steward_key_id: Option<String>,
-    /// v0.3.1 — Steward ML-DSA-65 signer for cold-path PQC fill-in
-    /// (CIRISPersist#10). Loaded from a 32-byte raw seed file at
-    /// constructor time when both `steward_pqc_key_id` and
-    /// `steward_pqc_key_path` are provided. Held as `Arc<dyn PqcSigner>`
-    /// so the auto-fire tokio task in `put_public_key` /
-    /// `put_attestation` / `put_revocation` can clone and own its own
-    /// reference for the duration of the cold-path sign.
+    /// signing happens via `steward_sign(message)` /
+    /// `steward_pqc_sign(message)` returning raw signature bytes,
+    /// matching the FFI-boundary discipline of `Engine.sign()`.
     ///
-    /// Persist owns the cold-path so consumers (lens, registry,
-    /// partner sites) don't reimplement it independently and drift —
-    /// same lesson as `canonicalize_envelope` post-CIRISPersist#7.
-    /// Per the writer contract in V004 schema header: kick off
-    /// IMMEDIATELY after Ed25519 sign, not delayed/batched/scheduled,
-    /// just off the synchronous request path. `tokio::spawn` post-put
-    /// matches that intent — the row lands hybrid-pending, classical
-    /// sig is on it, PQC catches up within seconds.
-    ///
-    /// `None` when no PQC steward key is configured — the auto-fire
-    /// path no-ops and the row stays hybrid-pending until a writer
-    /// fills it via `attach_*_pqc_signature` (the v0.2.0 escape hatch
-    /// for importing rows signed elsewhere).
-    steward_pqc_signer: Option<std::sync::Arc<dyn PqcSigner>>,
-    /// Identifier for the PQC steward identity (e.g.,
-    /// `lens-steward-pqc`). Distinct from `steward_key_id` (the
-    /// Ed25519 identity) because in deployments where the keys live
-    /// in different storage backends (Ed25519 in
-    /// ciris-keyring's classical signer, ML-DSA-65 in
-    /// `MlDsa65SoftwareSigner`'s file-backed seed) the alias spaces
-    /// don't have to match. Most deployments will pin them equal.
-    steward_pqc_key_id: Option<String>,
+    /// Held as `Arc` so the auto-fire tokio task in `put_public_key`
+    /// / `put_attestation` / `put_revocation` can clone and own its
+    /// own reference for the duration of the cold-path sign.
+    steward_signer: Option<Arc<crate::signing::StewardSigner>>,
 }
 
 #[pymethods]
@@ -262,95 +231,57 @@ impl PyEngine {
             }),
         };
 
-        // v0.2.2 — optional steward identity for federation-directory
-        // signing. Both-or-neither: passing one without the other is
-        // a config error. When configured, load the 32-byte raw
-        // Ed25519 seed from `steward_key_path` (chmod 600 expected;
-        // OS handles the permission check on read).
-        let (steward_key_id_owned, steward_signing_key) = match (steward_key_id, steward_key_path) {
-            (None, None) => (None, None),
-            (Some(id), Some(path)) => {
-                let seed = std::fs::read(&path).map_err(|e| {
-                    PyRuntimeError::new_err(format!("steward seed read ({path}): {e}"))
-                })?;
-                if seed.len() != 32 {
-                    return Err(PyValueError::new_err(format!(
-                        "steward seed wrong length: got {} bytes from {path}, \
-                             expected 32 raw Ed25519 bytes",
-                        seed.len()
-                    )));
+        // v0.4.2 (CIRISPersist#17) — Steward identity wiring is now
+        // [`crate::signing::StewardSigner::from_config`]. Same
+        // both-or-neither contract on the Ed25519 + PQC pairs;
+        // identical seed-load semantics; identical tracing::info
+        // observability shape. The Rust function is the
+        // single-source-of-truth — both PyO3 callers (this) and
+        // Rust callers (CIRISLensCore, CIRISEdge) hit the same
+        // construction path.
+        let steward_signer: Option<Arc<crate::signing::StewardSigner>> =
+            match (steward_key_id, steward_key_path) {
+                (None, None) => {
+                    // Pair PQC config check before silently dropping a
+                    // PQC-only config — surface as the same typed error
+                    // the loaded path would.
+                    if steward_pqc_key_id.is_some() || steward_pqc_key_path.is_some() {
+                        return Err(PyValueError::new_err(
+                            "steward_pqc_key_* requires steward_key_id + steward_key_path",
+                        ));
+                    }
+                    None
                 }
-                let arr: [u8; 32] = seed.as_slice().try_into().expect("length-checked");
-                let signing = ed25519_dalek::SigningKey::from_bytes(&arr);
-                tracing::info!(
-                    steward_key_id = id.as_str(),
-                    steward_pubkey_b64 = %{
-                        use base64::engine::general_purpose::STANDARD as B64;
-                        use base64::Engine as _;
-                        B64.encode(signing.verifying_key().to_bytes())
-                    },
-                    "ciris-persist: steward identity loaded"
-                );
-                (Some(id), Some(signing))
-            }
-            _ => {
-                return Err(PyValueError::new_err(
-                    "steward_key_id and steward_key_path must both be provided \
+                (Some(key_id), Some(key_path)) => {
+                    let cfg = crate::signing::StewardSignerConfig {
+                        key_id,
+                        key_path: std::path::PathBuf::from(key_path),
+                        pqc_key_id: steward_pqc_key_id,
+                        pqc_key_path: steward_pqc_key_path.map(std::path::PathBuf::from),
+                    };
+                    let signer = crate::signing::StewardSigner::from_config(&cfg)
+                        .map_err(steward_signer_err_to_py)?;
+                    Some(Arc::new(signer))
+                }
+                _ => {
+                    return Err(PyValueError::new_err(
+                        "steward_key_id and steward_key_path must both be provided \
                          or both omitted",
-                ));
-            }
-        };
+                    ));
+                }
+            };
 
-        // v0.3.1 — Optional ML-DSA-65 steward signer for cold-path
-        // PQC fill-in (CIRISPersist#10). Same both-or-neither
-        // construction shape as the Ed25519 steward identity.
-        // ciris-keyring v1.9.0's MlDsa65SoftwareSigner reads a 32-byte
-        // raw seed file (parallel to Ed25519SoftwareSigner / the
-        // existing steward_key_path); the seed bytes never enter the
-        // Python process. HW acceleration when post-quantum HSMs land
-        // is verify's responsibility (PqcSigner trait is the
-        // dispatch surface).
-        let (steward_pqc_key_id_owned, steward_pqc_signer): (
-            Option<String>,
-            Option<std::sync::Arc<dyn PqcSigner>>,
-        ) = match (steward_pqc_key_id, steward_pqc_key_path) {
-            (None, None) => (None, None),
-            (Some(id), Some(path)) => {
-                let signer = MlDsa65SoftwareSigner::from_seed_file(&path, &id).map_err(|e| {
-                    PyRuntimeError::new_err(format!("ML-DSA-65 steward seed load ({path}): {e}"))
-                })?;
-                tracing::info!(
-                    steward_pqc_key_id = id.as_str(),
-                    seed_path = path.as_str(),
-                    "ciris-persist: PQC steward identity loaded (ML-DSA-65, software)"
-                );
-                let arc: std::sync::Arc<dyn PqcSigner> = std::sync::Arc::new(signer);
-                (Some(id), Some(arc))
-            }
-            _ => {
-                return Err(PyValueError::new_err(
-                    "steward_pqc_key_id and steward_pqc_key_path must both be provided \
-                     or both omitted",
-                ));
-            }
-        };
-
-        // v0.3.2 (CIRISPersist#11) — Auto-sweep on init when PQC steward
-        // is configured. Drains hybrid-pending rows authored before the
-        // per-write cold-path was wired (or rows where the per-write
-        // spawn failed transiently). Spawned as a background task on
-        // the runtime so Engine::new returns immediately; sweep result
-        // is logged at tracing::info when complete.
-        //
-        // Multi-worker concurrent sweeps: bounded by the
-        // attach_*_pqc_signature WHERE pqc_completed_at IS NULL guard —
-        // losers no-op. Acceptable cost for v0.3.2; advisory lock can
-        // come later if profiling demands.
+        // v0.3.2 (CIRISPersist#11) — Auto-sweep on init when PQC
+        // steward is configured. Drains hybrid-pending rows authored
+        // before the per-write cold-path was wired (or rows where the
+        // per-write spawn failed transiently). Spawned as a background
+        // task on the runtime so Engine::new returns immediately;
+        // sweep result is logged at tracing::info when complete.
         if pqc_sweep_on_init {
-            if let Some(signer) = steward_pqc_signer.clone() {
+            if let Some(pqc_signer) = steward_signer.as_ref().and_then(|s| s.pqc_signer_arc()) {
                 let backend_for_sweep = backend.clone();
                 runtime.spawn(async move {
-                    let summary = run_pqc_sweep_inner(&backend_for_sweep, &*signer, 1000).await;
+                    let summary = run_pqc_sweep_inner(&backend_for_sweep, &*pqc_signer, 1000).await;
                     tracing::info!(
                         scanned = summary.total_scanned,
                         signed = summary.total_signed,
@@ -370,10 +301,7 @@ impl PyEngine {
             scrubber,
             signer,
             signer_key_id: signing_key_id.to_owned(),
-            steward_signing_key,
-            steward_key_id: steward_key_id_owned,
-            steward_pqc_signer,
-            steward_pqc_key_id: steward_pqc_key_id_owned,
+            steward_signer,
         })
     }
 
@@ -516,15 +444,16 @@ impl PyEngine {
     /// `steward_key_id` + `steward_key_path` (the federation steward
     /// role isn't configured).
     fn steward_public_key_b64(&self, _py: Python<'_>) -> PyResult<String> {
-        use base64::engine::general_purpose::STANDARD as B64;
-        use base64::Engine as _;
-        let key = self.steward_signing_key.as_ref().ok_or_else(|| {
-            PyValueError::new_err(
-                "no steward key configured (pass steward_key_id + steward_key_path \
-                 to the Engine constructor)",
-            )
-        })?;
-        Ok(B64.encode(key.verifying_key().to_bytes()))
+        // v0.4.2 — thin wrapper over StewardSigner::public_key_b64.
+        self.steward_signer
+            .as_ref()
+            .map(|s| s.public_key_b64())
+            .ok_or_else(|| {
+                PyValueError::new_err(
+                    "no steward key configured (pass steward_key_id + steward_key_path \
+                     to the Engine constructor)",
+                )
+            })
     }
 
     /// v0.2.2 — Return the configured `steward_key_id` (the lens-
@@ -534,12 +463,16 @@ impl PyEngine {
     ///
     /// Raises `ValueError` if no steward identity is configured.
     fn steward_key_id(&self, _py: Python<'_>) -> PyResult<String> {
-        self.steward_key_id.clone().ok_or_else(|| {
-            PyValueError::new_err(
-                "no steward key configured (pass steward_key_id + steward_key_path \
-                 to the Engine constructor)",
-            )
-        })
+        // v0.4.2 — thin wrapper over StewardSigner::key_id.
+        self.steward_signer
+            .as_ref()
+            .map(|s| s.key_id().to_owned())
+            .ok_or_else(|| {
+                PyValueError::new_err(
+                    "no steward key configured (pass steward_key_id + steward_key_path \
+                     to the Engine constructor)",
+                )
+            })
     }
 
     /// v0.2.2 — Sign arbitrary bytes with the steward Ed25519 signing
@@ -561,15 +494,19 @@ impl PyEngine {
         py: Python<'py>,
         message: &Bound<'py, PyBytes>,
     ) -> PyResult<Py<PyBytes>> {
-        use ed25519_dalek::Signer;
-        let key = self.steward_signing_key.as_ref().ok_or_else(|| {
+        // v0.4.2 — thin wrapper over StewardSigner::sign_ed25519.
+        // Single-source-of-truth: Rust callers (CIRISLensCore) and
+        // PyO3 callers hit identical bytes-in / bytes-out logic.
+        let signer = self.steward_signer.as_ref().ok_or_else(|| {
             PyValueError::new_err(
                 "no steward key configured (pass steward_key_id + steward_key_path \
                  to the Engine constructor)",
             )
         })?;
-        let sig = key.sign(message.as_bytes());
-        Ok(PyBytes::new(py, &sig.to_bytes()).unbind())
+        let sig = signer
+            .sign_ed25519(message.as_bytes())
+            .map_err(steward_signer_err_to_py)?;
+        Ok(PyBytes::new(py, &sig).unbind())
     }
 
     /// v0.3.1 — Return the steward ML-DSA-65 public key (base64) for
@@ -584,24 +521,22 @@ impl PyEngine {
     /// `steward_pqc_key_id` + `steward_pqc_key_path` (the cold-path
     /// PQC role isn't configured).
     fn steward_pqc_public_key_b64(&self, py: Python<'_>) -> PyResult<String> {
-        use base64::engine::general_purpose::STANDARD as B64;
-        use base64::Engine as _;
-        let signer = self.steward_pqc_signer.clone().ok_or_else(|| {
+        // v0.4.2 — thin wrapper over StewardSigner::pqc_public_key_b64.
+        let signer = self.steward_signer.clone().ok_or_else(|| {
             PyValueError::new_err(
                 "no PQC steward key configured (pass steward_pqc_key_id + \
                  steward_pqc_key_path to the Engine constructor)",
             )
         })?;
         let runtime = self.runtime.clone();
-        let bytes = py.detach(|| {
-            runtime.block_on(async move {
-                signer
-                    .public_key()
-                    .await
-                    .map_err(|e| PyRuntimeError::new_err(format!("PQC public_key: {e}")))
-            })
-        })?;
-        Ok(B64.encode(&bytes))
+        let result =
+            py.detach(|| runtime.block_on(async move { signer.pqc_public_key_b64().await }));
+        result.map_err(steward_signer_err_to_py)?.ok_or_else(|| {
+            PyValueError::new_err(
+                "no PQC steward key configured (pass steward_pqc_key_id + \
+                     steward_pqc_key_path to the Engine constructor)",
+            )
+        })
     }
 
     /// v0.3.1 — Return the configured `steward_pqc_key_id`. Distinct
@@ -609,12 +544,16 @@ impl PyEngine {
     /// typically pin them equal but the alias spaces don't have to
     /// match.
     fn steward_pqc_key_id(&self, _py: Python<'_>) -> PyResult<String> {
-        self.steward_pqc_key_id.clone().ok_or_else(|| {
-            PyValueError::new_err(
-                "no PQC steward key configured (pass steward_pqc_key_id + \
-                 steward_pqc_key_path to the Engine constructor)",
-            )
-        })
+        // v0.4.2 — thin wrapper over StewardSigner::pqc_key_id.
+        self.steward_signer
+            .as_ref()
+            .and_then(|s| s.pqc_key_id().map(str::to_owned))
+            .ok_or_else(|| {
+                PyValueError::new_err(
+                    "no PQC steward key configured (pass steward_pqc_key_id + \
+                     steward_pqc_key_path to the Engine constructor)",
+                )
+            })
     }
 
     /// v0.3.1 — Sign arbitrary bytes with the steward ML-DSA-65
@@ -640,7 +579,8 @@ impl PyEngine {
         py: Python<'py>,
         message: &Bound<'py, PyBytes>,
     ) -> PyResult<Py<PyBytes>> {
-        let signer = self.steward_pqc_signer.clone().ok_or_else(|| {
+        // v0.4.2 — thin wrapper over StewardSigner::sign_ml_dsa_65.
+        let signer = self.steward_signer.clone().ok_or_else(|| {
             PyValueError::new_err(
                 "no PQC steward key configured (pass steward_pqc_key_id + \
                  steward_pqc_key_path to the Engine constructor)",
@@ -648,14 +588,9 @@ impl PyEngine {
         })?;
         let runtime = self.runtime.clone();
         let msg = message.as_bytes().to_vec();
-        let sig_bytes = py.detach(|| {
-            runtime.block_on(async move {
-                signer
-                    .sign(&msg)
-                    .await
-                    .map_err(|e| PyRuntimeError::new_err(format!("PQC sign: {e}")))
-            })
-        })?;
+        let sig_bytes = py
+            .detach(|| runtime.block_on(async move { signer.sign_ml_dsa_65(&msg).await }))
+            .map_err(steward_signer_err_to_py)?;
         Ok(PyBytes::new(py, &sig_bytes).unbind())
     }
 
@@ -913,14 +848,18 @@ impl PyEngine {
         // the record. Cold-path skips when no PQC steward configured;
         // row stays hybrid-pending and consumers can fill via the
         // attach_*_pqc_signature escape hatch on their own schedule.
-        let cold_path_inputs = self.steward_pqc_signer.clone().map(|signer| {
-            (
-                signer,
-                record.record.key_id.clone(),
-                record.record.registration_envelope.clone(),
-                record.record.scrub_signature_classical.clone(),
-            )
-        });
+        let cold_path_inputs = self
+            .steward_signer
+            .as_ref()
+            .and_then(|s| s.pqc_signer_arc())
+            .map(|signer| {
+                (
+                    signer,
+                    record.record.key_id.clone(),
+                    record.record.registration_envelope.clone(),
+                    record.record.scrub_signature_classical.clone(),
+                )
+            });
 
         py.detach(|| {
             runtime.block_on(async move {
@@ -1021,14 +960,18 @@ impl PyEngine {
             })?;
 
         // v0.3.1 — cold-path PQC fill-in (CIRISPersist#10).
-        let cold_path_inputs = self.steward_pqc_signer.clone().map(|signer| {
-            (
-                signer,
-                att.attestation.attestation_id.clone(),
-                att.attestation.attestation_envelope.clone(),
-                att.attestation.scrub_signature_classical.clone(),
-            )
-        });
+        let cold_path_inputs = self
+            .steward_signer
+            .as_ref()
+            .and_then(|s| s.pqc_signer_arc())
+            .map(|signer| {
+                (
+                    signer,
+                    att.attestation.attestation_id.clone(),
+                    att.attestation.attestation_envelope.clone(),
+                    att.attestation.scrub_signature_classical.clone(),
+                )
+            });
 
         py.detach(|| {
             runtime.block_on(async move {
@@ -1121,14 +1064,18 @@ impl PyEngine {
             .map_err(|e| PyValueError::new_err(format!("SignedRevocation JSON decode: {e}")))?;
 
         // v0.3.1 — cold-path PQC fill-in (CIRISPersist#10).
-        let cold_path_inputs = self.steward_pqc_signer.clone().map(|signer| {
-            (
-                signer,
-                rev.revocation.revocation_id.clone(),
-                rev.revocation.revocation_envelope.clone(),
-                rev.revocation.scrub_signature_classical.clone(),
-            )
-        });
+        let cold_path_inputs = self
+            .steward_signer
+            .as_ref()
+            .and_then(|s| s.pqc_signer_arc())
+            .map(|signer| {
+                (
+                    signer,
+                    rev.revocation.revocation_id.clone(),
+                    rev.revocation.revocation_envelope.clone(),
+                    rev.revocation.scrub_signature_classical.clone(),
+                )
+            });
 
         py.detach(|| {
             runtime.block_on(async move {
@@ -1313,12 +1260,16 @@ impl PyEngine {
     /// as `steward_pqc_sign`).
     #[pyo3(signature = (batch_size=1000))]
     fn run_pqc_sweep<'py>(&self, py: Python<'py>, batch_size: i64) -> PyResult<Bound<'py, PyDict>> {
-        let signer = self.steward_pqc_signer.clone().ok_or_else(|| {
-            PyValueError::new_err(
-                "PQC steward not configured (pass steward_pqc_key_id and \
+        let signer = self
+            .steward_signer
+            .as_ref()
+            .and_then(|s| s.pqc_signer_arc())
+            .ok_or_else(|| {
+                PyValueError::new_err(
+                    "PQC steward not configured (pass steward_pqc_key_id and \
                  steward_pqc_key_path to the Engine constructor)",
-            )
-        })?;
+                )
+            })?;
         let backend = self.backend.clone();
         let runtime = self.runtime.clone();
 
@@ -2305,6 +2256,25 @@ impl PyEngine {
             })
         })
         .map_err(outbound_err_to_py)
+    }
+}
+
+/// v0.4.2 — Bridge `signing::StewardSignerError` → `PyErr` at the
+/// FFI boundary. Same discipline as `federation_err_to_py` and
+/// `outbound_err_to_py`: typed variants → ValueError (caller-fault
+/// 4xx-shape) or RuntimeError (server-fault 5xx-shape); verbose
+/// detail goes to tracing.
+fn steward_signer_err_to_py(e: crate::signing::StewardSignerError) -> PyErr {
+    use crate::signing::StewardSignerError;
+    tracing::warn!(error = %e, "steward signer error");
+    match e {
+        StewardSignerError::SeedRead { .. } | StewardSignerError::PqcSeedLoad { .. } => {
+            PyRuntimeError::new_err(format!("{e}"))
+        }
+        StewardSignerError::SeedLength { .. }
+        | StewardSignerError::PqcConfigInconsistent
+        | StewardSignerError::PqcNotConfigured => PyValueError::new_err(format!("{e}")),
+        StewardSignerError::PqcSign(_) => PyRuntimeError::new_err(format!("{e}")),
     }
 }
 

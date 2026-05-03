@@ -44,6 +44,12 @@ pub use crate::federation::FederationDirectory;
 pub use crate::outbound::OutboundQueue;
 pub use crate::store::Backend;
 
+// Steward signing surface (v0.4.2, CIRISPersist#17). Federation
+// peers signing as their deployment's steward identity construct
+// `StewardSigner` from filesystem seeds and call `sign_ed25519` /
+// `sign_ml_dsa_65` / `sign_hybrid`.
+pub use crate::signing::{StewardSigner, StewardSignerConfig, StewardSignerError};
+
 // Verify primitives. The full surface edge needs to compose a
 // verify pipeline against persist instead of rebuilding it.
 pub use crate::verify::{

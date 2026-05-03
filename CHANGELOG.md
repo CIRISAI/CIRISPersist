@@ -5,6 +5,116 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.4.2] — 2026-05-03
+
+**Rust-public `StewardSigner` for CIRISLensCore (rlib path).**
+Closes [CIRISPersist#17](https://github.com/CIRISAI/CIRISPersist/issues/17).
+Same closure pattern as v0.4.1's verify primitives:
+substrate-owned signing, PyO3 surface refactored to thin wrappers
+over the Rust struct.
+
+### `signing::StewardSigner` (Rust public API)
+
+```rust
+use ciris_persist::signing::{StewardSigner, StewardSignerConfig};
+
+let signer = StewardSigner::from_config(&StewardSignerConfig {
+    key_id: "lens-steward".into(),
+    key_path: "/run/secrets/lens-steward.seed".into(),
+    pqc_key_id: Some("lens-steward-pqc".into()),
+    pqc_key_path: Some("/run/secrets/lens-steward.mldsa.seed".into()),
+})?;
+
+// Hot-path Ed25519 sign (synchronous; 64-byte signature).
+let sig: [u8; 64] = signer.sign_ed25519(canonical_bytes)?;
+
+// Cold-path ML-DSA-65 sign (async; 3309-byte signature, FIPS 204 final).
+let pqc_sig: Vec<u8> = signer.sign_ml_dsa_65(canonical_bytes).await?;
+
+// Hybrid (Ed25519 + ML-DSA-65 over `canonical || classical_sig`)
+// returning ciris_crypto::HybridSignature shape.
+let hybrid: HybridSignature = signer.sign_hybrid(canonical_bytes).await?;
+
+// Accessors:
+signer.key_id()                    // &str
+signer.pqc_key_id()                // Option<&str>
+signer.public_key_b64()            // String (44 chars, base64 standard)
+signer.pqc_public_key_b64().await? // Option<String> (~2604 chars)
+```
+
+Construction mirrors the PyO3 Engine constructor exactly: 32-byte
+raw Ed25519 seed at `key_path`; optional ML-DSA-65 via
+`MlDsa65SoftwareSigner::from_seed_file` at `pqc_key_path`. Both-or-
+neither PQC config validated at construction
+(`StewardSignerError::PqcConfigInconsistent`). Same
+`tracing::info` observability shape ("ciris-persist: steward
+identity loaded").
+
+CIRISLensCore (rlib path, never PyO3) now composes against
+`signing::StewardSigner` for its detection-event signing. Mission
+lock-in `MISSION.md:166` ("uses persist.steward_sign() exclusively")
+is finally implementable from Rust.
+
+### PyO3 Engine refactored to back onto StewardSigner
+
+`PyEngine` previously held four steward fields directly
+(`steward_signing_key`, `steward_key_id`, `steward_pqc_signer`,
+`steward_pqc_key_id`). v0.4.2 collapses these to one
+`Option<Arc<StewardSigner>>`, and the PyO3 methods become thin
+wrappers:
+
+- `engine.steward_sign(message)` → `signer.sign_ed25519(message)`
+- `engine.steward_pqc_sign(message)` → `signer.sign_ml_dsa_65(message)`
+- `engine.steward_public_key_b64()` → `signer.public_key_b64()`
+- `engine.steward_pqc_public_key_b64()` → `signer.pqc_public_key_b64()`
+- `engine.steward_key_id()` → `signer.key_id()`
+- `engine.steward_pqc_key_id()` → `signer.pqc_key_id()`
+
+One implementation, both surfaces — CIRISPersist#7 single-source-of-
+truth pattern repeated for signing. Cold-path PQC fill-in spawns
+(per-write tokio::spawn + sweep) capture
+`signer.pqc_signer_arc()` instead of the old direct
+`steward_pqc_signer.clone()`.
+
+Python contract is unchanged — error tokens, return shapes, both-or-
+neither validation all match v0.4.1 byte-for-byte. New error
+variants for the StewardSigner construction path
+(`StewardSignerError::SeedRead`, `SeedLength`, `PqcSeedLoad`)
+surface as the same `ValueError` / `RuntimeError` shapes the
+inline path used.
+
+### Prelude
+
+```rust
+use ciris_persist::prelude::*;
+// + StewardSigner, StewardSignerConfig, StewardSignerError
+```
+
+### Tests
+
+183 lib (179 + 4 new) + 22 integration tests pass; clippy clean
+across all features; cargo-deny clean. New tests:
+
+- `from_config_loads_ed25519_seed`: round-trip seed file → signer
+  → sign/verify
+- `from_config_rejects_wrong_seed_length`: typed `SeedLength`
+  error on 31-byte seed
+- `from_config_rejects_pqc_config_inconsistent`: typed
+  `PqcConfigInconsistent` on key_id-without-key_path
+- `sign_ml_dsa_65_without_pqc_config_returns_typed_error`:
+  `PqcNotConfigured` when PQC isn't wired
+
+### Edge / lens-core action
+
+```rust
+[dependencies]
+ciris-persist = "0.4.2"
+```
+
+CIRISLensCore Phase 1 detection-event signing (LC-AV-2, LC-AV-11,
+LC-AV-18) can now compose against `StewardSigner` directly. PyO3
+consumers continue to use `engine.steward_sign(...)` unchanged.
+
 ## [0.4.1] — 2026-05-03
 
 **Rust-side verify primitives + curated prelude.** CIRISEdge ask

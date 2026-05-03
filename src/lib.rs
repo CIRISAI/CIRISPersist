@@ -41,6 +41,7 @@ pub mod schema;
 pub mod scrub;
 #[cfg(feature = "server")]
 pub mod server;
+pub mod signing;
 pub mod store;
 pub mod verify;
 
