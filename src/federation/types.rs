@@ -305,6 +305,29 @@ impl Revocation {
     }
 }
 
+/// One hybrid-pending federation row — minimum fields the sweep
+/// needs to recompute the cold-path bound-signature input. Returned
+/// by [`super::FederationDirectory::list_hybrid_pending_keys`] /
+/// `_attestations` / `_revocations` (CIRISPersist#11, v0.3.2).
+///
+/// `id` is the row's primary key (`key_id` for `federation_keys`,
+/// `attestation_id` / `revocation_id` for the others). `envelope` is
+/// the JSONB column the original Ed25519 signature was computed over
+/// — canonical bytes are recomputed via
+/// `PythonJsonDumpsCanonicalizer::canonicalize_value` to feed the
+/// bound-signature input. `classical_sig_b64` is the base64-encoded
+/// Ed25519 signature that PQC will sign over alongside the canonical
+/// bytes per the bound-signature contract.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HybridPendingRow {
+    /// Primary key of the hybrid-pending row.
+    pub id: String,
+    /// JSONB envelope the row's classical signature was computed over.
+    pub envelope: serde_json::Value,
+    /// Base64-encoded Ed25519 signature stored on the row.
+    pub classical_sig_b64: String,
+}
+
 /// Wraps a [`KeyRecord`] payload that the caller has signed but
 /// persist has not yet stored. Persist verifies the scrub-signature
 /// on receipt before writing. The wrapper exists so write-path

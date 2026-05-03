@@ -1159,6 +1159,101 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         }
         Ok(())
     }
+
+    async fn list_hybrid_pending_keys(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT key_id, registration_envelope, scrub_signature_classical \
+                 FROM cirislens.federation_keys \
+                 WHERE pqc_completed_at IS NULL \
+                 ORDER BY valid_from ASC \
+                 LIMIT $1",
+                &[&limit],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_hybrid_pending_keys: {e}"))
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::federation::HybridPendingRow {
+                id: row.get("key_id"),
+                envelope: row.get("registration_envelope"),
+                classical_sig_b64: row.get("scrub_signature_classical"),
+            })
+            .collect())
+    }
+
+    async fn list_hybrid_pending_attestations(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT attestation_id::text AS attestation_id, \
+                    attestation_envelope, scrub_signature_classical \
+                 FROM cirislens.federation_attestations \
+                 WHERE pqc_completed_at IS NULL \
+                 ORDER BY asserted_at ASC \
+                 LIMIT $1",
+                &[&limit],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_hybrid_pending_attestations: {e}"))
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::federation::HybridPendingRow {
+                id: row.get("attestation_id"),
+                envelope: row.get("attestation_envelope"),
+                classical_sig_b64: row.get("scrub_signature_classical"),
+            })
+            .collect())
+    }
+
+    async fn list_hybrid_pending_revocations(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT revocation_id::text AS revocation_id, \
+                    revocation_envelope, scrub_signature_classical \
+                 FROM cirislens.federation_revocations \
+                 WHERE pqc_completed_at IS NULL \
+                 ORDER BY revoked_at ASC \
+                 LIMIT $1",
+                &[&limit],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_hybrid_pending_revocations: {e}"))
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::federation::HybridPendingRow {
+                id: row.get("revocation_id"),
+                envelope: row.get("revocation_envelope"),
+                classical_sig_b64: row.get("scrub_signature_classical"),
+            })
+            .collect())
+    }
 }
 
 /// v0.2.1 — Decode a base64 standard-alphabet Ed25519 public key

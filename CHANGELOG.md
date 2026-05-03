@@ -5,6 +5,139 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.3.2] — 2026-05-02
+
+**Cold-path PQC sweep + read-only role for analytical consumers.**
+Closes [CIRISPersist#11](https://github.com/CIRISAI/CIRISPersist/issues/11)
+(sweep) and [CIRISPersist#9](https://github.com/CIRISAI/CIRISPersist/issues/9)
+(read-only role + public schema contract).
+
+### Sweep — closes #11
+
+v0.3.1 wired the per-write cold-path: `put_public_key` /
+`put_attestation` / `put_revocation` spawn a tokio task that
+canonicalizes the envelope, signs `(canonical || classical_sig)` with
+ML-DSA-65, and calls `attach_*_pqc_signature`. That covered every
+NEW row.
+
+It did NOT cover:
+
+1. **Historical hybrid-pending rows** authored before the per-write
+   cold-path was wired (lens deployment had 654 such rows from the
+   v0.3.0 → v0.3.1 transition window).
+2. **Cold-path failure recovery.** Any transient ML-DSA sign error,
+   runtime panic between hot-path commit and cold-path attach,
+   network blip during attach, or persist process restart with
+   cold-path tasks inflight left rows hybrid-pending forever.
+3. **V004's Phase 2 transition** ("pre-flip rows that are still
+   pending get walked through the upgrade pipeline") — the contract
+   assumed the upgrade pipeline existed.
+
+v0.3.2 ships that pipeline as `Engine.run_pqc_sweep()`.
+
+**Three new `FederationDirectory` trait methods**:
+
+```rust
+fn list_hybrid_pending_keys(&self, limit: i64)
+    -> impl Future<Output = Result<Vec<HybridPendingRow>, Error>> + Send;
+fn list_hybrid_pending_attestations(&self, limit: i64)
+    -> impl Future<Output = Result<Vec<HybridPendingRow>, Error>> + Send;
+fn list_hybrid_pending_revocations(&self, limit: i64)
+    -> impl Future<Output = Result<Vec<HybridPendingRow>, Error>> + Send;
+```
+
+Implemented across all three backends (memory, postgres, sqlite). Each
+returns `(id, envelope, classical_sig_b64)` triples for `WHERE
+pqc_completed_at IS NULL ORDER BY <natural-ts> ASC LIMIT $1` —
+sufficient to recompute the cold-path bound-signature input identical
+to the per-write flow.
+
+**`Engine.run_pqc_sweep(batch_size=1000) -> dict`**:
+
+```python
+result = engine.run_pqc_sweep()
+# {
+#   "scanned": int,        # total rows examined across the three tables
+#   "signed":  int,        # rows hybrid-completed by this call
+#   "failed":  int,        # rows where sign or attach errored (still pending)
+#   "by_table": {
+#     "federation_keys":         {"scanned": ..., "signed": ..., "failed": ...},
+#     "federation_attestations": {...},
+#     "federation_revocations":  {...},
+#   }
+# }
+```
+
+Walks each table cursor-style, reuses the v0.3.1 `cold_path_pqc_sign`
+helper, calls the matching `attach_*_pqc_signature`. Idempotent:
+`attach_*_pqc_signature` already guards via `WHERE
+pqc_completed_at IS NULL`, so multi-worker concurrent sweeps just
+waste signs on losers — no incorrect rows are produced. The
+silent-skip path on `Conflict` is not counted as `failed`.
+
+Re-invoke until `scanned == 0` to drain backlogs > `batch_size`.
+
+Raises `ValueError` if no PQC steward configured (matches
+`steward_pqc_sign` v0.3.1 shape).
+
+**`pqc_sweep_on_init=True` constructor param** — additive, default
+`True` when `steward_pqc_*` is configured. Spawned as a background
+tokio task at the tail of `Engine::new`; doesn't block construction
+return. Logs a `tracing::info!` summary when the sweep completes.
+
+The default-true matches the writer contract intent in V004's schema
+header: rows hybrid-complete by default; operators don't have to opt
+in to the contract being self-enforcing. Pass
+`pqc_sweep_on_init=False` to suppress (e.g., for migration-time
+table walks where boot-time PQC fill is undesirable).
+
+**Bridge action for the 654 lens rows**: nothing required beyond
+deploying v0.3.2. The next bridge redeploy auto-fires the sweep at
+boot; the 654 rows hybrid-complete passively within seconds.
+
+### Read-only role — closes #9
+
+`migrations/postgres/lens/V005__readonly_role.sql` provisions
+`cirislens_reader` (NOLOGIN, USAGE on `cirislens` schema, SELECT on
+all existing + future tables).
+
+Operators provision a login user out-of-band:
+
+```sql
+CREATE USER cirislens_analytics WITH PASSWORD '<vaulted>';
+GRANT cirislens_reader TO cirislens_analytics;
+```
+
+Lens analytical paths connect with that DSN
+(`CIRISLENS_READ_DSN=...`). Write paths stay Engine-only on the
+existing `DATABASE_URL`.
+
+`docs/PUBLIC_SCHEMA_CONTRACT.md` documents the column-stability
+contract:
+
+- `stable` — semver-guaranteed; removal/type-change requires major
+  bump + deprecation window
+- `stable-ro` — server-computed, downstream may read but writes
+  ignored (e.g. `persist_row_hash`)
+- `internal` — may change at any minor without notice; downstream
+  MUST NOT depend (e.g. `audit_*` forensic fields)
+
+Includes the `accord_traces` → `trace_events` / `trace_llm_calls`
+column mapping for lens science scripts migrating off the legacy
+denormalized table.
+
+### Tests
+
+155 lib + 22 integration tests pass; clippy clean across all
+features; cargo-deny clean. Two new memory-backend tests
+(`list_hybrid_pending_filters_completed_rows`,
+`list_hybrid_pending_limit_and_payload`) cover the sweep substrate.
+
+### Deps
+
+No version changes (`ciris-keyring` / `ciris-verify-core` v1.9.0 from
+v0.3.1).
+
 ## [0.3.1] — 2026-05-02
 
 **Persist-owned cold-path PQC fill-in.** Closes

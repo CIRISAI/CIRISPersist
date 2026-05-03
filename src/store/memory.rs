@@ -413,6 +413,75 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
         Ok(())
     }
+
+    async fn list_hybrid_pending_keys(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_keys
+            .values()
+            .filter(|r| r.pqc_completed_at.is_none())
+            .cloned()
+            .collect();
+        rows.sort_by_key(|r| r.valid_from);
+        Ok(rows
+            .into_iter()
+            .take(limit.max(0) as usize)
+            .map(|r| crate::federation::HybridPendingRow {
+                id: r.key_id,
+                envelope: r.registration_envelope,
+                classical_sig_b64: r.scrub_signature_classical,
+            })
+            .collect())
+    }
+
+    async fn list_hybrid_pending_attestations(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_attestations
+            .iter()
+            .filter(|r| r.pqc_completed_at.is_none())
+            .cloned()
+            .collect();
+        rows.sort_by_key(|r| r.asserted_at);
+        Ok(rows
+            .into_iter()
+            .take(limit.max(0) as usize)
+            .map(|r| crate::federation::HybridPendingRow {
+                id: r.attestation_id,
+                envelope: r.attestation_envelope,
+                classical_sig_b64: r.scrub_signature_classical,
+            })
+            .collect())
+    }
+
+    async fn list_hybrid_pending_revocations(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_revocations
+            .iter()
+            .filter(|r| r.pqc_completed_at.is_none())
+            .cloned()
+            .collect();
+        rows.sort_by_key(|r| r.revoked_at);
+        Ok(rows
+            .into_iter()
+            .take(limit.max(0) as usize)
+            .map(|r| crate::federation::HybridPendingRow {
+                id: r.revocation_id,
+                envelope: r.revocation_envelope,
+                classical_sig_b64: r.scrub_signature_classical,
+            })
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -1028,6 +1097,107 @@ mod tests {
             .unwrap();
         let revs = backend.revocations_for("k-target").await.unwrap();
         assert!(revs[0].is_pqc_complete());
+    }
+
+    /// v0.3.2 (CIRISPersist#11) — list_hybrid_pending_* returns rows
+    /// where pqc_completed_at IS NULL, oldest first; rows that have
+    /// been hybrid-completed via attach_*_pqc_signature are excluded.
+    /// This is the substrate `Engine.run_pqc_sweep` walks.
+    #[tokio::test]
+    async fn list_hybrid_pending_filters_completed_rows() {
+        let backend = MemoryBackend::new();
+        // Steward + three agent keys.
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("steward", "registry", "steward"),
+            })
+            .await
+            .unwrap();
+        for id in &["k-a", "k-b", "k-c"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(id, "primitive", "steward"),
+                })
+                .await
+                .unwrap();
+        }
+        // Two attestations, one revocation.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_attestation("att-x", "steward", "k-a", "steward"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_attestation("att-y", "steward", "k-b", "steward"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_revocation(SignedRevocation {
+                revocation: fix_revocation("rev-z", "k-c", "steward", "steward"),
+            })
+            .await
+            .unwrap();
+
+        // All hybrid-pending — 4 keys (steward + 3 agents), 2 attestations, 1 revocation.
+        let pending_keys = backend.list_hybrid_pending_keys(100).await.unwrap();
+        let pending_atts = backend.list_hybrid_pending_attestations(100).await.unwrap();
+        let pending_revs = backend.list_hybrid_pending_revocations(100).await.unwrap();
+        assert_eq!(pending_keys.len(), 4);
+        assert_eq!(pending_atts.len(), 2);
+        assert_eq!(pending_revs.len(), 1);
+
+        // Attach PQC to one row in each table. Filter excludes them.
+        backend
+            .attach_key_pqc_signature("k-a", "mldsa-pk", "mldsa-sig")
+            .await
+            .unwrap();
+        backend
+            .attach_attestation_pqc_signature("att-x", "att-pqc-sig")
+            .await
+            .unwrap();
+        backend
+            .attach_revocation_pqc_signature("rev-z", "rev-pqc-sig")
+            .await
+            .unwrap();
+        let pending_keys = backend.list_hybrid_pending_keys(100).await.unwrap();
+        let pending_atts = backend.list_hybrid_pending_attestations(100).await.unwrap();
+        let pending_revs = backend.list_hybrid_pending_revocations(100).await.unwrap();
+        assert_eq!(pending_keys.len(), 3);
+        assert!(!pending_keys.iter().any(|r| r.id == "k-a"));
+        assert_eq!(pending_atts.len(), 1);
+        assert_eq!(pending_atts[0].id, "att-y");
+        assert_eq!(pending_revs.len(), 0);
+    }
+
+    /// v0.3.2 (CIRISPersist#11) — limit caps the batch; envelope +
+    /// classical_sig fields are populated correctly so the sweep can
+    /// recompute the bound-signature input identical to the per-write
+    /// cold-path.
+    #[tokio::test]
+    async fn list_hybrid_pending_limit_and_payload() {
+        let backend = MemoryBackend::new();
+        for i in 0..5 {
+            let id = format!("k-{i}");
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(&id, "primitive", &id),
+                })
+                .await
+                .unwrap();
+        }
+        // Limit=2 returns 2 rows.
+        let rows = backend.list_hybrid_pending_keys(2).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        // Each row carries id, envelope, classical_sig — sufficient to
+        // recompute the cold-path bound-signature input.
+        for row in &rows {
+            assert!(row.id.starts_with("k-"));
+            assert!(!row.classical_sig_b64.is_empty());
+            assert!(row.envelope.is_object());
+        }
     }
 
     /// v0.2.1 — Backend::lookup_public_key dual-read. After

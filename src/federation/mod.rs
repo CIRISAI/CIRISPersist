@@ -37,7 +37,8 @@ use std::future::Future;
 pub mod types;
 
 pub use types::{
-    Attestation, KeyRecord, Revocation, SignedAttestation, SignedKeyRecord, SignedRevocation,
+    Attestation, HybridPendingRow, KeyRecord, Revocation, SignedAttestation, SignedKeyRecord,
+    SignedRevocation,
 };
 
 /// Federation directory trait — the registry/lens/agent's read+write
@@ -171,6 +172,45 @@ pub trait FederationDirectory: Send + Sync {
         revocation_id: &str,
         scrub_signature_pqc: &str,
     ) -> impl Future<Output = Result<(), Error>> + Send;
+
+    // ── Hybrid-pending sweep (CIRISPersist#11, v0.3.2) ─────────────
+    //
+    // Per V004's schema header §"Phase transitions":
+    //   "Pre-flip rows that are still pending get walked through the
+    //    upgrade pipeline."
+    // These three methods feed that pipeline. Persist's PyO3
+    // `Engine.run_pqc_sweep()` walks each batch and drives cold-path
+    // PQC fill-in for rows authored before the writer was configured
+    // with a PQC steward (or where the per-write cold-path failed
+    // transiently). Idempotent at the consumer level —
+    // `attach_*_pqc_signature` already guards against double-fill via
+    // `WHERE pqc_completed_at IS NULL`.
+
+    /// Return up to `limit` `federation_keys` rows where
+    /// `pqc_completed_at IS NULL`, ordered oldest first by
+    /// `valid_from`. Returns `(key_id, registration_envelope,
+    /// scrub_signature_classical)` triples sufficient to reconstruct
+    /// the cold-path bound-signature input.
+    fn list_hybrid_pending_keys(
+        &self,
+        limit: i64,
+    ) -> impl Future<Output = Result<Vec<HybridPendingRow>, Error>> + Send;
+
+    /// Return up to `limit` `federation_attestations` rows where
+    /// `pqc_completed_at IS NULL`, ordered oldest first by
+    /// `asserted_at`.
+    fn list_hybrid_pending_attestations(
+        &self,
+        limit: i64,
+    ) -> impl Future<Output = Result<Vec<HybridPendingRow>, Error>> + Send;
+
+    /// Return up to `limit` `federation_revocations` rows where
+    /// `pqc_completed_at IS NULL`, ordered oldest first by
+    /// `revoked_at`.
+    fn list_hybrid_pending_revocations(
+        &self,
+        limit: i64,
+    ) -> impl Future<Output = Result<Vec<HybridPendingRow>, Error>> + Send;
 }
 
 /// Federation directory errors. Distinct from

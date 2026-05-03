@@ -143,7 +143,8 @@ impl PyEngine {
     #[new]
     #[pyo3(signature = (dsn, signing_key_id, scrubber=None,
                         steward_key_id=None, steward_key_path=None,
-                        steward_pqc_key_id=None, steward_pqc_key_path=None))]
+                        steward_pqc_key_id=None, steward_pqc_key_path=None,
+                        pqc_sweep_on_init=true))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -154,6 +155,7 @@ impl PyEngine {
         steward_key_path: Option<String>,
         steward_pqc_key_id: Option<String>,
         steward_pqc_key_path: Option<String>,
+        pqc_sweep_on_init: bool,
     ) -> PyResult<Self> {
         // Build a multi-thread runtime once per Engine instance.
         let runtime =
@@ -332,6 +334,36 @@ impl PyEngine {
                 ));
             }
         };
+
+        // v0.3.2 (CIRISPersist#11) — Auto-sweep on init when PQC steward
+        // is configured. Drains hybrid-pending rows authored before the
+        // per-write cold-path was wired (or rows where the per-write
+        // spawn failed transiently). Spawned as a background task on
+        // the runtime so Engine::new returns immediately; sweep result
+        // is logged at tracing::info when complete.
+        //
+        // Multi-worker concurrent sweeps: bounded by the
+        // attach_*_pqc_signature WHERE pqc_completed_at IS NULL guard —
+        // losers no-op. Acceptable cost for v0.3.2; advisory lock can
+        // come later if profiling demands.
+        if pqc_sweep_on_init {
+            if let Some(signer) = steward_pqc_signer.clone() {
+                let backend_for_sweep = backend.clone();
+                runtime.spawn(async move {
+                    let summary =
+                        run_pqc_sweep_inner(&backend_for_sweep, &*signer, 1000).await;
+                    tracing::info!(
+                        scanned = summary.total_scanned,
+                        signed = summary.total_signed,
+                        failed = summary.total_failed,
+                        keys_signed = summary.keys.signed,
+                        attestations_signed = summary.attestations.signed,
+                        revocations_signed = summary.revocations.signed,
+                        "ciris-persist v0.3.2: cold-path PQC sweep on init complete"
+                    );
+                });
+            }
+        }
 
         Ok(PyEngine {
             backend,
@@ -1230,6 +1262,96 @@ impl PyEngine {
             })
         })
     }
+
+    /// v0.3.2 (CIRISPersist#11) — Walk hybrid-pending federation rows
+    /// across `federation_keys` / `federation_attestations` /
+    /// `federation_revocations` and drive cold-path PQC fill-in for
+    /// each. Same canonicalization + signing path as the per-write
+    /// auto-fire (`cold_path_pqc_sign`), just walked over the rows
+    /// already in the table without per-write spawn coverage:
+    ///
+    /// - Rows authored before v0.3.1 wired the per-write cold-path
+    /// - Rows authored before the PQC steward was configured on the
+    ///   writer
+    /// - Rows where the per-write `tokio::spawn` cold-path failed
+    ///   transiently (sign error, attach network blip, process restart
+    ///   between hot-path commit and cold-path attach)
+    ///
+    /// Per the writer contract in V004 schema header §"Phase
+    /// transitions":
+    ///
+    /// > Pre-flip rows that are still pending get walked through the
+    /// > upgrade pipeline.
+    ///
+    /// This method is that pipeline.
+    ///
+    /// Returns a dict shaped:
+    ///
+    /// ```text
+    /// {
+    ///   "scanned": int,        # total rows examined across the three tables
+    ///   "signed":  int,        # rows successfully hybrid-completed by this call
+    ///   "failed":  int,        # rows where sign or attach errored (still pending)
+    ///   "by_table": {
+    ///     "federation_keys":          {"scanned": ..., "signed": ..., "failed": ...},
+    ///     "federation_attestations":  {...},
+    ///     "federation_revocations":   {...},
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// Idempotent: `attach_*_pqc_signature` already guards against
+    /// double-fill via `WHERE pqc_completed_at IS NULL`. Multi-worker
+    /// concurrent sweeps waste signs on losers but do not produce
+    /// incorrect rows; the silent-skip path on `Conflict` is not
+    /// counted as failed.
+    ///
+    /// `batch_size` (default 1000) caps each table's scan in one call.
+    /// Re-invoke until `scanned == 0` to drain larger backlogs
+    /// incrementally.
+    ///
+    /// Raises `ValueError` if no PQC steward is configured (same shape
+    /// as `steward_pqc_sign`).
+    #[pyo3(signature = (batch_size=1000))]
+    fn run_pqc_sweep<'py>(
+        &self,
+        py: Python<'py>,
+        batch_size: i64,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let signer = self.steward_pqc_signer.clone().ok_or_else(|| {
+            PyValueError::new_err(
+                "PQC steward not configured (pass steward_pqc_key_id and \
+                 steward_pqc_key_path to the Engine constructor)",
+            )
+        })?;
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+
+        let summary = py.detach(move || {
+            runtime.block_on(async move {
+                run_pqc_sweep_inner(&backend, &*signer, batch_size).await
+            })
+        });
+
+        let dict = PyDict::new(py);
+        dict.set_item("scanned", summary.total_scanned)?;
+        dict.set_item("signed", summary.total_signed)?;
+        dict.set_item("failed", summary.total_failed)?;
+        let by_table = PyDict::new(py);
+        for (name, counts) in [
+            ("federation_keys", &summary.keys),
+            ("federation_attestations", &summary.attestations),
+            ("federation_revocations", &summary.revocations),
+        ] {
+            let d = PyDict::new(py);
+            d.set_item("scanned", counts.scanned)?;
+            d.set_item("signed", counts.signed)?;
+            d.set_item("failed", counts.failed)?;
+            by_table.set_item(name, d)?;
+        }
+        dict.set_item("by_table", by_table)?;
+        Ok(dict)
+    }
 }
 
 /// Bridge `federation::Error` → `PyErr` at the FFI boundary.
@@ -1296,6 +1418,227 @@ async fn cold_path_pqc_sign(
         .await
         .map_err(|e| format!("public_key: {e}"))?;
     Ok((B64.encode(&pubkey), B64.encode(&pqc_sig)))
+}
+
+/// v0.3.2 (CIRISPersist#11) — counts for one table's slice of a sweep.
+struct SweepCounts {
+    scanned: i64,
+    signed: i64,
+    failed: i64,
+}
+
+/// v0.3.2 (CIRISPersist#11) — aggregate sweep result across the three
+/// federation tables. Returned by `run_pqc_sweep_inner` and surfaced
+/// to Python as a dict by `Engine.run_pqc_sweep`.
+struct SweepSummary {
+    total_scanned: i64,
+    total_signed: i64,
+    total_failed: i64,
+    keys: SweepCounts,
+    attestations: SweepCounts,
+    revocations: SweepCounts,
+}
+
+/// v0.3.2 (CIRISPersist#11) — Drive a single-batch sweep across the
+/// three federation tables. Reused by both `Engine.run_pqc_sweep`
+/// (synchronous from Python) and the constructor's `pqc_sweep_on_init`
+/// auto-fire (background tokio task at end of `Engine::new`).
+async fn run_pqc_sweep_inner(
+    backend: &Arc<PostgresBackend>,
+    signer: &dyn PqcSigner,
+    batch_size: i64,
+) -> SweepSummary {
+    let keys = sweep_keys(backend, signer, batch_size).await;
+    let attestations = sweep_attestations(backend, signer, batch_size).await;
+    let revocations = sweep_revocations(backend, signer, batch_size).await;
+    let total_scanned = keys.scanned + attestations.scanned + revocations.scanned;
+    let total_signed = keys.signed + attestations.signed + revocations.signed;
+    let total_failed = keys.failed + attestations.failed + revocations.failed;
+    SweepSummary {
+        total_scanned,
+        total_signed,
+        total_failed,
+        keys,
+        attestations,
+        revocations,
+    }
+}
+
+async fn sweep_keys(
+    backend: &Arc<PostgresBackend>,
+    signer: &dyn PqcSigner,
+    batch_size: i64,
+) -> SweepCounts {
+    use crate::federation::FederationDirectory;
+    let rows = match backend.list_hybrid_pending_keys(batch_size).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "sweep_keys: list_hybrid_pending_keys failed");
+            return SweepCounts {
+                scanned: 0,
+                signed: 0,
+                failed: 0,
+            };
+        }
+    };
+    let scanned = rows.len() as i64;
+    let mut signed = 0i64;
+    let mut failed = 0i64;
+    for row in rows {
+        match cold_path_pqc_sign(signer, &row.envelope, &row.classical_sig_b64).await {
+            Ok((pubkey_b64, pqc_sig_b64)) => match backend
+                .attach_key_pqc_signature(&row.id, &pubkey_b64, &pqc_sig_b64)
+                .await
+            {
+                Ok(()) => signed += 1,
+                Err(crate::federation::Error::Conflict(_)) => {
+                    tracing::debug!(
+                        key_id = row.id.as_str(),
+                        "sweep: row hybrid-completed by another worker"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        key_id = row.id.as_str(),
+                        error = %e,
+                        "sweep: attach_key_pqc_signature failed"
+                    );
+                    failed += 1;
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    key_id = row.id.as_str(),
+                    error = %e,
+                    "sweep: cold_path_pqc_sign failed"
+                );
+                failed += 1;
+            }
+        }
+    }
+    SweepCounts {
+        scanned,
+        signed,
+        failed,
+    }
+}
+
+async fn sweep_attestations(
+    backend: &Arc<PostgresBackend>,
+    signer: &dyn PqcSigner,
+    batch_size: i64,
+) -> SweepCounts {
+    use crate::federation::FederationDirectory;
+    let rows = match backend.list_hybrid_pending_attestations(batch_size).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "sweep_attestations: list failed");
+            return SweepCounts {
+                scanned: 0,
+                signed: 0,
+                failed: 0,
+            };
+        }
+    };
+    let scanned = rows.len() as i64;
+    let mut signed = 0i64;
+    let mut failed = 0i64;
+    for row in rows {
+        match cold_path_pqc_sign(signer, &row.envelope, &row.classical_sig_b64).await {
+            Ok((_pubkey_b64, pqc_sig_b64)) => match backend
+                .attach_attestation_pqc_signature(&row.id, &pqc_sig_b64)
+                .await
+            {
+                Ok(()) => signed += 1,
+                Err(crate::federation::Error::Conflict(_)) => {
+                    tracing::debug!(
+                        attestation_id = row.id.as_str(),
+                        "sweep: row hybrid-completed by another worker"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        attestation_id = row.id.as_str(),
+                        error = %e,
+                        "sweep: attach_attestation_pqc_signature failed"
+                    );
+                    failed += 1;
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    attestation_id = row.id.as_str(),
+                    error = %e,
+                    "sweep: cold_path_pqc_sign failed"
+                );
+                failed += 1;
+            }
+        }
+    }
+    SweepCounts {
+        scanned,
+        signed,
+        failed,
+    }
+}
+
+async fn sweep_revocations(
+    backend: &Arc<PostgresBackend>,
+    signer: &dyn PqcSigner,
+    batch_size: i64,
+) -> SweepCounts {
+    use crate::federation::FederationDirectory;
+    let rows = match backend.list_hybrid_pending_revocations(batch_size).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "sweep_revocations: list failed");
+            return SweepCounts {
+                scanned: 0,
+                signed: 0,
+                failed: 0,
+            };
+        }
+    };
+    let scanned = rows.len() as i64;
+    let mut signed = 0i64;
+    let mut failed = 0i64;
+    for row in rows {
+        match cold_path_pqc_sign(signer, &row.envelope, &row.classical_sig_b64).await {
+            Ok((_pubkey_b64, pqc_sig_b64)) => match backend
+                .attach_revocation_pqc_signature(&row.id, &pqc_sig_b64)
+                .await
+            {
+                Ok(()) => signed += 1,
+                Err(crate::federation::Error::Conflict(_)) => {
+                    tracing::debug!(
+                        revocation_id = row.id.as_str(),
+                        "sweep: row hybrid-completed by another worker"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        revocation_id = row.id.as_str(),
+                        error = %e,
+                        "sweep: attach_revocation_pqc_signature failed"
+                    );
+                    failed += 1;
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    revocation_id = row.id.as_str(),
+                    error = %e,
+                    "sweep: cold_path_pqc_sign failed"
+                );
+                failed += 1;
+            }
+        }
+    }
+    SweepCounts {
+        scanned,
+        signed,
+        failed,
+    }
 }
 
 /// Scrubber bridge: wraps a Python callable in the [`Scrubber`]

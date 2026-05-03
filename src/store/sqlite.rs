@@ -1020,6 +1020,147 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         }
         Ok(())
     }
+
+    async fn list_hybrid_pending_keys(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let rows = tokio::task::spawn_blocking(
+            move || -> Result<Vec<(String, String, String)>, rusqlite::Error> {
+                let conn = conn.blocking_lock();
+                let mut stmt = conn.prepare(
+                    "SELECT key_id, registration_envelope, scrub_signature_classical \
+                     FROM federation_keys \
+                     WHERE pqc_completed_at IS NULL \
+                     ORDER BY valid_from ASC \
+                     LIMIT ?1",
+                )?;
+                let iter = stmt.query_map([limit], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?;
+                iter.collect()
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("list_hybrid_pending_keys: {e}"))
+        })?;
+        rows.into_iter()
+            .map(|(id, envelope_text, classical_sig_b64)| {
+                let envelope: serde_json::Value =
+                    serde_json::from_str(&envelope_text).map_err(|e| {
+                        crate::federation::Error::Backend(format!(
+                            "registration_envelope decode: {e}"
+                        ))
+                    })?;
+                Ok(crate::federation::HybridPendingRow {
+                    id,
+                    envelope,
+                    classical_sig_b64,
+                })
+            })
+            .collect()
+    }
+
+    async fn list_hybrid_pending_attestations(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let rows = tokio::task::spawn_blocking(
+            move || -> Result<Vec<(String, String, String)>, rusqlite::Error> {
+                let conn = conn.blocking_lock();
+                let mut stmt = conn.prepare(
+                    "SELECT attestation_id, attestation_envelope, scrub_signature_classical \
+                     FROM federation_attestations \
+                     WHERE pqc_completed_at IS NULL \
+                     ORDER BY asserted_at ASC \
+                     LIMIT ?1",
+                )?;
+                let iter = stmt.query_map([limit], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?;
+                iter.collect()
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("list_hybrid_pending_attestations: {e}"))
+        })?;
+        rows.into_iter()
+            .map(|(id, envelope_text, classical_sig_b64)| {
+                let envelope: serde_json::Value =
+                    serde_json::from_str(&envelope_text).map_err(|e| {
+                        crate::federation::Error::Backend(format!(
+                            "attestation_envelope decode: {e}"
+                        ))
+                    })?;
+                Ok(crate::federation::HybridPendingRow {
+                    id,
+                    envelope,
+                    classical_sig_b64,
+                })
+            })
+            .collect()
+    }
+
+    async fn list_hybrid_pending_revocations(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let rows = tokio::task::spawn_blocking(
+            move || -> Result<Vec<(String, String, String)>, rusqlite::Error> {
+                let conn = conn.blocking_lock();
+                let mut stmt = conn.prepare(
+                    "SELECT revocation_id, revocation_envelope, scrub_signature_classical \
+                     FROM federation_revocations \
+                     WHERE pqc_completed_at IS NULL \
+                     ORDER BY revoked_at ASC \
+                     LIMIT ?1",
+                )?;
+                let iter = stmt.query_map([limit], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?;
+                iter.collect()
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("list_hybrid_pending_revocations: {e}"))
+        })?;
+        rows.into_iter()
+            .map(|(id, envelope_text, classical_sig_b64)| {
+                let envelope: serde_json::Value =
+                    serde_json::from_str(&envelope_text).map_err(|e| {
+                        crate::federation::Error::Backend(format!(
+                            "revocation_envelope decode: {e}"
+                        ))
+                    })?;
+                Ok(crate::federation::HybridPendingRow {
+                    id,
+                    envelope,
+                    classical_sig_b64,
+                })
+            })
+            .collect()
+    }
 }
 
 fn parse_rfc3339(s: &str) -> chrono::DateTime<chrono::Utc> {
