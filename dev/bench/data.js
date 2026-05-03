@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777761596861,
+  "lastUpdate": 1777767662236,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -4727,6 +4727,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 18928463,
             "range": "± 20809324",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "19e8a74982ad797beb4786671cdfd18214cda567",
+          "message": "0.3.1 — persist-owned cold-path PQC fill-in (CIRISPersist#10)\n\nBuilt on CIRISVerify v1.9.0's PqcSigner trait + MlDsa65SoftwareSigner.\nPersist owns the cold-path so consumers (lens, registry, partner\nsites) don't reimplement it independently and drift — same lesson as\ncanonicalize_envelope post-CIRISPersist#7.\n\nEngine constructor: optional steward_pqc_key_id + steward_pqc_key_path\n(both-or-neither). Loaded via ciris_keyring::MlDsa65SoftwareSigner::\nfrom_seed_file at construction; seed bytes never cross FFI. HW\nacceleration when post-quantum HSMs land is verify's responsibility\n(PqcSigner trait is the dispatch surface).\n\nThree new PyO3 methods on Engine (escape hatches for explicit use;\nthe auto-fire flow is the primary mechanism):\n- steward_pqc_public_key_b64() -> str (1952B raw → ~2604 chars b64)\n- steward_pqc_key_id() -> str\n- steward_pqc_sign(message: bytes) -> bytes (3309B raw sig, FIPS 204 final)\n\nAuto-fire after federation writes (the load-bearing piece):\n- Capture envelope + classical_sig BEFORE backend consumes record\n- Await synchronous put — Python returns once row lands hybrid-pending\n- tokio::spawn fire-and-forget cold-path task:\n  1. Canonicalize envelope via PythonJsonDumpsCanonicalizer\n  2. Decode classical_sig from base64\n  3. Concatenate (canonical || classical_sig) — bound signature\n  4. Sign via PqcSigner::sign\n  5. Call attach_*_pqc_signature\n\nPer V004 schema header writer contract: \"kick off IMMEDIATELY after\nEd25519 sign, not delayed/batched/scheduled, just off the synchronous\nrequest path.\" tokio::spawn post-put matches that exactly.\n\nFail-open: cold-path sign or attach failures leave row hybrid-pending;\ntracing::warn surfaces in operator logs; consumers fill via the v0.2.0\nattach_*_pqc_signature escape hatch on their own schedule.\n\nBridge action: mount lens-steward.mldsa.seed alongside the existing\nEd25519 seed; lens Engine constructor adds the two new params; every\nfederation write auto-fires PQC; 648 hybrid-pending rows fill via\nread-and-republish loop or one-shot attach.\n\nDeps:\n- ciris-keyring v1.8.6 → v1.9.0 (pqc-ml-dsa feature)\n- ciris-verify-core v1.8.6 → v1.9.0\n\n157 lib + 22 integration tests green; clippy clean; cargo-deny clean.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-02T19:11:43-05:00",
+          "tree_id": "0776c104c2d99969c8891fea3558dd743436c7b6",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/19e8a74982ad797beb4786671cdfd18214cda567"
+        },
+        "date": 1777767661887,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101226,
+            "range": "± 3757",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 243793,
+            "range": "± 2210",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 526716,
+            "range": "± 2960",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1866138,
+            "range": "± 14918",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 338,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1446,
+            "range": "± 29",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7815,
+            "range": "± 50",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 353,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3065,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 8987,
+            "range": "± 59",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 40329,
+            "range": "± 222",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 37",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2217935,
+            "range": "± 76510",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6459134,
+            "range": "± 186060",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23005378,
+            "range": "± 214890",
             "unit": "ns/iter"
           }
         ]
