@@ -5,6 +5,164 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.4.0] — 2026-05-03
+
+**Federation substrate cut.** Three architectural deliverables shipped
+together: edge outbound queue (CIRISPersist#16), full verify surface
+exposed for agent-cutover-via-lenscore, and `accord_public_keys`
+dual-read fallback retired (lens#8 ASK 2). Closes CIRISEdge OQ-09.
+
+This is the schema-stabilization release — federation_keys is now
+the canonical pubkey directory, the outbound queue substrate exists,
+and the verify surface is complete enough that agent + edge can
+consume verify exclusively through `Engine`.
+
+### Edge outbound queue (CIRISPersist#16)
+
+Durable substrate for `CIRISEdge::send_durable()`. New
+`cirislens.edge_outbound_queue` table (V007 migration on postgres +
+sqlite). Five-state machine:
+
+```text
+enqueue → pending → sending ─┬─ delivered (no ACK required)
+                             ├─ awaiting_ack → delivered (ACK received)
+                             │                 ↓
+                             │              abandoned (ACK timeout → max_attempts)
+                             └─ pending (retry) | abandoned (max_attempts | ttl_expired)
+```
+
+Per-row policy (`max_attempts`, `ttl_seconds`, `ack_timeout_seconds`)
+copied at enqueue — message-type policy changes don't retroactively
+break in-flight rows. Optimistic claim
+(`claimed_until` + `claimed_by`) for multi-instance dispatch
+(CIRISEdge OQ-06) via `SELECT FOR UPDATE SKIP LOCKED` on postgres.
+
+15 new `OutboundQueue` trait methods exposed via PyO3:
+
+```python
+queue_id = engine.enqueue_outbound(
+    sender_key_id, destination_key_id, message_type, edge_schema_version,
+    envelope_bytes, body_sha256, body_size_bytes,
+    requires_ack, max_attempts, ttl_seconds,
+    initial_next_attempt_after_rfc3339,
+    ack_timeout_seconds=...,  # required when requires_ack=True
+)
+
+# Dispatch loop
+rows = engine.claim_pending_outbound(batch_size, claim_duration_seconds, claimed_by)
+engine.mark_transport_delivered(queue_id, transport)
+result = engine.mark_transport_failed(queue_id, error_class, error_detail, transport, next_attempt_after_rfc3339)
+# {"outcome": "retrying"|"abandoned", "attempt": int|None}
+engine.mark_replay_resolved(queue_id)
+
+# ACK matching (content-derived via body_sha256)
+row = engine.match_ack_to_outbound(in_reply_to_sha256)  # 32 bytes
+engine.mark_ack_received(queue_id, ack_envelope_bytes)
+
+# Background sweeps (run periodically per-deployment)
+engine.sweep_ack_timeouts() -> int
+engine.sweep_ttl_expired() -> int
+engine.sweep_expired_claims() -> int
+
+# Inspection / operator surface
+status = engine.outbound_status(queue_id)  # dict | None
+rows = engine.list_outbound(limit=100, status=..., destination_key_id=..., ...)
+engine.cancel_outbound(queue_id)
+engine.replay_abandoned(queue_id)
+```
+
+Stable error tokens: `outbound_invalid_argument`, `outbound_not_found`,
+`outbound_invalid_transition`, `outbound_backend`.
+
+### Full verify surface exposed (lens#8 + agent cutover)
+
+Five new `Engine` verify methods so the agent can cut over to
+persist for runtime verify when it's brought in via lenscore:
+
+```python
+# Full CompleteTrace verify with internal directory lookup
+result = engine.verify_trace(complete_trace_json)
+# {"verified": True, "schema_version": "2.7.0"|"2.7.9"}
+
+# Hybrid verify with internal lookup_public_key
+result = engine.verify_hybrid_via_directory(
+    canonical_bytes, signature_key_id,
+    ed25519_sig_b64, ml_dsa_65_sig_b64,
+    policy="strict|soft_freshness|ed25519_fallback",
+    soft_freshness_window_seconds=..., row_age_seconds=...,
+)
+
+# Federation directory row verify (verify-without-store)
+engine.verify_signed_key_record(json, policy, ...)
+engine.verify_signed_attestation(json, policy, ...)
+engine.verify_signed_revocation(json, policy, ...)
+```
+
+The agent's runtime verify needs (CompleteTrace, peer-message
+envelopes, federation directory rows, ACK envelopes, arbitrary
+canonical bytes) all map onto Engine methods. No federation peer
+needs to call `ciris_crypto::HybridVerifier` directly — verify-via-
+persist is the single-source-of-truth (CIRISPersist#7 architectural
+closure repeated for the verify path).
+
+### accord_public_keys dual-read fallback retired (lens#8 ASK 2)
+
+`Backend::lookup_public_key` on postgres + memory + sqlite now reads
+only from `federation_keys`. The dual-read fallback to
+`accord_public_keys` was retired this release, coordinated with
+lens dropping its direct INSERT into `accord_public_keys` the same
+release.
+
+The legacy table stays in the schema for historical reads via
+`cirislens_reader` (V005 read-only role) but the verify path no
+longer touches it. `sample_public_keys` diagnostic also reads
+federation_keys so the verify-unknown-key breadcrumb sample matches
+the actual lookup query.
+
+### Threat model bumps
+
+AV-40 (outbound queue disk exhaustion) and AV-41 (spoofed
+in_reply_to ACK matching) added to `docs/THREAT_MODEL.md` §3.11.
+Mitigation matrix updated.
+
+### Tests
+
+177 lib tests pass; clippy clean across all features; cargo-deny
+clean. `lookup_public_key_round_trip` and (formerly) `revoked_keys
+_filtered` rewritten to use federation_keys directly (the legacy
+accord_public_keys round-trip tests retired with the fallback).
+The `revoked_keys_filtered` test became `expired_keys_filtered`
+(federation revocations are a separate concern in
+`federation_revocations` post-v0.2.0).
+
+### Bridge action
+
+```
+ciris-persist==0.3.6  →  ciris-persist==0.4.0
+```
+
+Lens drops its direct INSERT into `accord_public_keys` the same
+release (the v0.3.x fallback path is gone). DSAR handler folds onto
+`engine.delete_traces_for_agent(agent_id_hash, signature_key_id)`
+per v0.3.6's per-key contract. Agent runtime verify can now cut over
+to persist exclusively.
+
+### Schema changes
+
+- V007 (postgres + sqlite): `cirislens.edge_outbound_queue` table +
+  6 partial indexes (pending dispatch, awaiting_ack sweep,
+  body_sha256 lookup, destination_key_id, status_enqueued,
+  claimed_until sweep)
+
+`accord_public_keys` table is **not dropped** — historical reads
+work; only the runtime fallback path is retired. v0.5.0 may drop
+the table itself once historical-reads consumers migrate.
+
+### Deps
+
+No version changes (`ciris-keyring` / `ciris-verify-core` /
+`ciris-crypto` v1.9.0).
+
 ## [0.3.6] — 2026-05-03
 
 **`Engine.verify_hybrid` for arbitrary canonical bytes** + **per-key

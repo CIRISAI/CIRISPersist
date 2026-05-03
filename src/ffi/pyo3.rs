@@ -1653,6 +1653,224 @@ impl PyEngine {
         Ok(dict)
     }
 
+    // ─── Verify surface for federation peer cutover (v0.4.0) ────
+
+    /// v0.4.0 — Verify a CompleteTrace envelope end-to-end.
+    /// Looks up `signature_key_id` via the federation directory,
+    /// reconstructs canonical bytes per `trace_schema_version`
+    /// (deterministic dispatch — 2.7.0 / 2.7.9), verifies the
+    /// Ed25519 signature.
+    ///
+    /// Returns `{"verified": True, "schema_version": "2.7.0"|"2.7.9"}`
+    /// on success. Raises `ValueError` with a stable verify
+    /// error-token (`verify_signature_mismatch`,
+    /// `verify_unknown_key`, `verify_invalid_signature`,
+    /// `verify_canonicalization_internal`,
+    /// `verify_unsupported_schema_version`) on failure.
+    ///
+    /// Use this when a peer wants to verify a CompleteTrace WITHOUT
+    /// storing it (dry-run validation, pre-storage check, audit
+    /// replay). Persistence still goes through
+    /// `receive_and_persist` (which verifies internally before
+    /// storing).
+    fn verify_trace<'py>(
+        &self,
+        py: Python<'py>,
+        complete_trace_json: &str,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        use crate::schema::CompleteTrace;
+        use crate::verify::{verify_trace_via_directory, PythonJsonDumpsCanonicalizer};
+        let trace: CompleteTrace = serde_json::from_str(complete_trace_json)
+            .map_err(|e| PyValueError::new_err(format!("CompleteTrace JSON decode: {e}")))?;
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let key_dir = TraceKeyDirectory { backend, runtime };
+        verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &key_dir).map_err(
+            |e| {
+                tracing::warn!(error = %e, kind = e.kind(), "verify_trace rejected");
+                PyValueError::new_err(e.kind())
+            },
+        )?;
+        let dict = PyDict::new(py);
+        dict.set_item("verified", true)?;
+        dict.set_item("schema_version", trace.trace_schema_version.as_str())?;
+        Ok(dict)
+    }
+
+    /// v0.4.0 — Hybrid verify with internal directory lookup.
+    /// Convenience wrapper around `verify_hybrid` + federation_keys
+    /// lookup: given `signature_key_id`, persist looks up both
+    /// pubkeys (Ed25519 + ML-DSA-65) and runs `verify_hybrid`.
+    ///
+    /// Saves the caller from doing a separate `lookup_public_key`
+    /// call before each verify. Same `policy` semantics as
+    /// `verify_hybrid` (Strict / SoftFreshness / Ed25519Fallback).
+    /// Same return shape (`{"outcome", "row_age_seconds"}`).
+    ///
+    /// Raises `ValueError` with `verify_unknown_key` if
+    /// `signature_key_id` doesn't resolve in federation_keys, or
+    /// the standard `verify_hybrid_*` tokens for crypto failures.
+    #[pyo3(signature = (
+        canonical_bytes,
+        signature_key_id,
+        ed25519_sig_b64,
+        ml_dsa_65_sig_b64,
+        policy,
+        soft_freshness_window_seconds=None,
+        row_age_seconds=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn verify_hybrid_via_directory<'py>(
+        &self,
+        py: Python<'py>,
+        canonical_bytes: &[u8],
+        signature_key_id: &str,
+        ed25519_sig_b64: &str,
+        ml_dsa_65_sig_b64: Option<&str>,
+        policy: &str,
+        soft_freshness_window_seconds: Option<f64>,
+        row_age_seconds: Option<f64>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        // Look up the federation_keys row to get both pubkeys.
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let key_id_owned = signature_key_id.to_owned();
+        let key_record_opt = py.detach(move || {
+            runtime.block_on(async move {
+                use crate::federation::FederationDirectory;
+                <PostgresBackend as FederationDirectory>::lookup_public_key(&backend, &key_id_owned)
+                    .await
+            })
+        });
+        let key_record = key_record_opt
+            .map_err(federation_err_to_py)?
+            .ok_or_else(|| PyValueError::new_err("verify_unknown_key"))?;
+        let ed25519_pubkey_b64 = key_record.pubkey_ed25519_base64.clone();
+        let ml_dsa_65_pubkey_b64 = key_record.pubkey_ml_dsa_65_base64.clone();
+
+        // Delegate to verify_hybrid with the looked-up pubkeys.
+        // ml_dsa_65_pubkey_b64 may be None when the row is hybrid-
+        // pending; verify_hybrid handles that via the policy.
+        self.verify_hybrid(
+            py,
+            canonical_bytes,
+            ed25519_sig_b64,
+            ml_dsa_65_sig_b64,
+            &ed25519_pubkey_b64,
+            ml_dsa_65_pubkey_b64.as_deref(),
+            policy,
+            soft_freshness_window_seconds,
+            row_age_seconds,
+        )
+    }
+
+    /// v0.4.0 — Verify a `SignedKeyRecord` envelope's scrub
+    /// signature. Looks up the scrub_key_id's pubkeys, recomputes
+    /// canonical bytes from `registration_envelope`, runs
+    /// hybrid-verify with the supplied policy.
+    ///
+    /// Used by federation peers consuming key registrations from
+    /// other peers (gossip / direct) to verify-before-store. The
+    /// federation directory's `put_public_key` does its own write-
+    /// path verification; this primitive lets a peer verify-without-
+    /// storing for dry-runs or trust-graph audits.
+    #[pyo3(signature = (
+        signed_key_record_json,
+        policy,
+        soft_freshness_window_seconds=None,
+        row_age_seconds=None,
+    ))]
+    fn verify_signed_key_record<'py>(
+        &self,
+        py: Python<'py>,
+        signed_key_record_json: &str,
+        policy: &str,
+        soft_freshness_window_seconds: Option<f64>,
+        row_age_seconds: Option<f64>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let signed: crate::federation::SignedKeyRecord =
+            serde_json::from_str(signed_key_record_json)
+                .map_err(|e| PyValueError::new_err(format!("SignedKeyRecord JSON decode: {e}")))?;
+        let canonical = canonicalize_envelope_value(&signed.record.registration_envelope)?;
+        self.verify_hybrid_via_directory(
+            py,
+            &canonical,
+            &signed.record.scrub_key_id,
+            &signed.record.scrub_signature_classical,
+            signed.record.scrub_signature_pqc.as_deref(),
+            policy,
+            soft_freshness_window_seconds,
+            row_age_seconds,
+        )
+    }
+
+    /// v0.4.0 — Verify a `SignedAttestation` envelope. Same shape
+    /// as `verify_signed_key_record`; canonical bytes come from
+    /// `attestation_envelope`.
+    #[pyo3(signature = (
+        signed_attestation_json,
+        policy,
+        soft_freshness_window_seconds=None,
+        row_age_seconds=None,
+    ))]
+    fn verify_signed_attestation<'py>(
+        &self,
+        py: Python<'py>,
+        signed_attestation_json: &str,
+        policy: &str,
+        soft_freshness_window_seconds: Option<f64>,
+        row_age_seconds: Option<f64>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let signed: crate::federation::SignedAttestation =
+            serde_json::from_str(signed_attestation_json).map_err(|e| {
+                PyValueError::new_err(format!("SignedAttestation JSON decode: {e}"))
+            })?;
+        let canonical = canonicalize_envelope_value(&signed.attestation.attestation_envelope)?;
+        self.verify_hybrid_via_directory(
+            py,
+            &canonical,
+            &signed.attestation.scrub_key_id,
+            &signed.attestation.scrub_signature_classical,
+            signed.attestation.scrub_signature_pqc.as_deref(),
+            policy,
+            soft_freshness_window_seconds,
+            row_age_seconds,
+        )
+    }
+
+    /// v0.4.0 — Verify a `SignedRevocation` envelope. Same shape
+    /// as `verify_signed_attestation`; canonical bytes come from
+    /// `revocation_envelope`.
+    #[pyo3(signature = (
+        signed_revocation_json,
+        policy,
+        soft_freshness_window_seconds=None,
+        row_age_seconds=None,
+    ))]
+    fn verify_signed_revocation<'py>(
+        &self,
+        py: Python<'py>,
+        signed_revocation_json: &str,
+        policy: &str,
+        soft_freshness_window_seconds: Option<f64>,
+        row_age_seconds: Option<f64>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let signed: crate::federation::SignedRevocation =
+            serde_json::from_str(signed_revocation_json)
+                .map_err(|e| PyValueError::new_err(format!("SignedRevocation JSON decode: {e}")))?;
+        let canonical = canonicalize_envelope_value(&signed.revocation.revocation_envelope)?;
+        self.verify_hybrid_via_directory(
+            py,
+            &canonical,
+            &signed.revocation.scrub_key_id,
+            &signed.revocation.scrub_signature_classical,
+            signed.revocation.scrub_signature_pqc.as_deref(),
+            policy,
+            soft_freshness_window_seconds,
+            row_age_seconds,
+        )
+    }
+
     // ─── Edge outbound queue (v0.4.0, CIRISPersist#16) ──────────
 
     /// v0.4.0 (CIRISPersist#16) — Enqueue an outbound row in
@@ -1701,12 +1919,9 @@ impl PyEngine {
         }
         let mut hash = [0u8; 32];
         hash.copy_from_slice(body_sha256);
-        let initial_next: chrono::DateTime<chrono::Utc> = initial_next_attempt_after_rfc3339
-            .parse()
-            .map_err(|e| {
-                PyValueError::new_err(format!(
-                    "initial_next_attempt_after_rfc3339 parse: {e}"
-                ))
+        let initial_next: chrono::DateTime<chrono::Utc> =
+            initial_next_attempt_after_rfc3339.parse().map_err(|e| {
+                PyValueError::new_err(format!("initial_next_attempt_after_rfc3339 parse: {e}"))
             })?;
 
         let backend = self.backend.clone();
@@ -1803,10 +2018,9 @@ impl PyEngine {
         transport: &str,
         next_attempt_after_rfc3339: &str,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let next_attempt_after: chrono::DateTime<chrono::Utc> =
-            next_attempt_after_rfc3339.parse().map_err(|e| {
-                PyValueError::new_err(format!("next_attempt_after_rfc3339 parse: {e}"))
-            })?;
+        let next_attempt_after: chrono::DateTime<chrono::Utc> = next_attempt_after_rfc3339
+            .parse()
+            .map_err(|e| PyValueError::new_err(format!("next_attempt_after_rfc3339 parse: {e}")))?;
         let backend = self.backend.clone();
         let runtime = self.runtime.clone();
         let qid = queue_id.to_owned();
@@ -1981,6 +2195,7 @@ impl PyEngine {
         message_type=None,
         enqueued_after_rfc3339=None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn list_outbound<'py>(
         &self,
         py: Python<'py>,
@@ -1992,9 +2207,10 @@ impl PyEngine {
         enqueued_after_rfc3339: Option<&str>,
     ) -> PyResult<pyo3::Bound<'py, pyo3::types::PyList>> {
         let status_parsed = match status {
-            Some(s) => Some(crate::outbound::OutboundStatus::from_str(s).ok_or_else(|| {
-                PyValueError::new_err(format!("unknown status: {s}"))
-            })?),
+            Some(s) => Some(
+                crate::outbound::OutboundStatus::from_wire_str(s)
+                    .ok_or_else(|| PyValueError::new_err(format!("unknown status: {s}")))?,
+            ),
             None => None,
         };
         let enqueued_after = match enqueued_after_rfc3339 {
@@ -2102,10 +2318,7 @@ fn outbound_row_to_pydict<'py>(
     )?;
     d.set_item("delivered_at", row.delivered_at.map(|t| t.to_rfc3339()))?;
     d.set_item("abandoned_at", row.abandoned_at.map(|t| t.to_rfc3339()))?;
-    d.set_item(
-        "abandoned_reason",
-        row.abandoned_reason.map(|r| r.as_str()),
-    )?;
+    d.set_item("abandoned_reason", row.abandoned_reason.map(|r| r.as_str()))?;
     d.set_item("attempt_count", row.attempt_count)?;
     d.set_item("max_attempts", row.max_attempts)?;
     d.set_item("ttl_seconds", row.ttl_seconds)?;
@@ -2138,6 +2351,46 @@ fn outbound_rows_to_pylist<'py>(
         list.append(outbound_row_to_pydict(py, &r)?)?;
     }
     Ok(list)
+}
+
+/// v0.4.0 — Adapter implementing `PublicKeyDirectory` against the
+/// PyO3 Engine's PostgresBackend + tokio runtime. Used by
+/// `Engine.verify_trace` to drive `verify_trace_via_directory`
+/// without requiring the caller to look up the key separately.
+struct TraceKeyDirectory {
+    backend: Arc<PostgresBackend>,
+    runtime: Arc<Runtime>,
+}
+
+impl crate::verify::PublicKeyDirectory for TraceKeyDirectory {
+    fn lookup(
+        &self,
+        key_id: &str,
+    ) -> Result<Option<ed25519_dalek::VerifyingKey>, Box<dyn std::error::Error + Send + Sync>> {
+        let backend = self.backend.clone();
+        let key_id = key_id.to_owned();
+        // verify_trace_via_directory's PublicKeyDirectory trait is
+        // synchronous; bridge to the async backend via block_on on
+        // the engine's tokio runtime. Same shape used by
+        // receive_and_persist's internal verify path.
+        let key_opt = self.runtime.block_on(async move {
+            use crate::store::Backend;
+            backend.lookup_public_key(&key_id).await
+        });
+        key_opt.map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))
+    }
+}
+
+/// v0.4.0 — Canonicalize a federation envelope value (registration_
+/// envelope / attestation_envelope / revocation_envelope) via
+/// PythonJsonDumpsCanonicalizer. Used by the verify_signed_*
+/// methods to produce the bytes the scrub signature was computed
+/// over.
+fn canonicalize_envelope_value(envelope: &serde_json::Value) -> PyResult<Vec<u8>> {
+    use crate::verify::canonical::Canonicalizer;
+    crate::verify::PythonJsonDumpsCanonicalizer
+        .canonicalize_value(envelope)
+        .map_err(|e| PyRuntimeError::new_err(format!("canonicalize_envelope_value: {e}")))
 }
 
 /// v0.3.5 — TraceLevel → wire-format string. Same shape as the

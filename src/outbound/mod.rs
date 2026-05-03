@@ -47,8 +47,7 @@
 pub mod types;
 
 pub use types::{
-    AbandonedReason, OutboundFailureOutcome, OutboundFilter, OutboundRow, OutboundStatus,
-    QueueId,
+    AbandonedReason, OutboundFailureOutcome, OutboundFilter, OutboundRow, OutboundStatus, QueueId,
 };
 
 use chrono::{DateTime, Utc};
@@ -214,10 +213,8 @@ pub trait OutboundQueue: Send + Sync {
     /// Operator-driven cancellation. Transitions a non-terminal row
     /// to `abandoned` with `abandoned_reason = 'operator_cancel'`.
     /// Idempotent: cancelling an already-terminal row is a no-op.
-    fn cancel_outbound(
-        &self,
-        queue_id: &QueueId,
-    ) -> impl Future<Output = Result<(), Error>> + Send;
+    fn cancel_outbound(&self, queue_id: &QueueId)
+        -> impl Future<Output = Result<(), Error>> + Send;
 
     /// Operator-driven replay of an abandoned row: reset to
     /// `pending`, attempt_count=0, next_attempt_after=now(). For

@@ -42,8 +42,11 @@ impl OutboundStatus {
     }
 
     /// Inverse of `as_str`. Returns `None` on unknown — caller
-    /// surfaces as `Error::Backend` rather than panic.
-    pub fn from_str(s: &str) -> Option<Self> {
+    /// surfaces as `Error::Backend` rather than panic. Named
+    /// `from_wire_str` to avoid the `std::str::FromStr` trait
+    /// collision (callers don't expect `.parse::<OutboundStatus>()`
+    /// to work; this is a wire-format helper, not a general parser).
+    pub fn from_wire_str(s: &str) -> Option<Self> {
         match s {
             "pending" => Some(Self::Pending),
             "sending" => Some(Self::Sending),
@@ -83,8 +86,9 @@ impl AbandonedReason {
         }
     }
 
-    /// Inverse of `as_str`.
-    pub fn from_str(s: &str) -> Option<Self> {
+    /// Inverse of `as_str` (wire-format helper; named to avoid
+    /// `std::str::FromStr` trait collision).
+    pub fn from_wire_str(s: &str) -> Option<Self> {
         match s {
             "max_attempts" => Some(Self::MaxAttempts),
             "ttl_expired" => Some(Self::TtlExpired),

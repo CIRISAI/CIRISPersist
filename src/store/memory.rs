@@ -87,9 +87,46 @@ impl MemoryBackend {
         Self::default()
     }
 
-    /// Register a public key. For test fixtures.
+    /// Register a public key. For test fixtures. v0.4.0 — writes to
+    /// federation_keys (the canonical pubkey directory post-lens#8
+    /// ASK 2). Pre-v0.4.0 wrote to a separate `keys` map; the legacy
+    /// fallback was retired in this release. The `keys` field stays
+    /// on the State struct so existing tests that build via this
+    /// helper continue to work; lookup_public_key reads only from
+    /// federation_keys.
     pub fn add_public_key(&self, key_id: &str, key: VerifyingKey) {
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine as _;
         let mut state = self.state.lock().expect("memory backend lock");
+        let pubkey_b64 = BASE64.encode(key.to_bytes());
+        // Write a minimal federation_keys row matching the test
+        // fixture shape. The v0.2.0 federation directory schema
+        // requires more fields; we fill them with stub-but-valid
+        // values appropriate for test scope. Production callers go
+        // through Engine.put_public_key with full SignedKeyRecord.
+        let now = chrono::Utc::now();
+        let rec = crate::federation::KeyRecord {
+            key_id: key_id.to_owned(),
+            pubkey_ed25519_base64: pubkey_b64,
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+            identity_type: "agent".to_owned(),
+            identity_ref: key_id.to_owned(),
+            valid_from: now,
+            valid_until: None,
+            registration_envelope: serde_json::json!({"id": key_id}),
+            original_content_hash: hex::encode([0u8; 32]),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: key_id.to_owned(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+        };
+        state.federation_keys.insert(key_id.to_owned(), rec);
+        // Keep the legacy map populated too — some tests still
+        // reference it via `state.keys`. Single source of truth at
+        // verify is federation_keys; this is just bookkeeping.
         state.keys.insert(key_id.to_owned(), key);
     }
 
@@ -155,32 +192,34 @@ impl Backend for MemoryBackend {
     }
 
     async fn lookup_public_key(&self, key_id: &str) -> Result<Option<VerifyingKey>, Error> {
-        // v0.2.1 — dual-read migration matching postgres + sqlite.
-        // federation_keys first; fall back to legacy `keys` map.
+        // v0.4.0 (lens#8 ASK 2) — federation_keys is the canonical
+        // pubkey directory. Legacy `keys` map fallback retired this
+        // release. The `keys` field stays on the State struct for
+        // test fixtures (add_public_key) but lookup_public_key no
+        // longer reads from it.
         use base64::engine::general_purpose::STANDARD as BASE64;
         use base64::Engine as _;
         let state = self.state.lock().expect("memory backend lock");
-        if let Some(rec) = state.federation_keys.get(key_id) {
-            // valid_until check (None means no expiry).
-            let now = chrono::Utc::now();
-            if rec.valid_until.map_or(true, |t| t > now) {
-                let bytes = BASE64
-                    .decode(&rec.pubkey_ed25519_base64)
-                    .map_err(|e| Error::Backend(format!("public_key_base64 decode: {e}")))?;
-                if bytes.len() != 32 {
-                    return Err(Error::Backend(format!(
-                        "public_key_base64 wrong length: got {}, expected 32",
-                        bytes.len()
-                    )));
-                }
-                let arr: [u8; 32] = bytes.as_slice().try_into().expect("length-checked");
-                let key = VerifyingKey::from_bytes(&arr)
-                    .map_err(|e| Error::Backend(format!("public_key parse: {e}")))?;
-                return Ok(Some(key));
-            }
+        let Some(rec) = state.federation_keys.get(key_id) else {
+            return Ok(None);
+        };
+        let now = chrono::Utc::now();
+        if rec.valid_until.is_some_and(|t| t <= now) {
+            return Ok(None);
         }
-        // Fall back to legacy keys map.
-        Ok(state.keys.get(key_id).copied())
+        let bytes = BASE64
+            .decode(&rec.pubkey_ed25519_base64)
+            .map_err(|e| Error::Backend(format!("public_key_base64 decode: {e}")))?;
+        if bytes.len() != 32 {
+            return Err(Error::Backend(format!(
+                "public_key_base64 wrong length: got {}, expected 32",
+                bytes.len()
+            )));
+        }
+        let arr: [u8; 32] = bytes.as_slice().try_into().expect("length-checked");
+        let key = VerifyingKey::from_bytes(&arr)
+            .map_err(|e| Error::Backend(format!("public_key parse: {e}")))?;
+        Ok(Some(key))
     }
 
     async fn run_migrations(&self) -> Result<(), Error> {
@@ -648,7 +687,11 @@ impl crate::outbound::OutboundQueue for MemoryBackend {
                 "ack_timeout_seconds required when requires_ack=true".into(),
             ));
         }
-        let queue_id = format!("{:x}-{:x}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), uuid_like_counter());
+        let queue_id = format!(
+            "{:x}-{:x}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            uuid_like_counter()
+        );
         let row = crate::outbound::OutboundRow {
             queue_id: queue_id.clone(),
             sender_key_id: sender_key_id.into(),
@@ -698,8 +741,7 @@ impl crate::outbound::OutboundQueue for MemoryBackend {
             .outbound_queue
             .iter()
             .filter(|(_, r)| {
-                r.status == crate::outbound::OutboundStatus::Pending
-                    && r.next_attempt_after <= now
+                r.status == crate::outbound::OutboundStatus::Pending && r.next_attempt_after <= now
             })
             .map(|(k, _)| k.clone())
             .collect();
@@ -733,9 +775,10 @@ impl crate::outbound::OutboundQueue for MemoryBackend {
     ) -> Result<(), crate::outbound::Error> {
         let now = chrono::Utc::now();
         let mut state = self.state.lock().expect("memory backend lock");
-        let r = state.outbound_queue.get_mut(queue_id).ok_or_else(|| {
-            crate::outbound::Error::NotFound(queue_id.clone())
-        })?;
+        let r = state
+            .outbound_queue
+            .get_mut(queue_id)
+            .ok_or_else(|| crate::outbound::Error::NotFound(queue_id.clone()))?;
         if r.status != crate::outbound::OutboundStatus::Sending {
             return Err(crate::outbound::Error::InvalidTransition(format!(
                 "queue_id {queue_id} not in 'sending'"
@@ -764,9 +807,10 @@ impl crate::outbound::OutboundQueue for MemoryBackend {
     ) -> Result<crate::outbound::OutboundFailureOutcome, crate::outbound::Error> {
         let now = chrono::Utc::now();
         let mut state = self.state.lock().expect("memory backend lock");
-        let r = state.outbound_queue.get_mut(queue_id).ok_or_else(|| {
-            crate::outbound::Error::NotFound(queue_id.clone())
-        })?;
+        let r = state
+            .outbound_queue
+            .get_mut(queue_id)
+            .ok_or_else(|| crate::outbound::Error::NotFound(queue_id.clone()))?;
         if r.status != crate::outbound::OutboundStatus::Sending {
             return Err(crate::outbound::Error::InvalidTransition(format!(
                 "queue_id {queue_id} not in 'sending'"
@@ -778,8 +822,7 @@ impl crate::outbound::OutboundQueue for MemoryBackend {
         r.claimed_until = None;
         r.claimed_by = None;
 
-        let ttl_expired = (now - r.enqueued_at)
-            > chrono::Duration::seconds(r.ttl_seconds);
+        let ttl_expired = (now - r.enqueued_at) > chrono::Duration::seconds(r.ttl_seconds);
         let attempts_exhausted = r.attempt_count >= r.max_attempts;
         if ttl_expired || attempts_exhausted {
             r.status = crate::outbound::OutboundStatus::Abandoned;
@@ -838,9 +881,10 @@ impl crate::outbound::OutboundQueue for MemoryBackend {
     ) -> Result<(), crate::outbound::Error> {
         let now = chrono::Utc::now();
         let mut state = self.state.lock().expect("memory backend lock");
-        let r = state.outbound_queue.get_mut(queue_id).ok_or_else(|| {
-            crate::outbound::Error::NotFound(queue_id.clone())
-        })?;
+        let r = state
+            .outbound_queue
+            .get_mut(queue_id)
+            .ok_or_else(|| crate::outbound::Error::NotFound(queue_id.clone()))?;
         if r.status != crate::outbound::OutboundStatus::AwaitingAck {
             return Err(crate::outbound::Error::InvalidTransition(format!(
                 "queue_id {queue_id} not in 'awaiting_ack'"
@@ -876,12 +920,10 @@ impl crate::outbound::OutboundQueue for MemoryBackend {
             .collect();
         for k in queue_ids {
             if let Some(r) = state.outbound_queue.get_mut(&k) {
-                let ttl_expired = (now - r.enqueued_at)
-                    > chrono::Duration::seconds(r.ttl_seconds);
+                let ttl_expired = (now - r.enqueued_at) > chrono::Duration::seconds(r.ttl_seconds);
                 let attempts_exhausted = r.attempt_count >= r.max_attempts;
                 r.last_error_class = Some("ack_timeout".into());
-                r.last_error_detail =
-                    Some("no ACK before ack_timeout_seconds expired".into());
+                r.last_error_detail = Some("no ACK before ack_timeout_seconds expired".into());
                 if ttl_expired || attempts_exhausted {
                     r.status = crate::outbound::OutboundStatus::Abandoned;
                     r.abandoned_at = Some(now);
@@ -968,9 +1010,7 @@ impl crate::outbound::OutboundQueue for MemoryBackend {
                         .message_type
                         .as_ref()
                         .map_or(true, |m| r.message_type == *m)
-                    && filter
-                        .enqueued_after
-                        .map_or(true, |t| r.enqueued_at >= t)
+                    && filter.enqueued_after.map_or(true, |t| r.enqueued_at >= t)
             })
             .cloned()
             .collect();
@@ -989,8 +1029,7 @@ impl crate::outbound::OutboundQueue for MemoryBackend {
             if !r.status.is_terminal() {
                 r.status = crate::outbound::OutboundStatus::Abandoned;
                 r.abandoned_at = Some(now);
-                r.abandoned_reason =
-                    Some(crate::outbound::AbandonedReason::OperatorCancel);
+                r.abandoned_reason = Some(crate::outbound::AbandonedReason::OperatorCancel);
                 r.claimed_until = None;
                 r.claimed_by = None;
             }
@@ -1004,9 +1043,10 @@ impl crate::outbound::OutboundQueue for MemoryBackend {
     ) -> Result<(), crate::outbound::Error> {
         let now = chrono::Utc::now();
         let mut state = self.state.lock().expect("memory backend lock");
-        let r = state.outbound_queue.get_mut(queue_id).ok_or_else(|| {
-            crate::outbound::Error::NotFound(queue_id.clone())
-        })?;
+        let r = state
+            .outbound_queue
+            .get_mut(queue_id)
+            .ok_or_else(|| crate::outbound::Error::NotFound(queue_id.clone()))?;
         if r.status != crate::outbound::OutboundStatus::Abandoned {
             return Err(crate::outbound::Error::InvalidTransition(format!(
                 "queue_id {queue_id} not in 'abandoned'"

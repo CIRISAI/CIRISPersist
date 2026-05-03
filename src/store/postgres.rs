@@ -509,23 +509,19 @@ impl Backend for PostgresBackend {
     }
 
     async fn lookup_public_key(&self, key_id: &str) -> Result<Option<VerifyingKey>, Error> {
-        // v0.2.1 — dual-read migration. Try federation_keys first
-        // (the v0.2.0 federation directory), fall back to
-        // accord_public_keys (legacy). Lens team's cutover path
-        // requires this: writes flow to federation_keys via the
-        // federation surface; this read site has to find them there.
-        // Once the v0.4.0 read-path migration lands, the legacy
-        // fallback is dropped.
+        // v0.4.0 (lens#8 ASK 2) — federation_keys is the canonical
+        // pubkey directory. The v0.2.1 dual-read fallback to
+        // accord_public_keys was retired in this release, coordinated
+        // with lens dropping its direct INSERT into accord_public_keys
+        // the same release. The legacy table stays in the schema for
+        // historical reads via cirislens_reader (V005 read-only role)
+        // but the verify path no longer touches it.
         //
-        // Filter: federation_keys has no revocation column directly
-        // (revocations live in federation_revocations); for v0.2.x we
-        // accept any unexpired federation_keys row. Strict consumers
-        // can layer on the revocation check via revocations_for().
-        // accord_public_keys retains its existing
-        // revoked_at/expires_at filter (THREAT_MODEL.md AV-11).
+        // Filter: federation_keys has no direct revocation column
+        // (revocations live in federation_revocations); we accept any
+        // unexpired row. Strict consumers can layer revocation checks
+        // via FederationDirectory::revocations_for().
         let client = self.get_client().await?;
-
-        // Try federation_keys first.
         let fed_row = client
             .query_opt(
                 "SELECT pubkey_ed25519_base64 FROM cirislens.federation_keys \
@@ -534,45 +530,30 @@ impl Backend for PostgresBackend {
                 &[&key_id],
             )
             .await
-            .map_err(|e| Error::Backend(format!("lookup_public_key (federation_keys): {e}")))?;
-        if let Some(row) = fed_row {
-            let b64: String = row.get(0);
-            return decode_ed25519_b64(&b64).map(Some);
-        }
-
-        // Fall back to accord_public_keys (legacy).
-        let row_opt = client
-            .query_opt(
-                "SELECT public_key_base64 FROM cirislens.accord_public_keys \
-                 WHERE key_id = $1 \
-                   AND revoked_at IS NULL \
-                   AND (expires_at IS NULL OR expires_at > NOW())",
-                &[&key_id],
-            )
-            .await
             .map_err(|e| Error::Backend(format!("lookup_public_key: {e}")))?;
-        let Some(row) = row_opt else {
-            return Ok(None);
-        };
-        let b64: String = row.get(0);
-        decode_ed25519_b64(&b64).map(Some)
+        match fed_row {
+            None => Ok(None),
+            Some(row) => {
+                let b64: String = row.get(0);
+                decode_ed25519_b64(&b64).map(Some)
+            }
+        }
     }
 
     async fn sample_public_keys(
         &self,
         limit: usize,
     ) -> Result<super::backend::PublicKeySample, Error> {
-        // v0.1.17 — diagnostic for CIRISPersist#6 verify-unknown-key
-        // breadcrumb. Same filter as `lookup_public_key`'s WHERE
-        // (unrevoked + unexpired), so the sample reflects exactly
-        // what the runtime lookup is querying against. ORDER BY
-        // key_id for stable cross-call ordering.
+        // v0.4.0 — diagnostic for the verify-unknown-key breadcrumb,
+        // updated to query federation_keys (the canonical directory
+        // post-lens#8 ASK 2). Same filter as `lookup_public_key`'s
+        // WHERE so the sample reflects exactly what the runtime
+        // lookup queries against.
         let client = self.get_client().await?;
         let count_row = client
             .query_one(
-                "SELECT COUNT(*)::BIGINT FROM cirislens.accord_public_keys \
-                 WHERE revoked_at IS NULL \
-                   AND (expires_at IS NULL OR expires_at > NOW())",
+                "SELECT COUNT(*)::BIGINT FROM cirislens.federation_keys \
+                 WHERE valid_until IS NULL OR valid_until > NOW()",
                 &[],
             )
             .await
@@ -582,9 +563,8 @@ impl Backend for PostgresBackend {
         let lim = i64::try_from(limit).unwrap_or(i64::MAX);
         let rows = client
             .query(
-                "SELECT key_id FROM cirislens.accord_public_keys \
-                 WHERE revoked_at IS NULL \
-                   AND (expires_at IS NULL OR expires_at > NOW()) \
+                "SELECT key_id FROM cirislens.federation_keys \
+                 WHERE valid_until IS NULL OR valid_until > NOW() \
                  ORDER BY key_id LIMIT $1",
                 &[&lim],
             )
@@ -1561,9 +1541,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
                 &[&now, &batch_size, &claim_until, &claimed_by],
             )
             .await
-            .map_err(|e| {
-                crate::outbound::Error::Backend(format!("claim_pending_outbound: {e}"))
-            })?;
+            .map_err(|e| crate::outbound::Error::Backend(format!("claim_pending_outbound: {e}")))?;
         tx.commit()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("commit claim: {e}")))?;
@@ -1652,12 +1630,15 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         let ttl_seconds: i64 = row.get(3);
 
         let now = chrono::Utc::now();
-        let ttl_expired =
-            (now - enqueued_at) > chrono::Duration::seconds(ttl_seconds);
+        let ttl_expired = (now - enqueued_at) > chrono::Duration::seconds(ttl_seconds);
         let attempts_exhausted = attempt_count >= max_attempts;
 
         let outcome = if ttl_expired || attempts_exhausted {
-            let reason = if ttl_expired { "ttl_expired" } else { "max_attempts" };
+            let reason = if ttl_expired {
+                "ttl_expired"
+            } else {
+                "max_attempts"
+            };
             tx.execute(
                 "UPDATE cirislens.edge_outbound_queue \
                  SET status = 'abandoned', \
@@ -1666,12 +1647,17 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
                      last_transport = $5, \
                      claimed_until = NULL, claimed_by = NULL \
                  WHERE queue_id = $6::uuid",
-                &[&now, &reason, &error_class, &error_detail, &transport, &queue_id],
+                &[
+                    &now,
+                    &reason,
+                    &error_class,
+                    &error_detail,
+                    &transport,
+                    &queue_id,
+                ],
             )
             .await
-            .map_err(|e| {
-                crate::outbound::Error::Backend(format!("mark abandoned: {e}"))
-            })?;
+            .map_err(|e| crate::outbound::Error::Backend(format!("mark abandoned: {e}")))?;
             crate::outbound::OutboundFailureOutcome::Abandoned
         } else {
             tx.execute(
@@ -1682,13 +1668,19 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
                      last_transport = $4, \
                      claimed_until = NULL, claimed_by = NULL \
                  WHERE queue_id = $5::uuid",
-                &[&next_attempt_after, &error_class, &error_detail, &transport, &queue_id],
+                &[
+                    &next_attempt_after,
+                    &error_class,
+                    &error_detail,
+                    &transport,
+                    &queue_id,
+                ],
             )
             .await
-            .map_err(|e| {
-                crate::outbound::Error::Backend(format!("mark retrying: {e}"))
-            })?;
-            crate::outbound::OutboundFailureOutcome::Retrying { attempt: attempt_count }
+            .map_err(|e| crate::outbound::Error::Backend(format!("mark retrying: {e}")))?;
+            crate::outbound::OutboundFailureOutcome::Retrying {
+                attempt: attempt_count,
+            }
         };
 
         tx.commit().await.map_err(|e| {
@@ -1719,9 +1711,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
                 &[&now, &queue_id],
             )
             .await
-            .map_err(|e| {
-                crate::outbound::Error::Backend(format!("mark_replay_resolved: {e}"))
-            })?;
+            .map_err(|e| crate::outbound::Error::Backend(format!("mark_replay_resolved: {e}")))?;
         Ok(())
     }
 
@@ -1751,9 +1741,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
                 &[&hash_vec],
             )
             .await
-            .map_err(|e| {
-                crate::outbound::Error::Backend(format!("match_ack_to_outbound: {e}"))
-            })?;
+            .map_err(|e| crate::outbound::Error::Backend(format!("match_ack_to_outbound: {e}")))?;
         match row_opt {
             None => Ok(None),
             Some(row) => Ok(Some(pg_row_to_outbound_row(row)?)),
@@ -1781,9 +1769,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
                 &[&ack_envelope_bytes, &now, &queue_id],
             )
             .await
-            .map_err(|e| {
-                crate::outbound::Error::Backend(format!("mark_ack_received: {e}"))
-            })?;
+            .map_err(|e| crate::outbound::Error::Backend(format!("mark_ack_received: {e}")))?;
         if n == 0 {
             return Err(crate::outbound::Error::InvalidTransition(format!(
                 "queue_id {queue_id} not in 'awaiting_ack'"
@@ -1886,9 +1872,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
                 &[&now],
             )
             .await
-            .map_err(|e| {
-                crate::outbound::Error::Backend(format!("sweep_expired_claims: {e}"))
-            })?;
+            .map_err(|e| crate::outbound::Error::Backend(format!("sweep_expired_claims: {e}")))?;
         Ok(n as i64)
     }
 
@@ -2053,14 +2037,14 @@ fn pg_row_to_outbound_row(
 ) -> Result<crate::outbound::OutboundRow, crate::outbound::Error> {
     use crate::outbound::{AbandonedReason, OutboundStatus};
     let status_str: String = row.get("status");
-    let status = OutboundStatus::from_str(&status_str).ok_or_else(|| {
+    let status = OutboundStatus::from_wire_str(&status_str).ok_or_else(|| {
         crate::outbound::Error::Backend(format!(
             "unknown status in edge_outbound_queue: {status_str}"
         ))
     })?;
     let abandoned_reason_str: Option<String> = row.get("abandoned_reason");
     let abandoned_reason = match abandoned_reason_str.as_deref() {
-        Some(s) => Some(AbandonedReason::from_str(s).ok_or_else(|| {
+        Some(s) => Some(AbandonedReason::from_wire_str(s).ok_or_else(|| {
             crate::outbound::Error::Backend(format!("unknown abandoned_reason: {s}"))
         })?),
         None => None,

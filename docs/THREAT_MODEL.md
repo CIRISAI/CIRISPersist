@@ -1,9 +1,12 @@
 # CIRISPersist Threat Model
 
-**Status:** v0.3.6 — adds federation directory (v0.2.0), hybrid
+**Status:** v0.4.0 — adds federation directory (v0.2.0), hybrid
 Ed25519+ML-DSA-65 PQC posture (v0.2.0), 2.7.9 wire-format
 extensions (v0.3.0–v0.3.4), per-key DSAR primitive (v0.3.6),
-`verify_hybrid` arbitrary-canonical-bytes surface (v0.3.6).
+`verify_hybrid` arbitrary-canonical-bytes surface (v0.3.6),
+edge outbound queue durable substrate (v0.4.0), full verify
+surface exposed (v0.4.0), accord_public_keys dual-read fallback
+retired (v0.4.0).
 **v0.1.2 baseline** (AV-1..AV-26) preserved verbatim;
 v0.2.0–v0.3.6 attack surface in §3.7..§3.10 (AV-28..AV-39).
 Updated each minor release.
@@ -1166,6 +1169,68 @@ observation); persist's substrate provides the cryptographic floor
 that makes the cohort-correctness claim measurable in the first
 place.
 
+### 3.11 Outbound queue substrate (v0.4.0)
+
+These vectors emerge from v0.4.0's `cirislens.edge_outbound_queue`
+table — the durable substrate for `CIRISEdge::send_durable()`.
+Phase 1 durable message types (BuildManifestPublication, DSARRequest/
+Response, AttestationGossip, PublicKeyRegistration) ride this table.
+
+#### AV-40: Outbound queue disk exhaustion
+
+**Attack**: An adversary with write access to the federation peer
+floods the outbound queue with high-TTL low-priority messages (or
+messages routed to unreachable peers that never deliver), filling
+the disk and starving legitimate traffic.
+
+**Mitigation v0.4.0**: per-row `body_size_bytes` capped 1..=8 MiB
+by schema CHECK; `ttl_seconds > 0` required so every row eventually
+abandons; `max_attempts` bounded so retry loops terminate.
+`Engine.run_pqc_sweep`-style operational discipline applies —
+deployments run `sweep_ttl_expired` periodically, and ops dashboards
+alert on `oldest-pending-age` exceeding deployment-level thresholds.
+
+**Secondary**: FK constraint requires both `sender_key_id` and
+`destination_key_id` resolve in `federation_keys`. Forging an
+outbound row requires forging a federation_keys row first (AV-28
+covers that).
+
+**Residual**: a deployment with no sweep cadence + permissive TTL
+policies grows its outbound queue without bound. Operational
+concern; persist's substrate provides the cleanup primitive
+(sweep_ttl_expired) but doesn't enforce the cadence.
+
+#### AV-41: Spoofed in_reply_to ACK matching
+
+**Attack**: An adversary intercepts an outbound envelope (or
+observes its body_sha256 via a lossy network path), then sends a
+forged ACK envelope claiming to ACK the in-flight row. The
+`match_ack_to_outbound` lookup matches on body_sha256; if the ACK
+is accepted, the row transitions to `delivered` without the actual
+receiver having processed the message.
+
+**Mitigation v0.4.0**: ACK envelopes go through persist's normal
+verify pipeline before `mark_ack_received` is called. Verify gates:
+- AV-1 (lookup_public_key): the ACK envelope's
+  `signature_key_id` must resolve in `federation_keys`
+- AV-39 (verify_hybrid via persist): hybrid signature on the ACK
+  envelope is verified before content is trusted
+
+The `body_sha256` matches up the in-flight row, but
+`mark_ack_received` is only called after the ACK envelope's
+signature is verified against the destination peer's pubkey. An
+attacker without the destination peer's signing key cannot mint a
+valid ACK envelope.
+
+**Secondary**: bound-signature pattern (AV-33) means an attacker
+who breaks Ed25519 alone still can't forge a hybrid-verified ACK.
+
+**Residual**: an attacker who compromises the destination peer's
+signing key (AV-2 trust boundary) can mint valid-looking ACKs. This
+is the same residual as agent-side forgery — out of persist's scope;
+upstream key-storage hardening + PoB statistical drift detection are
+the federation-level mitigations.
+
 ### 3.10 DSAR + verify primitives (v0.3.6)
 
 These vectors emerge from v0.3.6's per-key DSAR primitive
@@ -1298,6 +1363,8 @@ incentive against doing so.
 | AV-37 | deployment_profile cohort-identity injection | `deployment_profile` rides in 2.7.9 signed canonical bytes; agent's signature commits to declared labels; strict-parse at 2.7.9 rejects missing block (`MissingField("deployment_profile")`) | `deployment_resourcing` is intentionally lens-computed from cost/tokens/model observation, not agent-declared — labels can lie but emergent operational reality cannot | **✓ Mitigated v0.3.4** | — |
 | AV-38 | Per-key DSAR scope violation | v0.3.6 BREAKING: `signature_key_id` is REQUIRED on `delete_traces_for_agent`; deletion is scoped to `(agent_id_hash, signing_key_id)` at all three substrate layers (trace_events, trace_llm_calls cascade, federation_keys cascade); no `Option<>` back-compat shim | Lens-side DSAR audit ledger captures request envelope + signature verification independent of persist | **✓ Mitigated v0.3.6** (broke v0.3.5 shape; v0.3.5 yanked from PyPI) | — |
 | AV-39 | verify-via-persist bypass (consumer calls ciris_crypto direct) | `Engine.verify_hybrid` is the federation's single-source-of-truth — accepts arbitrary canonical bytes (not just CompleteTrace shapes), exposes the policy machinery (Strict / SoftFreshness / Ed25519Fallback), is the path of least resistance | Documented as the closure pattern (CIRISPersist#7); `docs/V0.2.0_VERIFY_SUBSUMPTION.md` carries the architectural reasoning | ✓ Architectural closure — not a runtime gate but the design path | — |
+| AV-40 | Outbound queue disk exhaustion | Per-row `body_size_bytes ≤ 8 MiB` + `ttl_seconds > 0` + `max_attempts > 0` schema CHECK; `sweep_ttl_expired` operational primitive bounds row lifetime; FK on sender/destination_key_id (AV-28 trust boundary) | Operator-tunable sweep cadence; `oldest-pending-age` ops dashboard | **✓ Mitigated v0.4.0** | — |
+| AV-41 | Spoofed in_reply_to ACK matching | ACK envelopes go through persist's normal verify pipeline (AV-1 unknown-key gate + AV-39 verify_hybrid via persist) before `mark_ack_received` is called; `body_sha256` content-derived matching is downstream of signature verify | Bound signature pattern (AV-33) closes Ed25519-alone forgery branch | **✓ Mitigated v0.4.0** | — |
 
 ---
 

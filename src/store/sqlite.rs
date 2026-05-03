@@ -321,33 +321,18 @@ impl Backend for SqliteBackend {
     }
 
     async fn lookup_public_key(&self, key_id: &str) -> Result<Option<VerifyingKey>, Error> {
-        // v0.2.1 — dual-read migration. Try federation_keys first
-        // (v0.2.0 federation directory), fall back to
-        // accord_public_keys (legacy). Same pattern as PostgresBackend.
+        // v0.4.0 (lens#8 ASK 2) — federation_keys is the canonical
+        // pubkey directory. accord_public_keys fallback retired this
+        // release. Same shape as PostgresBackend post-cutover.
         let key_id = key_id.to_owned();
         let conn = self.conn.clone();
         let b64_opt =
             tokio::task::spawn_blocking(move || -> Result<Option<String>, rusqlite::Error> {
                 let conn = conn.blocking_lock();
-                // federation_keys first.
-                let fed = conn
-                    .query_row(
-                        "SELECT pubkey_ed25519_base64 FROM federation_keys \
-                         WHERE key_id = ?1 \
-                           AND (valid_until IS NULL OR valid_until > CURRENT_TIMESTAMP)",
-                        [&key_id],
-                        |r| r.get::<_, String>(0),
-                    )
-                    .optional()?;
-                if fed.is_some() {
-                    return Ok(fed);
-                }
-                // Fall back to accord_public_keys (legacy).
                 conn.query_row(
-                    "SELECT public_key_base64 FROM accord_public_keys \
+                    "SELECT pubkey_ed25519_base64 FROM federation_keys \
                      WHERE key_id = ?1 \
-                       AND revoked_at IS NULL \
-                       AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)",
+                       AND (valid_until IS NULL OR valid_until > CURRENT_TIMESTAMP)",
                     [&key_id],
                     |r| r.get::<_, String>(0),
                 )
@@ -376,10 +361,9 @@ impl Backend for SqliteBackend {
     }
 
     async fn sample_public_keys(&self, limit: usize) -> Result<PublicKeySample, Error> {
-        // Same filter as `lookup_public_key`, ORDER BY key_id LIMIT N.
-        // Diagnostic-only path; mirrors the postgres impl so the
-        // verify-unknown-key breadcrumb (CIRISPersist#6, v0.1.17) sees
-        // identical shape regardless of backend.
+        // v0.4.0 — diagnostic queries federation_keys (canonical
+        // post-lens#8 ASK 2) so the verify-unknown-key breadcrumb
+        // sample matches what `lookup_public_key` actually queries.
         let conn = self.conn.clone();
         let lim = i64::try_from(limit).unwrap_or(i64::MAX);
 
@@ -387,16 +371,14 @@ impl Backend for SqliteBackend {
             move || -> Result<(usize, Vec<String>), rusqlite::Error> {
                 let conn = conn.blocking_lock();
                 let total: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM accord_public_keys \
-                     WHERE revoked_at IS NULL \
-                       AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)",
+                    "SELECT COUNT(*) FROM federation_keys \
+                     WHERE valid_until IS NULL OR valid_until > CURRENT_TIMESTAMP",
                     [],
                     |r| r.get(0),
                 )?;
                 let mut stmt = conn.prepare(
-                    "SELECT key_id FROM accord_public_keys \
-                     WHERE revoked_at IS NULL \
-                       AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP) \
+                    "SELECT key_id FROM federation_keys \
+                     WHERE valid_until IS NULL OR valid_until > CURRENT_TIMESTAMP \
                      ORDER BY key_id LIMIT ?1",
                 )?;
                 let rows = stmt.query_map([lim], |r| r.get::<_, String>(0))?;
@@ -1446,45 +1428,47 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
         let now = chrono::Utc::now();
         let claim_until = now + chrono::Duration::seconds(claim_duration_seconds);
         let claimed_by = claimed_by.to_owned();
-        let rows = tokio::task::spawn_blocking(move || -> Result<Vec<crate::outbound::OutboundRow>, rusqlite::Error> {
-            let mut conn = conn.blocking_lock();
-            let tx = conn.transaction()?;
-            let queue_ids: Vec<String> = {
-                let mut stmt = tx.prepare(
-                    "SELECT queue_id FROM edge_outbound_queue \
+        let rows = tokio::task::spawn_blocking(
+            move || -> Result<Vec<crate::outbound::OutboundRow>, rusqlite::Error> {
+                let mut conn = conn.blocking_lock();
+                let tx = conn.transaction()?;
+                let queue_ids: Vec<String> = {
+                    let mut stmt = tx.prepare(
+                        "SELECT queue_id FROM edge_outbound_queue \
                      WHERE status = 'pending' AND next_attempt_after <= ?1 \
                      ORDER BY next_attempt_after ASC LIMIT ?2",
-                )?;
-                let rows = stmt.query_map(
-                    rusqlite::params![now.to_rfc3339(), batch_size],
-                    |r| r.get::<_, String>(0),
-                )?;
-                rows.collect::<Result<Vec<_>, _>>()?
-            };
-            let now_str = now.to_rfc3339();
-            let claim_until_str = claim_until.to_rfc3339();
-            for qid in &queue_ids {
-                tx.execute(
-                    "UPDATE edge_outbound_queue \
+                    )?;
+                    let rows = stmt
+                        .query_map(rusqlite::params![now.to_rfc3339(), batch_size], |r| {
+                            r.get::<_, String>(0)
+                        })?;
+                    rows.collect::<Result<Vec<_>, _>>()?
+                };
+                let now_str = now.to_rfc3339();
+                let claim_until_str = claim_until.to_rfc3339();
+                for qid in &queue_ids {
+                    tx.execute(
+                        "UPDATE edge_outbound_queue \
                      SET status = 'sending', last_attempt_at = ?1, \
                          attempt_count = attempt_count + 1, \
                          claimed_until = ?2, claimed_by = ?3 \
                      WHERE queue_id = ?4",
-                    rusqlite::params![now_str, claim_until_str, claimed_by, qid],
-                )?;
-            }
-            let claimed: Vec<crate::outbound::OutboundRow> = {
-                let mut out = Vec::with_capacity(queue_ids.len());
-                let mut stmt = tx.prepare(SQLITE_OUTBOUND_SELECT_BY_ID)?;
-                for qid in &queue_ids {
-                    let row = stmt.query_row([qid], sqlite_row_to_outbound_row)?;
-                    out.push(row);
+                        rusqlite::params![now_str, claim_until_str, claimed_by, qid],
+                    )?;
                 }
-                out
-            };
-            tx.commit()?;
-            Ok(claimed)
-        })
+                let claimed: Vec<crate::outbound::OutboundRow> = {
+                    let mut out = Vec::with_capacity(queue_ids.len());
+                    let mut stmt = tx.prepare(SQLITE_OUTBOUND_SELECT_BY_ID)?;
+                    for qid in &queue_ids {
+                        let row = stmt.query_row([qid], sqlite_row_to_outbound_row)?;
+                        out.push(row);
+                    }
+                    out
+                };
+                tx.commit()?;
+                Ok(claimed)
+            },
+        )
         .await
         .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
         .map_err(|e| crate::outbound::Error::Backend(format!("claim_pending_outbound: {e}")))?;
@@ -1540,58 +1524,79 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
         let transport = transport.to_owned();
         let now = chrono::Utc::now();
         let next_str = next_attempt_after.to_rfc3339();
-        let outcome = tokio::task::spawn_blocking(move || -> Result<crate::outbound::OutboundFailureOutcome, rusqlite::Error> {
-            let mut conn = conn.blocking_lock();
-            let tx = conn.transaction()?;
-            let (attempt_count, max_attempts, enqueued_at_str, ttl_seconds): (i32, i32, String, i64) = tx
-                .query_row(
-                    "SELECT attempt_count, max_attempts, enqueued_at, ttl_seconds \
+        let outcome = tokio::task::spawn_blocking(
+            move || -> Result<crate::outbound::OutboundFailureOutcome, rusqlite::Error> {
+                let mut conn = conn.blocking_lock();
+                let tx = conn.transaction()?;
+                let (attempt_count, max_attempts, enqueued_at_str, ttl_seconds): (
+                    i32,
+                    i32,
+                    String,
+                    i64,
+                ) = tx
+                    .query_row(
+                        "SELECT attempt_count, max_attempts, enqueued_at, ttl_seconds \
                      FROM edge_outbound_queue \
                      WHERE queue_id = ?1 AND status = 'sending'",
-                    [&qid],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-                ).map_err(|e| {
-                    if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
-                        // surface a sentinel error so the caller can map to InvalidTransition
-                        rusqlite::Error::QueryReturnedNoRows
-                    } else { e }
-                })?;
-            let enqueued_at = parse_rfc3339(&enqueued_at_str);
-            let ttl_expired = (now - enqueued_at) > chrono::Duration::seconds(ttl_seconds);
-            let attempts_exhausted = attempt_count >= max_attempts;
-            let outcome = if ttl_expired || attempts_exhausted {
-                let reason = if ttl_expired { "ttl_expired" } else { "max_attempts" };
-                tx.execute(
-                    "UPDATE edge_outbound_queue \
+                        [&qid],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    )
+                    .map_err(|e| {
+                        if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
+                            // surface a sentinel error so the caller can map to InvalidTransition
+                            rusqlite::Error::QueryReturnedNoRows
+                        } else {
+                            e
+                        }
+                    })?;
+                let enqueued_at = parse_rfc3339(&enqueued_at_str);
+                let ttl_expired = (now - enqueued_at) > chrono::Duration::seconds(ttl_seconds);
+                let attempts_exhausted = attempt_count >= max_attempts;
+                let outcome = if ttl_expired || attempts_exhausted {
+                    let reason = if ttl_expired {
+                        "ttl_expired"
+                    } else {
+                        "max_attempts"
+                    };
+                    tx.execute(
+                        "UPDATE edge_outbound_queue \
                      SET status = 'abandoned', abandoned_at = ?1, abandoned_reason = ?2, \
                          last_error_class = ?3, last_error_detail = ?4, last_transport = ?5, \
                          claimed_until = NULL, claimed_by = NULL \
                      WHERE queue_id = ?6",
-                    rusqlite::params![now.to_rfc3339(), reason, error_class, error_detail, transport, qid],
-                )?;
-                crate::outbound::OutboundFailureOutcome::Abandoned
-            } else {
-                tx.execute(
-                    "UPDATE edge_outbound_queue \
+                        rusqlite::params![
+                            now.to_rfc3339(),
+                            reason,
+                            error_class,
+                            error_detail,
+                            transport,
+                            qid
+                        ],
+                    )?;
+                    crate::outbound::OutboundFailureOutcome::Abandoned
+                } else {
+                    tx.execute(
+                        "UPDATE edge_outbound_queue \
                      SET status = 'pending', next_attempt_after = ?1, \
                          last_error_class = ?2, last_error_detail = ?3, last_transport = ?4, \
                          claimed_until = NULL, claimed_by = NULL \
                      WHERE queue_id = ?5",
-                    rusqlite::params![next_str, error_class, error_detail, transport, qid],
-                )?;
-                crate::outbound::OutboundFailureOutcome::Retrying { attempt: attempt_count }
-            };
-            tx.commit()?;
-            Ok(outcome)
-        })
+                        rusqlite::params![next_str, error_class, error_detail, transport, qid],
+                    )?;
+                    crate::outbound::OutboundFailureOutcome::Retrying {
+                        attempt: attempt_count,
+                    }
+                };
+                tx.commit()?;
+                Ok(outcome)
+            },
+        )
         .await
         .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
         .map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => {
-                crate::outbound::Error::InvalidTransition(format!(
-                    "queue_id {queue_id} not in 'sending'"
-                ))
-            }
+            rusqlite::Error::QueryReturnedNoRows => crate::outbound::Error::InvalidTransition(
+                format!("queue_id {queue_id} not in 'sending'"),
+            ),
             other => crate::outbound::Error::Backend(format!("mark_transport_failed: {other}")),
         })?;
         Ok(outcome)
@@ -1679,19 +1684,39 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
             let tx = conn.transaction()?;
             // Walk awaiting_ack rows; per-row TTL/timeout checks in Rust
             // (sqlite has no interval arithmetic).
-            let candidates: Vec<(String, String, Option<i64>, i32, i32, String, i64)> = {
+            // (queue_id, transport_delivered_at, ack_timeout_seconds,
+            //  attempt_count, max_attempts, enqueued_at, ttl_seconds)
+            type AckCandidate = (String, String, Option<i64>, i32, i32, String, i64);
+            let candidates: Vec<AckCandidate> = {
                 let mut stmt = tx.prepare(
                     "SELECT queue_id, transport_delivered_at, ack_timeout_seconds, \
                             attempt_count, max_attempts, enqueued_at, ttl_seconds \
                      FROM edge_outbound_queue WHERE status = 'awaiting_ack'",
                 )?;
                 let rows = stmt.query_map([], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
                 })?;
                 rows.collect::<Result<Vec<_>, _>>()?
             };
             let mut count = 0i64;
-            for (qid, transport_delivered_str, ack_timeout, attempt, max_attempts, enqueued_str, ttl) in candidates {
+            for (
+                qid,
+                transport_delivered_str,
+                ack_timeout,
+                attempt,
+                max_attempts,
+                enqueued_str,
+                ttl,
+            ) in candidates
+            {
                 let transport_delivered = parse_rfc3339(&transport_delivered_str);
                 let Some(timeout) = ack_timeout else { continue };
                 if (now - transport_delivered) <= chrono::Duration::seconds(timeout) {
@@ -1701,7 +1726,11 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
                 let ttl_expired = (now - enqueued) > chrono::Duration::seconds(ttl);
                 let attempts_exhausted = attempt >= max_attempts;
                 if ttl_expired || attempts_exhausted {
-                    let reason = if ttl_expired { "ttl_expired" } else { "max_attempts" };
+                    let reason = if ttl_expired {
+                        "ttl_expired"
+                    } else {
+                        "max_attempts"
+                    };
                     tx.execute(
                         "UPDATE edge_outbound_queue \
                          SET status = 'abandoned', abandoned_at = ?1, abandoned_reason = ?2, \
@@ -1794,13 +1823,15 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
     ) -> Result<Option<crate::outbound::OutboundRow>, crate::outbound::Error> {
         let conn = self.conn.clone();
         let qid = queue_id.clone();
-        tokio::task::spawn_blocking(move || -> rusqlite::Result<Option<crate::outbound::OutboundRow>> {
-            let conn = conn.blocking_lock();
-            let sql = format!("{SQLITE_OUTBOUND_SELECT_PREFIX} WHERE queue_id = ?1");
-            let mut stmt = conn.prepare(&sql)?;
-            stmt.query_row([&qid], sqlite_row_to_outbound_row)
-                .optional()
-        })
+        tokio::task::spawn_blocking(
+            move || -> rusqlite::Result<Option<crate::outbound::OutboundRow>> {
+                let conn = conn.blocking_lock();
+                let sql = format!("{SQLITE_OUTBOUND_SELECT_PREFIX} WHERE queue_id = ?1");
+                let mut stmt = conn.prepare(&sql)?;
+                stmt.query_row([&qid], sqlite_row_to_outbound_row)
+                    .optional()
+            },
+        )
         .await
         .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
         .map_err(|e| crate::outbound::Error::Backend(format!("outbound_status: {e}")))
@@ -1843,14 +1874,19 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
             where_clauses.join(" AND "),
             limit_idx,
         );
-        tokio::task::spawn_blocking(move || -> rusqlite::Result<Vec<crate::outbound::OutboundRow>> {
-            let conn = conn.blocking_lock();
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt
-                .query_map(rusqlite::params_from_iter(binds.iter()), sqlite_row_to_outbound_row)?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(rows)
-        })
+        tokio::task::spawn_blocking(
+            move || -> rusqlite::Result<Vec<crate::outbound::OutboundRow>> {
+                let conn = conn.blocking_lock();
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt
+                    .query_map(
+                        rusqlite::params_from_iter(binds.iter()),
+                        sqlite_row_to_outbound_row,
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            },
+        )
         .await
         .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
         .map_err(|e| crate::outbound::Error::Backend(format!("list_outbound: {e}")))
@@ -1944,20 +1980,24 @@ fn sqlite_row_to_outbound_row(
 ) -> rusqlite::Result<crate::outbound::OutboundRow> {
     use crate::outbound::{AbandonedReason, OutboundStatus};
     let status_str: String = row.get("status")?;
-    let status = OutboundStatus::from_str(&status_str).ok_or_else(|| {
+    let status = OutboundStatus::from_wire_str(&status_str).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
             8,
             rusqlite::types::Type::Text,
-            Box::new(std::io::Error::other(format!("unknown status: {status_str}"))),
+            Box::new(std::io::Error::other(format!(
+                "unknown status: {status_str}"
+            ))),
         )
     })?;
     let abandoned_reason_str: Option<String> = row.get("abandoned_reason")?;
     let abandoned_reason = match abandoned_reason_str.as_deref() {
-        Some(s) => Some(AbandonedReason::from_str(s).ok_or_else(|| {
+        Some(s) => Some(AbandonedReason::from_wire_str(s).ok_or_else(|| {
             rusqlite::Error::FromSqlConversionFailure(
                 15,
                 rusqlite::types::Type::Text,
-                Box::new(std::io::Error::other(format!("unknown abandoned_reason: {s}"))),
+                Box::new(std::io::Error::other(format!(
+                    "unknown abandoned_reason: {s}"
+                ))),
             )
         })?),
         None => None,
@@ -2397,10 +2437,20 @@ mod tests {
             let conn = backend.conn.clone();
             tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
                 let conn = conn.blocking_lock();
+                // v0.4.0 — write directly to federation_keys (the
+                // canonical pubkey directory post-lens#8 ASK 2). The
+                // pre-v0.4.0 dual-read fallback to accord_public_keys
+                // was retired.
                 conn.execute(
-                    "INSERT INTO accord_public_keys (key_id, public_key_base64, algorithm) \
-                     VALUES (?1, ?2, ?3)",
-                    rusqlite::params!["key-test", pk_b64, "ed25519"],
+                    "INSERT INTO federation_keys (\
+                        key_id, pubkey_ed25519_base64, algorithm, \
+                        identity_type, identity_ref, valid_from, \
+                        registration_envelope, original_content_hash, \
+                        scrub_signature_classical, scrub_key_id, \
+                        scrub_timestamp, persist_row_hash\
+                     ) VALUES (?1, ?2, 'hybrid', 'agent', ?1, ?3, '{}', \
+                              x'00', '', ?1, ?3, '0')",
+                    rusqlite::params!["key-test", pk_b64, "2026-04-30T00:00:00+00:00"],
                 )?;
                 Ok(())
             })
@@ -2412,7 +2462,7 @@ mod tests {
         // Disambiguate: both Backend and FederationDirectory traits
         // expose `lookup_public_key` post-v0.2.0. This test exercises
         // the legacy Backend (VerifyingKey) shape used by the trace
-        // verify path.
+        // verify path. Source-of-truth is federation_keys (v0.4.0).
         let got = Backend::lookup_public_key(&backend, "key-test")
             .await
             .unwrap();
@@ -2426,28 +2476,50 @@ mod tests {
         assert!(none.is_none());
     }
 
-    /// Revoked keys are filtered out of lookup AND sample.
+    /// v0.4.0 — Expired federation_keys rows are filtered from
+    /// lookup AND sample. Replaces the v0.1.x revoked_at filter
+    /// against accord_public_keys (retired in this release).
+    /// Federation revocations now live in federation_revocations,
+    /// a separate concern (consumers walk that graph for revocation
+    /// policy).
     #[tokio::test]
-    async fn revoked_keys_filtered() {
+    async fn expired_keys_filtered() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
 
         let pk_b64 = BASE64.encode(fixture_pubkey().to_bytes());
 
-        // Insert two rows: one valid, one revoked.
         {
             let conn = backend.conn.clone();
             let pk_b64 = pk_b64.clone();
             tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
                 let conn = conn.blocking_lock();
                 conn.execute(
-                    "INSERT INTO accord_public_keys (key_id, public_key_base64) VALUES (?1, ?2)",
-                    rusqlite::params!["key-active", pk_b64],
+                    "INSERT INTO federation_keys (\
+                        key_id, pubkey_ed25519_base64, algorithm, \
+                        identity_type, identity_ref, valid_from, \
+                        registration_envelope, original_content_hash, \
+                        scrub_signature_classical, scrub_key_id, \
+                        scrub_timestamp, persist_row_hash\
+                     ) VALUES (?1, ?2, 'hybrid', 'agent', ?1, ?3, '{}', \
+                              x'00', '', ?1, ?3, '0')",
+                    rusqlite::params!["key-active", pk_b64, "2026-04-30T00:00:00+00:00"],
                 )?;
                 conn.execute(
-                    "INSERT INTO accord_public_keys (key_id, public_key_base64, revoked_at) \
-                     VALUES (?1, ?2, ?3)",
-                    rusqlite::params!["key-revoked", pk_b64, "2026-04-30T00:00:00+00:00"],
+                    "INSERT INTO federation_keys (\
+                        key_id, pubkey_ed25519_base64, algorithm, \
+                        identity_type, identity_ref, valid_from, valid_until, \
+                        registration_envelope, original_content_hash, \
+                        scrub_signature_classical, scrub_key_id, \
+                        scrub_timestamp, persist_row_hash\
+                     ) VALUES (?1, ?2, 'hybrid', 'agent', ?1, ?3, ?4, '{}', \
+                              x'00', '', ?1, ?3, '0')",
+                    rusqlite::params![
+                        "key-expired",
+                        pk_b64,
+                        "2026-04-29T00:00:00+00:00",
+                        "2026-04-30T00:00:00+00:00",
+                    ],
                 )?;
                 Ok(())
             })
@@ -2460,7 +2532,7 @@ mod tests {
             .await
             .unwrap()
             .is_some());
-        assert!(Backend::lookup_public_key(&backend, "key-revoked")
+        assert!(Backend::lookup_public_key(&backend, "key-expired")
             .await
             .unwrap()
             .is_none());
