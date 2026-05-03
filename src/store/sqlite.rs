@@ -1048,9 +1048,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         )
         .await
         .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
-        .map_err(|e| {
-            crate::federation::Error::Backend(format!("list_hybrid_pending_keys: {e}"))
-        })?;
+        .map_err(|e| crate::federation::Error::Backend(format!("list_hybrid_pending_keys: {e}")))?;
         rows.into_iter()
             .map(|(id, envelope_text, classical_sig_b64)| {
                 let envelope: serde_json::Value =

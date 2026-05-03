@@ -350,8 +350,7 @@ impl PyEngine {
             if let Some(signer) = steward_pqc_signer.clone() {
                 let backend_for_sweep = backend.clone();
                 runtime.spawn(async move {
-                    let summary =
-                        run_pqc_sweep_inner(&backend_for_sweep, &*signer, 1000).await;
+                    let summary = run_pqc_sweep_inner(&backend_for_sweep, &*signer, 1000).await;
                     tracing::info!(
                         scanned = summary.total_scanned,
                         signed = summary.total_signed,
@@ -1313,11 +1312,7 @@ impl PyEngine {
     /// Raises `ValueError` if no PQC steward is configured (same shape
     /// as `steward_pqc_sign`).
     #[pyo3(signature = (batch_size=1000))]
-    fn run_pqc_sweep<'py>(
-        &self,
-        py: Python<'py>,
-        batch_size: i64,
-    ) -> PyResult<Bound<'py, PyDict>> {
+    fn run_pqc_sweep<'py>(&self, py: Python<'py>, batch_size: i64) -> PyResult<Bound<'py, PyDict>> {
         let signer = self.steward_pqc_signer.clone().ok_or_else(|| {
             PyValueError::new_err(
                 "PQC steward not configured (pass steward_pqc_key_id and \
@@ -1328,9 +1323,8 @@ impl PyEngine {
         let runtime = self.runtime.clone();
 
         let summary = py.detach(move || {
-            runtime.block_on(async move {
-                run_pqc_sweep_inner(&backend, &*signer, batch_size).await
-            })
+            runtime
+                .block_on(async move { run_pqc_sweep_inner(&backend, &*signer, batch_size).await })
         });
 
         let dict = PyDict::new(py);
