@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777820828901,
+  "lastUpdate": 1777829909515,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -5411,6 +5411,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 22197790,
             "range": "± 724582",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "ea4e885672a1bf2f3eada9fe06df4d22cbfc0675",
+          "message": "0.3.4 — deployment_profile block at 2.7.9 (CIRISPersist#13)\n\nCloses CIRISPersist#13. Companion to CIRISAgent's 431b0e0ae (#718)\nwhich added the 6-field deployment_profile block to every\nCompleteTrace envelope at trace_schema_version 2.7.9.\n\nWhat ships:\n\n- DeploymentProfile struct on CompleteTrace (6 fields:\n  agent_role, agent_template, deployment_domain, deployment_type,\n  deployment_region: Option<String>, deployment_trust_mode).\n  Option<> so 2.7.0 deserializes cleanly.\n\n- Strict-parse at 2.7.9: BatchEnvelope::from_json rejects\n  missing deployment_profile with MissingField. v0.3.0's \"required\n  at 2.7.9\" claim now enforces semantic requirement, not just\n  presence (same gate-style as v0.3.3 parent_event_type).\n\n- Cross-shape rule at 2.7.0: a 2.7.0 envelope carrying the block\n  parses cleanly but the field does NOT enter 2.7.0 canonical\n  bytes. Mirrors per-component agent_id_hash. Two traces (with vs.\n  without the block) at 2.7.0 produce byte-identical canonical bytes.\n\n- 10-key 2.7.9 outer canonical (was 9). deployment_profile sorts\n  between components and started_at alphabetically (c < d < s).\n  Inside the block, 6 fields sort alphabetically too.\n\n- V006 migration (postgres + sqlite): 6 TEXT columns on\n  cirislens.trace_events + 4 partial indexes on the high-cardinality\n  cohort axes (deployment_domain, deployment_type, agent_role,\n  deployment_trust_mode) WHERE <col> IS NOT NULL.\n\n- decompose.rs copies the 6 fields onto every event row of the\n  trace, same shape as agent_name/agent_id_hash/cognitive_state.\n  Lens analytical paths group/filter without JSONB extracts.\n\nArchitectural note: denormalization is tech-debt — same labels\nlive in payload JSONB and 6 dedicated columns. Alternative (lens-\nside trace_context table fed by separate write path) re-introduces\nthe architectural problem CIRISPersist#10 closed (one substrate,\nN consumers; drift). Persist owns it.\n\nTests: 166 lib (162 + 4 new) + 22 integration green; clippy clean.\n\nBridge: bump ciris-persist==0.3.3 → 0.3.4 in api/requirements.txt\nand deploy alongside agent 431b0e0ae. Both required for\nend-to-end linkage.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-03T12:32:01-05:00",
+          "tree_id": "5003bedf413d2b1f6ff7a1f8187626a19c52cbf4",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/ea4e885672a1bf2f3eada9fe06df4d22cbfc0675"
+        },
+        "date": 1777829909186,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101828,
+            "range": "± 12896",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 243675,
+            "range": "± 1089",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 525661,
+            "range": "± 8870",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1859023,
+            "range": "± 17774",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 378,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1626,
+            "range": "± 36",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 9058,
+            "range": "± 72",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 375,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3094,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9533,
+            "range": "± 118",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41582,
+            "range": "± 138",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 621,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2151384,
+            "range": "± 70528",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6336474,
+            "range": "± 165292",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 22544245,
+            "range": "± 247061",
             "unit": "ns/iter"
           }
         ]
