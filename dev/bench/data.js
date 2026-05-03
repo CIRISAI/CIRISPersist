@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777833981062,
+  "lastUpdate": 1777835615607,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -5753,6 +5753,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 19453194,
             "range": "± 95882435",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "039c0574b67bb6653a92b0010c608c8a9a4a04ad",
+          "message": "threat-model: overhaul to v0.3.6 (AV-28..AV-39)\n\nDoc-only, no code change. The model was at v0.1.2 baseline + AV-17..\nAV-27 hardening; we'd shipped v0.2.0 → v0.3.6 since (federation\ndirectory, hybrid PQC, wire-format extensions, DSAR primitive,\nverify_hybrid) without updating the threat surface inventory.\nFederation peers (CIRISEdge, CIRISLens, future partner sites) read\nthis doc to know which mitigations persist owns vs which are\nconsumer-side responsibility. Stale model = consumers default to\neither over-defending or under-defending. Both fail \"make life\neasy to do things right.\"\n\nTwelve new attack vectors:\n\n  3.7 Federation directory (v0.2.0+):\n    AV-28 federation_keys directory pubkey poisoning\n    AV-29 attestation graph poisoning\n    AV-30 federation_keys self-FK integrity (DEFERRABLE)\n\n  3.8 Hybrid PQC posture (v0.2.0+):\n    AV-31 hybrid-pending exploitation\n    AV-32 cold-path PQC denial-of-completion\n    AV-33 bound-signature stripping\n\n  3.9 Wire-format extensions (v0.3.0..v0.3.4):\n    AV-34 cross-shape canonical injection\n    AV-35 schema-version dispatch attack (closed v0.3.0)\n    AV-36 LLM_CALL parent-linkage substitution (closed v0.3.3)\n    AV-37 deployment_profile cohort-identity injection\n\n  3.10 DSAR + verify primitives (v0.3.6):\n    AV-38 per-key DSAR scope violation (closed v0.3.6 BREAKING)\n    AV-39 verify-via-persist bypass (architectural closure)\n\nAlso updated:\n- §1 scope: federation directory, hybrid signing, deterministic\n  dispatch, cross-shape injection defense, deployment_profile\n  cohort identity, per-key DSAR, verify-via-persist\n- §6 assumptions 8-12 added (federation directory write authz,\n  steward key isolation, DSAR signature verification consumer-\n  side, verify-via-persist API discipline, clock skew bounded\n  for SoftFreshness)\n- §8 residual risks 11-14 added (compromised steward key,\n  hybrid-pending acceptance window, deployment_profile self-\n  classification mismatch, verify-via-persist consumer\n  discipline)\n- §9 posture summary rewritten as \"v0.3.6 Threat Posture\n  Summary\" (was \"v0.1.2 Threat Posture Summary\")\n- §10 update cadence: full landmark history v0.1.2 → v0.3.6\n\nThree architectural-closure patterns repeated across the new\nsurface:\n\n1. Single-source-of-truth substrate (CIRISPersist#7, #10, #14)\n2. Per-key authorization scope (DSAR AV-38, federation directory\n   writes AV-28)\n3. Substrate exposes edges; consumer composes policy\n   (attestation graph AV-29, verify policy AV-31/AV-39)\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-03T14:07:00-05:00",
+          "tree_id": "a9ad001e1e5ce09e3cc5ea7afe27bfc8a8afe9f7",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/039c0574b67bb6653a92b0010c608c8a9a4a04ad"
+        },
+        "date": 1777835614745,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 90484,
+            "range": "± 1488",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 233251,
+            "range": "± 2755",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 515741,
+            "range": "± 11610",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1923287,
+            "range": "± 11671",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 303,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1213,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 6768,
+            "range": "± 46",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 328,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3156,
+            "range": "± 92",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9570,
+            "range": "± 85",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 43873,
+            "range": "± 288",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 601,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2255562,
+            "range": "± 134218",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6364786,
+            "range": "± 283697",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 22673056,
+            "range": "± 454224",
             "unit": "ns/iter"
           }
         ]
