@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777767662236,
+  "lastUpdate": 1777770388419,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -4841,6 +4841,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23005378,
             "range": "± 214890",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "2867a2581ec10ef824e692f0e30dd5321a300e88",
+          "message": "0.3.2 — cold-path PQC sweep (#11) + read-only role + schema contract (#9)\n\n## #11 — Cold-path PQC sweep\n\nv0.3.1 wired per-write cold-path; that covered every NEW row but\nleft:\n- 654 historical hybrid-pending rows in lens's federation_keys\n- No recovery for transient cold-path failures (sign error, runtime\n  panic between hot-path commit and cold-path attach, network blip,\n  process restart with cold-path tasks inflight)\n- V004 Phase 2's \"pre-flip rows walk through the upgrade pipeline\"\n  with no pipeline implementation\n\nv0.3.2 ships the pipeline:\n\n- 3 new FederationDirectory trait methods + memory/postgres/sqlite\n  impls: list_hybrid_pending_{keys,attestations,revocations}(limit)\n  returning (id, envelope, classical_sig_b64) triples for\n  WHERE pqc_completed_at IS NULL ORDER BY <natural-ts> ASC LIMIT $1\n- Engine.run_pqc_sweep(batch_size=1000) -> dict — walks each table\n  cursor-style, reuses v0.3.1's cold_path_pqc_sign helper, calls\n  attach_*_pqc_signature. Returns {scanned, signed, failed, by_table}.\n  Idempotent via attach_*_pqc_signature's WHERE pqc_completed_at IS NULL\n  guard; multi-worker concurrent sweeps waste signs on losers but\n  don't produce incorrect rows. Re-invoke until scanned == 0 to drain\n  larger backlogs.\n- pqc_sweep_on_init=True constructor param (default True when PQC\n  steward configured) — spawned as background tokio task at end of\n  Engine::new; doesn't block construction. Bridge gets the sweep\n  for free on next redeploy; 654 lens rows hybrid-complete passively.\n\n## #9 — Read-only role + public schema contract\n\nmigrations/postgres/lens/V005__readonly_role.sql: cirislens_reader\nNOLOGIN role, USAGE on cirislens schema, SELECT on all existing +\nfuture tables. Operators GRANT to a login user out-of-band; lens\nanalytical paths use that DSN. Write paths stay Engine-only.\n\ndocs/PUBLIC_SCHEMA_CONTRACT.md: column-stability contract for\nanalytical consumers.\n- stable — semver-guaranteed; removal/type-change requires major\n  bump + deprecation window\n- stable-ro — server-computed (persist_row_hash); read but writes\n  ignored\n- internal — may change at any minor (audit_* forensic fields)\n\nIncludes accord_traces → trace_events/trace_llm_calls column mapping\nso lens science scripts can migrate off the legacy denormalized table.\n\n## Tests\n\n155 lib + 22 integration tests pass; clippy clean across all features;\ncargo-deny clean. Two new memory-backend tests cover the sweep\nsubstrate.\n\n## Deps\n\nNo version changes (ciris-keyring / ciris-verify-core v1.9.0 from v0.3.1).\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-02T20:00:14-05:00",
+          "tree_id": "f438dd573c7ebfa219c08af9f91daca3f94c1dcf",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/2867a2581ec10ef824e692f0e30dd5321a300e88"
+        },
+        "date": 1777770388117,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 102078,
+            "range": "± 1219",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 254861,
+            "range": "± 799",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 555698,
+            "range": "± 5618",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1983514,
+            "range": "± 28015",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 320,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1446,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 6568,
+            "range": "± 79",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 339,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3037,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9486,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 40659,
+            "range": "± 816",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 632,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2127216,
+            "range": "± 95671",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6540519,
+            "range": "± 89846",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 24019043,
+            "range": "± 202768",
             "unit": "ns/iter"
           }
         ]
