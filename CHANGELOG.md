@@ -5,6 +5,120 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.4.1] — 2026-05-03
+
+**Rust-side verify primitives + curated prelude.** CIRISEdge ask
+to eliminate cross-repo drift surfaces in edge's verify pipeline.
+All non-breaking; new public Rust API surface only.
+
+### `verify::verify_hybrid_via_directory` (Rust free function)
+
+```rust
+pub async fn verify_hybrid_via_directory<F: FederationDirectory>(
+    directory: &F,
+    canonical_bytes: &[u8],
+    signing_key_id: &str,
+    ed25519_sig_b64: &str,
+    ml_dsa_65_sig_b64: Option<&str>,
+    policy: HybridPolicy,
+    row_age: Option<Duration>,
+) -> Result<VerifyOutcome, VerifyError>;
+```
+
+The PyO3 `Engine.verify_hybrid_via_directory` already combined
+lookup + verify + policy. v0.4.1 promotes that combination to a
+first-class Rust function so edge calls one function instead of
+re-implementing the lookup-and-verify dance. Generic over
+`FederationDirectory` so callers compose against any backend.
+
+The PyO3 wrapper now backs onto this Rust function — one
+implementation, two surfaces (CIRISPersist#7 single-source-of-truth
+pattern repeated for the verify path). The Python contract
+(`verify_unknown_key` sentinel, error tokens, dict shape) is
+unchanged.
+
+### `verify::canonicalize_envelope_for_signing` (Rust free function)
+
+```rust
+pub fn canonicalize_envelope_for_signing(
+    envelope: &serde_json::Value,
+) -> Result<Vec<u8>, Error>;
+```
+
+Strips top-level `signature` and `signature_pqc` fields, then
+applies `PythonJsonDumpsCanonicalizer`. Returns the bytes the
+sender signed — what the verifier needs to reproduce. Closes the
+AV-5-class drift surface (canonicalization mismatch between sender
+and verifier) by giving the strip rule one home: persist owns it,
+edge calls it.
+
+PyO3: `engine.canonicalize_envelope_for_signing(envelope_json) -> bytes`.
+
+### `verify::body_sha256` (Rust free function)
+
+```rust
+pub fn body_sha256(body: &serde_json::value::RawValue) -> [u8; 32];
+```
+
+SHA-256 of body verbatim wire bytes. Used by the
+`body_sha256_prefix` forensic join key and `in_reply_to` content-
+derived ACK matching (`OutboundQueue::match_ack_to_outbound`).
+Takes `&RawValue` so callers hash the bytes they received, not a
+re-serialized form.
+
+PyO3: `engine.body_sha256(body_bytes) -> bytes`.
+
+### `ciris_persist::prelude` module
+
+Curated re-exports for federation peers integrating with persist
+at the Rust API layer:
+
+```rust
+use ciris_persist::prelude::*;
+// FederationDirectory, OutboundQueue, Backend traits
+// verify_hybrid_via_directory, verify_trace_via_directory,
+//   canonicalize_envelope_for_signing, body_sha256
+// HybridPolicy, VerifyOutcome, HybridVerifyError, PublicKeyDirectory
+// Canonicalizer, PythonJsonDumpsCanonicalizer, canonical_payload_value
+// AbandonedReason, OutboundFailureOutcome, OutboundFilter, OutboundRow,
+//   OutboundStatus, QueueId
+// Attestation, HybridPendingRow, KeyRecord, Revocation, SignedAttestation,
+//   SignedKeyRecord, SignedRevocation
+```
+
+Edge previously imported from 6+ sub-modules; one
+`use ciris_persist::prelude::*` now covers the substrate surface.
+Curated (not a `*` re-export of the world) — internal types
+(`IngestPipeline`, `BatchSummary`, etc.) stay sub-module-imported
+by the smaller set of consumers that need them.
+
+### Tests
+
+179 lib (177 + 2 new) + 22 integration tests pass; clippy clean
+across all features; cargo-deny clean. New tests:
+
+- `canonicalize_envelope_for_signing_strips_signature_fields`:
+  signed and unsigned envelopes produce byte-identical canonical
+  bytes
+- `body_sha256_matches_sha256_of_input`: digest equals
+  `sha256(body.get().as_bytes())` directly
+
+### Deps
+
+- `serde_json` feature `raw_value` enabled (was already
+  `arbitrary_precision`); needed for `body_sha256` taking
+  `&RawValue`. No version bump on serde_json itself.
+
+### Bridge / edge action
+
+```
+ciris-persist = "0.4.1"  # or in pyproject.toml: ciris-persist==0.4.1
+```
+
+Edge's verify pipeline can now collapse `~150 lines of hand-rolled
+lookup-and-canonicalize logic` to `~30 lines composing against
+persist's prelude` (per the CIRISEdge ask).
+
 ## [0.4.0] — 2026-05-03
 
 **Federation substrate cut.** Three architectural deliverables shipped

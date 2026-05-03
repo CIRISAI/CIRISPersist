@@ -267,6 +267,55 @@ pub fn verify_hybrid(
     }
 }
 
+/// v0.4.1 (CIRISEdge ask) — `verify_hybrid` with internal directory
+/// lookup. Generic over `FederationDirectory` so callers can compose
+/// against any backend (postgres, sqlite, memory, future) without
+/// committing to a concrete type.
+///
+/// Persist's PyO3 `Engine.verify_hybrid_via_directory` wraps this
+/// function; consumers of the Rust API call this directly. **One
+/// implementation, both surfaces** — the CIRISPersist#7 single-
+/// source-of-truth pattern.
+///
+/// Returns `VerifyError::Crypto("verify_unknown_key")` when the
+/// directory has no record of `signing_key_id` (matches the PyO3
+/// surface's stable error token for downstream HTTP layer mapping).
+///
+/// `signing_key_id` resolution: looks up the row in `federation_keys`
+/// via `FederationDirectory::lookup_public_key`. Both pubkeys
+/// (Ed25519 mandatory, ML-DSA-65 optional during hybrid-pending
+/// window) are pulled from the row. The caller's `ml_dsa_65_sig`
+/// nullability + `policy` decide whether the verify succeeds when
+/// the row is hybrid-pending (see [`HybridPolicy`]).
+pub async fn verify_hybrid_via_directory<F>(
+    directory: &F,
+    canonical_bytes: &[u8],
+    signing_key_id: &str,
+    ed25519_sig_b64: &str,
+    ml_dsa_65_sig_b64: Option<&str>,
+    policy: HybridPolicy,
+    row_age: Option<Duration>,
+) -> Result<VerifyOutcome, VerifyError>
+where
+    F: crate::federation::FederationDirectory,
+{
+    let key_record = directory
+        .lookup_public_key(signing_key_id)
+        .await
+        .map_err(|e| VerifyError::Crypto(format!("federation directory lookup: {e}")))?
+        .ok_or_else(|| VerifyError::Crypto("verify_unknown_key".to_string()))?;
+
+    verify_hybrid(
+        canonical_bytes,
+        ed25519_sig_b64,
+        ml_dsa_65_sig_b64,
+        &key_record.pubkey_ed25519_base64,
+        key_record.pubkey_ml_dsa_65_base64.as_deref(),
+        policy,
+        row_age,
+    )
+}
+
 /// Hybrid-pending path: only Ed25519 is available. Policy decides
 /// whether to accept and which `VerifyOutcome` variant lands.
 fn verify_ed25519_only_with_policy(

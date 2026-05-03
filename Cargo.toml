@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -91,7 +91,7 @@ serde         = { version = "1", features = ["derive"] }
 # unifies across the dep tree (any crate touching serde_json sees
 # string-backed Number internally). Externally observable behavior
 # is unchanged for code using stable APIs (Number::as_f64 etc.).
-serde_json    = { version = "1", features = ["arbitrary_precision"] }
+serde_json    = { version = "1", features = ["arbitrary_precision", "raw_value"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 sha2          = "0.10"
 chrono        = { version = "0.4", features = ["serde"] }

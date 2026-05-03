@@ -189,6 +189,62 @@ fn write_number(buf: &mut Vec<u8>, n: &serde_json::Number) {
     let _ = write!(buf, "{n}");
 }
 
+/// v0.4.1 (CIRISEdge ask) — Strip signature components from an
+/// envelope and canonicalize. Returns the bytes the sender signed
+/// — what the verifier needs to reproduce.
+///
+/// Rule: top-level `signature` and `signature_pqc` fields removed
+/// before applying [`PythonJsonDumpsCanonicalizer`]. Same shape as
+/// [`crate::federation::types::compute_persist_row_hash`]'s
+/// `persist_row_hash` strip — a row's signed canonical bytes never
+/// include the signature itself (else the hash would depend on
+/// itself).
+///
+/// Used by:
+/// - Edge's verify pipeline (strip-then-canonicalize-then-verify)
+/// - Persist's PyO3 `Engine.canonicalize_envelope_for_signing`
+///   wrapper (calls this directly)
+/// - Federation peers verifying inbound envelopes from gossip /
+///   direct send
+///
+/// **One implementation of the strip rule**: edge no longer
+/// re-implements which fields to strip; persist owns the rule.
+/// This closes the AV-5-class drift surface (canonicalization
+/// mismatch between sender and verifier).
+pub fn canonicalize_envelope_for_signing(
+    envelope: &serde_json::Value,
+) -> Result<Vec<u8>, super::Error> {
+    let mut value = envelope.clone();
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("signature");
+        obj.remove("signature_pqc");
+    }
+    PythonJsonDumpsCanonicalizer
+        .canonicalize_value(&value)
+        .map_err(|e| super::Error::Canonicalization(format!("{e}")))
+}
+
+/// v0.4.1 (CIRISEdge ask) — SHA-256 of a body's verbatim wire
+/// bytes. Used by:
+/// - `body_sha256_prefix` forensic join key in persist's tables
+/// - `in_reply_to` content-derived ACK matching
+///   ([`crate::outbound::OutboundQueue::match_ack_to_outbound`])
+/// - Edge's `body_sha256` field on `EdgeEnvelope`
+///
+/// Takes `&serde_json::value::RawValue` — the verbatim bytes the
+/// caller received, not a re-serialized `Value`. Hashing
+/// re-serialized bytes would re-canonicalize and lose the wire-
+/// format identity.
+///
+/// Returns the raw 32-byte digest; callers hex-encode or
+/// base64-encode as their downstream format requires.
+pub fn body_sha256(body: &serde_json::value::RawValue) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(body.get().as_bytes());
+    hasher.finalize().into()
+}
+
 fn write_string(buf: &mut Vec<u8>, s: &str) {
     // Python's json string encoding (ensure_ascii=True, default
     // separators):
@@ -495,5 +551,51 @@ mod tests {
         let sorted_expected = r#"{"a":1e-05,"m":42,"z":0.0031992000000000006}"#;
         let v: serde_json::Value = serde_json::from_str(unsorted).unwrap();
         assert_eq!(pyc(v), sorted_expected);
+    }
+
+    /// v0.4.1 (CIRISEdge ask) — `canonicalize_envelope_for_signing`
+    /// strips top-level `signature` and `signature_pqc` fields then
+    /// applies PythonJsonDumpsCanonicalizer. Two envelopes (one
+    /// without signature fields, one with) produce byte-identical
+    /// canonical bytes — the strip rule + canonicalizer is the
+    /// invertible-by-the-verifier shape.
+    #[test]
+    fn canonicalize_envelope_for_signing_strips_signature_fields() {
+        let unsigned = serde_json::json!({
+            "agent_role": "ally",
+            "deployment_domain": "general",
+            "trace_id": "abc",
+        });
+        let signed = serde_json::json!({
+            "agent_role": "ally",
+            "deployment_domain": "general",
+            "trace_id": "abc",
+            "signature": "0x1234567890abcdef",
+            "signature_pqc": "0xfedcba0987654321",
+        });
+        let bytes_unsigned = canonicalize_envelope_for_signing(&unsigned).unwrap();
+        let bytes_signed = canonicalize_envelope_for_signing(&signed).unwrap();
+        assert_eq!(
+            bytes_unsigned, bytes_signed,
+            "strip rule must produce byte-identical canonical bytes"
+        );
+        // And the result is the standard sorted Python json.dumps shape.
+        let expected = r#"{"agent_role":"ally","deployment_domain":"general","trace_id":"abc"}"#;
+        assert_eq!(bytes_unsigned, expected.as_bytes());
+    }
+
+    /// v0.4.1 (CIRISEdge ask) — `body_sha256` returns SHA-256 of the
+    /// raw bytes. Used as the `in_reply_to` content-derived ACK
+    /// matching key + the `body_sha256_prefix` forensic join key.
+    #[test]
+    fn body_sha256_matches_sha256_of_input() {
+        let body_str = r#"{"trace_id":"abc","action":"speak"}"#;
+        let body: Box<serde_json::value::RawValue> =
+            serde_json::value::RawValue::from_string(body_str.to_owned()).unwrap();
+        let digest = body_sha256(&body);
+        // Compare against direct sha256 of the verbatim bytes.
+        use sha2::{Digest, Sha256};
+        let expected: [u8; 32] = Sha256::digest(body_str.as_bytes()).into();
+        assert_eq!(digest, expected);
     }
 }

@@ -1580,32 +1580,8 @@ impl PyEngine {
         soft_freshness_window_seconds: Option<f64>,
         row_age_seconds: Option<f64>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        use crate::verify::{HybridPolicy, VerifyOutcome};
-        let parsed_policy = match policy {
-            "strict" => HybridPolicy::Strict,
-            "ed25519_fallback" => HybridPolicy::Ed25519Fallback,
-            "soft_freshness" => {
-                let secs = soft_freshness_window_seconds.ok_or_else(|| {
-                    PyValueError::new_err(
-                        "soft_freshness policy requires \
-                         soft_freshness_window_seconds",
-                    )
-                })?;
-                if !secs.is_finite() || secs < 0.0 {
-                    return Err(PyValueError::new_err(
-                        "soft_freshness_window_seconds must be a non-negative finite float",
-                    ));
-                }
-                HybridPolicy::SoftFreshness {
-                    window: std::time::Duration::from_secs_f64(secs),
-                }
-            }
-            other => {
-                return Err(PyValueError::new_err(format!(
-                    "unknown policy {other:?} (expected strict / ed25519_fallback / soft_freshness)"
-                )));
-            }
-        };
+        use crate::verify::VerifyOutcome;
+        let parsed_policy = parse_hybrid_policy(policy, soft_freshness_window_seconds)?;
 
         let row_age = row_age_seconds.and_then(|s| {
             if s.is_finite() && s >= 0.0 {
@@ -1697,10 +1673,12 @@ impl PyEngine {
         Ok(dict)
     }
 
-    /// v0.4.0 — Hybrid verify with internal directory lookup.
-    /// Convenience wrapper around `verify_hybrid` + federation_keys
-    /// lookup: given `signature_key_id`, persist looks up both
-    /// pubkeys (Ed25519 + ML-DSA-65) and runs `verify_hybrid`.
+    /// v0.4.0 / v0.4.1 — Hybrid verify with internal directory
+    /// lookup. v0.4.1 backs onto the Rust free function
+    /// `crate::verify::verify_hybrid_via_directory` so the PyO3
+    /// surface and Rust API surface share one implementation
+    /// (CIRISEdge ask 1; CIRISPersist#7 single-source-of-truth
+    /// pattern).
     ///
     /// Saves the caller from doing a separate `lookup_public_key`
     /// call before each verify. Same `policy` semantics as
@@ -1731,37 +1709,98 @@ impl PyEngine {
         soft_freshness_window_seconds: Option<f64>,
         row_age_seconds: Option<f64>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        // Look up the federation_keys row to get both pubkeys.
+        use crate::verify::{HybridPolicy, VerifyOutcome};
+        let parsed_policy = parse_hybrid_policy(policy, soft_freshness_window_seconds)?;
+        let row_age = row_age_seconds.and_then(|s| {
+            if s.is_finite() && s >= 0.0 {
+                Some(std::time::Duration::from_secs_f64(s))
+            } else {
+                None
+            }
+        });
+
+        let canonical_owned = canonical_bytes.to_vec();
+        let key_id_owned = signature_key_id.to_owned();
+        let ed25519_owned = ed25519_sig_b64.to_owned();
+        let pqc_owned = ml_dsa_65_sig_b64.map(str::to_owned);
         let backend = self.backend.clone();
         let runtime = self.runtime.clone();
-        let key_id_owned = signature_key_id.to_owned();
-        let key_record_opt = py.detach(move || {
-            runtime.block_on(async move {
-                use crate::federation::FederationDirectory;
-                <PostgresBackend as FederationDirectory>::lookup_public_key(&backend, &key_id_owned)
-                    .await
-            })
-        });
-        let key_record = key_record_opt
-            .map_err(federation_err_to_py)?
-            .ok_or_else(|| PyValueError::new_err("verify_unknown_key"))?;
-        let ed25519_pubkey_b64 = key_record.pubkey_ed25519_base64.clone();
-        let ml_dsa_65_pubkey_b64 = key_record.pubkey_ml_dsa_65_base64.clone();
 
-        // Delegate to verify_hybrid with the looked-up pubkeys.
-        // ml_dsa_65_pubkey_b64 may be None when the row is hybrid-
-        // pending; verify_hybrid handles that via the policy.
-        self.verify_hybrid(
-            py,
-            canonical_bytes,
-            ed25519_sig_b64,
-            ml_dsa_65_sig_b64,
-            &ed25519_pubkey_b64,
-            ml_dsa_65_pubkey_b64.as_deref(),
-            policy,
-            soft_freshness_window_seconds,
-            row_age_seconds,
-        )
+        let outcome = py
+            .detach(move || {
+                runtime.block_on(async move {
+                    crate::verify::verify_hybrid_via_directory(
+                        &*backend,
+                        &canonical_owned,
+                        &key_id_owned,
+                        &ed25519_owned,
+                        pqc_owned.as_deref(),
+                        parsed_policy,
+                        row_age,
+                    )
+                    .await
+                })
+            })
+            .map_err(|e| {
+                let s = e.to_string();
+                tracing::warn!(error = %e, kind = e.kind(), "verify_hybrid_via_directory rejected");
+                if s.contains("verify_unknown_key") {
+                    PyValueError::new_err("verify_unknown_key")
+                } else {
+                    PyValueError::new_err(e.kind())
+                }
+            })?;
+
+        let _ = HybridPolicy::Strict; // keep import live across feature combos
+        let dict = PyDict::new(py);
+        match outcome {
+            VerifyOutcome::HybridVerified => {
+                dict.set_item("outcome", "hybrid_verified")?;
+                dict.set_item("row_age_seconds", py.None())?;
+            }
+            VerifyOutcome::Ed25519VerifiedHybridPending { row_age } => {
+                dict.set_item("outcome", "ed25519_hybrid_pending")?;
+                let secs = row_age.map(|d| d.as_secs_f64());
+                match secs {
+                    Some(s) => dict.set_item("row_age_seconds", s)?,
+                    None => dict.set_item("row_age_seconds", py.None())?,
+                }
+            }
+            VerifyOutcome::Ed25519VerifiedFallback => {
+                dict.set_item("outcome", "ed25519_fallback")?;
+                dict.set_item("row_age_seconds", py.None())?;
+            }
+        }
+        Ok(dict)
+    }
+
+    /// v0.4.1 (CIRISEdge ask) — Strip-then-canonicalize an envelope
+    /// for signing/verifying. Removes top-level `signature` and
+    /// `signature_pqc` fields, applies PythonJsonDumpsCanonicalizer.
+    /// Wraps `crate::verify::canonicalize_envelope_for_signing`.
+    fn canonicalize_envelope_for_signing<'py>(
+        &self,
+        py: Python<'py>,
+        envelope_json: &str,
+    ) -> PyResult<Py<PyBytes>> {
+        let value: serde_json::Value = serde_json::from_str(envelope_json)
+            .map_err(|e| PyValueError::new_err(format!("envelope JSON decode: {e}")))?;
+        let bytes = crate::verify::canonicalize_envelope_for_signing(&value).map_err(|e| {
+            PyRuntimeError::new_err(format!("canonicalize_envelope_for_signing: {e}"))
+        })?;
+        Ok(PyBytes::new(py, &bytes).unbind())
+    }
+
+    /// v0.4.1 (CIRISEdge ask) — SHA-256 of body verbatim wire bytes.
+    /// Used by `body_sha256_prefix` forensic join key and
+    /// `in_reply_to` content-derived ACK matching. Persist hashes
+    /// the bytes as supplied — does NOT re-canonicalize.
+    fn body_sha256<'py>(&self, py: Python<'py>, body_bytes: &[u8]) -> PyResult<Py<PyBytes>> {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(body_bytes);
+        let digest: [u8; 32] = hasher.finalize().into();
+        Ok(PyBytes::new(py, &digest).unbind())
     }
 
     /// v0.4.0 — Verify a `SignedKeyRecord` envelope's scrub
@@ -2351,6 +2390,39 @@ fn outbound_rows_to_pylist<'py>(
         list.append(outbound_row_to_pydict(py, &r)?)?;
     }
     Ok(list)
+}
+
+/// v0.4.1 — Parse the policy string + optional soft_freshness window
+/// into a `HybridPolicy`. Shared by `Engine.verify_hybrid` and
+/// `Engine.verify_hybrid_via_directory` so the parsing rules are
+/// declared in one place.
+fn parse_hybrid_policy(
+    policy: &str,
+    soft_freshness_window_seconds: Option<f64>,
+) -> PyResult<crate::verify::HybridPolicy> {
+    use crate::verify::HybridPolicy;
+    match policy {
+        "strict" => Ok(HybridPolicy::Strict),
+        "ed25519_fallback" => Ok(HybridPolicy::Ed25519Fallback),
+        "soft_freshness" => {
+            let secs = soft_freshness_window_seconds.ok_or_else(|| {
+                PyValueError::new_err(
+                    "soft_freshness policy requires soft_freshness_window_seconds",
+                )
+            })?;
+            if !secs.is_finite() || secs < 0.0 {
+                return Err(PyValueError::new_err(
+                    "soft_freshness_window_seconds must be a non-negative finite float",
+                ));
+            }
+            Ok(HybridPolicy::SoftFreshness {
+                window: std::time::Duration::from_secs_f64(secs),
+            })
+        }
+        other => Err(PyValueError::new_err(format!(
+            "unknown policy {other:?} (expected strict / ed25519_fallback / soft_freshness)"
+        ))),
+    }
 }
 
 /// v0.4.0 — Adapter implementing `PublicKeyDirectory` against the

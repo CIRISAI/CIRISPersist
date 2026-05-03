@@ -35,6 +35,7 @@ pub mod ingest;
 pub mod journal;
 pub mod manifest;
 pub mod outbound;
+pub mod prelude;
 pub mod queue;
 pub mod schema;
 pub mod scrub;

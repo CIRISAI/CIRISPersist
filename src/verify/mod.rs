@@ -14,11 +14,16 @@ pub mod canonical;
 pub mod ed25519;
 pub mod hybrid;
 
-pub use canonical::{Canonicalizer, PythonJsonDumpsCanonicalizer};
+pub use canonical::{
+    body_sha256, canonicalize_envelope_for_signing, Canonicalizer, PythonJsonDumpsCanonicalizer,
+};
 pub use ed25519::{
     canonical_payload_value, verify_trace, verify_trace_via_directory, PublicKeyDirectory,
 };
-pub use hybrid::{verify_hybrid, HybridPolicy, VerifyError as HybridVerifyError, VerifyOutcome};
+pub use hybrid::{
+    verify_hybrid, verify_hybrid_via_directory, HybridPolicy, VerifyError as HybridVerifyError,
+    VerifyOutcome,
+};
 
 /// Verify-layer errors.
 #[derive(Debug, thiserror::Error)]
