@@ -99,35 +99,60 @@ pub trait Backend: Send + Sync {
     /// `migrations/sqlite/lens/`; the runner is `refinery`.
     fn run_migrations(&self) -> impl Future<Output = Result<(), Error>> + Send;
 
-    /// v0.3.5 (CIRISLens#8 ASK 1) — GDPR Article 17 / DSAR primitive.
-    /// Delete every persist-substrate row for `agent_id_hash`:
+    /// v0.3.6 (CIRISPersist#15, CIRISLens#8 ASK 1) — GDPR Article 17
+    /// / DSAR primitive. Per-key scope: deletion is scoped to
+    /// `(agent_id_hash, signing_key_id)` — both required.
     ///
-    /// - `trace_events` rows where `agent_id_hash` matches
+    /// `signature_key_id` is the **authorization scope** of the DSAR,
+    /// not just an identity filter. A request signed by key A is
+    /// only authorized to delete traces signed by key A. Without
+    /// per-key scope, any one valid key could file a DSAR deleting
+    /// traces from other agent instances claiming the same logical
+    /// identity (e.g., separate deployments of the same template
+    /// with different signing keys).
+    ///
+    /// **Breaking change vs v0.3.5**: v0.3.5 took only
+    /// `agent_id_hash` and broadened scope to all keys for that
+    /// agent. v0.3.6 requires `signature_key_id` — the per-key
+    /// contract is load-bearing for the federation's authorization
+    /// model. Admin / forensic deletions (operator with explicit
+    /// out-of-band authorization, no DSAR signature) belong in
+    /// standard privileged CRUD, not this primitive.
+    ///
+    /// Deletes:
+    /// - `trace_events` rows where `agent_id_hash` AND
+    ///   `signing_key_id` both match
     /// - `trace_llm_calls` rows joined by `trace_id` from the deleted
     ///   trace_events set (LLM call rows don't carry agent_id_hash
-    ///   directly per V001 schema)
+    ///   or signing_key_id per V001 schema; the trace_id bridge
+    ///   ensures cross-key cascade safety)
     ///
     /// When `include_federation_key=true`, additionally:
+    /// - the single `federation_keys` row where `key_id =
+    ///   signature_key_id` AND `identity_type='agent'` AND
+    ///   `identity_ref=agent_id_hash`
+    /// - FK-cascade: `federation_attestations` rows referencing that
+    ///   key (attesting / attested / scrub_key_id) deleted first
+    /// - FK-cascade: `federation_revocations` rows referencing that
+    ///   key, deleted before the federation_keys delete
     ///
-    /// - `federation_keys` rows where `identity_type='agent'` AND
-    ///   `identity_ref=agent_id_hash`. May be >1 if the agent rotated
-    ///   keys.
-    /// - FK-cascade: `federation_attestations` rows referencing those
-    ///   key_ids (attesting / attested / scrub_key_id) deleted first
-    /// - FK-cascade: `federation_revocations` rows referencing those
-    ///   key_ids deleted before the federation_keys delete
+    /// The agent's other registered keys stay alive — the per-key
+    /// authorization model means the DSAR can only revoke the key it
+    /// was signed with.
     ///
     /// All deletes happen in a single transaction. The caller's
-    /// `agent_id_hash` is not validated against any signing-key
-    /// proof — that's the lens's DSAR-orchestration responsibility.
-    /// Persist owns the substrate row delete; lens owns the audit +
-    /// signature verification of the request envelope.
+    /// `agent_id_hash` and `signature_key_id` are not validated
+    /// against any signing-key proof — that's the lens's
+    /// DSAR-orchestration responsibility. Persist owns the substrate
+    /// row delete; lens owns the audit + signature verification of
+    /// the request envelope.
     ///
-    /// Idempotent: re-invocation on an already-deleted agent returns
-    /// a `DeleteSummary` with all counts zero.
+    /// Idempotent: re-invocation returns a `DeleteSummary` with all
+    /// counts zero.
     fn delete_traces_for_agent(
         &self,
         agent_id_hash: &str,
+        signature_key_id: &str,
         include_federation_key: bool,
     ) -> impl Future<Output = Result<DeleteSummary, Error>> + Send;
 

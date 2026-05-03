@@ -5,6 +5,138 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.3.6] — 2026-05-03
+
+**`Engine.verify_hybrid` for arbitrary canonical bytes** + **per-key
+DSAR scope** (BREAKING).
+
+Closes [CIRISPersist#14](https://github.com/CIRISAI/CIRISPersist/issues/14)
+(CIRISEdge OQ-11 day-1 hybrid posture) and
+[CIRISPersist#15](https://github.com/CIRISAI/CIRISPersist/issues/15)
+(per-key DSAR authorization scope).
+
+### Engine.verify_hybrid (CIRISPersist#14)
+
+```python
+result = engine.verify_hybrid(
+    canonical_bytes,
+    ed25519_sig_b64,
+    ml_dsa_65_sig_b64,           # None when row is hybrid-pending
+    ed25519_pubkey_b64,
+    ml_dsa_65_pubkey_b64,         # None when row is hybrid-pending
+    policy="strict",              # | "ed25519_fallback" | "soft_freshness"
+    soft_freshness_window_seconds=None,  # required for soft_freshness
+    row_age_seconds=None,                # caller-provided row age (SoftFreshness)
+)
+# {"outcome": "hybrid_verified" | "ed25519_hybrid_pending" | "ed25519_fallback",
+#  "row_age_seconds": float | None}
+```
+
+The cryptographic primitive lives in `ciris_crypto::HybridVerifier`;
+v0.3.6 wraps it with persist's policy machinery + PyO3 surface so
+verify-via-persist remains the federation's single-source-of-truth
+(per CIRISPersist#7). Edge calling `ciris_crypto::HybridVerifier`
+directly would fork canonicalization expectations + bypass policy.
+
+`HybridPolicy::SoftFreshness { window }` accepts hybrid-pending rows
+when `row_age < window` — matches V004's eventual-consistency
+contract. The `row_age` is caller-supplied (lookup of the row's
+`pqc_completed_at` or `created_at` happens at the caller layer; the
+primitive itself is policy-aware but lookup-free).
+
+On verify failure raises `ValueError` with a stable persist
+error-token (`verify_hybrid_pending_rejected`,
+`verify_hybrid_soft_freshness_expired`,
+`verify_hybrid_pqc_fields_mismatch`, `verify_hybrid_base64`,
+`verify_hybrid_invalid_length`, `verify_hybrid_crypto`). Same
+discipline as the rest of persist's PyO3 surface — structured
+detail in tracing logs, stable token for HTTP layer mapping.
+
+### Per-key DSAR scope (CIRISPersist#15) — BREAKING
+
+`Engine.delete_traces_for_agent` now requires `signature_key_id`
+in addition to `agent_id_hash`:
+
+```python
+# v0.3.5 — REMOVED
+engine.delete_traces_for_agent(agent_id_hash, include_federation_key=False)
+
+# v0.3.6 — required
+engine.delete_traces_for_agent(
+    agent_id_hash,
+    signature_key_id,                     # required
+    include_federation_key=False,
+)
+```
+
+`signature_key_id` is the **authorization scope** of the DSAR, not
+just an identity filter. A request signed by key A is only
+authorized to delete traces signed by key A. Without per-key scope,
+any one valid key could file a DSAR deleting traces from other
+agent instances claiming the same logical identity (separate
+deployments of the same template with different signing keys).
+
+The v0.3.5 `Option<&str>` shape was wrong — `None` would have been
+a footgun for admin/forensic deletes, but those belong in standard
+privileged CRUD, not this DSAR primitive. v0.3.6 makes per-key
+scope absolute.
+
+Cascade semantics (per-key throughout):
+- `trace_events` rows: `WHERE agent_id_hash = $1 AND signing_key_id = $2`
+- `trace_llm_calls` rows: joined by `trace_id` from the deleted set
+- `federation_keys`: when `include_federation_key=true`, only the
+  one row matching `(agent_id_hash, signature_key_id)`. Other
+  registered keys for the same agent stay alive.
+- FK-cascade: `federation_attestations` + `federation_revocations`
+  referencing that one key, deleted before the federation_keys
+  delete.
+
+### Lens action
+
+Lens reverted the v0.3.5 fold attempt (lens commits 99359e8 →
+fbbd844) once the per-key contract surfaced. v0.3.6 unblocks the
+fold cleanly:
+
+```
+ciris-persist==0.3.5  →  ciris-persist==0.3.6
+```
+
+Lens DSAR handler at `accord_api.py:dsar_delete_traces` folds onto:
+
+```python
+engine.delete_traces_for_agent(agent_id_hash, signature_key_id)
+```
+
+— preserving the per-(agent_id_hash, signature_key_id) scope the
+lens-owned legacy tables already enforce.
+
+### Deps
+
+- **`ciris-crypto`** added as direct dep (git tag v1.9.0, features
+  `ed25519` + `pqc-ml-dsa`). Version-coherent with the existing
+  ciris-keyring + ciris-verify-core deps. Pulls in the
+  `HybridVerifier` + `Ed25519Verifier` + `MlDsa65Verifier` types
+  used by `verify_hybrid`.
+
+### Tests
+
+177 lib (+9 new) + 22 integration tests pass; clippy clean across
+all features; cargo-deny clean.
+
+New tests:
+
+- `verify::hybrid` (8 tests) — strict rejects hybrid-pending,
+  fallback accepts, soft_freshness within/past window/no-row-age,
+  PQC sig without pubkey rejects, full hybrid round-trip,
+  tampered canonical rejects
+- `dsar_per_key_scopes_correctly` — only the targeted key's traces
+  delete; cross-key + cross-agent rows survive
+- `dsar_per_key_cascades_llm_calls` — LLM call cascade walks the
+  same trace_id set, doesn't touch other-key LLM calls
+
+The v0.3.5 per-agent test was removed (the API doesn't exist
+anymore).
+
 ## [0.3.5] — 2026-05-03
 
 **DSAR primitive + page-cursor read primitive for analytical streaming.**

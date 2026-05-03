@@ -443,20 +443,25 @@ impl Backend for SqliteBackend {
     async fn delete_traces_for_agent(
         &self,
         agent_id_hash: &str,
+        signature_key_id: &str,
         include_federation_key: bool,
     ) -> Result<super::types::DeleteSummary, Error> {
         let agent = agent_id_hash.to_owned();
+        let key = signature_key_id.to_owned();
         let conn = self.conn.clone();
         let summary = tokio::task::spawn_blocking(
             move || -> Result<super::types::DeleteSummary, rusqlite::Error> {
                 let mut conn = conn.blocking_lock();
                 let tx = conn.transaction()?;
-                // Step 1: collect trace_ids of the agent's events.
+                // Per-key DSAR scope: both agent_id_hash AND
+                // signing_key_id must match. Same shape as postgres.
+                // Step 1: collect matching trace_ids.
                 let trace_ids: Vec<String> = {
                     let mut stmt = tx.prepare(
-                        "SELECT DISTINCT trace_id FROM trace_events WHERE agent_id_hash = ?1",
+                        "SELECT DISTINCT trace_id FROM trace_events \
+                         WHERE agent_id_hash = ?1 AND signing_key_id = ?2",
                     )?;
-                    let rows = stmt.query_map([&agent], |r| r.get::<_, String>(0))?;
+                    let rows = stmt.query_map([&agent, &key], |r| r.get::<_, String>(0))?;
                     rows.collect::<Result<Vec<_>, _>>()?
                 };
 
@@ -469,10 +474,12 @@ impl Backend for SqliteBackend {
                     }
                 }
 
-                // Step 3: delete trace_events rows.
+                // Step 3: delete trace_events rows. Same key-scope
+                // filter as step 1.
                 let trace_events_deleted = tx.execute(
-                    "DELETE FROM trace_events WHERE agent_id_hash = ?1",
-                    [&agent],
+                    "DELETE FROM trace_events \
+                     WHERE agent_id_hash = ?1 AND signing_key_id = ?2",
+                    [&agent, &key],
                 )? as u64;
 
                 let mut federation_keys_deleted = 0u64;
@@ -480,12 +487,16 @@ impl Backend for SqliteBackend {
                 let mut federation_revocations_deleted = 0u64;
 
                 if include_federation_key {
+                    // Per-key federation_keys cascade: the single
+                    // key_id matching (agent_id_hash, signature_key_id).
                     let target_key_ids: Vec<String> = {
                         let mut stmt = tx.prepare(
                             "SELECT key_id FROM federation_keys \
-                             WHERE identity_type = 'agent' AND identity_ref = ?1",
+                             WHERE identity_type = 'agent' \
+                               AND identity_ref = ?1 \
+                               AND key_id = ?2",
                         )?;
-                        let rows = stmt.query_map([&agent], |r| r.get::<_, String>(0))?;
+                        let rows = stmt.query_map([&agent, &key], |r| r.get::<_, String>(0))?;
                         rows.collect::<Result<Vec<_>, _>>()?
                     };
 

@@ -1347,23 +1347,28 @@ impl PyEngine {
         Ok(dict)
     }
 
-    /// v0.3.5 (CIRISLens#8 ASK 1) — GDPR Article 17 / DSAR primitive.
-    /// Delete every persist-substrate row for `agent_id_hash`.
+    /// v0.3.6 (CIRISPersist#15, CIRISLens#8 ASK 1) — GDPR Article 17
+    /// / DSAR primitive. Per-key scope: deletion is scoped to
+    /// `(agent_id_hash, signing_key_id)`.
     ///
-    /// Always deletes:
-    /// - `cirislens.trace_events` rows where `agent_id_hash` matches
+    /// `signature_key_id` is the **authorization scope** of the DSAR,
+    /// not just an identity filter. A request signed by key A is
+    /// only authorized to delete traces signed by key A.
+    ///
+    /// Deletes:
+    /// - `cirislens.trace_events` rows where `agent_id_hash` AND
+    ///   `signing_key_id` both match
     /// - `cirislens.trace_llm_calls` rows joined by `trace_id` from
     ///   the deleted trace_events set
     ///
     /// When `include_federation_key=True`, additionally:
-    /// - `cirislens.federation_keys` rows where
-    ///   `identity_type='agent'` AND `identity_ref=agent_id_hash`
-    ///   (may be >1 if the agent rotated keys)
+    /// - the single `cirislens.federation_keys` row where `key_id =
+    ///   signature_key_id` AND `identity_type='agent'` AND
+    ///   `identity_ref=agent_id_hash`
     /// - FK-cascade: `federation_attestations` and
-    ///   `federation_revocations` rows referencing those key_ids
-    ///   (deleted before the federation_keys delete to satisfy FK
-    ///   integrity — persist's federation FKs are not ON DELETE
-    ///   CASCADE)
+    ///   `federation_revocations` rows referencing that key
+    ///   (deleted first to satisfy FK integrity — persist's
+    ///   federation FKs are not ON DELETE CASCADE)
     ///
     /// All deletes happen in a single transaction. Returns a dict:
     ///
@@ -1378,30 +1383,33 @@ impl PyEngine {
     /// }
     /// ```
     ///
-    /// Idempotent: re-invocation on an already-deleted agent returns
-    /// all-zero counts.
+    /// Idempotent: re-invocation returns all-zero counts.
     ///
     /// **Persist owns the substrate row delete; lens orchestrates the
     /// DSAR audit + signature verification.** This method does not
-    /// validate the caller's authority to delete the agent's data —
-    /// that's lens-side policy. Persist is the substrate; lens is the
-    /// policy layer.
-    #[pyo3(signature = (agent_id_hash, include_federation_key=false))]
+    /// validate the caller's authority — that's lens-side policy.
+    #[pyo3(signature = (agent_id_hash, signature_key_id, include_federation_key=false))]
     fn delete_traces_for_agent<'py>(
         &self,
         py: Python<'py>,
         agent_id_hash: &str,
+        signature_key_id: &str,
         include_federation_key: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
         let backend = self.backend.clone();
         let runtime = self.runtime.clone();
         let agent_id_hash = agent_id_hash.to_owned();
+        let signature_key_id = signature_key_id.to_owned();
 
         let summary = py.detach(move || {
             runtime.block_on(async move {
                 use crate::store::Backend;
                 backend
-                    .delete_traces_for_agent(&agent_id_hash, include_federation_key)
+                    .delete_traces_for_agent(
+                        &agent_id_hash,
+                        &signature_key_id,
+                        include_federation_key,
+                    )
                     .await
             })
         });
@@ -1514,6 +1522,135 @@ impl PyEngine {
             list.append(d)?;
         }
         Ok(list)
+    }
+
+    /// v0.3.6 (CIRISPersist#14) — Hybrid Ed25519 + ML-DSA-65 verify
+    /// for arbitrary canonical bytes. CIRISEdge OQ-11 day-1 posture
+    /// unblocker.
+    ///
+    /// `policy` is one of `"strict"`, `"ed25519_fallback"`, or
+    /// `"soft_freshness"`. When `"soft_freshness"`,
+    /// `soft_freshness_window_seconds` is required; `row_age_seconds`
+    /// MAY be passed by the caller (caller-side lookup of
+    /// `pqc_completed_at`). Other policies ignore both.
+    ///
+    /// `ml_dsa_65_sig_b64` and `ml_dsa_65_pubkey_b64` are paired:
+    /// either both Some (full hybrid verify) or both None (the row
+    /// is hybrid-pending; acceptance depends on `policy`).
+    ///
+    /// Returns a dict:
+    ///
+    /// ```text
+    /// {
+    ///   "outcome": str,        # "hybrid_verified" | "ed25519_hybrid_pending" | "ed25519_fallback"
+    ///   "row_age_seconds": float|None,  # echoed back when SoftFreshness matches
+    /// }
+    /// ```
+    ///
+    /// On verify failure raises `ValueError` with the persist
+    /// error-token (`verify_hybrid_pending_rejected`,
+    /// `verify_hybrid_soft_freshness_expired`,
+    /// `verify_hybrid_pqc_fields_mismatch`,
+    /// `verify_hybrid_base64`, `verify_hybrid_invalid_length`,
+    /// `verify_hybrid_crypto`).
+    ///
+    /// Same error-token discipline as the rest of persist's PyO3
+    /// surface — structured detail in tracing logs, stable token in
+    /// the Python exception message for HTTP layer mapping.
+    #[pyo3(signature = (
+        canonical_bytes,
+        ed25519_sig_b64,
+        ml_dsa_65_sig_b64,
+        ed25519_pubkey_b64,
+        ml_dsa_65_pubkey_b64,
+        policy,
+        soft_freshness_window_seconds=None,
+        row_age_seconds=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn verify_hybrid<'py>(
+        &self,
+        py: Python<'py>,
+        canonical_bytes: &[u8],
+        ed25519_sig_b64: &str,
+        ml_dsa_65_sig_b64: Option<&str>,
+        ed25519_pubkey_b64: &str,
+        ml_dsa_65_pubkey_b64: Option<&str>,
+        policy: &str,
+        soft_freshness_window_seconds: Option<f64>,
+        row_age_seconds: Option<f64>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        use crate::verify::{HybridPolicy, VerifyOutcome};
+        let parsed_policy = match policy {
+            "strict" => HybridPolicy::Strict,
+            "ed25519_fallback" => HybridPolicy::Ed25519Fallback,
+            "soft_freshness" => {
+                let secs = soft_freshness_window_seconds.ok_or_else(|| {
+                    PyValueError::new_err(
+                        "soft_freshness policy requires \
+                         soft_freshness_window_seconds",
+                    )
+                })?;
+                if !secs.is_finite() || secs < 0.0 {
+                    return Err(PyValueError::new_err(
+                        "soft_freshness_window_seconds must be a non-negative finite float",
+                    ));
+                }
+                HybridPolicy::SoftFreshness {
+                    window: std::time::Duration::from_secs_f64(secs),
+                }
+            }
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown policy {other:?} (expected strict / ed25519_fallback / soft_freshness)"
+                )));
+            }
+        };
+
+        let row_age = row_age_seconds.and_then(|s| {
+            if s.is_finite() && s >= 0.0 {
+                Some(std::time::Duration::from_secs_f64(s))
+            } else {
+                None
+            }
+        });
+
+        let outcome = crate::verify::verify_hybrid(
+            canonical_bytes,
+            ed25519_sig_b64,
+            ml_dsa_65_sig_b64,
+            ed25519_pubkey_b64,
+            ml_dsa_65_pubkey_b64,
+            parsed_policy,
+            row_age,
+        )
+        .map_err(|e| {
+            // Stable token → ValueError per persist's FFI discipline.
+            // Verbose Display goes to tracing logs only.
+            tracing::warn!(error = %e, kind = e.kind(), "verify_hybrid rejected");
+            PyValueError::new_err(e.kind())
+        })?;
+
+        let dict = PyDict::new(py);
+        match outcome {
+            VerifyOutcome::HybridVerified => {
+                dict.set_item("outcome", "hybrid_verified")?;
+                dict.set_item("row_age_seconds", py.None())?;
+            }
+            VerifyOutcome::Ed25519VerifiedHybridPending { row_age } => {
+                dict.set_item("outcome", "ed25519_hybrid_pending")?;
+                let secs = row_age.map(|d| d.as_secs_f64());
+                match secs {
+                    Some(s) => dict.set_item("row_age_seconds", s)?,
+                    None => dict.set_item("row_age_seconds", py.None())?,
+                }
+            }
+            VerifyOutcome::Ed25519VerifiedFallback => {
+                dict.set_item("outcome", "ed25519_fallback")?;
+                dict.set_item("row_age_seconds", py.None())?;
+            }
+        }
+        Ok(dict)
     }
 }
 

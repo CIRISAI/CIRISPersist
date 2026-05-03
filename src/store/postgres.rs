@@ -660,6 +660,7 @@ impl Backend for PostgresBackend {
     async fn delete_traces_for_agent(
         &self,
         agent_id_hash: &str,
+        signature_key_id: &str,
         include_federation_key: bool,
     ) -> Result<super::types::DeleteSummary, Error> {
         let mut client = self
@@ -672,14 +673,16 @@ impl Backend for PostgresBackend {
             .await
             .map_err(|e| Error::Backend(format!("begin tx: {e}")))?;
 
-        // Step 1: collect agent's trace_ids so we can join the LLM
-        // call delete (trace_llm_calls has no agent_id_hash column;
-        // FK is on trace_id alone).
+        // Per-key DSAR scope: both agent_id_hash AND signing_key_id
+        // must match. trace_llm_calls cascade walks the matching set
+        // via the trace_id bridge (V001 schema: LLM call rows have
+        // no signing_key_id column).
+        // Step 1: collect matching trace_ids.
         let trace_ids: Vec<String> = tx
             .query(
                 "SELECT DISTINCT trace_id FROM cirislens.trace_events \
-                 WHERE agent_id_hash = $1",
-                &[&agent_id_hash],
+                 WHERE agent_id_hash = $1 AND signing_key_id = $2",
+                &[&agent_id_hash, &signature_key_id],
             )
             .await
             .map_err(|e| Error::Backend(format!("collect trace_ids: {e}")))?
@@ -687,7 +690,9 @@ impl Backend for PostgresBackend {
             .map(|row| row.get::<_, String>(0))
             .collect();
 
-        // Step 2: delete LLM call rows joined by trace_id.
+        // Step 2: delete LLM call rows joined by the matching
+        // trace_ids. Cross-key traces (agent rotated keys, signed
+        // under multiple keys) only cascade for this DSAR's key.
         let trace_llm_calls_deleted = if trace_ids.is_empty() {
             0u64
         } else {
@@ -700,11 +705,14 @@ impl Backend for PostgresBackend {
             .map_err(|e| Error::Backend(format!("delete trace_llm_calls: {e}")))?
         };
 
-        // Step 3: delete trace_events rows.
+        // Step 3: delete trace_events rows. Same key-scope filter as
+        // step 1 — both must agree, else step 2 could cascade
+        // delete LLM calls for trace_events rows step 3 leaves alive.
         let trace_events_deleted = tx
             .execute(
-                "DELETE FROM cirislens.trace_events WHERE agent_id_hash = $1",
-                &[&agent_id_hash],
+                "DELETE FROM cirislens.trace_events \
+                 WHERE agent_id_hash = $1 AND signing_key_id = $2",
+                &[&agent_id_hash, &signature_key_id],
             )
             .await
             .map_err(|e| Error::Backend(format!("delete trace_events: {e}")))?;
@@ -716,11 +724,14 @@ impl Backend for PostgresBackend {
         let mut federation_revocations_deleted = 0u64;
 
         if include_federation_key {
+            // Per-key federation_keys cascade: the single key_id
+            // matching (agent_id_hash, signature_key_id). The agent's
+            // other registered keys stay alive.
             let target_key_ids: Vec<String> = tx
                 .query(
                     "SELECT key_id FROM cirislens.federation_keys \
-                     WHERE identity_type = 'agent' AND identity_ref = $1",
-                    &[&agent_id_hash],
+                     WHERE identity_type = 'agent' AND identity_ref = $1 AND key_id = $2",
+                    &[&agent_id_hash, &signature_key_id],
                 )
                 .await
                 .map_err(|e| Error::Backend(format!("collect target_key_ids: {e}")))?

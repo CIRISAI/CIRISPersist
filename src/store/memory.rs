@@ -185,21 +185,26 @@ impl Backend for MemoryBackend {
     async fn delete_traces_for_agent(
         &self,
         agent_id_hash: &str,
+        signature_key_id: &str,
         include_federation_key: bool,
     ) -> Result<super::types::DeleteSummary, Error> {
         let mut state = self.state.lock().expect("memory backend lock");
-        // Step 1: collect trace_ids of the agent's events.
+        // Per-key DSAR scope: both agent_id_hash AND signing_key_id
+        // must match. trace_llm_calls cascade joins by trace_id
+        // (V001 schema — LLM call rows don't carry either field).
+        let row_matches = |row: &TraceEventRow| -> bool {
+            row.agent_id_hash == agent_id_hash && row.signing_key_id == signature_key_id
+        };
+
         let target_trace_ids: HashSet<String> = state
             .events
             .values()
-            .filter(|(_, row)| row.agent_id_hash == agent_id_hash)
+            .filter(|(_, row)| row_matches(row))
             .map(|(_, row)| row.trace_id.clone())
             .collect();
 
         let trace_events_before = state.events.len();
-        state
-            .events
-            .retain(|_, (_, row)| row.agent_id_hash != agent_id_hash);
+        state.events.retain(|_, (_, row)| !row_matches(row));
         let trace_events_deleted = (trace_events_before - state.events.len()) as u64;
 
         let llm_calls_before = state.llm_calls.len();
@@ -216,10 +221,18 @@ impl Backend for MemoryBackend {
             // Find every key_id where identity_type='agent' AND
             // identity_ref=agent_id_hash. May be multiple if the agent
             // rotated keys.
+            // Per-key federation_keys cascade: the single key_id
+            // matching (agent_id_hash, signature_key_id). The agent's
+            // other registered keys stay alive — DSAR can only revoke
+            // the key it was signed with.
             let target_key_ids: HashSet<String> = state
                 .federation_keys
                 .values()
-                .filter(|rec| rec.identity_type == "agent" && rec.identity_ref == agent_id_hash)
+                .filter(|rec| {
+                    rec.identity_type == "agent"
+                        && rec.identity_ref == agent_id_hash
+                        && rec.key_id == signature_key_id
+                })
                 .map(|rec| rec.key_id.clone())
                 .collect();
 
@@ -1309,103 +1322,156 @@ mod tests {
         }
     }
 
-    /// v0.3.5 (CIRISLens#8 ASK 1) — DSAR primitive deletes the agent's
-    /// trace_events + trace_llm_calls atomically. Returns the row
-    /// counts for the lens-side audit ledger. Idempotent.
-    #[tokio::test]
-    async fn dsar_deletes_trace_data_for_agent() {
-        use crate::store::Backend;
-        let backend = MemoryBackend::new();
-        // Insert traces for two agents; only one is the DSAR target.
-        let target_aih = "agent-target-hash";
-        let other_aih = "agent-other-hash";
-        for (aih, trace_suffix) in &[(target_aih, "t1"), (target_aih, "t2"), (other_aih, "o1")] {
-            let row = TraceEventRow {
-                trace_id: format!("trace-{trace_suffix}"),
-                thought_id: format!("th-{trace_suffix}"),
-                task_id: None,
-                step_point: None,
-                event_type: ReasoningEventType::ThoughtStart,
-                attempt_index: 0,
-                ts: "2026-04-30T00:00:00Z".parse().unwrap(),
-                agent_name: None,
-                agent_id_hash: (*aih).to_owned(),
-                cognitive_state: None,
-                trace_level: TraceLevel::Generic,
-                payload: serde_json::Map::new(),
-                cost_llm_calls: None,
-                cost_tokens: None,
-                cost_usd: None,
-                signature: "AAAA".into(),
-                signing_key_id: "k".into(),
-                signature_verified: true,
-                schema_version: "2.7.0".into(),
-                pii_scrubbed: false,
-                original_content_hash: None,
-                scrub_signature: None,
-                scrub_key_id: None,
-                scrub_timestamp: None,
-                agent_role: None,
-                agent_template: None,
-                deployment_domain: None,
-                deployment_type: None,
-                deployment_region: None,
-                deployment_trust_mode: None,
-            };
-            backend.insert_trace_events_batch(&[row]).await.unwrap();
-        }
-        // Add an LLM call for the target's trace t1.
-        let llm = TraceLlmCallRow {
-            trace_id: "trace-t1".into(),
-            thought_id: "th-t1".into(),
+    /// v0.3.6 (CIRISPersist#15) — Helper: insert a trace_events row
+    /// scoped to (agent_id_hash, signing_key_id). Returns the
+    /// trace_id used so the caller can pair an LLM call.
+    fn dsar_fixture_row(
+        agent_id_hash: &str,
+        signing_key_id: &str,
+        trace_suffix: &str,
+    ) -> TraceEventRow {
+        TraceEventRow {
+            trace_id: format!("trace-{trace_suffix}"),
+            thought_id: format!("th-{trace_suffix}"),
             task_id: None,
-            parent_event_id: None,
-            parent_event_type: ReasoningEventType::ThoughtStart,
-            parent_attempt_index: 0,
+            step_point: None,
+            event_type: ReasoningEventType::ThoughtStart,
             attempt_index: 0,
             ts: "2026-04-30T00:00:00Z".parse().unwrap(),
-            duration_ms: 0.0,
-            handler_name: "h".into(),
-            service_name: "s".into(),
-            model: None,
-            base_url: None,
-            response_model: None,
-            prompt_tokens: None,
-            completion_tokens: None,
-            prompt_bytes: None,
-            completion_bytes: None,
+            agent_name: None,
+            agent_id_hash: agent_id_hash.to_owned(),
+            cognitive_state: None,
+            trace_level: TraceLevel::Generic,
+            payload: serde_json::Map::new(),
+            cost_llm_calls: None,
+            cost_tokens: None,
             cost_usd: None,
-            status: crate::schema::LlmCallStatus::Ok,
-            error_class: None,
-            attempt_count: None,
-            retry_count: None,
-            prompt_hash: None,
-            prompt: None,
-            response_text: None,
-        };
-        backend.insert_trace_llm_calls_batch(&[llm]).await.unwrap();
+            signature: "AAAA".into(),
+            signing_key_id: signing_key_id.to_owned(),
+            signature_verified: true,
+            schema_version: "2.7.0".into(),
+            pii_scrubbed: false,
+            original_content_hash: None,
+            scrub_signature: None,
+            scrub_key_id: None,
+            scrub_timestamp: None,
+            agent_role: None,
+            agent_template: None,
+            deployment_domain: None,
+            deployment_type: None,
+            deployment_region: None,
+            deployment_trust_mode: None,
+        }
+    }
 
-        // First DSAR: deletes the target's 2 events + 1 llm call.
+    /// v0.3.6 (CIRISPersist#15) — Per-key DSAR scope: deletion is
+    /// scoped to (agent_id_hash, signing_key_id). Traces signed under
+    /// other keys for the same agent stay alive — the per-key
+    /// authorization model means the DSAR can only delete what its
+    /// signing key signed.
+    #[tokio::test]
+    async fn dsar_per_key_scopes_correctly() {
+        use crate::store::Backend;
+        let backend = MemoryBackend::new();
+        // Same agent_id_hash, two different signing keys (key1 + key2).
+        // Plus a different agent's row (other) under the same key1.
+        backend
+            .insert_trace_events_batch(&[
+                dsar_fixture_row("agent-A", "key1", "k1-t1"),
+                dsar_fixture_row("agent-A", "key1", "k1-t2"),
+                dsar_fixture_row("agent-A", "key2", "k2-t1"),
+                dsar_fixture_row("agent-B", "key1", "B-t1"),
+            ])
+            .await
+            .unwrap();
+
+        // DSAR for (agent-A, key1) — deletes only the 2 key1 rows.
         let summary = backend
-            .delete_traces_for_agent(target_aih, false)
+            .delete_traces_for_agent("agent-A", "key1", false)
             .await
             .unwrap();
         assert_eq!(summary.trace_events_deleted, 2);
-        assert_eq!(summary.trace_llm_calls_deleted, 1);
         assert_eq!(summary.federation_keys_deleted, 0);
 
-        // Other agent's row is untouched.
+        // Surviving rows: agent-A's key2 row + agent-B's key1 row.
         let remaining = backend.snapshot_events();
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].agent_id_hash, other_aih);
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining
+            .iter()
+            .any(|r| r.agent_id_hash == "agent-A" && r.signing_key_id == "key2"));
+        assert!(remaining
+            .iter()
+            .any(|r| r.agent_id_hash == "agent-B" && r.signing_key_id == "key1"));
 
-        // Idempotent: re-invocation returns all-zero.
+        // Idempotent: re-invocation on the now-deleted scope returns 0.
         let summary2 = backend
-            .delete_traces_for_agent(target_aih, false)
+            .delete_traces_for_agent("agent-A", "key1", false)
             .await
             .unwrap();
         assert_eq!(summary2.trace_events_deleted, 0);
-        assert_eq!(summary2.trace_llm_calls_deleted, 0);
+    }
+
+    /// v0.3.6 (CIRISPersist#15) — Per-key cascade through trace_llm_calls.
+    /// LLM call rows joined by trace_id only cascade for the targeted
+    /// key's traces. Cross-key LLM calls survive.
+    #[tokio::test]
+    async fn dsar_per_key_cascades_llm_calls() {
+        use crate::store::Backend;
+        let backend = MemoryBackend::new();
+        backend
+            .insert_trace_events_batch(&[
+                dsar_fixture_row("agent-A", "key1", "k1-t1"),
+                dsar_fixture_row("agent-A", "key2", "k2-t1"),
+            ])
+            .await
+            .unwrap();
+        // One LLM call per trace.
+        for trace_id in ["trace-k1-t1", "trace-k2-t1"] {
+            backend
+                .insert_trace_llm_calls_batch(&[TraceLlmCallRow {
+                    trace_id: trace_id.into(),
+                    thought_id: "th".into(),
+                    task_id: None,
+                    parent_event_id: None,
+                    parent_event_type: ReasoningEventType::ThoughtStart,
+                    parent_attempt_index: 0,
+                    attempt_index: 0,
+                    ts: "2026-04-30T00:00:00Z".parse().unwrap(),
+                    duration_ms: 0.0,
+                    handler_name: "h".into(),
+                    service_name: "s".into(),
+                    model: None,
+                    base_url: None,
+                    response_model: None,
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    prompt_bytes: None,
+                    completion_bytes: None,
+                    cost_usd: None,
+                    status: crate::schema::LlmCallStatus::Ok,
+                    error_class: None,
+                    attempt_count: None,
+                    retry_count: None,
+                    prompt_hash: None,
+                    prompt: None,
+                    response_text: None,
+                }])
+                .await
+                .unwrap();
+        }
+
+        // DSAR for (agent-A, key1) — cascades only the key1 LLM call.
+        let summary = backend
+            .delete_traces_for_agent("agent-A", "key1", false)
+            .await
+            .unwrap();
+        assert_eq!(summary.trace_events_deleted, 1);
+        assert_eq!(summary.trace_llm_calls_deleted, 1);
+
+        // The key2 LLM call survives.
+        let remaining = backend.snapshot_llm_calls();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].trace_id, "trace-k2-t1");
     }
 
     /// v0.3.5 (CIRISLens#8 ASK 3) — fetch_trace_events_page returns
