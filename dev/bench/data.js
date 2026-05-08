@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778263212166,
+  "lastUpdate": 1778263699029,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -6437,6 +6437,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25913871,
             "range": "± 660361",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "ef1ed0ac362e03b21c99ac5ae6940f64e18eed36",
+          "message": "0.4.4 — CI hygiene patch + pre-commit/pre-push hooks + bump script\n\nCI regressions on v0.4.3 (commit 826c142) didn't surface locally:\n\n1. server::tests::health_endpoint_returns_supported_versions asserted\n   vec![\"2.7.0\", \"2.7.9\"] against the v0.3.x-era hardcoded list.\n   v0.4.3's #21 work added \"2.7.legacy\" to SUPPORTED_VERSIONS without\n   updating this test. Fixed.\n2. cargo fmt --check flagged formatting drift in 4 files (introduced\n   during v0.4.3 work without a follow-up cargo fmt). Fixed via\n   cargo fmt --all.\n\nNo behavioral change. Functionality identical to v0.4.3.\n\nProcess additions to prevent this regression class:\n\n- scripts/hooks/pre-commit — runs cargo fmt --check + cargo clippy\n  (full features, all targets, -D warnings) before every commit.\n  Matches CI's strictest job; ~10s vs the 5+ min CI round-trip.\n- scripts/hooks/pre-push — runs cargo test --lib (server + pyo3\n  features) against the pushed range. Skips pushes that don't touch\n  Rust.\n- scripts/install-hooks.sh — symlinks hooks into .git/hooks/.\n  Idempotent; backs up pre-existing hooks. Run once after fresh\n  clone.\n- scripts/bump_version.sh <X.Y.Z> — bumps Cargo.toml [package].version,\n  prepends a dated CHANGELOG entry skeleton, refreshes Cargo.lock\n  via cargo check. Idempotent.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-08T13:01:29-05:00",
+          "tree_id": "5fc00d5c5cac7b5889c2a36cfd628f528a02863e",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/ef1ed0ac362e03b21c99ac5ae6940f64e18eed36"
+        },
+        "date": 1778263698446,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101347,
+            "range": "± 271",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 241905,
+            "range": "± 814",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 522937,
+            "range": "± 3201",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1850474,
+            "range": "± 19246",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 378,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1540,
+            "range": "± 69",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8681,
+            "range": "± 24",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 369,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3037,
+            "range": "± 38",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9396,
+            "range": "± 51",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41597,
+            "range": "± 183",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 621,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2159662,
+            "range": "± 37236",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6513615,
+            "range": "± 50195",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23568918,
+            "range": "± 343702",
             "unit": "ns/iter"
           }
         ]
