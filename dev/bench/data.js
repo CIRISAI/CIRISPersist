@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777847936644,
+  "lastUpdate": 1778263212166,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -6323,6 +6323,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23681042,
             "range": "± 217014",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "826c142d1ce4988d7772141f5b381b7e2e54784f",
+          "message": "0.4.3 — lens-derived schemas + 2.7.legacy restoration (CIRISPersist#18 + #21)\n\nTwo issues, one release. Both close federation-coordination work:\n#18 unblocks CIRISLensCore Phase 1 P0 ASKs + RATCHET projection-v1\npublication; #21 fixes a v0.4.0 regression that left pre-2.7.8.9\nfederation peers unable to federate.\n\nCIRISPersist#18 — cirislens_derived schemas\n- V008 migration: cirislens_derived.{detection_events, calibration_bundles}.\n  Hybrid-sig CHECK constraints (Ed25519 = 64 bytes, ML-DSA-65 = 3309\n  bytes per FIPS 204 final). Partial-unique index for atomic is_current\n  flip on calibration bundles.\n- src/derived/ module: DerivedSchema trait + 5 methods\n  (put_detection_event, get_detection_events, put_calibration_bundle,\n  get_current_calibration_bundle, get_calibration_bundle_by_version).\n  Full Postgres impl; NotImplemented stubs on Memory + SQLite.\n- Engine PyO3 surface verifies hybrid sigs via\n  verify_hybrid_via_directory under HybridPolicy::Strict before\n  backend write — both signatures must verify; no fallback.\n  CIRISPersist#7 single-source-of-truth: canonical_bytes runs through\n  persist::prelude::canonicalize_envelope_for_signing only.\n\nCIRISPersist#21 — restore 2.7.legacy under telemetry-driven sunset\n- SUPPORTED_VERSIONS now [\"2.7.0\", \"2.7.9\", \"2.7.legacy\"].\n- BatchEnvelope.trace_schema_version + CompleteTrace.trace_schema_version\n  get serde-default = \"2.7.legacy\". Pre-2.7.8.9 agents stamped no\n  version field at all (the field landed in CIRISAgent commit 431b0e0ae\n  alongside the 9-field cutover); absence is now the deterministic\n  signal for the 2-field canonical — NOT a try-list fallback.\n- Telemetry: tracing::info!(target: \"federation_canonical_match\",\n  wire = ..., trace_id = ...) per verify dispatch. Operator log\n  aggregation tallies wire = \"<dialect>\" emissions for the 7-day\n  zero-traffic sunset rule.\n\nTests: 175/175 lib tests pass. New tests:\n- absence_routes_to_legacy: round-trips a wire with NO\n  trace_schema_version through verify; asserts default kicks in,\n  is_supported accepts, dispatch routes to 2-field canonical, sig\n  verifies.\n- 4 Postgres integration tests for derived schemas (round-trip,\n  conflict-on-different-content, atomic is_current flip, signature\n  length validation).\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-08T12:49:12-05:00",
+          "tree_id": "ca97b21784a9a0fc5b13f310c8a2d92d257e5df9",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/826c142d1ce4988d7772141f5b381b7e2e54784f"
+        },
+        "date": 1778263211575,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 109374,
+            "range": "± 855",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 260653,
+            "range": "± 1565",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 561930,
+            "range": "± 11847",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1995251,
+            "range": "± 41702",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 341,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1452,
+            "range": "± 31",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8309,
+            "range": "± 18",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 350,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3027,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9618,
+            "range": "± 26",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41611,
+            "range": "± 425",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2242998,
+            "range": "± 89708",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7052307,
+            "range": "± 635049",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25913871,
+            "range": "± 660361",
             "unit": "ns/iter"
           }
         ]
