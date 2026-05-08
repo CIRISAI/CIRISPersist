@@ -226,7 +226,12 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let h: HealthOwned = serde_json::from_slice(&body).unwrap();
         assert_eq!(h.status, "ok");
-        assert_eq!(h.schema_versions_supported, vec!["2.7.0", "2.7.9"]);
+        // v0.4.3 (CIRISPersist#21) — 2.7.legacy restored under the
+        // telemetry-driven sunset rule.
+        assert_eq!(
+            h.schema_versions_supported,
+            vec!["2.7.0", "2.7.9", "2.7.legacy"]
+        );
         assert!(h.queue_capacity_remaining > 0);
     }
 

@@ -5,6 +5,48 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.4.4] — 2026-05-08
+
+**CI hygiene patch on top of v0.4.3.** v0.4.3 (commit 826c142) shipped
+two CI regressions that didn't surface locally:
+
+1. `server::tests::health_endpoint_returns_supported_versions` asserted
+   `vec!["2.7.0", "2.7.9"]` against the v0.3.x-era hardcoded list.
+   v0.4.3's #21 work added `"2.7.legacy"` to `SUPPORTED_VERSIONS`
+   without updating this test. Fixed.
+2. `cargo fmt --check` flagged formatting drift in 4 files (introduced
+   during the v0.4.3 work without a follow-up `cargo fmt`). Fixed.
+
+No behavioral change. Functionality is identical to v0.4.3.
+
+### Process: pre-commit + pre-push hooks (`scripts/hooks/`)
+
+To prevent this regression class, this release adds:
+
+- `scripts/hooks/pre-commit` — runs `cargo fmt --check` and
+  `cargo clippy --features postgres,pyo3,server,sqlite,tls
+  --all-targets -- -D warnings` (the strictest CI matrix job)
+  before every commit. Skips when no Rust files staged.
+- `scripts/hooks/pre-push` — runs `cargo test --features
+  postgres,pyo3,server --lib` against the pushed range. Skips
+  pushes that don't touch Rust.
+- `scripts/install-hooks.sh` — symlinks both into `.git/hooks/`.
+  Idempotent; backs up any pre-existing hooks. Run once after
+  fresh clone.
+
+Bypass (not for routine use): `git commit --no-verify` /
+`git push --no-verify`. The hooks match the CI checks exactly so
+running them locally costs ~10s vs. the 5+ minute CI round-trip
+that v0.4.3 wasted.
+
+### Process: `scripts/bump_version.sh`
+
+Companion: `./scripts/bump_version.sh <new_version>` bumps
+`[package].version` in Cargo.toml, prepends a dated CHANGELOG
+entry skeleton, and refreshes Cargo.lock via `cargo check`.
+Idempotent — re-running with the same version is a no-op on
+Cargo.toml but adds the CHANGELOG entry if missing.
+
 ## [0.4.3] — 2026-05-08
 
 **Lens-derived schemas + 2.7.legacy restoration.** Two issues, one

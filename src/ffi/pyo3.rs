@@ -2346,11 +2346,7 @@ impl PyEngine {
     /// `EventFilter` (`{"trace_id": ?, "detector": ?, "since": ?}`;
     /// any field may be null/absent). Returns a JSON array string
     /// of `DetectionEvent` objects, ordered by `ts DESC`.
-    fn get_detection_events(
-        &self,
-        py: Python<'_>,
-        filter_json: Option<&str>,
-    ) -> PyResult<String> {
+    fn get_detection_events(&self, py: Python<'_>, filter_json: Option<&str>) -> PyResult<String> {
         let backend = self.backend.clone();
         let runtime = self.runtime.clone();
         let filter: crate::derived::EventFilter = match filter_json {
@@ -2362,9 +2358,8 @@ impl PyEngine {
                     detector: Option<String>,
                     since: Option<chrono::DateTime<chrono::Utc>>,
                 }
-                let parsed: EventFilterJson = serde_json::from_str(s).map_err(|e| {
-                    PyValueError::new_err(format!("EventFilter JSON decode: {e}"))
-                })?;
+                let parsed: EventFilterJson = serde_json::from_str(s)
+                    .map_err(|e| PyValueError::new_err(format!("EventFilter JSON decode: {e}")))?;
                 crate::derived::EventFilter {
                     trace_id: parsed.trace_id,
                     detector: parsed.detector,
@@ -2397,9 +2392,7 @@ impl PyEngine {
         let backend = self.backend.clone();
         let runtime = self.runtime.clone();
         let bundle: crate::derived::CalibrationBundle = serde_json::from_str(bundle_json)
-            .map_err(|e| {
-                PyValueError::new_err(format!("CalibrationBundle JSON decode: {e}"))
-            })?;
+            .map_err(|e| PyValueError::new_err(format!("CalibrationBundle JSON decode: {e}")))?;
 
         let canonical_for_verify = bundle.canonical_bytes.clone();
         let signing_key_id = bundle.signing_key_id.clone();

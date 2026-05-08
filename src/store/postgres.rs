@@ -2330,9 +2330,7 @@ impl crate::derived::DerivedSchema for PostgresBackend {
                 ],
             )
             .await
-            .map_err(|e| {
-                crate::derived::Error::Backend(format!("insert detection_events: {e}"))
-            })?;
+            .map_err(|e| crate::derived::Error::Backend(format!("insert detection_events: {e}")))?;
 
         if result == 0 {
             let existing: Option<Vec<u8>> = client
@@ -2342,9 +2340,7 @@ impl crate::derived::DerivedSchema for PostgresBackend {
                     &[&event.detection_id],
                 )
                 .await
-                .map_err(|e| {
-                    crate::derived::Error::Backend(format!("conflict check: {e}"))
-                })?
+                .map_err(|e| crate::derived::Error::Backend(format!("conflict check: {e}")))?
                 .map(|r| r.get(0));
             if let Some(existing_bytes) = existing {
                 if existing_bytes != event.canonical_bytes {
@@ -2398,9 +2394,7 @@ impl crate::derived::DerivedSchema for PostgresBackend {
         let rows = client
             .query(&query, &params_ref[..])
             .await
-            .map_err(|e| {
-                crate::derived::Error::Backend(format!("select detection_events: {e}"))
-            })?;
+            .map_err(|e| crate::derived::Error::Backend(format!("select detection_events: {e}")))?;
 
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
@@ -2419,14 +2413,12 @@ impl crate::derived::DerivedSchema for PostgresBackend {
                     },
                 )?,
                 cohort_cell: r.get(5),
-                conformity_variant: crate::derived::ConformityVariant::from_db_str(
-                    &conformity_db,
-                )
-                .ok_or_else(|| {
-                    crate::derived::Error::Backend(format!(
-                        "unknown conformity_variant in DB: {conformity_db}"
-                    ))
-                })?,
+                conformity_variant: crate::derived::ConformityVariant::from_db_str(&conformity_db)
+                    .ok_or_else(|| {
+                        crate::derived::Error::Backend(format!(
+                            "unknown conformity_variant in DB: {conformity_db}"
+                        ))
+                    })?,
                 conformity_payload: r.get(7),
                 lens_core_version: r.get(8),
                 ratchet_calibration_version: r.get(9),
@@ -2480,9 +2472,7 @@ impl crate::derived::DerivedSchema for PostgresBackend {
                 &[],
             )
             .await
-            .map_err(|e| {
-                crate::derived::Error::Backend(format!("clear prior current: {e}"))
-            })?;
+            .map_err(|e| crate::derived::Error::Backend(format!("clear prior current: {e}")))?;
         }
 
         let result = tx
@@ -2527,9 +2517,7 @@ impl crate::derived::DerivedSchema for PostgresBackend {
                     &[&bundle.ratchet_calibration_version],
                 )
                 .await
-                .map_err(|e| {
-                    crate::derived::Error::Backend(format!("conflict check: {e}"))
-                })?
+                .map_err(|e| crate::derived::Error::Backend(format!("conflict check: {e}")))?
                 .map(|r| r.get(0));
             if let Some(existing_bytes) = existing {
                 if existing_bytes != bundle.canonical_bytes {
@@ -2566,9 +2554,7 @@ impl crate::derived::DerivedSchema for PostgresBackend {
                 &[],
             )
             .await
-            .map_err(|e| {
-                crate::derived::Error::Backend(format!("select current bundle: {e}"))
-            })?;
+            .map_err(|e| crate::derived::Error::Backend(format!("select current bundle: {e}")))?;
         Ok(row_opt.map(row_to_calibration_bundle))
     }
 
@@ -2796,9 +2782,7 @@ mod tests {
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
 
-        use crate::derived::{
-            ConformityVariant, DerivedSchema, DetectionEvent, DetectionSeverity,
-        };
+        use crate::derived::{ConformityVariant, DerivedSchema, DetectionEvent, DetectionSeverity};
         let did = uuid::Uuid::new_v4();
         let event_a = DetectionEvent {
             detection_id: did,
@@ -2864,7 +2848,10 @@ mod tests {
             signing_key_id: "ratchet-steward:1".into(),
             inserted_at: chrono::Utc::now(),
         };
-        backend.put_calibration_bundle(bundle_v1.clone()).await.unwrap();
+        backend
+            .put_calibration_bundle(bundle_v1.clone())
+            .await
+            .unwrap();
 
         let current = backend
             .get_current_calibration_bundle()
@@ -2911,9 +2898,7 @@ mod tests {
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
 
-        use crate::derived::{
-            ConformityVariant, DerivedSchema, DetectionEvent, DetectionSeverity,
-        };
+        use crate::derived::{ConformityVariant, DerivedSchema, DetectionEvent, DetectionSeverity};
         let bad = DetectionEvent {
             detection_id: uuid::Uuid::new_v4(),
             trace_id: "t".into(),

@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# pre-commit hook for CIRISPersist.
+#
+# Runs the FAST CI checks (fmt + clippy) so we never push code that
+# clippy or rustfmt rejects. Tests are gated on pre-push (slower).
+#
+# Installed by `./scripts/install-hooks.sh`. To run manually:
+#   ./scripts/hooks/pre-commit
+#
+# To bypass in an emergency (NOT for routine work):
+#   git commit --no-verify
+# Don't make a habit of it — bypassing means CI catches it instead,
+# which loses you 5+ minutes per round trip vs. the 10s this hook costs.
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+# Tracked-but-staged-only check: if there's nothing in the index
+# (`git diff --cached --quiet` exits 0), don't run anything.
+if git diff --cached --quiet; then
+    exit 0
+fi
+
+# Only run if Rust files changed. Bench-only / changelog-only /
+# migration-only / docs-only commits skip the full Rust gate.
+if ! git diff --cached --name-only | grep -qE '\.rs$|^Cargo\.(toml|lock)$'; then
+    exit 0
+fi
+
+echo "─── pre-commit: cargo fmt --check ───"
+if ! cargo fmt --all --check; then
+    echo
+    echo "✗ rustfmt found unformatted files. Run \`cargo fmt --all\` and re-stage." >&2
+    exit 1
+fi
+
+echo "─── pre-commit: cargo clippy (full features, all targets) ───"
+# Match the CI matrix's strictest job: full features + all targets +
+# -D warnings. Slower than `cargo clippy` alone but matches what CI
+# rejects, so we catch the regression here instead of on the runner.
+if ! cargo clippy \
+        --features postgres,pyo3,server,sqlite,tls \
+        --all-targets \
+        -- -D warnings; then
+    echo
+    echo "✗ clippy found warnings. Fix them; re-stage; re-commit." >&2
+    exit 1
+fi
+
+echo "✓ pre-commit checks passed"

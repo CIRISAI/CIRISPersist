@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# pre-push hook for CIRISPersist.
+#
+# Runs the SLOWER test gate before push. Pre-commit handles fmt +
+# clippy; pre-push runs `cargo test --lib` so we don't push code
+# that's broken at the unit level.
+#
+# Postgres + maturin integration tests still run only in CI (they
+# need TimescaleDB containers + cross-platform builds).
+#
+# Installed by `./scripts/install-hooks.sh`.
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+# Skip if we're pushing to a branch that hasn't changed any Rust
+# files since main — pre-push gets called even for tag pushes that
+# don't touch code on top of an already-tested commit.
+#
+# Heuristic: read the refs being pushed from stdin (git pre-push
+# protocol — `<local_ref> <local_sha> <remote_ref> <remote_sha>` per
+# line). If every local_sha is already an ancestor of an existing
+# remote ref or a tag pointing at code already on main, skip.
+RANGES=()
+while read -r local_ref local_sha remote_ref remote_sha; do
+    if [ "$local_sha" = "0000000000000000000000000000000000000000" ]; then
+        # Deletion; nothing to test.
+        continue
+    fi
+    if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
+        # New ref; test the full local_sha tip.
+        RANGES+=("$local_sha")
+    else
+        # Update; test the new range.
+        RANGES+=("$remote_sha..$local_sha")
+    fi
+done
+
+if [ ${#RANGES[@]} -eq 0 ]; then
+    exit 0
+fi
+
+# Did any *.rs / Cargo.* files change in the pushed range(s)?
+RUST_TOUCHED=0
+for r in "${RANGES[@]}"; do
+    if git diff --name-only "$r" 2>/dev/null | grep -qE '\.rs$|^Cargo\.(toml|lock)$'; then
+        RUST_TOUCHED=1
+        break
+    fi
+done
+
+if [ $RUST_TOUCHED -eq 0 ]; then
+    echo "─── pre-push: no Rust files in pushed range; skipping tests ───"
+    exit 0
+fi
+
+echo "─── pre-push: cargo test --lib (server + pyo3 features) ───"
+if ! cargo test --features postgres,pyo3,server --lib --quiet 2>&1 | tail -10; then
+    echo
+    echo "✗ tests failing. Fix them locally before pushing." >&2
+    echo "  Bypass (NOT for routine use): git push --no-verify" >&2
+    exit 1
+fi
+
+echo "✓ pre-push tests passed"

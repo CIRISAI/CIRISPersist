@@ -806,11 +806,10 @@ mod tests {
                 .contains_key("trace_schema_version"),
             "field should be absent on pre-2.7.8.9 wire"
         );
-        let pre_vstamp_trace: CompleteTrace =
-            serde_json::from_value(json_value).expect(
-                "pre-2.7.8.9 wire (no trace_schema_version) MUST deserialize \
+        let pre_vstamp_trace: CompleteTrace = serde_json::from_value(json_value).expect(
+            "pre-2.7.8.9 wire (no trace_schema_version) MUST deserialize \
                  — serde-default routes absence to \"2.7.legacy\"",
-            );
+        );
 
         // Confirm the default kicked in.
         assert_eq!(
