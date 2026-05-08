@@ -1084,6 +1084,54 @@ impl IsNoneOrZero for Option<i64> {
     }
 }
 
+// ─── DerivedSchema impl (v0.4.3, CIRISPersist#18) ──────────────────
+//
+// Memory backend stub — sovereign-mode Pi-class deployments without
+// lens-core / RATCHET don't need the substrate, so the put paths
+// return NotImplemented. The get paths return empty results so
+// callers that probe (e.g. lens-core's startup load) get a clean
+// "no current bundle" rather than an error.
+
+impl crate::derived::DerivedSchema for MemoryBackend {
+    async fn put_detection_event(
+        &self,
+        _event: crate::derived::DetectionEvent,
+    ) -> Result<(), crate::derived::Error> {
+        Err(crate::derived::Error::NotImplemented(
+            "put_detection_event (memory backend; use postgres for federation evidence)",
+        ))
+    }
+
+    async fn get_detection_events(
+        &self,
+        _filter: crate::derived::EventFilter,
+    ) -> Result<Vec<crate::derived::DetectionEvent>, crate::derived::Error> {
+        Ok(Vec::new())
+    }
+
+    async fn put_calibration_bundle(
+        &self,
+        _bundle: crate::derived::CalibrationBundle,
+    ) -> Result<(), crate::derived::Error> {
+        Err(crate::derived::Error::NotImplemented(
+            "put_calibration_bundle (memory backend; use postgres for federation evidence)",
+        ))
+    }
+
+    async fn get_current_calibration_bundle(
+        &self,
+    ) -> Result<Option<crate::derived::CalibrationBundle>, crate::derived::Error> {
+        Ok(None)
+    }
+
+    async fn get_calibration_bundle_by_version(
+        &self,
+        _version: i32,
+    ) -> Result<Option<crate::derived::CalibrationBundle>, crate::derived::Error> {
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

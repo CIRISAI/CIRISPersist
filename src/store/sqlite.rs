@@ -2265,6 +2265,54 @@ fn sqlite_row_to_revocation(
     })
 }
 
+// ─── DerivedSchema impl (v0.4.3, CIRISPersist#18) ──────────────────
+//
+// SQLite backend stub — same shape as memory.rs. Sovereign-mode
+// Pi-class deployments use SQLite primarily; if those deployments
+// later want lens-derived schemas, this is the impl site. Until
+// then, the put paths return NotImplemented and the get paths
+// return empty results.
+
+impl crate::derived::DerivedSchema for SqliteBackend {
+    async fn put_detection_event(
+        &self,
+        _event: crate::derived::DetectionEvent,
+    ) -> Result<(), crate::derived::Error> {
+        Err(crate::derived::Error::NotImplemented(
+            "put_detection_event (sqlite backend; use postgres for federation evidence)",
+        ))
+    }
+
+    async fn get_detection_events(
+        &self,
+        _filter: crate::derived::EventFilter,
+    ) -> Result<Vec<crate::derived::DetectionEvent>, crate::derived::Error> {
+        Ok(Vec::new())
+    }
+
+    async fn put_calibration_bundle(
+        &self,
+        _bundle: crate::derived::CalibrationBundle,
+    ) -> Result<(), crate::derived::Error> {
+        Err(crate::derived::Error::NotImplemented(
+            "put_calibration_bundle (sqlite backend; use postgres for federation evidence)",
+        ))
+    }
+
+    async fn get_current_calibration_bundle(
+        &self,
+    ) -> Result<Option<crate::derived::CalibrationBundle>, crate::derived::Error> {
+        Ok(None)
+    }
+
+    async fn get_calibration_bundle_by_version(
+        &self,
+        _version: i32,
+    ) -> Result<Option<crate::derived::CalibrationBundle>, crate::derived::Error> {
+        Ok(None)
+    }
+}
+
 // ─── Tests ─────────────────────────────────────────────────────────
 
 #[cfg(test)]

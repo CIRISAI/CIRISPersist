@@ -117,6 +117,15 @@ pub struct BatchEnvelope {
     /// Privacy / bandwidth tier this batch was emitted at.
     pub trace_level: TraceLevel,
     /// Wire-format schema version (gated by [`super::version::SUPPORTED_VERSIONS`]).
+    ///
+    /// v0.4.3 (CIRISPersist#21): absent in pre-2.7.8.9 envelopes
+    /// (the field landed in agent commit 431b0e0ae alongside the
+    /// 9-field cutover). Absence deserializes to `"2.7.legacy"` —
+    /// deterministic dispatch, NOT a try-list fallback. The
+    /// `is_supported` gate accepts `"2.7.legacy"` and the verify
+    /// dispatch routes it to
+    /// [`crate::verify::canonical_payload_value_legacy`].
+    #[serde(default = "super::version::default_legacy_schema_version")]
     pub trace_schema_version: SchemaVersion,
 
     /// Optional correlation metadata; populated only when the agent

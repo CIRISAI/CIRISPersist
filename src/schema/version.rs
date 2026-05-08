@@ -33,14 +33,34 @@ use serde::{Deserialize, Serialize};
 /// even if present on the wire — only the envelope `agent_id_hash`
 /// is authoritative at 2.7.0.
 ///
-/// Sunset markers — telemetry-driven, not date-committed:
-///   - Drop "2.7.0" once `federation_canonical_match_total{wire="2.7.0"}`
-///     stays at zero through a soak window.
-///   - Reserved sentinel `"2.7.legacy"` for the pre-2.7.8.9 2-field
-///     `{components, trace_level}` shape — accepted only via
-///     explicit version opt-in, never silent fallback for
-///     unrecognized versions.
-pub const SUPPORTED_VERSIONS: &[&str] = &["2.7.0", "2.7.9"];
+/// Sunset markers — telemetry-driven, not date-committed (CIRIS is
+/// decentralized; peers run whichever protocol versions they run;
+/// sunset is empirical, not calendar-flag-gated). All three dialects
+/// follow the SAME rule:
+///
+///   - Drop `"2.7.0"`      once `federation_canonical_match_total{wire="2.7.0"}`
+///     stays at zero through a 7-day soak window.
+///   - Drop `"2.7.legacy"` once `federation_canonical_match_total{wire="2.7.legacy"}`
+///     stays at zero through a 7-day soak window. (Restored as a
+///     supported dialect in v0.4.3 / CIRISPersist#21 — v0.4.0
+///     dropped it on a calendar/fleet-migration framing that didn't
+///     fit the decentralized model.)
+///   - `"2.7.9"` is the current fleet target; no sunset clock running.
+///
+/// `"2.7.legacy"` covers the pre-2.7.8.9 2-field
+/// `{components, trace_level}` canonical shape (no
+/// `trace_schema_version` field, no per-component `agent_id_hash`).
+/// Pre-2.7.8.9 agents stamped no version field at all (the field
+/// landed in agent commit 431b0e0ae alongside the 9-field cutover);
+/// those traces dispatch deterministically to
+/// `canonical_payload_value_legacy` via absence-routing in
+/// [`crate::schema::envelope::BatchEnvelope::from_json`]. Absence is
+/// the deterministic signal — pre-2.7.8.9 by definition; this is
+/// NOT a try-list fallback (TRACE_WIRE_FORMAT.md §8 prohibits those)
+/// because each trace contributes to exactly one canonical shape's
+/// verify path. Peers may also stamp `"2.7.legacy"` explicitly to
+/// hit the same dispatch arm via the sentinel route.
+pub const SUPPORTED_VERSIONS: &[&str] = &["2.7.0", "2.7.9", "2.7.legacy"];
 
 /// Type-checked wrapper around a schema version string.
 ///
@@ -59,6 +79,24 @@ pub const SUPPORTED_VERSIONS: &[&str] = &["2.7.0", "2.7.9"];
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct SchemaVersion(Cow<'static, str>);
+
+/// v0.4.3 (CIRISPersist#21) — `serde(default)` for the
+/// `trace_schema_version` field on [`super::BatchEnvelope`] and
+/// [`super::CompleteTrace`]. Pre-2.7.8.9 agents stamped no version
+/// field at all; absence is the deterministic signal for the
+/// legacy 2-field canonical shape (per agent commit 431b0e0ae,
+/// the field landed alongside the 9-field cutover; older traces
+/// are field-absent by definition).
+///
+/// This is NOT a try-list fallback — every absent-version trace
+/// dispatches to exactly ONE canonicalizer
+/// ([`crate::verify::canonical_payload_value_legacy`]), and the
+/// `federation_canonical_match_total{wire="2.7.legacy"}` counter
+/// observes the legacy traffic so the sunset rule
+/// (`SUPPORTED_VERSIONS` doc) is empirically driven.
+pub fn default_legacy_schema_version() -> SchemaVersion {
+    SchemaVersion(Cow::Borrowed("2.7.legacy"))
+}
 
 impl SchemaVersion {
     /// Strict parse: validate `s` against [`SUPPORTED_VERSIONS`] and
@@ -159,10 +197,19 @@ mod tests {
         match err {
             super::super::Error::UnsupportedSchemaVersion { got, supported } => {
                 assert_eq!(got, "2.6.0");
-                assert_eq!(supported, &["2.7.0", "2.7.9"]);
+                assert_eq!(supported, &["2.7.0", "2.7.9", "2.7.legacy"]);
             }
             _ => panic!("expected UnsupportedSchemaVersion, got {err:?}"),
         }
+    }
+
+    /// v0.4.3 (CIRISPersist#21) — `"2.7.legacy"` restored under the
+    /// telemetry-driven sunset rule.
+    #[test]
+    fn parse_accepts_2_7_legacy() {
+        let v = SchemaVersion::parse("2.7.legacy").expect("2.7.legacy is supported");
+        assert_eq!(v.as_str(), "2.7.legacy");
+        assert!(v.is_supported());
     }
 
     #[test]

@@ -5,6 +5,168 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.4.3] — 2026-05-08
+
+**Lens-derived schemas + 2.7.legacy restoration.** Two issues, one
+release. Both close federation-coordination work the lens-core +
+RATCHET track is blocked on (#18) and a v0.4.0 regression that left
+pre-2.7.8.9 federation peers stuck (#21).
+
+### Closes [CIRISPersist#18](https://github.com/CIRISAI/CIRISPersist/issues/18) — `cirislens_derived` schemas
+
+New schema `cirislens_derived` (separate from `cirislens` — different
+write authority, different access surface, different retention policy)
+holds two tables federation peers produce AFTER trace ingest:
+
+- `cirislens_derived.detection_events` — one row per lens-core detector
+  flag (LC-AV-2 cohort/declared-inferred mismatch P0; LC-AV-11
+  manifold-conformity outlier; LC-AV-18 reasoning-collapse; future
+  ratchet detectors). Forensic join key is `body_sha256` (matches
+  `edge::VerifiedTrace.body_sha256`).
+- `cirislens_derived.calibration_bundles` — one row per RATCHET
+  calibration; lens-core reads `is_current = TRUE` at startup + on
+  refresh. Partial-unique index `calibration_bundles_one_current`
+  enforces at-most-one-current at the DB level; `put_calibration_bundle`
+  flips `is_current` atomically (UPDATE prior + INSERT new in a
+  single transaction).
+
+Both record kinds carry hybrid (Ed25519 + ML-DSA-65) signatures over
+`canonical_bytes`. The `Engine.put_*` PyO3 surface verifies via
+`crate::verify::verify_hybrid_via_directory` under
+`HybridPolicy::Strict` BEFORE backend write (no fallback; both
+signatures must verify; CIRISPersist#14 closure pattern).
+`canonical_bytes` is canonical JSON via
+`persist::prelude::canonicalize_envelope_for_signing` —
+CIRISPersist#7 single-source-of-truth.
+
+### `derived::DerivedSchema` trait + 5 methods
+
+```rust
+impl DerivedSchema for PostgresBackend {
+    async fn put_detection_event(&self, event: DetectionEvent) -> Result<(), Error>;
+    async fn get_detection_events(&self, filter: EventFilter) -> Result<Vec<DetectionEvent>, Error>;
+    async fn put_calibration_bundle(&self, bundle: CalibrationBundle) -> Result<(), Error>;
+    async fn get_current_calibration_bundle(&self) -> Result<Option<CalibrationBundle>, Error>;
+    async fn get_calibration_bundle_by_version(&self, v: i32) -> Result<Option<CalibrationBundle>, Error>;
+}
+```
+
+Memory + SQLite backends return `Error::NotImplemented` for the put
+paths (sovereign-mode Pi-class deployments without lens-core /
+RATCHET don't need the substrate); the get paths return empty
+results so probing (e.g. lens-core's startup load) gets a clean "no
+current bundle" rather than an error.
+
+### PyO3 `Engine` surface
+
+Five methods mirroring the rlib trait, JSON-string in/out per the
+existing `put_public_key` / `put_attestation` / `put_revocation`
+idiom:
+
+```python
+engine.put_detection_event(json.dumps(event_dict))
+events_json = engine.get_detection_events(json.dumps({"trace_id": tid}))
+engine.put_calibration_bundle(json.dumps(bundle_dict))
+bundle_json = engine.get_current_calibration_bundle()  # None or JSON str
+bundle_json = engine.get_calibration_bundle_by_version(42)
+```
+
+Both put paths verify hybrid sigs before backend write; verify
+failures surface as `ValueError` with the standard `verify_*` token
+(`verify_unknown_key`, `hybrid_verify_strict_required`, etc.). This
+is the substrate-side closure of CIRISLensCore Phase 1 P0 ASKs
+(LC-AV-2 / -11 / -18) + RATCHET's projection-v1 publication path
+(CIRISLensCore#3).
+
+### V008 migration
+
+`migrations/postgres/lens/V008__lens_derived_schemas.sql`. Two
+tables in `cirislens_derived` schema. CHECK constraints on signature
+shape (Ed25519 = 64 bytes; ML-DSA-65 = 3309 bytes per FIPS 204
+final, CIRISVerify#4 / CIRISPersist#8) and body_sha256 length (32
+bytes). Partial-unique index on `is_current = TRUE` for atomic flip.
+
+### `prelude` exports
+
+```rust
+pub use crate::derived::{
+    CalibrationBundle, CohortCentroid, ConformityVariant, DetectionEvent,
+    DetectionSeverity, EventFilter, ProjectionMetadata, Standardization,
+};
+pub use crate::derived::DerivedSchema;
+```
+
+### Closes [CIRISPersist#21](https://github.com/CIRISAI/CIRISPersist/issues/21) — restore `2.7.legacy` under telemetry-driven sunset
+
+v0.4.0 dropped `2.7.legacy` from `SUPPORTED_VERSIONS` on a calendar /
+fleet-migration framing that doesn't fit the federation's
+decentralized model. CIRIS peers run whichever protocol versions
+they run; sunset is empirical, not calendar-flag-gated. v0.4.3
+restores `2.7.legacy` under the SAME telemetry-driven sunset rule
+`2.7.0` already follows:
+
+> Drop `"2.7.legacy"` once `federation_canonical_match_total{wire="2.7.legacy"}`
+> stays at zero through a 7-day soak window.
+
+### What changed
+
+- `SUPPORTED_VERSIONS` now `["2.7.0", "2.7.9", "2.7.legacy"]`
+  (`src/schema/version.rs`).
+- `SchemaVersion::default_legacy_schema_version()` — serde-default
+  fn returning `"2.7.legacy"`.
+- `BatchEnvelope.trace_schema_version` and
+  `CompleteTrace.trace_schema_version` get
+  `#[serde(default = "default_legacy_schema_version")]`. Pre-2.7.8.9
+  agents stamped no version field at all (the field landed in
+  CIRISAgent commit 431b0e0ae alongside the 9-field cutover); those
+  traces deserialize to the legacy default.
+- Verify dispatch arm `"2.7.legacy" => canonical_payload_value_legacy`
+  was already in place at `src/verify/ed25519.rs:463` from v0.3.0;
+  v0.4.3 just makes it reachable.
+- Telemetry: `tracing::info!(target: "federation_canonical_match",
+  wire = ..., trace_id = ..., "federation_canonical_match_total")`
+  emits per verify dispatch. Operators / lens log aggregation tally
+  `wire = "<dialect>"` emissions across the soak window. (Explicit
+  metrics-crate counter is a follow-up; tracing matches persist's
+  observability discipline today.)
+
+### Routing semantics — NOT a try-list fallback
+
+Each trace dispatches to exactly ONE canonicalizer based on
+`trace_schema_version`. Two routes hit the legacy arm:
+
+1. **Sentinel route**: `trace_schema_version = "2.7.legacy"`
+   explicitly stamped on the wire.
+2. **Absence route**: `trace_schema_version` absent on the wire
+   (pre-2.7.8.9). Serde-default deserializes to `"2.7.legacy"`.
+
+Both routes are deterministic — absence is the unambiguous signal
+for the pre-versioning dialect, NOT a "try 9-field, fall back to
+2-field" iteration. TRACE_WIRE_FORMAT.md §8's "no try-list under
+load" rule is preserved.
+
+### Tests
+
+- `verify::ed25519::tests::absence_routes_to_legacy` — round-trips a
+  pre-2.7.8.9 wire (no `trace_schema_version` field) through verify;
+  asserts default kicks in, `is_supported` accepts, dispatch routes
+  to the 2-field canonical, and the signature verifies.
+- `verify::ed25519::tests::legacy_two_field_canonical_dispatch_via_explicit_opt_in`
+  unchanged shape; docstring updated to reflect the v0.4.3 restoration.
+- `schema::version::tests::parse_accepts_2_7_legacy` —
+  `"2.7.legacy"` is now a strict-parse-accepted dialect.
+- `schema::version::tests::parse_rejects_old_version` — error message
+  carries the updated `SUPPORTED_VERSIONS` for diagnostic clarity.
+
+### Deeper bug, separate work item
+
+`trace_schema_version` isn't currently in the signed canonical bytes
+(it's a routing input only). An attacker could in principle forge
+the version stamp to route to a different canonicalizer. Long-term
+fix is bilateral — include in signed canonical bytes — coordinated
+across agent + persist + edge. Out of scope for this release;
+filed as a follow-up.
+
 ## [0.4.2] — 2026-05-03
 
 **Rust-public `StewardSigner` for CIRISLensCore (rlib path).**

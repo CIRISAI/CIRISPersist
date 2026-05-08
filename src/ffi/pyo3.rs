@@ -2257,6 +2257,241 @@ impl PyEngine {
         })
         .map_err(outbound_err_to_py)
     }
+
+    // ─── Lens-derived schemas (v0.4.3, CIRISPersist#18) ────────────
+    //
+    // CRUD surface for cirislens_derived.detection_events and
+    // cirislens_derived.calibration_bundles. Wire format: JSON strings
+    // in/out, mirroring the federation directory methods (put_public_key,
+    // put_attestation). Lens-core / RATCHET call json.dumps before
+    // passing in, json.loads on receiving back.
+    //
+    // Both put paths verify the hybrid (Ed25519 + ML-DSA-65) signature
+    // via crate::verify::verify_hybrid_via_directory under
+    // HybridPolicy::Strict BEFORE calling the backend write. Both
+    // signatures must verify; no fallback. Federation evidence is
+    // hybrid-mandatory (same principle as the build-manifest hybrid
+    // signing edge + persist already use).
+
+    /// Lens-derived: write a detection event.
+    ///
+    /// `event_json` is a JSON string of `DetectionEvent` (see
+    /// `crate::derived::types::DetectionEvent`). Persist verifies the
+    /// hybrid signature on `canonical_bytes` against
+    /// `signing_key_id` in `federation_keys` under
+    /// `HybridPolicy::Strict`. On verify failure raises `ValueError`
+    /// with the standard `verify_*` token. On verify success, the
+    /// row is inserted (idempotent on `detection_id`).
+    fn put_detection_event(&self, py: Python<'_>, event_json: &str) -> PyResult<()> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let event: crate::derived::DetectionEvent = serde_json::from_str(event_json)
+            .map_err(|e| PyValueError::new_err(format!("DetectionEvent JSON decode: {e}")))?;
+
+        // Hybrid verify under Strict — both signatures required.
+        // canonical_bytes carries the original signed shape; persist
+        // does NOT recanonicalize (CIRISPersist#7 single-source-of-
+        // truth: the canonicalizer ran ONCE upstream; persist verifies
+        // the bytes the signer signed).
+        let canonical_for_verify = event.canonical_bytes.clone();
+        let signing_key_id = event.signing_key_id.clone();
+        let ed25519_b64 = base64_encode(&event.ed25519_sig);
+        let ml_dsa_b64 = base64_encode(&event.ml_dsa_65_sig);
+        let backend_for_verify = backend.clone();
+        let runtime_for_verify = runtime.clone();
+
+        py.detach(move || {
+            runtime_for_verify.block_on(async move {
+                let outcome = crate::verify::verify_hybrid_via_directory(
+                    &*backend_for_verify,
+                    &canonical_for_verify,
+                    &signing_key_id,
+                    &ed25519_b64,
+                    Some(&ml_dsa_b64),
+                    crate::verify::HybridPolicy::Strict,
+                    None,
+                )
+                .await
+                .map_err(|e| {
+                    let s = e.to_string();
+                    tracing::warn!(
+                        error = %e, kind = e.kind(),
+                        "put_detection_event: hybrid verify rejected"
+                    );
+                    if s.contains("verify_unknown_key") {
+                        PyValueError::new_err("verify_unknown_key")
+                    } else {
+                        PyValueError::new_err(e.kind())
+                    }
+                })?;
+                // Strict policy ONLY accepts HybridVerified; the
+                // verify_hybrid_via_directory call already enforced
+                // this, but assert for defense-in-depth so a future
+                // signature-bypass bug surfaces here rather than
+                // silently storing.
+                if !matches!(outcome, crate::verify::VerifyOutcome::HybridVerified) {
+                    return Err(PyValueError::new_err("hybrid_verify_strict_required"));
+                }
+
+                use crate::derived::DerivedSchema;
+                backend
+                    .put_detection_event(event)
+                    .await
+                    .map_err(derived_err_to_py)
+            })
+        })
+    }
+
+    /// Lens-derived: query detection events. Filter is JSON-encoded
+    /// `EventFilter` (`{"trace_id": ?, "detector": ?, "since": ?}`;
+    /// any field may be null/absent). Returns a JSON array string
+    /// of `DetectionEvent` objects, ordered by `ts DESC`.
+    fn get_detection_events(
+        &self,
+        py: Python<'_>,
+        filter_json: Option<&str>,
+    ) -> PyResult<String> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let filter: crate::derived::EventFilter = match filter_json {
+            None => crate::derived::EventFilter::default(),
+            Some(s) => {
+                #[derive(serde::Deserialize)]
+                struct EventFilterJson {
+                    trace_id: Option<String>,
+                    detector: Option<String>,
+                    since: Option<chrono::DateTime<chrono::Utc>>,
+                }
+                let parsed: EventFilterJson = serde_json::from_str(s).map_err(|e| {
+                    PyValueError::new_err(format!("EventFilter JSON decode: {e}"))
+                })?;
+                crate::derived::EventFilter {
+                    trace_id: parsed.trace_id,
+                    detector: parsed.detector,
+                    since: parsed.since,
+                }
+            }
+        };
+        py.detach(move || {
+            runtime.block_on(async move {
+                use crate::derived::DerivedSchema;
+                let rows = backend
+                    .get_detection_events(filter)
+                    .await
+                    .map_err(derived_err_to_py)?;
+                serde_json::to_string(&rows).map_err(|e| {
+                    PyRuntimeError::new_err(format!("DetectionEvent JSON encode: {e}"))
+                })
+            })
+        })
+    }
+
+    /// Lens-derived: write a calibration bundle.
+    ///
+    /// `bundle_json` is a JSON string of `CalibrationBundle`. Persist
+    /// verifies the hybrid signature against `signing_key_id` in
+    /// `federation_keys` under `HybridPolicy::Strict`, then atomically
+    /// flips `is_current` on the previous current row and inserts the
+    /// new row in a single transaction.
+    fn put_calibration_bundle(&self, py: Python<'_>, bundle_json: &str) -> PyResult<()> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let bundle: crate::derived::CalibrationBundle = serde_json::from_str(bundle_json)
+            .map_err(|e| {
+                PyValueError::new_err(format!("CalibrationBundle JSON decode: {e}"))
+            })?;
+
+        let canonical_for_verify = bundle.canonical_bytes.clone();
+        let signing_key_id = bundle.signing_key_id.clone();
+        let ed25519_b64 = base64_encode(&bundle.ed25519_sig);
+        let ml_dsa_b64 = base64_encode(&bundle.ml_dsa_65_sig);
+        let backend_for_verify = backend.clone();
+        let runtime_for_verify = runtime.clone();
+
+        py.detach(move || {
+            runtime_for_verify.block_on(async move {
+                let outcome = crate::verify::verify_hybrid_via_directory(
+                    &*backend_for_verify,
+                    &canonical_for_verify,
+                    &signing_key_id,
+                    &ed25519_b64,
+                    Some(&ml_dsa_b64),
+                    crate::verify::HybridPolicy::Strict,
+                    None,
+                )
+                .await
+                .map_err(|e| {
+                    let s = e.to_string();
+                    tracing::warn!(
+                        error = %e, kind = e.kind(),
+                        "put_calibration_bundle: hybrid verify rejected"
+                    );
+                    if s.contains("verify_unknown_key") {
+                        PyValueError::new_err("verify_unknown_key")
+                    } else {
+                        PyValueError::new_err(e.kind())
+                    }
+                })?;
+                if !matches!(outcome, crate::verify::VerifyOutcome::HybridVerified) {
+                    return Err(PyValueError::new_err("hybrid_verify_strict_required"));
+                }
+
+                use crate::derived::DerivedSchema;
+                backend
+                    .put_calibration_bundle(bundle)
+                    .await
+                    .map_err(derived_err_to_py)
+            })
+        })
+    }
+
+    /// Lens-derived: get the bundle with `is_current = TRUE`.
+    /// Returns JSON-encoded `CalibrationBundle` or `None`.
+    fn get_current_calibration_bundle(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        py.detach(move || {
+            runtime.block_on(async move {
+                use crate::derived::DerivedSchema;
+                let opt = backend
+                    .get_current_calibration_bundle()
+                    .await
+                    .map_err(derived_err_to_py)?;
+                match opt {
+                    None => Ok(None),
+                    Some(b) => Ok(Some(serde_json::to_string(&b).map_err(|e| {
+                        PyRuntimeError::new_err(format!("CalibrationBundle JSON encode: {e}"))
+                    })?)),
+                }
+            })
+        })
+    }
+
+    /// Lens-derived: get the bundle for a specific
+    /// `ratchet_calibration_version`.
+    fn get_calibration_bundle_by_version(
+        &self,
+        py: Python<'_>,
+        version: i32,
+    ) -> PyResult<Option<String>> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        py.detach(move || {
+            runtime.block_on(async move {
+                use crate::derived::DerivedSchema;
+                let opt = backend
+                    .get_calibration_bundle_by_version(version)
+                    .await
+                    .map_err(derived_err_to_py)?;
+                match opt {
+                    None => Ok(None),
+                    Some(b) => Ok(Some(serde_json::to_string(&b).map_err(|e| {
+                        PyRuntimeError::new_err(format!("CalibrationBundle JSON encode: {e}"))
+                    })?)),
+                }
+            })
+        })
+    }
 }
 
 /// v0.4.2 — Bridge `signing::StewardSignerError` → `PyErr` at the
@@ -2450,6 +2685,30 @@ fn trace_level_str(t: crate::schema::TraceLevel) -> &'static str {
 /// Mission constraint (THREAT_MODEL.md AV-15): structured detail
 /// goes to tracing; the Python exception carries the stable kind
 /// token. Lens HTTP layer maps token → status code.
+/// v0.4.3 (CIRISPersist#18) — Bridge `derived::Error` → `PyErr` at
+/// the FFI boundary. Same discipline as the other err_to_py
+/// helpers: stable kind tokens cross the boundary, structured
+/// detail goes to tracing.
+fn derived_err_to_py(e: crate::derived::Error) -> PyErr {
+    let kind = e.kind();
+    tracing::warn!(error = %e, kind = kind, "derived error");
+    match e {
+        crate::derived::Error::InvalidArgument(_) => PyValueError::new_err(kind),
+        crate::derived::Error::Conflict(_) => PyValueError::new_err(kind),
+        crate::derived::Error::CalibrationVersionNotFound(_) => PyValueError::new_err(kind),
+        crate::derived::Error::Backend(_) => PyRuntimeError::new_err(kind),
+        crate::derived::Error::NotImplemented(_) => PyRuntimeError::new_err(kind),
+    }
+}
+
+/// v0.4.3 (CIRISPersist#18) — Encode raw bytes to base64 STANDARD
+/// for the verify_hybrid_via_directory call (which takes &str).
+fn base64_encode(bytes: &[u8]) -> String {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    B64.encode(bytes)
+}
+
 fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
     let kind = e.kind();
     tracing::warn!(error = %e, kind = kind, "federation error");

@@ -452,12 +452,22 @@ where
     // path. No shape-shopping attack surface; no spurious-sig-fail
     // SHA-256+verify latency multiplier under load.
     //
-    // Pre-v0.3.0 try-9-field-then-2-field fallback is retired: the
-    // legacy 2-field shape is reserved behind explicit
-    // `"2.7.legacy"` opt-in (not currently in SUPPORTED_VERSIONS;
-    // would need to be added to enable), never silent fallback for
-    // unrecognized versions.
-    let canonical = match trace.trace_schema_version.as_str() {
+    // Pre-v0.3.0 try-9-field-then-2-field fallback is retired: each
+    // trace dispatches to exactly ONE canonicalizer based on
+    // `trace_schema_version`. v0.4.3 (CIRISPersist#21) restored the
+    // `"2.7.legacy"` arm under the same telemetry-driven sunset rule
+    // 2.7.0 follows. Pre-2.7.8.9 traces with an absent version field
+    // dispatch here too via serde-default in
+    // [`crate::schema::trace::CompleteTrace`].
+    //
+    // The `target = "federation_canonical_match"` tracing event below
+    // is the observability primitive the sunset rule consumes:
+    // operators / lens-side log aggregation tally `wire = "<dialect>"`
+    // emissions across the soak window. (Explicit metrics-crate
+    // counter is a follow-up; tracing matches the rest of persist's
+    // observability discipline today.)
+    let wire = trace.trace_schema_version.as_str();
+    let canonical = match wire {
         "2.7.0" => canonical_payload_value(trace),
         "2.7.9" => canonical_payload_value_v279(trace),
         "2.7.legacy" => canonical_payload_value_legacy(trace),
@@ -469,6 +479,12 @@ where
             return Err(Error::UnsupportedSchemaVersion(other.to_owned()));
         }
     };
+    tracing::info!(
+        target: "federation_canonical_match",
+        wire = wire,
+        trace_id = trace.trace_id.as_str(),
+        "federation_canonical_match_total"
+    );
     let canonical_bytes = canonicalizer.canonicalize_value(&canonical)?;
     if key.verify_strict(&canonical_bytes, &sig).is_ok() {
         return Ok(());
@@ -648,26 +664,23 @@ mod tests {
             .expect("URL-safe-no-pad signature MUST verify post-v0.1.15");
     }
 
-    /// v0.3.0 — legacy 2-field canonical via explicit opt-in
+    /// v0.3.0 / v0.4.3 — legacy 2-field canonical via explicit
     /// `"2.7.legacy"` version sentinel.
     ///
     /// Pre-v0.3.0 (`v0.1.16`-`v0.2.x`) tried 9-field first then fell
     /// back to 2-field on mismatch — silent. Per
     /// `TRACE_WIRE_FORMAT.md §8 at cc41f315f`: deterministic dispatch
-    /// by `trace_schema_version`, no silent fallback. The 2-field
-    /// canonical is reserved behind explicit `"2.7.legacy"` opt-in.
-    /// SUPPORTED_VERSIONS doesn't include `"2.7.legacy"` by default
-    /// — adding it is a deployment-side decision, not a runtime
-    /// fallback. Test directly invokes `canonical_payload_value_legacy`
-    /// to confirm the dispatch arm produces the right bytes.
+    /// by `trace_schema_version`, no silent fallback.
+    ///
+    /// v0.4.0 dropped legacy on a calendar/fleet-migration framing.
+    /// v0.4.3 (CIRISPersist#21) restored `"2.7.legacy"` to
+    /// SUPPORTED_VERSIONS under the same telemetry-driven sunset
+    /// rule `"2.7.0"` follows. Two routes hit the legacy dispatch
+    /// arm: (1) explicit `"2.7.legacy"` sentinel (this test); (2)
+    /// absence of `trace_schema_version` field, via serde-default
+    /// (`absence_routes_to_legacy` test below).
     #[test]
     fn legacy_two_field_canonical_dispatch_via_explicit_opt_in() {
-        // This test bypasses the schema parse gate (which would
-        // reject "2.7.legacy" without explicit SUPPORTED_VERSIONS
-        // opt-in) and directly exercises the canonical reconstruction.
-        // verify_trace's dispatch arm for "2.7.legacy" exists; whether
-        // a deployment turns it on by adding to SUPPORTED_VERSIONS is
-        // a separate operational decision.
         let sk = fixed_signing_key();
         let key_id = "test-key:42";
         let mut data = serde_json::Map::new();
@@ -716,6 +729,107 @@ mod tests {
         // "2.7.legacy" sentinel, it routes to canonical_payload_value_legacy.
         verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &keys)
             .expect("explicit 2.7.legacy opt-in MUST verify via 2-field canonical");
+    }
+
+    /// v0.4.3 (CIRISPersist#21) — pre-2.7.8.9 traces with NO
+    /// `trace_schema_version` field deserialize to the
+    /// `"2.7.legacy"` default (serde-default attribute on
+    /// `BatchEnvelope.trace_schema_version` /
+    /// `CompleteTrace.trace_schema_version`). Verify dispatches
+    /// deterministically to the 2-field canonical. NOT a try-list
+    /// fallback — absence is the deterministic signal.
+    #[test]
+    fn absence_routes_to_legacy() {
+        // Construct a trace JSON with NO trace_schema_version field,
+        // matching pre-2.7.8.9 wire shape (the field landed in
+        // CIRISAgent commit 431b0e0ae alongside the 9-field cutover;
+        // older traces are field-absent by definition).
+        let sk = fixed_signing_key();
+        let key_id = "test-key:42";
+
+        // First: build a trace with version present so we can sign
+        // its canonical form, then strip the field for the wire.
+        let mut data = serde_json::Map::new();
+        data.insert("attempt_index".into(), serde_json::json!(0));
+        data.insert("seq".into(), serde_json::json!(1));
+        let trace_for_signing = CompleteTrace {
+            trace_id: "trace-pre-vstamp".into(),
+            thought_id: "th-1".into(),
+            task_id: None,
+            agent_id_hash: "deadbeef".into(),
+            started_at: "2026-04-30T00:15:53.123456+00:00".parse().unwrap(),
+            completed_at: "2026-04-30T00:16:12.789012+00:00".parse().unwrap(),
+            trace_level: crate::schema::TraceLevel::Generic,
+            // For SIGNING we use the legacy sentinel; the WIRE will
+            // have no trace_schema_version field at all.
+            trace_schema_version: serde_json::from_str("\"2.7.legacy\"").unwrap(),
+            components: vec![crate::schema::TraceComponent {
+                component_type: crate::schema::ComponentType::Conscience,
+                event_type: crate::schema::ReasoningEventType::ConscienceResult,
+                timestamp: "2026-04-30T00:15:53.123456+00:00".parse().unwrap(),
+                data,
+                agent_id_hash: None,
+            }],
+            deployment_profile: None,
+            signature: String::new(),
+            signature_key_id: key_id.to_owned(),
+        };
+
+        // Sign the LEGACY 2-field canonical form (which doesn't
+        // include trace_schema_version anyway — the legacy canonical
+        // is just `{components, trace_level}`, so the signature is
+        // identical whether the version field is present or absent).
+        let legacy_payload = canonical_payload_value_legacy(&trace_for_signing);
+        let bytes = PythonJsonDumpsCanonicalizer
+            .canonicalize_value(&legacy_payload)
+            .unwrap();
+        let sig = sk.sign(&bytes);
+
+        // Now construct the wire trace with NO trace_schema_version
+        // field. We do this by serializing to JSON, removing the
+        // field, and re-deserializing — exercising the serde-default
+        // path that production wire deserialization hits.
+        let signed = CompleteTrace {
+            signature: BASE64.encode(sig.to_bytes()),
+            ..trace_for_signing.clone()
+        };
+        let mut json_value = serde_json::to_value(&signed).unwrap();
+        json_value
+            .as_object_mut()
+            .unwrap()
+            .remove("trace_schema_version");
+        // Confirm it's actually gone before round-tripping.
+        assert!(
+            !json_value
+                .as_object()
+                .unwrap()
+                .contains_key("trace_schema_version"),
+            "field should be absent on pre-2.7.8.9 wire"
+        );
+        let pre_vstamp_trace: CompleteTrace =
+            serde_json::from_value(json_value).expect(
+                "pre-2.7.8.9 wire (no trace_schema_version) MUST deserialize \
+                 — serde-default routes absence to \"2.7.legacy\"",
+            );
+
+        // Confirm the default kicked in.
+        assert_eq!(
+            pre_vstamp_trace.trace_schema_version.as_str(),
+            "2.7.legacy",
+            "absence MUST default to 2.7.legacy"
+        );
+        assert!(
+            pre_vstamp_trace.trace_schema_version.is_supported(),
+            "default 2.7.legacy MUST be in SUPPORTED_VERSIONS post-v0.4.3"
+        );
+
+        // Verify dispatches to the legacy canonical arm.
+        let mut keys = MemKeys {
+            keys: HashMap::new(),
+        };
+        keys.keys.insert(key_id.to_owned(), sk.verifying_key());
+        verify_trace_via_directory(&pre_vstamp_trace, &PythonJsonDumpsCanonicalizer, &keys)
+            .expect("absence-routed pre-2.7.8.9 trace MUST verify via 2-field canonical");
     }
 
     /// CIRISPersist#5: a trace tampered after legacy-form signing

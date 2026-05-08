@@ -259,6 +259,11 @@ pub struct CompleteTrace {
     /// Privacy / bandwidth tier of the trace.
     pub trace_level: super::envelope::TraceLevel,
     /// Wire-format schema version this trace was emitted under.
+    ///
+    /// v0.4.3 (CIRISPersist#21): absent in pre-2.7.8.9 traces;
+    /// defaults to `"2.7.legacy"`. See
+    /// [`super::version::default_legacy_schema_version`].
+    #[serde(default = "super::version::default_legacy_schema_version")]
     pub trace_schema_version: SchemaVersion,
 
     /// Sequence of components making up the trace.

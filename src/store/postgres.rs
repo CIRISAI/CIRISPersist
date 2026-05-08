@@ -2261,6 +2261,364 @@ fn llm_status_str(s: crate::schema::LlmCallStatus) -> &'static str {
     }
 }
 
+// ─── DerivedSchema impl (v0.4.3, CIRISPersist#18) ──────────────────
+//
+// CRUD over cirislens_derived.{detection_events, calibration_bundles}.
+// Caller (Engine PyO3 surface) MUST verify hybrid signatures via
+// verify_hybrid_via_directory under HybridPolicy::Strict before
+// calling these put paths — this trait impl is storage-only.
+
+impl crate::derived::DerivedSchema for PostgresBackend {
+    async fn put_detection_event(
+        &self,
+        event: crate::derived::DetectionEvent,
+    ) -> Result<(), crate::derived::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::derived::Error::Backend(e.to_string()))?;
+
+        // Validate fixed-length signature shapes early so we surface a
+        // typed InvalidArgument rather than letting the DB CHECK fire
+        // as a backend SQL error string.
+        if event.body_sha256.len() != 32 {
+            return Err(crate::derived::Error::InvalidArgument(format!(
+                "body_sha256 must be 32 bytes (got {})",
+                event.body_sha256.len()
+            )));
+        }
+        if event.ed25519_sig.len() != 64 {
+            return Err(crate::derived::Error::InvalidArgument(format!(
+                "ed25519_sig must be 64 bytes (got {})",
+                event.ed25519_sig.len()
+            )));
+        }
+        if event.ml_dsa_65_sig.len() != 3309 {
+            return Err(crate::derived::Error::InvalidArgument(format!(
+                "ml_dsa_65_sig must be 3309 bytes (got {})",
+                event.ml_dsa_65_sig.len()
+            )));
+        }
+
+        // Idempotent on detection_id collision; raise Conflict on
+        // collision-with-different-canonical_bytes.
+        let result = client
+            .execute(
+                "INSERT INTO cirislens_derived.detection_events (\
+                    detection_id, trace_id, body_sha256, detector, severity, \
+                    cohort_cell, conformity_variant, conformity_payload, \
+                    lens_core_version, ratchet_calibration_version, \
+                    canonical_bytes, ed25519_sig, ml_dsa_65_sig, signing_key_id, ts\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
+                 ON CONFLICT (detection_id) DO NOTHING",
+                &[
+                    &event.detection_id,
+                    &event.trace_id,
+                    &event.body_sha256,
+                    &event.detector,
+                    &event.severity.as_db_str(),
+                    &event.cohort_cell,
+                    &event.conformity_variant.as_db_str(),
+                    &event.conformity_payload,
+                    &event.lens_core_version,
+                    &event.ratchet_calibration_version,
+                    &event.canonical_bytes,
+                    &event.ed25519_sig,
+                    &event.ml_dsa_65_sig,
+                    &event.signing_key_id,
+                    &event.ts,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::derived::Error::Backend(format!("insert detection_events: {e}"))
+            })?;
+
+        if result == 0 {
+            let existing: Option<Vec<u8>> = client
+                .query_opt(
+                    "SELECT canonical_bytes FROM cirislens_derived.detection_events \
+                     WHERE detection_id = $1",
+                    &[&event.detection_id],
+                )
+                .await
+                .map_err(|e| {
+                    crate::derived::Error::Backend(format!("conflict check: {e}"))
+                })?
+                .map(|r| r.get(0));
+            if let Some(existing_bytes) = existing {
+                if existing_bytes != event.canonical_bytes {
+                    return Err(crate::derived::Error::Conflict(format!(
+                        "detection_id {} already exists with different canonical_bytes",
+                        event.detection_id
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn get_detection_events(
+        &self,
+        filter: crate::derived::EventFilter,
+    ) -> Result<Vec<crate::derived::DetectionEvent>, crate::derived::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::derived::Error::Backend(e.to_string()))?;
+
+        // Build the query with conditional filters. We collect
+        // boxed-ToSql-trait-object refs into a Vec and pass as
+        // a slice — same pattern other typed-filter paths use.
+        // Ordering: ts DESC for operator-newest-first triage.
+        let mut query = String::from(
+            "SELECT detection_id, trace_id, body_sha256, detector, severity, \
+                cohort_cell, conformity_variant, conformity_payload, \
+                lens_core_version, ratchet_calibration_version, \
+                canonical_bytes, ed25519_sig, ml_dsa_65_sig, signing_key_id, ts \
+             FROM cirislens_derived.detection_events WHERE 1 = 1",
+        );
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        if let Some(t) = filter.trace_id {
+            params.push(Box::new(t));
+            query.push_str(&format!(" AND trace_id = ${}", params.len()));
+        }
+        if let Some(d) = filter.detector {
+            params.push(Box::new(d));
+            query.push_str(&format!(" AND detector = ${}", params.len()));
+        }
+        if let Some(s) = filter.since {
+            params.push(Box::new(s));
+            query.push_str(&format!(" AND ts >= ${}", params.len()));
+        }
+        query.push_str(" ORDER BY ts DESC LIMIT 1000");
+
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let rows = client
+            .query(&query, &params_ref[..])
+            .await
+            .map_err(|e| {
+                crate::derived::Error::Backend(format!("select detection_events: {e}"))
+            })?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let severity_db: String = r.get(4);
+            let conformity_db: String = r.get(6);
+            out.push(crate::derived::DetectionEvent {
+                detection_id: r.get(0),
+                trace_id: r.get(1),
+                body_sha256: r.get(2),
+                detector: r.get(3),
+                severity: crate::derived::DetectionSeverity::from_db_str(&severity_db).ok_or_else(
+                    || {
+                        crate::derived::Error::Backend(format!(
+                            "unknown severity in DB: {severity_db}"
+                        ))
+                    },
+                )?,
+                cohort_cell: r.get(5),
+                conformity_variant: crate::derived::ConformityVariant::from_db_str(
+                    &conformity_db,
+                )
+                .ok_or_else(|| {
+                    crate::derived::Error::Backend(format!(
+                        "unknown conformity_variant in DB: {conformity_db}"
+                    ))
+                })?,
+                conformity_payload: r.get(7),
+                lens_core_version: r.get(8),
+                ratchet_calibration_version: r.get(9),
+                canonical_bytes: r.get(10),
+                ed25519_sig: r.get(11),
+                ml_dsa_65_sig: r.get(12),
+                signing_key_id: r.get(13),
+                ts: r.get(14),
+            });
+        }
+        Ok(out)
+    }
+
+    async fn put_calibration_bundle(
+        &self,
+        bundle: crate::derived::CalibrationBundle,
+    ) -> Result<(), crate::derived::Error> {
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::derived::Error::Backend(e.to_string()))?;
+
+        // Same fixed-length signature shape gates as detection events.
+        if bundle.ed25519_sig.len() != 64 {
+            return Err(crate::derived::Error::InvalidArgument(format!(
+                "ed25519_sig must be 64 bytes (got {})",
+                bundle.ed25519_sig.len()
+            )));
+        }
+        if bundle.ml_dsa_65_sig.len() != 3309 {
+            return Err(crate::derived::Error::InvalidArgument(format!(
+                "ml_dsa_65_sig must be 3309 bytes (got {})",
+                bundle.ml_dsa_65_sig.len()
+            )));
+        }
+
+        // Atomic flip: clear previous current row + insert new row in
+        // a single transaction. The partial-unique index
+        // calibration_bundles_one_current makes the invariant
+        // DB-enforced — this transaction makes the transition
+        // race-free.
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::derived::Error::Backend(format!("begin tx: {e}")))?;
+
+        if bundle.is_current {
+            tx.execute(
+                "UPDATE cirislens_derived.calibration_bundles \
+                 SET is_current = FALSE WHERE is_current = TRUE",
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                crate::derived::Error::Backend(format!("clear prior current: {e}"))
+            })?;
+        }
+
+        let result = tx
+            .execute(
+                "INSERT INTO cirislens_derived.calibration_bundles (\
+                    ratchet_calibration_version, projection_version, calibrated_at, \
+                    calibration_corpus_sha256, calibration_corpus_n, sample_size_gate, \
+                    manifold_threshold_global, projection_metadata, cohort_centroids, \
+                    is_current, canonical_bytes, ed25519_sig, ml_dsa_65_sig, \
+                    signing_key_id, inserted_at\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
+                 ON CONFLICT (ratchet_calibration_version) DO NOTHING",
+                &[
+                    &bundle.ratchet_calibration_version,
+                    &bundle.projection_version,
+                    &bundle.calibrated_at,
+                    &bundle.calibration_corpus_sha256,
+                    &bundle.calibration_corpus_n,
+                    &bundle.sample_size_gate,
+                    &bundle.manifold_threshold_global,
+                    &bundle.projection_metadata,
+                    &bundle.cohort_centroids,
+                    &bundle.is_current,
+                    &bundle.canonical_bytes,
+                    &bundle.ed25519_sig,
+                    &bundle.ml_dsa_65_sig,
+                    &bundle.signing_key_id,
+                    &bundle.inserted_at,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::derived::Error::Backend(format!("insert calibration_bundles: {e}"))
+            })?;
+
+        if result == 0 {
+            // ON CONFLICT triggered — check if canonical_bytes match.
+            let existing: Option<Vec<u8>> = tx
+                .query_opt(
+                    "SELECT canonical_bytes FROM cirislens_derived.calibration_bundles \
+                     WHERE ratchet_calibration_version = $1",
+                    &[&bundle.ratchet_calibration_version],
+                )
+                .await
+                .map_err(|e| {
+                    crate::derived::Error::Backend(format!("conflict check: {e}"))
+                })?
+                .map(|r| r.get(0));
+            if let Some(existing_bytes) = existing {
+                if existing_bytes != bundle.canonical_bytes {
+                    return Err(crate::derived::Error::Conflict(format!(
+                        "ratchet_calibration_version {} already exists with different canonical_bytes",
+                        bundle.ratchet_calibration_version
+                    )));
+                }
+            }
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| crate::derived::Error::Backend(format!("commit tx: {e}")))?;
+        Ok(())
+    }
+
+    async fn get_current_calibration_bundle(
+        &self,
+    ) -> Result<Option<crate::derived::CalibrationBundle>, crate::derived::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::derived::Error::Backend(e.to_string()))?;
+        let row_opt = client
+            .query_opt(
+                "SELECT ratchet_calibration_version, projection_version, calibrated_at, \
+                    calibration_corpus_sha256, calibration_corpus_n, sample_size_gate, \
+                    manifold_threshold_global, projection_metadata, cohort_centroids, \
+                    is_current, canonical_bytes, ed25519_sig, ml_dsa_65_sig, \
+                    signing_key_id, inserted_at \
+                 FROM cirislens_derived.calibration_bundles \
+                 WHERE is_current = TRUE",
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                crate::derived::Error::Backend(format!("select current bundle: {e}"))
+            })?;
+        Ok(row_opt.map(row_to_calibration_bundle))
+    }
+
+    async fn get_calibration_bundle_by_version(
+        &self,
+        version: i32,
+    ) -> Result<Option<crate::derived::CalibrationBundle>, crate::derived::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::derived::Error::Backend(e.to_string()))?;
+        let row_opt = client
+            .query_opt(
+                "SELECT ratchet_calibration_version, projection_version, calibrated_at, \
+                    calibration_corpus_sha256, calibration_corpus_n, sample_size_gate, \
+                    manifold_threshold_global, projection_metadata, cohort_centroids, \
+                    is_current, canonical_bytes, ed25519_sig, ml_dsa_65_sig, \
+                    signing_key_id, inserted_at \
+                 FROM cirislens_derived.calibration_bundles \
+                 WHERE ratchet_calibration_version = $1",
+                &[&version],
+            )
+            .await
+            .map_err(|e| {
+                crate::derived::Error::Backend(format!("select bundle by version: {e}"))
+            })?;
+        Ok(row_opt.map(row_to_calibration_bundle))
+    }
+}
+
+fn row_to_calibration_bundle(r: tokio_postgres::Row) -> crate::derived::CalibrationBundle {
+    crate::derived::CalibrationBundle {
+        ratchet_calibration_version: r.get(0),
+        projection_version: r.get(1),
+        calibrated_at: r.get(2),
+        calibration_corpus_sha256: r.get(3),
+        calibration_corpus_n: r.get(4),
+        sample_size_gate: r.get(5),
+        manifold_threshold_global: r.get(6),
+        projection_metadata: r.get(7),
+        cohort_centroids: r.get(8),
+        is_current: r.get(9),
+        canonical_bytes: r.get(10),
+        ed25519_sig: r.get(11),
+        ml_dsa_65_sig: r.get(12),
+        signing_key_id: r.get(13),
+        inserted_at: r.get(14),
+    }
+}
+
 // ─── Integration tests, gated on a real Postgres ───────────────────
 //
 // Mission category §4 "Backend parity": the same row sequence that
@@ -2360,5 +2718,220 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         format!("{nanos:x}")
+    }
+
+    // ─── Lens-derived schemas (v0.4.3, CIRISPersist#18) ────────────
+
+    /// Smoke: detection event round-trip through put + get.
+    /// Note: this test calls the storage trait directly (post-verify
+    /// surface). The Engine PyO3 method enforces hybrid verify; this
+    /// test does NOT exercise that — see hybrid_verify_strict_*
+    /// tests in src/verify/hybrid.rs for the verify enforcement.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn detection_event_round_trip() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        use crate::derived::{
+            ConformityVariant, DerivedSchema, DetectionEvent, DetectionSeverity, EventFilter,
+        };
+        let event = DetectionEvent {
+            detection_id: uuid::Uuid::new_v4(),
+            trace_id: format!("trace-derived-{}", uuid_like()),
+            body_sha256: vec![0xAB; 32],
+            detector: "manifold_conformity_outlier".into(),
+            severity: DetectionSeverity::Warning,
+            cohort_cell: serde_json::json!({
+                "agent_role": "ally",
+                "agent_template": "ally-v3-default",
+                "deployment_domain": "moderation",
+                "deployment_type": "production",
+                "deployment_region": "US",
+                "deployment_trust_mode": "federated_peer"
+            }),
+            conformity_variant: ConformityVariant::Numeric,
+            conformity_payload: serde_json::json!({"score": 3.7}),
+            lens_core_version: "0.1.0".into(),
+            ratchet_calibration_version: 1,
+            canonical_bytes: b"{\"detection_id\":\"x\"}".to_vec(),
+            ed25519_sig: vec![0x01; 64],
+            ml_dsa_65_sig: vec![0x02; 3309],
+            signing_key_id: "lens-core-test:1".into(),
+            ts: chrono::Utc::now(),
+        };
+
+        backend.put_detection_event(event.clone()).await.unwrap();
+
+        // Idempotent on detection_id collision with same content.
+        backend.put_detection_event(event.clone()).await.unwrap();
+
+        // Read back via filter on trace_id.
+        let filter = EventFilter {
+            trace_id: Some(event.trace_id.clone()),
+            ..Default::default()
+        };
+        let rows = backend.get_detection_events(filter).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let got = &rows[0];
+        assert_eq!(got.detection_id, event.detection_id);
+        assert_eq!(got.detector, event.detector);
+        assert_eq!(got.severity, DetectionSeverity::Warning);
+        assert_eq!(got.conformity_variant, ConformityVariant::Numeric);
+    }
+
+    /// Conflict on same detection_id with DIFFERENT canonical_bytes
+    /// surfaces as derived::Error::Conflict.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn detection_event_conflict_on_different_content() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        use crate::derived::{
+            ConformityVariant, DerivedSchema, DetectionEvent, DetectionSeverity,
+        };
+        let did = uuid::Uuid::new_v4();
+        let event_a = DetectionEvent {
+            detection_id: did,
+            trace_id: format!("trace-conflict-{}", uuid_like()),
+            body_sha256: vec![0xAB; 32],
+            detector: "test".into(),
+            severity: DetectionSeverity::Info,
+            cohort_cell: serde_json::json!({}),
+            conformity_variant: ConformityVariant::Indeterminate,
+            conformity_payload: serde_json::json!({"reason": "missing"}),
+            lens_core_version: "0.1.0".into(),
+            ratchet_calibration_version: 1,
+            canonical_bytes: b"original".to_vec(),
+            ed25519_sig: vec![0x01; 64],
+            ml_dsa_65_sig: vec![0x02; 3309],
+            signing_key_id: "test:1".into(),
+            ts: chrono::Utc::now(),
+        };
+        backend.put_detection_event(event_a.clone()).await.unwrap();
+
+        let event_b = DetectionEvent {
+            canonical_bytes: b"DIFFERENT".to_vec(),
+            ..event_a
+        };
+        let err = backend.put_detection_event(event_b).await.unwrap_err();
+        assert!(matches!(err, crate::derived::Error::Conflict(_)));
+    }
+
+    /// Calibration bundle put → get_current → atomic flip on next put.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn calibration_bundle_atomic_current_flip() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        use crate::derived::{CalibrationBundle, DerivedSchema};
+
+        // Use timestamp-based versions so re-runs don't collide.
+        let v1 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i32;
+        let v2 = v1 + 1;
+
+        let bundle_v1 = CalibrationBundle {
+            ratchet_calibration_version: v1,
+            projection_version: "crc-v1".into(),
+            calibrated_at: chrono::Utc::now(),
+            calibration_corpus_sha256: "abc".into(),
+            calibration_corpus_n: 6465,
+            sample_size_gate: 30,
+            manifold_threshold_global: 3.5,
+            projection_metadata: serde_json::json!({}),
+            cohort_centroids: serde_json::json!([]),
+            is_current: true,
+            canonical_bytes: format!("v1-{v1}").into_bytes(),
+            ed25519_sig: vec![0x01; 64],
+            ml_dsa_65_sig: vec![0x02; 3309],
+            signing_key_id: "ratchet-steward:1".into(),
+            inserted_at: chrono::Utc::now(),
+        };
+        backend.put_calibration_bundle(bundle_v1.clone()).await.unwrap();
+
+        let current = backend
+            .get_current_calibration_bundle()
+            .await
+            .unwrap()
+            .expect("v1 should be current after put");
+        assert_eq!(current.ratchet_calibration_version, v1);
+        assert!(current.is_current);
+
+        // Insert v2 with is_current=true; v1 must flip to false atomically.
+        let bundle_v2 = CalibrationBundle {
+            ratchet_calibration_version: v2,
+            canonical_bytes: format!("v2-{v2}").into_bytes(),
+            ..bundle_v1.clone()
+        };
+        backend.put_calibration_bundle(bundle_v2).await.unwrap();
+
+        let current = backend
+            .get_current_calibration_bundle()
+            .await
+            .unwrap()
+            .expect("v2 should be current after flip");
+        assert_eq!(current.ratchet_calibration_version, v2);
+        assert!(current.is_current);
+
+        // v1 must still be readable by version, but is_current=false.
+        let v1_row = backend
+            .get_calibration_bundle_by_version(v1)
+            .await
+            .unwrap()
+            .expect("v1 should still exist post-flip");
+        assert!(!v1_row.is_current, "v1 must be flipped to is_current=false");
+    }
+
+    /// Wrong-length signatures rejected as InvalidArgument before
+    /// hitting the DB CHECK constraint (typed error surface).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn detection_event_rejects_wrong_signature_lengths() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        use crate::derived::{
+            ConformityVariant, DerivedSchema, DetectionEvent, DetectionSeverity,
+        };
+        let bad = DetectionEvent {
+            detection_id: uuid::Uuid::new_v4(),
+            trace_id: "t".into(),
+            body_sha256: vec![0xAB; 32],
+            detector: "test".into(),
+            severity: DetectionSeverity::Info,
+            cohort_cell: serde_json::json!({}),
+            conformity_variant: ConformityVariant::Numeric,
+            conformity_payload: serde_json::json!({"score": 1.0}),
+            lens_core_version: "0.1.0".into(),
+            ratchet_calibration_version: 1,
+            canonical_bytes: b"x".to_vec(),
+            ed25519_sig: vec![0x01; 32], // WRONG: must be 64
+            ml_dsa_65_sig: vec![0x02; 3309],
+            signing_key_id: "test:1".into(),
+            ts: chrono::Utc::now(),
+        };
+        let err = backend.put_detection_event(bad).await.unwrap_err();
+        assert!(matches!(err, crate::derived::Error::InvalidArgument(_)));
     }
 }

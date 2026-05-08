@@ -40,9 +40,18 @@
 
 // Trait surfaces consumers compose against. Federation peers
 // implement against these, not concrete backend types.
+pub use crate::derived::DerivedSchema;
 pub use crate::federation::FederationDirectory;
 pub use crate::outbound::OutboundQueue;
 pub use crate::store::Backend;
+
+// Lens-derived schema types (v0.4.3, CIRISPersist#18). Lens-core
+// writes detection events; RATCHET writes calibration bundles; both
+// flow through Engine.put_* (PyO3) or DerivedSchema impls (rlib).
+pub use crate::derived::{
+    CalibrationBundle, CohortCentroid, ConformityVariant, DetectionEvent, DetectionSeverity,
+    EventFilter, ProjectionMetadata, Standardization,
+};
 
 // Steward signing surface (v0.4.2, CIRISPersist#17). Federation
 // peers signing as their deployment's steward identity construct

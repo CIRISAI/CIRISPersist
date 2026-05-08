@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -99,9 +99,14 @@ thiserror     = "2"
 tracing       = "0.1"
 base64        = "0.22"
 hex           = "0.4"
+# v0.4.3 (CIRISPersist#18) — UUID type for cirislens_derived
+# .detection_events.detection_id. v4 generation lives at the
+# caller (lens-core); persist just stores. tokio-postgres's
+# with-uuid-1 feature gives us ToSql/FromSql for UUID columns.
+uuid          = { version = "1", features = ["serde", "v4"] }
 
 # Phase 1 — postgres feature
-tokio-postgres    = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1"], optional = true }
+tokio-postgres    = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"], optional = true }
 deadpool-postgres = { version = "0.14", optional = true }
 bytes             = { version = "1", optional = true }
 postgres-types    = { version = "0.2", optional = true }
