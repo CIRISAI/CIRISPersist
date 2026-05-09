@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778298255650,
+  "lastUpdate": 1778344922163,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -6779,6 +6779,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23662858,
             "range": "± 506014",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "85b2b31714b0cc3b9c1a5c0bbfbbef3c1b774419",
+          "message": "0.4.7 — threat-model: AV-35 clarified + AV-42 added (v0.4.3/v0.4.6 accommodation)\n\nPure documentation. No code change. Functionality identical to v0.4.6.\n\nThe v0.4.3 (#21) restoration of \"2.7.legacy\" plus the v0.4.6 (#22)\nattempt_index=0 fallback at the legacy arm exposed two gaps in\ndocs/THREAT_MODEL.md:\n\n1. AV-35 mitigation language overstated by claiming the routing\n   input itself is signed. True at 2.7.0/2.7.9 (both 9-field\n   canonicals carry trace_schema_version as a signed field); NOT\n   true at 2.7.legacy (2-field canonical only signs\n   {components, trace_level}). The actual load-bearing safety\n   property is verify-bound-to-arm-canonical: a signature signed\n   against arm-A's canonical cannot pass arm-B's verification.\n   Routing-input forgery buys an attacker nothing because the\n   verify step deterministically fails on wrong-arm reconstruction.\n   Narrative + summary table updated.\n\n2. AV-42 added: Legacy attempt_index dedup-collapse. Pre-2.7.8.9\n   emitters that don't populate data.attempt_index collapse retries\n   on the dedup tuple. Schema-version-gated (only 2.7.0 and\n   2.7.legacy); 2.7.9 still strict; malformed still errors through\n   AV-17. Sunset by federation_canonical_match_total{wire=\"2.7.legacy\"}\n   7-day-zero soak. Bounded by signing-key control. Cross-agent\n   collision closed by agent_id_hash in dedup tuple (AV-9, v0.1.2).\n   Lens-side synthesis impossible (legacy 2-field canonical signs\n   components[].data; mutation invalidates verify) — federation's\n   append-only contract takes priority over per-row dedup fidelity\n   at the legacy arm.\n\n§9 Threat Posture Summary updated: v0.3.6 → v0.4.6. Added blocks\nfor v0.4.0 outbound queue (AV-40, AV-41 — already shipped, previously\nuncatalogued in §9) and v0.4.3..v0.4.6 legacy accommodation\n(AV-35 preserved, AV-42 documented residual). Total closed:\nfifteen v0.2.0..v0.4.6 attack vectors.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-09T11:33:05-05:00",
+          "tree_id": "99de63a2762554aa74bbabb68dbd098944ebf25f",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/85b2b31714b0cc3b9c1a5c0bbfbbef3c1b774419"
+        },
+        "date": 1778344921797,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 102360,
+            "range": "± 844",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 242838,
+            "range": "± 683",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 524127,
+            "range": "± 1580",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1855738,
+            "range": "± 18411",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 365,
+            "range": "± 16",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1587,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8733,
+            "range": "± 31",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 368,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3149,
+            "range": "± 45",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9734,
+            "range": "± 21",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42163,
+            "range": "± 153",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2473251,
+            "range": "± 231353",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6752350,
+            "range": "± 269048",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 24071769,
+            "range": "± 863977",
             "unit": "ns/iter"
           }
         ]
