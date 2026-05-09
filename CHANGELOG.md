@@ -5,6 +5,112 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.4.5] — 2026-05-09
+
+**CIRISVerify deps bump v1.9.0 → v1.13.2.** Closes
+[CIRISPersist#20](https://github.com/CIRISAI/CIRISPersist/issues/20).
+Pure dep-only bump; no public-API changes in persist itself, no
+behavior change in any code path.
+
+### Why we jumped past the issue's v1.10.1 target
+
+CIRISPersist#20 was filed against v1.10.1 (the version current at
+filing time, 2026-05-04). Verify shipped four minor versions in the
+interim:
+
+| Verify version | What landed | Persist API touched? |
+|---|---|---|
+| v1.10.0 | `ciris-build-sign register` subcommand (CLI) | No |
+| v1.10.1 | HTTP `/v1/builds` cutover, drops `REGISTRY_JWT_SECRET` | No |
+| v1.10.2 | `register` writes all 3 tables atomically | No |
+| v1.11.0 | `RegistryClient` per-call project (CLI/library helper) | No |
+| v1.11.1 | `register` writes `binary_hash` not `manifest_hash` | No |
+| v1.11.2 | Step 5/6 walks agent_root when `python_hashes` is None | No |
+| v1.11.3 | CI: switch zig install to mlugg/setup-zig | No |
+| v1.12.0 | Per-call project on `RegistryClient` (closes #10/#11) | No |
+| v1.12.1 | post-release-verify workflow fix | No |
+| v1.12.2 | Defensive `_find_binary` platform suffix order (closes #13) | No |
+| **v1.13.0** | **`tree_verify::{verify_tree, TreeVerifyRequest, TreeVerifyResult, FailedFile, FailedFileKind}` — runtime tree-walking verifier (closes #9)** | No (consumer-side feature) |
+| v1.13.1 | rustdoc broken-intra-doc-links fix | No |
+| v1.13.2 | Install libtss2 in post-release-verify (Linux wheel TPM dep) | No |
+
+Every change in this window is CLI / RegistryClient / `verify_tree`
+work — none of it touches `ciris-keyring`, `ciris-verify-core`'s
+`HybridVerifier` / `Ed25519Verifier` / `MlDsa65Verifier`, or
+`ciris-crypto`'s primitive surface that persist consumes today.
+`cargo build` + `cargo test --lib` (179 tests) + `cargo clippy
+-D warnings` all pass against v1.13.2 with no persist-side changes.
+
+### What v1.13.0's `verify_tree` is for (informational)
+
+Runtime tree-walking verifier closing CIRISVerify#9. CIRISAgent uses
+it for L4 file-integrity attestation:
+
+```rust
+// ciris_verify_core::tree_verify
+pub async fn verify_tree(
+    request: &TreeVerifyRequest,
+    registry: &RegistryClient,
+) -> Result<TreeVerifyResult, VerifyError>;
+```
+
+Walks a source tree on disk, hashes via the same
+`walk_file_tree` + `FileTreeExtras::compute_tree_hash` algorithm
+`ciris-build-sign sign --tree` writes into
+`builds.file_manifest_hash`, fetches the registered manifest, and
+returns per-file divergences (`Missing` / `Extra` / `Mismatch`)
+plus a top-level `valid` verdict.
+
+Persist itself doesn't call `verify_tree` — that's an agent
+attestation concern, not a substrate concern. But the surface is
+now available to any consumer that imports persist's curated
+prelude (or the workspace-coherent `ciris-verify-core` directly).
+
+CIRISAgent's integration:
+- `ciris_engine/.../attestation/tree_verify.py` wraps `verify_tree`,
+  pulls `CANONICAL_RULES` from `tools/dev/stage_runtime` (the
+  drift-prevention singleton — same `ExemptRules` the CI sign step
+  uses, so runtime walk reproduces the canonical hash byte-for-
+  byte).
+- Mobile (Chaquopy) → Algorithm B (`startup_python_hashes.json`),
+  caps at L3.
+- Desktop / server / docker → Algorithm A (`verify_tree`), reaches
+  L4. Run before `run_attestation_sync`; result overlays
+  `attestation_data["python_integrity"]`.
+
+### Readiness for CIRISVerify v2.0
+
+CIRISVerify#7 (filed 2026-05-04, still open) is the prereq for
+`CIRISPersist#19`'s federated `SecretsService`: ciris-crypto v2.0
+must add `aes-gcm`, `kdf` (PBKDF2 + HKDF), `hmac`, and `random`
+features so persist can wire them into `src/secrets/crypto.rs` per
+FSD §7.5a. v0.4.5 lands persist in shape so this is a single
+Cargo.toml tag flip when v2.0 ships:
+
+```diff
+- ciris-keyring     = { ... tag = "v1.13.2", features = ["pqc-ml-dsa"] }
+- ciris-verify-core = { ... tag = "v1.13.2" }
+- ciris-crypto      = { ... tag = "v1.13.2", features = ["ed25519", "pqc-ml-dsa"] }
++ ciris-keyring     = { ... tag = "v2.0.0",  features = ["pqc-ml-dsa", "symmetric-derivation"] }
++ ciris-verify-core = { ... tag = "v2.0.0" }
++ ciris-crypto      = { ... tag = "v2.0.0",  features = [
++     "ed25519", "pqc-ml-dsa",
++     "aes-gcm", "kdf", "hmac", "random",
++ ] }
+```
+
+The `secrets-*` cargo features documented in
+`FSD/POST_INGEST_FILTER_PIPELINE.md §2.4` light up at that point;
+the `src/secrets/` module per §2.2 lands as a clean addition with
+a single import site (`src/secrets/crypto.rs` → `ciris_crypto::*`).
+The crypto-through-ciris-crypto invariant (FSD §7.5a) is unchanged:
+persist takes ZERO direct deps on AES-GCM/PBKDF2/HKDF/HMAC primitive
+crates ever — CIRISVerify is the federation's crypto authority.
+
+If verify chooses to ship the crypto facade in a v1.14.x patch
+instead of v2.0, the same Cargo.toml flip applies; only the tag
+string changes. Either way, persist is ready.
+
 ## [0.4.4] — 2026-05-08
 
 **CI hygiene patch on top of v0.4.3.** v0.4.3 (commit 826c142) shipped
