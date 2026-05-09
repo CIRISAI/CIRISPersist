@@ -5,6 +5,78 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.4.7] — 2026-05-09
+
+**Threat-model documentation update for v0.4.3 + v0.4.6 legacy
+accommodation.** Pure documentation; no code change. Functionality
+identical to v0.4.6.
+
+The v0.4.3 (CIRISPersist#21) restoration of `"2.7.legacy"` plus the
+v0.4.6 (CIRISPersist#22) `attempt_index = 0` fallback at the legacy
+arm exposed two documentation gaps in `docs/THREAT_MODEL.md` that
+this release closes:
+
+### Gap 1 — AV-35 mitigation language was imprecise
+
+Pre-v0.4.7, AV-35 said deterministic dispatch is safe because
+*"the field is part of signed canonical bytes, so an attacker
+cannot forge it without breaking the signature."*
+
+That's true at `2.7.0` and `2.7.9` (both 9-field canonicals carry
+`trace_schema_version` as a signed field). It's NOT true at
+`"2.7.legacy"` — the 2-field canonical only signs
+`{components, trace_level}`.
+
+The actual load-bearing safety property is **verification is bound
+to the dispatch arm's canonical**: a signature signed against arm-A's
+canonical bytes cannot pass arm-B's verification. Routing-input
+forgery buys an attacker nothing because the verify step
+deterministically fails on a wrong-arm reconstruction.
+
+AV-35 narrative + summary table updated to clarify. The structural
+invariant has always held; only the documentation overstated WHY.
+
+### Gap 2 — AV-42 added: legacy `attempt_index` dedup-collapse
+
+The v0.4.6 fallback documented in CHANGELOG was not in the threat
+model itself. v0.4.7 adds AV-42 covering:
+
+- **Attack** — pre-2.7.8.9 emitters that don't populate
+  `data.attempt_index` collapse retries on the dedup tuple (only
+  the first row lands; subsequent retries hit ON CONFLICT DO
+  NOTHING).
+- **Mitigation** — schema-version-gated (only `2.7.0` and
+  `"2.7.legacy"`); 2.7.9 still strict; malformed values still error
+  through AV-17 typed paths; fallback fires for absence ONLY.
+- **Sunset** — telemetry-driven via
+  `federation_canonical_match_total{wire="2.7.legacy"}` 7-day-zero
+  soak window. Time-bounded by empirical observation, not
+  permanent.
+- **Bounded by signing-key control** — exploiting requires the
+  legitimate signer's key, with which the attacker can already
+  forge any trace; marginal capability is "compress retry semantics
+  on the dedup tuple."
+- **Why not lens-side** — the legacy 2-field canonical signs
+  `components[].data`; synthesizing `attempt_index` post-hoc on the
+  agent or lens side invalidates verify. Federation's append-only
+  contract takes priority over per-row dedup fidelity at the legacy
+  arm.
+
+Added as residual #15 in §8, summary-table row, and threat-posture
+summary block. Net positive item documented inline (AV-42's
+companion correction): the v0.4.6 503→422 reclass closes a
+previously-uncatalogued self-DoS amplification surface where
+schema-misclass-as-Store turned every malformed batch into a
+Retry-After hot loop.
+
+### Section §9 also updated
+
+`v0.3.6 Threat Posture Summary` → `v0.4.6 Threat Posture Summary`
+with new blocks for v0.4.0 outbound queue (AV-40, AV-41 — already
+shipped, previously uncatalogued in §9) and v0.4.3..v0.4.6 legacy
+accommodation (AV-35 preserved, AV-42 new). Total closed:
+fifteen v0.2.0..v0.4.6 attack vectors.
+
 ## [0.4.6] — 2026-05-09
 
 **Legacy attempt_index gate + decompose error reclassification.** Closes

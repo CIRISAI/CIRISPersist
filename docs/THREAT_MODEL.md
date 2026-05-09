@@ -1079,20 +1079,52 @@ or denormalization layer — getting a trace counted as 2-field for
 verify but interpreted as 9-field for storage.
 
 **Mitigation v0.3.0**: deterministic dispatch by
-`trace_schema_version` (the field is part of signed canonical
-bytes, so an attacker cannot forge it without breaking the
-signature). Each trace contributes to exactly one canonical-shape
-verify path. No shape-shopping; no spurious-sig-fail latency
-multiplier. The 2-field legacy path is reserved behind explicit
-`"2.7.legacy"` opt-in (not in `SUPPORTED_VERSIONS`); never silent
-fallback for unrecognized versions.
+`trace_schema_version`. Each trace contributes to exactly one
+canonical-shape verify path. No shape-shopping; no
+spurious-sig-fail latency multiplier.
+
+The load-bearing safety property is **verification is bound to the
+dispatch arm's canonical**: a signature signed against arm-A's
+canonical bytes cannot pass arm-B's verification. The arm
+selection happens BEFORE verify, but a wrong-arm selection
+deterministically fails verify because the reconstructed canonical
+bytes won't match what the agent signed. Forging the routing input
+itself buys an attacker nothing — they still need to produce a
+signature that verifies against THE arm they routed to, which
+requires the signing key.
+
+The dispatch input (`trace_schema_version`) is itself in the
+signed canonical bytes at `2.7.0` and `2.7.9` (both 9-field
+canonicals carry it as a signed field). At `"2.7.legacy"` the
+2-field canonical signs only `{components, trace_level}` — the
+version stamp is NOT in those signed bytes. Safety holds anyway
+because of the verify-bound-to-arm-canonical property above:
+even though the routing input isn't itself signed at the legacy
+arm, a legacy-signed trace verifies only against the 2-field
+canonical, and the agent's choice to sign that shape is what
+binds them to it.
 
 **Secondary**: typed `Error::UnsupportedSchemaVersion` from the
 schema-parse layer rejects out-of-allowlist versions before the
 verify dispatch runs (AV-12 mitigation overlap).
 
+**v0.4.3 (CIRISPersist#21) restoration of `"2.7.legacy"`**:
+`SUPPORTED_VERSIONS` is now `["2.7.0", "2.7.9", "2.7.legacy"]`.
+v0.4.0 had dropped `"2.7.legacy"` on a calendar/fleet-migration
+framing that didn't fit the federation's decentralized model;
+v0.4.3 restored it under the same telemetry-driven sunset rule
+`"2.7.0"` already follows
+(`federation_canonical_match_total{wire="2.7.legacy"}` 7-day-zero
+soak window). Pre-2.7.8.9 emitters that don't stamp
+`trace_schema_version` at all dispatch deterministically to the
+legacy arm via serde-default — absence is the deterministic
+signal, NOT a try-list fallback (TRACE_WIRE_FORMAT.md §8
+prohibition on iterative arm-shopping is preserved). The
+verify-bound-to-arm-canonical property holds at the legacy arm
+identically; safety is unchanged from the v0.3.0 establishment.
+
 **Residual**: when `SUPPORTED_VERSIONS` legitimately holds multiple
-versions during a rollout window, both dispatch arms are live.
+versions during a rollout window, all three dispatch arms are live.
 Each is independent (no cross-version field reuse); the per-version
 review (§10) ensures shape independence.
 
@@ -1168,6 +1200,84 @@ over time (lens cohort cross-validation against behavioral
 observation); persist's substrate provides the cryptographic floor
 that makes the cohort-correctness claim measurable in the first
 place.
+
+### 3.10 Legacy schema accommodation (v0.4.3 / v0.4.6)
+
+Vectors emerge from the v0.4.3 restoration of `"2.7.legacy"` to
+`SUPPORTED_VERSIONS` (CIRISPersist#21) plus the v0.4.6 graceful-
+fallback for `attempt_index` at the legacy / 2.7.0 arms
+(CIRISPersist#22). Both changes accommodate pre-2.7.8.9 emitters
+that physically cannot be patched (the bridge cannot mutate signed
+bytes without invalidating verify). The accommodations are
+schema-version-gated, sunset-driven, and bounded by signing-key
+control — they don't widen the federation-wide attack surface, but
+they do introduce a documented agent-internal fidelity trade-off
+worth recording.
+
+#### AV-42: Legacy `attempt_index` dedup-collapse
+
+**Attack**: At `trace_schema_version ∈ {"2.7.0", "2.7.legacy"}`,
+components without `data.attempt_index` decompose with
+`attempt_index = 0` (v0.4.6 fallback). Multiple retries on the
+same `(agent_id_hash, trace_id, thought_id, event_type)` collapse
+on the dedup tuple
+`(agent_id_hash, trace_id, thought_id, event_type, attempt_index)`
+— only the first row lands; subsequent retries hit ON CONFLICT
+DO NOTHING and are silently skipped. An attacker controlling the
+signing key could in principle exploit this to suppress later
+retries with content different from the first.
+
+**Mitigation v0.4.6**: schema-version-gated. 2.7.9 still strict
+(`MissingField("attempt_index")` rejects absence in the typed
+parse layer); fallback fires only at `2.7.0` and `"2.7.legacy"`.
+Malformed values (negative, wrong type, out of range) still error
+through the typed paths (AV-17 protection unchanged) — fallback
+fires ONLY for the absence case (`MissingField`), not for any
+shape that suggests adversarial input.
+
+**Sunset by observed traffic**: the same telemetry-driven rule
+that gates `"2.7.0"` and `"2.7.legacy"` themselves
+(`federation_canonical_match_total{wire="<dialect>"}` 7-day-zero
+soak window) deprecates the dedup-collapse fallback once
+2.7.6-era traffic stops. The accommodation is bounded in time by
+empirical observation, not committed-to-forever.
+
+**Bounded by signing-key control**: an attacker exploiting this
+requires the legitimate signer's key. With the key, they can
+already forge any trace — the marginal capability gained is
+"compress retry semantics on the dedup tuple," which barely
+adds to their existing forgery capability. Cross-agent
+collision is closed by `agent_id_hash` in the dedup tuple
+(AV-9 mitigation, v0.1.2).
+
+**Why not lens-side fix**: the legacy 2-field canonical signs
+`{components, trace_level}`, so `components[].data` IS in the
+signed bytes. Synthesizing `data.attempt_index` post-hoc on the
+agent or lens side would invalidate the verify the v0.4.3
+legacy-restoration just got working. The federation's append-only
+contract takes priority over per-row dedup fidelity for legacy
+traffic; persist accepts the trade-off and documents it.
+
+**Companion correction (v0.4.6 / CIRISPersist#22)**: prior to
+v0.4.6, `decompose`'s `Schema(MissingField)` errors were
+mis-classified as `IngestError::Store` at `src/ingest.rs:229`,
+sending HTTP 503 + Retry-After (lens convention for transient
+backend faults) for what is actually a deterministic schema
+mismatch. Agents retried indefinitely on a 4xx shape, creating a
+self-DoS amplification surface (legitimate clients hammering
+persist on each malformed batch). v0.4.6's typed
+`store::Error::Schema(s) → IngestError::Schema(s)` split routes
+schema rejects to HTTP 422 (give-up); agents surface to ops
+instead of looping. **Net positive on the DoS-amplification
+surface**, not previously catalogued as its own AV because the
+threat model assumed schema rejects had always routed to 422.
+
+**Residual**: legacy-version retries within one agent collapse on
+the dedup key. Cross-agent collision closed by AV-9. Time-bounded
+by AV-42 sunset rule (observability-driven). The accommodation
+exists because pre-2.7.8.9 traffic is real and unrecoverable
+otherwise; the sunset rule is the discipline that prevents
+accommodation-creep into permanent technical debt.
 
 ### 3.11 Outbound queue substrate (v0.4.0)
 
@@ -1358,13 +1468,14 @@ incentive against doing so.
 | AV-32 | Cold-path PQC denial-of-completion | Per-write cold-path on engine's tokio runtime (no external network/service to deny); v0.3.2 sweep primitive (`Engine.run_pqc_sweep`) provides recovery; `pqc_sweep_on_init=True` constructor default runs sweep at boot | Writer contract documented in V004 schema header; persist owns the implementation (CIRISPersist#10) | **✓ Mitigated v0.3.1+v0.3.2** | — |
 | AV-33 | Bound-signature stripping (PQC over classical-only) | Hybrid scheme signs PQC over `(canonical \|\| classical_sig)`; persist's `HybridVerifier` rebuilds bound payload before PQC verify and rejects PQC-over-canonical-only | Matches CIRISVerify `HybridSignature` spec; primitive enforced at ciris-crypto layer, not reimplemented persist-side | **✓ Mitigated v0.2.0** | — |
 | AV-34 | Cross-shape canonical injection at 2.7.0 | Deterministic dispatch by `trace_schema_version`; per-component `agent_id_hash` (v0.3.0) and `deployment_profile` (v0.3.4) silently ignored at 2.7.0 — don't enter canonical bytes, don't affect dedup; byte-identical canonical with vs. without injection at 2.7.0 | Schema-version-aware decompose at 2.7.9 requires the shape (typed `MissingField` on absence); regression tests assert byte-identity | **✓ Mitigated v0.3.0+v0.3.4** | — |
-| AV-35 | Schema-version dispatch attack (try-N-shapes) | v0.3.0 deterministic dispatch — each trace contributes to exactly one canonical-shape verify path; no shape-shopping; no spurious-sig-fail latency multiplier | Typed `Error::UnsupportedSchemaVersion` rejects out-of-allowlist versions before dispatch (AV-12 overlap) | **✓ Mitigated v0.3.0** | — |
+| AV-35 | Schema-version dispatch attack (try-N-shapes) | v0.3.0 deterministic dispatch — each trace contributes to exactly one canonical-shape verify path; verification is bound to the dispatch arm's canonical (a wrong-arm selection deterministically fails verify); v0.4.3 (`"2.7.legacy"` restoration) preserves the property — even though the routing input isn't itself signed at the legacy arm, a legacy-signed trace verifies only against the 2-field canonical | Typed `Error::UnsupportedSchemaVersion` rejects out-of-allowlist versions before dispatch (AV-12 overlap); telemetry-driven sunset rule (AV-42) bounds the legacy arm's lifetime | **✓ Mitigated v0.3.0; preserved at v0.4.3** | — |
 | AV-36 | LLM_CALL parent-linkage substitution | v0.3.3 strict-parse at 2.7.9 — `MissingField("data.parent_event_type")` / `parent_attempt_index` rejects envelopes missing the wire fields; no substitution at 2.7.9 | Pre-v0.3.3 `parent_event_type='LLM_CALL'` rows tagged for RATCHET workaround via `handler_name`; new traffic post-v0.3.3 lands with spec-correct linkage | **✓ Mitigated v0.3.3** | — |
 | AV-37 | deployment_profile cohort-identity injection | `deployment_profile` rides in 2.7.9 signed canonical bytes; agent's signature commits to declared labels; strict-parse at 2.7.9 rejects missing block (`MissingField("deployment_profile")`) | `deployment_resourcing` is intentionally lens-computed from cost/tokens/model observation, not agent-declared — labels can lie but emergent operational reality cannot | **✓ Mitigated v0.3.4** | — |
 | AV-38 | Per-key DSAR scope violation | v0.3.6 BREAKING: `signature_key_id` is REQUIRED on `delete_traces_for_agent`; deletion is scoped to `(agent_id_hash, signing_key_id)` at all three substrate layers (trace_events, trace_llm_calls cascade, federation_keys cascade); no `Option<>` back-compat shim | Lens-side DSAR audit ledger captures request envelope + signature verification independent of persist | **✓ Mitigated v0.3.6** (broke v0.3.5 shape; v0.3.5 yanked from PyPI) | — |
 | AV-39 | verify-via-persist bypass (consumer calls ciris_crypto direct) | `Engine.verify_hybrid` is the federation's single-source-of-truth — accepts arbitrary canonical bytes (not just CompleteTrace shapes), exposes the policy machinery (Strict / SoftFreshness / Ed25519Fallback), is the path of least resistance | Documented as the closure pattern (CIRISPersist#7); `docs/V0.2.0_VERIFY_SUBSUMPTION.md` carries the architectural reasoning | ✓ Architectural closure — not a runtime gate but the design path | — |
 | AV-40 | Outbound queue disk exhaustion | Per-row `body_size_bytes ≤ 8 MiB` + `ttl_seconds > 0` + `max_attempts > 0` schema CHECK; `sweep_ttl_expired` operational primitive bounds row lifetime; FK on sender/destination_key_id (AV-28 trust boundary) | Operator-tunable sweep cadence; `oldest-pending-age` ops dashboard | **✓ Mitigated v0.4.0** | — |
 | AV-41 | Spoofed in_reply_to ACK matching | ACK envelopes go through persist's normal verify pipeline (AV-1 unknown-key gate + AV-39 verify_hybrid via persist) before `mark_ack_received` is called; `body_sha256` content-derived matching is downstream of signature verify | Bound signature pattern (AV-33) closes Ed25519-alone forgery branch | **✓ Mitigated v0.4.0** | — |
+| AV-42 | Legacy `attempt_index` dedup-collapse | v0.4.6 schema-version-gated fallback — only `2.7.0` / `"2.7.legacy"` arms fall back to `attempt_index = 0` on absence (`MissingField`); 2.7.9 still strict; malformed values (negative, wrong type, out of range) still error through AV-17 typed paths; fallback fires for absence ONLY, not for adversarial-shaped values; cross-agent collision closed by `agent_id_hash` in dedup tuple (AV-9) | Telemetry-driven sunset (`federation_canonical_match_total{wire="2.7.legacy"}` 7-day-zero soak); accommodation is time-bounded by empirical observation, not permanent | **✓ Documented residual v0.4.6** (deliberate fidelity trade-off; pre-2.7.8.9 traffic is unrecoverable otherwise — federation's append-only contract takes priority over per-row dedup fidelity for legacy arm) | — |
 
 ---
 
@@ -1558,9 +1669,27 @@ Risks CIRISPersist mitigates but cannot fully eliminate.
     policy machinery. Architectural cost (drift, per-consumer
     policy maintenance) is the disincentive; not a runtime gate.
 
+15. **(v0.4.6+) Legacy `attempt_index` dedup-collapse** (AV-42).
+    Pre-2.7.8.9 emitters never populate `data.attempt_index`; v0.4.6
+    falls back to 0 at the `2.7.0` and `"2.7.legacy"` arms so legacy
+    traffic ingests rather than rejects. Within one legacy agent,
+    retries on the same `(trace_id, thought_id, event_type)` collapse
+    on the dedup tuple — only the first row lands. Bounded by
+    signing-key control (cross-agent collision closed by
+    `agent_id_hash` in dedup tuple); time-bounded by sunset rule
+    (`federation_canonical_match_total{wire="2.7.legacy"}` 7-day-zero
+    soak). The accommodation exists because pre-2.7.8.9 traffic is
+    real and unrecoverable otherwise (the legacy 2-field canonical
+    signs `components[].data`, so synthesizing `attempt_index`
+    post-hoc on the agent or lens side invalidates verify); the
+    federation's append-only contract takes priority over per-row
+    dedup fidelity at the legacy arm. Sunset rule enforces
+    accommodation-discipline against drift into permanent technical
+    debt.
+
 ---
 
-## 9. v0.3.6 Threat Posture Summary
+## 9. v0.4.6 Threat Posture Summary
 
 ```
 v0.1.1 INTEGRATION-BLOCKING EXPOSURES → closed in v0.1.2
@@ -1599,11 +1728,21 @@ v0.3.6 DSAR + VERIFY PRIMITIVES
   ✓ AV-38 per-key DSAR scope violation (BREAKING: signature_key_id required)
   ✓ AV-39 verify-via-persist bypass (architectural closure via Engine.verify_hybrid)
 
+v0.4.0 OUTBOUND QUEUE SUBSTRATE
+  ✓ AV-40 outbound queue disk exhaustion (per-row size + ttl + max_attempts schema CHECK)
+  ✓ AV-41 spoofed in_reply_to ACK matching (verify-pipeline-gated before mark_ack_received)
+
+v0.4.3..v0.4.6 LEGACY ACCOMMODATION
+  ✓ AV-35 dispatch attack property preserved at "2.7.legacy" (verify-bound-to-arm-canonical
+          holds even though routing input isn't itself signed at the legacy arm)
+  ✓ AV-42 legacy attempt_index dedup-collapse (documented residual; schema-version-gated;
+          telemetry-driven sunset; bounded by signing-key control)
+
 PHASE-2-CLOSES (architecturally deferred)
   ⚠ AV-2  stolen-key forgery (peer-replicate audit chain)
   ⚠ AV-10 audit anchor capture without verification
 
-v0.4.x TRACK
+v0.4.x TRACK (still pending)
   ⚠ AV-11 explicit rotate_public_key(rotation_proof) API
   ⚠ AV-16 side-channel timing on key-directory enumeration
   ⚠ AV-20..AV-23 (statement_timeout, per-agent rate limiting,
@@ -1621,13 +1760,14 @@ DESIGN-DECISIONS-PER-MISSION (intentional, not defects)
   ✓ AV-39 verify-via-persist single-source-of-truth (CIRISPersist#7 pattern)
 
 CARGO AUDIT
-  ✓ 0 vulnerabilities across deps as of v0.3.6
+  ✓ 0 vulnerabilities across deps as of v0.4.7
 ```
 
-**Twelve v0.2.0..v0.3.6 attack vectors closed**: federation
+**Fifteen v0.2.0..v0.4.6 attack vectors closed**: federation
 directory integrity (AV-28..AV-30), hybrid PQC posture
 (AV-31..AV-33), wire-format extensions (AV-34..AV-37), DSAR + verify
-primitives (AV-38..AV-39).
+primitives (AV-38..AV-39), outbound queue substrate (AV-40..AV-41),
+legacy accommodation residual documented (AV-42).
 
 Three architectural-closure patterns repeated across the surface:
 
