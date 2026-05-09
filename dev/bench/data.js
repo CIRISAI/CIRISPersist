@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778263699029,
+  "lastUpdate": 1778294595411,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -6551,6 +6551,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23568918,
             "range": "± 343702",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "63eae10f9ba68904a91e09cb89f2ab67e526aa5f",
+          "message": "0.4.5 — bump CIRISVerify deps v1.9.0 → v1.13.2 (CIRISPersist#20)\n\nPure dep-only bump. No public-API changes in persist; no behavior\nchange in any code path. cargo build + cargo test --lib (179 tests)\n+ cargo clippy -D warnings all pass against v1.13.2.\n\nWhy we jumped past the issue's v1.10.1 target: verify shipped four\nminor versions in the interim (v1.10.0 → v1.13.2). v1.10.0..v1.13.2\nis all CLI / RegistryClient / `verify_tree` work — nothing touches\n`ciris-keyring`, `ciris-verify-core`'s HybridVerifier, or\n`ciris-crypto`'s primitive surface that persist consumes today. So\nwe land on the current verify line in one move.\n\nWhat v1.13.0's `verify_tree` is for (informational): runtime tree-\nwalking verifier closing CIRISVerify#9. Walks a source tree, hashes\nvia the same Algorithm A `ciris-build-sign sign --tree` writes into\n`builds.file_manifest_hash`, returns per-file divergences. CIRISAgent\nuses it for L4 file-integrity attestation\n(`ciris_engine/.../attestation/tree_verify.py`); persist itself\ndoesn't call it.\n\nReadiness for CIRISVerify v2.0: CIRISVerify#7 is the prereq for\nCIRISPersist#19's federated SecretsService — verify v2.0 (or v1.14.x\npatch) must add `aes-gcm`, `kdf` (PBKDF2+HKDF), `hmac`, and `random`\nfeatures to ciris-crypto. v0.4.5 lands persist in shape so this is a\nsingle Cargo.toml tag flip + cargo features turn-on when verify\nships. The crypto-through-ciris-crypto invariant (FSD §7.5a) is\nunchanged: persist takes ZERO direct deps on AES-GCM/PBKDF2/HKDF/HMAC\nprimitive crates ever.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-08T21:34:25-05:00",
+          "tree_id": "c610dea904e6d4b20d0a58dd304ea61d192e8e83",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/63eae10f9ba68904a91e09cb89f2ab67e526aa5f"
+        },
+        "date": 1778294594497,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 107731,
+            "range": "± 740",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 249380,
+            "range": "± 3125",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 532698,
+            "range": "± 2713",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1872639,
+            "range": "± 23721",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 346,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1431,
+            "range": "± 32",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8281,
+            "range": "± 31",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 362,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3084,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9535,
+            "range": "± 44",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41382,
+            "range": "± 125",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2298574,
+            "range": "± 73137",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6761545,
+            "range": "± 158301",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23959569,
+            "range": "± 228375",
             "unit": "ns/iter"
           }
         ]
