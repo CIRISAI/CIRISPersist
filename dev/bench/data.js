@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778294595411,
+  "lastUpdate": 1778298255650,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -6665,6 +6665,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23959569,
             "range": "± 228375",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "de25e97712298cf322d42e84eab54dc5d71adbe4",
+          "message": "0.4.6 — legacy attempt_index gate + decompose error reclass (CIRISPersist#22)\n\nPre-2.7.8 emitters never populate `data.attempt_index`. Two persist-\nside bugs were chaining off this:\n\n1. `decompose` raised `Schema(MissingField(\"attempt_index\"))` for\n   any pre-2.7.8 component. Per the v0.4.3 (#21) legacy restoration,\n   those traces SHOULD ingest cleanly.\n2. `ingest.rs:229` mis-classified the schema reject as a `Store`\n   error, sending 503 + Retry-After instead of 422. Agents retried\n   forever on a deterministic 4xx.\n\nFixes:\n\n- `decompose.rs:82` — schema-version-gated attempt_index sourcing,\n  same shape as the existing parent_event_type/parent_attempt_index\n  gate (CIRISPersist#12, v0.3.3). 2.7.9 strict; 2.7.0/2.7.legacy\n  fall back to 0 ONLY for the absence case. Malformed values\n  (negative, wrong type, out of range) still error.\n- `ingest.rs:229` — typed Schema/Store split in the decompose\n  map_err: `store::Error::Schema(s) → IngestError::Schema(s)`,\n  other → `IngestError::Store`. Stops the 503-retry loop on\n  deterministic schema mismatches. The two `insert_*_batch`\n  callsites stay on Store (they legitimately return backend-write\n  errors).\n- `IngestError::detail()` + `schema::Error::detail()` — non-breaking\n  field-name surfacing. PyO3 emits Python exception `args` as\n  `(kind, detail)` when detail is present, `(kind,)` otherwise.\n  Lens consumers read `e.args[1]` for the field name without\n  source-diving persist.\n\nTests: 184 pass (5 new over baseline 179). Load-bearing:\n`decompose_schema_error_routes_to_schema_variant` explicitly panics\nwith REGRESSION marker if the fix is reverted.\n\nOut of scope follow-up: `LlmCallSummary` carries its own typed\n`attempt_index: u32`. If bridge traffic includes pre-2.7.8 LLM_CALL\ncomponents, lifting that into the legacy fallback is a separate\nissue.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-08T22:36:30-05:00",
+          "tree_id": "737c63d72e99cd74f65f1ce1c5e76dff24dc3102",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/de25e97712298cf322d42e84eab54dc5d71adbe4"
+        },
+        "date": 1778298254767,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 105775,
+            "range": "± 5154",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 246470,
+            "range": "± 2443",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 528871,
+            "range": "± 2030",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1857666,
+            "range": "± 18139",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 349,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1513,
+            "range": "± 18",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8244,
+            "range": "± 103",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 365,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3150,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9657,
+            "range": "± 20",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42215,
+            "range": "± 1235",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 621,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2252721,
+            "range": "± 96184",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6606224,
+            "range": "± 74023",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23662858,
+            "range": "± 506014",
             "unit": "ns/iter"
           }
         ]
