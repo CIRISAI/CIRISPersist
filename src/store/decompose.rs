@@ -79,7 +79,39 @@ pub fn decompose(trace: &CompleteTrace) -> Result<Decomposed, Error> {
     let mut llm_calls = Vec::new();
 
     for component in &trace.components {
-        let attempt_index = component.attempt_index().map_err(Error::Schema)?;
+        // v0.4.6 (CIRISPersist#22) — schema-version-gated attempt_index
+        // sourcing. Same shape as `build_llm_call_row`'s
+        // parent_event_type / parent_attempt_index gate below
+        // (CIRISPersist#12, v0.3.3).
+        //
+        //   2.7.9: REQUIRED on the wire. Reject the trace.
+        //   2.7.0 / 2.7.legacy / future: prefer wire field; fall back
+        //     to 0 ONLY for the absence case (MissingField). Malformed
+        //     values (negative, wrong type, out of range) still error —
+        //     those are signal, not legacy quirk.
+        //
+        // Why fallback to 0 for legacy: the 2-field legacy canonical
+        // signs `{components, trace_level}`, so components[].data IS
+        // in the signed bytes. We cannot synthesize attempt_index
+        // post-hoc on the agent or lens side without invalidating
+        // verify. Persist accepting attempt_index=0 for absent fields
+        // collapses legacy retries on the dedup tuple
+        // `(agent_id_hash, trace_id, thought_id, event_type, attempt_index)`,
+        // which is acceptable for backfill — the alternative is
+        // dropping pre-2.7.8 traces entirely, violating the
+        // federation's append-only contract.
+        //
+        // Same `federation_canonical_match_total{wire="2.7.legacy"}`
+        // 7-day-zero-traffic sunset rule (v0.4.3 / CIRISPersist#21)
+        // deprecates this fallback once 2.7.6-era traffic stops.
+        let attempt_index = match trace.trace_schema_version.as_str() {
+            "2.7.9" => component.attempt_index().map_err(Error::Schema)?,
+            _ => match component.attempt_index() {
+                Ok(n) => n,
+                Err(crate::schema::Error::MissingField("attempt_index")) => 0,
+                Err(other) => return Err(Error::Schema(other)),
+            },
+        };
 
         let cost = component.cost_summary();
 
@@ -461,16 +493,101 @@ mod tests {
     }
 
     #[test]
-    fn missing_attempt_index_is_typed_error() {
-        // Mission category §4: malformed agent data surfaces as a
+    fn missing_attempt_index_at_2_7_9_is_typed_error() {
+        // Mission category §4: malformed 2.7.9 data surfaces as a
         // typed schema error, not a panic. Decompose propagates.
+        //
+        // v0.4.6 (CIRISPersist#22) — only the strict 2.7.9 path
+        // raises MissingField now; legacy versions fall back to 0
+        // (see `legacy_2_7_0_decomposes_with_default_attempt_index_zero`).
         let mut trace = fixture_trace();
-        // Strip attempt_index from the first component — should fail.
+        trace.trace_schema_version = SchemaVersion::parse("2.7.9").unwrap();
+        // 2.7.9 also requires deployment_profile via the envelope
+        // gate, but decompose itself doesn't enforce that — it
+        // accepts None here. The MissingField path under test
+        // fires on the attempt_index strip alone.
         trace.components[0].data.remove("attempt_index");
         let err = decompose(&trace).unwrap_err();
         match err {
             Error::Schema(crate::schema::Error::MissingField("attempt_index")) => {}
             other => panic!("expected MissingField(attempt_index), got {other:?}"),
+        }
+    }
+
+    /// v0.4.6 (CIRISPersist#22) — pre-2.7.8 emitters never populate
+    /// `data.attempt_index`. Decompose at 2.7.0 / 2.7.legacy MUST
+    /// fall back to 0 rather than rejecting (the alternative is
+    /// dropping pre-2.7.8 traces entirely, violating the federation's
+    /// append-only contract). Same telemetry-driven sunset rule
+    /// `federation_canonical_match_total{wire="2.7.legacy"}`
+    /// deprecates this once 2.7.6-era traffic stops.
+    ///
+    /// Note: this test strips attempt_index from non-LLM components.
+    /// `LlmCallSummary` carries its own typed `attempt_index: u32`
+    /// (see `events.rs:259`); pre-2.7.8 LLM_CALL components without
+    /// that field fail at the LlmCallSummary deserialize, not at the
+    /// decompose-line-82 gate this fix targets. Lifting LLM_CALL's
+    /// attempt_index into the legacy fallback is a separate scope
+    /// (issue may follow-up if bridge traffic carries pre-2.7.8
+    /// LLM_CALL components).
+    #[test]
+    fn legacy_2_7_0_decomposes_with_default_attempt_index_zero() {
+        let mut trace = fixture_trace();
+        // Strip attempt_index from non-LLM components only (matching
+        // the scope of the decompose.rs:82 gate).
+        for c in &mut trace.components {
+            if c.event_type != ReasoningEventType::LlmCall {
+                c.data.remove("attempt_index");
+            }
+        }
+        let d = decompose(&trace).expect("legacy 2.7.0 absence MUST fall back to 0");
+        for row in &d.events {
+            if row.event_type == ReasoningEventType::LlmCall {
+                continue; // out of scope for this fix
+            }
+            assert_eq!(
+                row.attempt_index, 0,
+                "legacy fallback writes 0 for {:?}",
+                row.event_type
+            );
+        }
+    }
+
+    /// v0.4.6 (CIRISPersist#22) — forward-compat: if a legacy emitter
+    /// HAS populated `data.attempt_index` (mixed-version fleet), the
+    /// wire value MUST be honored, not silently overwritten with 0.
+    /// Same shape as the existing `parent_event_type` /
+    /// `parent_attempt_index` 2.7.0 fallback (CIRISPersist#12).
+    #[test]
+    fn legacy_2_7_0_with_explicit_attempt_index_uses_wire_value() {
+        let mut trace = fixture_trace();
+        // Bump component[3] to attempt_index=3 explicitly while
+        // leaving the others intact.
+        trace.components[3]
+            .data
+            .insert("attempt_index".to_owned(), serde_json::json!(3));
+        let d = decompose(&trace).expect("wire value honored");
+        // Component 3 (CONSCIENCE_RESULT recursive) gets attempt_index=3.
+        assert_eq!(d.events[3].attempt_index, 3);
+        // Other components keep their fixture values.
+        assert_eq!(d.events[0].attempt_index, 0);
+    }
+
+    /// v0.4.6 (CIRISPersist#22) — at the legacy gate, MALFORMED
+    /// values (negative, wrong type, out of range) still error.
+    /// The fallback ONLY catches the absence case — bad data is
+    /// signal, not legacy quirk.
+    #[test]
+    fn legacy_2_7_0_rejects_malformed_attempt_index() {
+        let mut trace = fixture_trace();
+        // Negative — not a valid retry counter.
+        trace.components[0]
+            .data
+            .insert("attempt_index".to_owned(), serde_json::json!(-1));
+        let err = decompose(&trace).unwrap_err();
+        match err {
+            Error::Schema(crate::schema::Error::NegativeAttemptIndex(-1)) => {}
+            other => panic!("expected NegativeAttemptIndex(-1), got {other:?}"),
         }
     }
 

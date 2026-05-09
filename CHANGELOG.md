@@ -5,6 +5,137 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.4.6] — 2026-05-09
+
+**Legacy attempt_index gate + decompose error reclassification.** Closes
+[CIRISPersist#22](https://github.com/CIRISAI/CIRISPersist/issues/22).
+
+A 2.7.6-stable trace (legacy emitter, no `data.attempt_index` on
+components) was hitting two persist-side bugs in series:
+
+1. `decompose` raised `Schema(MissingField("attempt_index"))` for
+   any component lacking the field (pre-2.7.8 emitters don't
+   populate it).
+2. The ingest call site mis-classified that schema error as a
+   `Store` error, so the lens emitted **HTTP 503 + `Retry-After: 5`**
+   instead of **422**. Agents retried forever on a deterministic
+   schema reject.
+
+We can't fix this lens-side: the 2-field legacy canonical signs
+`{components, trace_level}`, so `components[].data` IS in the
+signed bytes. Synthesizing `data.attempt_index` post-hoc on the
+agent or lens side would invalidate the verify the
+`v0.4.3 / CIRISPersist#21` legacy-restoration just got working.
+
+### 1. `decompose.rs:82` — schema-version-gated `attempt_index` sourcing
+
+Same shape as the existing `parent_event_type` / `parent_attempt_index`
+gate at `build_llm_call_row` (CIRISPersist#12, v0.3.3):
+
+- **2.7.9**: REQUIRED on the wire. Reject the trace.
+- **2.7.0 / 2.7.legacy** (and future-versions-not-yet-wired):
+  prefer wire field; fall back to **0** ONLY for the absence case
+  (`MissingField`). Malformed values (negative, wrong type, out of
+  range) still error — those are signal, not legacy quirk.
+
+Why fallback to 0 for legacy: the dedup-collapse cost (legacy
+retries deduping to attempt 0 on the
+`(agent_id_hash, trace_id, thought_id, event_type, attempt_index)`
+tuple) is acceptable for backfill — the alternative is dropping
+pre-2.7.8 traces entirely, violating the federation's append-only
+contract. Same telemetry-driven sunset rule
+`federation_canonical_match_total{wire="2.7.legacy"}` (v0.4.3 /
+CIRISPersist#21) deprecates the fallback once 2.7.6-era traffic
+stops.
+
+### 2. `ingest.rs:229` — typed Schema/Store error split
+
+```rust
+let mut d = crate::store::decompose(trace).map_err(|e| match e {
+    crate::store::Error::Schema(s) => IngestError::Schema(s),
+    other => IngestError::Store(other),
+})?;
+```
+
+`IngestError::Store` is documented (line 78-80) as
+"Backend write failure (DB unreachable, IO, etc.). Lens → HTTP 503
++ Retry-After." `decompose` returns `store::Error::Schema(...)` for
+deterministic schema mismatches, which now correctly round-trip as
+`IngestError::Schema` (line 62-65: "Lens → HTTP 422").
+
+The two `insert_*_batch` callsites at `ingest.rs:265` / `:270` were
+audited and stay on the `Store` arm — they legitimately return
+`StoreError` from the backend write itself.
+
+This stops the **503-retry loop on deterministic schema mismatches**:
+agents see 422, give up immediately, and surface the bad trace to
+ops instead of hammering the lens.
+
+### 3. `IngestError::detail()` — non-breaking field-name surfacing
+
+`IngestError::kind()` returns `&'static str` (closed-set token; can't
+include a dynamic field name). Pre-fix, `kind() == "schema_missing_field"`
+forced the bridge team to source-dive `decompose.rs` to find out
+WHICH field was missing.
+
+Added (option (b) per the issue, non-breaking):
+
+```rust
+impl crate::schema::Error {
+    pub fn detail(&self) -> Option<String> { /* … */ }
+}
+
+impl IngestError {
+    pub fn detail(&self) -> Option<String> { /* delegates to schema's */ }
+}
+```
+
+`schema::Error::detail()` returns the variant-specific dynamic
+content (field name for `MissingField`, version stamp for
+`UnsupportedSchemaVersion`, `field:expected:got` for
+`FieldTypeMismatch`, etc.) — closed-set or operator-supplied
+strings; AV-15-safe by construction.
+
+PyO3 surface (`Engine.receive_and_persist`) emits Python exception
+`args` as a 2-tuple `(kind, detail)` when detail is present;
+`(kind,)` otherwise. Lens consumers read:
+
+```python
+kind = e.args[0]
+detail = e.args[1] if len(e.args) > 1 else None
+```
+
+Backward-compatible: pre-fix consumers reading `e.args[0]` (or
+matching `str(e)` against a kind token) keep working.
+
+### Tests
+
+- `decompose::tests::missing_attempt_index_at_2_7_9_is_typed_error`
+  (renamed from `missing_attempt_index_is_typed_error`; gates the
+  strict 2.7.9 path)
+- `decompose::tests::legacy_2_7_0_decomposes_with_default_attempt_index_zero`
+  — pre-2.7.8 absence → fallback to 0
+- `decompose::tests::legacy_2_7_0_with_explicit_attempt_index_uses_wire_value`
+  — forward-compat: wire value honored when present
+- `decompose::tests::legacy_2_7_0_rejects_malformed_attempt_index`
+  — negative/wrong-type/out-of-range still error at the legacy gate
+- `ingest::tests::decompose_schema_error_routes_to_schema_variant`
+  — the load-bearing test for the 503-retry-loop fix; explicitly
+  panics with REGRESSION marker if the variant comes back as `Store`
+- `ingest::tests::ingest_error_detail_surfaces_missing_field_name` —
+  detail() returns the field name for MissingField
+
+184 lib tests pass (5 new over baseline 179).
+
+### Out of scope follow-up
+
+`LlmCallSummary` (`events.rs:259`) carries its own typed
+`attempt_index: u32` — pre-2.7.8 LLM_CALL components without that
+field fail at the LlmCallSummary deserialize, not at the
+decompose-line-82 gate this fix targets. If bridge traffic carries
+pre-2.7.8 LLM_CALL components, lifting LLM_CALL's attempt_index
+into the legacy fallback is a follow-up issue.
+
 ## [0.4.5] — 2026-05-09
 
 **CIRISVerify deps bump v1.9.0 → v1.13.2.** Closes

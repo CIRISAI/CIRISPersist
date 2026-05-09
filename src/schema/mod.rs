@@ -133,6 +133,44 @@ impl Error {
             Error::AttemptIndexOutOfRange { .. } => "schema_attempt_index_out_of_range",
         }
     }
+
+    /// v0.4.6 (CIRISPersist#22) — Variant-specific detail string.
+    ///
+    /// `kind()` returns the stable enum-discriminant token (e.g.
+    /// `"schema_missing_field"`); `detail()` returns the variant's
+    /// dynamic content (e.g. `"attempt_index"` for the missing-field
+    /// case) so callers can surface "WHICH field" to operators
+    /// without sourcediving the persist crate.
+    ///
+    /// THREAT_MODEL.md AV-15-safe by construction: every value
+    /// returned here is either a `&'static str` from a closed enum
+    /// of accessor names, a typed integer (`i64`, `u32`, `usize`),
+    /// or an operator-supplied configuration string already
+    /// surfaced through other paths (`UnsupportedSchemaVersion.got`
+    /// is the version stamp the agent put on the wire; if it's
+    /// adversarial that's already the lens's problem at the parse
+    /// layer). No raw user-payload strings cross this boundary.
+    ///
+    /// Returns `None` for `Json` because `serde_json::Error`'s
+    /// `Display` form may include parser-position text that echoes
+    /// untrusted bytes; callers wanting that level of detail use
+    /// the `tracing` log path.
+    pub fn detail(&self) -> Option<String> {
+        match self {
+            Error::Json(_) => None,
+            Error::UnsupportedSchemaVersion { got, .. } => Some(got.clone()),
+            Error::UnknownTraceLevel(s) => Some(s.clone()),
+            Error::MissingField(name) => Some((*name).to_string()),
+            Error::FieldTypeMismatch {
+                field,
+                expected,
+                got,
+            } => Some(format!("{field}:expected={expected},got={got}")),
+            Error::NegativeAttemptIndex(n) => Some(n.to_string()),
+            Error::DataTooDeep(d) => Some(d.to_string()),
+            Error::AttemptIndexOutOfRange { got, max } => Some(format!("got={got},max={max}")),
+        }
+    }
 }
 
 /// Maximum nesting depth of any component's `data` blob.

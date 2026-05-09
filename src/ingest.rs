@@ -104,6 +104,34 @@ impl IngestError {
             IngestError::Sign(_) => "sign_keyring",
         }
     }
+
+    /// v0.4.6 (CIRISPersist#22) — Variant-specific detail string.
+    ///
+    /// `kind()` returns the stable enum-discriminant token
+    /// (e.g. `"schema_missing_field"`); `detail()` returns the
+    /// variant's dynamic content (e.g. the field name
+    /// `"attempt_index"`) so callers can surface "WHICH field" /
+    /// "WHICH version" / etc. to operators without source-diving
+    /// persist.
+    ///
+    /// Currently delegates to the schema error's `detail()`; the
+    /// other variants don't yet carry a typed inner detail surface
+    /// (verify / scrub / store / sign return `None`). Adding more
+    /// is a follow-up — the schema arm covers the
+    /// missing-field-name case the bridge team flagged in #22.
+    ///
+    /// AV-15-safe: same boundary discipline as `kind()`. The
+    /// returned string is closed-set or operator-configurable
+    /// (never raw user-payload bytes).
+    pub fn detail(&self) -> Option<String> {
+        match self {
+            IngestError::Schema(e) => e.detail(),
+            IngestError::Verify(_)
+            | IngestError::Scrub(_)
+            | IngestError::Store(_)
+            | IngestError::Sign(_) => None,
+        }
+    }
 }
 
 /// Per-component scrub envelope produced by step 3.5.
@@ -226,7 +254,24 @@ where
         for event in &env.events {
             match event {
                 BatchEvent::CompleteTrace { trace, .. } => {
-                    let mut d = crate::store::decompose(trace).map_err(IngestError::Store)?;
+                    // v0.4.6 (CIRISPersist#22) — typed Schema/Store
+                    // split. `decompose` returns `store::Error`, which
+                    // can be `Schema(SchemaError)` for missing/wrong
+                    // fields — those are deterministic 4xx (lens 422),
+                    // NOT Store (lens 503 + Retry-After). Pre-fix the
+                    // blanket `map_err(IngestError::Store)` sent
+                    // schema rejects through the 503 path, triggering
+                    // hot agent retry loops on deterministic schema
+                    // mismatches. Preserve the variant.
+                    //
+                    // The two `insert_*_batch` callsites below
+                    // (lines ~265 / ~270) legitimately return
+                    // `StoreError` from the backend write itself, so
+                    // they correctly stay on the Store arm.
+                    let mut d = crate::store::decompose(trace).map_err(|e| match e {
+                        crate::store::Error::Schema(s) => IngestError::Schema(s),
+                        other => IngestError::Store(other),
+                    })?;
                     for row in &mut d.events {
                         let env_for_row = &envelopes[env_idx];
                         row.original_content_hash = Some(env_for_row.original_content_hash.clone());
@@ -722,6 +767,128 @@ mod tests {
             backend.snapshot_events().is_empty(),
             "rejected traces must produce zero rows"
         );
+    }
+
+    /// v0.4.6 (CIRISPersist#22) — decompose's schema-layer rejects
+    /// MUST surface as `IngestError::Schema` (lens 422), not
+    /// `IngestError::Store` (lens 503 + Retry-After). Pre-fix the
+    /// blanket `map_err(IngestError::Store)` triggered hot agent
+    /// retry loops on deterministic schema mismatches — agents saw
+    /// 503+Retry-After and hammered the lens forever. The fix
+    /// preserves the variant via a typed `match` on `store::Error`.
+    #[tokio::test]
+    async fn decompose_schema_error_routes_to_schema_variant() {
+        // Build a 2.7.9 trace that parses cleanly + verifies + then
+        // fails at decompose because `data.attempt_index` is missing
+        // on a component (2.7.9 strict gate). Note: deployment_profile
+        // is required by BatchEnvelope::from_json at 2.7.9.
+        let sk = SigningKey::from_bytes(&[0x42; 32]);
+        let key_id = "ciris-agent-key:test-22";
+
+        let mut trace = CompleteTrace {
+            trace_id: "trace-22-schema-route".into(),
+            thought_id: "th-1".into(),
+            task_id: None,
+            agent_id_hash: "deadbeef".into(),
+            started_at: "2026-04-30T00:15:53.123456Z".parse().unwrap(),
+            completed_at: "2026-04-30T00:16:12.789012Z".parse().unwrap(),
+            trace_level: crate::schema::TraceLevel::Generic,
+            trace_schema_version: SchemaVersion::parse("2.7.9").unwrap(),
+            components: vec![crate::schema::TraceComponent {
+                component_type: crate::schema::ComponentType::Observation,
+                event_type: crate::schema::ReasoningEventType::ThoughtStart,
+                timestamp: "2026-04-30T00:15:53.123Z".parse().unwrap(),
+                // Empty data → no attempt_index → 2.7.9 strict gate fires.
+                data: serde_json::Map::new(),
+                // 2.7.9 requires per-component agent_id_hash locked-equal
+                // to the envelope.
+                agent_id_hash: Some("deadbeef".into()),
+            }],
+            // 2.7.9 envelope gate requires deployment_profile.
+            deployment_profile: Some(crate::schema::DeploymentProfile {
+                agent_role: "ally".into(),
+                agent_template: "ally-v3-default".into(),
+                deployment_domain: "moderation".into(),
+                deployment_type: "production".into(),
+                deployment_region: Some("US".into()),
+                deployment_trust_mode: "federated_peer".into(),
+            }),
+            signature: String::new(),
+            signature_key_id: key_id.into(),
+        };
+        // Sign over the 2.7.9 canonical (per-component agent_id_hash
+        // included; deployment_profile in the envelope alpha-position).
+        let canonical = crate::verify::ed25519::canonical_payload_value_v279(&trace);
+        let bytes = PythonJsonDumpsCanonicalizer
+            .canonicalize_value(&canonical)
+            .unwrap();
+        let sig = sk.sign(&bytes);
+        trace.signature = BASE64.encode(sig.to_bytes());
+
+        let trace_json = serde_json::to_value(&trace).unwrap();
+        let envelope = serde_json::json!({
+            "events": [{
+                "event_type": "complete_trace",
+                "trace_level": "generic",
+                "trace": trace_json,
+            }],
+            "batch_timestamp": "2026-04-30T15:00:00+00:00",
+            "consent_timestamp": "2025-01-01T00:00:00Z",
+            "trace_level": "generic",
+            "trace_schema_version": "2.7.9",
+        });
+
+        let backend = MemoryBackend::new();
+        backend.add_public_key(key_id, sk.verifying_key());
+        let (signer, signer_key_id) = make_test_signer().await;
+        let pipeline = IngestPipeline {
+            backend: &backend,
+            canonicalizer: &PythonJsonDumpsCanonicalizer,
+            scrubber: &NullScrubber,
+            signer: &*signer,
+            signer_key_id: &signer_key_id,
+        };
+
+        let err = pipeline
+            .receive_and_persist(envelope.to_string().as_bytes())
+            .await
+            .unwrap_err();
+
+        // The whole point of the fix: this must be Schema, NOT Store.
+        match err {
+            IngestError::Schema(SchemaError::MissingField("attempt_index")) => {}
+            IngestError::Store(_) => panic!(
+                "REGRESSION (CIRISPersist#22): decompose schema reject \
+                 misclassified as Store — would trigger 503+Retry-After \
+                 hot retry loop on a deterministic 4xx mismatch"
+            ),
+            other => panic!("expected Schema(MissingField(attempt_index)), got {other:?}"),
+        }
+
+        // Backend received zero rows — the schema reject must short-circuit
+        // before any insert.
+        assert!(backend.snapshot_events().is_empty());
+    }
+
+    /// v0.4.6 (CIRISPersist#22) — `IngestError::detail()` surfaces the
+    /// dynamic field name for `MissingField`. Lens consumers read
+    /// `e.args[1]` (or `e.detail()` on the Rust side) instead of
+    /// source-diving persist to find which field was missing.
+    #[test]
+    fn ingest_error_detail_surfaces_missing_field_name() {
+        let e = IngestError::Schema(SchemaError::MissingField("attempt_index"));
+        assert_eq!(e.kind(), "schema_missing_field");
+        assert_eq!(e.detail(), Some("attempt_index".to_string()));
+
+        let e = IngestError::Schema(SchemaError::MissingField("data.parent_event_type"));
+        assert_eq!(e.kind(), "schema_missing_field");
+        assert_eq!(e.detail(), Some("data.parent_event_type".to_string()));
+
+        // Non-schema variants → None today (verify/scrub/store/sign
+        // don't yet expose detail; expanding is a follow-up).
+        let e = IngestError::Sign("keyring locked".into());
+        assert_eq!(e.kind(), "sign_keyring");
+        assert_eq!(e.detail(), None);
     }
 
     #[tokio::test]

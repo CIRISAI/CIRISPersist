@@ -793,23 +793,45 @@ impl PyEngine {
             // THREAT_MODEL.md AV-15: sanitize at the FFI boundary.
             // Verbose `Display` form (which may include
             // attacker-supplied content) goes to tracing logs; the
-            // Python exception carries only the stable kind token.
+            // Python exception carries only the stable kind token
+            // (and, when present, a structured `detail` string —
+            // closed-set field names / typed integers / version
+            // stamps; never raw user-payload bytes).
             // The lens HTTP layer maps token → status code.
+            //
+            // v0.4.6 (CIRISPersist#22) — When `IngestError::detail()`
+            // is `Some`, the Python exception's `args` is the 2-tuple
+            // `(kind, detail)` so callers can extract the field name
+            // (e.g. `"attempt_index"`) without source-diving the
+            // persist crate. When `None`, `args` stays as `(kind,)` —
+            // backward-compatible with the v0.4.5 single-string shape.
+            // Lens consumers read:
+            //
+            //   kind = e.args[0]
+            //   detail = e.args[1] if len(e.args) > 1 else None
             Err(e) => {
                 let kind = e.kind();
-                tracing::warn!(error = %e, kind = kind, "ingest rejected");
+                let detail = e.detail();
+                tracing::warn!(
+                    error = %e, kind = kind, detail = detail.as_deref(),
+                    "ingest rejected"
+                );
                 match e {
                     // Schema / verify / scrub → ValueError (caller-fault; 4xx).
                     IngestError::Schema(_) | IngestError::Verify(_) | IngestError::Scrub(_) => {
-                        Err(PyValueError::new_err(kind))
+                        Err(match detail {
+                            Some(d) => PyValueError::new_err((kind, d)),
+                            None => PyValueError::new_err(kind),
+                        })
                     }
                     // Store / Sign → RuntimeError (server-fault; 5xx).
                     // AV-25: signing failure is operator-side
                     // (keyring locked, hardware unavailable, etc.) —
                     // never the agent's fault, never a 4xx.
-                    IngestError::Store(_) | IngestError::Sign(_) => {
-                        Err(PyRuntimeError::new_err(kind))
-                    }
+                    IngestError::Store(_) | IngestError::Sign(_) => Err(match detail {
+                        Some(d) => PyRuntimeError::new_err((kind, d)),
+                        None => PyRuntimeError::new_err(kind),
+                    }),
                 }
             }
         }
