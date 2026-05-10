@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778445500427,
+  "lastUpdate": 1778445734642,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -7007,6 +7007,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23416698,
             "range": "± 183813",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "00e07fb5fae746c3db2136e67ffe3ea5655f18e0",
+          "message": "WIP v0.5.0 §A — list_trace_summaries + get_trace_summary postgres impl\n\nLens-bleeding endpoint /repository/traces (CIRISLens#10) unblocked.\n\nAlgorithm:\n- Single-pass GROUP BY trace_id with FILTER (WHERE event_type = '...')\n  aggregation extracting DMA / conscience / action / thought-metadata\n  from JSONB payload per event_type. No N+1 round-trips.\n- ORDER BY started_at DESC, trace_id DESC (newest-first triage).\n- Cursor: HAVING (MIN(ts), MIN(trace_id)) < (cursor_ts, cursor_id)\n  — row-tuple comparison gives strict-less-than ordering matching\n  the ORDER BY direction.\n- LIMIT bound 1..=10000 (above is operator-misuse; below is no-op).\n\nJSONB extracts (TRACE_SUMMARY_SELECT shared between get + list):\n- THOUGHT_START → thought_type, thought_depth\n- DMA_RESULTS → csdma_plausibility_score, dsdma_domain_alignment,\n                dsdma_domain\n- IDMA_RESULT → idma_k_eff, idma_correlation_risk,\n                idma_fragility_flag, idma_phase\n- CONSCIENCE_RESULT → conscience_passed, action_was_overridden +\n                      4 per-axis pass flags\n- ACTION_RESULT → selected_action, action_success\n- Cost columns — already denormalized; no JSONB extraction\n\nIndex coverage:\n- agent_id_hash filter → trace_events_dedup leading column\n- agent_name filter → trace_events_agent_ts\n- No-filter → time hypertable scan in newest-first order\n\nWire types unchanged from foundation commit b7be5bb. Memory + SQLite\nbackends still NotImplemented for §A. Sections B/F/E + PyO3 +\nthreat-model AV-43 still pending before v0.5.0 tag.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-10T15:33:56-05:00",
+          "tree_id": "fa47611f4301c86a694f0e54ffe9d99632f5e689",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/00e07fb5fae746c3db2136e67ffe3ea5655f18e0"
+        },
+        "date": 1778445733680,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101675,
+            "range": "± 365",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 242683,
+            "range": "± 573",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 527152,
+            "range": "± 2800",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1859908,
+            "range": "± 23278",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 346,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1442,
+            "range": "± 42",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8189,
+            "range": "± 170",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 360,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3248,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9741,
+            "range": "± 134",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42608,
+            "range": "± 297",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 621,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2306862,
+            "range": "± 142992",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6647259,
+            "range": "± 581467",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23964575,
+            "range": "± 591837",
             "unit": "ns/iter"
           }
         ]
