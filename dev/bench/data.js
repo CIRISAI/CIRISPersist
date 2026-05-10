@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778344922163,
+  "lastUpdate": 1778445500427,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -6893,6 +6893,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 24071769,
             "range": "± 863977",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "b7be5bbb64ef1b11506aa60e28fbd0c81f756399",
+          "message": "WIP v0.5.0 — federation read primitives foundation (CIRISPersist#23)\n\nTrait surface + typed shapes + skeleton stubs for the v0.5.0 batch\n(sections A/B/F/E per FSD/V0_5_0_FEDERATION_READ_PRIMITIVES.md).\nPostgres impl + PyO3 wrappers + threat model + tests land in\nfollow-up commits before the v0.5.0 tag.\n\nSurface duality (v0.4.1 verify-primitive precedent): every primitive\nwill land as Rust-public ReadEngine trait method + PyO3 wrapper on\nEngine. Single source of truth.\n\nModule shape:\n  src/read/mod.rs      — ReadEngine trait (12 methods) + Error +\n                         module docs\n  src/read/types.rs    — TimeWindow, TraceCursor, TraceFilter,\n                         DeviationMetric\n  src/read/trace.rs    — Section A/B/F: TraceSummary, TraceListPage,\n                         TraceDetail, TraceComponentRow,\n                         TraceEnvelopeRefs, DivergenceRow,\n                         TemporalDriftRow, HashChainGap, OverrideRateRow\n  src/read/scoring.rs  — Section E: ScoringFactorAggregate,\n                         RecoveryEvent, CoherencePoint,\n                         AuditChainAggregate\n\nBackend impls:\n  - Memory  → NotImplemented for all 12 (read primitives are SQL-heavy\n              aggregates that don't fit the in-memory shape)\n  - SQLite  → NotImplemented for all 12 (v0.6.x sovereign-mode track\n              ports A/B/F where the shape transfers; E falls back to\n              raw-window queries)\n  - Postgres → NotImplemented for all 12 today; section impls land\n              in follow-up commits\n\nTrait + Section types in prelude.\n\nThreat-model invariants documented inline in mod.rs:\n  - AV-9: trace-scoped reads carry agent_id_hash so callers\n          authorize at their layer\n  - AV-15: error kinds are closed-set &'static str tokens\n  - AV-43: read-side adversary section to be added to\n          docs/THREAT_MODEL.md when v0.5.0 ships\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-10T15:29:56-05:00",
+          "tree_id": "9a99d1579d64fdcde089b349fcca029b9d942d85",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/b7be5bbb64ef1b11506aa60e28fbd0c81f756399"
+        },
+        "date": 1778445499600,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 96042,
+            "range": "± 930",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 238915,
+            "range": "± 3399",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 520857,
+            "range": "± 3633",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1942612,
+            "range": "± 27235",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 304,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1206,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7218,
+            "range": "± 70",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 318,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3259,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9832,
+            "range": "± 45",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 44441,
+            "range": "± 152",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 538,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2063256,
+            "range": "± 37686",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6398490,
+            "range": "± 56773",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23416698,
+            "range": "± 183813",
             "unit": "ns/iter"
           }
         ]
