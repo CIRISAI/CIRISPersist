@@ -3329,4 +3329,443 @@ mod tests {
         let err = backend.put_detection_event(bad).await.unwrap_err();
         assert!(matches!(err, crate::derived::Error::InvalidArgument(_)));
     }
+
+    // ─── ReadEngine §A tests (v0.5.0, CIRISPersist#23) ──────────────
+
+    /// Insert a synthetic 5-component trace into `cirislens.trace_events`
+    /// covering THOUGHT_START + DMA_RESULTS + IDMA_RESULT +
+    /// CONSCIENCE_RESULT + ACTION_RESULT — the rows the
+    /// `TRACE_SUMMARY_SELECT` JSONB-extraction reads from. Returns
+    /// the trace_id (caller can supply or auto-generate).
+    ///
+    /// Caller can pass `agent_id_hash`, `agent_name`,
+    /// `deployment_domain` to control the AV-9 / filter test surface.
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_section_a_fixture_trace(
+        backend: &PostgresBackend,
+        trace_id: &str,
+        agent_id_hash: &str,
+        agent_name: Option<&str>,
+        deployment_domain: Option<&str>,
+        started_at: chrono::DateTime<chrono::Utc>,
+        action_was_overridden: bool,
+        csdma_score: f64,
+        dsdma_alignment: f64,
+        idma_k_eff: f64,
+    ) -> String {
+        let base_payload =
+            |extras: serde_json::Value| -> serde_json::Map<String, serde_json::Value> {
+                if let serde_json::Value::Object(m) = extras {
+                    m.into_iter().collect()
+                } else {
+                    serde_json::Map::new()
+                }
+            };
+        let mk_row = |event_type: ReasoningEventType,
+                      ts_offset_ms: i64,
+                      payload: serde_json::Value,
+                      cost_llm_calls: Option<i32>,
+                      cost_tokens: Option<i32>,
+                      cost_usd: Option<f64>|
+         -> TraceEventRow {
+            TraceEventRow {
+                trace_id: trace_id.to_owned(),
+                thought_id: format!("th-{trace_id}"),
+                task_id: Some(format!("task-{trace_id}")),
+                step_point: None,
+                event_type,
+                attempt_index: 0,
+                ts: started_at + chrono::Duration::milliseconds(ts_offset_ms),
+                agent_name: agent_name.map(str::to_owned),
+                agent_id_hash: agent_id_hash.to_owned(),
+                cognitive_state: Some("work".into()),
+                trace_level: crate::schema::TraceLevel::Generic,
+                payload: base_payload(payload),
+                cost_llm_calls,
+                cost_tokens,
+                cost_usd,
+                signature: "AAAA".into(),
+                signing_key_id: "test-key".into(),
+                signature_verified: true,
+                schema_version: "2.7.0".into(),
+                pii_scrubbed: false,
+                original_content_hash: None,
+                scrub_signature: None,
+                scrub_key_id: None,
+                scrub_timestamp: None,
+                agent_role: Some("ally".into()),
+                agent_template: Some("ally-v3-default".into()),
+                deployment_domain: deployment_domain.map(str::to_owned),
+                deployment_type: Some("production".into()),
+                deployment_region: Some("US".into()),
+                deployment_trust_mode: Some("federated_peer".into()),
+            }
+        };
+
+        let rows = vec![
+            mk_row(
+                ReasoningEventType::ThoughtStart,
+                0,
+                serde_json::json!({
+                    "thought_type": "standard",
+                    "thought_depth": 1,
+                }),
+                None,
+                None,
+                None,
+            ),
+            mk_row(
+                ReasoningEventType::DmaResults,
+                10,
+                serde_json::json!({
+                    "csdma_plausibility_score": csdma_score,
+                    "dsdma_domain_alignment": dsdma_alignment,
+                    "dsdma_domain": "moderation",
+                }),
+                None,
+                None,
+                None,
+            ),
+            mk_row(
+                ReasoningEventType::IdmaResult,
+                20,
+                serde_json::json!({
+                    "idma_k_eff": idma_k_eff,
+                    "idma_correlation_risk": 0.05,
+                    "idma_fragility_flag": false,
+                    "idma_phase": "stable",
+                }),
+                None,
+                None,
+                None,
+            ),
+            mk_row(
+                ReasoningEventType::ConscienceResult,
+                30,
+                serde_json::json!({
+                    "conscience_passed": !action_was_overridden,
+                    "action_was_overridden": action_was_overridden,
+                    "entropy_passed": true,
+                    "coherence_passed": true,
+                    "optimization_veto_passed": !action_was_overridden,
+                    "epistemic_humility_passed": true,
+                }),
+                None,
+                None,
+                None,
+            ),
+            mk_row(
+                ReasoningEventType::ActionResult,
+                40,
+                serde_json::json!({
+                    "action_executed": "speak",
+                    "success": !action_was_overridden,
+                }),
+                Some(2),
+                Some(1500),
+                Some(0.045),
+            ),
+        ];
+        backend.insert_trace_events_batch(&rows).await.unwrap();
+        trace_id.to_owned()
+    }
+
+    /// §A round-trip: insert a 5-component trace, read its summary,
+    /// every JSONB-extracted field matches the fixture.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_a_get_trace_summary_round_trip() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        use crate::read::ReadEngine;
+        let tid = format!("trace-§a-rt-{}", uuid_like());
+        let started = chrono::Utc::now();
+        insert_section_a_fixture_trace(
+            &backend,
+            &tid,
+            "agent-rt",
+            Some("Scout"),
+            Some("moderation"),
+            started,
+            false, // not overridden
+            0.83,  // csdma
+            0.91,  // dsdma
+            1.42,  // idma_k_eff
+        )
+        .await;
+
+        let s = backend
+            .get_trace_summary(&tid)
+            .await
+            .unwrap()
+            .expect("summary present");
+        assert_eq!(s.trace_id, tid);
+        assert_eq!(s.agent_id_hash, "agent-rt");
+        assert_eq!(s.agent_name.as_deref(), Some("Scout"));
+        assert_eq!(s.deployment_domain.as_deref(), Some("moderation"));
+        assert!(s.signature_verified);
+        // JSONB extracts:
+        assert_eq!(s.thought_type.as_deref(), Some("standard"));
+        assert_eq!(s.thought_depth, Some(1));
+        assert!((s.csdma_plausibility_score.unwrap() - 0.83).abs() < 1e-9);
+        assert!((s.dsdma_domain_alignment.unwrap() - 0.91).abs() < 1e-9);
+        assert_eq!(s.dsdma_domain.as_deref(), Some("moderation"));
+        assert!((s.idma_k_eff.unwrap() - 1.42).abs() < 1e-9);
+        assert_eq!(s.idma_fragility_flag, Some(false));
+        assert_eq!(s.idma_phase.as_deref(), Some("stable"));
+        assert_eq!(s.conscience_passed, Some(true));
+        assert_eq!(s.action_was_overridden, Some(false));
+        assert_eq!(s.entropy_passed, Some(true));
+        assert_eq!(s.coherence_passed, Some(true));
+        assert_eq!(s.optimization_veto_passed, Some(true));
+        assert_eq!(s.epistemic_humility_passed, Some(true));
+        assert_eq!(s.selected_action.as_deref(), Some("speak"));
+        assert_eq!(s.action_success, Some(true));
+        assert_eq!(s.llm_calls, Some(2));
+        assert_eq!(s.tokens_total, Some(1500));
+        assert!((s.cost_usd.unwrap() - 0.045).abs() < 1e-9);
+    }
+
+    /// §A: unknown trace_id returns None (not Err).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_a_get_trace_summary_unknown_returns_none() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        use crate::read::ReadEngine;
+        let opt = backend
+            .get_trace_summary("trace-does-not-exist-xyz-§a")
+            .await
+            .unwrap();
+        assert!(opt.is_none());
+    }
+
+    /// §A: list newest-first ordering + cursor pagination correctness.
+    /// Insert 5 traces with staggered started_at; page through with
+    /// limit=2; assert no overlap, no gaps, terminates with
+    /// next_cursor=None.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_a_list_cursor_pagination() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        use crate::read::ReadEngine;
+
+        // Use a unique agent_id_hash + agent_name + domain so the
+        // fixture set is isolated from any other test data in the
+        // shared DB. Filter on (agent_id_hash, agent_name) below.
+        let aid = format!("agent-cursor-{}", uuid_like());
+        let aname = format!("Cursor-{}", uuid_like());
+        let dom = format!("dom-{}", uuid_like());
+        let base = chrono::Utc::now() - chrono::Duration::hours(1);
+
+        let mut tids: Vec<String> = Vec::new();
+        for i in 0..5 {
+            let tid = format!("trace-§a-cur-{}-{i}", uuid_like());
+            // Stagger started_at by 1 minute each. i=0 oldest, i=4 newest.
+            let started = base + chrono::Duration::minutes(i64::from(i));
+            insert_section_a_fixture_trace(
+                &backend,
+                &tid,
+                &aid,
+                Some(&aname),
+                Some(&dom),
+                started,
+                false,
+                0.5,
+                0.5,
+                1.0,
+            )
+            .await;
+            tids.push(tid);
+        }
+        // Newest-first order = reverse of insertion order.
+        tids.reverse();
+
+        let filter = crate::read::TraceFilter {
+            agent_id_hash: Some(aid.clone()),
+            ..Default::default()
+        };
+
+        // Page 1: limit=2 → first 2 newest.
+        let p1 = backend
+            .list_trace_summaries(filter.clone(), None, 2)
+            .await
+            .unwrap();
+        assert_eq!(p1.items.len(), 2);
+        assert_eq!(p1.items[0].trace_id, tids[0]);
+        assert_eq!(p1.items[1].trace_id, tids[1]);
+        let c1 = p1.next_cursor.clone().expect("cursor for page 2");
+
+        // Page 2: limit=2 → next 2.
+        let p2 = backend
+            .list_trace_summaries(filter.clone(), Some(c1), 2)
+            .await
+            .unwrap();
+        assert_eq!(p2.items.len(), 2);
+        assert_eq!(p2.items[0].trace_id, tids[2]);
+        assert_eq!(p2.items[1].trace_id, tids[3]);
+        let c2 = p2.next_cursor.clone().expect("cursor for page 3");
+
+        // Page 3: limit=2 → 1 row remaining; next_cursor MUST be None
+        // because items.len() < limit (cleanly signals end of stream).
+        let p3 = backend
+            .list_trace_summaries(filter.clone(), Some(c2), 2)
+            .await
+            .unwrap();
+        assert_eq!(p3.items.len(), 1);
+        assert_eq!(p3.items[0].trace_id, tids[4]);
+        assert!(p3.next_cursor.is_none());
+
+        // Across all 3 pages: union covers all 5 trace_ids exactly once.
+        let mut seen: Vec<String> = Vec::new();
+        for p in [p1, p2, p3] {
+            for s in p.items {
+                seen.push(s.trace_id);
+            }
+        }
+        assert_eq!(seen.len(), 5);
+        assert_eq!(seen, tids);
+    }
+
+    /// §A AV-9 invariant: agent_id_hash filter isolates traces. Two
+    /// agents with overlapping `trace_id` numerals are distinguished
+    /// strictly by agent_id_hash.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_a_agent_id_hash_isolation() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        use crate::read::ReadEngine;
+
+        let suffix = uuid_like();
+        let aid_a = format!("agent-A-{suffix}");
+        let aid_b = format!("agent-B-{suffix}");
+        let started = chrono::Utc::now();
+
+        let tid_a = format!("trace-§a-iso-A-{suffix}");
+        let tid_b = format!("trace-§a-iso-B-{suffix}");
+        insert_section_a_fixture_trace(
+            &backend,
+            &tid_a,
+            &aid_a,
+            Some(&format!("AgentA-{suffix}")),
+            Some(&format!("dom-iso-{suffix}")),
+            started,
+            false,
+            0.7,
+            0.7,
+            1.0,
+        )
+        .await;
+        insert_section_a_fixture_trace(
+            &backend,
+            &tid_b,
+            &aid_b,
+            Some(&format!("AgentB-{suffix}")),
+            Some(&format!("dom-iso-{suffix}")),
+            started,
+            false,
+            0.7,
+            0.7,
+            1.0,
+        )
+        .await;
+
+        // Filtering by aid_a returns only A's trace.
+        let p_a = backend
+            .list_trace_summaries(
+                crate::read::TraceFilter {
+                    agent_id_hash: Some(aid_a.clone()),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        let trace_ids_a: Vec<&String> = p_a.items.iter().map(|s| &s.trace_id).collect();
+        assert!(trace_ids_a.contains(&&tid_a));
+        assert!(!trace_ids_a.contains(&&tid_b));
+        // AV-9: every returned summary carries agent_id_hash so
+        // callers authorize at their layer.
+        for s in &p_a.items {
+            assert_eq!(s.agent_id_hash, aid_a);
+        }
+    }
+
+    /// §A: limit boundaries — 0 rejects, 10001 rejects, 1 accepts.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_a_list_limit_boundaries() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        use crate::read::ReadEngine;
+        let f = crate::read::TraceFilter::default();
+
+        let too_low = backend
+            .list_trace_summaries(f.clone(), None, 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(too_low, crate::read::Error::InvalidArgument(_)));
+
+        let too_high = backend
+            .list_trace_summaries(f.clone(), None, 10_001)
+            .await
+            .unwrap_err();
+        assert!(matches!(too_high, crate::read::Error::InvalidArgument(_)));
+
+        // limit=1 accepts (no error); result count depends on DB
+        // state, just check it didn't error.
+        let _ok = backend.list_trace_summaries(f, None, 1).await.unwrap();
+    }
+
+    /// §A: invalid cursor version rejects with InvalidCursor.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_a_invalid_cursor_version_rejects() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        use crate::read::ReadEngine;
+        let bad_cursor = crate::read::TraceCursor {
+            version: "v99".into(),
+            last_started_at: chrono::Utc::now(),
+            last_trace_id: "x".into(),
+        };
+        let err = backend
+            .list_trace_summaries(crate::read::TraceFilter::default(), Some(bad_cursor), 10)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::read::Error::InvalidCursor(_)));
+    }
 }
