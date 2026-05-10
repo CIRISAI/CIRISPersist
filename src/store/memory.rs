@@ -1084,6 +1084,145 @@ impl IsNoneOrZero for Option<i64> {
     }
 }
 
+// ─── ReadEngine impl (v0.5.0, CIRISPersist#23) ─────────────────────
+//
+// Memory backend — read primitives are SQL-heavy aggregates that
+// don't fit the in-memory shape. Returns NotImplemented for every
+// method; tests can compose against the Postgres backend directly,
+// and Memory backend remains for the lighter Backend trait surfaces
+// (insert / dedup / federation directory).
+
+impl crate::read::ReadEngine for MemoryBackend {
+    async fn list_trace_summaries(
+        &self,
+        _filter: crate::read::TraceFilter,
+        _cursor: Option<crate::read::TraceCursor>,
+        _limit: i64,
+    ) -> Result<crate::read::TraceListPage, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "list_trace_summaries (memory backend; use postgres for federation reads)",
+        ))
+    }
+
+    async fn get_trace_summary(
+        &self,
+        _trace_id: &str,
+    ) -> Result<Option<crate::read::TraceSummary>, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "get_trace_summary (memory backend; use postgres for federation reads)",
+        ))
+    }
+
+    async fn get_trace_detail(
+        &self,
+        _trace_id: &str,
+    ) -> Result<Option<crate::read::TraceDetail>, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "get_trace_detail (memory backend; use postgres for federation reads)",
+        ))
+    }
+
+    async fn cross_agent_divergence(
+        &self,
+        _deployment_domain: &str,
+        _window: crate::read::TimeWindow,
+        _metric: crate::read::DeviationMetric,
+    ) -> Result<Vec<crate::read::DivergenceRow>, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "cross_agent_divergence (memory backend)",
+        ))
+    }
+
+    async fn temporal_drift(
+        &self,
+        _agent_id_hash: &str,
+        _baseline: crate::read::TimeWindow,
+        _comparison: crate::read::TimeWindow,
+    ) -> Result<Vec<crate::read::TemporalDriftRow>, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "temporal_drift (memory backend)",
+        ))
+    }
+
+    async fn hash_chain_gaps(
+        &self,
+        _agent_id_hash: &str,
+        _window: crate::read::TimeWindow,
+    ) -> Result<Vec<crate::read::HashChainGap>, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "hash_chain_gaps (memory backend)",
+        ))
+    }
+
+    async fn conscience_override_rates(
+        &self,
+        _deployment_domain: &str,
+        _window: crate::read::TimeWindow,
+    ) -> Result<Vec<crate::read::OverrideRateRow>, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "conscience_override_rates (memory backend)",
+        ))
+    }
+
+    async fn aggregate_scoring_factors(
+        &self,
+        _agent_id_hash: &str,
+        _window: crate::read::TimeWindow,
+        _baseline: Option<crate::read::TimeWindow>,
+    ) -> Result<crate::read::ScoringFactorAggregate, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "aggregate_scoring_factors (memory backend)",
+        ))
+    }
+
+    async fn aggregate_scoring_factors_batch(
+        &self,
+        _agent_id_hashes: &[String],
+        _window: crate::read::TimeWindow,
+        _baseline: Option<crate::read::TimeWindow>,
+    ) -> Result<Vec<crate::read::ScoringFactorAggregate>, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "aggregate_scoring_factors_batch (memory backend)",
+        ))
+    }
+
+    async fn count_traces(
+        &self,
+        _filter: crate::read::TraceFilter,
+    ) -> Result<i64, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "count_traces (memory backend)",
+        ))
+    }
+
+    async fn count_overrides(
+        &self,
+        _filter: crate::read::TraceFilter,
+    ) -> Result<i64, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "count_overrides (memory backend)",
+        ))
+    }
+
+    async fn count_identity_changes(
+        &self,
+        _filter: crate::read::TraceFilter,
+    ) -> Result<i64, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "count_identity_changes (memory backend)",
+        ))
+    }
+
+    async fn aggregate_audit_chain(
+        &self,
+        _filter: crate::read::TraceFilter,
+    ) -> Result<crate::read::AuditChainAggregate, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "aggregate_audit_chain (memory backend)",
+        ))
+    }
+}
+
 // ─── DerivedSchema impl (v0.4.3, CIRISPersist#18) ──────────────────
 //
 // Memory backend stub — sovereign-mode Pi-class deployments without

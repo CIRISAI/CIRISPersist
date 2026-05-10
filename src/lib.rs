@@ -38,6 +38,7 @@ pub mod manifest;
 pub mod outbound;
 pub mod prelude;
 pub mod queue;
+pub mod read;
 pub mod schema;
 pub mod scrub;
 #[cfg(feature = "server")]

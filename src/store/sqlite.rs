@@ -2265,6 +2265,147 @@ fn sqlite_row_to_revocation(
     })
 }
 
+// ─── ReadEngine impl (v0.5.0, CIRISPersist#23) ─────────────────────
+//
+// SQLite backend — Phase 1 sovereign-mode parity for the Backend
+// trait, but the v0.5.0 read primitives need TimescaleDB-aware SQL
+// (continuous aggregates for sections E/G/H, JSONB extraction for
+// sections A/B). Returns NotImplemented for every method in v0.5.0;
+// the v0.6.x sovereign-mode track will land SQLite impls where the
+// shape transfers (sections A/B/F should port; E's continuous-
+// aggregate backing falls back to raw-window queries).
+
+impl crate::read::ReadEngine for SqliteBackend {
+    async fn list_trace_summaries(
+        &self,
+        _filter: crate::read::TraceFilter,
+        _cursor: Option<crate::read::TraceCursor>,
+        _limit: i64,
+    ) -> Result<crate::read::TraceListPage, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "list_trace_summaries (sqlite v0.5.0; v0.6.x sovereign-mode track)",
+        ))
+    }
+
+    async fn get_trace_summary(
+        &self,
+        _trace_id: &str,
+    ) -> Result<Option<crate::read::TraceSummary>, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "get_trace_summary (sqlite v0.5.0; v0.6.x sovereign-mode track)",
+        ))
+    }
+
+    async fn get_trace_detail(
+        &self,
+        _trace_id: &str,
+    ) -> Result<Option<crate::read::TraceDetail>, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "get_trace_detail (sqlite v0.5.0; v0.6.x sovereign-mode track)",
+        ))
+    }
+
+    async fn cross_agent_divergence(
+        &self,
+        _deployment_domain: &str,
+        _window: crate::read::TimeWindow,
+        _metric: crate::read::DeviationMetric,
+    ) -> Result<Vec<crate::read::DivergenceRow>, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "cross_agent_divergence (sqlite v0.5.0)",
+        ))
+    }
+
+    async fn temporal_drift(
+        &self,
+        _agent_id_hash: &str,
+        _baseline: crate::read::TimeWindow,
+        _comparison: crate::read::TimeWindow,
+    ) -> Result<Vec<crate::read::TemporalDriftRow>, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "temporal_drift (sqlite v0.5.0)",
+        ))
+    }
+
+    async fn hash_chain_gaps(
+        &self,
+        _agent_id_hash: &str,
+        _window: crate::read::TimeWindow,
+    ) -> Result<Vec<crate::read::HashChainGap>, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "hash_chain_gaps (sqlite v0.5.0)",
+        ))
+    }
+
+    async fn conscience_override_rates(
+        &self,
+        _deployment_domain: &str,
+        _window: crate::read::TimeWindow,
+    ) -> Result<Vec<crate::read::OverrideRateRow>, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "conscience_override_rates (sqlite v0.5.0)",
+        ))
+    }
+
+    async fn aggregate_scoring_factors(
+        &self,
+        _agent_id_hash: &str,
+        _window: crate::read::TimeWindow,
+        _baseline: Option<crate::read::TimeWindow>,
+    ) -> Result<crate::read::ScoringFactorAggregate, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "aggregate_scoring_factors (sqlite v0.5.0)",
+        ))
+    }
+
+    async fn aggregate_scoring_factors_batch(
+        &self,
+        _agent_id_hashes: &[String],
+        _window: crate::read::TimeWindow,
+        _baseline: Option<crate::read::TimeWindow>,
+    ) -> Result<Vec<crate::read::ScoringFactorAggregate>, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "aggregate_scoring_factors_batch (sqlite v0.5.0)",
+        ))
+    }
+
+    async fn count_traces(
+        &self,
+        _filter: crate::read::TraceFilter,
+    ) -> Result<i64, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "count_traces (sqlite v0.5.0)",
+        ))
+    }
+
+    async fn count_overrides(
+        &self,
+        _filter: crate::read::TraceFilter,
+    ) -> Result<i64, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "count_overrides (sqlite v0.5.0)",
+        ))
+    }
+
+    async fn count_identity_changes(
+        &self,
+        _filter: crate::read::TraceFilter,
+    ) -> Result<i64, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "count_identity_changes (sqlite v0.5.0)",
+        ))
+    }
+
+    async fn aggregate_audit_chain(
+        &self,
+        _filter: crate::read::TraceFilter,
+    ) -> Result<crate::read::AuditChainAggregate, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "aggregate_audit_chain (sqlite v0.5.0)",
+        ))
+    }
+}
+
 // ─── DerivedSchema impl (v0.4.3, CIRISPersist#18) ──────────────────
 //
 // SQLite backend stub — same shape as memory.rs. Sovereign-mode

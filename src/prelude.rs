@@ -43,7 +43,18 @@
 pub use crate::derived::DerivedSchema;
 pub use crate::federation::FederationDirectory;
 pub use crate::outbound::OutboundQueue;
+pub use crate::read::ReadEngine;
 pub use crate::store::Backend;
+
+// Federation read primitive types (v0.5.0, CIRISPersist#23).
+// Sections A/B/F/E ship in v0.5.0 — trace listing, trace detail,
+// Coherence Ratchet inputs, scoring factor aggregates. Sections
+// C/D/G/H/I land in v0.5.1 after lens validates the v0.5.0 batch.
+pub use crate::read::{
+    AuditChainAggregate, DeviationMetric, DivergenceRow, HashChainGap, OverrideRateRow,
+    RecoveryEvent, ScoringFactorAggregate, TemporalDriftRow, TimeWindow, TraceComponentRow,
+    TraceCursor, TraceDetail, TraceEnvelopeRefs, TraceFilter, TraceListPage, TraceSummary,
+};
 
 // Lens-derived schema types (v0.4.3, CIRISPersist#18). Lens-core
 // writes detection events; RATCHET writes calibration bundles; both

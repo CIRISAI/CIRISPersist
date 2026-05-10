@@ -2261,6 +2261,148 @@ fn llm_status_str(s: crate::schema::LlmCallStatus) -> &'static str {
     }
 }
 
+// ─── ReadEngine impl (v0.5.0, CIRISPersist#23) ─────────────────────
+//
+// Federation read primitives — sections A/B/F/E per the v0.5.0 batch.
+// Skeleton stubs in this commit; section impls land in follow-up
+// commits before tagging v0.5.0:
+//   - Section A: list_trace_summaries + get_trace_summary
+//   - Section B: get_trace_detail
+//   - Section F: cross_agent_divergence + temporal_drift +
+//                hash_chain_gaps + conscience_override_rates
+//   - Section E: aggregate_scoring_factors + batch + count_*
+
+impl crate::read::ReadEngine for PostgresBackend {
+    async fn list_trace_summaries(
+        &self,
+        _filter: crate::read::TraceFilter,
+        _cursor: Option<crate::read::TraceCursor>,
+        _limit: i64,
+    ) -> Result<crate::read::TraceListPage, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "list_trace_summaries (postgres v0.5.0 §A — impl pending)",
+        ))
+    }
+
+    async fn get_trace_summary(
+        &self,
+        _trace_id: &str,
+    ) -> Result<Option<crate::read::TraceSummary>, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "get_trace_summary (postgres v0.5.0 §A — impl pending)",
+        ))
+    }
+
+    async fn get_trace_detail(
+        &self,
+        _trace_id: &str,
+    ) -> Result<Option<crate::read::TraceDetail>, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "get_trace_detail (postgres v0.5.0 §B — impl pending)",
+        ))
+    }
+
+    async fn cross_agent_divergence(
+        &self,
+        _deployment_domain: &str,
+        _window: crate::read::TimeWindow,
+        _metric: crate::read::DeviationMetric,
+    ) -> Result<Vec<crate::read::DivergenceRow>, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "cross_agent_divergence (postgres v0.5.0 §F — impl pending)",
+        ))
+    }
+
+    async fn temporal_drift(
+        &self,
+        _agent_id_hash: &str,
+        _baseline: crate::read::TimeWindow,
+        _comparison: crate::read::TimeWindow,
+    ) -> Result<Vec<crate::read::TemporalDriftRow>, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "temporal_drift (postgres v0.5.0 §F — impl pending)",
+        ))
+    }
+
+    async fn hash_chain_gaps(
+        &self,
+        _agent_id_hash: &str,
+        _window: crate::read::TimeWindow,
+    ) -> Result<Vec<crate::read::HashChainGap>, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "hash_chain_gaps (postgres v0.5.0 §F — impl pending)",
+        ))
+    }
+
+    async fn conscience_override_rates(
+        &self,
+        _deployment_domain: &str,
+        _window: crate::read::TimeWindow,
+    ) -> Result<Vec<crate::read::OverrideRateRow>, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "conscience_override_rates (postgres v0.5.0 §F — impl pending)",
+        ))
+    }
+
+    async fn aggregate_scoring_factors(
+        &self,
+        _agent_id_hash: &str,
+        _window: crate::read::TimeWindow,
+        _baseline: Option<crate::read::TimeWindow>,
+    ) -> Result<crate::read::ScoringFactorAggregate, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "aggregate_scoring_factors (postgres v0.5.0 §E — impl pending)",
+        ))
+    }
+
+    async fn aggregate_scoring_factors_batch(
+        &self,
+        _agent_id_hashes: &[String],
+        _window: crate::read::TimeWindow,
+        _baseline: Option<crate::read::TimeWindow>,
+    ) -> Result<Vec<crate::read::ScoringFactorAggregate>, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "aggregate_scoring_factors_batch (postgres v0.5.0 §E — impl pending)",
+        ))
+    }
+
+    async fn count_traces(
+        &self,
+        _filter: crate::read::TraceFilter,
+    ) -> Result<i64, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "count_traces (postgres v0.5.0 §E — impl pending)",
+        ))
+    }
+
+    async fn count_overrides(
+        &self,
+        _filter: crate::read::TraceFilter,
+    ) -> Result<i64, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "count_overrides (postgres v0.5.0 §E — impl pending)",
+        ))
+    }
+
+    async fn count_identity_changes(
+        &self,
+        _filter: crate::read::TraceFilter,
+    ) -> Result<i64, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "count_identity_changes (postgres v0.5.0 §E — impl pending)",
+        ))
+    }
+
+    async fn aggregate_audit_chain(
+        &self,
+        _filter: crate::read::TraceFilter,
+    ) -> Result<crate::read::AuditChainAggregate, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "aggregate_audit_chain (postgres v0.5.0 §E — impl pending)",
+        ))
+    }
+}
+
 // ─── DerivedSchema impl (v0.4.3, CIRISPersist#18) ──────────────────
 //
 // CRUD over cirislens_derived.{detection_events, calibration_bundles}.
