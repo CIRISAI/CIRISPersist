@@ -2507,6 +2507,367 @@ impl PyEngine {
             })
         })
     }
+
+    // ─── Federation read primitives (v0.5.0, CIRISPersist#23) ──────
+    //
+    // 12 wrappers over crate::read::ReadEngine. Wire format: JSON
+    // strings in/out for complex types (TraceFilter, TraceCursor,
+    // TraceSummary, TraceListPage, TraceDetail, TimeWindow,
+    // DivergenceRow/etc., ScoringFactorAggregate); primitives as
+    // direct args (trace_id, agent_id_hash, limit, etc.). Lens calls
+    // json.dumps before passing in, json.loads on receiving back —
+    // adds a serde round-trip per call but keeps the API uniform
+    // across complex shapes (same idiom as put_public_key /
+    // put_attestation / put_detection_event).
+    //
+    // AV-15: read_err_to_py emits stable kind tokens at the FFI
+    // boundary; verbose detail to tracing only.
+
+    // ── Section A: trace listing ────────────────────────────────
+
+    /// Lens-bleeding endpoint /repository/traces driver.
+    /// Returns a JSON string of `TraceListPage`.
+    #[pyo3(signature = (filter_json, cursor_json=None, limit=100))]
+    fn list_trace_summaries(
+        &self,
+        py: Python<'_>,
+        filter_json: &str,
+        cursor_json: Option<&str>,
+        limit: i64,
+    ) -> PyResult<String> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
+            .map_err(|e| PyValueError::new_err(format!("TraceFilter JSON decode: {e}")))?;
+        let cursor: Option<crate::read::TraceCursor> = match cursor_json {
+            None => None,
+            Some(s) => Some(
+                serde_json::from_str(s)
+                    .map_err(|e| PyValueError::new_err(format!("TraceCursor JSON decode: {e}")))?,
+            ),
+        };
+        py.detach(move || {
+            runtime.block_on(async move {
+                use crate::read::ReadEngine;
+                let page = backend
+                    .list_trace_summaries(filter, cursor, limit)
+                    .await
+                    .map_err(read_err_to_py)?;
+                serde_json::to_string(&page)
+                    .map_err(|e| PyRuntimeError::new_err(format!("TraceListPage encode: {e}")))
+            })
+        })
+    }
+
+    /// Single-trace summary lookup. Returns JSON-encoded
+    /// `TraceSummary` or `None`.
+    fn get_trace_summary(&self, py: Python<'_>, trace_id: &str) -> PyResult<Option<String>> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let trace_id = trace_id.to_owned();
+        py.detach(move || {
+            runtime.block_on(async move {
+                use crate::read::ReadEngine;
+                let opt = backend
+                    .get_trace_summary(&trace_id)
+                    .await
+                    .map_err(read_err_to_py)?;
+                match opt {
+                    None => Ok(None),
+                    Some(s) => Ok(Some(serde_json::to_string(&s).map_err(|e| {
+                        PyRuntimeError::new_err(format!("TraceSummary encode: {e}"))
+                    })?)),
+                }
+            })
+        })
+    }
+
+    // ── Section B: trace detail ─────────────────────────────────
+
+    /// Full trace reconstruction. Returns JSON-encoded `TraceDetail`
+    /// or `None`. Drives `/repository/traces/{trace_id}`.
+    fn get_trace_detail(&self, py: Python<'_>, trace_id: &str) -> PyResult<Option<String>> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let trace_id = trace_id.to_owned();
+        py.detach(move || {
+            runtime.block_on(async move {
+                use crate::read::ReadEngine;
+                let opt = backend
+                    .get_trace_detail(&trace_id)
+                    .await
+                    .map_err(read_err_to_py)?;
+                match opt {
+                    None => Ok(None),
+                    Some(d) => Ok(Some(serde_json::to_string(&d).map_err(|e| {
+                        PyRuntimeError::new_err(format!("TraceDetail encode: {e}"))
+                    })?)),
+                }
+            })
+        })
+    }
+
+    // ── Section F: Coherence Ratchet inputs ─────────────────────
+
+    /// Cross-agent divergence z-scores. `metric` is one of
+    /// `"csdma_plausibility"`, `"dsdma_domain_alignment"`,
+    /// `"idma_k_eff"`, `"idma_correlation_risk"`,
+    /// `"conscience_override_rate"`. Returns JSON array of
+    /// `DivergenceRow`.
+    fn cross_agent_divergence(
+        &self,
+        py: Python<'_>,
+        deployment_domain: &str,
+        window_json: &str,
+        metric: &str,
+    ) -> PyResult<String> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let domain = deployment_domain.to_owned();
+        let window: crate::read::TimeWindow = serde_json::from_str(window_json)
+            .map_err(|e| PyValueError::new_err(format!("TimeWindow JSON decode: {e}")))?;
+        let metric: crate::read::DeviationMetric =
+            serde_json::from_str(&format!("\"{metric}\""))
+                .map_err(|e| PyValueError::new_err(format!("DeviationMetric decode: {e}")))?;
+        py.detach(move || {
+            runtime.block_on(async move {
+                use crate::read::ReadEngine;
+                let rows = backend
+                    .cross_agent_divergence(&domain, window, metric)
+                    .await
+                    .map_err(read_err_to_py)?;
+                serde_json::to_string(&rows)
+                    .map_err(|e| PyRuntimeError::new_err(format!("DivergenceRow encode: {e}")))
+            })
+        })
+    }
+
+    /// Temporal drift between two windows for one agent.
+    /// Returns JSON array of `TemporalDriftRow`.
+    fn temporal_drift(
+        &self,
+        py: Python<'_>,
+        agent_id_hash: &str,
+        baseline_json: &str,
+        comparison_json: &str,
+    ) -> PyResult<String> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let aid = agent_id_hash.to_owned();
+        let baseline: crate::read::TimeWindow = serde_json::from_str(baseline_json)
+            .map_err(|e| PyValueError::new_err(format!("baseline TimeWindow decode: {e}")))?;
+        let comparison: crate::read::TimeWindow = serde_json::from_str(comparison_json)
+            .map_err(|e| PyValueError::new_err(format!("comparison TimeWindow decode: {e}")))?;
+        py.detach(move || {
+            runtime.block_on(async move {
+                use crate::read::ReadEngine;
+                let rows = backend
+                    .temporal_drift(&aid, baseline, comparison)
+                    .await
+                    .map_err(read_err_to_py)?;
+                serde_json::to_string(&rows)
+                    .map_err(|e| PyRuntimeError::new_err(format!("TemporalDriftRow encode: {e}")))
+            })
+        })
+    }
+
+    /// Audit-chain gaps for an agent over a window. Returns JSON
+    /// array of `HashChainGap`.
+    fn hash_chain_gaps(
+        &self,
+        py: Python<'_>,
+        agent_id_hash: &str,
+        window_json: &str,
+    ) -> PyResult<String> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let aid = agent_id_hash.to_owned();
+        let window: crate::read::TimeWindow = serde_json::from_str(window_json)
+            .map_err(|e| PyValueError::new_err(format!("TimeWindow decode: {e}")))?;
+        py.detach(move || {
+            runtime.block_on(async move {
+                use crate::read::ReadEngine;
+                let rows = backend
+                    .hash_chain_gaps(&aid, window)
+                    .await
+                    .map_err(read_err_to_py)?;
+                serde_json::to_string(&rows)
+                    .map_err(|e| PyRuntimeError::new_err(format!("HashChainGap encode: {e}")))
+            })
+        })
+    }
+
+    /// Per-agent conscience-override rates within a deployment
+    /// domain. Returns JSON array of `OverrideRateRow`.
+    fn conscience_override_rates(
+        &self,
+        py: Python<'_>,
+        deployment_domain: &str,
+        window_json: &str,
+    ) -> PyResult<String> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let domain = deployment_domain.to_owned();
+        let window: crate::read::TimeWindow = serde_json::from_str(window_json)
+            .map_err(|e| PyValueError::new_err(format!("TimeWindow decode: {e}")))?;
+        py.detach(move || {
+            runtime.block_on(async move {
+                use crate::read::ReadEngine;
+                let rows = backend
+                    .conscience_override_rates(&domain, window)
+                    .await
+                    .map_err(read_err_to_py)?;
+                serde_json::to_string(&rows)
+                    .map_err(|e| PyRuntimeError::new_err(format!("OverrideRateRow encode: {e}")))
+            })
+        })
+    }
+
+    // ── Section E: scoring factor aggregates ────────────────────
+
+    /// Bundled scoring factor aggregate. Replaces api/scoring.py's
+    /// raw SQL. Returns JSON-encoded `ScoringFactorAggregate`.
+    /// `baseline_window_json=None` → `drift_z_score` is None.
+    #[pyo3(signature = (agent_id_hash, window_json, baseline_window_json=None))]
+    fn aggregate_scoring_factors(
+        &self,
+        py: Python<'_>,
+        agent_id_hash: &str,
+        window_json: &str,
+        baseline_window_json: Option<&str>,
+    ) -> PyResult<String> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let aid = agent_id_hash.to_owned();
+        let window: crate::read::TimeWindow = serde_json::from_str(window_json)
+            .map_err(|e| PyValueError::new_err(format!("TimeWindow decode: {e}")))?;
+        let baseline: Option<crate::read::TimeWindow> =
+            match baseline_window_json {
+                None => None,
+                Some(s) => Some(serde_json::from_str(s).map_err(|e| {
+                    PyValueError::new_err(format!("baseline TimeWindow decode: {e}"))
+                })?),
+            };
+        py.detach(move || {
+            runtime.block_on(async move {
+                use crate::read::ReadEngine;
+                let agg = backend
+                    .aggregate_scoring_factors(&aid, window, baseline)
+                    .await
+                    .map_err(read_err_to_py)?;
+                serde_json::to_string(&agg).map_err(|e| {
+                    PyRuntimeError::new_err(format!("ScoringFactorAggregate encode: {e}"))
+                })
+            })
+        })
+    }
+
+    /// Batch variant — fleet-wide score sweep. `agent_id_hashes_json`
+    /// is a JSON array of strings. Returns JSON array of
+    /// `ScoringFactorAggregate` in input order.
+    #[pyo3(signature = (agent_id_hashes_json, window_json, baseline_window_json=None))]
+    fn aggregate_scoring_factors_batch(
+        &self,
+        py: Python<'_>,
+        agent_id_hashes_json: &str,
+        window_json: &str,
+        baseline_window_json: Option<&str>,
+    ) -> PyResult<String> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let aids: Vec<String> = serde_json::from_str(agent_id_hashes_json)
+            .map_err(|e| PyValueError::new_err(format!("agent_id_hashes decode: {e}")))?;
+        let window: crate::read::TimeWindow = serde_json::from_str(window_json)
+            .map_err(|e| PyValueError::new_err(format!("TimeWindow decode: {e}")))?;
+        let baseline: Option<crate::read::TimeWindow> =
+            match baseline_window_json {
+                None => None,
+                Some(s) => Some(serde_json::from_str(s).map_err(|e| {
+                    PyValueError::new_err(format!("baseline TimeWindow decode: {e}"))
+                })?),
+            };
+        py.detach(move || {
+            runtime.block_on(async move {
+                use crate::read::ReadEngine;
+                let aggs = backend
+                    .aggregate_scoring_factors_batch(&aids, window, baseline)
+                    .await
+                    .map_err(read_err_to_py)?;
+                serde_json::to_string(&aggs).map_err(|e| {
+                    PyRuntimeError::new_err(format!("ScoringFactorAggregate[] encode: {e}"))
+                })
+            })
+        })
+    }
+
+    /// Granular: count distinct trace_id matching filter.
+    fn count_traces(&self, py: Python<'_>, filter_json: &str) -> PyResult<i64> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
+            .map_err(|e| PyValueError::new_err(format!("TraceFilter decode: {e}")))?;
+        py.detach(move || {
+            runtime.block_on(async move {
+                use crate::read::ReadEngine;
+                backend.count_traces(filter).await.map_err(read_err_to_py)
+            })
+        })
+    }
+
+    /// Granular: count traces where conscience overrode the action.
+    fn count_overrides(&self, py: Python<'_>, filter_json: &str) -> PyResult<i64> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
+            .map_err(|e| PyValueError::new_err(format!("TraceFilter decode: {e}")))?;
+        py.detach(move || {
+            runtime.block_on(async move {
+                use crate::read::ReadEngine;
+                backend
+                    .count_overrides(filter)
+                    .await
+                    .map_err(read_err_to_py)
+            })
+        })
+    }
+
+    /// Granular: count agent_name changes (identity changes).
+    fn count_identity_changes(&self, py: Python<'_>, filter_json: &str) -> PyResult<i64> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
+            .map_err(|e| PyValueError::new_err(format!("TraceFilter decode: {e}")))?;
+        py.detach(move || {
+            runtime.block_on(async move {
+                use crate::read::ReadEngine;
+                backend
+                    .count_identity_changes(filter)
+                    .await
+                    .map_err(read_err_to_py)
+            })
+        })
+    }
+
+    /// Granular: audit-chain aggregate.
+    /// Returns JSON-encoded `AuditChainAggregate`.
+    fn aggregate_audit_chain(&self, py: Python<'_>, filter_json: &str) -> PyResult<String> {
+        let backend = self.backend.clone();
+        let runtime = self.runtime.clone();
+        let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
+            .map_err(|e| PyValueError::new_err(format!("TraceFilter decode: {e}")))?;
+        py.detach(move || {
+            runtime.block_on(async move {
+                use crate::read::ReadEngine;
+                let agg = backend
+                    .aggregate_audit_chain(filter)
+                    .await
+                    .map_err(read_err_to_py)?;
+                serde_json::to_string(&agg).map_err(|e| {
+                    PyRuntimeError::new_err(format!("AuditChainAggregate encode: {e}"))
+                })
+            })
+        })
+    }
 }
 
 /// v0.4.2 — Bridge `signing::StewardSignerError` → `PyErr` at the
@@ -2700,6 +3061,24 @@ fn trace_level_str(t: crate::schema::TraceLevel) -> &'static str {
 /// Mission constraint (THREAT_MODEL.md AV-15): structured detail
 /// goes to tracing; the Python exception carries the stable kind
 /// token. Lens HTTP layer maps token → status code.
+/// v0.5.0 (CIRISPersist#23) — Bridge `read::Error` → `PyErr` at the
+/// FFI boundary. Federation read primitives. Same discipline as
+/// `derived_err_to_py` / `outbound_err_to_py`: stable kind tokens
+/// cross the boundary, structured detail goes to tracing.
+///
+/// AV-15 / AV-43: kind tokens are closed-set `&'static str`; no
+/// attacker-controlled strings leak across the boundary.
+fn read_err_to_py(e: crate::read::Error) -> PyErr {
+    let kind = e.kind();
+    tracing::warn!(error = %e, kind = kind, "read error");
+    match e {
+        crate::read::Error::InvalidArgument(_) => PyValueError::new_err(kind),
+        crate::read::Error::InvalidCursor(_) => PyValueError::new_err(kind),
+        crate::read::Error::Backend(_) => PyRuntimeError::new_err(kind),
+        crate::read::Error::NotImplemented(_) => PyRuntimeError::new_err(kind),
+    }
+}
+
 /// v0.4.3 (CIRISPersist#18) — Bridge `derived::Error` → `PyErr` at
 /// the FFI boundary. Same discipline as the other err_to_py
 /// helpers: stable kind tokens cross the boundary, structured
