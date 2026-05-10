@@ -2757,46 +2757,363 @@ impl crate::read::ReadEngine for PostgresBackend {
         }))
     }
 
+    /// Section F: cross-agent divergence z-scores within a deployment
+    /// domain. Per-agent metric mean compared to the domain population
+    /// mean+std (`STDDEV_SAMP`); rows ordered by `|z_score| DESC`
+    /// (most-divergent first; lens applies its own clustering).
+    ///
+    /// Two SQL shapes:
+    /// 1. Numerical metrics (CSDMA / DSDMA / IDMA k_eff / IDMA
+    ///    correlation_risk) — per-agent AVG of the JSONB field over
+    ///    the relevant event_type rows.
+    /// 2. ConscienceOverrideRate — per-trace BOOL_OR collapse +
+    ///    per-agent rate over distinct traces.
     async fn cross_agent_divergence(
         &self,
-        _deployment_domain: &str,
-        _window: crate::read::TimeWindow,
-        _metric: crate::read::DeviationMetric,
+        deployment_domain: &str,
+        window: crate::read::TimeWindow,
+        metric: crate::read::DeviationMetric,
     ) -> Result<Vec<crate::read::DivergenceRow>, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "cross_agent_divergence (postgres v0.5.0 §F — impl pending)",
-        ))
+        use crate::read::DeviationMetric;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
+
+        let rows = if matches!(metric, DeviationMetric::ConscienceOverrideRate) {
+            // CONSCIENCE_RESULT can fire multiple times per trace
+            // (recursive retries); BOOL_OR(action_was_overridden)
+            // collapses to one bool per (agent_id_hash, trace_id) so
+            // the per-agent rate is over distinct traces.
+            client
+                .query(
+                    "WITH per_trace AS ( \
+                        SELECT agent_id_hash, MIN(agent_name) AS agent_name, trace_id, \
+                               BOOL_OR( \
+                                 (event_type = 'CONSCIENCE_RESULT' \
+                                   AND (payload->>'action_was_overridden')::bool) \
+                               ) AS was_overridden \
+                        FROM cirislens.trace_events \
+                        WHERE deployment_domain = $1 AND ts >= $2 AND ts < $3 \
+                        GROUP BY agent_id_hash, trace_id \
+                     ), \
+                     per_agent AS ( \
+                        SELECT agent_id_hash, MIN(agent_name) AS agent_name, \
+                               COUNT(*) AS sample_count, \
+                               (SUM(CASE WHEN was_overridden THEN 1 ELSE 0 END)::float8) \
+                                 / NULLIF(COUNT(*), 0)::float8 AS rate \
+                        FROM per_trace \
+                        GROUP BY agent_id_hash \
+                        HAVING COUNT(*) > 0 \
+                     ), \
+                     domain_stats AS ( \
+                        SELECT AVG(rate) AS m, STDDEV_SAMP(rate) AS s FROM per_agent \
+                     ) \
+                     SELECT pa.agent_id_hash, pa.agent_name, \
+                            CASE WHEN ds.s IS NULL OR ds.s = 0.0 THEN 0.0::float8 \
+                                 ELSE (pa.rate - ds.m) / ds.s \
+                            END AS z_score, \
+                            pa.sample_count \
+                     FROM per_agent pa CROSS JOIN domain_stats ds \
+                     ORDER BY ABS( \
+                        CASE WHEN ds.s IS NULL OR ds.s = 0.0 THEN 0.0::float8 \
+                             ELSE (pa.rate - ds.m) / ds.s \
+                        END \
+                     ) DESC, pa.agent_id_hash ASC",
+                    &[&deployment_domain, &window.since, &window.until],
+                )
+                .await
+                .map_err(|e| {
+                    crate::read::Error::Backend(format!("cross_agent_divergence override: {e}"))
+                })?
+        } else {
+            let (event_type_filter, field_path): (&str, &str) = match metric {
+                DeviationMetric::CsdmaPlausibility => ("DMA_RESULTS", "csdma_plausibility_score"),
+                DeviationMetric::DsdmaDomainAlignment => ("DMA_RESULTS", "dsdma_domain_alignment"),
+                DeviationMetric::IdmaKEff => ("IDMA_RESULT", "idma_k_eff"),
+                DeviationMetric::IdmaCorrelationRisk => ("IDMA_RESULT", "idma_correlation_risk"),
+                DeviationMetric::ConscienceOverrideRate => unreachable!(),
+            };
+            let sql = format!(
+                "WITH per_agent AS ( \
+                    SELECT agent_id_hash, MIN(agent_name) AS agent_name, \
+                           AVG((payload->>'{field_path}')::float8) AS mean, \
+                           COUNT(*) FILTER (WHERE payload ? '{field_path}') AS sample_count \
+                    FROM cirislens.trace_events \
+                    WHERE deployment_domain = $1 AND ts >= $2 AND ts < $3 \
+                          AND event_type = '{event_type_filter}' \
+                          AND payload ? '{field_path}' \
+                    GROUP BY agent_id_hash \
+                    HAVING COUNT(*) > 0 \
+                ), \
+                domain_stats AS ( \
+                    SELECT AVG(mean) AS m, STDDEV_SAMP(mean) AS s FROM per_agent \
+                ) \
+                SELECT pa.agent_id_hash, pa.agent_name, \
+                       CASE WHEN ds.s IS NULL OR ds.s = 0.0 THEN 0.0::float8 \
+                            ELSE (pa.mean - ds.m) / ds.s \
+                       END AS z_score, \
+                       pa.sample_count \
+                FROM per_agent pa CROSS JOIN domain_stats ds \
+                ORDER BY ABS( \
+                    CASE WHEN ds.s IS NULL OR ds.s = 0.0 THEN 0.0::float8 \
+                         ELSE (pa.mean - ds.m) / ds.s \
+                    END \
+                ) DESC, pa.agent_id_hash ASC",
+            );
+            client
+                .query(&sql, &[&deployment_domain, &window.since, &window.until])
+                .await
+                .map_err(|e| crate::read::Error::Backend(format!("cross_agent_divergence: {e}")))?
+        };
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(crate::read::DivergenceRow {
+                agent_id_hash: row.get("agent_id_hash"),
+                agent_name: row.get("agent_name"),
+                z_score: row.get::<_, f64>("z_score"),
+                deviation_metric: metric,
+                sample_count: row.get::<_, i64>("sample_count"),
+            });
+        }
+        Ok(out)
     }
 
+    /// Section F: temporal drift between two windows for one agent.
+    /// Returns one row per metric where BOTH windows had samples
+    /// (rows with no samples in either window are omitted —
+    /// significance is undefined). Significance is a Welch-style
+    /// z-score on the mean shift; lens applies its own p-value
+    /// mapping.
     async fn temporal_drift(
         &self,
-        _agent_id_hash: &str,
-        _baseline: crate::read::TimeWindow,
-        _comparison: crate::read::TimeWindow,
+        agent_id_hash: &str,
+        baseline: crate::read::TimeWindow,
+        comparison: crate::read::TimeWindow,
     ) -> Result<Vec<crate::read::TemporalDriftRow>, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "temporal_drift (postgres v0.5.0 §F — impl pending)",
-        ))
+        use crate::read::DeviationMetric;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
+
+        let metrics = [
+            (
+                DeviationMetric::CsdmaPlausibility,
+                "DMA_RESULTS",
+                "csdma_plausibility_score",
+            ),
+            (
+                DeviationMetric::DsdmaDomainAlignment,
+                "DMA_RESULTS",
+                "dsdma_domain_alignment",
+            ),
+            (DeviationMetric::IdmaKEff, "IDMA_RESULT", "idma_k_eff"),
+            (
+                DeviationMetric::IdmaCorrelationRisk,
+                "IDMA_RESULT",
+                "idma_correlation_risk",
+            ),
+        ];
+
+        let mut out = Vec::new();
+        for (metric, et, field) in metrics {
+            let sql = format!(
+                "SELECT \
+                   AVG(CASE WHEN ts >= $2 AND ts < $3 THEN (payload->>'{field}')::float8 END) \
+                     AS base_m, \
+                   VAR_SAMP(CASE WHEN ts >= $2 AND ts < $3 \
+                                 THEN (payload->>'{field}')::float8 END) AS base_v, \
+                   COUNT(*) FILTER (WHERE ts >= $2 AND ts < $3 AND payload ? '{field}') \
+                     AS base_n, \
+                   AVG(CASE WHEN ts >= $4 AND ts < $5 THEN (payload->>'{field}')::float8 END) \
+                     AS comp_m, \
+                   VAR_SAMP(CASE WHEN ts >= $4 AND ts < $5 \
+                                 THEN (payload->>'{field}')::float8 END) AS comp_v, \
+                   COUNT(*) FILTER (WHERE ts >= $4 AND ts < $5 AND payload ? '{field}') \
+                     AS comp_n \
+                 FROM cirislens.trace_events \
+                 WHERE agent_id_hash = $1 \
+                       AND event_type = '{et}' \
+                       AND payload ? '{field}' \
+                       AND ((ts >= $2 AND ts < $3) OR (ts >= $4 AND ts < $5))",
+            );
+            let row = client
+                .query_one(
+                    &sql,
+                    &[
+                        &agent_id_hash,
+                        &baseline.since,
+                        &baseline.until,
+                        &comparison.since,
+                        &comparison.until,
+                    ],
+                )
+                .await
+                .map_err(|e| crate::read::Error::Backend(format!("temporal_drift query: {e}")))?;
+
+            let bn: i64 = row.get("base_n");
+            let cn: i64 = row.get("comp_n");
+            if bn == 0 || cn == 0 {
+                continue;
+            }
+            let bm: f64 = row.get::<_, Option<f64>>("base_m").unwrap_or(0.0);
+            let cm: f64 = row.get::<_, Option<f64>>("comp_m").unwrap_or(0.0);
+            let bv: f64 = row.get::<_, Option<f64>>("base_v").unwrap_or(0.0);
+            let cv: f64 = row.get::<_, Option<f64>>("comp_v").unwrap_or(0.0);
+
+            let pooled_se = ((bv / (bn as f64).max(1.0)) + (cv / (cn as f64).max(1.0))).sqrt();
+            let significance = if pooled_se > 0.0 {
+                (cm - bm) / pooled_se
+            } else {
+                0.0
+            };
+            let variance_ratio = if bv > 0.0 { cv / bv } else { 0.0 };
+            out.push(crate::read::TemporalDriftRow {
+                deviation_metric: metric,
+                baseline_window: baseline,
+                comparison_window: comparison,
+                mean_shift: cm - bm,
+                variance_ratio,
+                significance,
+            });
+        }
+
+        Ok(out)
     }
 
+    /// Section F: detected gaps in the agent's audit-chain sequence
+    /// number timeline. Uses LAG window function over
+    /// `audit_sequence_number` to find non-contiguous pairs.
+    /// Audit sequence is populated only on `ACTION_RESULT` rows
+    /// (per V001 schema); the query naturally limits to
+    /// action-sealed traces.
     async fn hash_chain_gaps(
         &self,
-        _agent_id_hash: &str,
-        _window: crate::read::TimeWindow,
+        agent_id_hash: &str,
+        window: crate::read::TimeWindow,
     ) -> Result<Vec<crate::read::HashChainGap>, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "hash_chain_gaps (postgres v0.5.0 §F — impl pending)",
-        ))
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
+
+        let rows = client
+            .query(
+                "WITH ordered AS ( \
+                    SELECT audit_sequence_number AS seq, ts, \
+                           LAG(audit_sequence_number) OVER w AS prev_seq, \
+                           LAG(ts) OVER w AS prev_ts \
+                    FROM cirislens.trace_events \
+                    WHERE agent_id_hash = $1 AND ts >= $2 AND ts < $3 \
+                          AND audit_sequence_number IS NOT NULL \
+                    WINDOW w AS (ORDER BY audit_sequence_number) \
+                 ) \
+                 SELECT prev_seq, seq, prev_ts, ts \
+                 FROM ordered \
+                 WHERE prev_seq IS NOT NULL AND seq > prev_seq + 1 \
+                 ORDER BY seq ASC",
+                &[&agent_id_hash, &window.since, &window.until],
+            )
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("hash_chain_gaps: {e}")))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(crate::read::HashChainGap {
+                agent_id_hash: agent_id_hash.to_owned(),
+                gap_start_seq: row.get("prev_seq"),
+                gap_end_seq: row.get("seq"),
+                gap_start_ts: row.get("prev_ts"),
+                gap_end_ts: row.get("ts"),
+            });
+        }
+        Ok(out)
     }
 
+    /// Section F: per-agent conscience-override rates within a
+    /// deployment domain. Per-trace `was_overridden` collapses
+    /// recursive CONSCIENCE_RESULT retries via BOOL_OR before
+    /// per-agent aggregation. `multiple_of_domain_avg = override_rate
+    /// / domain_avg_rate`; >1.0 means the agent overrides more than
+    /// peers.
     async fn conscience_override_rates(
         &self,
-        _deployment_domain: &str,
-        _window: crate::read::TimeWindow,
+        deployment_domain: &str,
+        window: crate::read::TimeWindow,
     ) -> Result<Vec<crate::read::OverrideRateRow>, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "conscience_override_rates (postgres v0.5.0 §F — impl pending)",
-        ))
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
+
+        let rows = client
+            .query(
+                "WITH per_trace AS ( \
+                    SELECT agent_id_hash, MIN(agent_name) AS agent_name, \
+                           MIN(deployment_domain) AS deployment_domain, trace_id, \
+                           BOOL_OR( \
+                             (event_type = 'CONSCIENCE_RESULT' \
+                               AND (payload->>'action_was_overridden')::bool) \
+                           ) AS was_overridden \
+                    FROM cirislens.trace_events \
+                    WHERE deployment_domain = $1 AND ts >= $2 AND ts < $3 \
+                    GROUP BY agent_id_hash, trace_id \
+                 ), \
+                 per_agent AS ( \
+                    SELECT agent_id_hash, MIN(agent_name) AS agent_name, \
+                           MIN(deployment_domain) AS deployment_domain, \
+                           SUM(CASE WHEN was_overridden THEN 1 ELSE 0 END)::bigint \
+                             AS override_count, \
+                           COUNT(*)::bigint AS trace_count \
+                    FROM per_trace \
+                    GROUP BY agent_id_hash \
+                 ), \
+                 dom AS ( \
+                    SELECT \
+                       SUM(override_count)::float8 / NULLIF(SUM(trace_count), 0)::float8 \
+                         AS domain_avg_rate \
+                    FROM per_agent \
+                 ) \
+                 SELECT pa.agent_id_hash, pa.agent_name, pa.deployment_domain, \
+                        pa.override_count, pa.trace_count, \
+                        CASE WHEN pa.trace_count = 0 THEN 0.0::float8 \
+                             ELSE pa.override_count::float8 / pa.trace_count::float8 \
+                        END AS override_rate, \
+                        COALESCE(d.domain_avg_rate, 0.0::float8) AS domain_avg_rate \
+                 FROM per_agent pa CROSS JOIN dom d \
+                 ORDER BY override_rate DESC, pa.agent_id_hash ASC",
+                &[&deployment_domain, &window.since, &window.until],
+            )
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("conscience_override_rates: {e}")))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let override_rate: f64 = row.get("override_rate");
+            let domain_avg: f64 = row.get("domain_avg_rate");
+            let multiple = if domain_avg > 0.0 {
+                override_rate / domain_avg
+            } else {
+                0.0
+            };
+            out.push(crate::read::OverrideRateRow {
+                agent_id_hash: row.get("agent_id_hash"),
+                agent_name: row.get("agent_name"),
+                deployment_domain: row.get("deployment_domain"),
+                override_count: row.get("override_count"),
+                trace_count: row.get("trace_count"),
+                override_rate,
+                domain_avg_rate: domain_avg,
+                multiple_of_domain_avg: multiple,
+            });
+        }
+        Ok(out)
     }
 
     async fn aggregate_scoring_factors(
@@ -4115,6 +4432,394 @@ mod tests {
             .expect("detail present even without LLM calls");
         assert_eq!(detail.components.len(), 5);
         assert!(detail.llm_calls.is_empty());
+    }
+
+    // ─── ReadEngine §F tests (v0.5.0, CIRISPersist#23) ──────────────
+
+    /// §F cross_agent_divergence — three agents in the same domain
+    /// with different csdma_plausibility_score means; assert the
+    /// outlier has the largest |z_score|; sample_count matches the
+    /// fixture.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_f_cross_agent_divergence_csdma() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        use crate::read::ReadEngine;
+        let suffix = uuid_like();
+        let dom = format!("dom-§f-{suffix}");
+        let now = chrono::Utc::now();
+        let window = crate::read::TimeWindow {
+            since: now - chrono::Duration::hours(1),
+            until: now + chrono::Duration::hours(1),
+        };
+
+        // Three agents:
+        //   agent-A: csdma=0.85 (close to peer mean)
+        //   agent-B: csdma=0.85 (close to peer mean)
+        //   agent-C: csdma=0.30 (outlier — much lower)
+        for (aid, score) in [
+            (format!("agent-§f-A-{suffix}"), 0.85_f64),
+            (format!("agent-§f-B-{suffix}"), 0.85_f64),
+            (format!("agent-§f-C-{suffix}"), 0.30_f64),
+        ] {
+            let tid = format!("trace-§f-{aid}");
+            insert_section_a_fixture_trace(
+                &backend,
+                &tid,
+                &aid,
+                Some(&aid),
+                Some(&dom),
+                now,
+                false,
+                score,
+                0.5,
+                1.0,
+            )
+            .await;
+        }
+
+        let rows = backend
+            .cross_agent_divergence(
+                &dom,
+                window,
+                crate::read::DeviationMetric::CsdmaPlausibility,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        // Most-divergent first: agent-C should top the list.
+        assert!(rows[0].agent_id_hash.contains("agent-§f-C-"));
+        assert!(rows[0].z_score.abs() > rows[1].z_score.abs());
+        // sample_count matches the fixture (1 DMA_RESULTS row per agent).
+        for r in &rows {
+            assert_eq!(r.sample_count, 1);
+            assert_eq!(
+                r.deviation_metric,
+                crate::read::DeviationMetric::CsdmaPlausibility
+            );
+        }
+    }
+
+    /// §F cross_agent_divergence — ConscienceOverrideRate metric.
+    /// Agent-A overrides 1/3 of traces; agent-B overrides 0/3.
+    /// A's z-score should be positive; B's negative.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_f_cross_agent_divergence_override_rate() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        use crate::read::ReadEngine;
+        let suffix = uuid_like();
+        let dom = format!("dom-§f-or-{suffix}");
+        let now = chrono::Utc::now();
+        let aid_a = format!("agent-§f-A-{suffix}");
+        let aid_b = format!("agent-§f-B-{suffix}");
+
+        // agent-A: 3 traces, 1 overridden (rate=1/3)
+        for i in 0..3 {
+            let tid = format!("trace-§f-A-{suffix}-{i}");
+            insert_section_a_fixture_trace(
+                &backend,
+                &tid,
+                &aid_a,
+                Some(&aid_a),
+                Some(&dom),
+                now + chrono::Duration::seconds(i64::from(i)),
+                i == 0, // first one overridden
+                0.5,
+                0.5,
+                1.0,
+            )
+            .await;
+        }
+        // agent-B: 3 traces, 0 overridden (rate=0)
+        for i in 0..3 {
+            let tid = format!("trace-§f-B-{suffix}-{i}");
+            insert_section_a_fixture_trace(
+                &backend,
+                &tid,
+                &aid_b,
+                Some(&aid_b),
+                Some(&dom),
+                now + chrono::Duration::seconds(i64::from(i)),
+                false,
+                0.5,
+                0.5,
+                1.0,
+            )
+            .await;
+        }
+
+        let window = crate::read::TimeWindow {
+            since: now - chrono::Duration::hours(1),
+            until: now + chrono::Duration::hours(1),
+        };
+        let rows = backend
+            .cross_agent_divergence(
+                &dom,
+                window,
+                crate::read::DeviationMetric::ConscienceOverrideRate,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        // agent-A has higher override rate → positive z; agent-B → negative.
+        let a_row = rows.iter().find(|r| r.agent_id_hash == aid_a).unwrap();
+        let b_row = rows.iter().find(|r| r.agent_id_hash == aid_b).unwrap();
+        assert!(a_row.z_score > 0.0, "agent-A z-score must be positive");
+        assert!(b_row.z_score < 0.0, "agent-B z-score must be negative");
+        assert_eq!(a_row.sample_count, 3);
+        assert_eq!(b_row.sample_count, 3);
+    }
+
+    /// §F temporal_drift — same agent, two windows with different
+    /// csdma means; assert mean_shift = comp_mean - base_mean and
+    /// significance has correct sign.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_f_temporal_drift() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        use crate::read::ReadEngine;
+        let suffix = uuid_like();
+        let aid = format!("agent-§f-td-{suffix}");
+        let now = chrono::Utc::now();
+
+        // Baseline window: 5 traces with csdma values varying around 0.8
+        // (mean=0.8, non-zero variance). Comparison: 5 traces around 0.5
+        // (mean=0.5, non-zero variance). mean_shift = -0.3; pooled_se >
+        // 0; significance is well-defined and negative.
+        let base_t = now - chrono::Duration::hours(2);
+        let base_scores = [0.75, 0.78, 0.80, 0.82, 0.85];
+        for (i, score) in base_scores.iter().enumerate() {
+            let tid = format!("trace-§f-td-base-{suffix}-{i}");
+            insert_section_a_fixture_trace(
+                &backend,
+                &tid,
+                &aid,
+                Some(&aid),
+                Some("d"),
+                base_t + chrono::Duration::minutes(i64::try_from(i).unwrap()),
+                false,
+                *score,
+                0.5,
+                1.0,
+            )
+            .await;
+        }
+        let comp_t = now - chrono::Duration::minutes(20);
+        let comp_scores = [0.45, 0.48, 0.50, 0.52, 0.55];
+        for (i, score) in comp_scores.iter().enumerate() {
+            let tid = format!("trace-§f-td-comp-{suffix}-{i}");
+            insert_section_a_fixture_trace(
+                &backend,
+                &tid,
+                &aid,
+                Some(&aid),
+                Some("d"),
+                comp_t + chrono::Duration::minutes(i64::try_from(i).unwrap()),
+                false,
+                *score,
+                0.5,
+                1.0,
+            )
+            .await;
+        }
+
+        let baseline = crate::read::TimeWindow {
+            since: now - chrono::Duration::hours(3),
+            until: now - chrono::Duration::hours(1),
+        };
+        let comparison = crate::read::TimeWindow {
+            since: now - chrono::Duration::minutes(45),
+            until: now + chrono::Duration::minutes(15),
+        };
+        let rows = backend
+            .temporal_drift(&aid, baseline, comparison)
+            .await
+            .unwrap();
+        // Find the CSDMA row.
+        let csdma = rows
+            .iter()
+            .find(|r| r.deviation_metric == crate::read::DeviationMetric::CsdmaPlausibility)
+            .expect("CSDMA drift row");
+        assert!((csdma.mean_shift - (-0.3)).abs() < 1e-9);
+        // significance has same sign as mean_shift (negative shift → negative z)
+        assert!(csdma.significance < 0.0);
+    }
+
+    /// §F hash_chain_gaps — insert ACTION_RESULT rows with
+    /// audit_sequence_number = 1, 2, 5, 6 (gap between 2 and 5);
+    /// assert one detected gap with start=2, end=5.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_f_hash_chain_gaps() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        use crate::read::ReadEngine;
+        let suffix = uuid_like();
+        let aid = format!("agent-§f-gap-{suffix}");
+        let now = chrono::Utc::now();
+
+        // ACTION_RESULT rows directly via Backend insert with
+        // audit_sequence_number set. Need to pass a TraceEventRow
+        // with audit fields set; the existing fixture helper
+        // doesn't take audit_sequence_number. Build inline.
+        let mk = |seq: i64, ts_offset_min: i64| TraceEventRow {
+            trace_id: format!("trace-§f-gap-{suffix}-{seq}"),
+            thought_id: format!("th-{seq}"),
+            task_id: None,
+            step_point: None,
+            event_type: ReasoningEventType::ActionResult,
+            attempt_index: 0,
+            ts: now + chrono::Duration::minutes(ts_offset_min),
+            agent_name: Some(aid.clone()),
+            agent_id_hash: aid.clone(),
+            cognitive_state: Some("work".into()),
+            trace_level: crate::schema::TraceLevel::Generic,
+            payload: {
+                let mut m = serde_json::Map::new();
+                m.insert("audit_sequence_number".into(), seq.into());
+                m.insert("audit_entry_hash".into(), "deadbeef".into());
+                m.insert("audit_signature".into(), "BBBB".into());
+                m
+            },
+            cost_llm_calls: None,
+            cost_tokens: None,
+            cost_usd: None,
+            signature: "AAAA".into(),
+            signing_key_id: "test-key".into(),
+            signature_verified: true,
+            schema_version: "2.7.0".into(),
+            pii_scrubbed: false,
+            original_content_hash: None,
+            scrub_signature: None,
+            scrub_key_id: None,
+            scrub_timestamp: None,
+            agent_role: None,
+            agent_template: None,
+            deployment_domain: None,
+            deployment_type: None,
+            deployment_region: None,
+            deployment_trust_mode: None,
+        };
+        // Insert seqs 1,2,5,6 — single gap (3,4 missing).
+        backend
+            .insert_trace_events_batch(&[mk(1, 0), mk(2, 1), mk(5, 2), mk(6, 3)])
+            .await
+            .unwrap();
+
+        let window = crate::read::TimeWindow {
+            since: now - chrono::Duration::minutes(1),
+            until: now + chrono::Duration::hours(1),
+        };
+        let gaps = backend.hash_chain_gaps(&aid, window).await.unwrap();
+        assert_eq!(gaps.len(), 1);
+        let g = &gaps[0];
+        assert_eq!(g.gap_start_seq, 2);
+        assert_eq!(g.gap_end_seq, 5);
+        assert_eq!(g.agent_id_hash, aid);
+    }
+
+    /// §F conscience_override_rates — two agents in same domain:
+    /// agent-A overrides 2/4 traces (rate=0.5); agent-B overrides 1/4
+    /// (rate=0.25). Domain avg = (2+1)/(4+4) = 0.375. Multiples
+    /// surface correctly.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_f_conscience_override_rates() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        use crate::read::ReadEngine;
+        let suffix = uuid_like();
+        let dom = format!("dom-§f-cor-{suffix}");
+        let aid_a = format!("agent-§f-cor-A-{suffix}");
+        let aid_b = format!("agent-§f-cor-B-{suffix}");
+        let now = chrono::Utc::now();
+
+        // agent-A: 4 traces, traces[0..2] overridden (2/4 = 0.5)
+        for i in 0..4 {
+            let tid = format!("trace-§f-cor-A-{suffix}-{i}");
+            insert_section_a_fixture_trace(
+                &backend,
+                &tid,
+                &aid_a,
+                Some(&aid_a),
+                Some(&dom),
+                now + chrono::Duration::seconds(i64::from(i)),
+                i < 2,
+                0.5,
+                0.5,
+                1.0,
+            )
+            .await;
+        }
+        // agent-B: 4 traces, traces[0] overridden (1/4 = 0.25)
+        for i in 0..4 {
+            let tid = format!("trace-§f-cor-B-{suffix}-{i}");
+            insert_section_a_fixture_trace(
+                &backend,
+                &tid,
+                &aid_b,
+                Some(&aid_b),
+                Some(&dom),
+                now + chrono::Duration::seconds(i64::from(i)),
+                i == 0,
+                0.5,
+                0.5,
+                1.0,
+            )
+            .await;
+        }
+
+        let window = crate::read::TimeWindow {
+            since: now - chrono::Duration::hours(1),
+            until: now + chrono::Duration::hours(1),
+        };
+        let rows = backend
+            .conscience_override_rates(&dom, window)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let a = rows.iter().find(|r| r.agent_id_hash == aid_a).unwrap();
+        let b = rows.iter().find(|r| r.agent_id_hash == aid_b).unwrap();
+        assert_eq!(a.override_count, 2);
+        assert_eq!(a.trace_count, 4);
+        assert!((a.override_rate - 0.5).abs() < 1e-9);
+        assert_eq!(b.override_count, 1);
+        assert_eq!(b.trace_count, 4);
+        assert!((b.override_rate - 0.25).abs() < 1e-9);
+        // Domain avg = 3/8 = 0.375; A's multiple = 0.5/0.375 ≈ 1.333.
+        assert!((a.domain_avg_rate - 0.375).abs() < 1e-9);
+        assert!((a.multiple_of_domain_avg - 1.333_333_333_333_333_3).abs() < 1e-6);
+        // B's multiple = 0.25/0.375 ≈ 0.667.
+        assert!((b.multiple_of_domain_avg - 0.666_666_666_666_666_7).abs() < 1e-6);
     }
 
     /// §A: invalid cursor version rejects with InvalidCursor.
