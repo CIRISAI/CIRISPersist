@@ -2264,33 +2264,301 @@ fn llm_status_str(s: crate::schema::LlmCallStatus) -> &'static str {
 // ─── ReadEngine impl (v0.5.0, CIRISPersist#23) ─────────────────────
 //
 // Federation read primitives — sections A/B/F/E per the v0.5.0 batch.
-// Skeleton stubs in this commit; section impls land in follow-up
-// commits before tagging v0.5.0:
-//   - Section A: list_trace_summaries + get_trace_summary
-//   - Section B: get_trace_detail
-//   - Section F: cross_agent_divergence + temporal_drift +
-//                hash_chain_gaps + conscience_override_rates
-//   - Section E: aggregate_scoring_factors + batch + count_*
+// Section A (list + get) shipped; B/F/E land in follow-up commits
+// before the v0.5.0 tag.
+//
+// JSONB-extraction strategy: every TraceSummary field that lives
+// inside a per-event-type payload (DMA scores, conscience flags,
+// action result, thought metadata) is extracted via PostgreSQL
+// FILTER (WHERE event_type = '...') aggregation in one single-pass
+// GROUP BY trace_id. Avoids N+1 round-trips and keeps the SQL
+// readable. Index coverage: trace_events_dedup
+// (agent_id_hash, trace_id, ...) handles the trace_id-bound queries;
+// trace_events_agent_ts handles agent-filtered list pagination.
+
+/// JSONB-extraction SELECT clause shared by [`get_trace_summary`] and
+/// [`list_trace_summaries`]. The leading `MIN(trace_id)` produces the
+/// trace_id column for the GROUP BY result row.
+const TRACE_SUMMARY_SELECT: &str = "\
+    MIN(trace_id) AS trace_id, \
+    MIN(thought_id) AS thought_id, \
+    MIN(task_id) AS task_id, \
+    MIN(agent_id_hash) AS agent_id_hash, \
+    MIN(agent_name) AS agent_name, \
+    MIN(agent_role) AS agent_role, \
+    MIN(deployment_domain) AS deployment_domain, \
+    MIN(deployment_type) AS deployment_type, \
+    MIN(ts) AS started_at, \
+    MAX(ts) AS completed_at, \
+    MIN(trace_level) AS trace_level, \
+    MIN(schema_version) AS schema_version, \
+    BOOL_AND(signature_verified) AS signature_verified, \
+    MIN(cognitive_state) AS cognitive_state, \
+    \
+    MAX(payload->>'thought_type') FILTER (WHERE event_type = 'THOUGHT_START') AS thought_type, \
+    MAX((payload->>'thought_depth')::int) FILTER (WHERE event_type = 'THOUGHT_START') AS thought_depth, \
+    \
+    AVG((payload->>'csdma_plausibility_score')::float8) FILTER (WHERE event_type = 'DMA_RESULTS') AS csdma_plausibility_score, \
+    AVG((payload->>'dsdma_domain_alignment')::float8) FILTER (WHERE event_type = 'DMA_RESULTS') AS dsdma_domain_alignment, \
+    MAX(payload->>'dsdma_domain') FILTER (WHERE event_type = 'DMA_RESULTS') AS dsdma_domain, \
+    \
+    AVG((payload->>'idma_k_eff')::float8) FILTER (WHERE event_type = 'IDMA_RESULT') AS idma_k_eff, \
+    AVG((payload->>'idma_correlation_risk')::float8) FILTER (WHERE event_type = 'IDMA_RESULT') AS idma_correlation_risk, \
+    BOOL_OR((payload->>'idma_fragility_flag')::bool) FILTER (WHERE event_type = 'IDMA_RESULT') AS idma_fragility_flag, \
+    MAX(payload->>'idma_phase') FILTER (WHERE event_type = 'IDMA_RESULT') AS idma_phase, \
+    \
+    BOOL_AND((payload->>'conscience_passed')::bool) FILTER (WHERE event_type = 'CONSCIENCE_RESULT') AS conscience_passed, \
+    BOOL_OR((payload->>'action_was_overridden')::bool) FILTER (WHERE event_type = 'CONSCIENCE_RESULT') AS action_was_overridden, \
+    BOOL_AND((payload->>'entropy_passed')::bool) FILTER (WHERE event_type = 'CONSCIENCE_RESULT') AS entropy_passed, \
+    BOOL_AND((payload->>'coherence_passed')::bool) FILTER (WHERE event_type = 'CONSCIENCE_RESULT') AS coherence_passed, \
+    BOOL_AND((payload->>'optimization_veto_passed')::bool) FILTER (WHERE event_type = 'CONSCIENCE_RESULT') AS optimization_veto_passed, \
+    BOOL_AND((payload->>'epistemic_humility_passed')::bool) FILTER (WHERE event_type = 'CONSCIENCE_RESULT') AS epistemic_humility_passed, \
+    \
+    MAX(payload->>'action_executed') FILTER (WHERE event_type = 'ACTION_RESULT') AS selected_action, \
+    BOOL_AND((payload->>'success')::bool) FILTER (WHERE event_type = 'ACTION_RESULT') AS action_success, \
+    \
+    MAX(cost_llm_calls) AS llm_calls, \
+    MAX(cost_tokens) AS tokens_total, \
+    MAX(cost_usd) AS cost_usd";
+
+/// Convert a row produced by `TRACE_SUMMARY_SELECT` into a
+/// [`crate::read::TraceSummary`]. Trace-level (`trace_level` column
+/// is `TEXT` in V001 — converted via `serde_json::from_str` on the
+/// quoted token).
+fn pg_row_to_trace_summary(
+    row: &tokio_postgres::Row,
+) -> Result<crate::read::TraceSummary, crate::read::Error> {
+    use crate::schema::TraceLevel;
+    let trace_level_str: String = row.get("trace_level");
+    // TraceLevel is `#[serde(rename_all = "snake_case")]`; the column
+    // stores the unquoted enum token.
+    let trace_level: TraceLevel = serde_json::from_str(&format!("\"{trace_level_str}\""))
+        .map_err(|e| crate::read::Error::Backend(format!("trace_level decode: {e}")))?;
+
+    Ok(crate::read::TraceSummary {
+        trace_id: row.get("trace_id"),
+        thought_id: row.get("thought_id"),
+        task_id: row.get("task_id"),
+        agent_id_hash: row.get("agent_id_hash"),
+        agent_name: row.get("agent_name"),
+        agent_role: row.get("agent_role"),
+        deployment_domain: row.get("deployment_domain"),
+        deployment_type: row.get("deployment_type"),
+        started_at: row.get("started_at"),
+        completed_at: row.get("completed_at"),
+        trace_level,
+        schema_version: row.get("schema_version"),
+        signature_verified: row
+            .get::<_, Option<bool>>("signature_verified")
+            .unwrap_or(false),
+        cognitive_state: row.get("cognitive_state"),
+        thought_type: row.get("thought_type"),
+        thought_depth: row.get("thought_depth"),
+        csdma_plausibility_score: row.get("csdma_plausibility_score"),
+        dsdma_domain_alignment: row.get("dsdma_domain_alignment"),
+        dsdma_domain: row.get("dsdma_domain"),
+        idma_k_eff: row.get("idma_k_eff"),
+        idma_correlation_risk: row.get("idma_correlation_risk"),
+        idma_fragility_flag: row.get("idma_fragility_flag"),
+        idma_phase: row.get("idma_phase"),
+        conscience_passed: row.get("conscience_passed"),
+        action_was_overridden: row.get("action_was_overridden"),
+        entropy_passed: row.get("entropy_passed"),
+        coherence_passed: row.get("coherence_passed"),
+        optimization_veto_passed: row.get("optimization_veto_passed"),
+        epistemic_humility_passed: row.get("epistemic_humility_passed"),
+        selected_action: row.get("selected_action"),
+        action_success: row.get("action_success"),
+        llm_calls: row.get("llm_calls"),
+        tokens_total: row.get("tokens_total"),
+        cost_usd: row.get("cost_usd"),
+    })
+}
 
 impl crate::read::ReadEngine for PostgresBackend {
+    /// Section A: paged trace summary listing.
+    ///
+    /// Algorithm:
+    /// 1. Apply [`TraceFilter`] WHERE clauses on `trace_events`.
+    /// 2. GROUP BY trace_id with FILTER aggregation per event_type
+    ///    (see [`TRACE_SUMMARY_SELECT`]).
+    /// 3. ORDER BY started_at DESC, trace_id DESC.
+    /// 4. Cursor: `(started_at, trace_id) < (cursor.last_started_at, cursor.last_trace_id)`
+    ///    using row-tuple comparison.
+    /// 5. LIMIT $limit.
+    ///
+    /// Index coverage: `agent_id_hash` filter hits `trace_events_dedup`
+    /// (agent_id_hash leading); `agent_name` filter hits
+    /// `trace_events_agent_ts`. No-filter listing scans the time
+    /// hypertable in newest-first order.
     async fn list_trace_summaries(
         &self,
-        _filter: crate::read::TraceFilter,
-        _cursor: Option<crate::read::TraceCursor>,
-        _limit: i64,
+        filter: crate::read::TraceFilter,
+        cursor: Option<crate::read::TraceCursor>,
+        limit: i64,
     ) -> Result<crate::read::TraceListPage, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "list_trace_summaries (postgres v0.5.0 §A — impl pending)",
-        ))
+        if !(1..=10_000).contains(&limit) {
+            return Err(crate::read::Error::InvalidArgument(format!(
+                "limit must be in 1..=10000, got {limit}"
+            )));
+        }
+        if let Some(c) = &cursor {
+            if c.version != "v1" {
+                return Err(crate::read::Error::InvalidCursor(format!(
+                    "cursor version {} not supported (expected v1)",
+                    c.version
+                )));
+            }
+        }
+
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
+
+        // Build the WHERE clause. Bind parameters accumulate in order
+        // ($1..$N); we collect typed boxes so the slice can outlive
+        // the format! closure.
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        let mut where_parts: Vec<String> = Vec::new();
+
+        if let Some(w) = filter.time_window {
+            params.push(Box::new(w.since));
+            where_parts.push(format!("ts >= ${}", params.len()));
+            params.push(Box::new(w.until));
+            where_parts.push(format!("ts < ${}", params.len()));
+        }
+        if let Some(h) = filter.agent_id_hash {
+            params.push(Box::new(h));
+            where_parts.push(format!("agent_id_hash = ${}", params.len()));
+        }
+        if let Some(n) = filter.agent_name {
+            params.push(Box::new(n));
+            where_parts.push(format!("agent_name = ${}", params.len()));
+        }
+        if let Some(d) = filter.deployment_domain {
+            params.push(Box::new(d));
+            where_parts.push(format!("deployment_domain = ${}", params.len()));
+        }
+        if let Some(d) = filter.deployment_type {
+            params.push(Box::new(d));
+            where_parts.push(format!("deployment_type = ${}", params.len()));
+        }
+        if let Some(level) = filter.trace_level {
+            // TraceLevel serializes as snake_case lowercase; the V001
+            // column is plain TEXT.
+            let s = match serde_json::to_value(level) {
+                Ok(serde_json::Value::String(s)) => s,
+                _ => {
+                    return Err(crate::read::Error::Backend(
+                        "trace_level enum did not serialize to JSON string".into(),
+                    ))
+                }
+            };
+            params.push(Box::new(s));
+            where_parts.push(format!("trace_level = ${}", params.len()));
+        }
+        if let Some(verified) = filter.signature_verified {
+            params.push(Box::new(verified));
+            where_parts.push(format!("signature_verified = ${}", params.len()));
+        }
+        if let Some(v) = filter.schema_version {
+            params.push(Box::new(v));
+            where_parts.push(format!("schema_version = ${}", params.len()));
+        }
+        if let Some(s) = filter.cognitive_state {
+            params.push(Box::new(s));
+            where_parts.push(format!("cognitive_state = ${}", params.len()));
+        }
+
+        let where_sql = if where_parts.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", where_parts.join(" AND "))
+        };
+
+        // HAVING gates the cursor on the GROUPED row's started_at /
+        // trace_id (cannot use WHERE since started_at = MIN(ts) is an
+        // aggregate). Row-tuple comparison gives strict-less-than
+        // ordering matching the ORDER BY direction.
+        let having_sql = match &cursor {
+            Some(_) => {
+                params.push(Box::new(cursor.as_ref().unwrap().last_started_at));
+                let p1 = params.len();
+                params.push(Box::new(cursor.as_ref().unwrap().last_trace_id.clone()));
+                let p2 = params.len();
+                format!("HAVING (MIN(ts), MIN(trace_id)) < (${p1}, ${p2})")
+            }
+            None => String::new(),
+        };
+
+        params.push(Box::new(limit));
+        let limit_p = params.len();
+
+        let sql = format!(
+            "SELECT {select} \
+             FROM cirislens.trace_events \
+             {where_sql} \
+             GROUP BY trace_id \
+             {having_sql} \
+             ORDER BY started_at DESC, trace_id DESC \
+             LIMIT ${limit_p}",
+            select = TRACE_SUMMARY_SELECT,
+        );
+
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+
+        let rows = client
+            .query(&sql, &params_ref[..])
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("list_trace_summaries: {e}")))?;
+
+        let mut items: Vec<crate::read::TraceSummary> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            items.push(pg_row_to_trace_summary(row)?);
+        }
+
+        // Cursor for next page: trailing edge of this page.
+        let next_cursor = if items.len() as i64 == limit {
+            items
+                .last()
+                .map(|s| crate::read::TraceCursor::from_trailing(s.started_at, s.trace_id.clone()))
+        } else {
+            None
+        };
+
+        Ok(crate::read::TraceListPage { items, next_cursor })
     }
 
+    /// Section A: single-trace summary lookup.
     async fn get_trace_summary(
         &self,
-        _trace_id: &str,
+        trace_id: &str,
     ) -> Result<Option<crate::read::TraceSummary>, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "get_trace_summary (postgres v0.5.0 §A — impl pending)",
-        ))
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
+
+        let sql = format!(
+            "SELECT {select} \
+             FROM cirislens.trace_events \
+             WHERE trace_id = $1 \
+             GROUP BY trace_id",
+            select = TRACE_SUMMARY_SELECT,
+        );
+
+        let row_opt = client
+            .query_opt(&sql, &[&trace_id])
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("get_trace_summary: {e}")))?;
+        match row_opt {
+            None => Ok(None),
+            Some(row) => Ok(Some(pg_row_to_trace_summary(&row)?)),
+        }
     }
 
     async fn get_trace_detail(
