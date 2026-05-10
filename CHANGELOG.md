@@ -5,6 +5,209 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.5.0] — 2026-05-10
+
+**Federation read primitives — sections A/B/F/E.** Closes the lens-bleeding
+read-side starvation that's been live since the persist-ingest cutover:
+50 lens SELECTs against `cirislens.trace_events` directly, the
+`/coherence-ratchet/stats` endpoint 500'ing, and `api/scoring.py`
+running raw SQL on a substrate it shouldn't reach into.
+
+Closes [CIRISPersist#23](https://github.com/CIRISAI/CIRISPersist/issues/23)
+sections **A** (trace listing), **B** (trace detail), **F** (Coherence
+Ratchet inputs), **E** (scoring factor aggregates). Sections C/D/G/H/I
+ship in v0.5.1 after lens validates the v0.5.0 batch in production.
+
+### Surface duality (v0.4.1 verify-primitive precedent)
+
+Every primitive lands as **both** a Rust-public method on the
+`ReadEngine` trait (re-exported through `crate::prelude`) AND a thin
+PyO3 wrapper on `Engine`. Single source of truth — no Python-only
+reimplementation drifting from Rust. Lens (PyO3 path), CIRISLensCore
+(rlib path), and sovereign-mode agents (in-process Rust) consume the
+same surface.
+
+### Module shape
+
+```
+src/read/
+├── mod.rs       — ReadEngine trait (12 methods) + Error + module docs
+├── types.rs     — TimeWindow, TraceCursor, TraceFilter, DeviationMetric
+├── trace.rs     — A/B/F: TraceSummary, TraceListPage, TraceDetail,
+│                  TraceComponentRow, TraceEnvelopeRefs,
+│                  DivergenceRow, TemporalDriftRow, HashChainGap,
+│                  OverrideRateRow
+└── scoring.rs   — E: ScoringFactorAggregate, RecoveryEvent,
+                   CoherencePoint, AuditChainAggregate
+```
+
+### Section A — Trace listing
+
+`Engine.list_trace_summaries(filter, cursor=None, limit=100)` and
+`Engine.get_trace_summary(trace_id)` drive `/repository/traces` and
+the trace explorer.
+
+`TraceSummary` carries denormalized DMA / conscience / action /
+cost fields synthesized from the trace's component rows via
+PostgreSQL `FILTER (WHERE event_type = '...')` aggregation in one
+GROUP BY pass — no N+1 round-trips. Cursor pagination via
+`(started_at, trace_id)` tuple comparison; no OFFSET/LIMIT.
+
+Filter struct supports time window, agent_id_hash, agent_name,
+deployment_domain, deployment_type, trace_level, signature_verified,
+schema_version, cognitive_state. Index coverage: agent_id_hash hits
+`trace_events_dedup` leading column; agent_name hits
+`trace_events_agent_ts`; no-filter scans the time hypertable
+newest-first.
+
+### Section B — Trace detail
+
+`Engine.get_trace_detail(trace_id)` returns full trace
+reconstruction: summary + all per-component data (chronological) +
+LLM call rows (chronological) + envelope-level scrub + signature
+refs. Three queries, one round-trip each; not paged (one trace fits
+per spec — production traces top out around 30 components plus a
+handful of LLM calls). Composes against §A's summary for the rollup
+view; new helper `pg_row_to_llm_call_row` decodes the typed
+`trace_llm_calls` rows.
+
+### Section F — Coherence Ratchet inputs
+
+Drives `/coherence-ratchet/stats` (currently 500'ing in lens because
+it queries `accord_traces` directly). Lens consumes these inputs;
+clustering / detection logic stays in lens.
+
+- `cross_agent_divergence(domain, window, metric)` — per-agent metric
+  mean compared to domain population mean+std (`STDDEV_SAMP`); rows
+  ordered by `|z_score| DESC`. Two SQL shapes: numerical metrics
+  (CSDMA / DSDMA / IDMA k_eff / IDMA correlation_risk) + override-rate
+  (per-trace BOOL_OR collapse + per-agent rate over distinct traces).
+- `temporal_drift(agent, baseline, comparison)` — Welch-style z-score
+  on mean shift between two windows; lens applies its own p-value
+  mapping.
+- `hash_chain_gaps(agent, window)` — LAG window function over
+  `audit_sequence_number` to detect non-contiguous pairs.
+- `conscience_override_rates(domain, window)` — per-agent override
+  rate with population-weighted domain average; `multiple_of_domain_avg`
+  surfaces "this agent overrides N× more than peers."
+
+### Section E — Scoring factor aggregates
+
+Replaces `api/scoring.py`'s raw SQL. The "big aggregate" of #23.
+
+`Engine.aggregate_scoring_factors(agent, window, baseline=None)`
+returns one bundled `ScoringFactorAggregate` covering every Capacity
+Score factor input in 4 round-trips:
+1. Per-trace collapse + window-wide counts (trace_count,
+   identity_changes, conscience_overrides, audit_chain_total,
+   audit_signed_total, unsafe_action_count) in one CTE pass.
+2. Audit-chain gap count via LAG window.
+3. Recovery events (top 50 most-recent override → next-pass pairs)
+   via LEAD window over per-trace `started_at`.
+4. Coherence decay series (~24 buckets across the window; min
+   1-minute buckets for sub-hour windows) via `to_timestamp` bucket
+   math.
+5. Drift z-score: when `baseline_window` provided, delegates to
+   `temporal_drift` for the CSDMA significance.
+
+`aggregate_scoring_factors_batch(agents, window, baseline=None)` —
+fleet-wide score sweep. Loops over agents calling the single-agent
+path; future single-query batch optimization deferred to v0.5.x
+(lens-side batched calls are <100 agents today).
+
+Granular sub-primitives composable for narrower questions:
+- `count_traces(filter)` — DISTINCT trace_id count.
+- `count_overrides(filter)` — BOOL_OR per-trace dedupe of recursive
+  CONSCIENCE_RESULT retries.
+- `count_identity_changes(filter)` — agent_name-rename count
+  (agent_id_hash IS the identity fingerprint by construction;
+  renames within a single hash are what's surfaced).
+- `aggregate_audit_chain(filter)` — total / signed / hashed +
+  gap_count (gap_count meaningful only when filter narrows to one
+  agent; documented).
+
+`calibration_error` is `None` for v0.5.0 — persist's wire format
+doesn't carry `epistemic_certainty` yet. Wired up when that field
+flows through.
+
+### PyO3 surface (12 wrappers)
+
+JSON-string in/out for complex types
+(TraceFilter, TraceCursor, TraceSummary, TraceListPage, TraceDetail,
+TimeWindow, DivergenceRow, ScoringFactorAggregate, etc.); primitives
+as direct args. Same idiom as `put_public_key` /
+`put_attestation` / `put_detection_event` already established.
+
+```python
+import json
+page = json.loads(engine.list_trace_summaries(
+    filter_json=json.dumps({"agent_id_hash": h}),
+    cursor_json=None,
+    limit=50,
+))
+detail = json.loads(engine.get_trace_detail(trace_id))
+agg = json.loads(engine.aggregate_scoring_factors(
+    agent_id_hash=h,
+    window_json=json.dumps({"since": ..., "until": ...}),
+    baseline_window_json=None,
+))
+```
+
+### Threat model — AV-43 added
+
+`docs/THREAT_MODEL.md` §3.11 + summary table + §9 posture summary
+add **AV-43: Read-side adversary inference attack**:
+
+- Aggregates return computed statistics, not per-trace content.
+- `sample_count` / `trace_count` fields surface explicitly so
+  callers gate k-anonymity at their layer.
+- Error kinds are closed-set `&'static str` (no attacker-controlled
+  strings cross the FFI boundary).
+- AV-9 invariant preserved: trace-scoped reads carry `agent_id_hash`
+  so callers authorize per-trace access at their layer.
+
+§9 posture summary: header bumped v0.4.6 → v0.5.0; 16 attack
+vectors closed across v0.2.0..v0.5.0.
+
+### Tests
+
+19 integration tests against real Postgres (gated on
+`CIRIS_PERSIST_TEST_PG_URL`; CI workflow already sets it):
+
+| Section | Tests |
+|---|---|
+| §A | round-trip; unknown→None; cursor pagination (5 traces, 3 pages, no overlap/gaps); agent_id_hash isolation (AV-9); limit boundaries (0/10001 reject); invalid cursor version reject |
+| §B | round-trip with LLM call; unknown→None; no-LLM-calls returns empty Vec |
+| §F | cross_agent_divergence on CSDMA (outlier detected) + override rate (sign of z); temporal_drift mean shift + significance sign; hash_chain_gaps detects 2→5 gap; conscience_override_rates with domain-weighted average |
+| §E | aggregate round-trip; batch (empty + non-empty in input order); count_traces; count_overrides; aggregate_audit_chain (no audit rows → zero counts) |
+
+All 19 pass against local `postgres:15-alpine` (timescaledb-less; the
+V001 hypertable conversion is gated on `pg_extension` lookup so the
+migration runs cleanly without it). 203 total lib tests pass.
+
+### Carve-out retirement deferred to v0.5.1
+
+The `cirislens_reader` Postgres role / lens-side direct-SQL path stays
+deprecated-but-not-yet-retired in v0.5.0. Section D (LLM call surface)
+covers `trace_llm_calls`, which lens currently reads via direct SQL;
+until D ships in v0.5.1, that path remains. v0.5.0's threat-model
+entry (AV-43) flags this honestly: "primary read surface; full
+carve-out retirement in v0.5.1."
+
+### Out of scope for v0.5.0 (deferred to v0.5.1)
+
+- Section C — Task-grouped listing (lens can group on the lens side
+  as a workaround until v0.5.1).
+- Section D — LLM call surface (LlmCallFilter, LlmCostAggregate);
+  trace_llm_calls full read path.
+- Section G — Corpus shape (operator dashboard).
+- Section H — Privacy / scrub observability.
+- Section I — Federation observability bulk (list_federation_keys,
+  list_revocations, list_attestations).
+
+`FSD/V0_5_0_FEDERATION_READ_PRIMITIVES.md` documents the v0.5.0
+sub-batch and the v0.5.1 deferral.
+
 ## [0.4.7] — 2026-05-09
 
 **Threat-model documentation update for v0.4.3 + v0.4.6 legacy

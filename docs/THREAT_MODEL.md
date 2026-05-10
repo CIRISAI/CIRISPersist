@@ -1279,7 +1279,81 @@ exists because pre-2.7.8.9 traffic is real and unrecoverable
 otherwise; the sunset rule is the discipline that prevents
 accommodation-creep into permanent technical debt.
 
-### 3.11 Outbound queue substrate (v0.4.0)
+### 3.11 Federation read primitives (v0.5.0)
+
+Vectors emerge from the v0.5.0 read surface (CIRISPersist#23 sections
+A/B/F/E). The primitives expose typed reads to lens, lens-core, and
+sovereign-mode agents — closing the historical `cirislens_reader`
+direct-SQL carve-out the v0.2.0+ `fetch_trace_events_page` docstring
+named.
+
+#### AV-43: Read-side adversary inference attack
+
+**Attack**: A federation peer with read access to the substrate uses
+the v0.5.0 aggregate primitives — `aggregate_scoring_factors`,
+`cross_agent_divergence`, `temporal_drift`,
+`conscience_override_rates` — to infer per-trace content of another
+peer's traces by pattern analysis. Examples: correlating a narrowly-
+windowed scoring aggregate against a `cross_agent_divergence` z-score
+to deanonymize a specific trace's properties; running per-minute
+`coherence_decay_series` queries to reconstruct the timing of
+individual decisions.
+
+**Mitigation v0.5.0**: aggregates return computed statistics, not
+per-trace content. The smallest-window primitive
+(`aggregate_scoring_factors` over a sub-hour window) requires the
+caller to apply k-anonymity policy at *their* layer (minimum-cell-size
+gates, refusing aggregate computation when `trace_count` is below a
+threshold). Persist returns counts truthfully and documents the
+window-size dependency.
+
+The aggregate row shapes carry `sample_count` / `trace_count` fields
+explicitly so the caller's k-anonymity gate is a one-line check:
+
+```python
+agg = engine.aggregate_scoring_factors(...)
+if agg["trace_count"] < K_THRESHOLD:
+    raise InsufficientSamples(agg["trace_count"])
+```
+
+`DivergenceRow.sample_count` and `OverrideRateRow.trace_count` carry
+the same gate primitive. `CoherencePoint.trace_count` per bucket
+similarly enables per-bucket gating in lens.
+
+**Audience-tier discipline (closed-set + structured detail)**: AV-15
+holds — the read primitives' error kinds are closed-set
+`&'static str` (`read_invalid_argument`, `read_invalid_cursor`,
+`read_backend`, `read_not_implemented`). No raw user-payload bytes
+cross the FFI boundary in error paths.
+
+**AV-9 invariant preserved**: every trace-scoped read (sections A/B
+trace primitives) returns `agent_id_hash` on the result so callers
+authorize per-trace access at their layer. A malicious peer cannot
+read another peer's traces via `trace_id` alone; the persist
+substrate exposes the rows but the authorization boundary lives at
+the consumer (lens API, sovereign-mode agent's own gate).
+
+**Residual**: a federation operator with `cirislens_reader` role (or
+its v0.5.1 retirement target — see *Note on full carve-out
+retirement* below) running narrow windows can in principle reconstruct
+trace patterns. The aggregation primitives don't widen this surface —
+the underlying rows were already accessible to that role. The typed
+read primitives + AV-15-safe error layer ARE the way to retire the
+direct-SQL carve-out; v0.5.0 lands the surface, v0.5.1 retires the
+final carve-out (section D / LLM call surface lands then).
+
+**Note on full carve-out retirement (deferred to v0.5.1)**: v0.5.0
+ships sections A/B/F/E (TraceSummary listing, trace detail, Coherence
+Ratchet inputs, scoring factor aggregates). Sections C/D/G/H/I (task
+grouping, LLM call surface, corpus shape, scrub stats, federation
+bulk) ship in v0.5.1 after lens validates the v0.5.0 batch in
+production. Until v0.5.1, lens still uses direct SQL for LLM call
+queries (section D's territory); the `cirislens_reader` role's
+lens-side use is deprecated in v0.5.0 but not yet fully retired
+because section D doesn't have its typed primitive yet. The
+deprecation message points lens-team at section D's pending work.
+
+### 3.12 Outbound queue substrate (v0.4.0)
 
 These vectors emerge from v0.4.0's `cirislens.edge_outbound_queue`
 table — the durable substrate for `CIRISEdge::send_durable()`.
@@ -1476,6 +1550,7 @@ incentive against doing so.
 | AV-40 | Outbound queue disk exhaustion | Per-row `body_size_bytes ≤ 8 MiB` + `ttl_seconds > 0` + `max_attempts > 0` schema CHECK; `sweep_ttl_expired` operational primitive bounds row lifetime; FK on sender/destination_key_id (AV-28 trust boundary) | Operator-tunable sweep cadence; `oldest-pending-age` ops dashboard | **✓ Mitigated v0.4.0** | — |
 | AV-41 | Spoofed in_reply_to ACK matching | ACK envelopes go through persist's normal verify pipeline (AV-1 unknown-key gate + AV-39 verify_hybrid via persist) before `mark_ack_received` is called; `body_sha256` content-derived matching is downstream of signature verify | Bound signature pattern (AV-33) closes Ed25519-alone forgery branch | **✓ Mitigated v0.4.0** | — |
 | AV-42 | Legacy `attempt_index` dedup-collapse | v0.4.6 schema-version-gated fallback — only `2.7.0` / `"2.7.legacy"` arms fall back to `attempt_index = 0` on absence (`MissingField`); 2.7.9 still strict; malformed values (negative, wrong type, out of range) still error through AV-17 typed paths; fallback fires for absence ONLY, not for adversarial-shaped values; cross-agent collision closed by `agent_id_hash` in dedup tuple (AV-9) | Telemetry-driven sunset (`federation_canonical_match_total{wire="2.7.legacy"}` 7-day-zero soak); accommodation is time-bounded by empirical observation, not permanent | **✓ Documented residual v0.4.6** (deliberate fidelity trade-off; pre-2.7.8.9 traffic is unrecoverable otherwise — federation's append-only contract takes priority over per-row dedup fidelity for legacy arm) | — |
+| AV-43 | Read-side adversary inference attack | v0.5.0 aggregate primitives return computed statistics (counts, means, z-scores, decay-series points), not per-trace content; `sample_count` / `trace_count` fields surface explicitly so callers gate k-anonymity at their layer (one-line check: `if agg.trace_count < K_THRESHOLD: refuse`); error kinds are closed-set `&'static str` (no attacker-controlled strings); AV-9 trace-scoped reads carry `agent_id_hash` so callers authorize per-trace access at their layer | Substrate exposes truthful aggregates; consumer composes k-anonymity policy (lens-side, sovereign-mode agent's own gate) — same architectural-non-goal pattern as AV-29 attestation graph (persist exposes edges, consumers compose policy) | **✓ Documented v0.5.0** (substrate surface; consumer-side policy required for inference resistance) | — |
 
 ---
 
@@ -1689,7 +1764,7 @@ Risks CIRISPersist mitigates but cannot fully eliminate.
 
 ---
 
-## 9. v0.4.6 Threat Posture Summary
+## 9. v0.5.0 Threat Posture Summary
 
 ```
 v0.1.1 INTEGRATION-BLOCKING EXPOSURES → closed in v0.1.2
@@ -1738,6 +1813,10 @@ v0.4.3..v0.4.6 LEGACY ACCOMMODATION
   ✓ AV-42 legacy attempt_index dedup-collapse (documented residual; schema-version-gated;
           telemetry-driven sunset; bounded by signing-key control)
 
+v0.5.0 FEDERATION READ PRIMITIVES
+  ✓ AV-43 read-side adversary inference attack (documented; aggregates return statistics
+          not content; consumer-side k-anonymity gate via sample_count / trace_count)
+
 PHASE-2-CLOSES (architecturally deferred)
   ⚠ AV-2  stolen-key forgery (peer-replicate audit chain)
   ⚠ AV-10 audit anchor capture without verification
@@ -1760,14 +1839,15 @@ DESIGN-DECISIONS-PER-MISSION (intentional, not defects)
   ✓ AV-39 verify-via-persist single-source-of-truth (CIRISPersist#7 pattern)
 
 CARGO AUDIT
-  ✓ 0 vulnerabilities across deps as of v0.4.7
+  ✓ 0 vulnerabilities across deps as of v0.5.0
 ```
 
-**Fifteen v0.2.0..v0.4.6 attack vectors closed**: federation
+**Sixteen v0.2.0..v0.5.0 attack vectors closed**: federation
 directory integrity (AV-28..AV-30), hybrid PQC posture
 (AV-31..AV-33), wire-format extensions (AV-34..AV-37), DSAR + verify
 primitives (AV-38..AV-39), outbound queue substrate (AV-40..AV-41),
-legacy accommodation residual documented (AV-42).
+legacy accommodation residual documented (AV-42), federation read
+primitives + read-side inference resistance (AV-43).
 
 Three architectural-closure patterns repeated across the surface:
 
