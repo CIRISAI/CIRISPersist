@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778446009280,
+  "lastUpdate": 1778446321925,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -7235,6 +7235,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23811933,
             "range": "± 285610",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "17f57e5a49969e7abf718bf71605c7386ae325e7",
+          "message": "WIP v0.5.0 §B — get_trace_detail postgres impl + tests\n\nDrives /repository/traces/{trace_id} (CIRISLens explore-a-trace page).\n\nThree queries, one round-trip each:\n1. Summary view — composes against §A's get_trace_summary (no SQL\n   duplication; same JSONB-extracting GROUP BY).\n2. trace_events rows for the trace_id, ts ASC (chronological\n   component sequence). Returned as TraceComponentRow (drops the\n   per-row signature/scrub fields — those are envelope constants\n   folded into TraceEnvelopeRefs).\n3. trace_llm_calls rows for the trace_id, ts ASC.\n\nEnvelope refs read from the first component row (per-trace\nconstants by construction; AV-24/25 scrub envelope + signature are\nagent-emit-time invariants, equal across all rows of one trace).\n\nConcurrent-delete handling: if summary returned Some but components\nare empty, return None (consistent surface for callers to retry).\n\nNew helper: pg_row_to_llm_call_row() — typed decode of\ntrace_llm_calls rows. Mirrors pg_row_to_event_row's shape; reads\nonly the columns selected by §B's LLM-calls SELECT.\n\nTests (3, all green against local postgres:15-alpine):\n- get_trace_detail_round_trip — 5-component fixture + 1 LLM call\n  row; assert summary parity with §A; components chronological;\n  LLM call surfaces; envelope refs reflect fixture constants.\n- get_trace_detail_unknown_returns_none — typed None.\n- no_llm_calls_returns_empty_vec — trace without LLM calls still\n  produces TraceDetail; llm_calls is empty Vec, not None on the\n  overall TraceDetail.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-10T15:41:58-05:00",
+          "tree_id": "2f10de216b40fa33a0fe5de0f80f2c976dfe54c0",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/17f57e5a49969e7abf718bf71605c7386ae325e7"
+        },
+        "date": 1778446321442,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 95946,
+            "range": "± 3231",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 238375,
+            "range": "± 500",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 520467,
+            "range": "± 3819",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1940466,
+            "range": "± 23778",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 305,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1197,
+            "range": "± 23",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7168,
+            "range": "± 122",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 318,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3210,
+            "range": "± 28",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9898,
+            "range": "± 184",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 44164,
+            "range": "± 104",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 537,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2650254,
+            "range": "± 274147",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7050001,
+            "range": "± 378910",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 24295166,
+            "range": "± 517676",
             "unit": "ns/iter"
           }
         ]
