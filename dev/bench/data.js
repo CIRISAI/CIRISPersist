@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778446321925,
+  "lastUpdate": 1778446506313,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -7349,6 +7349,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 24295166,
             "range": "± 517676",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "190e5bb3badda85137cecaf843660bed4c95b5ac",
+          "message": "WIP v0.5.0 §F — Coherence Ratchet inputs (4 methods + 5 tests)\n\nDrives /coherence-ratchet/stats (currently 500'ing in lens because\nit queries accord_traces directly). Lens consumes these inputs;\nclustering / detection logic stays in lens.\n\ncross_agent_divergence(domain, window, metric):\n- Numerical metrics (CSDMA / DSDMA / IDMA k_eff / IDMA correlation_risk):\n  per-agent AVG of the JSONB field over the relevant event_type rows,\n  z-scored against the domain population mean+std (STDDEV_SAMP).\n- ConscienceOverrideRate: per-trace BOOL_OR collapse of recursive\n  CONSCIENCE_RESULT retries → per-agent rate over distinct traces →\n  z-scored across the domain.\n- Ordered by |z_score| DESC (most-divergent agents first).\n\ntemporal_drift(agent, baseline, comparison):\n- One row per metric (4 numerical metrics) where BOTH windows had\n  samples. Welch-style z-score on the mean shift; lens applies its\n  own p-value mapping.\n- mean_shift = comparison_mean - baseline_mean (negative when agent\n  scores worse over time on the metric).\n- variance_ratio = comparison_var / baseline_var (>1 = wider spread).\n\nhash_chain_gaps(agent, window):\n- LAG window function over audit_sequence_number to find\n  non-contiguous pairs. Audit sequence is populated only on\n  ACTION_RESULT rows per V001 schema.\n- Returns (gap_start_seq, gap_end_seq, gap_start_ts, gap_end_ts) per\n  detected discontinuity.\n\nconscience_override_rates(domain, window):\n- Per-trace was_overridden = BOOL_OR over recursive CONSCIENCE_RESULT.\n- Per-agent override_count / trace_count.\n- Domain avg = SUM(overrides) / SUM(traces) — population-weighted\n  (not mean-of-rates) so high-volume agents dominate the reference.\n- multiple_of_domain_avg = override_rate / domain_avg (>1.0 means\n  the agent overrides more than peers).\n\nTests (5, all green against local postgres:15-alpine):\n- cross_agent_divergence_csdma: 3 agents, one outlier; assert\n  outlier has the largest |z_score|; sample_count matches fixture.\n- cross_agent_divergence_override_rate: agent-A 1/3 overrides,\n  agent-B 0/3; A's z > 0; B's z < 0.\n- temporal_drift: varied csdma values across windows (constant\n  values produce var=0 → significance=0; meaningful test needs\n  spread); assert mean_shift = -0.3 and significance < 0.\n- hash_chain_gaps: insert audit_sequence_number = 1,2,5,6; detect\n  gap (start=2, end=5).\n- conscience_override_rates: agent-A 2/4, agent-B 1/4; domain avg\n  = 3/8; multiples = 4/3 and 2/3 respectively.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-10T15:47:04-05:00",
+          "tree_id": "4b41d80cc006d4a7924b0ef0a7617c03c18b3971",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/190e5bb3badda85137cecaf843660bed4c95b5ac"
+        },
+        "date": 1778446505483,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 113746,
+            "range": "± 7579",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 264649,
+            "range": "± 4379",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 564168,
+            "range": "± 2221",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1993180,
+            "range": "± 85735",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 353,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1500,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7384,
+            "range": "± 29",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 364,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 2931,
+            "range": "± 44",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9642,
+            "range": "± 243",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42259,
+            "range": "± 253",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2271185,
+            "range": "± 81956",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7019815,
+            "range": "± 126382",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25800985,
+            "range": "± 701950",
             "unit": "ns/iter"
           }
         ]
