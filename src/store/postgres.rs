@@ -2261,6 +2261,79 @@ fn llm_status_str(s: crate::schema::LlmCallStatus) -> &'static str {
     }
 }
 
+/// v0.5.0 (CIRISPersist#23 §B) — Decode a `cirislens.trace_llm_calls`
+/// row into a typed [`TraceLlmCallRow`]. Mirrors `pg_row_to_event_row`
+/// for the LLM-call table; reads only the columns selected by
+/// `get_trace_detail`'s LLM-calls SELECT.
+fn pg_row_to_llm_call_row(
+    row: &tokio_postgres::Row,
+) -> Result<crate::store::types::TraceLlmCallRow, crate::read::Error> {
+    use crate::schema::{LlmCallStatus, ReasoningEventType};
+
+    let parent_event_type_str: String = row.get("parent_event_type");
+    let parent_event_type =
+        ReasoningEventType::from_wire_str(&parent_event_type_str).ok_or_else(|| {
+            crate::read::Error::Backend(format!(
+                "unknown parent_event_type in trace_llm_calls: {parent_event_type_str}"
+            ))
+        })?;
+
+    let status_str: String = row.get("status");
+    let status = match status_str.as_str() {
+        "ok" => LlmCallStatus::Ok,
+        "timeout" => LlmCallStatus::Timeout,
+        "rate_limited" => LlmCallStatus::RateLimited,
+        "model_not_available" => LlmCallStatus::ModelNotAvailable,
+        "instructor_retry" => LlmCallStatus::InstructorRetry,
+        "other_error" => LlmCallStatus::OtherError,
+        other => {
+            return Err(crate::read::Error::Backend(format!(
+                "unknown llm_call status: {other}"
+            )))
+        }
+    };
+
+    let parent_attempt_index_i32: i32 = row.get("parent_attempt_index");
+    let parent_attempt_index = u32::try_from(parent_attempt_index_i32).map_err(|_| {
+        crate::read::Error::Backend(format!(
+            "parent_attempt_index {parent_attempt_index_i32} negative"
+        ))
+    })?;
+    let attempt_index_i32: i32 = row.get("attempt_index");
+    let attempt_index = u32::try_from(attempt_index_i32).map_err(|_| {
+        crate::read::Error::Backend(format!("attempt_index {attempt_index_i32} negative"))
+    })?;
+
+    Ok(crate::store::types::TraceLlmCallRow {
+        trace_id: row.get("trace_id"),
+        thought_id: row.get("thought_id"),
+        task_id: row.get("task_id"),
+        parent_event_id: row.get("parent_event_id"),
+        parent_event_type,
+        parent_attempt_index,
+        attempt_index,
+        ts: row.get("ts"),
+        duration_ms: row.get("duration_ms"),
+        handler_name: row.get("handler_name"),
+        service_name: row.get("service_name"),
+        model: row.get("model"),
+        base_url: row.get("base_url"),
+        response_model: row.get("response_model"),
+        prompt_tokens: row.get("prompt_tokens"),
+        completion_tokens: row.get("completion_tokens"),
+        prompt_bytes: row.get("prompt_bytes"),
+        completion_bytes: row.get("completion_bytes"),
+        cost_usd: row.get("cost_usd"),
+        status,
+        error_class: row.get("error_class"),
+        attempt_count: row.get("attempt_count"),
+        retry_count: row.get("retry_count"),
+        prompt_hash: row.get("prompt_hash"),
+        prompt: row.get("prompt"),
+        response_text: row.get("response_text"),
+    })
+}
+
 // ─── ReadEngine impl (v0.5.0, CIRISPersist#23) ─────────────────────
 //
 // Federation read primitives — sections A/B/F/E per the v0.5.0 batch.
@@ -2561,13 +2634,127 @@ impl crate::read::ReadEngine for PostgresBackend {
         }
     }
 
+    /// Section B: full trace reconstruction.
+    ///
+    /// Three queries, one round-trip each:
+    /// 1. The summary view (reuses [`Self::get_trace_summary`]).
+    /// 2. All `trace_events` rows for the trace_id, ordered by
+    ///    `ts ASC` — chronological component sequence. Returned as
+    ///    [`crate::read::TraceComponentRow`] (drops the per-row
+    ///    signature/scrub fields — those are envelope constants
+    ///    folded into [`crate::read::TraceEnvelopeRefs`]).
+    /// 3. All `trace_llm_calls` rows for the trace_id, ordered by
+    ///    `ts ASC`.
+    ///
+    /// Envelope refs are read from the first component row (per-trace
+    /// constants by construction; AV-24/25 scrub envelope + signature
+    /// are agent-emit-time invariants).
     async fn get_trace_detail(
         &self,
-        _trace_id: &str,
+        trace_id: &str,
     ) -> Result<Option<crate::read::TraceDetail>, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "get_trace_detail (postgres v0.5.0 §B — impl pending)",
-        ))
+        // Compose against §A's summary path. Returns early on absent
+        // trace — saves the two follow-on round-trips.
+        let summary = match self.get_trace_summary(trace_id).await? {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
+
+        // Components: full event_type spread, chronological. Reuse
+        // pg_row_to_event_row to get the typed TraceEventRow then
+        // strip down to TraceComponentRow.
+        let event_rows = client
+            .query(
+                "SELECT event_id, trace_id, thought_id, task_id, step_point, event_type, \
+                        attempt_index, ts, agent_name, agent_id_hash, cognitive_state, \
+                        trace_level, payload, cost_llm_calls, cost_tokens, cost_usd, \
+                        signature, signing_key_id, signature_verified, schema_version, \
+                        pii_scrubbed, audit_sequence_number, audit_entry_hash, \
+                        audit_signature, original_content_hash, scrub_signature, \
+                        scrub_key_id, scrub_timestamp, agent_role, agent_template, \
+                        deployment_domain, deployment_type, deployment_region, \
+                        deployment_trust_mode \
+                 FROM cirislens.trace_events \
+                 WHERE trace_id = $1 \
+                 ORDER BY ts ASC",
+                &[&trace_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::read::Error::Backend(format!("get_trace_detail components: {e}"))
+            })?;
+
+        if event_rows.is_empty() {
+            // Summary returned Some but components empty? Concurrent
+            // delete between round-trips. Surface as None — callers retry.
+            return Ok(None);
+        }
+
+        // Envelope refs: read from the first row. AV-24/25 fields
+        // are per-trace constants by construction.
+        let first = &event_rows[0];
+        let envelope = crate::read::TraceEnvelopeRefs {
+            signature: first.get("signature"),
+            signature_key_id: first.get("signing_key_id"),
+            original_content_hash: first.get("original_content_hash"),
+            scrub_signature: first.get("scrub_signature"),
+            scrub_key_id: first.get("scrub_key_id"),
+            scrub_timestamp: first.get("scrub_timestamp"),
+            pii_scrubbed: first
+                .get::<_, Option<bool>>("pii_scrubbed")
+                .unwrap_or(false),
+        };
+
+        let mut components: Vec<crate::read::TraceComponentRow> =
+            Vec::with_capacity(event_rows.len());
+        for row in event_rows {
+            let (_event_id, full) = pg_row_to_event_row(row)
+                .map_err(|e| crate::read::Error::Backend(format!("event row decode: {e}")))?;
+            components.push(crate::read::TraceComponentRow {
+                step_point: full.step_point,
+                event_type: full.event_type,
+                attempt_index: full.attempt_index,
+                ts: full.ts,
+                payload: full.payload,
+            });
+        }
+
+        // LLM calls: chronological. Inline decode (no shared helper
+        // exists — V001 trace_llm_calls is not in any other read path).
+        let llm_rows = client
+            .query(
+                "SELECT trace_id, thought_id, task_id, parent_event_id, \
+                        parent_event_type, parent_attempt_index, attempt_index, ts, \
+                        duration_ms, handler_name, service_name, model, base_url, \
+                        response_model, prompt_tokens, completion_tokens, prompt_bytes, \
+                        completion_bytes, cost_usd, status, error_class, attempt_count, \
+                        retry_count, prompt_hash, prompt, response_text \
+                 FROM cirislens.trace_llm_calls \
+                 WHERE trace_id = $1 \
+                 ORDER BY ts ASC",
+                &[&trace_id],
+            )
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("get_trace_detail llm_calls: {e}")))?;
+
+        let mut llm_calls: Vec<crate::store::types::TraceLlmCallRow> =
+            Vec::with_capacity(llm_rows.len());
+        for row in llm_rows {
+            llm_calls.push(pg_row_to_llm_call_row(&row)?);
+        }
+
+        Ok(Some(crate::read::TraceDetail {
+            summary,
+            components,
+            llm_calls,
+            envelope,
+        }))
     }
 
     async fn cross_agent_divergence(
@@ -3743,6 +3930,191 @@ mod tests {
         // limit=1 accepts (no error); result count depends on DB
         // state, just check it didn't error.
         let _ok = backend.list_trace_summaries(f, None, 1).await.unwrap();
+    }
+
+    // ─── ReadEngine §B tests (v0.5.0, CIRISPersist#23) ──────────────
+
+    /// §B round-trip: insert a 5-component fixture trace + 1 LLM
+    /// call row; read detail; assert summary matches §A; components
+    /// chronological; LLM calls present; envelope refs surface
+    /// per-trace constants.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_b_get_trace_detail_round_trip() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        use crate::read::ReadEngine;
+        let tid = format!("trace-§b-rt-{}", uuid_like());
+        let started = chrono::Utc::now();
+        insert_section_a_fixture_trace(
+            &backend,
+            &tid,
+            "agent-§b",
+            Some("Scout-§b"),
+            Some("moderation"),
+            started,
+            false,
+            0.83,
+            0.91,
+            1.42,
+        )
+        .await;
+
+        // Insert one LLM call row associated with the trace.
+        let llm_row = crate::store::types::TraceLlmCallRow {
+            trace_id: tid.clone(),
+            thought_id: format!("th-{tid}"),
+            task_id: Some(format!("task-{tid}")),
+            parent_event_id: None,
+            parent_event_type: ReasoningEventType::DmaResults,
+            parent_attempt_index: 0,
+            attempt_index: 0,
+            ts: started + chrono::Duration::milliseconds(15),
+            duration_ms: 1234.5,
+            handler_name: "EthicalPDMA".into(),
+            service_name: "openai".into(),
+            model: Some("gpt-4o".into()),
+            base_url: None,
+            response_model: None,
+            prompt_tokens: Some(800),
+            completion_tokens: Some(150),
+            prompt_bytes: None,
+            completion_bytes: None,
+            cost_usd: Some(0.024),
+            status: crate::schema::LlmCallStatus::Ok,
+            error_class: None,
+            attempt_count: Some(1),
+            retry_count: Some(0),
+            prompt_hash: Some("hash-abcd".into()),
+            prompt: None,
+            response_text: None,
+        };
+        backend
+            .insert_trace_llm_calls_batch(&[llm_row])
+            .await
+            .unwrap();
+
+        let detail = backend
+            .get_trace_detail(&tid)
+            .await
+            .unwrap()
+            .expect("detail present");
+
+        // Summary parity with §A.
+        assert_eq!(detail.summary.trace_id, tid);
+        assert_eq!(detail.summary.agent_id_hash, "agent-§b");
+        assert_eq!(detail.summary.action_was_overridden, Some(false));
+
+        // Components: 5 rows, chronological.
+        assert_eq!(detail.components.len(), 5);
+        assert_eq!(
+            detail.components[0].event_type,
+            ReasoningEventType::ThoughtStart
+        );
+        assert_eq!(
+            detail.components[1].event_type,
+            ReasoningEventType::DmaResults
+        );
+        assert_eq!(
+            detail.components[2].event_type,
+            ReasoningEventType::IdmaResult
+        );
+        assert_eq!(
+            detail.components[3].event_type,
+            ReasoningEventType::ConscienceResult
+        );
+        assert_eq!(
+            detail.components[4].event_type,
+            ReasoningEventType::ActionResult
+        );
+        // ts strictly ascending.
+        for i in 1..detail.components.len() {
+            assert!(
+                detail.components[i].ts >= detail.components[i - 1].ts,
+                "components must be chronological"
+            );
+        }
+        // Component payload retained verbatim — DMA_RESULTS row carries
+        // the canonical scoring fields.
+        let dma = &detail.components[1];
+        assert!(dma.payload.contains_key("csdma_plausibility_score"));
+        assert!(dma.payload.contains_key("dsdma_domain_alignment"));
+
+        // LLM calls: one row with the fields we inserted.
+        assert_eq!(detail.llm_calls.len(), 1);
+        let call = &detail.llm_calls[0];
+        assert_eq!(call.trace_id, tid);
+        assert_eq!(call.handler_name, "EthicalPDMA");
+        assert_eq!(call.service_name, "openai");
+        assert_eq!(call.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(call.prompt_tokens, Some(800));
+        assert!(matches!(call.status, crate::schema::LlmCallStatus::Ok));
+
+        // Envelope refs: per-trace constants from the fixture.
+        assert_eq!(detail.envelope.signature, "AAAA");
+        assert_eq!(detail.envelope.signature_key_id, "test-key");
+        assert!(!detail.envelope.pii_scrubbed);
+        assert!(detail.envelope.original_content_hash.is_none()); // fixture sets None
+    }
+
+    /// §B: unknown trace_id returns None (not Err).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_b_get_trace_detail_unknown_returns_none() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        use crate::read::ReadEngine;
+        let opt = backend
+            .get_trace_detail("trace-does-not-exist-§b-xyz")
+            .await
+            .unwrap();
+        assert!(opt.is_none());
+    }
+
+    /// §B: trace with no LLM call rows still produces a TraceDetail
+    /// with empty `llm_calls` (NOT None on the overall TraceDetail).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_b_no_llm_calls_returns_empty_vec() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        use crate::read::ReadEngine;
+        let tid = format!("trace-§b-no-llm-{}", uuid_like());
+        insert_section_a_fixture_trace(
+            &backend,
+            &tid,
+            "agent-no-llm",
+            Some("X"),
+            Some("d"),
+            chrono::Utc::now(),
+            false,
+            0.5,
+            0.5,
+            1.0,
+        )
+        .await;
+        let detail = backend
+            .get_trace_detail(&tid)
+            .await
+            .unwrap()
+            .expect("detail present even without LLM calls");
+        assert_eq!(detail.components.len(), 5);
+        assert!(detail.llm_calls.is_empty());
     }
 
     /// §A: invalid cursor version rejects with InvalidCursor.
