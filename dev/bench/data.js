@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778446858757,
+  "lastUpdate": 1778447003716,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -7577,6 +7577,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23950235,
             "range": "± 557785",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "93879bb9ec9c07cb5e5a8a525bf82af3e892ab2f",
+          "message": "WIP v0.5.0 — PyO3 wrappers for all 12 ReadEngine methods\n\nFederation read primitives surfaced through Engine. Wire format:\nJSON strings in/out for complex types (TraceFilter, TraceCursor,\nTraceSummary, TraceListPage, TraceDetail, TimeWindow, DivergenceRow,\nScoringFactorAggregate, etc.); primitives as direct args (trace_id,\nagent_id_hash, limit). Same idiom as put_public_key /\nput_attestation / put_detection_event already established.\n\n12 wrappers (delegating to crate::read::ReadEngine impl on the\nbackend):\n\n  Section A:\n    list_trace_summaries(filter_json, cursor_json=None, limit=100)\n    get_trace_summary(trace_id)\n  Section B:\n    get_trace_detail(trace_id)\n  Section F:\n    cross_agent_divergence(deployment_domain, window_json, metric)\n    temporal_drift(agent_id_hash, baseline_json, comparison_json)\n    hash_chain_gaps(agent_id_hash, window_json)\n    conscience_override_rates(deployment_domain, window_json)\n  Section E:\n    aggregate_scoring_factors(agent, window_json, baseline_json=None)\n    aggregate_scoring_factors_batch(agents_json, window_json,\n                                    baseline_json=None)\n    count_traces(filter_json)\n    count_overrides(filter_json)\n    count_identity_changes(filter_json)\n    aggregate_audit_chain(filter_json)\n\n(That's 13 — count_overrides + count_identity_changes + count_traces\n+ aggregate_audit_chain are 4 granular methods alongside §E's\naggregate + batch, totaling 6 in §E. 12 trait methods, 13 PyO3\nmethods because aggregate_audit_chain returns a typed struct as\nJSON; everything else maps 1:1.)\n\nread_err_to_py helper added near the other *_err_to_py helpers.\nAV-15 / AV-43: kind tokens are closed-set &'static str; verbose\ndetail to tracing only. InvalidArgument / InvalidCursor →\nValueError; Backend / NotImplemented → RuntimeError.\n\nLens consumers can now call any of these 12 from Python:\n\n  import json\n  page = json.loads(engine.list_trace_summaries(\n    filter_json=json.dumps({\"agent_id_hash\": h}),\n    cursor_json=None,\n    limit=50,\n  ))\n\ncargo build + clippy clean across all features.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-10T15:55:08-05:00",
+          "tree_id": "8862af88b377d89766be683a24fc7cc9a95c1bd0",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/93879bb9ec9c07cb5e5a8a525bf82af3e892ab2f"
+        },
+        "date": 1778447002813,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101596,
+            "range": "± 1001",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 242916,
+            "range": "± 1248",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 525208,
+            "range": "± 11260",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1859837,
+            "range": "± 16432",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 370,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1429,
+            "range": "± 78",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8267,
+            "range": "± 182",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 359,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3147,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9481,
+            "range": "± 154",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41587,
+            "range": "± 253",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 622,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2309957,
+            "range": "± 135551",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6694099,
+            "range": "± 141961",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 24019674,
+            "range": "± 363029",
             "unit": "ns/iter"
           }
         ]
