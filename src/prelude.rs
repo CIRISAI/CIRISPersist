@@ -51,9 +51,10 @@ pub use crate::store::Backend;
 // Coherence Ratchet inputs, scoring factor aggregates. Sections
 // C/D/G/H/I land in v0.5.1 after lens validates the v0.5.0 batch.
 pub use crate::read::{
-    AuditChainAggregate, DeviationMetric, DivergenceRow, HashChainGap, OverrideRateRow,
-    RecoveryEvent, ScoringFactorAggregate, TemporalDriftRow, TimeWindow, TraceComponentRow,
-    TraceCursor, TraceDetail, TraceEnvelopeRefs, TraceFilter, TraceListPage, TraceSummary,
+    AuditChainAggregate, CoherencePoint, DeviationMetric, DivergenceRow, HashChainGap,
+    OverrideRateRow, RecoveryEvent, ScoringFactorAggregate, TemporalDriftRow, TimeWindow,
+    TraceComponentRow, TraceCursor, TraceDetail, TraceEnvelopeRefs, TraceFilter, TraceListPage,
+    TraceSummary,
 };
 
 // Lens-derived schema types (v0.4.3, CIRISPersist#18). Lens-core

@@ -3116,63 +3116,491 @@ impl crate::read::ReadEngine for PostgresBackend {
         Ok(out)
     }
 
+    /// Section E: bundled scoring factor aggregate. Replaces
+    /// `api/scoring.py`'s raw SQL. Composes via 4 round-trips:
+    /// 1. Per-trace collapse + window-wide counts (Factor C, I_int,
+    ///    I_inc subset).
+    /// 2. Audit-chain gap count (LAG window function).
+    /// 3. Recovery events (Factor R) — top 50 most recent.
+    /// 4. Coherence decay series (Factor S) — bucketed pass-rate.
+    /// 5. Drift z-score (when baseline_window provided) — delegates
+    ///    to `temporal_drift` for csdma_plausibility_score.
+    ///
+    /// AV-43: aggregates return computed statistics. Smallest-window
+    /// callers apply k-anonymity at their layer based on `trace_count`.
     async fn aggregate_scoring_factors(
         &self,
-        _agent_id_hash: &str,
-        _window: crate::read::TimeWindow,
-        _baseline: Option<crate::read::TimeWindow>,
+        agent_id_hash: &str,
+        window: crate::read::TimeWindow,
+        baseline_window: Option<crate::read::TimeWindow>,
     ) -> Result<crate::read::ScoringFactorAggregate, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "aggregate_scoring_factors (postgres v0.5.0 §E — impl pending)",
-        ))
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
+
+        let main = client
+            .query_one(
+                "WITH per_trace AS ( \
+                    SELECT trace_id, MIN(agent_name) AS agent_name, \
+                           BOOL_OR( \
+                             event_type = 'CONSCIENCE_RESULT' \
+                              AND (payload->>'action_was_overridden')::bool \
+                           ) AS was_overridden, \
+                           BOOL_OR( \
+                             event_type = 'CONSCIENCE_RESULT' \
+                              AND (payload->>'conscience_passed')::bool = false \
+                           ) AS conscience_failed, \
+                           BOOL_OR( \
+                             event_type = 'ACTION_RESULT' \
+                              AND (payload->>'success')::bool = true \
+                           ) AS action_succeeded, \
+                           BOOL_OR(audit_sequence_number IS NOT NULL) AS has_audit_seq, \
+                           BOOL_OR(audit_signature IS NOT NULL) AS has_audit_sig \
+                    FROM cirislens.trace_events \
+                    WHERE agent_id_hash = $1 AND ts >= $2 AND ts < $3 \
+                    GROUP BY trace_id \
+                 ) \
+                 SELECT \
+                    COUNT(*)::bigint AS trace_count, \
+                    GREATEST(COUNT(DISTINCT agent_name) - 1, 0)::bigint AS identity_changes, \
+                    SUM(CASE WHEN was_overridden THEN 1 ELSE 0 END)::bigint \
+                      AS conscience_overrides, \
+                    SUM(CASE WHEN has_audit_seq THEN 1 ELSE 0 END)::bigint \
+                      AS audit_chain_total, \
+                    SUM(CASE WHEN has_audit_sig THEN 1 ELSE 0 END)::bigint \
+                      AS audit_signed_total, \
+                    SUM(CASE WHEN conscience_failed AND action_succeeded THEN 1 ELSE 0 END) \
+                      ::bigint AS unsafe_action_count \
+                 FROM per_trace",
+                &[&agent_id_hash, &window.since, &window.until],
+            )
+            .await
+            .map_err(|e| {
+                crate::read::Error::Backend(format!("aggregate_scoring_factors main: {e}"))
+            })?;
+
+        let trace_count: i64 = main.get("trace_count");
+        let identity_changes: i64 = main.get("identity_changes");
+        let conscience_overrides: i64 = main.get("conscience_overrides");
+        let audit_chain_total: i64 = main.get("audit_chain_total");
+        let audit_signed_total: i64 = main.get("audit_signed_total");
+        let unsafe_action_count: i64 = main.get("unsafe_action_count");
+        let unsafe_action_rate = if trace_count > 0 {
+            unsafe_action_count as f64 / trace_count as f64
+        } else {
+            0.0
+        };
+
+        // Audit-chain gaps via LAG window — cheap, single round-trip.
+        let gaps_row = client
+            .query_one(
+                "WITH ordered AS ( \
+                    SELECT audit_sequence_number AS seq, \
+                           LAG(audit_sequence_number) OVER w AS prev_seq \
+                    FROM cirislens.trace_events \
+                    WHERE agent_id_hash = $1 AND ts >= $2 AND ts < $3 \
+                          AND audit_sequence_number IS NOT NULL \
+                    WINDOW w AS (ORDER BY audit_sequence_number) \
+                 ) \
+                 SELECT COUNT(*)::bigint AS gap_count \
+                 FROM ordered \
+                 WHERE prev_seq IS NOT NULL AND seq > prev_seq + 1",
+                &[&agent_id_hash, &window.since, &window.until],
+            )
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("audit_chain_gaps count: {e}")))?;
+        let audit_chain_gaps: i64 = gaps_row.get("gap_count");
+
+        // Recovery events: top 50 most-recent override → next-pass pairs.
+        let recovery_rows = client
+            .query(
+                "WITH per_trace AS ( \
+                    SELECT trace_id, MIN(ts) AS started_at, MAX(ts) AS completed_at, \
+                           BOOL_OR( \
+                             event_type = 'CONSCIENCE_RESULT' \
+                              AND (payload->>'action_was_overridden')::bool \
+                           ) AS was_overridden, \
+                           BOOL_AND( \
+                             CASE WHEN event_type = 'CONSCIENCE_RESULT' \
+                                  THEN (payload->>'coherence_passed')::bool \
+                                  ELSE TRUE END \
+                           ) AS coherence_passed \
+                    FROM cirislens.trace_events \
+                    WHERE agent_id_hash = $1 AND ts >= $2 AND ts < $3 \
+                    GROUP BY trace_id \
+                 ), \
+                 ordered AS ( \
+                    SELECT trace_id, started_at, completed_at, was_overridden, \
+                           LEAD(trace_id) OVER w AS next_trace_id, \
+                           LEAD(started_at) OVER w AS next_started_at, \
+                           LEAD(coherence_passed) OVER w AS next_coherence_passed \
+                    FROM per_trace \
+                    WINDOW w AS (ORDER BY started_at) \
+                 ) \
+                 SELECT trace_id AS override_trace_id, completed_at AS override_at, \
+                        next_trace_id AS recovery_trace_id, \
+                        next_started_at AS recovery_at, \
+                        EXTRACT(EPOCH FROM (next_started_at - completed_at))::float8 \
+                          AS recovery_latency_seconds \
+                 FROM ordered \
+                 WHERE was_overridden = TRUE \
+                       AND next_trace_id IS NOT NULL \
+                       AND next_coherence_passed = TRUE \
+                 ORDER BY override_at DESC \
+                 LIMIT 50",
+                &[&agent_id_hash, &window.since, &window.until],
+            )
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("recovery_events: {e}")))?;
+
+        let mut recovery_events: Vec<crate::read::RecoveryEvent> =
+            Vec::with_capacity(recovery_rows.len());
+        for row in recovery_rows {
+            recovery_events.push(crate::read::RecoveryEvent {
+                override_trace_id: row.get("override_trace_id"),
+                override_at: row.get("override_at"),
+                recovery_trace_id: row.get("recovery_trace_id"),
+                recovery_at: row.get("recovery_at"),
+                recovery_latency_seconds: row.get("recovery_latency_seconds"),
+            });
+        }
+
+        // Coherence decay series: bucket the window into ~24 points
+        // (or 1-minute buckets for sub-hour windows).
+        let window_secs = (window.until - window.since).num_seconds().max(1);
+        let bucket_secs = (window_secs / 24).max(60);
+        let decay_rows = client
+            .query(
+                "WITH per_trace AS ( \
+                    SELECT trace_id, MIN(ts) AS started_at, \
+                           BOOL_AND( \
+                             CASE WHEN event_type = 'CONSCIENCE_RESULT' \
+                                  THEN (payload->>'coherence_passed')::bool \
+                                  ELSE TRUE END \
+                           ) AS coherence_passed \
+                    FROM cirislens.trace_events \
+                    WHERE agent_id_hash = $1 AND ts >= $2 AND ts < $3 \
+                    GROUP BY trace_id \
+                 ) \
+                 SELECT \
+                    to_timestamp( \
+                        (EXTRACT(EPOCH FROM started_at)::bigint / $4::bigint) * $4::bigint \
+                    ) AS bucket_at, \
+                    COUNT(*)::bigint AS trace_count, \
+                    SUM(CASE WHEN coherence_passed THEN 1 ELSE 0 END)::bigint \
+                      AS coherence_passed_count \
+                 FROM per_trace \
+                 GROUP BY bucket_at \
+                 ORDER BY bucket_at ASC",
+                &[&agent_id_hash, &window.since, &window.until, &bucket_secs],
+            )
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("coherence_decay: {e}")))?;
+
+        let mut coherence_decay_series: Vec<crate::read::CoherencePoint> =
+            Vec::with_capacity(decay_rows.len());
+        for row in decay_rows {
+            let tc: i64 = row.get("trace_count");
+            let pc: i64 = row.get("coherence_passed_count");
+            let pass_rate = if tc > 0 { pc as f64 / tc as f64 } else { 0.0 };
+            coherence_decay_series.push(crate::read::CoherencePoint {
+                at: row.get("bucket_at"),
+                coherence_passed_count: pc,
+                trace_count: tc,
+                coherence_pass_rate: pass_rate,
+            });
+        }
+
+        // Drift z-score: when baseline_window supplied, surface the
+        // CSDMA significance from temporal_drift. Other metrics' drift
+        // is in temporal_drift's own primitive surface.
+        let drift_z_score = if let Some(base) = baseline_window {
+            let drift_rows = self.temporal_drift(agent_id_hash, base, window).await?;
+            drift_rows
+                .iter()
+                .find(|r| r.deviation_metric == crate::read::DeviationMetric::CsdmaPlausibility)
+                .map(|r| r.significance)
+        } else {
+            None
+        };
+
+        // Calibration error: persist's wire format doesn't carry
+        // epistemic_certainty yet. Placeholder None for v0.5.0; wire
+        // up when the field flows through.
+        let calibration_error: Option<f64> = None;
+
+        Ok(crate::read::ScoringFactorAggregate {
+            agent_id_hash: agent_id_hash.to_owned(),
+            window,
+            trace_count,
+            identity_changes,
+            conscience_overrides,
+            audit_chain_total,
+            audit_chain_gaps,
+            audit_signed_total,
+            recovery_events,
+            drift_z_score,
+            calibration_error,
+            unsafe_action_rate,
+            coherence_decay_series,
+        })
     }
 
+    /// Section E: batch variant — fleet-wide score sweep. Loops over
+    /// agents calling the single-agent path. Future optimization
+    /// (single-query batched aggregation) is a v0.5.x follow-up;
+    /// initial impl prioritizes correctness over round-trip
+    /// reduction (lens-side batched calls today are <100 agents).
     async fn aggregate_scoring_factors_batch(
         &self,
-        _agent_id_hashes: &[String],
-        _window: crate::read::TimeWindow,
-        _baseline: Option<crate::read::TimeWindow>,
+        agent_id_hashes: &[String],
+        window: crate::read::TimeWindow,
+        baseline_window: Option<crate::read::TimeWindow>,
     ) -> Result<Vec<crate::read::ScoringFactorAggregate>, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "aggregate_scoring_factors_batch (postgres v0.5.0 §E — impl pending)",
-        ))
+        if agent_id_hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::with_capacity(agent_id_hashes.len());
+        for aid in agent_id_hashes {
+            out.push(
+                self.aggregate_scoring_factors(aid, window, baseline_window)
+                    .await?,
+            );
+        }
+        Ok(out)
     }
 
+    /// Section E granular: count distinct trace_id matching a filter.
     async fn count_traces(
         &self,
-        _filter: crate::read::TraceFilter,
+        filter: crate::read::TraceFilter,
     ) -> Result<i64, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "count_traces (postgres v0.5.0 §E — impl pending)",
-        ))
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
+        let (where_sql, params) = build_filter_where(&filter)?;
+        let sql = format!(
+            "SELECT COUNT(DISTINCT trace_id)::bigint AS n \
+             FROM cirislens.trace_events {where_sql}",
+        );
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let row = client
+            .query_one(&sql, &params_ref[..])
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("count_traces: {e}")))?;
+        Ok(row.get::<_, i64>("n"))
     }
 
+    /// Section E granular: count traces where conscience overrode the
+    /// action. BOOL_OR per-trace dedupes recursive CONSCIENCE_RESULT
+    /// retries.
     async fn count_overrides(
         &self,
-        _filter: crate::read::TraceFilter,
+        filter: crate::read::TraceFilter,
     ) -> Result<i64, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "count_overrides (postgres v0.5.0 §E — impl pending)",
-        ))
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
+        let (where_sql, params) = build_filter_where(&filter)?;
+        let sql = format!(
+            "SELECT COUNT(*)::bigint AS n FROM ( \
+                SELECT trace_id \
+                FROM cirislens.trace_events \
+                {where_sql} \
+                GROUP BY trace_id \
+                HAVING BOOL_OR( \
+                    event_type = 'CONSCIENCE_RESULT' \
+                     AND (payload->>'action_was_overridden')::bool \
+                ) \
+             ) sub",
+        );
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let row = client
+            .query_one(&sql, &params_ref[..])
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("count_overrides: {e}")))?;
+        Ok(row.get::<_, i64>("n"))
     }
 
+    /// Section E granular: count agent_name changes (the meaningful
+    /// sense of "identity change" — agent_id_hash IS the identity
+    /// fingerprint by construction; renames within a single hash are
+    /// what's surfaced).
     async fn count_identity_changes(
         &self,
-        _filter: crate::read::TraceFilter,
+        filter: crate::read::TraceFilter,
     ) -> Result<i64, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "count_identity_changes (postgres v0.5.0 §E — impl pending)",
-        ))
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
+        let (where_sql, params) = build_filter_where(&filter)?;
+        let sql = format!(
+            "SELECT GREATEST(COUNT(DISTINCT agent_name) - 1, 0)::bigint AS n \
+             FROM cirislens.trace_events {where_sql}",
+        );
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let row = client
+            .query_one(&sql, &params_ref[..])
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("count_identity_changes: {e}")))?;
+        Ok(row.get::<_, i64>("n"))
     }
 
+    /// Section E granular: audit-chain aggregate. Total signed audit
+    /// entries + detected sequence-number gaps. Gap count is meaningful
+    /// only when filter narrows to one agent (cross-agent sequences
+    /// interleave); when filter doesn't pin agent_id_hash, gap_count
+    /// returns 0 with a documented limitation.
     async fn aggregate_audit_chain(
         &self,
-        _filter: crate::read::TraceFilter,
+        filter: crate::read::TraceFilter,
     ) -> Result<crate::read::AuditChainAggregate, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "aggregate_audit_chain (postgres v0.5.0 §E — impl pending)",
-        ))
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
+        let (where_sql, params) = build_filter_where(&filter)?;
+        let totals_sql = format!(
+            "SELECT \
+                COUNT(*) FILTER (WHERE audit_sequence_number IS NOT NULL)::bigint \
+                  AS audit_total, \
+                COUNT(*) FILTER (WHERE audit_signature IS NOT NULL)::bigint \
+                  AS audit_signed, \
+                COUNT(*) FILTER (WHERE audit_entry_hash IS NOT NULL)::bigint \
+                  AS audit_hashed \
+             FROM cirislens.trace_events {where_sql}",
+        );
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let row = client
+            .query_one(&totals_sql, &params_ref[..])
+            .await
+            .map_err(|e| {
+                crate::read::Error::Backend(format!("aggregate_audit_chain totals: {e}"))
+            })?;
+        let audit_total: i64 = row.get("audit_total");
+        let audit_signed: i64 = row.get("audit_signed");
+        let audit_hashed: i64 = row.get("audit_hashed");
+
+        let gap_count = if filter.agent_id_hash.is_some() {
+            let gaps_sql = format!(
+                "WITH ordered AS ( \
+                    SELECT audit_sequence_number AS seq, \
+                           LAG(audit_sequence_number) OVER w AS prev_seq \
+                    FROM cirislens.trace_events \
+                    {where_sql} AND audit_sequence_number IS NOT NULL \
+                    WINDOW w AS (ORDER BY audit_sequence_number) \
+                 ) \
+                 SELECT COUNT(*)::bigint AS gap_count \
+                 FROM ordered \
+                 WHERE prev_seq IS NOT NULL AND seq > prev_seq + 1",
+            );
+            let g_row = client
+                .query_one(&gaps_sql, &params_ref[..])
+                .await
+                .map_err(|e| {
+                    crate::read::Error::Backend(format!("aggregate_audit_chain gaps: {e}"))
+                })?;
+            g_row.get::<_, i64>("gap_count")
+        } else {
+            0
+        };
+
+        Ok(crate::read::AuditChainAggregate {
+            audit_total,
+            audit_signed,
+            audit_hashed,
+            gap_count,
+        })
     }
+}
+
+/// v0.5.0 §E helper — build a parameterized WHERE clause from a
+/// [`crate::read::TraceFilter`]. Returns the SQL fragment (starts
+/// with "WHERE " when non-empty, empty string when no filters set)
+/// and the boxed param list.
+///
+/// Used by the granular `count_*` and `aggregate_audit_chain`
+/// primitives. Section A's `list_trace_summaries` builds its own
+/// inline because it composes WHERE + HAVING (cursor) + ORDER BY +
+/// LIMIT in one place.
+fn build_filter_where(
+    filter: &crate::read::TraceFilter,
+) -> Result<
+    (
+        String,
+        Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+    ),
+    crate::read::Error,
+> {
+    let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+    let mut where_parts: Vec<String> = Vec::new();
+
+    if let Some(w) = filter.time_window {
+        params.push(Box::new(w.since));
+        where_parts.push(format!("ts >= ${}", params.len()));
+        params.push(Box::new(w.until));
+        where_parts.push(format!("ts < ${}", params.len()));
+    }
+    if let Some(h) = &filter.agent_id_hash {
+        params.push(Box::new(h.clone()));
+        where_parts.push(format!("agent_id_hash = ${}", params.len()));
+    }
+    if let Some(n) = &filter.agent_name {
+        params.push(Box::new(n.clone()));
+        where_parts.push(format!("agent_name = ${}", params.len()));
+    }
+    if let Some(d) = &filter.deployment_domain {
+        params.push(Box::new(d.clone()));
+        where_parts.push(format!("deployment_domain = ${}", params.len()));
+    }
+    if let Some(d) = &filter.deployment_type {
+        params.push(Box::new(d.clone()));
+        where_parts.push(format!("deployment_type = ${}", params.len()));
+    }
+    if let Some(level) = filter.trace_level {
+        let s = match serde_json::to_value(level) {
+            Ok(serde_json::Value::String(s)) => s,
+            _ => {
+                return Err(crate::read::Error::Backend(
+                    "trace_level enum did not serialize to JSON string".into(),
+                ))
+            }
+        };
+        params.push(Box::new(s));
+        where_parts.push(format!("trace_level = ${}", params.len()));
+    }
+    if let Some(verified) = filter.signature_verified {
+        params.push(Box::new(verified));
+        where_parts.push(format!("signature_verified = ${}", params.len()));
+    }
+    if let Some(v) = &filter.schema_version {
+        params.push(Box::new(v.clone()));
+        where_parts.push(format!("schema_version = ${}", params.len()));
+    }
+    if let Some(s) = &filter.cognitive_state {
+        params.push(Box::new(s.clone()));
+        where_parts.push(format!("cognitive_state = ${}", params.len()));
+    }
+
+    let where_sql = if where_parts.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", where_parts.join(" AND "))
+    };
+    Ok((where_sql, params))
 }
 
 // ─── DerivedSchema impl (v0.4.3, CIRISPersist#18) ──────────────────
@@ -4820,6 +5248,275 @@ mod tests {
         assert!((a.multiple_of_domain_avg - 1.333_333_333_333_333_3).abs() < 1e-6);
         // B's multiple = 0.25/0.375 ≈ 0.667.
         assert!((b.multiple_of_domain_avg - 0.666_666_666_666_666_7).abs() < 1e-6);
+    }
+
+    // ─── ReadEngine §E tests (v0.5.0, CIRISPersist#23) ──────────────
+
+    /// §E aggregate_scoring_factors round-trip — fixture has 4 traces:
+    /// 1 overridden (action=succeed → unsafe), 3 not overridden;
+    /// assert all factor inputs surface correctly.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_e_aggregate_scoring_factors_round_trip() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        use crate::read::ReadEngine;
+        let suffix = uuid_like();
+        let aid = format!("agent-§e-{suffix}");
+        let now = chrono::Utc::now();
+
+        // 4 traces: traces[0] overridden (will count as unsafe via
+        // the action_succeeded BOOL_OR true at ACTION_RESULT) ;
+        // traces[1..4] not overridden, normal.
+        for i in 0..4 {
+            let tid = format!("trace-§e-{suffix}-{i}");
+            insert_section_a_fixture_trace(
+                &backend,
+                &tid,
+                &aid,
+                Some(&aid),
+                Some("d"),
+                now + chrono::Duration::seconds(i64::from(i)),
+                i == 0, // overridden iff first
+                0.5,
+                0.5,
+                1.0,
+            )
+            .await;
+        }
+
+        let window = crate::read::TimeWindow {
+            since: now - chrono::Duration::hours(1),
+            until: now + chrono::Duration::hours(1),
+        };
+        let agg = backend
+            .aggregate_scoring_factors(&aid, window, None)
+            .await
+            .unwrap();
+
+        assert_eq!(agg.agent_id_hash, aid);
+        assert_eq!(agg.trace_count, 4);
+        assert_eq!(agg.identity_changes, 0); // single agent_name
+        assert_eq!(agg.conscience_overrides, 1); // trace 0
+                                                 // Audit-chain: fixture doesn't populate audit_sequence_number,
+                                                 // so audit_chain_total = 0.
+        assert_eq!(agg.audit_chain_total, 0);
+        assert_eq!(agg.audit_signed_total, 0);
+        assert_eq!(agg.audit_chain_gaps, 0);
+        // unsafe action: fixture's overridden trace has
+        // action_was_overridden=true with conscience_passed=false
+        // AND action_succeeded=true (the `success` field on
+        // ACTION_RESULT is `!action_was_overridden` per fixture
+        // helper, so when overridden the action shows success=false
+        // — NOT unsafe). So unsafe_action_rate = 0 in this fixture.
+        assert!((agg.unsafe_action_rate - 0.0).abs() < 1e-9);
+        // No baseline → no drift z-score.
+        assert!(agg.drift_z_score.is_none());
+        // calibration_error always None for v0.5.0.
+        assert!(agg.calibration_error.is_none());
+        // Coherence series: at least one bucket point.
+        assert!(!agg.coherence_decay_series.is_empty());
+        // Recovery events: trace[0] overridden, trace[1] passes (not
+        // overridden + coherence_passed=true) → 1 recovery event.
+        assert_eq!(agg.recovery_events.len(), 1);
+        let recovery = &agg.recovery_events[0];
+        assert!(recovery.override_trace_id.contains("§e"));
+        assert!(recovery.recovery_latency_seconds >= 0.0);
+    }
+
+    /// §E aggregate_scoring_factors_batch — empty input returns empty
+    /// vec; non-empty returns one aggregate per agent in order.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_e_aggregate_scoring_factors_batch() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        use crate::read::ReadEngine;
+        // Empty input.
+        let empty = backend
+            .aggregate_scoring_factors_batch(
+                &[],
+                crate::read::TimeWindow {
+                    since: chrono::Utc::now() - chrono::Duration::hours(1),
+                    until: chrono::Utc::now(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
+
+        // Two agents.
+        let suffix = uuid_like();
+        let aid_a = format!("agent-§e-batch-A-{suffix}");
+        let aid_b = format!("agent-§e-batch-B-{suffix}");
+        let now = chrono::Utc::now();
+        for aid in [&aid_a, &aid_b] {
+            insert_section_a_fixture_trace(
+                &backend,
+                &format!("trace-§e-batch-{aid}"),
+                aid,
+                Some(aid),
+                Some("d"),
+                now,
+                false,
+                0.5,
+                0.5,
+                1.0,
+            )
+            .await;
+        }
+
+        let window = crate::read::TimeWindow {
+            since: now - chrono::Duration::hours(1),
+            until: now + chrono::Duration::hours(1),
+        };
+        let aggs = backend
+            .aggregate_scoring_factors_batch(&[aid_a.clone(), aid_b.clone()], window, None)
+            .await
+            .unwrap();
+        assert_eq!(aggs.len(), 2);
+        // Order matches input.
+        assert_eq!(aggs[0].agent_id_hash, aid_a);
+        assert_eq!(aggs[1].agent_id_hash, aid_b);
+    }
+
+    /// §E count_traces — agent_id_hash filter narrows correctly.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_e_count_traces() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        use crate::read::ReadEngine;
+        let suffix = uuid_like();
+        let aid = format!("agent-§e-count-{suffix}");
+        let now = chrono::Utc::now();
+        for i in 0..3 {
+            insert_section_a_fixture_trace(
+                &backend,
+                &format!("trace-§e-count-{suffix}-{i}"),
+                &aid,
+                Some(&aid),
+                Some("d"),
+                now,
+                false,
+                0.5,
+                0.5,
+                1.0,
+            )
+            .await;
+        }
+
+        let n = backend
+            .count_traces(crate::read::TraceFilter {
+                agent_id_hash: Some(aid.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(n, 3);
+    }
+
+    /// §E count_overrides — distinct from count_traces; collapses
+    /// recursive CONSCIENCE_RESULT correctly.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_e_count_overrides() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        use crate::read::ReadEngine;
+        let suffix = uuid_like();
+        let aid = format!("agent-§e-cor-{suffix}");
+        let now = chrono::Utc::now();
+        // 5 traces, traces[0..2] overridden (2/5)
+        for i in 0..5 {
+            insert_section_a_fixture_trace(
+                &backend,
+                &format!("trace-§e-cor-{suffix}-{i}"),
+                &aid,
+                Some(&aid),
+                Some("d"),
+                now,
+                i < 2,
+                0.5,
+                0.5,
+                1.0,
+            )
+            .await;
+        }
+        let n = backend
+            .count_overrides(crate::read::TraceFilter {
+                agent_id_hash: Some(aid),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+
+    /// §E aggregate_audit_chain — fixture has no audit_sequence_number
+    /// rows; verify zero counts. (audit fields are populated only on
+    /// real ACTION_RESULT rows the agent actually emits with audit
+    /// anchors; the §A fixture helper doesn't populate them.)
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_e_aggregate_audit_chain_no_audit_rows() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        use crate::read::ReadEngine;
+        let suffix = uuid_like();
+        let aid = format!("agent-§e-audit-{suffix}");
+        let now = chrono::Utc::now();
+        insert_section_a_fixture_trace(
+            &backend,
+            &format!("trace-§e-audit-{suffix}"),
+            &aid,
+            Some(&aid),
+            Some("d"),
+            now,
+            false,
+            0.5,
+            0.5,
+            1.0,
+        )
+        .await;
+
+        let agg = backend
+            .aggregate_audit_chain(crate::read::TraceFilter {
+                agent_id_hash: Some(aid),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(agg.audit_total, 0);
+        assert_eq!(agg.audit_signed, 0);
+        assert_eq!(agg.audit_hashed, 0);
+        assert_eq!(agg.gap_count, 0);
     }
 
     /// §A: invalid cursor version rejects with InvalidCursor.

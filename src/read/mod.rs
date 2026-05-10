@@ -71,7 +71,7 @@ pub mod scoring;
 pub mod trace;
 pub mod types;
 
-pub use scoring::{AuditChainAggregate, RecoveryEvent, ScoringFactorAggregate};
+pub use scoring::{AuditChainAggregate, CoherencePoint, RecoveryEvent, ScoringFactorAggregate};
 pub use trace::{
     DivergenceRow, HashChainGap, OverrideRateRow, TemporalDriftRow, TraceComponentRow, TraceDetail,
     TraceEnvelopeRefs, TraceListPage, TraceSummary,
