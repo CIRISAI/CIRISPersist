@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778445734642,
+  "lastUpdate": 1778446009280,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -7121,6 +7121,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23964575,
             "range": "± 591837",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "9e96b335a32ad9661ca7cfc168c2dfe35baa251a",
+          "message": "WIP v0.5.0 §A tests — list_trace_summaries + get_trace_summary\n\n6 integration tests against real Postgres (gated on\nCIRIS_PERSIST_TEST_PG_URL; CI workflow ci.yml already sets this):\n\n- get_trace_summary_round_trip — insert 5-component fixture trace\n  (THOUGHT_START + DMA_RESULTS + IDMA_RESULT + CONSCIENCE_RESULT +\n  ACTION_RESULT); read summary; assert every JSONB-extracted field\n  matches (DMA scores, IDMA flags, conscience flags, action result,\n  cost columns).\n- get_trace_summary_unknown_returns_none — typed None, not Err.\n- list_cursor_pagination — 5 traces with staggered started_at;\n  page through with limit=2; no overlap, no gaps,\n  next_cursor=None when items.len() < limit.\n- agent_id_hash_isolation — AV-9 invariant: filter by agent A\n  excludes agent B; every returned summary carries agent_id_hash.\n- list_limit_boundaries — limit=0 + limit=10001 → InvalidArgument;\n  limit=1 accepts.\n- invalid_cursor_version_rejects — version=\"v99\" → InvalidCursor.\n\nAll 6 pass against local postgres:15-alpine (timescaledb-less; the\nV001 hypertable conversion is gated on pg_extension lookup so the\nmigration runs cleanly without it).\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-10T15:38:37-05:00",
+          "tree_id": "230b17ea7cb419c640020603bc8a6899fad08213",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/9e96b335a32ad9661ca7cfc168c2dfe35baa251a"
+        },
+        "date": 1778446008303,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 105331,
+            "range": "± 2725",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 246137,
+            "range": "± 791",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 526933,
+            "range": "± 3149",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1855377,
+            "range": "± 10130",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 345,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1465,
+            "range": "± 32",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8259,
+            "range": "± 20",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 365,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3222,
+            "range": "± 20",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9602,
+            "range": "± 28",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41425,
+            "range": "± 85",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 621,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2326343,
+            "range": "± 237423",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6678568,
+            "range": "± 146869",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23811933,
+            "range": "± 285610",
             "unit": "ns/iter"
           }
         ]
