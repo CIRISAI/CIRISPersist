@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778447003716,
+  "lastUpdate": 1778447348861,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -7691,6 +7691,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 24019674,
             "range": "± 363029",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "6cead11b5a0b866271048554ed374ec06d218716",
+          "message": "0.5.0 — federation read primitives §A/B/F/E (CIRISPersist#23)\n\nCloses lens-bleeding read-side starvation: 50 lens SELECTs against\ncirislens.trace_events directly, /coherence-ratchet/stats 500'ing,\napi/scoring.py raw SQL — all replaced by typed read primitives\nthrough the persist substrate.\n\nSurface duality (v0.4.1 verify-primitive precedent): every primitive\nlands as both a Rust-public ReadEngine trait method AND a thin PyO3\nwrapper on Engine. Single source of truth.\n\n§A trace listing — list_trace_summaries + get_trace_summary; drives\n/repository/traces. JSONB-extracting GROUP BY with FILTER aggregation\nin one DB pass; cursor pagination via (started_at, trace_id) tuple.\n\n§B trace detail — get_trace_detail; drives /repository/traces/{id}.\n3 round-trips composing summary + components (chronological) + LLM\ncalls + envelope refs.\n\n§F Coherence Ratchet inputs — cross_agent_divergence (CSDMA / DSDMA /\nIDMA k_eff / IDMA correlation_risk / override_rate), temporal_drift\n(Welch z-score on mean shift), hash_chain_gaps (LAG window over\naudit_sequence_number), conscience_override_rates (per-trace BOOL_OR\ncollapse + population-weighted domain average). Drives\n/coherence-ratchet/stats.\n\n§E scoring factor aggregates — replaces api/scoring.py raw SQL.\nBundled aggregate_scoring_factors + batch + 4 granular sub-primitives\n(count_traces, count_overrides, count_identity_changes,\naggregate_audit_chain). 4 round-trips per aggregate covering Capacity\nScore factors C / I_int / R / I_inc / S inputs (recovery events,\ncoherence decay series, etc.).\n\nPyO3: 12 wrappers, JSON-string in/out for complex types. Same idiom\nas the existing federation directory + derived schema methods.\n\nThreat model AV-43 added — read-side adversary inference attack.\nAggregates return computed statistics not content; sample_count /\ntrace_count surface explicitly for caller-side k-anonymity gates;\nAV-9 trace-scoped reads carry agent_id_hash. Posture summary §9\nheader bumped v0.4.6 → v0.5.0; 16 vectors closed across v0.2.0..v0.5.0.\n\nTests: 19 integration tests against real Postgres (gated on\nCIRIS_PERSIST_TEST_PG_URL). 203 total lib tests pass.\n\nOut of scope (deferred to v0.5.1): sections C/D/G/H/I plus the\nfinal cirislens_reader carve-out retirement (gated on §D — LLM call\nsurface — which v0.5.1 covers). v0.5.0 deprecates but does not yet\nfully retire the carve-out.\n\nFSD/V0_5_0_FEDERATION_READ_PRIMITIVES.md documents the sub-batch\nshape.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-10T15:58:54-05:00",
+          "tree_id": "33f63fbbe1805a1e25d798e4184d05d0a949422d",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/6cead11b5a0b866271048554ed374ec06d218716"
+        },
+        "date": 1778447347903,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 96730,
+            "range": "± 1316",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 238504,
+            "range": "± 2587",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 522182,
+            "range": "± 1698",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1944514,
+            "range": "± 23993",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 304,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1218,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7205,
+            "range": "± 130",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 317,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3188,
+            "range": "± 17",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9834,
+            "range": "± 34",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 44092,
+            "range": "± 220",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 548,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2526796,
+            "range": "± 120064",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6868747,
+            "range": "± 4295891",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23996161,
+            "range": "± 453270",
             "unit": "ns/iter"
           }
         ]
