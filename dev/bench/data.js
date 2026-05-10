@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778446506313,
+  "lastUpdate": 1778446858757,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -7463,6 +7463,120 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25800985,
             "range": "± 701950",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "d98dfabbd002651d89e4100204f61e3d0d006bbe",
+          "message": "WIP v0.5.0 §E — ScoringFactorAggregate + batch + 4 granular (5 tests)\n\nReplaces api/scoring.py raw SQL. The \"big aggregate\" of #23.\n\naggregate_scoring_factors(agent, window, baseline?):\n- 4 round-trips composing all Capacity Score factor inputs:\n  1. Per-trace collapse + window-wide counts (trace_count,\n     identity_changes, conscience_overrides, audit_chain_total,\n     audit_signed_total, unsafe_action_count). One CTE pass.\n  2. Audit-chain gap count via LAG window (cheap, single row).\n  3. Recovery events (top 50 most-recent override → next-pass\n     pairs) via LEAD window over per-trace started_at.\n  4. Coherence decay series (~24 buckets across the window;\n     min 1-minute buckets for sub-hour windows) via to_timestamp\n     bucket math.\n- drift_z_score: when baseline_window provided, delegates to\n  temporal_drift on csdma_plausibility_score.\n- calibration_error: None for v0.5.0 (epistemic_certainty isn't\n  in persist's wire format yet — wire up when that field flows).\n\naggregate_scoring_factors_batch(agents, window, baseline?):\n- Loop over agents calling the single-agent path. Future\n  optimization (single-query batched aggregation) deferred to\n  v0.5.x; lens-side batched calls are <100 agents today.\n\nGranular primitives — composable narrower questions:\n- count_traces(filter) — DISTINCT trace_id count.\n- count_overrides(filter) — BOOL_OR per-trace dedupe of recursive\n  CONSCIENCE_RESULT retries.\n- count_identity_changes(filter) — agent_name-rename count\n  (agent_id_hash IS the identity fingerprint by construction).\n- aggregate_audit_chain(filter) — total / signed / hashed +\n  gap_count (gap_count meaningful only when filter narrows to one\n  agent — cross-agent sequences interleave; documented).\n\nHelper: build_filter_where(filter) → (SQL fragment, boxed params).\nUsed by all granular primitives. §A's list_trace_summaries builds\nits own WHERE inline because it composes WHERE+HAVING+ORDER+LIMIT.\n\nCoherencePoint added to prelude exports (was missing).\n\nTests (5, all green against local postgres:15-alpine):\n- aggregate_scoring_factors_round_trip — 4-trace fixture w/ 1\n  override; assert all factor inputs surface; recovery_events\n  detects override→pass; coherence series populated.\n- aggregate_scoring_factors_batch — empty input → empty vec;\n  2-agent input → 2 aggregates in input order.\n- count_traces — agent_id_hash filter narrows correctly.\n- count_overrides — distinct from count_traces; recursive\n  CONSCIENCE_RESULT collapsed to per-trace BOOL_OR.\n- aggregate_audit_chain_no_audit_rows — fixture without audit\n  fields returns zero counts.\n\nAll four §A/B/F/E sections shipped. v0.5.0 still pending: PyO3\nwrappers + threat-model AV-43 + CHANGELOG + tag.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-10T15:52:47-05:00",
+          "tree_id": "d5e316c478cea649e632be18d679cd3b2d33510d",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/d98dfabbd002651d89e4100204f61e3d0d006bbe"
+        },
+        "date": 1778446857844,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 102253,
+            "range": "± 4384",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 245809,
+            "range": "± 4202",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 531961,
+            "range": "± 2739",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1883396,
+            "range": "± 20499",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 347,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1537,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8241,
+            "range": "± 41",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 361,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3110,
+            "range": "± 61",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9436,
+            "range": "± 98",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41624,
+            "range": "± 131",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 621,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2448460,
+            "range": "± 182969",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6862264,
+            "range": "± 373467",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23950235,
+            "range": "± 557785",
             "unit": "ns/iter"
           }
         ]
