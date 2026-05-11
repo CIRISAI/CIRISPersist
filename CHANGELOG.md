@@ -5,6 +5,95 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.5.2] — 2026-05-11
+
+**Bump CIRISVerify deps v1.13.2 → v2.0.0 — fixes CI break from
+upstream `ml_dsa` minor-version drift.**
+
+v0.5.1 CI failed across every job (clippy + fmt + audit, all wheel
+builds, linux full-features, darwin no-postgres, ios) with:
+
+```
+error[E0432]: unresolved import `ml_dsa::KeyGen`
+error[E0599]: no function or associated item named `from_seed`
+              found for struct `MlDsa65`
+```
+
+Root cause: `ciris-crypto v1.13.2` declared a caret range on
+`ml-dsa`. The `ml-dsa` crate published a breaking minor that
+removed `KeyGen` and `MlDsa65::from_seed`. v0.5.0 + v0.5.1 had
+locally-cached `Cargo.lock` entries against the older `ml-dsa`, so
+local builds and v0.5.0's CI run yesterday passed; today's CI
+fresh-resolve pulled the new incompatible `ml-dsa` and broke the
+build crate-wide. CIRISPersist's `Cargo.lock` is gitignored
+(intentional — we treat persist as a library, not a binary), so
+CI gets the latest semver-compatible resolution every time.
+
+v2.0.0 of `ciris-crypto` pins `ml-dsa = 0.1.0-rc.9` precisely (no
+caret range), closing this drift hazard. The bump matches the
+already-planned v2.0-readiness work documented in v0.4.5 — Eric's
+note at v2.0.0 publish time confirmed "zero breaking changes
+despite the major bump; the major signals federation policy
+('ciris-crypto is now THE crypto authority'), not API breakage."
+Verified: 205 lib tests pass against v2.0.0 with no persist-side
+code changes.
+
+### Cargo.toml diff
+
+```diff
+- ciris-keyring     = { ... tag = "v1.13.2", version = "1", features = ["pqc-ml-dsa"] }
+- ciris-verify-core = { ... tag = "v1.13.2", version = "1" }
+- ciris-crypto      = { ... tag = "v1.13.2", version = "1", features = ["ed25519", "pqc-ml-dsa"] }
++ ciris-keyring     = { ... tag = "v2.0.0",  version = "2", features = ["pqc-ml-dsa"] }
++ ciris-verify-core = { ... tag = "v2.0.0",  version = "2" }
++ ciris-crypto      = { ... tag = "v2.0.0",  version = "2", features = ["ed25519", "pqc-ml-dsa"] }
+```
+
+Three tag bumps + three semver-major constraints (`version = "1"`
+→ `"2"`, required by git-dep resolution). Zero code changes.
+
+### What v2.0.0 brings beyond unblocking CI
+
+(Informational; persist doesn't activate any of these in v0.5.2.)
+
+- `aes-gcm` / `kdf` / `hmac` / `random` feature gates on
+  `ciris-crypto` — the federated SecretsService prereq from
+  CIRISPersist#19. v0.6.0 lights these up when the pipeline ships.
+- `symmetric-derivation` on `ciris-keyring` (hardware HKDF) —
+  same #19 prereq.
+- `tree_verify` / `TreeVerifyRequest` / `TreeVerifyResult` /
+  `FailedFile` / `FailedFileKind` on `ciris-verify-core` — runtime
+  tree-walking verifier closing CIRISVerify#9. Surface is
+  available through persist's curated prelude for any consumer
+  that wants it; persist itself doesn't call `verify_tree` (that's
+  CIRISAgent's attestation concern).
+
+The crypto-through-ciris-crypto invariant (FSD §7.5a) remains:
+persist takes ZERO direct deps on AES-GCM/PBKDF2/HKDF/HMAC/RNG
+primitive crates. The v0.6.0 work flips features on the existing
+deps, no new crates land.
+
+### Tests
+
+205 lib tests pass against v2.0.0 (same count as v0.5.1; no test
+churn). The two CIRISPersist#24 regression tests
+(`empty_window_does_not_panic`, `empty_baseline_does_not_panic`)
+continue to pass — the v0.5.1 hotfix is unaffected.
+
+### Defense-in-depth observation
+
+The v0.5.1 CI break was caused by a transitive dep crater outside
+our control. Our git-dep surface with caret-range transitive
+constraints exposes us to drift. The v0.5.2 solution is "bump to
+a verify version that pins exact transitives" — and verify v2.0.0
+chose exactly that (`ml-dsa = 0.1.0-rc.9` exact, not caret). The
+structural alternative is committing `Cargo.lock` in-tree; the
+current gitignored-lock posture is documented in `Cargo.toml`'s
+comment block. This break is the first time that trade-off bit.
+If it recurs, switching to a committed `Cargo.lock` is the
+cheaper move than chasing every transitive dep's pinning
+discipline upstream.
+
 ## [0.5.1] — 2026-05-11
 
 **P0 hotfix: `aggregate_scoring_factors` panicked + crashed uvicorn
