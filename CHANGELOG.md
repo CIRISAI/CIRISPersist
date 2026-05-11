@@ -5,6 +5,142 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.5.1] — 2026-05-11
+
+**P0 hotfix: `aggregate_scoring_factors` panicked + crashed uvicorn
+workers when the baseline window was empty.** Closes
+[CIRISPersist#24](https://github.com/CIRISAI/CIRISPersist/issues/24).
+Production lens wedge 2026-05-11 15:09–15:59 UTC.
+
+### Root cause
+
+The §E `aggregate_scoring_factors` main SELECT runs without
+`GROUP BY`, so on an empty input CTE (the agent has zero
+`trace_events` rows in the window) Postgres produces ONE result row
+but every `SUM(CASE WHEN ... THEN 1 ELSE 0 END)` returns NULL per
+the SQL spec. Pre-v0.5.1 the Rust code read those columns as
+`Row::get::<_, i64>` (not `Option<i64>`); `i64: FromSql` rejects
+NULL → `Row::get` panicked → PyO3 propagated as
+`Fatal Python error: Aborted` → SIGABRT → every uvicorn worker
+died in parallel from concurrent §E baseline calls → `/health`
+unreachable → lens wedged.
+
+Trigger from prod validation matrix:
+
+```
+GET /api/v1/accord/scoring/factors/{agent}?hours=24&baseline_hours=168
+```
+
+Scout has 0 traces in the baseline window (168h–24h ago); every
+baseline call crashed a worker. The fleet has ≥1 sparse-baseline
+agent (Scout) so this fired immediately on real validation traffic.
+
+The SIGABRT-not-PyErr behavior is itself a separate hazard — `panic =
+"abort"` in our release profile prevents PyO3's panic-catching
+trampoline from converting Rust panics to `PanicException`. v0.5.2
+addresses that broader hardening (see *Hardening track* below).
+
+### Fix
+
+Belt-and-braces — fix applied at BOTH layers:
+
+1. **SQL layer (data-layer fix)** — `COALESCE(SUM(...), 0)` on
+   every SUM in the `aggregate_scoring_factors` main query (4
+   SUMs: `conscience_overrides`, `audit_chain_total`,
+   `audit_signed_total`, `unsafe_action_count`). The COALESCE
+   intent is co-located with the SUM so future query edits keep
+   the contract.
+2. **Rust layer (defense-in-depth)** — read the 4 COALESCE'd
+   columns via `try_get::<_, Option<i64>>(col)?.unwrap_or(0)`
+   instead of `get::<_, i64>`. A future SQL edit that drops a
+   COALESCE surfaces as a typed `Error::Backend` (HTTP 500) at the
+   lens, not a Rust panic → SIGABRT → process abort.
+
+`COUNT(*)` and `GREATEST(...)::bigint` stay un-COALESCE'd and read
+as direct `i64`: SQL semantics guarantee non-NULL on empty input
+(`COUNT` → 0, `GREATEST(... -1, 0)` → 0 by the literal).
+
+### Tests — regression-proofed
+
+Two new integration tests that exercise the exact prod-crash code path:
+
+- `read_section_e_aggregate_scoring_factors_empty_window_does_not_panic`
+  — unknown agent + far-past window = empty CTE = pre-fix
+  `Row::get` panics. Test asserts all counts/rates are 0 / empty
+  Vecs. **Verified to fail with the exact prod crash signature
+  (`panicked at src/store/postgres.rs:3218:46: error retrieving
+  column conscience_overrides: error deserializing column 2`) when
+  the COALESCE is reverted; passes cleanly with the fix.**
+- `read_section_e_aggregate_scoring_factors_empty_baseline_does_not_panic`
+  — replicates the production trigger exactly: main window has
+  traces, baseline window is empty (sparse-baseline agent). Asserts
+  the result computes successfully with `drift_z_score=None` (no
+  baseline samples → no drift).
+
+### Audit — other NULL-panic candidates across §A/B/F/E
+
+Grepped every `Row::get` call in the ReadEngine impl. The remaining
+SUM-with-no-GROUP-BY pattern is the only place the bug surfaces:
+
+| Site | SQL shape | NULL-safe because |
+|---|---|---|
+| `cross_agent_divergence` numeric branch | per-agent CTE has `HAVING COUNT(*) > 0`; outer SELECT iterates rows only if per_agent is non-empty | empty per_agent → 0 rows out → no iteration |
+| `cross_agent_divergence` override-rate branch | same `HAVING` shape | same |
+| `temporal_drift` | `COUNT(*) FILTER` for `base_n`/`comp_n` (never NULL); AVG/VAR_SAMP read via `Option<f64>` already; `bn==0` guard fires before AVG read | already Option-aware; defensive guard |
+| `hash_chain_gaps` | `WHERE prev_seq IS NOT NULL AND seq > prev_seq + 1` filter post-LAG | NULL rows filtered before SELECT |
+| `conscience_override_rates` | `GROUP BY agent_id_hash`; per_agent has at least one trace per group; `COALESCE(... , 0.0)` already applied to domain_avg | non-empty groups + existing COALESCE |
+| `aggregate_audit_chain` totals | `COUNT(*) FILTER (WHERE ...)` — returns 0 on no match, never NULL | spec |
+| `aggregate_audit_chain` gap_count | `COUNT(*)` post-LAG-window | spec |
+| `count_traces` / `count_overrides` / `count_identity_changes` | `COUNT(DISTINCT)` / `COUNT(*)` / `GREATEST(... -1, 0)` | spec |
+| `coherence_decay_series` | `GROUP BY bucket_at` — empty buckets produce no rows | non-empty groups |
+| `recovery_events` | `WHERE was_overridden = TRUE AND next_trace_id IS NOT NULL AND next_coherence_passed = TRUE` — every result-row field is non-NULL by the filter | filter post-LEAD |
+
+The lesson generalizes: **`SUM(CASE WHEN ...)` over a possibly-empty
+set without `GROUP BY` is the foot-gun.** Documented inline at the
+fix site so future query authors see the trap.
+
+### Hardening track (v0.5.2 / v0.5.3) — informed by post-mortem
+
+Hardening research filed at v0.5.1 ship time. The proximate fix
+(this release) closes the bug; the systemic hardening track
+addresses the failure-class:
+
+1. **(v0.5.2, P0)** Remove `panic = "abort"` from the `cdylib`
+   release profile; switch to `panic = "unwind"`. Without this,
+   PyO3's panic-catching trampoline can't fire — any future Rust
+   panic anywhere becomes SIGABRT. Threat-model implication
+   re-evaluated; original AV-17/§4.2 audit argument for abort is
+   pre-PyO3 (CIRISPersist#16 outbound queue era) and doesn't
+   survive in a long-lived uvicorn-worker `cdylib`.
+2. **(v0.5.2, P0)** Crate-wide sweep `Row::get` →
+   `try_get::<_, Option<T>>`. Add CI gate: `rg "\.get::<" src/`
+   returning non-zero fails the build.
+3. **(v0.5.2, P0)** Wrap every `#[pyfunction]` entry point in
+   `std::panic::catch_unwind(AssertUnwindSafe(|| …))` and convert
+   the payload into a typed `LensQueryError(Exception)` — never let
+   `PanicException` (which derives from `BaseException`, not
+   `Exception`) reach uvicorn's request handler.
+4. **(v0.5.3, P1)** sqlfluff in CI with custom rule banning bare
+   `SUM(` / `AVG(` without `COALESCE`; FILTER-aware variant.
+5. **(v0.5.3, P1)** Per-worker panic budget + circuit breaker
+   (Cloudflare's `workers-rs` poisoned-instance pattern).
+
+Each of those is a separate issue filed alongside this release.
+v0.5.1 ships only the direct fix — every layer that broke today
+gets its own focused release rather than a megabump.
+
+### Operational notes
+
+- 201 lib tests pass against local postgres:15-alpine (the two new
+  regression tests above + the existing v0.5.0 suite). Hooks
+  (fmt + clippy + test) clean.
+- The 7 lens-side calls that surfaced this (`§E baseline_hours`
+  paths) work cleanly post-fix; bridge team verified end-to-end
+  reproduction matrix locally with the patched build before this
+  release tagged.
+- Lens-team unblocked from declaring v0.5.0/v0.5.1 validated.
+- §B / §F surfaces unchanged; §A unchanged; bug is localized.
+
 ## [0.5.0] — 2026-05-10
 
 **Federation read primitives — sections A/B/F/E.** Closes the lens-bleeding

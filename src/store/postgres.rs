@@ -3140,6 +3140,33 @@ impl crate::read::ReadEngine for PostgresBackend {
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
+        // v0.5.1 (CIRISPersist#24) — NULL-safety on the SUM aggregates.
+        //
+        // This main SELECT runs without GROUP BY, so when the input
+        // `per_trace` CTE is empty (the agent has zero rows in
+        // [since, until)), Postgres still produces ONE result row but
+        // every SUM(CASE WHEN ...) returns NULL (per the SQL spec:
+        // SUM over an empty set is NULL; COUNT is 0).
+        //
+        // Pre-v0.5.1 the Rust read SUM-derived columns as `i64` (not
+        // `Option<i64>`), causing `Row::get::<_, i64>` to panic on
+        // NULL → PyO3 propagated the panic as `Fatal Python error:
+        // Aborted` → SIGABRT killed every uvicorn worker in parallel
+        // from concurrent §E baseline calls. Production wedge
+        // 2026-05-11 15:09–15:59 UTC. (The SIGABRT-not-PyErr
+        // behavior is from `panic = "abort"` in our release profile;
+        // v0.5.2 lifts that constraint per the hardening track.)
+        //
+        // Belt-and-braces: COALESCE at the SQL layer (data-layer fix
+        // — future query edits keep the contract co-located with
+        // the SUM) AND `try_get<Option<i64>>` at the Rust layer
+        // (defense-in-depth — a future SQL edit that drops a
+        // COALESCE surfaces as a typed backend error, lens 500, not
+        // a Rust panic).
+        //
+        // COUNT(*) and GREATEST(...)::bigint stay un-COALESCE'd:
+        // SQL semantics guarantee non-NULL on empty input (COUNT → 0,
+        // GREATEST → 0 by the literal).
         let main = client
             .query_one(
                 "WITH per_trace AS ( \
@@ -3165,14 +3192,16 @@ impl crate::read::ReadEngine for PostgresBackend {
                  SELECT \
                     COUNT(*)::bigint AS trace_count, \
                     GREATEST(COUNT(DISTINCT agent_name) - 1, 0)::bigint AS identity_changes, \
-                    SUM(CASE WHEN was_overridden THEN 1 ELSE 0 END)::bigint \
+                    COALESCE(SUM(CASE WHEN was_overridden THEN 1 ELSE 0 END), 0)::bigint \
                       AS conscience_overrides, \
-                    SUM(CASE WHEN has_audit_seq THEN 1 ELSE 0 END)::bigint \
+                    COALESCE(SUM(CASE WHEN has_audit_seq THEN 1 ELSE 0 END), 0)::bigint \
                       AS audit_chain_total, \
-                    SUM(CASE WHEN has_audit_sig THEN 1 ELSE 0 END)::bigint \
+                    COALESCE(SUM(CASE WHEN has_audit_sig THEN 1 ELSE 0 END), 0)::bigint \
                       AS audit_signed_total, \
-                    SUM(CASE WHEN conscience_failed AND action_succeeded THEN 1 ELSE 0 END) \
-                      ::bigint AS unsafe_action_count \
+                    COALESCE( \
+                      SUM(CASE WHEN conscience_failed AND action_succeeded THEN 1 ELSE 0 END), \
+                      0 \
+                    )::bigint AS unsafe_action_count \
                  FROM per_trace",
                 &[&agent_id_hash, &window.since, &window.until],
             )
@@ -3183,10 +3212,25 @@ impl crate::read::ReadEngine for PostgresBackend {
 
         let trace_count: i64 = main.get("trace_count");
         let identity_changes: i64 = main.get("identity_changes");
-        let conscience_overrides: i64 = main.get("conscience_overrides");
-        let audit_chain_total: i64 = main.get("audit_chain_total");
-        let audit_signed_total: i64 = main.get("audit_signed_total");
-        let unsafe_action_count: i64 = main.get("unsafe_action_count");
+        // Defense-in-depth on the COALESCE'd columns: `try_get<Option<i64>>`
+        // so a future SQL edit that drops a COALESCE surfaces as a
+        // typed Backend error instead of a Rust panic.
+        let conscience_overrides: i64 = main
+            .try_get::<_, Option<i64>>("conscience_overrides")
+            .map_err(|e| crate::read::Error::Backend(format!("conscience_overrides decode: {e}")))?
+            .unwrap_or(0);
+        let audit_chain_total: i64 = main
+            .try_get::<_, Option<i64>>("audit_chain_total")
+            .map_err(|e| crate::read::Error::Backend(format!("audit_chain_total decode: {e}")))?
+            .unwrap_or(0);
+        let audit_signed_total: i64 = main
+            .try_get::<_, Option<i64>>("audit_signed_total")
+            .map_err(|e| crate::read::Error::Backend(format!("audit_signed_total decode: {e}")))?
+            .unwrap_or(0);
+        let unsafe_action_count: i64 = main
+            .try_get::<_, Option<i64>>("unsafe_action_count")
+            .map_err(|e| crate::read::Error::Backend(format!("unsafe_action_count decode: {e}")))?
+            .unwrap_or(0);
         let unsafe_action_rate = if trace_count > 0 {
             unsafe_action_count as f64 / trace_count as f64
         } else {
@@ -3958,6 +4002,7 @@ fn row_to_calibration_bundle(r: tokio_postgres::Row) -> crate::derived::Calibrat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use std::env;
 
     fn pg_dsn() -> Option<String> {
@@ -5327,6 +5372,113 @@ mod tests {
         let recovery = &agg.recovery_events[0];
         assert!(recovery.override_trace_id.contains("§e"));
         assert!(recovery.recovery_latency_seconds >= 0.0);
+    }
+
+    /// §E REGRESSION (v0.5.1 / CIRISPersist#24): `aggregate_scoring_factors`
+    /// with an empty window MUST NOT panic. Pre-fix the SUM(CASE WHEN ...)
+    /// aggregates returned NULL from an empty CTE, `Row::get::<_, i64>`
+    /// panicked on the NULL, PyO3 propagated as `Fatal Python error:
+    /// Aborted` → SIGABRT → every uvicorn worker died in parallel from
+    /// concurrent §E baseline calls (prod wedge 2026-05-11 15:09-15:59
+    /// UTC).
+    ///
+    /// Fix: COALESCE(SUM(...), 0) at the SQL layer + `try_get<Option<i64>>`
+    /// at the Rust layer (belt-and-braces). This test exercises the
+    /// empty-window code path explicitly; if it regresses, the test
+    /// will panic with the same signature as prod did.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_e_aggregate_scoring_factors_empty_window_does_not_panic() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        use crate::read::ReadEngine;
+        // Agent that doesn't exist + window in the far past = empty CTE
+        // = SUM returns NULL = pre-fix Row::get panics.
+        let aid = format!("agent-§e-empty-{}", uuid_like());
+        let window = crate::read::TimeWindow {
+            since: chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap(),
+            until: chrono::Utc.with_ymd_and_hms(2020, 1, 2, 0, 0, 0).unwrap(),
+        };
+
+        let agg = backend
+            .aggregate_scoring_factors(&aid, window, None)
+            .await
+            .expect("MUST NOT panic on empty window");
+
+        // Empty-window results: all counts are 0, all rates are 0.0,
+        // all series/event lists are empty.
+        assert_eq!(agg.agent_id_hash, aid);
+        assert_eq!(agg.trace_count, 0);
+        assert_eq!(agg.identity_changes, 0);
+        assert_eq!(agg.conscience_overrides, 0);
+        assert_eq!(agg.audit_chain_total, 0);
+        assert_eq!(agg.audit_chain_gaps, 0);
+        assert_eq!(agg.audit_signed_total, 0);
+        assert!((agg.unsafe_action_rate - 0.0).abs() < 1e-9);
+        assert!(agg.recovery_events.is_empty());
+        assert!(agg.coherence_decay_series.is_empty());
+        assert!(agg.drift_z_score.is_none());
+        assert!(agg.calibration_error.is_none());
+    }
+
+    /// §E REGRESSION (v0.5.1 / CIRISPersist#24): same as above but with
+    /// a baseline_window also empty. Pre-fix the baseline → main flow
+    /// was the exact path that crashed prod (`?hours=24&baseline_hours=168`
+    /// where the baseline window had no traces for Scout).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_e_aggregate_scoring_factors_empty_baseline_does_not_panic() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        use crate::read::ReadEngine;
+        let suffix = uuid_like();
+        let aid = format!("agent-§e-emptybase-{suffix}");
+        let now = chrono::Utc::now();
+
+        // Main window: has traces. Baseline window: empty (sparse-
+        // baseline agent like Scout in prod).
+        insert_section_a_fixture_trace(
+            &backend,
+            &format!("trace-§e-emptybase-{suffix}"),
+            &aid,
+            Some(&aid),
+            Some("d"),
+            now,
+            false,
+            0.5,
+            0.5,
+            1.0,
+        )
+        .await;
+        let window = crate::read::TimeWindow {
+            since: now - chrono::Duration::hours(1),
+            until: now + chrono::Duration::hours(1),
+        };
+        let baseline = crate::read::TimeWindow {
+            since: chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap(),
+            until: chrono::Utc.with_ymd_and_hms(2020, 1, 2, 0, 0, 0).unwrap(),
+        };
+
+        let agg = backend
+            .aggregate_scoring_factors(&aid, window, Some(baseline))
+            .await
+            .expect("MUST NOT panic on empty baseline");
+
+        // Main window has data.
+        assert_eq!(agg.trace_count, 1);
+        // Baseline has no samples → drift_z_score is None (the
+        // temporal_drift result has no row for csdma).
+        assert!(agg.drift_z_score.is_none());
     }
 
     /// §E aggregate_scoring_factors_batch — empty input returns empty
