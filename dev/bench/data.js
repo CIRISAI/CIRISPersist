@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778533597455,
+  "lastUpdate": 1778539888075,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -7937,6 +7937,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 24112408,
             "range": "± 303156",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "96452270b8b86a302c6333009d8a3d5d6894ccd5",
+          "message": "0.5.4 — CIRISPersist#28 sweep completion + #29 Python regression test\n\nFinishes the panic-isolation track v0.5.3 started. v0.5.3 hardened\nthe v0.5.0 ReadEngine surface (the realized CIRISPersist#24 incident\npath); v0.5.4 sweeps the remainder + adds the end-to-end regression\ntest the v0.5.3 hardening lacked.\n\n#28 part 1 — PgRowExt extension + full postgres sweep.\n\nPgRowExt generalized:\n  - safe_get<T, I>          — RowIndex (column name OR position)\n  - safe_get_with<T,I,E,F>  — F: FnOnce(String) -> E so non-ReadEngine\n                              layers route NULL into their own\n                              Error::Backend variant.\n\nEvery bare Row::get in src/store/postgres.rs swept (~75 additional\nsites). Federation directory decoders (pg_row_to_key_record /\n_attestation / _revocation) lifted from infallible to Result; call\nsites collect via ::<Result<Vec<_>, _>>(). pg_row_to_event_row,\npg_row_to_outbound_row, list_hybrid_pending_*, lookup_public_key,\nsample_public_keys, delete_traces_for_agent, enqueue_outbound,\nmark_transport_failed, count_traces, count_overrides,\ncount_identity_changes, aggregate_audit_chain all swept.\n\nSQLite path exempt by construction — rusqlite::Row::get already\nreturns Result on NULL (not the tokio_postgres panic class).\n\nCI gate: scripts/hooks/pre-commit now rejects bare row.get( / .get::<\npatterns in src/store/postgres.rs at commit time. Regression class\ncan't sneak back in.\n\n#28 part 2 — FFI catch_panic sweep.\n\nv0.5.3 wrapped 13 v0.5.0 ReadEngine PyO3 methods. v0.5.4 wraps the\nremaining 53 pre-v0.5.0 entry points (federation directory writers,\noutbound queue ops, derived-schema CRUD, verify primitives,\ncanonicalization helpers, steward signing, debug methods). Every\nPyO3 method on PyEngine (~70 entry points) now routes panic through\nthe explicit catch_panic wrapper, converting PanicException\n(BaseException) into LensQueryError (Exception). Wrap applied via\na deterministic brace-depth scan (no proc-macro infra introduced).\n\n#29 — Python regression test gate.\n\nNew feature: test-panic = [] in Cargo.toml. With it on, a\nmodule-level #[pyfunction] _test_inject_panic bypasses Engine\nconstruction (no postgres/keyring setup) and panics inside\ncatch_panic. Release wheels don't compile it in.\n\ntests/python/test_catch_panic.py (5 tests):\n  1. LensQueryError exported and subclasses Exception\n  2. Panic surfaces as LensQueryError, message preserved\n  3. `except Exception:` catches it — the CIRISPersist#24 wedge\n     shape, now regression-tested\n  4. Converted error is NOT a pyo3.exceptions.PanicException\n  5. Module survives N panics; non-panic calls still work after\n\nLensQueryError re-exported via python/ciris_persist/__init__.py for\nconsumer ergonomics. pyproject.toml grows [tool.pytest.ini_options].\n.github/workflows/ci.yml's linux-x86_64 job appends maturin develop\n--features test-panic,pyo3 + pytest tests/python/.\n\nLocal validation: 5/5 tests pass against maturin-develop build.\n205 lib tests still green.\n\nThreat model: no new vector — v0.5.4 closes the carve-out in\nv0.5.3's §3.13 (\"pre-v0.5.0 sites tracked in #28\") without\nmodifying AV-44. §9 header unchanged at v0.5.3.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-11T17:43:14-05:00",
+          "tree_id": "677a39d03e60453fa68acc074acc494c12366b6b",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/96452270b8b86a302c6333009d8a3d5d6894ccd5"
+        },
+        "date": 1778539887728,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 104174,
+            "range": "± 1186",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 245583,
+            "range": "± 14901",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 527582,
+            "range": "± 1346",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1866936,
+            "range": "± 23900",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 349,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1515,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7983,
+            "range": "± 200",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21219,
+            "range": "± 220",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24286,
+            "range": "± 99",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83602,
+            "range": "± 276",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 377,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3305,
+            "range": "± 45",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9592,
+            "range": "± 129",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42784,
+            "range": "± 471",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2351207,
+            "range": "± 63176",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6740503,
+            "range": "± 134800",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 24195205,
+            "range": "± 319460",
             "unit": "ns/iter"
           }
         ]
