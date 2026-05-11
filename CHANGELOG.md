@@ -5,6 +5,174 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.5.3] — 2026-05-11
+
+**Panic-isolation hardening track + verify deps v2.0.1 → v2.0.2.**
+Three orthogonal layers of defense against the failure class that
+caused CIRISPersist#24's prod wedge. Closes
+[CIRISPersist#25](https://github.com/CIRISAI/CIRISPersist/issues/25)
++ [#26](https://github.com/CIRISAI/CIRISPersist/issues/26)
++ [#27](https://github.com/CIRISAI/CIRISPersist/issues/27).
+
+### Phase 1 — `panic = "abort"` → `"unwind"` (CIRISPersist#25)
+
+`Cargo.toml` `[profile.release]`:
+
+```diff
+-panic = "abort"
++panic = "unwind"
+```
+
+The original v0.1.x argument (SECURITY_AUDIT_v0.1.2.md §4.2) was
+"abort fast so supervisor restart kicks in." That was correct for
+the standalone-bin shape; the v0.5.x cdylib-in-uvicorn shape
+inverts the trade-off — `abort()` short-circuits PyO3's
+panic-catching trampoline (pyo3#797), so the prod wedge SIGABRT'd
+every uvicorn worker in parallel from concurrent §E baseline
+calls. `unwind` lets the trampoline catch panics as
+`PanicException`. ~3-5% release-binary size cost from unwind
+tables.
+
+Full reframing rationale in `Cargo.toml`'s `[profile.release]`
+comment + `THREAT_MODEL.md` §3.13 (new section) + AV-44 (new).
+
+### Phase 2 — `PgRowExt::safe_get` + ReadEngine sweep (CIRISPersist#26)
+
+`tokio_postgres::Row::get::<_, T>` panics when the column is NULL
+and `T: FromSql` doesn't accept NULL. New `PgRowExt` trait wraps
+`try_get` with a typed `Backend` error mapping that names the
+column:
+
+```rust
+trait PgRowExt {
+    fn safe_get<'a, T>(&'a self, col: &str) -> Result<T, crate::read::Error>
+    where T: tokio_postgres::types::FromSql<'a>;
+}
+```
+
+Every `Row::get(col)` in the v0.5.0 ReadEngine impl + decode
+helpers (`pg_row_to_trace_summary`, `pg_row_to_llm_call_row`)
+swept to `row.safe_get(col)?`. ~80 sites. Now a NULL surfaces as
+HTTP 500 with `decode column <name>: <error>` instead of a Rust
+panic.
+
+Sweep scope (intentional): v0.5.0 read primitives only — that's
+where the realized bug (CIRISPersist#24) happened, and where the
+JSONB-extracting SUM-CASE patterns recur. Pre-v0.5.0 sites
+(decompose, federation directory, outbound queue, derived put
+paths) shipped stably without a realized panic; **CIRISPersist#28**
+tracks completing the full crate-wide sweep in v0.5.4. Phase 3
+(below) catches any missed sites defensively.
+
+### Phase 3 — `LensQueryError` + `catch_panic` wrapper (CIRISPersist#27)
+
+PyO3's built-in trampoline (now firing under `panic=unwind` from
+Phase 1) raises `pyo3.exceptions.PanicException` — a Python
+**BaseException** subclass. uvicorn's `try: except Exception:`
+request-handler error path **doesn't catch BaseException**, so a
+caught panic still escapes to uvicorn's outer handler — recoverable
+but ugly (stack-trace dump, request fails with non-standard error
+class).
+
+New typed exception `cirislens_persist.LensQueryError(Exception)`
++ `catch_panic` helper at `src/ffi/pyo3.rs`:
+
+```rust
+pyo3::create_exception!(
+    ciris_persist,
+    LensQueryError,
+    pyo3::exceptions::PyException  // derives from Exception, NOT BaseException
+);
+
+fn catch_panic<F, R>(f: F) -> PyResult<R>
+where F: FnOnce() -> PyResult<R> {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        Err(payload) => {
+            let msg = panic_payload_to_string(payload);
+            tracing::error!(panic = %msg, "PyO3 catch_panic caught Rust panic");
+            Err(PyErr::new::<LensQueryError, _>(format!("rust_panic: {msg}")))
+        }
+    }
+}
+```
+
+All 13 v0.5.0 ReadEngine PyO3 methods wrapped:
+- `list_trace_summaries`, `get_trace_summary` (§A)
+- `get_trace_detail` (§B)
+- `cross_agent_divergence`, `temporal_drift`, `hash_chain_gaps`,
+  `conscience_override_rates` (§F)
+- `aggregate_scoring_factors`, `aggregate_scoring_factors_batch`,
+  `count_traces`, `count_overrides`, `count_identity_changes`,
+  `aggregate_audit_chain` (§E)
+
+Now a Rust panic in any of those methods → `LensQueryError` →
+caught by `try: except Exception:` in uvicorn → clean HTTP 500.
+Pre-v0.5.0 methods (`put_public_key`, `put_attestation`, derived
+schema CRUD, outbound queue ops) still rely on PyO3's built-in
+trampoline (raising `PanicException` / BaseException);
+CIRISPersist#28 tracks completing the explicit-wrap sweep.
+
+### Verify deps v2.0.1 → v2.0.2
+
+Three tag bumps: `ciris-keyring` + `ciris-verify-core` +
+`ciris-crypto` to `v2.0.2`. v2.0.2 closed the
+`ml-dsa → pkcs8 = "^0.11.0-rc.11"` caret-range hazard that broke
+v2.0.0's and v2.0.1's fresh-resolve (CIRISVerify#18). v2.0.2 pins
+`pkcs8` exact at the federation-crypto-authority layer; ml-dsa's
+deeper transitives now resolve cleanly.
+
+### Three-layer defense matrix (post-v0.5.3)
+
+| Layer | Mechanism | What it catches |
+|---|---|---|
+| SQL → Rust | `PgRowExt::safe_get` (try_get + Option-aware) | NULL surfaces as `None` at decode, before panic candidates form |
+| Rust → FFI | `panic = "unwind"` in release profile | PyO3 trampoline catches Rust panics as `PanicException` (BaseException) |
+| FFI → Python | `catch_panic(AssertUnwindSafe(...))` per `#[pyfunction]` | Converts caught panic to typed `LensQueryError(Exception)`; uvicorn catches as 500 |
+
+After v0.5.3: a single bad row / bad query at any layer triggers
+HTTP 500 from lens, not a worker outage. The CIRISPersist#24
+failure class is closed.
+
+### Threat model
+
+- `THREAT_MODEL.md §3.13` (new section) — panic-isolation posture,
+  reframing of `panic = "abort"` rationale for v0.5.x cdylib shape.
+- `THREAT_MODEL.md` summary table: **AV-44 added** — Rust panic
+  escalates to process abort; three-layer mitigation documented.
+- `§9 Threat Posture Summary` header bumped v0.5.0 → v0.5.3;
+  17 vectors closed across v0.2.0..v0.5.3 (added AV-44).
+
+### Tests
+
+205 lib tests pass (no new tests in this release — Phase 1 + Phase
+2 + Phase 3 are structural defense layers; CIRISPersist#24's
+empty-window regression test from v0.5.1 + the v0.5.0 19-test
+integration suite continue to pass through all three changes).
+
+Phase 3 doesn't add an automated panic-injection regression test
+(that requires Python-side fixture infrastructure we don't yet
+have); a follow-up CIRISPersist#29 will add one when the
+maturin-wheel CI grows the Python-test infrastructure.
+
+### Out of scope (deferred)
+
+- **CIRISPersist#28** — Complete the `safe_get` sweep + `catch_panic`
+  wrap for pre-v0.5.0 PyO3 methods (federation directory, derived
+  schemas, outbound queue, ingest pipeline). Pre-v0.5.0 sites have
+  shipped stably for many releases; the v0.5.3 catch_unwind via
+  PyO3's built-in trampoline catches any panic there as
+  `PanicException` (BaseException) — bounded but ugly. v0.5.4
+  completes the typed-Exception conversion crate-wide.
+- **CIRISPersist#29** — Python-side panic-injection regression
+  test (requires maturin-wheel test infrastructure).
+- **v0.5.4 P1** — sqlfluff CI rule banning bare `SUM(` / `AVG(`
+  without `COALESCE` (per the research agent's findings on
+  CIRISPersist#24).
+- **v0.5.4 P1** — Per-worker panic budget + circuit breaker
+  (Cloudflare `workers-rs` poisoned-instance pattern).
+
 ## [0.5.2] — 2026-05-11
 
 **Bump CIRISVerify deps v1.13.2 → v2.0.0 — fixes CI break from

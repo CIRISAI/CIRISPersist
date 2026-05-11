@@ -2270,7 +2270,7 @@ fn pg_row_to_llm_call_row(
 ) -> Result<crate::store::types::TraceLlmCallRow, crate::read::Error> {
     use crate::schema::{LlmCallStatus, ReasoningEventType};
 
-    let parent_event_type_str: String = row.get("parent_event_type");
+    let parent_event_type_str: String = row.safe_get("parent_event_type")?;
     let parent_event_type =
         ReasoningEventType::from_wire_str(&parent_event_type_str).ok_or_else(|| {
             crate::read::Error::Backend(format!(
@@ -2278,7 +2278,7 @@ fn pg_row_to_llm_call_row(
             ))
         })?;
 
-    let status_str: String = row.get("status");
+    let status_str: String = row.safe_get("status")?;
     let status = match status_str.as_str() {
         "ok" => LlmCallStatus::Ok,
         "timeout" => LlmCallStatus::Timeout,
@@ -2293,45 +2293,85 @@ fn pg_row_to_llm_call_row(
         }
     };
 
-    let parent_attempt_index_i32: i32 = row.get("parent_attempt_index");
+    let parent_attempt_index_i32: i32 = row.safe_get("parent_attempt_index")?;
     let parent_attempt_index = u32::try_from(parent_attempt_index_i32).map_err(|_| {
         crate::read::Error::Backend(format!(
             "parent_attempt_index {parent_attempt_index_i32} negative"
         ))
     })?;
-    let attempt_index_i32: i32 = row.get("attempt_index");
+    let attempt_index_i32: i32 = row.safe_get("attempt_index")?;
     let attempt_index = u32::try_from(attempt_index_i32).map_err(|_| {
         crate::read::Error::Backend(format!("attempt_index {attempt_index_i32} negative"))
     })?;
 
     Ok(crate::store::types::TraceLlmCallRow {
-        trace_id: row.get("trace_id"),
-        thought_id: row.get("thought_id"),
-        task_id: row.get("task_id"),
-        parent_event_id: row.get("parent_event_id"),
+        trace_id: row.safe_get("trace_id")?,
+        thought_id: row.safe_get("thought_id")?,
+        task_id: row.safe_get("task_id")?,
+        parent_event_id: row.safe_get("parent_event_id")?,
         parent_event_type,
         parent_attempt_index,
         attempt_index,
-        ts: row.get("ts"),
-        duration_ms: row.get("duration_ms"),
-        handler_name: row.get("handler_name"),
-        service_name: row.get("service_name"),
-        model: row.get("model"),
-        base_url: row.get("base_url"),
-        response_model: row.get("response_model"),
-        prompt_tokens: row.get("prompt_tokens"),
-        completion_tokens: row.get("completion_tokens"),
-        prompt_bytes: row.get("prompt_bytes"),
-        completion_bytes: row.get("completion_bytes"),
-        cost_usd: row.get("cost_usd"),
+        ts: row.safe_get("ts")?,
+        duration_ms: row.safe_get("duration_ms")?,
+        handler_name: row.safe_get("handler_name")?,
+        service_name: row.safe_get("service_name")?,
+        model: row.safe_get("model")?,
+        base_url: row.safe_get("base_url")?,
+        response_model: row.safe_get("response_model")?,
+        prompt_tokens: row.safe_get("prompt_tokens")?,
+        completion_tokens: row.safe_get("completion_tokens")?,
+        prompt_bytes: row.safe_get("prompt_bytes")?,
+        completion_bytes: row.safe_get("completion_bytes")?,
+        cost_usd: row.safe_get("cost_usd")?,
         status,
-        error_class: row.get("error_class"),
-        attempt_count: row.get("attempt_count"),
-        retry_count: row.get("retry_count"),
-        prompt_hash: row.get("prompt_hash"),
-        prompt: row.get("prompt"),
-        response_text: row.get("response_text"),
+        error_class: row.safe_get("error_class")?,
+        attempt_count: row.safe_get("attempt_count")?,
+        retry_count: row.safe_get("retry_count")?,
+        prompt_hash: row.safe_get("prompt_hash")?,
+        prompt: row.safe_get("prompt")?,
+        response_text: row.safe_get("response_text")?,
     })
+}
+
+// ─── PgRowExt — NULL-safe row decode helper (v0.5.3, CIRISPersist#26)
+//
+// `tokio_postgres::Row::get::<_, T>` panics when the column is NULL
+// and `T: FromSql` doesn't accept NULL (i.e. T is not `Option<_>`).
+// Pre-v0.5.3 every `row.get(col)` in this file was a latent panic
+// site; CIRISPersist#24 realized one (SUM-on-empty-CTE → NULL → panic
+// → SIGABRT cascade across uvicorn workers).
+//
+// `PgRowExt::safe_get` wraps `try_get` with a typed Backend error
+// mapping. Panics become `read::Error::Backend(...)` — lens HTTP 500
+// instead of process abort. The error message names the column so
+// future operators can triage without source-diving.
+//
+// Sweep scope (v0.5.3): the v0.5.0 ReadEngine impl + its decode
+// helpers (pg_row_to_trace_summary, pg_row_to_llm_call_row). The
+// pre-v0.5.0 sites (decompose, federation directory, outbound queue,
+// derived put paths) are tracked in CIRISPersist#28 — they've shipped
+// stably without a realized panic, but the v0.5.3 catch_unwind layer
+// (CIRISPersist#27) catches any future regression defensively until
+// the full sweep lands.
+
+trait PgRowExt {
+    /// Decode a column with typed-error propagation on failure.
+    /// Replaces `Row::get(col)`'s panic-on-NULL behavior with a
+    /// `read::Error::Backend` that names the column.
+    fn safe_get<'a, T>(&'a self, col: &str) -> Result<T, crate::read::Error>
+    where
+        T: tokio_postgres::types::FromSql<'a>;
+}
+
+impl PgRowExt for tokio_postgres::Row {
+    fn safe_get<'a, T>(&'a self, col: &str) -> Result<T, crate::read::Error>
+    where
+        T: tokio_postgres::types::FromSql<'a>,
+    {
+        self.try_get(col)
+            .map_err(|e| crate::read::Error::Backend(format!("decode column {col}: {e}")))
+    }
 }
 
 // ─── ReadEngine impl (v0.5.0, CIRISPersist#23) ─────────────────────
@@ -2398,53 +2438,60 @@ const TRACE_SUMMARY_SELECT: &str = "\
 /// [`crate::read::TraceSummary`]. Trace-level (`trace_level` column
 /// is `TEXT` in V001 — converted via `serde_json::from_str` on the
 /// quoted token).
+///
+/// v0.5.3 (CIRISPersist#26) — every column read goes through
+/// `PgRowExt::safe_get` so a NULL-on-deserialize becomes a typed
+/// `read::Error::Backend` (HTTP 500), not a process-aborting panic.
+/// Option-typed fields tolerate NULL natively (Option<T>: FromSql
+/// accepts NULL → None); non-Option fields surface the NULL as an
+/// error with the offending column name.
 fn pg_row_to_trace_summary(
     row: &tokio_postgres::Row,
 ) -> Result<crate::read::TraceSummary, crate::read::Error> {
     use crate::schema::TraceLevel;
-    let trace_level_str: String = row.get("trace_level");
-    // TraceLevel is `#[serde(rename_all = "snake_case")]`; the column
-    // stores the unquoted enum token.
+    let trace_level_str: String = row.safe_get("trace_level")?;
     let trace_level: TraceLevel = serde_json::from_str(&format!("\"{trace_level_str}\""))
         .map_err(|e| crate::read::Error::Backend(format!("trace_level decode: {e}")))?;
 
     Ok(crate::read::TraceSummary {
-        trace_id: row.get("trace_id"),
-        thought_id: row.get("thought_id"),
-        task_id: row.get("task_id"),
-        agent_id_hash: row.get("agent_id_hash"),
-        agent_name: row.get("agent_name"),
-        agent_role: row.get("agent_role"),
-        deployment_domain: row.get("deployment_domain"),
-        deployment_type: row.get("deployment_type"),
-        started_at: row.get("started_at"),
-        completed_at: row.get("completed_at"),
+        trace_id: row.safe_get("trace_id")?,
+        thought_id: row.safe_get("thought_id")?,
+        task_id: row.safe_get("task_id")?,
+        agent_id_hash: row.safe_get("agent_id_hash")?,
+        agent_name: row.safe_get("agent_name")?,
+        agent_role: row.safe_get("agent_role")?,
+        deployment_domain: row.safe_get("deployment_domain")?,
+        deployment_type: row.safe_get("deployment_type")?,
+        started_at: row.safe_get("started_at")?,
+        completed_at: row.safe_get("completed_at")?,
         trace_level,
-        schema_version: row.get("schema_version"),
+        schema_version: row.safe_get("schema_version")?,
+        // BOOL_AND result may be NULL for an empty group; default to
+        // false for the safety property.
         signature_verified: row
-            .get::<_, Option<bool>>("signature_verified")
+            .safe_get::<Option<bool>>("signature_verified")?
             .unwrap_or(false),
-        cognitive_state: row.get("cognitive_state"),
-        thought_type: row.get("thought_type"),
-        thought_depth: row.get("thought_depth"),
-        csdma_plausibility_score: row.get("csdma_plausibility_score"),
-        dsdma_domain_alignment: row.get("dsdma_domain_alignment"),
-        dsdma_domain: row.get("dsdma_domain"),
-        idma_k_eff: row.get("idma_k_eff"),
-        idma_correlation_risk: row.get("idma_correlation_risk"),
-        idma_fragility_flag: row.get("idma_fragility_flag"),
-        idma_phase: row.get("idma_phase"),
-        conscience_passed: row.get("conscience_passed"),
-        action_was_overridden: row.get("action_was_overridden"),
-        entropy_passed: row.get("entropy_passed"),
-        coherence_passed: row.get("coherence_passed"),
-        optimization_veto_passed: row.get("optimization_veto_passed"),
-        epistemic_humility_passed: row.get("epistemic_humility_passed"),
-        selected_action: row.get("selected_action"),
-        action_success: row.get("action_success"),
-        llm_calls: row.get("llm_calls"),
-        tokens_total: row.get("tokens_total"),
-        cost_usd: row.get("cost_usd"),
+        cognitive_state: row.safe_get("cognitive_state")?,
+        thought_type: row.safe_get("thought_type")?,
+        thought_depth: row.safe_get("thought_depth")?,
+        csdma_plausibility_score: row.safe_get("csdma_plausibility_score")?,
+        dsdma_domain_alignment: row.safe_get("dsdma_domain_alignment")?,
+        dsdma_domain: row.safe_get("dsdma_domain")?,
+        idma_k_eff: row.safe_get("idma_k_eff")?,
+        idma_correlation_risk: row.safe_get("idma_correlation_risk")?,
+        idma_fragility_flag: row.safe_get("idma_fragility_flag")?,
+        idma_phase: row.safe_get("idma_phase")?,
+        conscience_passed: row.safe_get("conscience_passed")?,
+        action_was_overridden: row.safe_get("action_was_overridden")?,
+        entropy_passed: row.safe_get("entropy_passed")?,
+        coherence_passed: row.safe_get("coherence_passed")?,
+        optimization_veto_passed: row.safe_get("optimization_veto_passed")?,
+        epistemic_humility_passed: row.safe_get("epistemic_humility_passed")?,
+        selected_action: row.safe_get("selected_action")?,
+        action_success: row.safe_get("action_success")?,
+        llm_calls: row.safe_get("llm_calls")?,
+        tokens_total: row.safe_get("tokens_total")?,
+        cost_usd: row.safe_get("cost_usd")?,
     })
 }
 
@@ -2700,12 +2747,12 @@ impl crate::read::ReadEngine for PostgresBackend {
         // are per-trace constants by construction.
         let first = &event_rows[0];
         let envelope = crate::read::TraceEnvelopeRefs {
-            signature: first.get("signature"),
-            signature_key_id: first.get("signing_key_id"),
-            original_content_hash: first.get("original_content_hash"),
-            scrub_signature: first.get("scrub_signature"),
-            scrub_key_id: first.get("scrub_key_id"),
-            scrub_timestamp: first.get("scrub_timestamp"),
+            signature: first.safe_get("signature")?,
+            signature_key_id: first.safe_get("signing_key_id")?,
+            original_content_hash: first.safe_get("original_content_hash")?,
+            scrub_signature: first.safe_get("scrub_signature")?,
+            scrub_key_id: first.safe_get("scrub_key_id")?,
+            scrub_timestamp: first.safe_get("scrub_timestamp")?,
             pii_scrubbed: first
                 .get::<_, Option<bool>>("pii_scrubbed")
                 .unwrap_or(false),
@@ -2871,11 +2918,11 @@ impl crate::read::ReadEngine for PostgresBackend {
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             out.push(crate::read::DivergenceRow {
-                agent_id_hash: row.get("agent_id_hash"),
-                agent_name: row.get("agent_name"),
-                z_score: row.get::<_, f64>("z_score"),
+                agent_id_hash: row.safe_get("agent_id_hash")?,
+                agent_name: row.safe_get("agent_name")?,
+                z_score: row.safe_get::<f64>("z_score")?,
                 deviation_metric: metric,
-                sample_count: row.get::<_, i64>("sample_count"),
+                sample_count: row.safe_get::<i64>("sample_count")?,
             });
         }
         Ok(out)
@@ -2955,15 +3002,15 @@ impl crate::read::ReadEngine for PostgresBackend {
                 .await
                 .map_err(|e| crate::read::Error::Backend(format!("temporal_drift query: {e}")))?;
 
-            let bn: i64 = row.get("base_n");
-            let cn: i64 = row.get("comp_n");
+            let bn: i64 = row.safe_get("base_n")?;
+            let cn: i64 = row.safe_get("comp_n")?;
             if bn == 0 || cn == 0 {
                 continue;
             }
-            let bm: f64 = row.get::<_, Option<f64>>("base_m").unwrap_or(0.0);
-            let cm: f64 = row.get::<_, Option<f64>>("comp_m").unwrap_or(0.0);
-            let bv: f64 = row.get::<_, Option<f64>>("base_v").unwrap_or(0.0);
-            let cv: f64 = row.get::<_, Option<f64>>("comp_v").unwrap_or(0.0);
+            let bm: f64 = row.safe_get::<Option<f64>>("base_m")?.unwrap_or(0.0);
+            let cm: f64 = row.safe_get::<Option<f64>>("comp_m")?.unwrap_or(0.0);
+            let bv: f64 = row.safe_get::<Option<f64>>("base_v")?.unwrap_or(0.0);
+            let cv: f64 = row.safe_get::<Option<f64>>("comp_v")?.unwrap_or(0.0);
 
             let pooled_se = ((bv / (bn as f64).max(1.0)) + (cv / (cn as f64).max(1.0))).sqrt();
             let significance = if pooled_se > 0.0 {
@@ -3026,10 +3073,10 @@ impl crate::read::ReadEngine for PostgresBackend {
         for row in rows {
             out.push(crate::read::HashChainGap {
                 agent_id_hash: agent_id_hash.to_owned(),
-                gap_start_seq: row.get("prev_seq"),
-                gap_end_seq: row.get("seq"),
-                gap_start_ts: row.get("prev_ts"),
-                gap_end_ts: row.get("ts"),
+                gap_start_seq: row.safe_get("prev_seq")?,
+                gap_end_seq: row.safe_get("seq")?,
+                gap_start_ts: row.safe_get("prev_ts")?,
+                gap_end_ts: row.safe_get("ts")?,
             });
         }
         Ok(out)
@@ -3095,19 +3142,19 @@ impl crate::read::ReadEngine for PostgresBackend {
 
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            let override_rate: f64 = row.get("override_rate");
-            let domain_avg: f64 = row.get("domain_avg_rate");
+            let override_rate: f64 = row.safe_get("override_rate")?;
+            let domain_avg: f64 = row.safe_get("domain_avg_rate")?;
             let multiple = if domain_avg > 0.0 {
                 override_rate / domain_avg
             } else {
                 0.0
             };
             out.push(crate::read::OverrideRateRow {
-                agent_id_hash: row.get("agent_id_hash"),
-                agent_name: row.get("agent_name"),
-                deployment_domain: row.get("deployment_domain"),
-                override_count: row.get("override_count"),
-                trace_count: row.get("trace_count"),
+                agent_id_hash: row.safe_get("agent_id_hash")?,
+                agent_name: row.safe_get("agent_name")?,
+                deployment_domain: row.safe_get("deployment_domain")?,
+                override_count: row.safe_get("override_count")?,
+                trace_count: row.safe_get("trace_count")?,
                 override_rate,
                 domain_avg_rate: domain_avg,
                 multiple_of_domain_avg: multiple,
@@ -3210,8 +3257,8 @@ impl crate::read::ReadEngine for PostgresBackend {
                 crate::read::Error::Backend(format!("aggregate_scoring_factors main: {e}"))
             })?;
 
-        let trace_count: i64 = main.get("trace_count");
-        let identity_changes: i64 = main.get("identity_changes");
+        let trace_count: i64 = main.safe_get("trace_count")?;
+        let identity_changes: i64 = main.safe_get("identity_changes")?;
         // Defense-in-depth on the COALESCE'd columns: `try_get<Option<i64>>`
         // so a future SQL edit that drops a COALESCE surfaces as a
         // typed Backend error instead of a Rust panic.
@@ -3255,7 +3302,7 @@ impl crate::read::ReadEngine for PostgresBackend {
             )
             .await
             .map_err(|e| crate::read::Error::Backend(format!("audit_chain_gaps count: {e}")))?;
-        let audit_chain_gaps: i64 = gaps_row.get("gap_count");
+        let audit_chain_gaps: i64 = gaps_row.safe_get("gap_count")?;
 
         // Recovery events: top 50 most-recent override → next-pass pairs.
         let recovery_rows = client
@@ -3303,11 +3350,11 @@ impl crate::read::ReadEngine for PostgresBackend {
             Vec::with_capacity(recovery_rows.len());
         for row in recovery_rows {
             recovery_events.push(crate::read::RecoveryEvent {
-                override_trace_id: row.get("override_trace_id"),
-                override_at: row.get("override_at"),
-                recovery_trace_id: row.get("recovery_trace_id"),
-                recovery_at: row.get("recovery_at"),
-                recovery_latency_seconds: row.get("recovery_latency_seconds"),
+                override_trace_id: row.safe_get("override_trace_id")?,
+                override_at: row.safe_get("override_at")?,
+                recovery_trace_id: row.safe_get("recovery_trace_id")?,
+                recovery_at: row.safe_get("recovery_at")?,
+                recovery_latency_seconds: row.safe_get("recovery_latency_seconds")?,
             });
         }
 
@@ -3346,11 +3393,11 @@ impl crate::read::ReadEngine for PostgresBackend {
         let mut coherence_decay_series: Vec<crate::read::CoherencePoint> =
             Vec::with_capacity(decay_rows.len());
         for row in decay_rows {
-            let tc: i64 = row.get("trace_count");
-            let pc: i64 = row.get("coherence_passed_count");
+            let tc: i64 = row.safe_get("trace_count")?;
+            let pc: i64 = row.safe_get("coherence_passed_count")?;
             let pass_rate = if tc > 0 { pc as f64 / tc as f64 } else { 0.0 };
             coherence_decay_series.push(crate::read::CoherencePoint {
-                at: row.get("bucket_at"),
+                at: row.safe_get("bucket_at")?,
                 coherence_passed_count: pc,
                 trace_count: tc,
                 coherence_pass_rate: pass_rate,
@@ -3534,9 +3581,9 @@ impl crate::read::ReadEngine for PostgresBackend {
             .map_err(|e| {
                 crate::read::Error::Backend(format!("aggregate_audit_chain totals: {e}"))
             })?;
-        let audit_total: i64 = row.get("audit_total");
-        let audit_signed: i64 = row.get("audit_signed");
-        let audit_hashed: i64 = row.get("audit_hashed");
+        let audit_total: i64 = row.safe_get("audit_total")?;
+        let audit_signed: i64 = row.safe_get("audit_signed")?;
+        let audit_hashed: i64 = row.safe_get("audit_hashed")?;
 
         let gap_count = if filter.agent_id_hash.is_some() {
             let gaps_sql = format!(

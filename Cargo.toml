@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -79,14 +79,14 @@ tls = ["dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-native-certs"]
 # ciris-crypto invariant (FSD §7.5a) means persist takes ZERO direct
 # deps on AES-GCM/PBKDF2/HKDF/HMAC primitive crates ever — the
 # `src/secrets/crypto.rs` facade lands as a single import-site change.
-ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.0.0", version = "2", features = ["pqc-ml-dsa"] }
-ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.0.0", version = "2" }
+ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.0.2", version = "2", features = ["pqc-ml-dsa"] }
+ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.0.2", version = "2" }
 # v0.3.6 (CIRISPersist#14) — direct ciris-crypto dep for HybridVerifier
 # in `Engine.verify_hybrid`. Same git source / tag as ciris-keyring +
 # ciris-verify-core so versions are workspace-coherent. Features
 # `ed25519` + `pqc-ml-dsa` light up the concrete Ed25519Verifier +
 # MlDsa65Verifier impls used by HybridVerifier::verify.
-ciris-crypto      = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.0.0", version = "2", features = ["ed25519", "pqc-ml-dsa"] }
+ciris-crypto      = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.0.2", version = "2", features = ["ed25519", "pqc-ml-dsa"] }
 async-trait   = "0.1"
 # v0.1.14 — filesystem advisory locks for the cohabitation
 # bootstrap (docs/COHABITATION.md). POSIX flock cross-process,
@@ -236,12 +236,37 @@ required-features = ["postgres"]
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
-# SECURITY_AUDIT_v0.1.2.md §4.2 — panic = "abort" so a bug in a
-# transitive dep or a future unwrap() we missed crashes the
-# process fast (supervisor restarts, journal-replay path runs).
-# Unwind into a half-shut state with no restart trigger is the
-# failure mode this prevents.
-panic = "abort"
+# v0.5.3 (CIRISPersist#25) — switched panic = "abort" → "unwind".
+#
+# The original v0.1.x audit argument (SECURITY_AUDIT_v0.1.2.md §4.2)
+# was: "panic = 'abort' so a bug in a transitive dep or a future
+# unwrap() we missed crashes the process fast (supervisor restarts,
+# journal-replay path runs). Unwind into a half-shut state with no
+# restart trigger is the failure mode this prevents."
+#
+# That was correct for the v0.1.x standalone-bin era — a panic
+# crashing the persist process triggers a supervisor restart and
+# the journal-replay path picks up where it left off.
+#
+# v0.5.x runs as a PyO3 cdylib loaded into long-lived uvicorn
+# workers. In that shape, `panic = "abort"` short-circuits PyO3's
+# panic-catching trampoline (pyo3#797) — the panic runtime calls
+# abort() before catch_unwind runs. Result: a single bad row /
+# bad query SIGABRT'd every uvicorn worker in parallel, taking
+# down /health itself (prod wedge 2026-05-11 / CIRISPersist#24).
+#
+# `panic = "unwind"` lets PyO3 catch the Rust panic and convert it
+# to PanicException (Python BaseException subclass). The lens still
+# crashes the offending request, but the worker pool survives.
+# v0.5.3 (CIRISPersist#27) adds an additional catch_unwind +
+# typed LensQueryError(Exception) layer on top so panics become
+# normal-Exception 500s, not BaseException worker-poisoners.
+#
+# Trade-off: ~3-5% larger release binary (unwind tables), no
+# realized ROP-via-landing-pads attack surface at the cdylib layer
+# (the original concern was for a standalone-bin attack surface).
+# See THREAT_MODEL.md §4.2 for the reframed posture.
+panic = "unwind"
 # SECURITY_AUDIT_v0.1.2.md §4.3 — overflow-checks=true on release
 # turns AV-17-class integer-truncation bugs into runtime panics
 # instead of silent corruption. Single-digit-percent perf cost;

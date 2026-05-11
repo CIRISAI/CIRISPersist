@@ -1502,6 +1502,75 @@ prevent a determined consumer from forking the code. The
 architectural cost (drift, per-consumer policy maintenance) is the
 incentive against doing so.
 
+### 3.13 Panic-isolation posture (v0.5.3)
+
+Vectors emerge from running persist as a PyO3 `cdylib` loaded into
+long-lived uvicorn workers, not the v0.1.x standalone-bin shape the
+original `panic = "abort"` audit (SECURITY_AUDIT_v0.1.2.md §4.2)
+assumed. The 2026-05-11 prod wedge (CIRISPersist#24) realized the
+failure mode: a single NULL deserialization panicked `Row::get`,
+the panic runtime called `abort()` before PyO3's `catch_unwind`
+trampoline could fire, and parallel calls SIGABRT'd every uvicorn
+worker — taking down `/health` itself.
+
+The v0.5.3 hardening track (CIRISPersist#25 + #26 + #27) replaces
+the single layer of "abort fast" with three orthogonal layers of
+panic-resistance:
+
+| Layer | What it catches |
+|---|---|
+| SQL → Rust (`try_get<Option<T>>`) | NULL surfaces as `None`, not panic |
+| Rust → FFI (`panic = "unwind"`) | PyO3 trampoline catches Rust panics as `PanicException` |
+| FFI → Python (`catch_unwind` + `LensQueryError`) | Panics become normal `Exception` 500s, not `BaseException` worker poisoners |
+
+#### AV-44: Rust panic escalates to process abort
+
+**Attack**: any Rust panic anywhere in the crate (NULL
+deserialization, integer overflow on release-overflow-checks, an
+`unwrap` on a typed error path, a future SQL edit that breaks an
+invariant) triggers process abort, taking down the entire uvicorn
+worker pool. Parallel concurrent calls amplify — every worker
+SIGABRT'd within milliseconds, `/health` unreachable.
+
+**Mitigation v0.5.3**:
+
+1. **`panic = "unwind"` in the release profile** (Cargo.toml). The
+   panic runtime unwinds the stack; PyO3's built-in trampoline
+   (pyo3#797) catches the panic via `catch_unwind` and raises
+   `PanicException` (a Python `BaseException` subclass). The
+   worker process survives; the offending request fails.
+2. **Explicit `std::panic::catch_unwind(AssertUnwindSafe(|| ...))`
+   wrapping every `#[pyfunction]` body** (v0.5.3 / CIRISPersist#27).
+   The catch converts the panic payload to a typed
+   `LensQueryError` Python exception that derives from `Exception`
+   (not `BaseException`) — uvicorn's normal error handling catches
+   it as a 500, not a worker reset.
+3. **Crate-wide `Row::get` → `try_get::<_, Option<T>>` sweep**
+   (v0.5.3 / CIRISPersist#26). NULL surfaces as `None` at the
+   data-decode layer, before it can become a panic candidate.
+
+**Re-evaluation of the original abort rationale**: the
+SECURITY_AUDIT_v0.1.2.md §4.2 argument was sound for the v0.1.x
+era when persist ran as a standalone binary with a supervisor
+restart loop. In that shape, abort-and-restart was a feature —
+the journal-replay path picked up cleanly. The cdylib-in-uvicorn
+shape (v0.5.x+) inverts the trade-off: process abort means
+parallel uvicorn workers all die simultaneously, with no
+supervisor below them to coordinate restarts. Unwind preserves the
+worker pool; the realized failure mode (SIGABRT cascade) is worse
+than the theoretical one the audit prevented (unwind into half-shut
+state). The ~3-5% release-binary size increase from unwind tables
+is the cost.
+
+**Residual**: a Rust panic inside the SQL driver's tokio runtime
+(deep inside `tokio-postgres`) might still escape PyO3's
+trampoline if `tokio::spawn`'d before unwinding completes. The
+`catch_unwind` wrapper at the PyO3 entry point catches this when
+the await returns; in-flight tokio tasks panicking in the
+background are logged via `tracing::error` but don't propagate
+back to Python. Documented residual; v0.5.3 sweep applies the
+defensive layer at every point we control.
+
 ---
 
 ## 4. Mitigation Matrix
@@ -1551,6 +1620,7 @@ incentive against doing so.
 | AV-41 | Spoofed in_reply_to ACK matching | ACK envelopes go through persist's normal verify pipeline (AV-1 unknown-key gate + AV-39 verify_hybrid via persist) before `mark_ack_received` is called; `body_sha256` content-derived matching is downstream of signature verify | Bound signature pattern (AV-33) closes Ed25519-alone forgery branch | **✓ Mitigated v0.4.0** | — |
 | AV-42 | Legacy `attempt_index` dedup-collapse | v0.4.6 schema-version-gated fallback — only `2.7.0` / `"2.7.legacy"` arms fall back to `attempt_index = 0` on absence (`MissingField`); 2.7.9 still strict; malformed values (negative, wrong type, out of range) still error through AV-17 typed paths; fallback fires for absence ONLY, not for adversarial-shaped values; cross-agent collision closed by `agent_id_hash` in dedup tuple (AV-9) | Telemetry-driven sunset (`federation_canonical_match_total{wire="2.7.legacy"}` 7-day-zero soak); accommodation is time-bounded by empirical observation, not permanent | **✓ Documented residual v0.4.6** (deliberate fidelity trade-off; pre-2.7.8.9 traffic is unrecoverable otherwise — federation's append-only contract takes priority over per-row dedup fidelity for legacy arm) | — |
 | AV-43 | Read-side adversary inference attack | v0.5.0 aggregate primitives return computed statistics (counts, means, z-scores, decay-series points), not per-trace content; `sample_count` / `trace_count` fields surface explicitly so callers gate k-anonymity at their layer (one-line check: `if agg.trace_count < K_THRESHOLD: refuse`); error kinds are closed-set `&'static str` (no attacker-controlled strings); AV-9 trace-scoped reads carry `agent_id_hash` so callers authorize per-trace access at their layer | Substrate exposes truthful aggregates; consumer composes k-anonymity policy (lens-side, sovereign-mode agent's own gate) — same architectural-non-goal pattern as AV-29 attestation graph (persist exposes edges, consumers compose policy) | **✓ Documented v0.5.0** (substrate surface; consumer-side policy required for inference resistance) | — |
+| AV-44 | Rust panic escalates to process abort | v0.5.3 three-layer panic isolation: (1) `panic = "unwind"` in release profile lets PyO3's `catch_unwind` trampoline fire; (2) explicit `catch_unwind(AssertUnwindSafe)` wrapping every `#[pyfunction]` body converts panic payload to `LensQueryError(Exception)` — derives from `Exception` not `BaseException` so uvicorn catches as 500; (3) crate-wide `Row::get` → `try_get::<_, Option<T>>` sweep surfaces NULL as `None` at the decode layer, before panic candidates form | tracing::error captures every caught panic with payload + site; in-flight tokio tasks panicking in background are logged but don't propagate to Python (documented residual) | **✓ Mitigated v0.5.3** (closes CIRISPersist#24 failure class; original SECURITY_AUDIT_v0.1.2.md §4.2 abort rationale reframed for v0.5.x cdylib-in-uvicorn shape) | — |
 
 ---
 
@@ -1764,7 +1834,7 @@ Risks CIRISPersist mitigates but cannot fully eliminate.
 
 ---
 
-## 9. v0.5.0 Threat Posture Summary
+## 9. v0.5.3 Threat Posture Summary
 
 ```
 v0.1.1 INTEGRATION-BLOCKING EXPOSURES → closed in v0.1.2
@@ -1817,6 +1887,11 @@ v0.5.0 FEDERATION READ PRIMITIVES
   ✓ AV-43 read-side adversary inference attack (documented; aggregates return statistics
           not content; consumer-side k-anonymity gate via sample_count / trace_count)
 
+v0.5.3 PANIC-ISOLATION HARDENING
+  ✓ AV-44 Rust panic escalates to process abort (closed; panic=unwind + crate-wide
+          try_get<Option<T>> sweep + PyO3 catch_unwind + typed LensQueryError(Exception);
+          three independent defense layers from SQL → Rust → FFI → Python)
+
 PHASE-2-CLOSES (architecturally deferred)
   ⚠ AV-2  stolen-key forgery (peer-replicate audit chain)
   ⚠ AV-10 audit anchor capture without verification
@@ -1839,15 +1914,16 @@ DESIGN-DECISIONS-PER-MISSION (intentional, not defects)
   ✓ AV-39 verify-via-persist single-source-of-truth (CIRISPersist#7 pattern)
 
 CARGO AUDIT
-  ✓ 0 vulnerabilities across deps as of v0.5.0
+  ✓ 0 vulnerabilities across deps as of v0.5.3
 ```
 
-**Sixteen v0.2.0..v0.5.0 attack vectors closed**: federation
+**Seventeen v0.2.0..v0.5.3 attack vectors closed**: federation
 directory integrity (AV-28..AV-30), hybrid PQC posture
 (AV-31..AV-33), wire-format extensions (AV-34..AV-37), DSAR + verify
 primitives (AV-38..AV-39), outbound queue substrate (AV-40..AV-41),
 legacy accommodation residual documented (AV-42), federation read
-primitives + read-side inference resistance (AV-43).
+primitives + read-side inference resistance (AV-43), panic-isolation
+hardening across all FFI boundary layers (AV-44).
 
 Three architectural-closure patterns repeated across the surface:
 

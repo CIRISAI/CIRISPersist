@@ -2535,26 +2535,28 @@ impl PyEngine {
         cursor_json: Option<&str>,
         limit: i64,
     ) -> PyResult<String> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
-            .map_err(|e| PyValueError::new_err(format!("TraceFilter JSON decode: {e}")))?;
-        let cursor: Option<crate::read::TraceCursor> = match cursor_json {
-            None => None,
-            Some(s) => Some(
-                serde_json::from_str(s)
-                    .map_err(|e| PyValueError::new_err(format!("TraceCursor JSON decode: {e}")))?,
-            ),
-        };
-        py.detach(move || {
-            runtime.block_on(async move {
-                use crate::read::ReadEngine;
-                let page = backend
-                    .list_trace_summaries(filter, cursor, limit)
-                    .await
-                    .map_err(read_err_to_py)?;
-                serde_json::to_string(&page)
-                    .map_err(|e| PyRuntimeError::new_err(format!("TraceListPage encode: {e}")))
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
+                .map_err(|e| PyValueError::new_err(format!("TraceFilter JSON decode: {e}")))?;
+            let cursor: Option<crate::read::TraceCursor> =
+                match cursor_json {
+                    None => None,
+                    Some(s) => Some(serde_json::from_str(s).map_err(|e| {
+                        PyValueError::new_err(format!("TraceCursor JSON decode: {e}"))
+                    })?),
+                };
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::read::ReadEngine;
+                    let page = backend
+                        .list_trace_summaries(filter, cursor, limit)
+                        .await
+                        .map_err(read_err_to_py)?;
+                    serde_json::to_string(&page)
+                        .map_err(|e| PyRuntimeError::new_err(format!("TraceListPage encode: {e}")))
+                })
             })
         })
     }
@@ -2562,22 +2564,24 @@ impl PyEngine {
     /// Single-trace summary lookup. Returns JSON-encoded
     /// `TraceSummary` or `None`.
     fn get_trace_summary(&self, py: Python<'_>, trace_id: &str) -> PyResult<Option<String>> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let trace_id = trace_id.to_owned();
-        py.detach(move || {
-            runtime.block_on(async move {
-                use crate::read::ReadEngine;
-                let opt = backend
-                    .get_trace_summary(&trace_id)
-                    .await
-                    .map_err(read_err_to_py)?;
-                match opt {
-                    None => Ok(None),
-                    Some(s) => Ok(Some(serde_json::to_string(&s).map_err(|e| {
-                        PyRuntimeError::new_err(format!("TraceSummary encode: {e}"))
-                    })?)),
-                }
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let trace_id = trace_id.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::read::ReadEngine;
+                    let opt = backend
+                        .get_trace_summary(&trace_id)
+                        .await
+                        .map_err(read_err_to_py)?;
+                    match opt {
+                        None => Ok(None),
+                        Some(s) => Ok(Some(serde_json::to_string(&s).map_err(|e| {
+                            PyRuntimeError::new_err(format!("TraceSummary encode: {e}"))
+                        })?)),
+                    }
+                })
             })
         })
     }
@@ -2587,22 +2591,24 @@ impl PyEngine {
     /// Full trace reconstruction. Returns JSON-encoded `TraceDetail`
     /// or `None`. Drives `/repository/traces/{trace_id}`.
     fn get_trace_detail(&self, py: Python<'_>, trace_id: &str) -> PyResult<Option<String>> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let trace_id = trace_id.to_owned();
-        py.detach(move || {
-            runtime.block_on(async move {
-                use crate::read::ReadEngine;
-                let opt = backend
-                    .get_trace_detail(&trace_id)
-                    .await
-                    .map_err(read_err_to_py)?;
-                match opt {
-                    None => Ok(None),
-                    Some(d) => Ok(Some(serde_json::to_string(&d).map_err(|e| {
-                        PyRuntimeError::new_err(format!("TraceDetail encode: {e}"))
-                    })?)),
-                }
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let trace_id = trace_id.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::read::ReadEngine;
+                    let opt = backend
+                        .get_trace_detail(&trace_id)
+                        .await
+                        .map_err(read_err_to_py)?;
+                    match opt {
+                        None => Ok(None),
+                        Some(d) => Ok(Some(serde_json::to_string(&d).map_err(|e| {
+                            PyRuntimeError::new_err(format!("TraceDetail encode: {e}"))
+                        })?)),
+                    }
+                })
             })
         })
     }
@@ -2621,23 +2627,25 @@ impl PyEngine {
         window_json: &str,
         metric: &str,
     ) -> PyResult<String> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let domain = deployment_domain.to_owned();
-        let window: crate::read::TimeWindow = serde_json::from_str(window_json)
-            .map_err(|e| PyValueError::new_err(format!("TimeWindow JSON decode: {e}")))?;
-        let metric: crate::read::DeviationMetric =
-            serde_json::from_str(&format!("\"{metric}\""))
-                .map_err(|e| PyValueError::new_err(format!("DeviationMetric decode: {e}")))?;
-        py.detach(move || {
-            runtime.block_on(async move {
-                use crate::read::ReadEngine;
-                let rows = backend
-                    .cross_agent_divergence(&domain, window, metric)
-                    .await
-                    .map_err(read_err_to_py)?;
-                serde_json::to_string(&rows)
-                    .map_err(|e| PyRuntimeError::new_err(format!("DivergenceRow encode: {e}")))
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let domain = deployment_domain.to_owned();
+            let window: crate::read::TimeWindow = serde_json::from_str(window_json)
+                .map_err(|e| PyValueError::new_err(format!("TimeWindow JSON decode: {e}")))?;
+            let metric: crate::read::DeviationMetric =
+                serde_json::from_str(&format!("\"{metric}\""))
+                    .map_err(|e| PyValueError::new_err(format!("DeviationMetric decode: {e}")))?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::read::ReadEngine;
+                    let rows = backend
+                        .cross_agent_divergence(&domain, window, metric)
+                        .await
+                        .map_err(read_err_to_py)?;
+                    serde_json::to_string(&rows)
+                        .map_err(|e| PyRuntimeError::new_err(format!("DivergenceRow encode: {e}")))
+                })
             })
         })
     }
@@ -2651,22 +2659,25 @@ impl PyEngine {
         baseline_json: &str,
         comparison_json: &str,
     ) -> PyResult<String> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let aid = agent_id_hash.to_owned();
-        let baseline: crate::read::TimeWindow = serde_json::from_str(baseline_json)
-            .map_err(|e| PyValueError::new_err(format!("baseline TimeWindow decode: {e}")))?;
-        let comparison: crate::read::TimeWindow = serde_json::from_str(comparison_json)
-            .map_err(|e| PyValueError::new_err(format!("comparison TimeWindow decode: {e}")))?;
-        py.detach(move || {
-            runtime.block_on(async move {
-                use crate::read::ReadEngine;
-                let rows = backend
-                    .temporal_drift(&aid, baseline, comparison)
-                    .await
-                    .map_err(read_err_to_py)?;
-                serde_json::to_string(&rows)
-                    .map_err(|e| PyRuntimeError::new_err(format!("TemporalDriftRow encode: {e}")))
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let aid = agent_id_hash.to_owned();
+            let baseline: crate::read::TimeWindow = serde_json::from_str(baseline_json)
+                .map_err(|e| PyValueError::new_err(format!("baseline TimeWindow decode: {e}")))?;
+            let comparison: crate::read::TimeWindow = serde_json::from_str(comparison_json)
+                .map_err(|e| PyValueError::new_err(format!("comparison TimeWindow decode: {e}")))?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::read::ReadEngine;
+                    let rows = backend
+                        .temporal_drift(&aid, baseline, comparison)
+                        .await
+                        .map_err(read_err_to_py)?;
+                    serde_json::to_string(&rows).map_err(|e| {
+                        PyRuntimeError::new_err(format!("TemporalDriftRow encode: {e}"))
+                    })
+                })
             })
         })
     }
@@ -2679,20 +2690,22 @@ impl PyEngine {
         agent_id_hash: &str,
         window_json: &str,
     ) -> PyResult<String> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let aid = agent_id_hash.to_owned();
-        let window: crate::read::TimeWindow = serde_json::from_str(window_json)
-            .map_err(|e| PyValueError::new_err(format!("TimeWindow decode: {e}")))?;
-        py.detach(move || {
-            runtime.block_on(async move {
-                use crate::read::ReadEngine;
-                let rows = backend
-                    .hash_chain_gaps(&aid, window)
-                    .await
-                    .map_err(read_err_to_py)?;
-                serde_json::to_string(&rows)
-                    .map_err(|e| PyRuntimeError::new_err(format!("HashChainGap encode: {e}")))
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let aid = agent_id_hash.to_owned();
+            let window: crate::read::TimeWindow = serde_json::from_str(window_json)
+                .map_err(|e| PyValueError::new_err(format!("TimeWindow decode: {e}")))?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::read::ReadEngine;
+                    let rows = backend
+                        .hash_chain_gaps(&aid, window)
+                        .await
+                        .map_err(read_err_to_py)?;
+                    serde_json::to_string(&rows)
+                        .map_err(|e| PyRuntimeError::new_err(format!("HashChainGap encode: {e}")))
+                })
             })
         })
     }
@@ -2705,20 +2718,23 @@ impl PyEngine {
         deployment_domain: &str,
         window_json: &str,
     ) -> PyResult<String> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let domain = deployment_domain.to_owned();
-        let window: crate::read::TimeWindow = serde_json::from_str(window_json)
-            .map_err(|e| PyValueError::new_err(format!("TimeWindow decode: {e}")))?;
-        py.detach(move || {
-            runtime.block_on(async move {
-                use crate::read::ReadEngine;
-                let rows = backend
-                    .conscience_override_rates(&domain, window)
-                    .await
-                    .map_err(read_err_to_py)?;
-                serde_json::to_string(&rows)
-                    .map_err(|e| PyRuntimeError::new_err(format!("OverrideRateRow encode: {e}")))
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let domain = deployment_domain.to_owned();
+            let window: crate::read::TimeWindow = serde_json::from_str(window_json)
+                .map_err(|e| PyValueError::new_err(format!("TimeWindow decode: {e}")))?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::read::ReadEngine;
+                    let rows = backend
+                        .conscience_override_rates(&domain, window)
+                        .await
+                        .map_err(read_err_to_py)?;
+                    serde_json::to_string(&rows).map_err(|e| {
+                        PyRuntimeError::new_err(format!("OverrideRateRow encode: {e}"))
+                    })
+                })
             })
         })
     }
@@ -2736,27 +2752,28 @@ impl PyEngine {
         window_json: &str,
         baseline_window_json: Option<&str>,
     ) -> PyResult<String> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let aid = agent_id_hash.to_owned();
-        let window: crate::read::TimeWindow = serde_json::from_str(window_json)
-            .map_err(|e| PyValueError::new_err(format!("TimeWindow decode: {e}")))?;
-        let baseline: Option<crate::read::TimeWindow> =
-            match baseline_window_json {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let aid = agent_id_hash.to_owned();
+            let window: crate::read::TimeWindow = serde_json::from_str(window_json)
+                .map_err(|e| PyValueError::new_err(format!("TimeWindow decode: {e}")))?;
+            let baseline: Option<crate::read::TimeWindow> = match baseline_window_json {
                 None => None,
                 Some(s) => Some(serde_json::from_str(s).map_err(|e| {
                     PyValueError::new_err(format!("baseline TimeWindow decode: {e}"))
                 })?),
             };
-        py.detach(move || {
-            runtime.block_on(async move {
-                use crate::read::ReadEngine;
-                let agg = backend
-                    .aggregate_scoring_factors(&aid, window, baseline)
-                    .await
-                    .map_err(read_err_to_py)?;
-                serde_json::to_string(&agg).map_err(|e| {
-                    PyRuntimeError::new_err(format!("ScoringFactorAggregate encode: {e}"))
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::read::ReadEngine;
+                    let agg = backend
+                        .aggregate_scoring_factors(&aid, window, baseline)
+                        .await
+                        .map_err(read_err_to_py)?;
+                    serde_json::to_string(&agg).map_err(|e| {
+                        PyRuntimeError::new_err(format!("ScoringFactorAggregate encode: {e}"))
+                    })
                 })
             })
         })
@@ -2773,28 +2790,29 @@ impl PyEngine {
         window_json: &str,
         baseline_window_json: Option<&str>,
     ) -> PyResult<String> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let aids: Vec<String> = serde_json::from_str(agent_id_hashes_json)
-            .map_err(|e| PyValueError::new_err(format!("agent_id_hashes decode: {e}")))?;
-        let window: crate::read::TimeWindow = serde_json::from_str(window_json)
-            .map_err(|e| PyValueError::new_err(format!("TimeWindow decode: {e}")))?;
-        let baseline: Option<crate::read::TimeWindow> =
-            match baseline_window_json {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let aids: Vec<String> = serde_json::from_str(agent_id_hashes_json)
+                .map_err(|e| PyValueError::new_err(format!("agent_id_hashes decode: {e}")))?;
+            let window: crate::read::TimeWindow = serde_json::from_str(window_json)
+                .map_err(|e| PyValueError::new_err(format!("TimeWindow decode: {e}")))?;
+            let baseline: Option<crate::read::TimeWindow> = match baseline_window_json {
                 None => None,
                 Some(s) => Some(serde_json::from_str(s).map_err(|e| {
                     PyValueError::new_err(format!("baseline TimeWindow decode: {e}"))
                 })?),
             };
-        py.detach(move || {
-            runtime.block_on(async move {
-                use crate::read::ReadEngine;
-                let aggs = backend
-                    .aggregate_scoring_factors_batch(&aids, window, baseline)
-                    .await
-                    .map_err(read_err_to_py)?;
-                serde_json::to_string(&aggs).map_err(|e| {
-                    PyRuntimeError::new_err(format!("ScoringFactorAggregate[] encode: {e}"))
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::read::ReadEngine;
+                    let aggs = backend
+                        .aggregate_scoring_factors_batch(&aids, window, baseline)
+                        .await
+                        .map_err(read_err_to_py)?;
+                    serde_json::to_string(&aggs).map_err(|e| {
+                        PyRuntimeError::new_err(format!("ScoringFactorAggregate[] encode: {e}"))
+                    })
                 })
             })
         })
@@ -2802,48 +2820,54 @@ impl PyEngine {
 
     /// Granular: count distinct trace_id matching filter.
     fn count_traces(&self, py: Python<'_>, filter_json: &str) -> PyResult<i64> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
-            .map_err(|e| PyValueError::new_err(format!("TraceFilter decode: {e}")))?;
-        py.detach(move || {
-            runtime.block_on(async move {
-                use crate::read::ReadEngine;
-                backend.count_traces(filter).await.map_err(read_err_to_py)
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
+                .map_err(|e| PyValueError::new_err(format!("TraceFilter decode: {e}")))?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::read::ReadEngine;
+                    backend.count_traces(filter).await.map_err(read_err_to_py)
+                })
             })
         })
     }
 
     /// Granular: count traces where conscience overrode the action.
     fn count_overrides(&self, py: Python<'_>, filter_json: &str) -> PyResult<i64> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
-            .map_err(|e| PyValueError::new_err(format!("TraceFilter decode: {e}")))?;
-        py.detach(move || {
-            runtime.block_on(async move {
-                use crate::read::ReadEngine;
-                backend
-                    .count_overrides(filter)
-                    .await
-                    .map_err(read_err_to_py)
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
+                .map_err(|e| PyValueError::new_err(format!("TraceFilter decode: {e}")))?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::read::ReadEngine;
+                    backend
+                        .count_overrides(filter)
+                        .await
+                        .map_err(read_err_to_py)
+                })
             })
         })
     }
 
     /// Granular: count agent_name changes (identity changes).
     fn count_identity_changes(&self, py: Python<'_>, filter_json: &str) -> PyResult<i64> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
-            .map_err(|e| PyValueError::new_err(format!("TraceFilter decode: {e}")))?;
-        py.detach(move || {
-            runtime.block_on(async move {
-                use crate::read::ReadEngine;
-                backend
-                    .count_identity_changes(filter)
-                    .await
-                    .map_err(read_err_to_py)
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
+                .map_err(|e| PyValueError::new_err(format!("TraceFilter decode: {e}")))?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::read::ReadEngine;
+                    backend
+                        .count_identity_changes(filter)
+                        .await
+                        .map_err(read_err_to_py)
+                })
             })
         })
     }
@@ -2851,19 +2875,21 @@ impl PyEngine {
     /// Granular: audit-chain aggregate.
     /// Returns JSON-encoded `AuditChainAggregate`.
     fn aggregate_audit_chain(&self, py: Python<'_>, filter_json: &str) -> PyResult<String> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
-            .map_err(|e| PyValueError::new_err(format!("TraceFilter decode: {e}")))?;
-        py.detach(move || {
-            runtime.block_on(async move {
-                use crate::read::ReadEngine;
-                let agg = backend
-                    .aggregate_audit_chain(filter)
-                    .await
-                    .map_err(read_err_to_py)?;
-                serde_json::to_string(&agg).map_err(|e| {
-                    PyRuntimeError::new_err(format!("AuditChainAggregate encode: {e}"))
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
+                .map_err(|e| PyValueError::new_err(format!("TraceFilter decode: {e}")))?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::read::ReadEngine;
+                    let agg = backend
+                        .aggregate_audit_chain(filter)
+                        .await
+                        .map_err(read_err_to_py)?;
+                    serde_json::to_string(&agg).map_err(|e| {
+                        PyRuntimeError::new_err(format!("AuditChainAggregate encode: {e}"))
+                    })
                 })
             })
         })
@@ -3809,15 +3835,82 @@ mod tests {
     }
 }
 
+/// v0.5.3 (CIRISPersist#27) — typed Python exception that PyO3's
+/// `catch_panic` wrapper raises when a Rust panic propagates through
+/// the FFI boundary.
+///
+/// Derives from Python's `Exception` (not `BaseException`) so that
+/// uvicorn's normal `try: except Exception` request-handler error
+/// path catches it as a 500 — the request fails cleanly without
+/// poisoning the worker. PyO3's built-in trampoline raises
+/// `pyo3.exceptions.PanicException` which derives from
+/// `BaseException` and is NOT caught by `except Exception`, so a
+/// panic that bypasses our `catch_panic` would still surface as a
+/// BaseException-uncaught-in-uvicorn-handler — recoverable but ugly.
+///
+/// The pre-v0.5.0 PyO3 methods (federation directory, derived
+/// schemas, outbound queue) still rely on PyO3's built-in trampoline;
+/// CIRISPersist#28 tracks completing the explicit-wrap sweep across
+/// the rest of the surface. Until then, panic=unwind + the trampoline
+/// catches them as PanicException (BaseException) — bad but bounded.
+#[allow(missing_docs)] // pyo3::create_exception macro emits items without doc-comments
+mod lens_query_error {
+    pyo3::create_exception!(ciris_persist, LensQueryError, pyo3::exceptions::PyException);
+}
+pub use lens_query_error::LensQueryError;
+
+/// v0.5.3 (CIRISPersist#27) — wrap a PyO3 method body with explicit
+/// panic catching. Converts any panic payload into a typed
+/// [`LensQueryError`] (derives from `Exception`, not `BaseException`)
+/// so uvicorn catches as a normal 500.
+///
+/// Use `AssertUnwindSafe` because `&self` on PyO3 methods isn't
+/// `UnwindSafe` by default — we assert that the panic-then-continue
+/// path is acceptable for our method bodies (every method's state is
+/// already typed-error guarded via `safe_get` and explicit
+/// `map_err`s; a panic implies a bug, not a recoverable state).
+fn catch_panic<F, R>(f: F) -> PyResult<R>
+where
+    F: FnOnce() -> PyResult<R>,
+{
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        Err(payload) => {
+            let msg = panic_payload_to_string(payload);
+            tracing::error!(panic = %msg, "PyO3 catch_panic caught Rust panic");
+            Err(PyErr::new::<LensQueryError, _>(format!(
+                "rust_panic: {msg}"
+            )))
+        }
+    }
+}
+
+/// v0.5.3 (CIRISPersist#27) — extract a human-readable string from
+/// a `catch_unwind` payload (Box<dyn Any + Send>). Tries `String`
+/// then `&str` then falls back to a generic label.
+fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else {
+        "(opaque panic payload)".to_string()
+    }
+}
+
 /// `ciris_persist` Python module entry point. The build script
 /// (maturin) generates the C entry that Python imports.
 #[pymodule]
-fn ciris_persist(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn ciris_persist(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEngine>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add(
         "SUPPORTED_SCHEMA_VERSIONS",
         crate::schema::SUPPORTED_VERSIONS.to_vec(),
     )?;
+    // v0.5.3 (CIRISPersist#27) — register LensQueryError so the
+    // catch_panic wrapper has a typed exception class to raise.
+    m.add("LensQueryError", py.get_type::<LensQueryError>())?;
     Ok(())
 }
