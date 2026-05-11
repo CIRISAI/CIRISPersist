@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778447348861,
+  "lastUpdate": 1778533597455,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -7805,6 +7805,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23996161,
             "range": "± 453270",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "9e8a0993a312efe70e9fb739cb019638450d122d",
+          "message": "0.5.3 — panic-isolation hardening track (CIRISPersist#25/#26/#27) + verify v2.0.2\n\nThree orthogonal layers of defense against the CIRISPersist#24\nfailure class (SUM-NULL → Row::get panic → SIGABRT cascade across\nuvicorn workers).\n\nPhase 1 (#25): panic = \"abort\" → \"unwind\" in release profile.\nPyO3's catch_unwind trampoline now fires; Rust panics become\nPanicException not SIGABRT. SECURITY_AUDIT_v0.1.2.md §4.2's abort\nrationale was correct for v0.1.x standalone-bin but doesn't\nsurvive v0.5.x cdylib-in-uvicorn — reframed in THREAT_MODEL.md\n§3.13 + AV-44.\n\nPhase 2 (#26): PgRowExt::safe_get trait — try_get with typed\nBackend error mapping. ~80 sites swept across v0.5.0 ReadEngine\nimpl + decode helpers. NULL surfaces as HTTP 500 with column\nname, not Rust panic. Pre-v0.5.0 sites tracked in\nCIRISPersist#28 for v0.5.4 sweep completion.\n\nPhase 3 (#27): pyo3::create_exception! LensQueryError(Exception) +\ncatch_panic(AssertUnwindSafe(...)) wrapping all 13 v0.5.0\nReadEngine PyO3 methods. Caught panics convert to LensQueryError\n— uvicorn's \"except Exception\" catches as clean 500 instead of\nescaping as PanicException (BaseException).\n\nVerify deps v2.0.1 → v2.0.2 — closes ml-dsa → pkcs8 caret-range\nhazard (CIRISVerify#18). v2.0.2 pins pkcs8 exact.\n\nThree-layer defense matrix:\n- SQL → Rust:    safe_get (try_get + Option)   → NULL = None\n- Rust → FFI:    panic = \"unwind\"               → PanicException\n- FFI → Python:  catch_panic + LensQueryError   → typed 500\n\n#24 failure class closed.\n\nThreat model: AV-44 added; §3.13 new; §9 bumped v0.5.0 → v0.5.3;\n17 vectors closed across v0.2.0..v0.5.3.\n\n205 lib tests pass. Hooks (fmt + clippy + test) clean.\n\nOut of scope (deferred to v0.5.4):\n- CIRISPersist#28 — pre-v0.5.0 PyO3 methods sweep\n- CIRISPersist#29 — Python-side panic-injection regression test\n- sqlfluff CI rule banning bare SUM/AVG without COALESCE\n- Per-worker panic budget + circuit breaker\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-11T15:58:12-05:00",
+          "tree_id": "941439206273263f3225ebf9075781568306aff8",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/9e8a0993a312efe70e9fb739cb019638450d122d"
+        },
+        "date": 1778533597021,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101749,
+            "range": "± 231",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 241713,
+            "range": "± 1721",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 523089,
+            "range": "± 2256",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1850379,
+            "range": "± 18591",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 347,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1424,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8212,
+            "range": "± 96",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21129,
+            "range": "± 48",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24188,
+            "range": "± 61",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83528,
+            "range": "± 149",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 366,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3309,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9499,
+            "range": "± 384",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42373,
+            "range": "± 184",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2558848,
+            "range": "± 122902",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6857166,
+            "range": "± 1100899",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 24112408,
+            "range": "± 303156",
             "unit": "ns/iter"
           }
         ]
