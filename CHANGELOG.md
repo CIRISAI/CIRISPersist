@@ -5,6 +5,144 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.5.4] — 2026-05-11
+
+**Crate-wide panic-isolation sweep completion + Python regression test
+gate.** v0.5.3 hardened the v0.5.0 ReadEngine surface (the realized
+incident path from CIRISPersist#24); v0.5.4 finishes the work across
+the rest of the postgres backend and the FFI surface, then adds a
+Python regression test that asserts the catch_panic invariant
+end-to-end through the wheel. Closes
+[CIRISPersist#28](https://github.com/CIRISAI/CIRISPersist/issues/28)
++ [#29](https://github.com/CIRISAI/CIRISPersist/issues/29).
+
+### Phase 1 — `PgRowExt::safe_get` extension + full postgres sweep (#28)
+
+The `PgRowExt` trait introduced in v0.5.3 only handled column-name
+lookups returning `crate::read::Error`. v0.5.4 generalises it to
+support both column-name and positional indices, and adds a
+generic `safe_get_with(idx, err_ctor)` variant so non-ReadEngine
+layers (federation, outbound, derived) can route the NULL-on-decode
+failure into their own `Error::Backend` variants:
+
+```rust
+trait PgRowExt {
+    fn safe_get<'a, T, I>(&'a self, idx: I) -> Result<T, crate::read::Error>
+    where T: FromSql<'a>, I: RowIndex + Display;
+
+    fn safe_get_with<'a, T, I, E, F>(&'a self, idx: I, err: F) -> Result<T, E>
+    where T: FromSql<'a>, I: RowIndex + Display,
+          F: FnOnce(String) -> E;
+}
+```
+
+Every remaining bare `Row::get` on a `tokio_postgres::Row` in
+`src/store/postgres.rs` swept to `safe_get` / `safe_get_with`. ~75
+additional sites across:
+
+- `pg_row_to_event_row` (decompose, ~30 sites, `store::Error`)
+- `pg_row_to_outbound_row` (~30 sites, `outbound::Error`)
+- `pg_row_to_key_record`, `pg_row_to_attestation`,
+  `pg_row_to_revocation` (federation directory decoders;
+  signatures bumped from infallible to `Result<_, federation::Error>`;
+  call sites collect via `::<Result<Vec<_>, _>>()`)
+- `list_hybrid_pending_{keys,attestations,revocations}` (PQC sweep
+  pending lists)
+- `lookup_public_key` + `sample_public_keys` (federation directory
+  scalar reads)
+- `delete_traces_for_agent` (DSAR cascade scalar reads)
+- `enqueue_outbound` + `mark_transport_failed` (outbound state
+  machine reads)
+- `count_traces`, `count_overrides`, `count_identity_changes`,
+  `aggregate_audit_chain` (read-engine count rollups that emit
+  i64 via aggregate-on-empty paths)
+
+A CI gate in `scripts/hooks/pre-commit` rejects new bare `row.get(`
+patterns in `src/store/postgres.rs` so the regression class can't
+sneak back in. SQLite path (`src/store/sqlite.rs`) is exempt by
+construction — `rusqlite::Row::get` already returns `Result` on
+NULL and doesn't share the panic class.
+
+### Phase 2 — FFI `catch_panic` sweep (#28 part 2)
+
+v0.5.3 wrapped the 13 v0.5.0 ReadEngine PyO3 methods in
+`catch_panic(||{...})`. v0.5.4 completed the wrap across the
+remaining 53 pre-v0.5.0 entry points (federation directory writers,
+outbound queue ops, derived-schema CRUD, verify primitives,
+canonicalization helpers, steward signing, debug methods). Now
+**every** PyO3 method on `PyEngine` (~70 entry points) routes panic
+through the explicit wrapper, converting `PanicException`
+(BaseException) into `LensQueryError` (Exception) so uvicorn's
+`except Exception:` path catches it as a normal 500.
+
+Wrap done via a deterministic one-shot script with a brace-depth
+scan (no proc-macro infra introduced — additive only). Pre/post
+sanity: 169 lib unit tests pass before, 169 pass after, plus the
+new Python test in Phase 3.
+
+### Phase 3 — Python regression test (#29)
+
+New feature-gated facility:
+
+- `Cargo.toml`: `test-panic = []` feature flag.
+- `#[cfg(feature = "test-panic")] #[pyfunction] _test_inject_panic`
+  module-level function (no Engine construction needed — bypasses
+  postgres + keyring setup) that calls `panic!()` inside the
+  catch_panic wrapper.
+- `tests/python/test_catch_panic.py` (5 tests):
+  1. `LensQueryError` is exported and subclasses `Exception`.
+  2. Rust panic surfaces as `LensQueryError` with message preserved.
+  3. Bare `except Exception:` catches it (the actual CIRISPersist#24
+     wedge shape — the regression-test the v0.5.3 hardening lacked).
+  4. The converted error is NOT a `pyo3.exceptions.PanicException`.
+  5. Module survives N repeated panics — process doesn't abort,
+     normal calls still work after.
+- `python/ciris_persist/__init__.py`: re-exports `LensQueryError`
+  for consumer use (`from ciris_persist import LensQueryError`).
+- `pyproject.toml`: `[tool.pytest.ini_options] testpaths =
+  ["tests/python"]` for discovery.
+- `.github/workflows/ci.yml`: appends `maturin develop --features
+  test-panic,pyo3 --release` + `pytest tests/python/` to the
+  linux-x86_64 job. Release wheels don't compile the injector in
+  (gated out by feature flag — not exposed on PyPI artifacts).
+
+Local validation: all 5 tests pass against a fresh maturin-develop
+build.
+
+### Threat model
+
+- THREAT_MODEL.md §3.13 (panic isolation): no new vector — v0.5.4
+  closes the carve-out in v0.5.3's text ("pre-v0.5.0 sites tracked
+  in #28") without changing the AV-44 row's status. §9 header
+  unchanged at v0.5.3 since this release strengthens defenses
+  already counted rather than adding new ones.
+
+### What you get
+
+- Bridge / lens / agent: a Rust panic anywhere in persist now
+  surfaces as `LensQueryError` (subclass of `Exception`) — a single
+  `try: ... except ciris_persist.LensQueryError: ...` in the
+  request handler catches every postgres NULL-on-decode hazard +
+  every Rust panic class.
+- Operators: the panic message is preserved through the FFI
+  conversion (the typed exception's `str()` carries
+  `rust_panic: <original panic message>`), so triage doesn't
+  require source-diving.
+- Future maintainers: the pre-commit Row::get gate rejects new
+  unsafe reads at commit time, not at production crash time.
+
+### Upgrade
+
+```toml
+ciris-persist = "0.5.4"
+```
+
+No API changes. The new `LensQueryError` export is additive; the
+new `_test_inject_panic` symbol is feature-gated off in release
+wheels (PyPI consumers don't see it). If lens / bridge already
+catch every `Exception` at the request boundary (the recommended
+shape), they get the v0.5.4 hardening for free.
+
 ## [0.5.3] — 2026-05-11
 
 **Panic-isolation hardening track + verify deps v2.0.1 → v2.0.2.**

@@ -534,7 +534,7 @@ impl Backend for PostgresBackend {
         match fed_row {
             None => Ok(None),
             Some(row) => {
-                let b64: String = row.get(0);
+                let b64: String = row.safe_get_with(0, Error::Backend)?;
                 decode_ed25519_b64(&b64).map(Some)
             }
         }
@@ -558,7 +558,7 @@ impl Backend for PostgresBackend {
             )
             .await
             .map_err(|e| Error::Backend(format!("count_public_keys: {e}")))?;
-        let total: i64 = count_row.get(0);
+        let total: i64 = count_row.safe_get_with(0, Error::Backend)?;
 
         let lim = i64::try_from(limit).unwrap_or(i64::MAX);
         let rows = client
@@ -570,7 +570,10 @@ impl Backend for PostgresBackend {
             )
             .await
             .map_err(|e| Error::Backend(format!("sample_public_keys: {e}")))?;
-        let sample: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+        let sample: Vec<String> = rows
+            .iter()
+            .map(|r| r.safe_get_with(0, Error::Backend))
+            .collect::<Result<_, _>>()?;
 
         Ok(super::backend::PublicKeySample {
             size: total.max(0) as usize,
@@ -667,8 +670,8 @@ impl Backend for PostgresBackend {
             .await
             .map_err(|e| Error::Backend(format!("collect trace_ids: {e}")))?
             .into_iter()
-            .map(|row| row.get::<_, String>(0))
-            .collect();
+            .map(|row| row.safe_get_with::<String, _, _, _>(0, Error::Backend))
+            .collect::<Result<_, _>>()?;
 
         // Step 2: delete LLM call rows joined by the matching
         // trace_ids. Cross-key traces (agent rotated keys, signed
@@ -716,8 +719,8 @@ impl Backend for PostgresBackend {
                 .await
                 .map_err(|e| Error::Backend(format!("collect target_key_ids: {e}")))?
                 .into_iter()
-                .map(|row| row.get::<_, String>(0))
-                .collect();
+                .map(|row| row.safe_get_with::<String, _, _, _>(0, Error::Backend))
+                .collect::<Result<_, _>>()?;
 
             if !target_key_ids.is_empty() {
                 federation_revocations_deleted = tx
@@ -946,7 +949,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("lookup federation_keys: {e}"))
             })?;
-        Ok(row_opt.map(pg_row_to_key_record))
+        row_opt.map(pg_row_to_key_record).transpose()
     }
 
     async fn lookup_keys_for_identity(
@@ -970,7 +973,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("lookup_keys_for_identity: {e}"))
             })?;
-        Ok(rows.into_iter().map(pg_row_to_key_record).collect())
+        rows.into_iter().map(pg_row_to_key_record).collect()
     }
 
     async fn put_attestation(
@@ -1057,7 +1060,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("list_attestations_for: {e}"))
             })?;
-        Ok(rows.into_iter().map(pg_row_to_attestation).collect())
+        rows.into_iter().map(pg_row_to_attestation).collect()
     }
 
     async fn list_attestations_by(
@@ -1081,7 +1084,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_by: {e}")))?;
-        Ok(rows.into_iter().map(pg_row_to_attestation).collect())
+        rows.into_iter().map(pg_row_to_attestation).collect()
     }
 
     async fn put_revocation(
@@ -1162,7 +1165,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("revocations_for: {e}")))?;
-        Ok(rows.into_iter().map(pg_row_to_revocation).collect())
+        rows.into_iter().map(pg_row_to_revocation).collect()
     }
 
     async fn attach_key_pqc_signature(
@@ -1246,11 +1249,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("attach lookup: {e}")))?;
-        let mut row = row_opt.map(pg_row_to_attestation).ok_or_else(|| {
-            crate::federation::Error::InvalidArgument(format!(
-                "federation_attestations row {attestation_id} does not exist"
-            ))
-        })?;
+        let mut row = row_opt
+            .map(pg_row_to_attestation)
+            .transpose()?
+            .ok_or_else(|| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "federation_attestations row {attestation_id} does not exist"
+                ))
+            })?;
         if row.is_pqc_complete() {
             return Err(crate::federation::Error::Conflict(format!(
                 "federation_attestations row {attestation_id} is already PQC-complete"
@@ -1301,11 +1307,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("attach lookup: {e}")))?;
-        let mut row = row_opt.map(pg_row_to_revocation).ok_or_else(|| {
-            crate::federation::Error::InvalidArgument(format!(
-                "federation_revocations row {revocation_id} does not exist"
-            ))
-        })?;
+        let mut row = row_opt
+            .map(pg_row_to_revocation)
+            .transpose()?
+            .ok_or_else(|| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "federation_revocations row {revocation_id} does not exist"
+                ))
+            })?;
         if row.is_pqc_complete() {
             return Err(crate::federation::Error::Conflict(format!(
                 "federation_revocations row {revocation_id} is already PQC-complete"
@@ -1357,14 +1366,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("list_hybrid_pending_keys: {e}"))
             })?;
-        Ok(rows
-            .into_iter()
-            .map(|row| crate::federation::HybridPendingRow {
-                id: row.get("key_id"),
-                envelope: row.get("registration_envelope"),
-                classical_sig_b64: row.get("scrub_signature_classical"),
+        rows.into_iter()
+            .map(|row| {
+                let mk_err = crate::federation::Error::Backend;
+                Ok(crate::federation::HybridPendingRow {
+                    id: row.safe_get_with("key_id", mk_err)?,
+                    envelope: row.safe_get_with("registration_envelope", mk_err)?,
+                    classical_sig_b64: row.safe_get_with("scrub_signature_classical", mk_err)?,
+                })
             })
-            .collect())
+            .collect()
     }
 
     async fn list_hybrid_pending_attestations(
@@ -1389,14 +1400,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("list_hybrid_pending_attestations: {e}"))
             })?;
-        Ok(rows
-            .into_iter()
-            .map(|row| crate::federation::HybridPendingRow {
-                id: row.get("attestation_id"),
-                envelope: row.get("attestation_envelope"),
-                classical_sig_b64: row.get("scrub_signature_classical"),
+        rows.into_iter()
+            .map(|row| {
+                let mk_err = crate::federation::Error::Backend;
+                Ok(crate::federation::HybridPendingRow {
+                    id: row.safe_get_with("attestation_id", mk_err)?,
+                    envelope: row.safe_get_with("attestation_envelope", mk_err)?,
+                    classical_sig_b64: row.safe_get_with("scrub_signature_classical", mk_err)?,
+                })
             })
-            .collect())
+            .collect()
     }
 
     async fn list_hybrid_pending_revocations(
@@ -1421,14 +1434,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("list_hybrid_pending_revocations: {e}"))
             })?;
-        Ok(rows
-            .into_iter()
-            .map(|row| crate::federation::HybridPendingRow {
-                id: row.get("revocation_id"),
-                envelope: row.get("revocation_envelope"),
-                classical_sig_b64: row.get("scrub_signature_classical"),
+        rows.into_iter()
+            .map(|row| {
+                let mk_err = crate::federation::Error::Backend;
+                Ok(crate::federation::HybridPendingRow {
+                    id: row.safe_get_with("revocation_id", mk_err)?,
+                    envelope: row.safe_get_with("revocation_envelope", mk_err)?,
+                    classical_sig_b64: row.safe_get_with("scrub_signature_classical", mk_err)?,
+                })
             })
-            .collect())
+            .collect()
     }
 }
 
@@ -1489,7 +1504,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
             )
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("enqueue_outbound: {e}")))?;
-        Ok(row.get(0))
+        row.safe_get_with(0, crate::outbound::Error::Backend)
     }
 
     async fn claim_pending_outbound(
@@ -1624,10 +1639,11 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
                 ))
             })?;
 
-        let attempt_count: i32 = row.get(0);
-        let max_attempts: i32 = row.get(1);
-        let enqueued_at: chrono::DateTime<chrono::Utc> = row.get(2);
-        let ttl_seconds: i64 = row.get(3);
+        let mk_err = crate::outbound::Error::Backend;
+        let attempt_count: i32 = row.safe_get_with(0, mk_err)?;
+        let max_attempts: i32 = row.safe_get_with(1, mk_err)?;
+        let enqueued_at: chrono::DateTime<chrono::Utc> = row.safe_get_with(2, mk_err)?;
+        let ttl_seconds: i64 = row.safe_get_with(3, mk_err)?;
 
         let now = chrono::Utc::now();
         let ttl_expired = (now - enqueued_at) > chrono::Duration::seconds(ttl_seconds);
@@ -2036,20 +2052,25 @@ fn pg_row_to_outbound_row(
     row: tokio_postgres::Row,
 ) -> Result<crate::outbound::OutboundRow, crate::outbound::Error> {
     use crate::outbound::{AbandonedReason, OutboundStatus};
-    let status_str: String = row.get("status");
+    // v0.5.4 (CIRISPersist#28) — typed NULL-safety via safe_get_with;
+    // outbound::Error::Backend swallows the deserialize message.
+    let mk_err = crate::outbound::Error::Backend;
+    let status_str: String = row.safe_get_with("status", crate::outbound::Error::Backend)?;
     let status = OutboundStatus::from_wire_str(&status_str).ok_or_else(|| {
         crate::outbound::Error::Backend(format!(
             "unknown status in edge_outbound_queue: {status_str}"
         ))
     })?;
-    let abandoned_reason_str: Option<String> = row.get("abandoned_reason");
+    let abandoned_reason_str: Option<String> =
+        row.safe_get_with("abandoned_reason", crate::outbound::Error::Backend)?;
     let abandoned_reason = match abandoned_reason_str.as_deref() {
         Some(s) => Some(AbandonedReason::from_wire_str(s).ok_or_else(|| {
             crate::outbound::Error::Backend(format!("unknown abandoned_reason: {s}"))
         })?),
         None => None,
     };
-    let body_sha256_vec: Vec<u8> = row.get("body_sha256");
+    let body_sha256_vec: Vec<u8> =
+        row.safe_get_with("body_sha256", crate::outbound::Error::Backend)?;
     if body_sha256_vec.len() != 32 {
         return Err(crate::outbound::Error::Backend(format!(
             "body_sha256 wrong length: {} (expected 32)",
@@ -2060,34 +2081,34 @@ fn pg_row_to_outbound_row(
     body_sha256.copy_from_slice(&body_sha256_vec);
 
     Ok(crate::outbound::OutboundRow {
-        queue_id: row.get("queue_id"),
-        sender_key_id: row.get("sender_key_id"),
-        destination_key_id: row.get("destination_key_id"),
-        message_type: row.get("message_type"),
-        edge_schema_version: row.get("edge_schema_version"),
-        envelope_bytes: row.get("envelope_bytes"),
+        queue_id: row.safe_get_with("queue_id", mk_err)?,
+        sender_key_id: row.safe_get_with("sender_key_id", mk_err)?,
+        destination_key_id: row.safe_get_with("destination_key_id", mk_err)?,
+        message_type: row.safe_get_with("message_type", mk_err)?,
+        edge_schema_version: row.safe_get_with("edge_schema_version", mk_err)?,
+        envelope_bytes: row.safe_get_with("envelope_bytes", mk_err)?,
         body_sha256,
-        body_size_bytes: row.get("body_size_bytes"),
+        body_size_bytes: row.safe_get_with("body_size_bytes", mk_err)?,
         status,
-        enqueued_at: row.get("enqueued_at"),
-        next_attempt_after: row.get("next_attempt_after"),
-        last_attempt_at: row.get("last_attempt_at"),
-        transport_delivered_at: row.get("transport_delivered_at"),
-        delivered_at: row.get("delivered_at"),
-        abandoned_at: row.get("abandoned_at"),
+        enqueued_at: row.safe_get_with("enqueued_at", mk_err)?,
+        next_attempt_after: row.safe_get_with("next_attempt_after", mk_err)?,
+        last_attempt_at: row.safe_get_with("last_attempt_at", mk_err)?,
+        transport_delivered_at: row.safe_get_with("transport_delivered_at", mk_err)?,
+        delivered_at: row.safe_get_with("delivered_at", mk_err)?,
+        abandoned_at: row.safe_get_with("abandoned_at", mk_err)?,
         abandoned_reason,
-        attempt_count: row.get("attempt_count"),
-        max_attempts: row.get("max_attempts"),
-        ttl_seconds: row.get("ttl_seconds"),
-        last_error_class: row.get("last_error_class"),
-        last_error_detail: row.get("last_error_detail"),
-        last_transport: row.get("last_transport"),
-        requires_ack: row.get("requires_ack"),
-        ack_timeout_seconds: row.get("ack_timeout_seconds"),
-        ack_envelope_bytes: row.get("ack_envelope_bytes"),
-        ack_received_at: row.get("ack_received_at"),
-        claimed_until: row.get("claimed_until"),
-        claimed_by: row.get("claimed_by"),
+        attempt_count: row.safe_get_with("attempt_count", mk_err)?,
+        max_attempts: row.safe_get_with("max_attempts", mk_err)?,
+        ttl_seconds: row.safe_get_with("ttl_seconds", mk_err)?,
+        last_error_class: row.safe_get_with("last_error_class", mk_err)?,
+        last_error_detail: row.safe_get_with("last_error_detail", mk_err)?,
+        last_transport: row.safe_get_with("last_transport", mk_err)?,
+        requires_ack: row.safe_get_with("requires_ack", mk_err)?,
+        ack_timeout_seconds: row.safe_get_with("ack_timeout_seconds", mk_err)?,
+        ack_envelope_bytes: row.safe_get_with("ack_envelope_bytes", mk_err)?,
+        ack_received_at: row.safe_get_with("ack_received_at", mk_err)?,
+        claimed_until: row.safe_get_with("claimed_until", mk_err)?,
+        claimed_by: row.safe_get_with("claimed_by", mk_err)?,
     })
 }
 
@@ -2108,67 +2129,80 @@ fn decode_ed25519_b64(b64: &str) -> Result<VerifyingKey, Error> {
     VerifyingKey::from_bytes(&arr).map_err(|e| Error::Backend(format!("public_key parse: {e}")))
 }
 
-fn pg_row_to_key_record(row: tokio_postgres::Row) -> crate::federation::KeyRecord {
-    let original_content_hash: Vec<u8> = row.get("original_content_hash");
-    crate::federation::KeyRecord {
-        key_id: row.get("key_id"),
-        pubkey_ed25519_base64: row.get("pubkey_ed25519_base64"),
-        pubkey_ml_dsa_65_base64: row.get("pubkey_ml_dsa_65_base64"),
-        algorithm: row.get("algorithm"),
-        identity_type: row.get("identity_type"),
-        identity_ref: row.get("identity_ref"),
-        valid_from: row.get("valid_from"),
-        valid_until: row.get("valid_until"),
-        registration_envelope: row.get("registration_envelope"),
+// v0.5.4 (CIRISPersist#28) — three federation directory row decoders
+// were infallible; bumped to Result<_, federation::Error> so a NULL in
+// any column surfaces as a typed Backend error instead of a panic.
+// Call sites collect via `::<Result<Vec<_>, _>>()`.
+fn pg_row_to_key_record(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::KeyRecord, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    let original_content_hash: Vec<u8> = row.safe_get_with("original_content_hash", mk_err)?;
+    Ok(crate::federation::KeyRecord {
+        key_id: row.safe_get_with("key_id", mk_err)?,
+        pubkey_ed25519_base64: row.safe_get_with("pubkey_ed25519_base64", mk_err)?,
+        pubkey_ml_dsa_65_base64: row.safe_get_with("pubkey_ml_dsa_65_base64", mk_err)?,
+        algorithm: row.safe_get_with("algorithm", mk_err)?,
+        identity_type: row.safe_get_with("identity_type", mk_err)?,
+        identity_ref: row.safe_get_with("identity_ref", mk_err)?,
+        valid_from: row.safe_get_with("valid_from", mk_err)?,
+        valid_until: row.safe_get_with("valid_until", mk_err)?,
+        registration_envelope: row.safe_get_with("registration_envelope", mk_err)?,
         original_content_hash: hex::encode(&original_content_hash),
-        scrub_signature_classical: row.get("scrub_signature_classical"),
-        scrub_signature_pqc: row.get("scrub_signature_pqc"),
-        scrub_key_id: row.get("scrub_key_id"),
-        scrub_timestamp: row.get("scrub_timestamp"),
-        pqc_completed_at: row.get("pqc_completed_at"),
-        persist_row_hash: row.get("persist_row_hash"),
-    }
+        scrub_signature_classical: row.safe_get_with("scrub_signature_classical", mk_err)?,
+        scrub_signature_pqc: row.safe_get_with("scrub_signature_pqc", mk_err)?,
+        scrub_key_id: row.safe_get_with("scrub_key_id", mk_err)?,
+        scrub_timestamp: row.safe_get_with("scrub_timestamp", mk_err)?,
+        pqc_completed_at: row.safe_get_with("pqc_completed_at", mk_err)?,
+        persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
+    })
 }
 
-fn pg_row_to_attestation(row: tokio_postgres::Row) -> crate::federation::Attestation {
-    let original_content_hash: Vec<u8> = row.get("original_content_hash");
-    crate::federation::Attestation {
-        attestation_id: row.get("attestation_id"),
-        attesting_key_id: row.get("attesting_key_id"),
-        attested_key_id: row.get("attested_key_id"),
-        attestation_type: row.get("attestation_type"),
-        weight: row.get("weight"),
-        asserted_at: row.get("asserted_at"),
-        expires_at: row.get("expires_at"),
-        attestation_envelope: row.get("attestation_envelope"),
+fn pg_row_to_attestation(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::Attestation, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    let original_content_hash: Vec<u8> = row.safe_get_with("original_content_hash", mk_err)?;
+    Ok(crate::federation::Attestation {
+        attestation_id: row.safe_get_with("attestation_id", mk_err)?,
+        attesting_key_id: row.safe_get_with("attesting_key_id", mk_err)?,
+        attested_key_id: row.safe_get_with("attested_key_id", mk_err)?,
+        attestation_type: row.safe_get_with("attestation_type", mk_err)?,
+        weight: row.safe_get_with("weight", mk_err)?,
+        asserted_at: row.safe_get_with("asserted_at", mk_err)?,
+        expires_at: row.safe_get_with("expires_at", mk_err)?,
+        attestation_envelope: row.safe_get_with("attestation_envelope", mk_err)?,
         original_content_hash: hex::encode(&original_content_hash),
-        scrub_signature_classical: row.get("scrub_signature_classical"),
-        scrub_signature_pqc: row.get("scrub_signature_pqc"),
-        scrub_key_id: row.get("scrub_key_id"),
-        scrub_timestamp: row.get("scrub_timestamp"),
-        pqc_completed_at: row.get("pqc_completed_at"),
-        persist_row_hash: row.get("persist_row_hash"),
-    }
+        scrub_signature_classical: row.safe_get_with("scrub_signature_classical", mk_err)?,
+        scrub_signature_pqc: row.safe_get_with("scrub_signature_pqc", mk_err)?,
+        scrub_key_id: row.safe_get_with("scrub_key_id", mk_err)?,
+        scrub_timestamp: row.safe_get_with("scrub_timestamp", mk_err)?,
+        pqc_completed_at: row.safe_get_with("pqc_completed_at", mk_err)?,
+        persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
+    })
 }
 
-fn pg_row_to_revocation(row: tokio_postgres::Row) -> crate::federation::Revocation {
-    let original_content_hash: Vec<u8> = row.get("original_content_hash");
-    crate::federation::Revocation {
-        revocation_id: row.get("revocation_id"),
-        revoked_key_id: row.get("revoked_key_id"),
-        revoking_key_id: row.get("revoking_key_id"),
-        reason: row.get("reason"),
-        revoked_at: row.get("revoked_at"),
-        effective_at: row.get("effective_at"),
-        revocation_envelope: row.get("revocation_envelope"),
+fn pg_row_to_revocation(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::Revocation, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    let original_content_hash: Vec<u8> = row.safe_get_with("original_content_hash", mk_err)?;
+    Ok(crate::federation::Revocation {
+        revocation_id: row.safe_get_with("revocation_id", mk_err)?,
+        revoked_key_id: row.safe_get_with("revoked_key_id", mk_err)?,
+        revoking_key_id: row.safe_get_with("revoking_key_id", mk_err)?,
+        reason: row.safe_get_with("reason", mk_err)?,
+        revoked_at: row.safe_get_with("revoked_at", mk_err)?,
+        effective_at: row.safe_get_with("effective_at", mk_err)?,
+        revocation_envelope: row.safe_get_with("revocation_envelope", mk_err)?,
         original_content_hash: hex::encode(&original_content_hash),
-        scrub_signature_classical: row.get("scrub_signature_classical"),
-        scrub_signature_pqc: row.get("scrub_signature_pqc"),
-        scrub_key_id: row.get("scrub_key_id"),
-        scrub_timestamp: row.get("scrub_timestamp"),
-        pqc_completed_at: row.get("pqc_completed_at"),
-        persist_row_hash: row.get("persist_row_hash"),
-    }
+        scrub_signature_classical: row.safe_get_with("scrub_signature_classical", mk_err)?,
+        scrub_signature_pqc: row.safe_get_with("scrub_signature_pqc", mk_err)?,
+        scrub_key_id: row.safe_get_with("scrub_key_id", mk_err)?,
+        scrub_timestamp: row.safe_get_with("scrub_timestamp", mk_err)?,
+        pqc_completed_at: row.safe_get_with("pqc_completed_at", mk_err)?,
+        persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
+    })
 }
 
 /// v0.3.5 (CIRISLens#8 ASK 3) — Convert a postgres row from
@@ -2177,13 +2211,17 @@ fn pg_row_to_revocation(row: tokio_postgres::Row) -> crate::federation::Revocati
 /// SELECT clause; we read by name here to make additions safer.
 fn pg_row_to_event_row(row: tokio_postgres::Row) -> Result<(i64, TraceEventRow), Error> {
     use crate::schema::{ReasoningEventType, TraceLevel};
-    let event_type_str: String = row.get("event_type");
+    // v0.5.4 (CIRISPersist#28) — every column read goes through
+    // safe_get_with so NULL-on-deserialize becomes typed store::Error,
+    // not a Rust panic. Same shape as v0.5.3's ReadEngine sweep,
+    // adapted for store::Error::Backend.
+    let event_type_str: String = row.safe_get_with("event_type", Error::Backend)?;
     let event_type = ReasoningEventType::from_wire_str(&event_type_str).ok_or_else(|| {
         Error::Backend(format!(
             "unknown event_type in trace_events row: {event_type_str}"
         ))
     })?;
-    let trace_level_str: String = row.get("trace_level");
+    let trace_level_str: String = row.safe_get_with("trace_level", Error::Backend)?;
     let trace_level = match trace_level_str.as_str() {
         "generic" => TraceLevel::Generic,
         "detailed" => TraceLevel::Detailed,
@@ -2192,52 +2230,52 @@ fn pg_row_to_event_row(row: tokio_postgres::Row) -> Result<(i64, TraceEventRow),
             return Err(Error::Backend(format!("unknown trace_level: {other}")));
         }
     };
-    let attempt_index_i32: i32 = row.get("attempt_index");
+    let attempt_index_i32: i32 = row.safe_get_with("attempt_index", Error::Backend)?;
     let attempt_index = u32::try_from(attempt_index_i32).map_err(|_| {
         Error::Backend(format!(
             "attempt_index {attempt_index_i32} negative — schema CHECK should have rejected"
         ))
     })?;
-    let payload_value: serde_json::Value = row.get("payload");
+    let payload_value: serde_json::Value = row.safe_get_with("payload", Error::Backend)?;
     let payload = match payload_value {
         serde_json::Value::Object(map) => map,
         _ => serde_json::Map::new(),
     };
 
-    let event_id: i64 = row.get("event_id");
+    let event_id: i64 = row.safe_get_with("event_id", Error::Backend)?;
     Ok((
         event_id,
         TraceEventRow {
-            trace_id: row.get("trace_id"),
-            thought_id: row.get("thought_id"),
-            task_id: row.get("task_id"),
-            step_point: row.get("step_point"),
+            trace_id: row.safe_get_with("trace_id", Error::Backend)?,
+            thought_id: row.safe_get_with("thought_id", Error::Backend)?,
+            task_id: row.safe_get_with("task_id", Error::Backend)?,
+            step_point: row.safe_get_with("step_point", Error::Backend)?,
             event_type,
             attempt_index,
-            ts: row.get("ts"),
-            agent_name: row.get("agent_name"),
-            agent_id_hash: row.get("agent_id_hash"),
-            cognitive_state: row.get("cognitive_state"),
+            ts: row.safe_get_with("ts", Error::Backend)?,
+            agent_name: row.safe_get_with("agent_name", Error::Backend)?,
+            agent_id_hash: row.safe_get_with("agent_id_hash", Error::Backend)?,
+            cognitive_state: row.safe_get_with("cognitive_state", Error::Backend)?,
             trace_level,
             payload,
-            cost_llm_calls: row.get("cost_llm_calls"),
-            cost_tokens: row.get("cost_tokens"),
-            cost_usd: row.get("cost_usd"),
-            signature: row.get("signature"),
-            signing_key_id: row.get("signing_key_id"),
-            signature_verified: row.get("signature_verified"),
-            schema_version: row.get("schema_version"),
-            pii_scrubbed: row.get("pii_scrubbed"),
-            original_content_hash: row.get("original_content_hash"),
-            scrub_signature: row.get("scrub_signature"),
-            scrub_key_id: row.get("scrub_key_id"),
-            scrub_timestamp: row.get("scrub_timestamp"),
-            agent_role: row.get("agent_role"),
-            agent_template: row.get("agent_template"),
-            deployment_domain: row.get("deployment_domain"),
-            deployment_type: row.get("deployment_type"),
-            deployment_region: row.get("deployment_region"),
-            deployment_trust_mode: row.get("deployment_trust_mode"),
+            cost_llm_calls: row.safe_get_with("cost_llm_calls", Error::Backend)?,
+            cost_tokens: row.safe_get_with("cost_tokens", Error::Backend)?,
+            cost_usd: row.safe_get_with("cost_usd", Error::Backend)?,
+            signature: row.safe_get_with("signature", Error::Backend)?,
+            signing_key_id: row.safe_get_with("signing_key_id", Error::Backend)?,
+            signature_verified: row.safe_get_with("signature_verified", Error::Backend)?,
+            schema_version: row.safe_get_with("schema_version", Error::Backend)?,
+            pii_scrubbed: row.safe_get_with("pii_scrubbed", Error::Backend)?,
+            original_content_hash: row.safe_get_with("original_content_hash", Error::Backend)?,
+            scrub_signature: row.safe_get_with("scrub_signature", Error::Backend)?,
+            scrub_key_id: row.safe_get_with("scrub_key_id", Error::Backend)?,
+            scrub_timestamp: row.safe_get_with("scrub_timestamp", Error::Backend)?,
+            agent_role: row.safe_get_with("agent_role", Error::Backend)?,
+            agent_template: row.safe_get_with("agent_template", Error::Backend)?,
+            deployment_domain: row.safe_get_with("deployment_domain", Error::Backend)?,
+            deployment_type: row.safe_get_with("deployment_type", Error::Backend)?,
+            deployment_region: row.safe_get_with("deployment_region", Error::Backend)?,
+            deployment_trust_mode: row.safe_get_with("deployment_trust_mode", Error::Backend)?,
         },
     ))
 }
@@ -2347,30 +2385,70 @@ fn pg_row_to_llm_call_row(
 // instead of process abort. The error message names the column so
 // future operators can triage without source-diving.
 //
-// Sweep scope (v0.5.3): the v0.5.0 ReadEngine impl + its decode
-// helpers (pg_row_to_trace_summary, pg_row_to_llm_call_row). The
-// pre-v0.5.0 sites (decompose, federation directory, outbound queue,
-// derived put paths) are tracked in CIRISPersist#28 — they've shipped
-// stably without a realized panic, but the v0.5.3 catch_unwind layer
-// (CIRISPersist#27) catches any future regression defensively until
-// the full sweep lands.
+// Sweep scope (v0.5.4 — CIRISPersist#28): every `tokio_postgres::Row`
+// read in this file now goes through `safe_get` or `safe_get_with`.
+// Includes the v0.5.0 ReadEngine impl (v0.5.3 baseline) plus the
+// pre-v0.5.0 surface: `pg_row_to_event_row`, `pg_row_to_outbound_row`,
+// `pg_row_to_key_record`, `pg_row_to_attestation`, `pg_row_to_revocation`,
+// the federation pending lists, the outbound dequeue + DSAR scalar
+// reads, and the read-engine count rollups. The CI gate (scripts/
+// hooks/pre-commit) rejects new bare `row.get(` patterns in this file
+// to prevent regression.
 
 trait PgRowExt {
-    /// Decode a column with typed-error propagation on failure.
-    /// Replaces `Row::get(col)`'s panic-on-NULL behavior with a
-    /// `read::Error::Backend` that names the column.
-    fn safe_get<'a, T>(&'a self, col: &str) -> Result<T, crate::read::Error>
+    /// Decode a column with typed-error propagation, returning
+    /// [`crate::read::Error`] (ReadEngine layer). v0.5.3 surface.
+    ///
+    /// Generic over `RowIndex` so both `safe_get("col_name")` and
+    /// `safe_get(0)` work uniformly. Matches `tokio_postgres::Row::
+    /// try_get`'s signature.
+    fn safe_get<'a, T, I>(&'a self, idx: I) -> Result<T, crate::read::Error>
     where
-        T: tokio_postgres::types::FromSql<'a>;
+        T: tokio_postgres::types::FromSql<'a>,
+        I: tokio_postgres::row::RowIndex + std::fmt::Display;
+
+    /// Decode a column with caller-supplied error constructor.
+    /// v0.5.4 (CIRISPersist#28) — used by non-ReadEngine layers
+    /// (federation, outbound, derived, decompose) so each layer's
+    /// `Backend(String)` variant can be plugged in directly:
+    ///
+    /// ```ignore
+    /// let bytes: Vec<u8> = row
+    ///     .safe_get_with("envelope_bytes", federation::Error::Backend)?;
+    /// ```
+    ///
+    /// All four federation-side error enums (`federation::Error`,
+    /// `outbound::Error`, `derived::Error`, `store::Error`, plus
+    /// `read::Error`) define `Backend(String)` as a tuple variant,
+    /// which Rust treats as `Fn(String) -> E` — usable as the
+    /// constructor without a closure wrapper.
+    fn safe_get_with<'a, T, I, E, F>(&'a self, idx: I, err: F) -> Result<T, E>
+    where
+        T: tokio_postgres::types::FromSql<'a>,
+        I: tokio_postgres::row::RowIndex + std::fmt::Display,
+        F: FnOnce(String) -> E;
 }
 
 impl PgRowExt for tokio_postgres::Row {
-    fn safe_get<'a, T>(&'a self, col: &str) -> Result<T, crate::read::Error>
+    fn safe_get<'a, T, I>(&'a self, idx: I) -> Result<T, crate::read::Error>
     where
         T: tokio_postgres::types::FromSql<'a>,
+        I: tokio_postgres::row::RowIndex + std::fmt::Display,
     {
-        self.try_get(col)
-            .map_err(|e| crate::read::Error::Backend(format!("decode column {col}: {e}")))
+        let label = format!("{idx}");
+        self.try_get(idx)
+            .map_err(|e| crate::read::Error::Backend(format!("decode column {label}: {e}")))
+    }
+
+    fn safe_get_with<'a, T, I, E, F>(&'a self, idx: I, err: F) -> Result<T, E>
+    where
+        T: tokio_postgres::types::FromSql<'a>,
+        I: tokio_postgres::row::RowIndex + std::fmt::Display,
+        F: FnOnce(String) -> E,
+    {
+        let label = format!("{idx}");
+        self.try_get(idx)
+            .map_err(|e| err(format!("decode column {label}: {e}")))
     }
 }
 
@@ -2469,7 +2547,7 @@ fn pg_row_to_trace_summary(
         // BOOL_AND result may be NULL for an empty group; default to
         // false for the safety property.
         signature_verified: row
-            .safe_get::<Option<bool>>("signature_verified")?
+            .safe_get::<Option<bool>, _>("signature_verified")?
             .unwrap_or(false),
         cognitive_state: row.safe_get("cognitive_state")?,
         thought_type: row.safe_get("thought_type")?,
@@ -2754,7 +2832,7 @@ impl crate::read::ReadEngine for PostgresBackend {
             scrub_key_id: first.safe_get("scrub_key_id")?,
             scrub_timestamp: first.safe_get("scrub_timestamp")?,
             pii_scrubbed: first
-                .get::<_, Option<bool>>("pii_scrubbed")
+                .safe_get::<Option<bool>, _>("pii_scrubbed")?
                 .unwrap_or(false),
         };
 
@@ -2920,9 +2998,9 @@ impl crate::read::ReadEngine for PostgresBackend {
             out.push(crate::read::DivergenceRow {
                 agent_id_hash: row.safe_get("agent_id_hash")?,
                 agent_name: row.safe_get("agent_name")?,
-                z_score: row.safe_get::<f64>("z_score")?,
+                z_score: row.safe_get::<f64, _>("z_score")?,
                 deviation_metric: metric,
-                sample_count: row.safe_get::<i64>("sample_count")?,
+                sample_count: row.safe_get::<i64, _>("sample_count")?,
             });
         }
         Ok(out)
@@ -3007,10 +3085,10 @@ impl crate::read::ReadEngine for PostgresBackend {
             if bn == 0 || cn == 0 {
                 continue;
             }
-            let bm: f64 = row.safe_get::<Option<f64>>("base_m")?.unwrap_or(0.0);
-            let cm: f64 = row.safe_get::<Option<f64>>("comp_m")?.unwrap_or(0.0);
-            let bv: f64 = row.safe_get::<Option<f64>>("base_v")?.unwrap_or(0.0);
-            let cv: f64 = row.safe_get::<Option<f64>>("comp_v")?.unwrap_or(0.0);
+            let bm: f64 = row.safe_get::<Option<f64>, _>("base_m")?.unwrap_or(0.0);
+            let cm: f64 = row.safe_get::<Option<f64>, _>("comp_m")?.unwrap_or(0.0);
+            let bv: f64 = row.safe_get::<Option<f64>, _>("base_v")?.unwrap_or(0.0);
+            let cv: f64 = row.safe_get::<Option<f64>, _>("comp_v")?.unwrap_or(0.0);
 
             let pooled_se = ((bv / (bn as f64).max(1.0)) + (cv / (cn as f64).max(1.0))).sqrt();
             let significance = if pooled_se > 0.0 {
@@ -3484,7 +3562,7 @@ impl crate::read::ReadEngine for PostgresBackend {
             .query_one(&sql, &params_ref[..])
             .await
             .map_err(|e| crate::read::Error::Backend(format!("count_traces: {e}")))?;
-        Ok(row.get::<_, i64>("n"))
+        row.safe_get::<i64, _>("n")
     }
 
     /// Section E granular: count traces where conscience overrode the
@@ -3518,7 +3596,7 @@ impl crate::read::ReadEngine for PostgresBackend {
             .query_one(&sql, &params_ref[..])
             .await
             .map_err(|e| crate::read::Error::Backend(format!("count_overrides: {e}")))?;
-        Ok(row.get::<_, i64>("n"))
+        row.safe_get::<i64, _>("n")
     }
 
     /// Section E granular: count agent_name changes (the meaningful
@@ -3545,7 +3623,7 @@ impl crate::read::ReadEngine for PostgresBackend {
             .query_one(&sql, &params_ref[..])
             .await
             .map_err(|e| crate::read::Error::Backend(format!("count_identity_changes: {e}")))?;
-        Ok(row.get::<_, i64>("n"))
+        row.safe_get::<i64, _>("n")
     }
 
     /// Section E granular: audit-chain aggregate. Total signed audit
@@ -3604,7 +3682,7 @@ impl crate::read::ReadEngine for PostgresBackend {
                 .map_err(|e| {
                     crate::read::Error::Backend(format!("aggregate_audit_chain gaps: {e}"))
                 })?;
-            g_row.get::<_, i64>("gap_count")
+            g_row.safe_get::<i64, _>("gap_count")?
         } else {
             0
         };

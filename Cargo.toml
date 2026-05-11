@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -35,6 +35,15 @@ sqlite         = ["dep:rusqlite", "dep:refinery", "refinery/rusqlite"]
 # Phase 2 features (declared now; impls land later — MISSION.md §2 / FSD §4).
 c-abi          = []
 peer-replicate = []
+
+# v0.5.4 (CIRISPersist#29) — test-only PyO3 hook that injects a Rust
+# panic at a controlled call site. Used by the Python regression test
+# (`tests/python/test_catch_panic.py`) to assert that the FFI
+# catch_panic layer converts panics into `LensQueryError` (Exception,
+# caught by uvicorn) rather than `PanicException` (BaseException,
+# slips past `except Exception`). NOT exposed in release wheels —
+# CI's pytest job is the only consumer.
+test-panic = []
 
 # v0.1.3 — optional TLS for the Postgres connection pool. Defaults
 # to no-TLS (deployments where the lens process and Postgres are

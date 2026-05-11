@@ -11,6 +11,14 @@ from typing import Any, Callable, TypedDict
 __version__: str
 SUPPORTED_SCHEMA_VERSIONS: list[str]
 
+class LensQueryError(Exception):
+    """v0.5.3+ (CIRISPersist#27) — typed exception raised when a Rust
+    panic crosses the FFI boundary. Subclasses ``Exception`` (not
+    ``BaseException``) so uvicorn's ``try: except Exception:`` catches
+    it as a normal 500. The original panic message is preserved as
+    ``"rust_panic: <message>"`` in the exception's str form.
+    """
+
 class BatchSummary(TypedDict):
     """Result shape from :meth:`Engine.receive_and_persist`."""
     envelopes_processed: int

@@ -353,17 +353,19 @@ impl PyEngine {
     /// envelope; same key that becomes the Reticulum destination
     /// when Phase 2.3 lands (one key, three roles).
     fn public_key_b64(&self, py: Python<'_>) -> PyResult<String> {
-        use base64::engine::general_purpose::STANDARD as BASE64;
-        use base64::Engine as _;
-        let signer = self.signer.clone();
-        let runtime = self.runtime.clone();
-        py.detach(|| {
-            runtime.block_on(async move {
-                let bytes = signer
-                    .public_key()
-                    .await
-                    .map_err(|e| PyRuntimeError::new_err(format!("public_key: {e}")))?;
-                Ok::<_, PyErr>(BASE64.encode(bytes))
+        catch_panic(|| {
+            use base64::engine::general_purpose::STANDARD as BASE64;
+            use base64::Engine as _;
+            let signer = self.signer.clone();
+            let runtime = self.runtime.clone();
+            py.detach(|| {
+                runtime.block_on(async move {
+                    let bytes = signer
+                        .public_key()
+                        .await
+                        .map_err(|e| PyRuntimeError::new_err(format!("public_key: {e}")))?;
+                    Ok::<_, PyErr>(BASE64.encode(bytes))
+                })
             })
         })
     }
@@ -385,18 +387,20 @@ impl PyEngine {
     /// for the cold-path PQC kickoff per
     /// `docs/FEDERATION_DIRECTORY.md` §"Trust contract".
     fn sign<'py>(&self, py: Python<'py>, message: &Bound<'py, PyBytes>) -> PyResult<Py<PyBytes>> {
-        let signer = self.signer.clone();
-        let runtime = self.runtime.clone();
-        let msg = message.as_bytes().to_vec();
-        let sig_bytes = py.detach(|| {
-            runtime.block_on(async move {
-                signer
-                    .sign(&msg)
-                    .await
-                    .map_err(|e| PyRuntimeError::new_err(format!("sign: {e}")))
-            })
-        })?;
-        Ok(PyBytes::new(py, &sig_bytes).unbind())
+        catch_panic(|| {
+            let signer = self.signer.clone();
+            let runtime = self.runtime.clone();
+            let msg = message.as_bytes().to_vec();
+            let sig_bytes = py.detach(|| {
+                runtime.block_on(async move {
+                    signer
+                        .sign(&msg)
+                        .await
+                        .map_err(|e| PyRuntimeError::new_err(format!("sign: {e}")))
+                })
+            })?;
+            Ok(PyBytes::new(py, &sig_bytes).unbind())
+        })
     }
 
     /// v0.2.1 — Canonicalize a federation envelope (KeyRecord
@@ -424,14 +428,16 @@ impl PyEngine {
         py: Python<'py>,
         envelope_json: &str,
     ) -> PyResult<Py<PyBytes>> {
-        let value: serde_json::Value = serde_json::from_str(envelope_json)
-            .map_err(|e| PyValueError::new_err(format!("envelope JSON decode: {e}")))?;
-        let bytes = <PythonJsonDumpsCanonicalizer as crate::verify::canonical::Canonicalizer>::canonicalize_value(
+        catch_panic(|| {
+            let value: serde_json::Value = serde_json::from_str(envelope_json)
+                .map_err(|e| PyValueError::new_err(format!("envelope JSON decode: {e}")))?;
+            let bytes = <PythonJsonDumpsCanonicalizer as crate::verify::canonical::Canonicalizer>::canonicalize_value(
             &PythonJsonDumpsCanonicalizer,
             &value,
         )
         .map_err(|e| PyRuntimeError::new_err(format!("canonicalize: {e}")))?;
-        Ok(PyBytes::new(py, &bytes).unbind())
+            Ok(PyBytes::new(py, &bytes).unbind())
+        })
     }
 
     /// v0.2.2 — Return the steward Ed25519 public key (base64) for
@@ -444,16 +450,18 @@ impl PyEngine {
     /// `steward_key_id` + `steward_key_path` (the federation steward
     /// role isn't configured).
     fn steward_public_key_b64(&self, _py: Python<'_>) -> PyResult<String> {
-        // v0.4.2 — thin wrapper over StewardSigner::public_key_b64.
-        self.steward_signer
-            .as_ref()
-            .map(|s| s.public_key_b64())
-            .ok_or_else(|| {
-                PyValueError::new_err(
-                    "no steward key configured (pass steward_key_id + steward_key_path \
+        catch_panic(|| {
+            // v0.4.2 — thin wrapper over StewardSigner::public_key_b64.
+            self.steward_signer
+                .as_ref()
+                .map(|s| s.public_key_b64())
+                .ok_or_else(|| {
+                    PyValueError::new_err(
+                        "no steward key configured (pass steward_key_id + steward_key_path \
                      to the Engine constructor)",
-                )
-            })
+                    )
+                })
+        })
     }
 
     /// v0.2.2 — Return the configured `steward_key_id` (the lens-
@@ -463,16 +471,18 @@ impl PyEngine {
     ///
     /// Raises `ValueError` if no steward identity is configured.
     fn steward_key_id(&self, _py: Python<'_>) -> PyResult<String> {
-        // v0.4.2 — thin wrapper over StewardSigner::key_id.
-        self.steward_signer
-            .as_ref()
-            .map(|s| s.key_id().to_owned())
-            .ok_or_else(|| {
-                PyValueError::new_err(
-                    "no steward key configured (pass steward_key_id + steward_key_path \
+        catch_panic(|| {
+            // v0.4.2 — thin wrapper over StewardSigner::key_id.
+            self.steward_signer
+                .as_ref()
+                .map(|s| s.key_id().to_owned())
+                .ok_or_else(|| {
+                    PyValueError::new_err(
+                        "no steward key configured (pass steward_key_id + steward_key_path \
                      to the Engine constructor)",
-                )
-            })
+                    )
+                })
+        })
     }
 
     /// v0.2.2 — Sign arbitrary bytes with the steward Ed25519 signing
@@ -494,19 +504,21 @@ impl PyEngine {
         py: Python<'py>,
         message: &Bound<'py, PyBytes>,
     ) -> PyResult<Py<PyBytes>> {
-        // v0.4.2 — thin wrapper over StewardSigner::sign_ed25519.
-        // Single-source-of-truth: Rust callers (CIRISLensCore) and
-        // PyO3 callers hit identical bytes-in / bytes-out logic.
-        let signer = self.steward_signer.as_ref().ok_or_else(|| {
-            PyValueError::new_err(
-                "no steward key configured (pass steward_key_id + steward_key_path \
+        catch_panic(|| {
+            // v0.4.2 — thin wrapper over StewardSigner::sign_ed25519.
+            // Single-source-of-truth: Rust callers (CIRISLensCore) and
+            // PyO3 callers hit identical bytes-in / bytes-out logic.
+            let signer = self.steward_signer.as_ref().ok_or_else(|| {
+                PyValueError::new_err(
+                    "no steward key configured (pass steward_key_id + steward_key_path \
                  to the Engine constructor)",
-            )
-        })?;
-        let sig = signer
-            .sign_ed25519(message.as_bytes())
-            .map_err(steward_signer_err_to_py)?;
-        Ok(PyBytes::new(py, &sig).unbind())
+                )
+            })?;
+            let sig = signer
+                .sign_ed25519(message.as_bytes())
+                .map_err(steward_signer_err_to_py)?;
+            Ok(PyBytes::new(py, &sig).unbind())
+        })
     }
 
     /// v0.3.1 — Return the steward ML-DSA-65 public key (base64) for
@@ -521,21 +533,23 @@ impl PyEngine {
     /// `steward_pqc_key_id` + `steward_pqc_key_path` (the cold-path
     /// PQC role isn't configured).
     fn steward_pqc_public_key_b64(&self, py: Python<'_>) -> PyResult<String> {
-        // v0.4.2 — thin wrapper over StewardSigner::pqc_public_key_b64.
-        let signer = self.steward_signer.clone().ok_or_else(|| {
-            PyValueError::new_err(
-                "no PQC steward key configured (pass steward_pqc_key_id + \
+        catch_panic(|| {
+            // v0.4.2 — thin wrapper over StewardSigner::pqc_public_key_b64.
+            let signer = self.steward_signer.clone().ok_or_else(|| {
+                PyValueError::new_err(
+                    "no PQC steward key configured (pass steward_pqc_key_id + \
                  steward_pqc_key_path to the Engine constructor)",
-            )
-        })?;
-        let runtime = self.runtime.clone();
-        let result =
-            py.detach(|| runtime.block_on(async move { signer.pqc_public_key_b64().await }));
-        result.map_err(steward_signer_err_to_py)?.ok_or_else(|| {
-            PyValueError::new_err(
-                "no PQC steward key configured (pass steward_pqc_key_id + \
+                )
+            })?;
+            let runtime = self.runtime.clone();
+            let result =
+                py.detach(|| runtime.block_on(async move { signer.pqc_public_key_b64().await }));
+            result.map_err(steward_signer_err_to_py)?.ok_or_else(|| {
+                PyValueError::new_err(
+                    "no PQC steward key configured (pass steward_pqc_key_id + \
                      steward_pqc_key_path to the Engine constructor)",
-            )
+                )
+            })
         })
     }
 
@@ -544,16 +558,18 @@ impl PyEngine {
     /// typically pin them equal but the alias spaces don't have to
     /// match.
     fn steward_pqc_key_id(&self, _py: Python<'_>) -> PyResult<String> {
-        // v0.4.2 — thin wrapper over StewardSigner::pqc_key_id.
-        self.steward_signer
-            .as_ref()
-            .and_then(|s| s.pqc_key_id().map(str::to_owned))
-            .ok_or_else(|| {
-                PyValueError::new_err(
-                    "no PQC steward key configured (pass steward_pqc_key_id + \
+        catch_panic(|| {
+            // v0.4.2 — thin wrapper over StewardSigner::pqc_key_id.
+            self.steward_signer
+                .as_ref()
+                .and_then(|s| s.pqc_key_id().map(str::to_owned))
+                .ok_or_else(|| {
+                    PyValueError::new_err(
+                        "no PQC steward key configured (pass steward_pqc_key_id + \
                      steward_pqc_key_path to the Engine constructor)",
-                )
-            })
+                    )
+                })
+        })
     }
 
     /// v0.3.1 — Sign arbitrary bytes with the steward ML-DSA-65
@@ -579,19 +595,21 @@ impl PyEngine {
         py: Python<'py>,
         message: &Bound<'py, PyBytes>,
     ) -> PyResult<Py<PyBytes>> {
-        // v0.4.2 — thin wrapper over StewardSigner::sign_ml_dsa_65.
-        let signer = self.steward_signer.clone().ok_or_else(|| {
-            PyValueError::new_err(
-                "no PQC steward key configured (pass steward_pqc_key_id + \
+        catch_panic(|| {
+            // v0.4.2 — thin wrapper over StewardSigner::sign_ml_dsa_65.
+            let signer = self.steward_signer.clone().ok_or_else(|| {
+                PyValueError::new_err(
+                    "no PQC steward key configured (pass steward_pqc_key_id + \
                  steward_pqc_key_path to the Engine constructor)",
-            )
-        })?;
-        let runtime = self.runtime.clone();
-        let msg = message.as_bytes().to_vec();
-        let sig_bytes = py
-            .detach(|| runtime.block_on(async move { signer.sign_ml_dsa_65(&msg).await }))
-            .map_err(steward_signer_err_to_py)?;
-        Ok(PyBytes::new(py, &sig_bytes).unbind())
+                )
+            })?;
+            let runtime = self.runtime.clone();
+            let msg = message.as_bytes().to_vec();
+            let sig_bytes = py
+                .detach(|| runtime.block_on(async move { signer.sign_ml_dsa_65(&msg).await }))
+                .map_err(steward_signer_err_to_py)?;
+            Ok(PyBytes::new(py, &sig_bytes).unbind())
+        })
     }
 
     /// v0.1.18 — debug helper for canonical-byte drift diagnosis
@@ -632,36 +650,38 @@ impl PyEngine {
         py: Python<'py>,
         body: &Bound<'py, PyBytes>,
     ) -> PyResult<Bound<'py, pyo3::types::PyList>> {
-        use crate::schema::{BatchEnvelope, BatchEvent};
-        use crate::verify::ed25519::canonical_payload_sha256s;
-        use base64::engine::general_purpose::STANDARD as BASE64;
-        use base64::Engine as _;
+        catch_panic(|| {
+            use crate::schema::{BatchEnvelope, BatchEvent};
+            use crate::verify::ed25519::canonical_payload_sha256s;
+            use base64::engine::general_purpose::STANDARD as BASE64;
+            use base64::Engine as _;
 
-        let bytes = body.as_bytes();
-        let env =
-            BatchEnvelope::from_json(bytes).map_err(|e| PyValueError::new_err(format!("{e}")))?;
+            let bytes = body.as_bytes();
+            let env = BatchEnvelope::from_json(bytes)
+                .map_err(|e| PyValueError::new_err(format!("{e}")))?;
 
-        let result = pyo3::types::PyList::empty(py);
-        for event in &env.events {
-            let BatchEvent::CompleteTrace { trace, .. } = event;
-            let diag = canonical_payload_sha256s(trace, &PythonJsonDumpsCanonicalizer)
-                .map_err(|e| PyRuntimeError::new_err(format!("canonicalize: {e}")))?;
-            let entry = PyDict::new(py);
-            entry.set_item("trace_id", trace.trace_id.as_str())?;
-            entry.set_item("signature_key_id", trace.signature_key_id.as_str())?;
-            entry.set_item("signature", trace.signature.as_str())?;
-            entry.set_item("canonical_9field_sha256", diag.nine_field_sha256.as_str())?;
-            entry.set_item(
-                "canonical_9field_b64",
-                BASE64.encode(&diag.nine_field_bytes),
-            )?;
-            entry.set_item("canonical_9field_bytes_len", diag.nine_field_bytes.len())?;
-            entry.set_item("canonical_2field_sha256", diag.two_field_sha256.as_str())?;
-            entry.set_item("canonical_2field_b64", BASE64.encode(&diag.two_field_bytes))?;
-            entry.set_item("canonical_2field_bytes_len", diag.two_field_bytes.len())?;
-            result.append(entry)?;
-        }
-        Ok(result)
+            let result = pyo3::types::PyList::empty(py);
+            for event in &env.events {
+                let BatchEvent::CompleteTrace { trace, .. } = event;
+                let diag = canonical_payload_sha256s(trace, &PythonJsonDumpsCanonicalizer)
+                    .map_err(|e| PyRuntimeError::new_err(format!("canonicalize: {e}")))?;
+                let entry = PyDict::new(py);
+                entry.set_item("trace_id", trace.trace_id.as_str())?;
+                entry.set_item("signature_key_id", trace.signature_key_id.as_str())?;
+                entry.set_item("signature", trace.signature.as_str())?;
+                entry.set_item("canonical_9field_sha256", diag.nine_field_sha256.as_str())?;
+                entry.set_item(
+                    "canonical_9field_b64",
+                    BASE64.encode(&diag.nine_field_bytes),
+                )?;
+                entry.set_item("canonical_9field_bytes_len", diag.nine_field_bytes.len())?;
+                entry.set_item("canonical_2field_sha256", diag.two_field_sha256.as_str())?;
+                entry.set_item("canonical_2field_b64", BASE64.encode(&diag.two_field_bytes))?;
+                entry.set_item("canonical_2field_bytes_len", diag.two_field_bytes.len())?;
+                result.append(entry)?;
+            }
+            Ok(result)
+        })
     }
 
     /// Register the agent's Ed25519 public key for verification.
@@ -707,43 +727,45 @@ impl PyEngine {
         expires_at: Option<&str>,
         added_by: Option<&str>,
     ) -> PyResult<()> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let key_id = signature_key_id.to_owned();
-        let pub_b64 = public_key_b64.to_owned();
-        let algo = algorithm.unwrap_or("Ed25519").to_owned();
-        let desc = description.map(str::to_owned);
-        let added = added_by.map(str::to_owned);
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let key_id = signature_key_id.to_owned();
+            let pub_b64 = public_key_b64.to_owned();
+            let algo = algorithm.unwrap_or("Ed25519").to_owned();
+            let desc = description.map(str::to_owned);
+            let added = added_by.map(str::to_owned);
 
-        // Parse expires_at ISO-8601 → DateTime<Utc>; reject
-        // malformed values upfront (typed error preferred over
-        // letting the SQL layer choke).
-        let expires_dt: Option<chrono::DateTime<chrono::Utc>> = match expires_at {
-            None => None,
-            Some(s) => Some(s.parse().map_err(|e| {
-                PyValueError::new_err(format!("expires_at must be ISO-8601 (got {s:?}): {e}"))
-            })?),
-        };
+            // Parse expires_at ISO-8601 → DateTime<Utc>; reject
+            // malformed values upfront (typed error preferred over
+            // letting the SQL layer choke).
+            let expires_dt: Option<chrono::DateTime<chrono::Utc>> = match expires_at {
+                None => None,
+                Some(s) => Some(s.parse().map_err(|e| {
+                    PyValueError::new_err(format!("expires_at must be ISO-8601 (got {s:?}): {e}"))
+                })?),
+            };
 
-        py.detach(|| {
-            runtime.block_on(async move {
-                let client = backend
-                    .pool()
-                    .get()
-                    .await
-                    .map_err(|e| PyRuntimeError::new_err(format!("pool: {e}")))?;
-                client
-                    .execute(
-                        "INSERT INTO cirislens.accord_public_keys \
+            py.detach(|| {
+                runtime.block_on(async move {
+                    let client = backend
+                        .pool()
+                        .get()
+                        .await
+                        .map_err(|e| PyRuntimeError::new_err(format!("pool: {e}")))?;
+                    client
+                        .execute(
+                            "INSERT INTO cirislens.accord_public_keys \
                          (key_id, public_key_base64, algorithm, description, \
                           expires_at, added_by) \
                          VALUES ($1, $2, $3, $4, $5, $6) \
                          ON CONFLICT (key_id) DO NOTHING",
-                        &[&key_id, &pub_b64, &algo, &desc, &expires_dt, &added],
-                    )
-                    .await
-                    .map_err(|e| PyRuntimeError::new_err(format!("register: {e}")))?;
-                Ok::<_, PyErr>(())
+                            &[&key_id, &pub_b64, &algo, &desc, &expires_dt, &added],
+                        )
+                        .await
+                        .map_err(|e| PyRuntimeError::new_err(format!("register: {e}")))?;
+                    Ok::<_, PyErr>(())
+                })
             })
         })
     }
@@ -759,82 +781,84 @@ impl PyEngine {
         py: Python<'py>,
         body: &Bound<'py, PyBytes>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let bytes = body.as_bytes().to_vec();
-        let backend = self.backend.clone();
-        let scrubber = self.scrubber.clone();
-        let signer = self.signer.clone();
-        let signer_key_id = self.signer_key_id.clone();
-        let runtime = self.runtime.clone();
+        catch_panic(|| {
+            let bytes = body.as_bytes().to_vec();
+            let backend = self.backend.clone();
+            let scrubber = self.scrubber.clone();
+            let signer = self.signer.clone();
+            let signer_key_id = self.signer_key_id.clone();
+            let runtime = self.runtime.clone();
 
-        let summary = py.detach(|| {
-            runtime.block_on(async move {
-                let pipeline = IngestPipeline {
-                    backend: &*backend,
-                    canonicalizer: &PythonJsonDumpsCanonicalizer,
-                    scrubber: &*scrubber,
-                    signer: &*signer,
-                    signer_key_id: &signer_key_id,
-                };
-                pipeline.receive_and_persist(&bytes).await
-            })
-        });
+            let summary = py.detach(|| {
+                runtime.block_on(async move {
+                    let pipeline = IngestPipeline {
+                        backend: &*backend,
+                        canonicalizer: &PythonJsonDumpsCanonicalizer,
+                        scrubber: &*scrubber,
+                        signer: &*signer,
+                        signer_key_id: &signer_key_id,
+                    };
+                    pipeline.receive_and_persist(&bytes).await
+                })
+            });
 
-        match summary {
-            Ok(s) => {
-                let dict = PyDict::new(py);
-                dict.set_item("envelopes_processed", s.envelopes_processed)?;
-                dict.set_item("trace_events_inserted", s.trace_events_inserted)?;
-                dict.set_item("trace_events_conflicted", s.trace_events_conflicted)?;
-                dict.set_item("trace_llm_calls_inserted", s.trace_llm_calls_inserted)?;
-                dict.set_item("scrubbed_fields", s.scrubbed_fields)?;
-                dict.set_item("signatures_verified", s.signatures_verified)?;
-                Ok(dict)
-            }
-            // THREAT_MODEL.md AV-15: sanitize at the FFI boundary.
-            // Verbose `Display` form (which may include
-            // attacker-supplied content) goes to tracing logs; the
-            // Python exception carries only the stable kind token
-            // (and, when present, a structured `detail` string —
-            // closed-set field names / typed integers / version
-            // stamps; never raw user-payload bytes).
-            // The lens HTTP layer maps token → status code.
-            //
-            // v0.4.6 (CIRISPersist#22) — When `IngestError::detail()`
-            // is `Some`, the Python exception's `args` is the 2-tuple
-            // `(kind, detail)` so callers can extract the field name
-            // (e.g. `"attempt_index"`) without source-diving the
-            // persist crate. When `None`, `args` stays as `(kind,)` —
-            // backward-compatible with the v0.4.5 single-string shape.
-            // Lens consumers read:
-            //
-            //   kind = e.args[0]
-            //   detail = e.args[1] if len(e.args) > 1 else None
-            Err(e) => {
-                let kind = e.kind();
-                let detail = e.detail();
-                tracing::warn!(
-                    error = %e, kind = kind, detail = detail.as_deref(),
-                    "ingest rejected"
-                );
-                match e {
-                    // Schema / verify / scrub → ValueError (caller-fault; 4xx).
-                    IngestError::Schema(_) | IngestError::Verify(_) | IngestError::Scrub(_) => {
-                        Err(match detail {
-                            Some(d) => PyValueError::new_err((kind, d)),
-                            None => PyValueError::new_err(kind),
-                        })
+            match summary {
+                Ok(s) => {
+                    let dict = PyDict::new(py);
+                    dict.set_item("envelopes_processed", s.envelopes_processed)?;
+                    dict.set_item("trace_events_inserted", s.trace_events_inserted)?;
+                    dict.set_item("trace_events_conflicted", s.trace_events_conflicted)?;
+                    dict.set_item("trace_llm_calls_inserted", s.trace_llm_calls_inserted)?;
+                    dict.set_item("scrubbed_fields", s.scrubbed_fields)?;
+                    dict.set_item("signatures_verified", s.signatures_verified)?;
+                    Ok(dict)
+                }
+                // THREAT_MODEL.md AV-15: sanitize at the FFI boundary.
+                // Verbose `Display` form (which may include
+                // attacker-supplied content) goes to tracing logs; the
+                // Python exception carries only the stable kind token
+                // (and, when present, a structured `detail` string —
+                // closed-set field names / typed integers / version
+                // stamps; never raw user-payload bytes).
+                // The lens HTTP layer maps token → status code.
+                //
+                // v0.4.6 (CIRISPersist#22) — When `IngestError::detail()`
+                // is `Some`, the Python exception's `args` is the 2-tuple
+                // `(kind, detail)` so callers can extract the field name
+                // (e.g. `"attempt_index"`) without source-diving the
+                // persist crate. When `None`, `args` stays as `(kind,)` —
+                // backward-compatible with the v0.4.5 single-string shape.
+                // Lens consumers read:
+                //
+                //   kind = e.args[0]
+                //   detail = e.args[1] if len(e.args) > 1 else None
+                Err(e) => {
+                    let kind = e.kind();
+                    let detail = e.detail();
+                    tracing::warn!(
+                        error = %e, kind = kind, detail = detail.as_deref(),
+                        "ingest rejected"
+                    );
+                    match e {
+                        // Schema / verify / scrub → ValueError (caller-fault; 4xx).
+                        IngestError::Schema(_) | IngestError::Verify(_) | IngestError::Scrub(_) => {
+                            Err(match detail {
+                                Some(d) => PyValueError::new_err((kind, d)),
+                                None => PyValueError::new_err(kind),
+                            })
+                        }
+                        // Store / Sign → RuntimeError (server-fault; 5xx).
+                        // AV-25: signing failure is operator-side
+                        // (keyring locked, hardware unavailable, etc.) —
+                        // never the agent's fault, never a 4xx.
+                        IngestError::Store(_) | IngestError::Sign(_) => Err(match detail {
+                            Some(d) => PyRuntimeError::new_err((kind, d)),
+                            None => PyRuntimeError::new_err(kind),
+                        }),
                     }
-                    // Store / Sign → RuntimeError (server-fault; 5xx).
-                    // AV-25: signing failure is operator-side
-                    // (keyring locked, hardware unavailable, etc.) —
-                    // never the agent's fault, never a 4xx.
-                    IngestError::Store(_) | IngestError::Sign(_) => Err(match detail {
-                        Some(d) => PyRuntimeError::new_err((kind, d)),
-                        None => PyRuntimeError::new_err(kind),
-                    }),
                 }
             }
-        }
+        })
     }
 
     // ── v0.2.0 — FederationDirectory surface ───────────────────────
@@ -859,71 +883,79 @@ impl PyEngine {
     /// signing on the cold path and calls `attach_key_pqc_signature`
     /// to fill them in. `algorithm` MUST be `"hybrid"`.
     fn put_public_key(&self, py: Python<'_>, signed_key_record_json: &str) -> PyResult<()> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let record: crate::federation::SignedKeyRecord =
-            serde_json::from_str(signed_key_record_json)
-                .map_err(|e| PyValueError::new_err(format!("SignedKeyRecord JSON decode: {e}")))?;
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let record: crate::federation::SignedKeyRecord =
+                serde_json::from_str(signed_key_record_json).map_err(|e| {
+                    PyValueError::new_err(format!("SignedKeyRecord JSON decode: {e}"))
+                })?;
 
-        // v0.3.1 — cold-path PQC fill-in (CIRISPersist#10). Capture
-        // the inputs the auto-fire task needs BEFORE backend consumes
-        // the record. Cold-path skips when no PQC steward configured;
-        // row stays hybrid-pending and consumers can fill via the
-        // attach_*_pqc_signature escape hatch on their own schedule.
-        let cold_path_inputs = self
-            .steward_signer
-            .as_ref()
-            .and_then(|s| s.pqc_signer_arc())
-            .map(|signer| {
-                (
-                    signer,
-                    record.record.key_id.clone(),
-                    record.record.registration_envelope.clone(),
-                    record.record.scrub_signature_classical.clone(),
-                )
-            });
+            // v0.3.1 — cold-path PQC fill-in (CIRISPersist#10). Capture
+            // the inputs the auto-fire task needs BEFORE backend consumes
+            // the record. Cold-path skips when no PQC steward configured;
+            // row stays hybrid-pending and consumers can fill via the
+            // attach_*_pqc_signature escape hatch on their own schedule.
+            let cold_path_inputs = self
+                .steward_signer
+                .as_ref()
+                .and_then(|s| s.pqc_signer_arc())
+                .map(|signer| {
+                    (
+                        signer,
+                        record.record.key_id.clone(),
+                        record.record.registration_envelope.clone(),
+                        record.record.scrub_signature_classical.clone(),
+                    )
+                });
 
-        py.detach(|| {
-            runtime.block_on(async move {
-                use crate::federation::FederationDirectory;
-                backend
-                    .put_public_key(record)
-                    .await
-                    .map_err(federation_err_to_py)?;
+            py.detach(|| {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    backend
+                        .put_public_key(record)
+                        .await
+                        .map_err(federation_err_to_py)?;
 
-                // Cold-path fire-and-forget. We're already inside
-                // tokio::Runtime::block_on, so tokio::spawn here
-                // schedules the task without waiting. The synchronous
-                // Python call returns as soon as the put commits;
-                // PQC catches up within seconds.
-                if let Some((signer, key_id, envelope, classical_sig_b64)) = cold_path_inputs {
-                    let backend = backend.clone();
-                    tokio::spawn(async move {
-                        match cold_path_pqc_sign(&*signer, &envelope, &classical_sig_b64).await {
-                            Ok((pubkey_b64, pqc_sig_b64)) => {
-                                if let Err(e) = backend
-                                    .attach_key_pqc_signature(&key_id, &pubkey_b64, &pqc_sig_b64)
-                                    .await
-                                {
+                    // Cold-path fire-and-forget. We're already inside
+                    // tokio::Runtime::block_on, so tokio::spawn here
+                    // schedules the task without waiting. The synchronous
+                    // Python call returns as soon as the put commits;
+                    // PQC catches up within seconds.
+                    if let Some((signer, key_id, envelope, classical_sig_b64)) = cold_path_inputs {
+                        let backend = backend.clone();
+                        tokio::spawn(async move {
+                            match cold_path_pqc_sign(&*signer, &envelope, &classical_sig_b64).await
+                            {
+                                Ok((pubkey_b64, pqc_sig_b64)) => {
+                                    if let Err(e) = backend
+                                        .attach_key_pqc_signature(
+                                            &key_id,
+                                            &pubkey_b64,
+                                            &pqc_sig_b64,
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            key_id = key_id.as_str(),
+                                            error = %e,
+                                            "cold-path PQC attach_key_pqc_signature failed; \
+                                             row stays hybrid-pending"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
                                     tracing::warn!(
                                         key_id = key_id.as_str(),
                                         error = %e,
-                                        "cold-path PQC attach_key_pqc_signature failed; \
-                                         row stays hybrid-pending"
+                                        "cold-path PQC sign failed; row stays hybrid-pending"
                                     );
                                 }
                             }
-                            Err(e) => {
-                                tracing::warn!(
-                                    key_id = key_id.as_str(),
-                                    error = %e,
-                                    "cold-path PQC sign failed; row stays hybrid-pending"
-                                );
-                            }
-                        }
-                    });
-                }
-                Ok(())
+                        });
+                    }
+                    Ok(())
+                })
             })
         })
     }
@@ -931,23 +963,25 @@ impl PyEngine {
     /// Federation directory: lookup a public key by `key_id`.
     /// Returns the JSON-encoded `KeyRecord` string, or `None`.
     fn lookup_public_key(&self, py: Python<'_>, key_id: &str) -> PyResult<Option<String>> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let key_id = key_id.to_owned();
-        py.detach(|| {
-            runtime.block_on(async move {
-                let opt =
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let key_id = key_id.to_owned();
+            py.detach(|| {
+                runtime.block_on(async move {
+                    let opt =
                     <PostgresBackend as crate::federation::FederationDirectory>::lookup_public_key(
                         &backend, &key_id,
                     )
                     .await
                     .map_err(federation_err_to_py)?;
-                match opt {
-                    None => Ok(None),
-                    Some(rec) => Ok(Some(serde_json::to_string(&rec).map_err(|e| {
-                        PyRuntimeError::new_err(format!("KeyRecord JSON encode: {e}"))
-                    })?)),
-                }
+                    match opt {
+                        None => Ok(None),
+                        Some(rec) => Ok(Some(serde_json::to_string(&rec).map_err(|e| {
+                            PyRuntimeError::new_err(format!("KeyRecord JSON encode: {e}"))
+                        })?)),
+                    }
+                })
             })
         })
     }
@@ -955,18 +989,20 @@ impl PyEngine {
     /// Federation directory: lookup all public keys for an identity_ref.
     /// Returns a JSON array string of `KeyRecord` objects.
     fn lookup_keys_for_identity(&self, py: Python<'_>, identity_ref: &str) -> PyResult<String> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let identity_ref = identity_ref.to_owned();
-        py.detach(|| {
-            runtime.block_on(async move {
-                use crate::federation::FederationDirectory;
-                let rows = backend
-                    .lookup_keys_for_identity(&identity_ref)
-                    .await
-                    .map_err(federation_err_to_py)?;
-                serde_json::to_string(&rows).map_err(|e| {
-                    PyRuntimeError::new_err(format!("Vec<KeyRecord> JSON encode: {e}"))
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let identity_ref = identity_ref.to_owned();
+            py.detach(|| {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    let rows = backend
+                        .lookup_keys_for_identity(&identity_ref)
+                        .await
+                        .map_err(federation_err_to_py)?;
+                    serde_json::to_string(&rows).map_err(|e| {
+                        PyRuntimeError::new_err(format!("Vec<KeyRecord> JSON encode: {e}"))
+                    })
                 })
             })
         })
@@ -974,29 +1010,30 @@ impl PyEngine {
 
     /// Federation directory: write an attestation.
     fn put_attestation(&self, py: Python<'_>, signed_attestation_json: &str) -> PyResult<()> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let att: crate::federation::SignedAttestation =
-            serde_json::from_str(signed_attestation_json).map_err(|e| {
-                PyValueError::new_err(format!("SignedAttestation JSON decode: {e}"))
-            })?;
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let att: crate::federation::SignedAttestation =
+                serde_json::from_str(signed_attestation_json).map_err(|e| {
+                    PyValueError::new_err(format!("SignedAttestation JSON decode: {e}"))
+                })?;
 
-        // v0.3.1 — cold-path PQC fill-in (CIRISPersist#10).
-        let cold_path_inputs = self
-            .steward_signer
-            .as_ref()
-            .and_then(|s| s.pqc_signer_arc())
-            .map(|signer| {
-                (
-                    signer,
-                    att.attestation.attestation_id.clone(),
-                    att.attestation.attestation_envelope.clone(),
-                    att.attestation.scrub_signature_classical.clone(),
-                )
-            });
+            // v0.3.1 — cold-path PQC fill-in (CIRISPersist#10).
+            let cold_path_inputs = self
+                .steward_signer
+                .as_ref()
+                .and_then(|s| s.pqc_signer_arc())
+                .map(|signer| {
+                    (
+                        signer,
+                        att.attestation.attestation_id.clone(),
+                        att.attestation.attestation_envelope.clone(),
+                        att.attestation.scrub_signature_classical.clone(),
+                    )
+                });
 
-        py.detach(|| {
-            runtime.block_on(async move {
+            py.detach(|| {
+                runtime.block_on(async move {
                 use crate::federation::FederationDirectory;
                 backend
                     .put_attestation(att)
@@ -1037,23 +1074,26 @@ impl PyEngine {
                 }
                 Ok(())
             })
+            })
         })
     }
 
     /// Federation directory: list attestations targeting `attested_key_id`.
     fn list_attestations_for(&self, py: Python<'_>, attested_key_id: &str) -> PyResult<String> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let attested_key_id = attested_key_id.to_owned();
-        py.detach(|| {
-            runtime.block_on(async move {
-                use crate::federation::FederationDirectory;
-                let rows = backend
-                    .list_attestations_for(&attested_key_id)
-                    .await
-                    .map_err(federation_err_to_py)?;
-                serde_json::to_string(&rows).map_err(|e| {
-                    PyRuntimeError::new_err(format!("Vec<Attestation> JSON encode: {e}"))
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let attested_key_id = attested_key_id.to_owned();
+            py.detach(|| {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    let rows = backend
+                        .list_attestations_for(&attested_key_id)
+                        .await
+                        .map_err(federation_err_to_py)?;
+                    serde_json::to_string(&rows).map_err(|e| {
+                        PyRuntimeError::new_err(format!("Vec<Attestation> JSON encode: {e}"))
+                    })
                 })
             })
         })
@@ -1061,18 +1101,20 @@ impl PyEngine {
 
     /// Federation directory: list attestations issued by `attesting_key_id`.
     fn list_attestations_by(&self, py: Python<'_>, attesting_key_id: &str) -> PyResult<String> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let attesting_key_id = attesting_key_id.to_owned();
-        py.detach(|| {
-            runtime.block_on(async move {
-                use crate::federation::FederationDirectory;
-                let rows = backend
-                    .list_attestations_by(&attesting_key_id)
-                    .await
-                    .map_err(federation_err_to_py)?;
-                serde_json::to_string(&rows).map_err(|e| {
-                    PyRuntimeError::new_err(format!("Vec<Attestation> JSON encode: {e}"))
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let attesting_key_id = attesting_key_id.to_owned();
+            py.detach(|| {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    let rows = backend
+                        .list_attestations_by(&attesting_key_id)
+                        .await
+                        .map_err(federation_err_to_py)?;
+                    serde_json::to_string(&rows).map_err(|e| {
+                        PyRuntimeError::new_err(format!("Vec<Attestation> JSON encode: {e}"))
+                    })
                 })
             })
         })
@@ -1080,79 +1122,90 @@ impl PyEngine {
 
     /// Federation directory: write a revocation.
     fn put_revocation(&self, py: Python<'_>, signed_revocation_json: &str) -> PyResult<()> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let rev: crate::federation::SignedRevocation = serde_json::from_str(signed_revocation_json)
-            .map_err(|e| PyValueError::new_err(format!("SignedRevocation JSON decode: {e}")))?;
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let rev: crate::federation::SignedRevocation =
+                serde_json::from_str(signed_revocation_json).map_err(|e| {
+                    PyValueError::new_err(format!("SignedRevocation JSON decode: {e}"))
+                })?;
 
-        // v0.3.1 — cold-path PQC fill-in (CIRISPersist#10).
-        let cold_path_inputs = self
-            .steward_signer
-            .as_ref()
-            .and_then(|s| s.pqc_signer_arc())
-            .map(|signer| {
-                (
-                    signer,
-                    rev.revocation.revocation_id.clone(),
-                    rev.revocation.revocation_envelope.clone(),
-                    rev.revocation.scrub_signature_classical.clone(),
-                )
-            });
+            // v0.3.1 — cold-path PQC fill-in (CIRISPersist#10).
+            let cold_path_inputs = self
+                .steward_signer
+                .as_ref()
+                .and_then(|s| s.pqc_signer_arc())
+                .map(|signer| {
+                    (
+                        signer,
+                        rev.revocation.revocation_id.clone(),
+                        rev.revocation.revocation_envelope.clone(),
+                        rev.revocation.scrub_signature_classical.clone(),
+                    )
+                });
 
-        py.detach(|| {
-            runtime.block_on(async move {
-                use crate::federation::FederationDirectory;
-                backend
-                    .put_revocation(rev)
-                    .await
-                    .map_err(federation_err_to_py)?;
-                if let Some((signer, revocation_id, envelope, classical_sig_b64)) = cold_path_inputs
-                {
-                    let backend = backend.clone();
-                    tokio::spawn(async move {
-                        match cold_path_pqc_sign(&*signer, &envelope, &classical_sig_b64).await {
-                            Ok((_pubkey_b64, pqc_sig_b64)) => {
-                                if let Err(e) = backend
-                                    .attach_revocation_pqc_signature(&revocation_id, &pqc_sig_b64)
-                                    .await
-                                {
+            py.detach(|| {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    backend
+                        .put_revocation(rev)
+                        .await
+                        .map_err(federation_err_to_py)?;
+                    if let Some((signer, revocation_id, envelope, classical_sig_b64)) =
+                        cold_path_inputs
+                    {
+                        let backend = backend.clone();
+                        tokio::spawn(async move {
+                            match cold_path_pqc_sign(&*signer, &envelope, &classical_sig_b64).await
+                            {
+                                Ok((_pubkey_b64, pqc_sig_b64)) => {
+                                    if let Err(e) = backend
+                                        .attach_revocation_pqc_signature(
+                                            &revocation_id,
+                                            &pqc_sig_b64,
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            revocation_id = revocation_id.as_str(),
+                                            error = %e,
+                                            "cold-path PQC attach_revocation_pqc_signature failed; \
+                                             row stays hybrid-pending"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
                                     tracing::warn!(
                                         revocation_id = revocation_id.as_str(),
                                         error = %e,
-                                        "cold-path PQC attach_revocation_pqc_signature failed; \
-                                         row stays hybrid-pending"
+                                        "cold-path PQC sign failed; row stays hybrid-pending"
                                     );
                                 }
                             }
-                            Err(e) => {
-                                tracing::warn!(
-                                    revocation_id = revocation_id.as_str(),
-                                    error = %e,
-                                    "cold-path PQC sign failed; row stays hybrid-pending"
-                                );
-                            }
-                        }
-                    });
-                }
-                Ok(())
+                        });
+                    }
+                    Ok(())
+                })
             })
         })
     }
 
     /// Federation directory: list revocations targeting `revoked_key_id`.
     fn revocations_for(&self, py: Python<'_>, revoked_key_id: &str) -> PyResult<String> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let revoked_key_id = revoked_key_id.to_owned();
-        py.detach(|| {
-            runtime.block_on(async move {
-                use crate::federation::FederationDirectory;
-                let rows = backend
-                    .revocations_for(&revoked_key_id)
-                    .await
-                    .map_err(federation_err_to_py)?;
-                serde_json::to_string(&rows).map_err(|e| {
-                    PyRuntimeError::new_err(format!("Vec<Revocation> JSON encode: {e}"))
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let revoked_key_id = revoked_key_id.to_owned();
+            py.detach(|| {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    let rows = backend
+                        .revocations_for(&revoked_key_id)
+                        .await
+                        .map_err(federation_err_to_py)?;
+                    serde_json::to_string(&rows).map_err(|e| {
+                        PyRuntimeError::new_err(format!("Vec<Revocation> JSON encode: {e}"))
+                    })
                 })
             })
         })
@@ -1169,18 +1222,20 @@ impl PyEngine {
         pubkey_ml_dsa_65_base64: &str,
         scrub_signature_pqc: &str,
     ) -> PyResult<()> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let key_id = key_id.to_owned();
-        let mldsa_pk = pubkey_ml_dsa_65_base64.to_owned();
-        let pqc_sig = scrub_signature_pqc.to_owned();
-        py.detach(|| {
-            runtime.block_on(async move {
-                use crate::federation::FederationDirectory;
-                backend
-                    .attach_key_pqc_signature(&key_id, &mldsa_pk, &pqc_sig)
-                    .await
-                    .map_err(federation_err_to_py)
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let key_id = key_id.to_owned();
+            let mldsa_pk = pubkey_ml_dsa_65_base64.to_owned();
+            let pqc_sig = scrub_signature_pqc.to_owned();
+            py.detach(|| {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    backend
+                        .attach_key_pqc_signature(&key_id, &mldsa_pk, &pqc_sig)
+                        .await
+                        .map_err(federation_err_to_py)
+                })
             })
         })
     }
@@ -1193,17 +1248,19 @@ impl PyEngine {
         attestation_id: &str,
         scrub_signature_pqc: &str,
     ) -> PyResult<()> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let attestation_id = attestation_id.to_owned();
-        let pqc_sig = scrub_signature_pqc.to_owned();
-        py.detach(|| {
-            runtime.block_on(async move {
-                use crate::federation::FederationDirectory;
-                backend
-                    .attach_attestation_pqc_signature(&attestation_id, &pqc_sig)
-                    .await
-                    .map_err(federation_err_to_py)
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let attestation_id = attestation_id.to_owned();
+            let pqc_sig = scrub_signature_pqc.to_owned();
+            py.detach(|| {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    backend
+                        .attach_attestation_pqc_signature(&attestation_id, &pqc_sig)
+                        .await
+                        .map_err(federation_err_to_py)
+                })
             })
         })
     }
@@ -1216,17 +1273,19 @@ impl PyEngine {
         revocation_id: &str,
         scrub_signature_pqc: &str,
     ) -> PyResult<()> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let revocation_id = revocation_id.to_owned();
-        let pqc_sig = scrub_signature_pqc.to_owned();
-        py.detach(|| {
-            runtime.block_on(async move {
-                use crate::federation::FederationDirectory;
-                backend
-                    .attach_revocation_pqc_signature(&revocation_id, &pqc_sig)
-                    .await
-                    .map_err(federation_err_to_py)
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let revocation_id = revocation_id.to_owned();
+            let pqc_sig = scrub_signature_pqc.to_owned();
+            py.detach(|| {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    backend
+                        .attach_revocation_pqc_signature(&revocation_id, &pqc_sig)
+                        .await
+                        .map_err(federation_err_to_py)
+                })
             })
         })
     }
@@ -1282,42 +1341,45 @@ impl PyEngine {
     /// as `steward_pqc_sign`).
     #[pyo3(signature = (batch_size=1000))]
     fn run_pqc_sweep<'py>(&self, py: Python<'py>, batch_size: i64) -> PyResult<Bound<'py, PyDict>> {
-        let signer = self
-            .steward_signer
-            .as_ref()
-            .and_then(|s| s.pqc_signer_arc())
-            .ok_or_else(|| {
-                PyValueError::new_err(
-                    "PQC steward not configured (pass steward_pqc_key_id and \
+        catch_panic(|| {
+            let signer = self
+                .steward_signer
+                .as_ref()
+                .and_then(|s| s.pqc_signer_arc())
+                .ok_or_else(|| {
+                    PyValueError::new_err(
+                        "PQC steward not configured (pass steward_pqc_key_id and \
                  steward_pqc_key_path to the Engine constructor)",
-                )
-            })?;
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
+                    )
+                })?;
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
 
-        let summary = py.detach(move || {
-            runtime
-                .block_on(async move { run_pqc_sweep_inner(&backend, &*signer, batch_size).await })
-        });
+            let summary = py.detach(move || {
+                runtime.block_on(async move {
+                    run_pqc_sweep_inner(&backend, &*signer, batch_size).await
+                })
+            });
 
-        let dict = PyDict::new(py);
-        dict.set_item("scanned", summary.total_scanned)?;
-        dict.set_item("signed", summary.total_signed)?;
-        dict.set_item("failed", summary.total_failed)?;
-        let by_table = PyDict::new(py);
-        for (name, counts) in [
-            ("federation_keys", &summary.keys),
-            ("federation_attestations", &summary.attestations),
-            ("federation_revocations", &summary.revocations),
-        ] {
-            let d = PyDict::new(py);
-            d.set_item("scanned", counts.scanned)?;
-            d.set_item("signed", counts.signed)?;
-            d.set_item("failed", counts.failed)?;
-            by_table.set_item(name, d)?;
-        }
-        dict.set_item("by_table", by_table)?;
-        Ok(dict)
+            let dict = PyDict::new(py);
+            dict.set_item("scanned", summary.total_scanned)?;
+            dict.set_item("signed", summary.total_signed)?;
+            dict.set_item("failed", summary.total_failed)?;
+            let by_table = PyDict::new(py);
+            for (name, counts) in [
+                ("federation_keys", &summary.keys),
+                ("federation_attestations", &summary.attestations),
+                ("federation_revocations", &summary.revocations),
+            ] {
+                let d = PyDict::new(py);
+                d.set_item("scanned", counts.scanned)?;
+                d.set_item("signed", counts.signed)?;
+                d.set_item("failed", counts.failed)?;
+                by_table.set_item(name, d)?;
+            }
+            dict.set_item("by_table", by_table)?;
+            Ok(dict)
+        })
     }
 
     /// v0.3.6 (CIRISPersist#15, CIRISLens#8 ASK 1) — GDPR Article 17
@@ -1369,39 +1431,41 @@ impl PyEngine {
         signature_key_id: &str,
         include_federation_key: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let agent_id_hash = agent_id_hash.to_owned();
-        let signature_key_id = signature_key_id.to_owned();
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let agent_id_hash = agent_id_hash.to_owned();
+            let signature_key_id = signature_key_id.to_owned();
 
-        let summary = py.detach(move || {
-            runtime.block_on(async move {
-                use crate::store::Backend;
-                backend
-                    .delete_traces_for_agent(
-                        &agent_id_hash,
-                        &signature_key_id,
-                        include_federation_key,
-                    )
-                    .await
-            })
-        });
-        let summary = summary.map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+            let summary = py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::store::Backend;
+                    backend
+                        .delete_traces_for_agent(
+                            &agent_id_hash,
+                            &signature_key_id,
+                            include_federation_key,
+                        )
+                        .await
+                })
+            });
+            let summary = summary.map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
 
-        let dict = PyDict::new(py);
-        dict.set_item("trace_events_deleted", summary.trace_events_deleted)?;
-        dict.set_item("trace_llm_calls_deleted", summary.trace_llm_calls_deleted)?;
-        dict.set_item("federation_keys_deleted", summary.federation_keys_deleted)?;
-        dict.set_item(
-            "federation_attestations_deleted",
-            summary.federation_attestations_deleted,
-        )?;
-        dict.set_item(
-            "federation_revocations_deleted",
-            summary.federation_revocations_deleted,
-        )?;
-        dict.set_item("deleted_at", summary.deleted_at.to_rfc3339())?;
-        Ok(dict)
+            let dict = PyDict::new(py);
+            dict.set_item("trace_events_deleted", summary.trace_events_deleted)?;
+            dict.set_item("trace_llm_calls_deleted", summary.trace_llm_calls_deleted)?;
+            dict.set_item("federation_keys_deleted", summary.federation_keys_deleted)?;
+            dict.set_item(
+                "federation_attestations_deleted",
+                summary.federation_attestations_deleted,
+            )?;
+            dict.set_item(
+                "federation_revocations_deleted",
+                summary.federation_revocations_deleted,
+            )?;
+            dict.set_item("deleted_at", summary.deleted_at.to_rfc3339())?;
+            Ok(dict)
+        })
     }
 
     /// v0.3.5 (CIRISLens#8 ASK 3) — Page-cursor read primitive for
@@ -1437,64 +1501,66 @@ impl PyEngine {
         limit: i64,
         agent_id_hash: Option<&str>,
     ) -> PyResult<pyo3::Bound<'py, pyo3::types::PyList>> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let agent_filter = agent_id_hash.map(str::to_owned);
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let agent_filter = agent_id_hash.map(str::to_owned);
 
-        let rows: Vec<(i64, crate::store::types::TraceEventRow)> = py
-            .detach(move || {
-                runtime.block_on(async move {
-                    use crate::store::Backend;
-                    backend
-                        .fetch_trace_events_page(after_event_id, limit, agent_filter.as_deref())
-                        .await
+            let rows: Vec<(i64, crate::store::types::TraceEventRow)> = py
+                .detach(move || {
+                    runtime.block_on(async move {
+                        use crate::store::Backend;
+                        backend
+                            .fetch_trace_events_page(after_event_id, limit, agent_filter.as_deref())
+                            .await
+                    })
                 })
-            })
-            .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+                .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
 
-        let list = pyo3::types::PyList::empty(py);
-        for (event_id, row) in rows {
-            let d = PyDict::new(py);
-            d.set_item("event_id", event_id)?;
-            d.set_item("trace_id", &row.trace_id)?;
-            d.set_item("thought_id", &row.thought_id)?;
-            d.set_item("task_id", row.task_id.as_deref())?;
-            d.set_item("step_point", row.step_point.as_deref())?;
-            d.set_item("event_type", row.event_type.as_str())?;
-            d.set_item("attempt_index", row.attempt_index)?;
-            d.set_item("ts", row.ts.to_rfc3339())?;
-            d.set_item("agent_name", row.agent_name.as_deref())?;
-            d.set_item("agent_id_hash", &row.agent_id_hash)?;
-            d.set_item("cognitive_state", row.cognitive_state.as_deref())?;
-            d.set_item("trace_level", trace_level_str(row.trace_level))?;
-            d.set_item(
-                "payload",
-                pyo3::types::PyString::new(
-                    py,
-                    &serde_json::to_string(&serde_json::Value::Object(row.payload))
-                        .unwrap_or_default(),
-                ),
-            )?;
-            d.set_item("cost_llm_calls", row.cost_llm_calls)?;
-            d.set_item("cost_tokens", row.cost_tokens)?;
-            d.set_item("cost_usd", row.cost_usd)?;
-            d.set_item("signature", &row.signature)?;
-            d.set_item("signing_key_id", &row.signing_key_id)?;
-            d.set_item("signature_verified", row.signature_verified)?;
-            d.set_item("schema_version", &row.schema_version)?;
-            d.set_item("pii_scrubbed", row.pii_scrubbed)?;
-            d.set_item("agent_role", row.agent_role.as_deref())?;
-            d.set_item("agent_template", row.agent_template.as_deref())?;
-            d.set_item("deployment_domain", row.deployment_domain.as_deref())?;
-            d.set_item("deployment_type", row.deployment_type.as_deref())?;
-            d.set_item("deployment_region", row.deployment_region.as_deref())?;
-            d.set_item(
-                "deployment_trust_mode",
-                row.deployment_trust_mode.as_deref(),
-            )?;
-            list.append(d)?;
-        }
-        Ok(list)
+            let list = pyo3::types::PyList::empty(py);
+            for (event_id, row) in rows {
+                let d = PyDict::new(py);
+                d.set_item("event_id", event_id)?;
+                d.set_item("trace_id", &row.trace_id)?;
+                d.set_item("thought_id", &row.thought_id)?;
+                d.set_item("task_id", row.task_id.as_deref())?;
+                d.set_item("step_point", row.step_point.as_deref())?;
+                d.set_item("event_type", row.event_type.as_str())?;
+                d.set_item("attempt_index", row.attempt_index)?;
+                d.set_item("ts", row.ts.to_rfc3339())?;
+                d.set_item("agent_name", row.agent_name.as_deref())?;
+                d.set_item("agent_id_hash", &row.agent_id_hash)?;
+                d.set_item("cognitive_state", row.cognitive_state.as_deref())?;
+                d.set_item("trace_level", trace_level_str(row.trace_level))?;
+                d.set_item(
+                    "payload",
+                    pyo3::types::PyString::new(
+                        py,
+                        &serde_json::to_string(&serde_json::Value::Object(row.payload))
+                            .unwrap_or_default(),
+                    ),
+                )?;
+                d.set_item("cost_llm_calls", row.cost_llm_calls)?;
+                d.set_item("cost_tokens", row.cost_tokens)?;
+                d.set_item("cost_usd", row.cost_usd)?;
+                d.set_item("signature", &row.signature)?;
+                d.set_item("signing_key_id", &row.signing_key_id)?;
+                d.set_item("signature_verified", row.signature_verified)?;
+                d.set_item("schema_version", &row.schema_version)?;
+                d.set_item("pii_scrubbed", row.pii_scrubbed)?;
+                d.set_item("agent_role", row.agent_role.as_deref())?;
+                d.set_item("agent_template", row.agent_template.as_deref())?;
+                d.set_item("deployment_domain", row.deployment_domain.as_deref())?;
+                d.set_item("deployment_type", row.deployment_type.as_deref())?;
+                d.set_item("deployment_region", row.deployment_region.as_deref())?;
+                d.set_item(
+                    "deployment_trust_mode",
+                    row.deployment_trust_mode.as_deref(),
+                )?;
+                list.append(d)?;
+            }
+            Ok(list)
+        })
     }
 
     /// v0.3.6 (CIRISPersist#14) — Hybrid Ed25519 + ML-DSA-65 verify
@@ -1553,53 +1619,55 @@ impl PyEngine {
         soft_freshness_window_seconds: Option<f64>,
         row_age_seconds: Option<f64>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        use crate::verify::VerifyOutcome;
-        let parsed_policy = parse_hybrid_policy(policy, soft_freshness_window_seconds)?;
+        catch_panic(|| {
+            use crate::verify::VerifyOutcome;
+            let parsed_policy = parse_hybrid_policy(policy, soft_freshness_window_seconds)?;
 
-        let row_age = row_age_seconds.and_then(|s| {
-            if s.is_finite() && s >= 0.0 {
-                Some(std::time::Duration::from_secs_f64(s))
-            } else {
-                None
-            }
-        });
+            let row_age = row_age_seconds.and_then(|s| {
+                if s.is_finite() && s >= 0.0 {
+                    Some(std::time::Duration::from_secs_f64(s))
+                } else {
+                    None
+                }
+            });
 
-        let outcome = crate::verify::verify_hybrid(
-            canonical_bytes,
-            ed25519_sig_b64,
-            ml_dsa_65_sig_b64,
-            ed25519_pubkey_b64,
-            ml_dsa_65_pubkey_b64,
-            parsed_policy,
-            row_age,
-        )
-        .map_err(|e| {
-            // Stable token → ValueError per persist's FFI discipline.
-            // Verbose Display goes to tracing logs only.
-            tracing::warn!(error = %e, kind = e.kind(), "verify_hybrid rejected");
-            PyValueError::new_err(e.kind())
-        })?;
+            let outcome = crate::verify::verify_hybrid(
+                canonical_bytes,
+                ed25519_sig_b64,
+                ml_dsa_65_sig_b64,
+                ed25519_pubkey_b64,
+                ml_dsa_65_pubkey_b64,
+                parsed_policy,
+                row_age,
+            )
+            .map_err(|e| {
+                // Stable token → ValueError per persist's FFI discipline.
+                // Verbose Display goes to tracing logs only.
+                tracing::warn!(error = %e, kind = e.kind(), "verify_hybrid rejected");
+                PyValueError::new_err(e.kind())
+            })?;
 
-        let dict = PyDict::new(py);
-        match outcome {
-            VerifyOutcome::HybridVerified => {
-                dict.set_item("outcome", "hybrid_verified")?;
-                dict.set_item("row_age_seconds", py.None())?;
-            }
-            VerifyOutcome::Ed25519VerifiedHybridPending { row_age } => {
-                dict.set_item("outcome", "ed25519_hybrid_pending")?;
-                let secs = row_age.map(|d| d.as_secs_f64());
-                match secs {
-                    Some(s) => dict.set_item("row_age_seconds", s)?,
-                    None => dict.set_item("row_age_seconds", py.None())?,
+            let dict = PyDict::new(py);
+            match outcome {
+                VerifyOutcome::HybridVerified => {
+                    dict.set_item("outcome", "hybrid_verified")?;
+                    dict.set_item("row_age_seconds", py.None())?;
+                }
+                VerifyOutcome::Ed25519VerifiedHybridPending { row_age } => {
+                    dict.set_item("outcome", "ed25519_hybrid_pending")?;
+                    let secs = row_age.map(|d| d.as_secs_f64());
+                    match secs {
+                        Some(s) => dict.set_item("row_age_seconds", s)?,
+                        None => dict.set_item("row_age_seconds", py.None())?,
+                    }
+                }
+                VerifyOutcome::Ed25519VerifiedFallback => {
+                    dict.set_item("outcome", "ed25519_fallback")?;
+                    dict.set_item("row_age_seconds", py.None())?;
                 }
             }
-            VerifyOutcome::Ed25519VerifiedFallback => {
-                dict.set_item("outcome", "ed25519_fallback")?;
-                dict.set_item("row_age_seconds", py.None())?;
-            }
-        }
-        Ok(dict)
+            Ok(dict)
+        })
     }
 
     // ─── Verify surface for federation peer cutover (v0.4.0) ────
@@ -1627,23 +1695,25 @@ impl PyEngine {
         py: Python<'py>,
         complete_trace_json: &str,
     ) -> PyResult<Bound<'py, PyDict>> {
-        use crate::schema::CompleteTrace;
-        use crate::verify::{verify_trace_via_directory, PythonJsonDumpsCanonicalizer};
-        let trace: CompleteTrace = serde_json::from_str(complete_trace_json)
-            .map_err(|e| PyValueError::new_err(format!("CompleteTrace JSON decode: {e}")))?;
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let key_dir = TraceKeyDirectory { backend, runtime };
-        verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &key_dir).map_err(
-            |e| {
-                tracing::warn!(error = %e, kind = e.kind(), "verify_trace rejected");
-                PyValueError::new_err(e.kind())
-            },
-        )?;
-        let dict = PyDict::new(py);
-        dict.set_item("verified", true)?;
-        dict.set_item("schema_version", trace.trace_schema_version.as_str())?;
-        Ok(dict)
+        catch_panic(|| {
+            use crate::schema::CompleteTrace;
+            use crate::verify::{verify_trace_via_directory, PythonJsonDumpsCanonicalizer};
+            let trace: CompleteTrace = serde_json::from_str(complete_trace_json)
+                .map_err(|e| PyValueError::new_err(format!("CompleteTrace JSON decode: {e}")))?;
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let key_dir = TraceKeyDirectory { backend, runtime };
+            verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &key_dir).map_err(
+                |e| {
+                    tracing::warn!(error = %e, kind = e.kind(), "verify_trace rejected");
+                    PyValueError::new_err(e.kind())
+                },
+            )?;
+            let dict = PyDict::new(py);
+            dict.set_item("verified", true)?;
+            dict.set_item("schema_version", trace.trace_schema_version.as_str())?;
+            Ok(dict)
+        })
     }
 
     /// v0.4.0 / v0.4.1 — Hybrid verify with internal directory
@@ -1682,24 +1752,25 @@ impl PyEngine {
         soft_freshness_window_seconds: Option<f64>,
         row_age_seconds: Option<f64>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        use crate::verify::{HybridPolicy, VerifyOutcome};
-        let parsed_policy = parse_hybrid_policy(policy, soft_freshness_window_seconds)?;
-        let row_age = row_age_seconds.and_then(|s| {
-            if s.is_finite() && s >= 0.0 {
-                Some(std::time::Duration::from_secs_f64(s))
-            } else {
-                None
-            }
-        });
+        catch_panic(|| {
+            use crate::verify::{HybridPolicy, VerifyOutcome};
+            let parsed_policy = parse_hybrid_policy(policy, soft_freshness_window_seconds)?;
+            let row_age = row_age_seconds.and_then(|s| {
+                if s.is_finite() && s >= 0.0 {
+                    Some(std::time::Duration::from_secs_f64(s))
+                } else {
+                    None
+                }
+            });
 
-        let canonical_owned = canonical_bytes.to_vec();
-        let key_id_owned = signature_key_id.to_owned();
-        let ed25519_owned = ed25519_sig_b64.to_owned();
-        let pqc_owned = ml_dsa_65_sig_b64.map(str::to_owned);
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
+            let canonical_owned = canonical_bytes.to_vec();
+            let key_id_owned = signature_key_id.to_owned();
+            let ed25519_owned = ed25519_sig_b64.to_owned();
+            let pqc_owned = ml_dsa_65_sig_b64.map(str::to_owned);
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
 
-        let outcome = py
+            let outcome = py
             .detach(move || {
                 runtime.block_on(async move {
                     crate::verify::verify_hybrid_via_directory(
@@ -1724,27 +1795,28 @@ impl PyEngine {
                 }
             })?;
 
-        let _ = HybridPolicy::Strict; // keep import live across feature combos
-        let dict = PyDict::new(py);
-        match outcome {
-            VerifyOutcome::HybridVerified => {
-                dict.set_item("outcome", "hybrid_verified")?;
-                dict.set_item("row_age_seconds", py.None())?;
-            }
-            VerifyOutcome::Ed25519VerifiedHybridPending { row_age } => {
-                dict.set_item("outcome", "ed25519_hybrid_pending")?;
-                let secs = row_age.map(|d| d.as_secs_f64());
-                match secs {
-                    Some(s) => dict.set_item("row_age_seconds", s)?,
-                    None => dict.set_item("row_age_seconds", py.None())?,
+            let _ = HybridPolicy::Strict; // keep import live across feature combos
+            let dict = PyDict::new(py);
+            match outcome {
+                VerifyOutcome::HybridVerified => {
+                    dict.set_item("outcome", "hybrid_verified")?;
+                    dict.set_item("row_age_seconds", py.None())?;
+                }
+                VerifyOutcome::Ed25519VerifiedHybridPending { row_age } => {
+                    dict.set_item("outcome", "ed25519_hybrid_pending")?;
+                    let secs = row_age.map(|d| d.as_secs_f64());
+                    match secs {
+                        Some(s) => dict.set_item("row_age_seconds", s)?,
+                        None => dict.set_item("row_age_seconds", py.None())?,
+                    }
+                }
+                VerifyOutcome::Ed25519VerifiedFallback => {
+                    dict.set_item("outcome", "ed25519_fallback")?;
+                    dict.set_item("row_age_seconds", py.None())?;
                 }
             }
-            VerifyOutcome::Ed25519VerifiedFallback => {
-                dict.set_item("outcome", "ed25519_fallback")?;
-                dict.set_item("row_age_seconds", py.None())?;
-            }
-        }
-        Ok(dict)
+            Ok(dict)
+        })
     }
 
     /// v0.4.1 (CIRISEdge ask) — Strip-then-canonicalize an envelope
@@ -1756,12 +1828,14 @@ impl PyEngine {
         py: Python<'py>,
         envelope_json: &str,
     ) -> PyResult<Py<PyBytes>> {
-        let value: serde_json::Value = serde_json::from_str(envelope_json)
-            .map_err(|e| PyValueError::new_err(format!("envelope JSON decode: {e}")))?;
-        let bytes = crate::verify::canonicalize_envelope_for_signing(&value).map_err(|e| {
-            PyRuntimeError::new_err(format!("canonicalize_envelope_for_signing: {e}"))
-        })?;
-        Ok(PyBytes::new(py, &bytes).unbind())
+        catch_panic(|| {
+            let value: serde_json::Value = serde_json::from_str(envelope_json)
+                .map_err(|e| PyValueError::new_err(format!("envelope JSON decode: {e}")))?;
+            let bytes = crate::verify::canonicalize_envelope_for_signing(&value).map_err(|e| {
+                PyRuntimeError::new_err(format!("canonicalize_envelope_for_signing: {e}"))
+            })?;
+            Ok(PyBytes::new(py, &bytes).unbind())
+        })
     }
 
     /// v0.4.1 (CIRISEdge ask) — SHA-256 of body verbatim wire bytes.
@@ -1769,11 +1843,13 @@ impl PyEngine {
     /// `in_reply_to` content-derived ACK matching. Persist hashes
     /// the bytes as supplied — does NOT re-canonicalize.
     fn body_sha256<'py>(&self, py: Python<'py>, body_bytes: &[u8]) -> PyResult<Py<PyBytes>> {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(body_bytes);
-        let digest: [u8; 32] = hasher.finalize().into();
-        Ok(PyBytes::new(py, &digest).unbind())
+        catch_panic(|| {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(body_bytes);
+            let digest: [u8; 32] = hasher.finalize().into();
+            Ok(PyBytes::new(py, &digest).unbind())
+        })
     }
 
     /// v0.4.0 — Verify a `SignedKeyRecord` envelope's scrub
@@ -1800,20 +1876,23 @@ impl PyEngine {
         soft_freshness_window_seconds: Option<f64>,
         row_age_seconds: Option<f64>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let signed: crate::federation::SignedKeyRecord =
-            serde_json::from_str(signed_key_record_json)
-                .map_err(|e| PyValueError::new_err(format!("SignedKeyRecord JSON decode: {e}")))?;
-        let canonical = canonicalize_envelope_value(&signed.record.registration_envelope)?;
-        self.verify_hybrid_via_directory(
-            py,
-            &canonical,
-            &signed.record.scrub_key_id,
-            &signed.record.scrub_signature_classical,
-            signed.record.scrub_signature_pqc.as_deref(),
-            policy,
-            soft_freshness_window_seconds,
-            row_age_seconds,
-        )
+        catch_panic(|| {
+            let signed: crate::federation::SignedKeyRecord =
+                serde_json::from_str(signed_key_record_json).map_err(|e| {
+                    PyValueError::new_err(format!("SignedKeyRecord JSON decode: {e}"))
+                })?;
+            let canonical = canonicalize_envelope_value(&signed.record.registration_envelope)?;
+            self.verify_hybrid_via_directory(
+                py,
+                &canonical,
+                &signed.record.scrub_key_id,
+                &signed.record.scrub_signature_classical,
+                signed.record.scrub_signature_pqc.as_deref(),
+                policy,
+                soft_freshness_window_seconds,
+                row_age_seconds,
+            )
+        })
     }
 
     /// v0.4.0 — Verify a `SignedAttestation` envelope. Same shape
@@ -1833,21 +1912,23 @@ impl PyEngine {
         soft_freshness_window_seconds: Option<f64>,
         row_age_seconds: Option<f64>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let signed: crate::federation::SignedAttestation =
-            serde_json::from_str(signed_attestation_json).map_err(|e| {
-                PyValueError::new_err(format!("SignedAttestation JSON decode: {e}"))
-            })?;
-        let canonical = canonicalize_envelope_value(&signed.attestation.attestation_envelope)?;
-        self.verify_hybrid_via_directory(
-            py,
-            &canonical,
-            &signed.attestation.scrub_key_id,
-            &signed.attestation.scrub_signature_classical,
-            signed.attestation.scrub_signature_pqc.as_deref(),
-            policy,
-            soft_freshness_window_seconds,
-            row_age_seconds,
-        )
+        catch_panic(|| {
+            let signed: crate::federation::SignedAttestation =
+                serde_json::from_str(signed_attestation_json).map_err(|e| {
+                    PyValueError::new_err(format!("SignedAttestation JSON decode: {e}"))
+                })?;
+            let canonical = canonicalize_envelope_value(&signed.attestation.attestation_envelope)?;
+            self.verify_hybrid_via_directory(
+                py,
+                &canonical,
+                &signed.attestation.scrub_key_id,
+                &signed.attestation.scrub_signature_classical,
+                signed.attestation.scrub_signature_pqc.as_deref(),
+                policy,
+                soft_freshness_window_seconds,
+                row_age_seconds,
+            )
+        })
     }
 
     /// v0.4.0 — Verify a `SignedRevocation` envelope. Same shape
@@ -1867,20 +1948,23 @@ impl PyEngine {
         soft_freshness_window_seconds: Option<f64>,
         row_age_seconds: Option<f64>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let signed: crate::federation::SignedRevocation =
-            serde_json::from_str(signed_revocation_json)
-                .map_err(|e| PyValueError::new_err(format!("SignedRevocation JSON decode: {e}")))?;
-        let canonical = canonicalize_envelope_value(&signed.revocation.revocation_envelope)?;
-        self.verify_hybrid_via_directory(
-            py,
-            &canonical,
-            &signed.revocation.scrub_key_id,
-            &signed.revocation.scrub_signature_classical,
-            signed.revocation.scrub_signature_pqc.as_deref(),
-            policy,
-            soft_freshness_window_seconds,
-            row_age_seconds,
-        )
+        catch_panic(|| {
+            let signed: crate::federation::SignedRevocation =
+                serde_json::from_str(signed_revocation_json).map_err(|e| {
+                    PyValueError::new_err(format!("SignedRevocation JSON decode: {e}"))
+                })?;
+            let canonical = canonicalize_envelope_value(&signed.revocation.revocation_envelope)?;
+            self.verify_hybrid_via_directory(
+                py,
+                &canonical,
+                &signed.revocation.scrub_key_id,
+                &signed.revocation.scrub_signature_classical,
+                signed.revocation.scrub_signature_pqc.as_deref(),
+                policy,
+                soft_freshness_window_seconds,
+                row_age_seconds,
+            )
+        })
     }
 
     // ─── Edge outbound queue (v0.4.0, CIRISPersist#16) ──────────
@@ -1923,48 +2007,50 @@ impl PyEngine {
         initial_next_attempt_after_rfc3339: &str,
         ack_timeout_seconds: Option<i64>,
     ) -> PyResult<String> {
-        if body_sha256.len() != 32 {
-            return Err(PyValueError::new_err(format!(
-                "body_sha256 must be 32 bytes, got {}",
-                body_sha256.len()
-            )));
-        }
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(body_sha256);
-        let initial_next: chrono::DateTime<chrono::Utc> =
-            initial_next_attempt_after_rfc3339.parse().map_err(|e| {
-                PyValueError::new_err(format!("initial_next_attempt_after_rfc3339 parse: {e}"))
-            })?;
+        catch_panic(|| {
+            if body_sha256.len() != 32 {
+                return Err(PyValueError::new_err(format!(
+                    "body_sha256 must be 32 bytes, got {}",
+                    body_sha256.len()
+                )));
+            }
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(body_sha256);
+            let initial_next: chrono::DateTime<chrono::Utc> =
+                initial_next_attempt_after_rfc3339.parse().map_err(|e| {
+                    PyValueError::new_err(format!("initial_next_attempt_after_rfc3339 parse: {e}"))
+                })?;
 
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let sender = sender_key_id.to_owned();
-        let dest = destination_key_id.to_owned();
-        let mt = message_type.to_owned();
-        let esv = edge_schema_version.to_owned();
-        let env_bytes = envelope_bytes.to_vec();
-        py.detach(move || {
-            runtime.block_on(async move {
-                use crate::outbound::OutboundQueue;
-                backend
-                    .enqueue_outbound(
-                        &sender,
-                        &dest,
-                        &mt,
-                        &esv,
-                        &env_bytes,
-                        &hash,
-                        body_size_bytes,
-                        requires_ack,
-                        ack_timeout_seconds,
-                        max_attempts,
-                        ttl_seconds,
-                        initial_next,
-                    )
-                    .await
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let sender = sender_key_id.to_owned();
+            let dest = destination_key_id.to_owned();
+            let mt = message_type.to_owned();
+            let esv = edge_schema_version.to_owned();
+            let env_bytes = envelope_bytes.to_vec();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::outbound::OutboundQueue;
+                    backend
+                        .enqueue_outbound(
+                            &sender,
+                            &dest,
+                            &mt,
+                            &esv,
+                            &env_bytes,
+                            &hash,
+                            body_size_bytes,
+                            requires_ack,
+                            ack_timeout_seconds,
+                            max_attempts,
+                            ttl_seconds,
+                            initial_next,
+                        )
+                        .await
+                })
             })
+            .map_err(outbound_err_to_py)
         })
-        .map_err(outbound_err_to_py)
     }
 
     /// v0.4.0 — Atomic claim of up to `batch_size` pending rows.
@@ -1977,24 +2063,26 @@ impl PyEngine {
         claim_duration_seconds: i64,
         claimed_by: &str,
     ) -> PyResult<pyo3::Bound<'py, pyo3::types::PyList>> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let claimed_by_owned = claimed_by.to_owned();
-        let rows = py
-            .detach(move || {
-                runtime.block_on(async move {
-                    use crate::outbound::OutboundQueue;
-                    backend
-                        .claim_pending_outbound(
-                            batch_size,
-                            claim_duration_seconds,
-                            &claimed_by_owned,
-                        )
-                        .await
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let claimed_by_owned = claimed_by.to_owned();
+            let rows = py
+                .detach(move || {
+                    runtime.block_on(async move {
+                        use crate::outbound::OutboundQueue;
+                        backend
+                            .claim_pending_outbound(
+                                batch_size,
+                                claim_duration_seconds,
+                                &claimed_by_owned,
+                            )
+                            .await
+                    })
                 })
-            })
-            .map_err(outbound_err_to_py)?;
-        outbound_rows_to_pylist(py, rows)
+                .map_err(outbound_err_to_py)?;
+            outbound_rows_to_pylist(py, rows)
+        })
     }
 
     /// v0.4.0 — Transport reports successful delivery. Transitions
@@ -2006,17 +2094,19 @@ impl PyEngine {
         queue_id: &str,
         transport: &str,
     ) -> PyResult<()> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let qid = queue_id.to_owned();
-        let transport = transport.to_owned();
-        py.detach(move || {
-            runtime.block_on(async move {
-                use crate::outbound::OutboundQueue;
-                backend.mark_transport_delivered(&qid, &transport).await
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let qid = queue_id.to_owned();
+            let transport = transport.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::outbound::OutboundQueue;
+                    backend.mark_transport_delivered(&qid, &transport).await
+                })
             })
+            .map_err(outbound_err_to_py)
         })
-        .map_err(outbound_err_to_py)
     }
 
     /// v0.4.0 — Transport reports failure. Returns a dict shaped
@@ -2030,53 +2120,58 @@ impl PyEngine {
         transport: &str,
         next_attempt_after_rfc3339: &str,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let next_attempt_after: chrono::DateTime<chrono::Utc> = next_attempt_after_rfc3339
-            .parse()
-            .map_err(|e| PyValueError::new_err(format!("next_attempt_after_rfc3339 parse: {e}")))?;
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let qid = queue_id.to_owned();
-        let ec = error_class.to_owned();
-        let ed = error_detail.to_owned();
-        let transport = transport.to_owned();
-        let outcome = py
-            .detach(move || {
-                runtime.block_on(async move {
-                    use crate::outbound::OutboundQueue;
-                    backend
-                        .mark_transport_failed(&qid, &ec, &ed, &transport, next_attempt_after)
-                        .await
+        catch_panic(|| {
+            let next_attempt_after: chrono::DateTime<chrono::Utc> =
+                next_attempt_after_rfc3339.parse().map_err(|e| {
+                    PyValueError::new_err(format!("next_attempt_after_rfc3339 parse: {e}"))
+                })?;
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let qid = queue_id.to_owned();
+            let ec = error_class.to_owned();
+            let ed = error_detail.to_owned();
+            let transport = transport.to_owned();
+            let outcome = py
+                .detach(move || {
+                    runtime.block_on(async move {
+                        use crate::outbound::OutboundQueue;
+                        backend
+                            .mark_transport_failed(&qid, &ec, &ed, &transport, next_attempt_after)
+                            .await
+                    })
                 })
-            })
-            .map_err(outbound_err_to_py)?;
-        let dict = PyDict::new(py);
-        match outcome {
-            crate::outbound::OutboundFailureOutcome::Retrying { attempt } => {
-                dict.set_item("outcome", "retrying")?;
-                dict.set_item("attempt", attempt)?;
+                .map_err(outbound_err_to_py)?;
+            let dict = PyDict::new(py);
+            match outcome {
+                crate::outbound::OutboundFailureOutcome::Retrying { attempt } => {
+                    dict.set_item("outcome", "retrying")?;
+                    dict.set_item("attempt", attempt)?;
+                }
+                crate::outbound::OutboundFailureOutcome::Abandoned => {
+                    dict.set_item("outcome", "abandoned")?;
+                    dict.set_item("attempt", py.None())?;
+                }
             }
-            crate::outbound::OutboundFailureOutcome::Abandoned => {
-                dict.set_item("outcome", "abandoned")?;
-                dict.set_item("attempt", py.None())?;
-            }
-        }
-        Ok(dict)
+            Ok(dict)
+        })
     }
 
     /// v0.4.0 — Treat a previously-sent row as delivered (the
     /// receiver replied `replay_detected`; the original send already
     /// landed before the ACK could arrive).
     fn mark_replay_resolved(&self, py: Python<'_>, queue_id: &str) -> PyResult<()> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let qid = queue_id.to_owned();
-        py.detach(move || {
-            runtime.block_on(async move {
-                use crate::outbound::OutboundQueue;
-                backend.mark_replay_resolved(&qid).await
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let qid = queue_id.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::outbound::OutboundQueue;
+                    backend.mark_replay_resolved(&qid).await
+                })
             })
+            .map_err(outbound_err_to_py)
         })
-        .map_err(outbound_err_to_py)
     }
 
     /// v0.4.0 — Look up an `awaiting_ack` row by the receiver's
@@ -2086,28 +2181,30 @@ impl PyEngine {
         py: Python<'py>,
         in_reply_to_sha256: &[u8],
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
-        if in_reply_to_sha256.len() != 32 {
-            return Err(PyValueError::new_err(format!(
-                "in_reply_to_sha256 must be 32 bytes, got {}",
-                in_reply_to_sha256.len()
-            )));
-        }
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(in_reply_to_sha256);
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let row_opt = py
-            .detach(move || {
-                runtime.block_on(async move {
-                    use crate::outbound::OutboundQueue;
-                    backend.match_ack_to_outbound(&hash).await
+        catch_panic(|| {
+            if in_reply_to_sha256.len() != 32 {
+                return Err(PyValueError::new_err(format!(
+                    "in_reply_to_sha256 must be 32 bytes, got {}",
+                    in_reply_to_sha256.len()
+                )));
+            }
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(in_reply_to_sha256);
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let row_opt = py
+                .detach(move || {
+                    runtime.block_on(async move {
+                        use crate::outbound::OutboundQueue;
+                        backend.match_ack_to_outbound(&hash).await
+                    })
                 })
-            })
-            .map_err(outbound_err_to_py)?;
-        match row_opt {
-            None => Ok(None),
-            Some(r) => Ok(Some(outbound_row_to_pydict(py, &r)?)),
-        }
+                .map_err(outbound_err_to_py)?;
+            match row_opt {
+                None => Ok(None),
+                Some(r) => Ok(Some(outbound_row_to_pydict(py, &r)?)),
+            }
+        })
     }
 
     /// v0.4.0 — Record the receiver's ACK envelope on a matched
@@ -2118,58 +2215,66 @@ impl PyEngine {
         queue_id: &str,
         ack_envelope_bytes: &[u8],
     ) -> PyResult<()> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let qid = queue_id.to_owned();
-        let ack = ack_envelope_bytes.to_vec();
-        py.detach(move || {
-            runtime.block_on(async move {
-                use crate::outbound::OutboundQueue;
-                backend.mark_ack_received(&qid, &ack).await
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let qid = queue_id.to_owned();
+            let ack = ack_envelope_bytes.to_vec();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::outbound::OutboundQueue;
+                    backend.mark_ack_received(&qid, &ack).await
+                })
             })
+            .map_err(outbound_err_to_py)
         })
-        .map_err(outbound_err_to_py)
     }
 
     /// v0.4.0 — Sweep ACK timeouts. Returns the count of rows
     /// touched (retried or abandoned).
     fn sweep_ack_timeouts(&self, py: Python<'_>) -> PyResult<i64> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        py.detach(move || {
-            runtime.block_on(async move {
-                use crate::outbound::OutboundQueue;
-                backend.sweep_ack_timeouts().await
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::outbound::OutboundQueue;
+                    backend.sweep_ack_timeouts().await
+                })
             })
+            .map_err(outbound_err_to_py)
         })
-        .map_err(outbound_err_to_py)
     }
 
     /// v0.4.0 — Sweep TTL-expired rows.
     fn sweep_ttl_expired(&self, py: Python<'_>) -> PyResult<i64> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        py.detach(move || {
-            runtime.block_on(async move {
-                use crate::outbound::OutboundQueue;
-                backend.sweep_ttl_expired().await
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::outbound::OutboundQueue;
+                    backend.sweep_ttl_expired().await
+                })
             })
+            .map_err(outbound_err_to_py)
         })
-        .map_err(outbound_err_to_py)
     }
 
     /// v0.4.0 — Sweep expired claims (revert sending → pending for
     /// rows whose claimed_until elapsed).
     fn sweep_expired_claims(&self, py: Python<'_>) -> PyResult<i64> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        py.detach(move || {
-            runtime.block_on(async move {
-                use crate::outbound::OutboundQueue;
-                backend.sweep_expired_claims().await
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::outbound::OutboundQueue;
+                    backend.sweep_expired_claims().await
+                })
             })
+            .map_err(outbound_err_to_py)
         })
-        .map_err(outbound_err_to_py)
     }
 
     /// v0.4.0 — Look up a row by queue_id. Returns the row dict or
@@ -2179,21 +2284,23 @@ impl PyEngine {
         py: Python<'py>,
         queue_id: &str,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let qid = queue_id.to_owned();
-        let row_opt = py
-            .detach(move || {
-                runtime.block_on(async move {
-                    use crate::outbound::OutboundQueue;
-                    backend.outbound_status(&qid).await
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let qid = queue_id.to_owned();
+            let row_opt = py
+                .detach(move || {
+                    runtime.block_on(async move {
+                        use crate::outbound::OutboundQueue;
+                        backend.outbound_status(&qid).await
+                    })
                 })
-            })
-            .map_err(outbound_err_to_py)?;
-        match row_opt {
-            None => Ok(None),
-            Some(r) => Ok(Some(outbound_row_to_pydict(py, &r)?)),
-        }
+                .map_err(outbound_err_to_py)?;
+            match row_opt {
+                None => Ok(None),
+                Some(r) => Ok(Some(outbound_row_to_pydict(py, &r)?)),
+            }
+        })
     }
 
     /// v0.4.0 — List outbound rows with optional filters. Returns
@@ -2218,66 +2325,72 @@ impl PyEngine {
         message_type: Option<&str>,
         enqueued_after_rfc3339: Option<&str>,
     ) -> PyResult<pyo3::Bound<'py, pyo3::types::PyList>> {
-        let status_parsed = match status {
-            Some(s) => Some(
-                crate::outbound::OutboundStatus::from_wire_str(s)
-                    .ok_or_else(|| PyValueError::new_err(format!("unknown status: {s}")))?,
-            ),
-            None => None,
-        };
-        let enqueued_after = match enqueued_after_rfc3339 {
-            Some(s) => Some(s.parse::<chrono::DateTime<chrono::Utc>>().map_err(|e| {
-                PyValueError::new_err(format!("enqueued_after_rfc3339 parse: {e}"))
-            })?),
-            None => None,
-        };
-        let filter = crate::outbound::OutboundFilter {
-            status: status_parsed,
-            destination_key_id: destination_key_id.map(str::to_owned),
-            sender_key_id: sender_key_id.map(str::to_owned),
-            message_type: message_type.map(str::to_owned),
-            enqueued_after,
-        };
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let rows = py
-            .detach(move || {
-                runtime.block_on(async move {
-                    use crate::outbound::OutboundQueue;
-                    backend.list_outbound(filter, limit).await
+        catch_panic(|| {
+            let status_parsed = match status {
+                Some(s) => Some(
+                    crate::outbound::OutboundStatus::from_wire_str(s)
+                        .ok_or_else(|| PyValueError::new_err(format!("unknown status: {s}")))?,
+                ),
+                None => None,
+            };
+            let enqueued_after = match enqueued_after_rfc3339 {
+                Some(s) => Some(s.parse::<chrono::DateTime<chrono::Utc>>().map_err(|e| {
+                    PyValueError::new_err(format!("enqueued_after_rfc3339 parse: {e}"))
+                })?),
+                None => None,
+            };
+            let filter = crate::outbound::OutboundFilter {
+                status: status_parsed,
+                destination_key_id: destination_key_id.map(str::to_owned),
+                sender_key_id: sender_key_id.map(str::to_owned),
+                message_type: message_type.map(str::to_owned),
+                enqueued_after,
+            };
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let rows = py
+                .detach(move || {
+                    runtime.block_on(async move {
+                        use crate::outbound::OutboundQueue;
+                        backend.list_outbound(filter, limit).await
+                    })
                 })
-            })
-            .map_err(outbound_err_to_py)?;
-        outbound_rows_to_pylist(py, rows)
+                .map_err(outbound_err_to_py)?;
+            outbound_rows_to_pylist(py, rows)
+        })
     }
 
     /// v0.4.0 — Operator-driven cancellation. Idempotent.
     fn cancel_outbound(&self, py: Python<'_>, queue_id: &str) -> PyResult<()> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let qid = queue_id.to_owned();
-        py.detach(move || {
-            runtime.block_on(async move {
-                use crate::outbound::OutboundQueue;
-                backend.cancel_outbound(&qid).await
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let qid = queue_id.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::outbound::OutboundQueue;
+                    backend.cancel_outbound(&qid).await
+                })
             })
+            .map_err(outbound_err_to_py)
         })
-        .map_err(outbound_err_to_py)
     }
 
     /// v0.4.0 — Operator-driven replay. Resets attempt_count=0 and
     /// requeues an abandoned row.
     fn replay_abandoned(&self, py: Python<'_>, queue_id: &str) -> PyResult<()> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let qid = queue_id.to_owned();
-        py.detach(move || {
-            runtime.block_on(async move {
-                use crate::outbound::OutboundQueue;
-                backend.replay_abandoned(&qid).await
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let qid = queue_id.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::outbound::OutboundQueue;
+                    backend.replay_abandoned(&qid).await
+                })
             })
+            .map_err(outbound_err_to_py)
         })
-        .map_err(outbound_err_to_py)
     }
 
     // ─── Lens-derived schemas (v0.4.3, CIRISPersist#18) ────────────
@@ -2305,61 +2418,63 @@ impl PyEngine {
     /// with the standard `verify_*` token. On verify success, the
     /// row is inserted (idempotent on `detection_id`).
     fn put_detection_event(&self, py: Python<'_>, event_json: &str) -> PyResult<()> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let event: crate::derived::DetectionEvent = serde_json::from_str(event_json)
-            .map_err(|e| PyValueError::new_err(format!("DetectionEvent JSON decode: {e}")))?;
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let event: crate::derived::DetectionEvent = serde_json::from_str(event_json)
+                .map_err(|e| PyValueError::new_err(format!("DetectionEvent JSON decode: {e}")))?;
 
-        // Hybrid verify under Strict — both signatures required.
-        // canonical_bytes carries the original signed shape; persist
-        // does NOT recanonicalize (CIRISPersist#7 single-source-of-
-        // truth: the canonicalizer ran ONCE upstream; persist verifies
-        // the bytes the signer signed).
-        let canonical_for_verify = event.canonical_bytes.clone();
-        let signing_key_id = event.signing_key_id.clone();
-        let ed25519_b64 = base64_encode(&event.ed25519_sig);
-        let ml_dsa_b64 = base64_encode(&event.ml_dsa_65_sig);
-        let backend_for_verify = backend.clone();
-        let runtime_for_verify = runtime.clone();
+            // Hybrid verify under Strict — both signatures required.
+            // canonical_bytes carries the original signed shape; persist
+            // does NOT recanonicalize (CIRISPersist#7 single-source-of-
+            // truth: the canonicalizer ran ONCE upstream; persist verifies
+            // the bytes the signer signed).
+            let canonical_for_verify = event.canonical_bytes.clone();
+            let signing_key_id = event.signing_key_id.clone();
+            let ed25519_b64 = base64_encode(&event.ed25519_sig);
+            let ml_dsa_b64 = base64_encode(&event.ml_dsa_65_sig);
+            let backend_for_verify = backend.clone();
+            let runtime_for_verify = runtime.clone();
 
-        py.detach(move || {
-            runtime_for_verify.block_on(async move {
-                let outcome = crate::verify::verify_hybrid_via_directory(
-                    &*backend_for_verify,
-                    &canonical_for_verify,
-                    &signing_key_id,
-                    &ed25519_b64,
-                    Some(&ml_dsa_b64),
-                    crate::verify::HybridPolicy::Strict,
-                    None,
-                )
-                .await
-                .map_err(|e| {
-                    let s = e.to_string();
-                    tracing::warn!(
-                        error = %e, kind = e.kind(),
-                        "put_detection_event: hybrid verify rejected"
-                    );
-                    if s.contains("verify_unknown_key") {
-                        PyValueError::new_err("verify_unknown_key")
-                    } else {
-                        PyValueError::new_err(e.kind())
-                    }
-                })?;
-                // Strict policy ONLY accepts HybridVerified; the
-                // verify_hybrid_via_directory call already enforced
-                // this, but assert for defense-in-depth so a future
-                // signature-bypass bug surfaces here rather than
-                // silently storing.
-                if !matches!(outcome, crate::verify::VerifyOutcome::HybridVerified) {
-                    return Err(PyValueError::new_err("hybrid_verify_strict_required"));
-                }
-
-                use crate::derived::DerivedSchema;
-                backend
-                    .put_detection_event(event)
+            py.detach(move || {
+                runtime_for_verify.block_on(async move {
+                    let outcome = crate::verify::verify_hybrid_via_directory(
+                        &*backend_for_verify,
+                        &canonical_for_verify,
+                        &signing_key_id,
+                        &ed25519_b64,
+                        Some(&ml_dsa_b64),
+                        crate::verify::HybridPolicy::Strict,
+                        None,
+                    )
                     .await
-                    .map_err(derived_err_to_py)
+                    .map_err(|e| {
+                        let s = e.to_string();
+                        tracing::warn!(
+                            error = %e, kind = e.kind(),
+                            "put_detection_event: hybrid verify rejected"
+                        );
+                        if s.contains("verify_unknown_key") {
+                            PyValueError::new_err("verify_unknown_key")
+                        } else {
+                            PyValueError::new_err(e.kind())
+                        }
+                    })?;
+                    // Strict policy ONLY accepts HybridVerified; the
+                    // verify_hybrid_via_directory call already enforced
+                    // this, but assert for defense-in-depth so a future
+                    // signature-bypass bug surfaces here rather than
+                    // silently storing.
+                    if !matches!(outcome, crate::verify::VerifyOutcome::HybridVerified) {
+                        return Err(PyValueError::new_err("hybrid_verify_strict_required"));
+                    }
+
+                    use crate::derived::DerivedSchema;
+                    backend
+                        .put_detection_event(event)
+                        .await
+                        .map_err(derived_err_to_py)
+                })
             })
         })
     }
@@ -2369,35 +2484,38 @@ impl PyEngine {
     /// any field may be null/absent). Returns a JSON array string
     /// of `DetectionEvent` objects, ordered by `ts DESC`.
     fn get_detection_events(&self, py: Python<'_>, filter_json: Option<&str>) -> PyResult<String> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let filter: crate::derived::EventFilter = match filter_json {
-            None => crate::derived::EventFilter::default(),
-            Some(s) => {
-                #[derive(serde::Deserialize)]
-                struct EventFilterJson {
-                    trace_id: Option<String>,
-                    detector: Option<String>,
-                    since: Option<chrono::DateTime<chrono::Utc>>,
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let filter: crate::derived::EventFilter = match filter_json {
+                None => crate::derived::EventFilter::default(),
+                Some(s) => {
+                    #[derive(serde::Deserialize)]
+                    struct EventFilterJson {
+                        trace_id: Option<String>,
+                        detector: Option<String>,
+                        since: Option<chrono::DateTime<chrono::Utc>>,
+                    }
+                    let parsed: EventFilterJson = serde_json::from_str(s).map_err(|e| {
+                        PyValueError::new_err(format!("EventFilter JSON decode: {e}"))
+                    })?;
+                    crate::derived::EventFilter {
+                        trace_id: parsed.trace_id,
+                        detector: parsed.detector,
+                        since: parsed.since,
+                    }
                 }
-                let parsed: EventFilterJson = serde_json::from_str(s)
-                    .map_err(|e| PyValueError::new_err(format!("EventFilter JSON decode: {e}")))?;
-                crate::derived::EventFilter {
-                    trace_id: parsed.trace_id,
-                    detector: parsed.detector,
-                    since: parsed.since,
-                }
-            }
-        };
-        py.detach(move || {
-            runtime.block_on(async move {
-                use crate::derived::DerivedSchema;
-                let rows = backend
-                    .get_detection_events(filter)
-                    .await
-                    .map_err(derived_err_to_py)?;
-                serde_json::to_string(&rows).map_err(|e| {
-                    PyRuntimeError::new_err(format!("DetectionEvent JSON encode: {e}"))
+            };
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::derived::DerivedSchema;
+                    let rows = backend
+                        .get_detection_events(filter)
+                        .await
+                        .map_err(derived_err_to_py)?;
+                    serde_json::to_string(&rows).map_err(|e| {
+                        PyRuntimeError::new_err(format!("DetectionEvent JSON encode: {e}"))
+                    })
                 })
             })
         })
@@ -2411,51 +2529,55 @@ impl PyEngine {
     /// flips `is_current` on the previous current row and inserts the
     /// new row in a single transaction.
     fn put_calibration_bundle(&self, py: Python<'_>, bundle_json: &str) -> PyResult<()> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        let bundle: crate::derived::CalibrationBundle = serde_json::from_str(bundle_json)
-            .map_err(|e| PyValueError::new_err(format!("CalibrationBundle JSON decode: {e}")))?;
-
-        let canonical_for_verify = bundle.canonical_bytes.clone();
-        let signing_key_id = bundle.signing_key_id.clone();
-        let ed25519_b64 = base64_encode(&bundle.ed25519_sig);
-        let ml_dsa_b64 = base64_encode(&bundle.ml_dsa_65_sig);
-        let backend_for_verify = backend.clone();
-        let runtime_for_verify = runtime.clone();
-
-        py.detach(move || {
-            runtime_for_verify.block_on(async move {
-                let outcome = crate::verify::verify_hybrid_via_directory(
-                    &*backend_for_verify,
-                    &canonical_for_verify,
-                    &signing_key_id,
-                    &ed25519_b64,
-                    Some(&ml_dsa_b64),
-                    crate::verify::HybridPolicy::Strict,
-                    None,
-                )
-                .await
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let bundle: crate::derived::CalibrationBundle = serde_json::from_str(bundle_json)
                 .map_err(|e| {
-                    let s = e.to_string();
-                    tracing::warn!(
-                        error = %e, kind = e.kind(),
-                        "put_calibration_bundle: hybrid verify rejected"
-                    );
-                    if s.contains("verify_unknown_key") {
-                        PyValueError::new_err("verify_unknown_key")
-                    } else {
-                        PyValueError::new_err(e.kind())
-                    }
+                    PyValueError::new_err(format!("CalibrationBundle JSON decode: {e}"))
                 })?;
-                if !matches!(outcome, crate::verify::VerifyOutcome::HybridVerified) {
-                    return Err(PyValueError::new_err("hybrid_verify_strict_required"));
-                }
 
-                use crate::derived::DerivedSchema;
-                backend
-                    .put_calibration_bundle(bundle)
+            let canonical_for_verify = bundle.canonical_bytes.clone();
+            let signing_key_id = bundle.signing_key_id.clone();
+            let ed25519_b64 = base64_encode(&bundle.ed25519_sig);
+            let ml_dsa_b64 = base64_encode(&bundle.ml_dsa_65_sig);
+            let backend_for_verify = backend.clone();
+            let runtime_for_verify = runtime.clone();
+
+            py.detach(move || {
+                runtime_for_verify.block_on(async move {
+                    let outcome = crate::verify::verify_hybrid_via_directory(
+                        &*backend_for_verify,
+                        &canonical_for_verify,
+                        &signing_key_id,
+                        &ed25519_b64,
+                        Some(&ml_dsa_b64),
+                        crate::verify::HybridPolicy::Strict,
+                        None,
+                    )
                     .await
-                    .map_err(derived_err_to_py)
+                    .map_err(|e| {
+                        let s = e.to_string();
+                        tracing::warn!(
+                            error = %e, kind = e.kind(),
+                            "put_calibration_bundle: hybrid verify rejected"
+                        );
+                        if s.contains("verify_unknown_key") {
+                            PyValueError::new_err("verify_unknown_key")
+                        } else {
+                            PyValueError::new_err(e.kind())
+                        }
+                    })?;
+                    if !matches!(outcome, crate::verify::VerifyOutcome::HybridVerified) {
+                        return Err(PyValueError::new_err("hybrid_verify_strict_required"));
+                    }
+
+                    use crate::derived::DerivedSchema;
+                    backend
+                        .put_calibration_bundle(bundle)
+                        .await
+                        .map_err(derived_err_to_py)
+                })
             })
         })
     }
@@ -2463,21 +2585,23 @@ impl PyEngine {
     /// Lens-derived: get the bundle with `is_current = TRUE`.
     /// Returns JSON-encoded `CalibrationBundle` or `None`.
     fn get_current_calibration_bundle(&self, py: Python<'_>) -> PyResult<Option<String>> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        py.detach(move || {
-            runtime.block_on(async move {
-                use crate::derived::DerivedSchema;
-                let opt = backend
-                    .get_current_calibration_bundle()
-                    .await
-                    .map_err(derived_err_to_py)?;
-                match opt {
-                    None => Ok(None),
-                    Some(b) => Ok(Some(serde_json::to_string(&b).map_err(|e| {
-                        PyRuntimeError::new_err(format!("CalibrationBundle JSON encode: {e}"))
-                    })?)),
-                }
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::derived::DerivedSchema;
+                    let opt = backend
+                        .get_current_calibration_bundle()
+                        .await
+                        .map_err(derived_err_to_py)?;
+                    match opt {
+                        None => Ok(None),
+                        Some(b) => Ok(Some(serde_json::to_string(&b).map_err(|e| {
+                            PyRuntimeError::new_err(format!("CalibrationBundle JSON encode: {e}"))
+                        })?)),
+                    }
+                })
             })
         })
     }
@@ -2489,21 +2613,23 @@ impl PyEngine {
         py: Python<'_>,
         version: i32,
     ) -> PyResult<Option<String>> {
-        let backend = self.backend.clone();
-        let runtime = self.runtime.clone();
-        py.detach(move || {
-            runtime.block_on(async move {
-                use crate::derived::DerivedSchema;
-                let opt = backend
-                    .get_calibration_bundle_by_version(version)
-                    .await
-                    .map_err(derived_err_to_py)?;
-                match opt {
-                    None => Ok(None),
-                    Some(b) => Ok(Some(serde_json::to_string(&b).map_err(|e| {
-                        PyRuntimeError::new_err(format!("CalibrationBundle JSON encode: {e}"))
-                    })?)),
-                }
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::derived::DerivedSchema;
+                    let opt = backend
+                        .get_calibration_bundle_by_version(version)
+                        .await
+                        .map_err(derived_err_to_py)?;
+                    match opt {
+                        None => Ok(None),
+                        Some(b) => Ok(Some(serde_json::to_string(&b).map_err(|e| {
+                            PyRuntimeError::new_err(format!("CalibrationBundle JSON encode: {e}"))
+                        })?)),
+                    }
+                })
             })
         })
     }
@@ -3848,11 +3974,11 @@ mod tests {
 /// panic that bypasses our `catch_panic` would still surface as a
 /// BaseException-uncaught-in-uvicorn-handler — recoverable but ugly.
 ///
-/// The pre-v0.5.0 PyO3 methods (federation directory, derived
-/// schemas, outbound queue) still rely on PyO3's built-in trampoline;
-/// CIRISPersist#28 tracks completing the explicit-wrap sweep across
-/// the rest of the surface. Until then, panic=unwind + the trampoline
-/// catches them as PanicException (BaseException) — bad but bounded.
+/// v0.5.4 (CIRISPersist#28) — the explicit-wrap sweep is now complete
+/// across every PyO3 method (~70 entry points). Every panic that
+/// would have escaped as `PanicException` (BaseException, slips past
+/// `except Exception`) is now converted to `LensQueryError`
+/// (Exception, caught by uvicorn's normal request-handler error path).
 #[allow(missing_docs)] // pyo3::create_exception macro emits items without doc-comments
 mod lens_query_error {
     pyo3::create_exception!(ciris_persist, LensQueryError, pyo3::exceptions::PyException);
@@ -3899,6 +4025,25 @@ fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
+/// v0.5.4 (CIRISPersist#29) — test-only module-level panic injector.
+/// Bypasses Engine construction (no Postgres / keyring setup needed)
+/// so the Python regression suite can isolate the FFI catch_panic
+/// layer's behavior. Compiled in only with `--features test-panic`;
+/// release wheels don't expose this function.
+///
+/// Asserts the same invariant as the v0.5.3 wrap: a Rust panic
+/// crossing the FFI boundary must surface as `LensQueryError`
+/// (subclass of `Exception`, caught by `except Exception:`) rather
+/// than `PanicException` (subclass of `BaseException`, the
+/// CIRISPersist#24 wedge mode).
+#[cfg(feature = "test-panic")]
+#[pyfunction]
+fn _test_inject_panic(panic_msg: &str) -> PyResult<()> {
+    catch_panic(|| {
+        panic!("{panic_msg}");
+    })
+}
+
 /// `ciris_persist` Python module entry point. The build script
 /// (maturin) generates the C entry that Python imports.
 #[pymodule]
@@ -3912,5 +4057,9 @@ fn ciris_persist(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // v0.5.3 (CIRISPersist#27) — register LensQueryError so the
     // catch_panic wrapper has a typed exception class to raise.
     m.add("LensQueryError", py.get_type::<LensQueryError>())?;
+    // v0.5.4 (CIRISPersist#29) — feature-gated panic injector for the
+    // Python regression suite. Off in release wheels.
+    #[cfg(feature = "test-panic")]
+    m.add_function(pyo3::wrap_pyfunction!(_test_inject_panic, m)?)?;
     Ok(())
 }

@@ -5,3 +5,12 @@ Cargo.lock
 .idea/
 .vscode/
 *.rs.bk
+
+# Python build artifacts from maturin develop (v0.5.4 — CIRISPersist#29
+# pytest infra). Don't commit locally-built .so / .pyc files.
+__pycache__/
+*.pyc
+*.pyo
+*.abi3.so
+.pytest_cache/
+.venv/

@@ -44,6 +44,28 @@ jobs:
         run: cargo test --features "postgres server pyo3" --all-targets
       - name: cargo test (default — fixture suite)
         run: cargo test --test wire_format_fixtures
+      # v0.5.4 (CIRISPersist#29) — Python regression test for the FFI
+      # catch_panic layer. Builds the wheel with the `test-panic`
+      # feature gate enabled (release wheels don't), then pytest
+      # confirms a Rust panic crossing the FFI surfaces as
+      # `LensQueryError` (Exception) and NOT `PanicException`
+      # (BaseException) — the v0.5.3+v0.5.4 invariant. Closes the
+      # CIRISPersist#24 failure class regression-test gap.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: install maturin + pytest
+        run: pip install maturin pytest
+      - name: maturin develop (test-panic feature)
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install maturin pytest
+          maturin develop --features test-panic,pyo3 --release
+      - name: pytest tests/python/
+        run: |
+          source .venv/bin/activate
+          pytest tests/python/ -v
 
   # NOTE: the prior `linux-aarch64-build` cross-compile job was removed
   # in v0.1.15. Its purpose ("prove the crate cross-compiles to arm64

@@ -49,4 +49,34 @@ if ! cargo clippy \
     exit 1
 fi
 
+# v0.5.4 (CIRISPersist#28) — bare `row.get(...)` on a `tokio_postgres::Row`
+# panics on NULL when the type isn't `Option<_>`. CIRISPersist#24 was
+# exactly this class. Every postgres-side read must go through
+# `safe_get` / `safe_get_with` (PgRowExt). The grep below catches new
+# bare reads in src/store/postgres.rs; the helper itself + its tests
+# are the only legitimate `.get(` sites and live in the trait impl.
+#
+# Allowlist intentionally narrow: only postgres.rs is gated.
+# - sqlite (`rusqlite::Row::get`) already returns `Result` and is
+#   safe by default.
+# - The PgRowExt trait impl's own `try_get` call is the single
+#   approved low-level read site.
+echo "─── pre-commit: ban bare Row::get in postgres backend ───"
+if git diff --cached --name-only | grep -q '^src/store/postgres\.rs$'; then
+    # Strip the PgRowExt trait impl (the only legit `try_get` site) from
+    # the search by skipping anything inside `impl PgRowExt for `.
+    BAD=$(grep -nE '\brow\.get\(|\b\.get::<' src/store/postgres.rs \
+        | grep -vE '//|^\s*\*' \
+        || true)
+    if [ -n "$BAD" ]; then
+        echo
+        echo "✗ Bare row.get / .get::<> found in src/store/postgres.rs:" >&2
+        echo "$BAD" >&2
+        echo >&2
+        echo "Use row.safe_get(col) or row.safe_get_with(col, Err::Variant) instead." >&2
+        echo "(PgRowExt's try_get is the only approved low-level site.)" >&2
+        exit 1
+    fi
+fi
+
 echo "✓ pre-commit checks passed"

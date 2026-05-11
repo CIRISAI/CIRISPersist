@@ -25,6 +25,16 @@ The scrubber MUST NOT alter ``trace_schema_version`` /
 Engine rejects schema-altering scrubber output.
 """
 
-from .ciris_persist import Engine, SUPPORTED_SCHEMA_VERSIONS, __version__
+from .ciris_persist import (
+    Engine,
+    LensQueryError,
+    SUPPORTED_SCHEMA_VERSIONS,
+    __version__,
+)
 
-__all__ = ["Engine", "SUPPORTED_SCHEMA_VERSIONS", "__version__"]
+__all__ = [
+    "Engine",
+    "LensQueryError",
+    "SUPPORTED_SCHEMA_VERSIONS",
+    "__version__",
+]
