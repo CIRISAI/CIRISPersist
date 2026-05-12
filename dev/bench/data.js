@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778603304294,
+  "lastUpdate": 1778603940807,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -9389,6 +9389,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23628422,
             "range": "± 280814",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "c47e4a02e8e066870d1c3a0877cf6ff27b15d737",
+          "message": "FSD: rename agent deferral_* → agent_deferrals_* + add Appendix A (federation-consensus substrate)\n\nCloses CIRISPersist#31 and CIRISPersist#30 — both FSD-only, no\nimplementation work yet.\n\nCIRISPersist#31 — agent_deferrals_* rename (7 sites)\nThe Phase 3 AGENT-LOCAL deferral tables are renamed to\nagent_deferrals_* to disambiguate from CIRISNodeCore's federation-\nconsensus deferral Contributions (deferral_request / deferral_response\nsubtypes of the contributions table). Same domain term, different\nrow classes — namespacing prevents schema-discovery + operator-\nmental-model drift. Option (A) from the issue.\n\nRename done in §1 / §2 / §4 / §5 / §8 — every mention of deferral_*\nin the FSD. Single-line note added at §5.1's governance-tables row\npointing at Appendix A's rationale.\n\nCIRISPersist#30 — Appendix A \"Federation-consensus substrate\n(CIRISNodeCore)\"\nNew appendix covers the typed-write + read surfaces CIRISNodeCore\nv0.1.0 will consume:\n\n  Write (one method per row class, contribution_type discriminates):\n    engine.put_contribution        cirisnode.contributions\n    engine.cast_vote               cirisnode.votes\n    engine.update_credits_ledger   cirisnode.credits_ledger\n    engine.update_expertise_ledger cirisnode.expertise_ledger\n    engine.put_moderation_event    cirisnode.moderation_events\n    engine.put_slashing_attestation cirisnode.slashing_attestations\n    engine.put_reconsideration_request / _attestation\n                                   cirisnode.reconsideration_*\n\n  Read:\n    contributors_eligible_for_routing (MISSION.md §3.3 routing)\n    read_vote_weight                 (SCHEMA.md §5.2 vote weighting)\n    list_contributions + 5 other bulk-list primitives (mirrors v0.5.5\n                                  §I cursor-paged shape)\n    pending_audit_chain / canonical_audit_chain (SCHEMA.md §13.2 split)\n    get_credits_ledger / get_expertise_ledger (point lookup)\n\nSequencing: spec only NOW (v0.6.0); first cut (V011 migration +\nput_contribution + cast_vote + bulk-list reads) at CIRISNodeCore\nv0.1.0 cut-time, gated on a new `cirisnode` Cargo feature so\ndeployments that don't need the federation-consensus surface skip\nthe migration. Same shape lens-core / edge-core consume persist.\n\nBoth issues will be closed by the merge of this commit.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-12T11:31:25-05:00",
+          "tree_id": "1faa0ae10d0af555e1bc20e13e43151f937db6c5",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/c47e4a02e8e066870d1c3a0877cf6ff27b15d737"
+        },
+        "date": 1778603940197,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 108502,
+            "range": "± 2710",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 260432,
+            "range": "± 600",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 561043,
+            "range": "± 14580",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1990545,
+            "range": "± 7612",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 378,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1555,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8138,
+            "range": "± 92",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23140,
+            "range": "± 107",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26388,
+            "range": "± 161",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91018,
+            "range": "± 187",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 367,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3178,
+            "range": "± 38",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9453,
+            "range": "± 110",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42486,
+            "range": "± 144",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 646,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2220294,
+            "range": "± 171051",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7010800,
+            "range": "± 253812",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25878603,
+            "range": "± 151493",
             "unit": "ns/iter"
           }
         ]
