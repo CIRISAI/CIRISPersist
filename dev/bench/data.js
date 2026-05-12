@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778548289508,
+  "lastUpdate": 1778599211116,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -8597,6 +8597,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23473667,
             "range": "± 290933",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "90db69b96b4943bed4824d9b5b96d59d272f6f8f",
+          "message": "v0.6.0-α1: classify taxonomy + Stage trait scaffolding + V009 migration\n\nFoundation commit for CIRISPersist#19 (post-ingest filter pipeline).\nv0.6.0-α series builds toward final v0.6.0; secrets module (18-method\nSecretsService) deferred to v0.6.1 per user decision.\n\nNEW SURFACE\n- src/pipeline/classify/ — 36-variant ContentClass + DetectionMethod\n  (8) + Sensitivity (4) + Action (7) + LearningState (D5) + the\n  composed ContentClassMatch struct. Wire-stable serde shape per FSD\n  §6.3. Existing taxonomies (Agent's SecretType / SensitivityLevel /\n  TriggerType / FilterPriority, LensCore scrub regex catalog /\n  walker / NER) project onto subsets of these 5 orthogonal axes.\n\n- src/pipeline/mod.rs — Stage trait (impl Future GAT style matching\n  ReadEngine convention), PipelineState accumulator, pipeline::Error\n  with stable kind() tokens (THREAT_MODEL.md AV-15). No concrete\n  stages yet — those land with the scrub (α2) + extract (α3) lifts.\n\n- Cargo features: classify (regex), scrub (depends on classify),\n  extract (depends on scrub), scrub-ner (candle + tokenizers + hf-hub),\n  scrub-ort (ort + ndarray). Bundles: default-pipeline-ml +\n  default-sovereign-light per FSD §2.4.\n\n- V009 migration: extracted_features, classifications,\n  pipeline_metadata JSONB columns on cirislens.trace_events. All\n  NULLABLE (rollback-safe per FSD §12.7; pre-pipeline rows stay\n  valid). NOTE: FSD §12.1 calls these V007 / V008 — renumbered to\n  V009 / V010 because V007 (edge_outbound_queue) and V008\n  (lens_derived_schemas) shipped earlier.\n\nWHAT'S NEXT (v0.6.0-α2..α5)\n- α2: port cirislens-core scrubber/ verbatim (~2,700 LOC: walker,\n  regex, fields, mod, ner.rs scaffolds) under scrub feature gate.\n- α3: port cirislens-core extraction/ verbatim (~530 LOC) as the\n  extract module + ExtractStage.\n- α4: NER feature-gated modules (xlm_r_loader, distilbert_loader,\n  ort_loader, ner).\n- α5: Engine API additions (get_features, get_classifications,\n  iter_features_by_cohort) + PyO3 wrappers.\n- v0.6.0 release.\n\nCargo.toml NOT bumped yet — staying at 0.5.8 until v0.6.0 foundation\nis complete. Tags ship the final release; intermediate commits are\nreviewable checkpoints on main.\n\n230 lib tests pass (was 222; +8 new classify + pipeline scaffolding\ntests). V009 verified against live ciris-qa-postgres container —\nextracted_features / classifications / pipeline_metadata columns\npresent after first PG-test run.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-12T10:08:01-05:00",
+          "tree_id": "3e8feb51078201b62f97e88c2670f88f350d5b13",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/90db69b96b4943bed4824d9b5b96d59d272f6f8f"
+        },
+        "date": 1778599210506,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 109175,
+            "range": "± 708",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 251063,
+            "range": "± 775",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 533632,
+            "range": "± 31086",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1866709,
+            "range": "± 27743",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 345,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1508,
+            "range": "± 45",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8209,
+            "range": "± 31",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21125,
+            "range": "± 133",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24150,
+            "range": "± 47",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83528,
+            "range": "± 212",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 389,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3242,
+            "range": "± 20",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9476,
+            "range": "± 41",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41867,
+            "range": "± 144",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2263411,
+            "range": "± 49808",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6642954,
+            "range": "± 161755",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23807596,
+            "range": "± 670122",
             "unit": "ns/iter"
           }
         ]
