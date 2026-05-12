@@ -80,6 +80,29 @@ scrub-ort      = ["scrub-ner", "dep:ort", "dep:ndarray"]
 default-pipeline-ml     = ["scrub-ner", "extract"]
 default-sovereign-light = ["scrub", "extract"]
 
+# v0.6.1 (CIRISPersist#19) — federated SecretsService features per
+# FSD POST_INGEST_FILTER_PIPELINE.md §2.4 + §7.
+# - secrets:         18-method SecretsService trait + postgres impl +
+#                    crypto facade routing through ciris-crypto. Adds
+#                    deps on ciris-crypto's aes-gcm + kdf + hmac +
+#                    random features so AES-256-GCM + PBKDF2 + HMAC
+#                    SHA-256 + OS-RNG are available behind the facade.
+#                    Persist takes ZERO direct primitive deps; the
+#                    crypto-through-ciris-crypto invariant
+#                    (FSD §7.5a) is enforced by `src/secrets/crypto.rs`
+#                    being the sole import site of `ciris_crypto::*`.
+# - secrets-server:  HTTP API (axum) for federated secrets CRUD per
+#                    FSD §8. Requires the `server` feature too.
+#
+# The hardware-key migration path (FSD §3.1 #18 — `migrate_to_hardware_key`)
+# is DEFERRED. Today's ciris-keyring v2.0.2 doesn't expose a
+# `symmetric-derivation` feature; once CIRISVerify ships that
+# upstream we'll add a `secrets-hw = ["secrets", "ciris-keyring/symmetric-derivation"]`
+# feature here. Until then the trait method exists but always
+# returns SecretsError::HardwareKeyUnavailable.
+secrets        = ["postgres", "ciris-crypto/aes-gcm", "ciris-crypto/kdf", "ciris-crypto/hmac", "ciris-crypto/random"]
+secrets-server = ["secrets", "server"]
+
 # v0.1.3 — optional TLS for the Postgres connection pool. Defaults
 # to no-TLS (deployments where the lens process and Postgres are
 # on the same host or a private network). Enable when the DB is

@@ -50,6 +50,8 @@ pub mod queue;
 pub mod read;
 pub mod schema;
 pub mod scrub;
+#[cfg(feature = "secrets")]
+pub mod secrets;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod signing;
