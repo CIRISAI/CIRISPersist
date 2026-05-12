@@ -5,6 +5,46 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.5.6] — 2026-05-12
+
+**Test fixture hotfix for v0.5.5 §I federation observability tests.**
+
+v0.5.5's tag-push CI failed two §I tests under live Postgres
+(unit-only `cargo test` had passed because PG-gated tests early-return
+without `CIRIS_PERSIST_TEST_PG_URL`):
+
+1. `read_section_i_list_federation_keys_cursor` asserted
+   `next_cursor.is_none()` on an exact-fill page (4 keys, limit=2 →
+   page 2 yields 2 items with no more remaining). The pagination
+   contract (matching §A from v0.5.0) is "next_cursor is None **only**
+   when items.len() < limit"; impl can't distinguish "exactly limit
+   remaining" from "more remain" without fetching limit+1. Fixed the
+   test: walk an extra empty page (page 3) and assert IT has no
+   cursor and zero items.
+2. `read_section_i_list_revocations_round_trip` set
+   `original_content_hash: "abc"` — 3 hex chars, odd length. The
+   federation persist layer rejects with
+   `InvalidArgument("Odd number of digits")`. Fixed the fixture to
+   use a 64-char sha256-shaped hex placeholder.
+
+**Zero impl changes** — every §C/D/G/H/I primitive's Rust code is
+the v0.5.5 code unchanged. The pagination contract was correct;
+only the §I test assertion was wrong about it.
+
+v0.5.5's PyPI publish was skipped because of the test failure (no
+artifact ever reached PyPI); v0.5.5's git tag exists but doesn't
+correspond to a shipped wheel. Build manifest WAS registered with
+the registry for version=0.5.5, which is why we cut v0.5.6 rather
+than force-moving the v0.5.5 tag — manifest integrity discipline.
+
+Lens / lens-core teams: target `ciris-persist == 0.5.6` for adoption.
+
+### Upgrade
+
+```toml
+ciris-persist = "0.5.6"
+```
+
 ## [0.5.5] — 2026-05-11
 
 **Federation read primitives §C/D/G/H/I — closes CIRISPersist#23.**

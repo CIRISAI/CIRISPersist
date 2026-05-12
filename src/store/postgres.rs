@@ -7398,7 +7398,11 @@ mod tests {
         assert_eq!(p1.items[1].key_id, key_ids[1]);
         let c1 = p1.next_cursor.expect("page 2 cursor");
 
-        // Page 2
+        // Page 2 — exact-fill (2 remaining items, limit=2). The
+        // pagination contract (matching §A) is "next_cursor is None
+        // only when items.len() < limit"; an exact-match page returns
+        // Some(cursor) and the consumer fetches one more page that
+        // yields zero items. Page 3 below is the empty-tail probe.
         let p2 = backend
             .list_federation_keys(filter.clone(), Some(c1), 2)
             .await
@@ -7406,7 +7410,15 @@ mod tests {
         assert_eq!(p2.items.len(), 2);
         assert_eq!(p2.items[0].key_id, key_ids[2]);
         assert_eq!(p2.items[1].key_id, key_ids[3]);
-        assert!(p2.next_cursor.is_none(), "exact-match page → no cursor");
+        let c2 = p2.next_cursor.expect("page 3 cursor (exact-fill page)");
+
+        // Page 3 — empty tail, cursor None.
+        let p3 = backend
+            .list_federation_keys(filter.clone(), Some(c2), 2)
+            .await
+            .unwrap();
+        assert!(p3.items.is_empty(), "no more items past 4-key fixture");
+        assert!(p3.next_cursor.is_none(), "empty page → no cursor");
 
         // PQC filter: should return only 2 keys (i=0, i=2 had pqc=true,
         // i.e. key_ids[3] and key_ids[1] after reverse).
@@ -7472,7 +7484,11 @@ mod tests {
             revoked_at: now,
             effective_at: now,
             revocation_envelope: serde_json::json!({"id": rev_id}),
-            original_content_hash: "abc".into(),
+            // sha256-shaped placeholder hex — persist's revocation
+            // path runs hex-decode on original_content_hash and rejects
+            // odd-length strings. Use a full 64-char hex string.
+            original_content_hash:
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
             scrub_signature_classical: "c2ln".into(),
             scrub_signature_pqc: None,
             scrub_key_id: revoking_id.clone(),
