@@ -63,6 +63,14 @@ ignore = [
     "RUSTSEC-2026-0098",  # rustls-webpki URI-name constraint (we don't validate URI SANs)
     "RUSTSEC-2026-0099",  # rustls-webpki wildcard-DNS constraint (no name-constraint certs)
     "RUSTSEC-2026-0104",  # rustls-webpki CRL parse panic (we don't parse CRLs)
+
+    # v0.6.0-α4 — restored heavy ML deps (candle / tokenizers / hf-hub
+    # / ort / ndarray) for the post-ingest filter pipeline's NER stage.
+    # Both transitive advisories are `unmaintained`-track, not
+    # exploitable vulnerabilities. Same status as the other
+    # unmaintained ignores above. Re-evaluate when candle/ort upgrade.
+    "RUSTSEC-2025-0119",  # number_prefix unmaintained — transitive via indicatif → hf-hub
+    "RUSTSEC-2024-0436",  # paste unmaintained — transitive via candle / ort macros
 ]
 
 [sources]

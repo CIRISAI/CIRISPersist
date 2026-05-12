@@ -43,6 +43,15 @@ pub mod ner;
 pub mod regex;
 pub mod walker;
 
+// v0.6.0-α4 — feature-gated NER model loaders.
+#[cfg(feature = "scrub-ner")]
+pub mod distilbert_loader;
+#[cfg(feature = "scrub-ner")]
+pub mod xlm_r_loader;
+
+#[cfg(feature = "scrub-ort")]
+pub mod ort_loader;
+
 pub use fields::scrub_fields;
 
 use serde_json::Value;
@@ -260,10 +269,14 @@ mod tests {
         assert!(!out.stats.ner_ran);
     }
 
+    /// When `scrub-ner` is off, the NER backend is unconfigured and
+    /// `FullTraces` MUST reject (fail-loud, no silent coverage loss).
+    /// When `scrub-ner` is on, the backend may legitimately be ready
+    /// (e.g. `CIRISLENS_NER_MODEL_DIR` set or an HF cache exists), so
+    /// this test only asserts the off-feature invariant.
+    #[cfg(not(feature = "scrub-ner"))]
     #[test]
     fn full_traces_without_ner_rejects() {
-        // v0.6.0-α2: NER backend is stubbed so is_configured() == false;
-        // full_traces must fail loudly.
         let trace = json!({"task_description": "anything"});
         let result = scrub_trace(trace, TraceLevel::FullTraces);
         assert!(matches!(result, Err(ScrubError::NerNotConfigured)));

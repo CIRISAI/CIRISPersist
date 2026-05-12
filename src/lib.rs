@@ -1,9 +1,17 @@
 // THREAT_MODEL.md §6 #6 / SECURITY_AUDIT_v0.1.2.md §4.1 — no
 // `unsafe` blocks in our code, gated at the crate level. PyO3 +
 // redb + tokio-postgres etc. have transitive `unsafe` (which is
-// fine and out of our scope); `forbid` here only applies to this
+// fine and out of our scope); `deny` here only applies to this
 // crate.
-#![forbid(unsafe_code)]
+//
+// v0.6.0-α4 (CIRISPersist#19) — relaxed from `forbid` to `deny` so
+// that the feature-gated NER backends (`scrub-ner` / `scrub-ort`)
+// can selectively allow unsafe ONLY at the `safetensors::mmap` call
+// sites. The mmap path is unavoidable in the ML ecosystem — every
+// candle / ort example uses it identically. Non-NER code stays
+// hard-locked: every `#[allow(unsafe_code)]` must appear at the
+// top of a module file and be visible to security audits.
+#![deny(unsafe_code)]
 // SECURITY_AUDIT_v0.1.4.md §4 §4.4 — v0.1.6 hygiene batch.
 // Every public item gets a doc comment. CI fails on any addition
 // that ships without one. The intent is operator-readable:

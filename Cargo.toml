@@ -65,15 +65,19 @@ test-panic = []
 classify       = ["dep:regex"]
 scrub          = ["classify"]
 extract        = ["scrub"]
-# scrub-ner / scrub-ort declarations DEFERRED to v0.6.0-α4 alongside
-# the actual NER backend lift. The heavy ML deps (candle / tokenizers
-# / hf-hub / ort / ndarray) pull in `number_prefix` + `paste`
-# transitively, both of which cargo-deny flags as `unmaintained` (RUSTSEC
-# advisory). Add deps + features back when α4 lands the real NER code
-# + a corresponding `deny.toml` ignore block scoped to those advisories.
 
-# Bundle feature for sovereign / Pi-class deployments — light scrubber
-# (regex-only) + extract, no ML.
+# v0.6.0-α4 — NER backends. `scrub-ner` activates the Candle XLM-R +
+# DistilBERT backends; `scrub-ort` adds the ORT INT8 fast path
+# (~3-4× faster on CPU vs Candle). Both backends compile in when
+# `scrub-ort` is on; runtime picks via `CIRISLENS_NER_BACKBONE` env.
+# The transitive `number_prefix` + `paste` unmaintained advisories
+# are ignored in deny.toml (both unmaintained-track only, not
+# exploitable).
+scrub-ner      = ["scrub", "dep:anyhow", "dep:log", "dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub"]
+scrub-ort      = ["scrub-ner", "dep:ort", "dep:ndarray"]
+
+# Bundle features for common deployment shapes.
+default-pipeline-ml     = ["scrub-ner", "extract"]
 default-sovereign-light = ["scrub", "extract"]
 
 # v0.1.3 — optional TLS for the Postgres connection pool. Defaults
@@ -192,11 +196,28 @@ http-body-util = { version = "0.1", optional = true }
 pyo3 = { version = "0.28", features = ["extension-module", "abi3-py311"], optional = true }
 
 # v0.6.0 (CIRISPersist#19) — post-ingest filter pipeline deps.
-# Light deps land in α2 (scrub lift); heavy ML deps (candle /
-# tokenizers / hf-hub / ort / ndarray) defer to α4 (NER lift)
-# alongside a deny.toml ignore block for their transitive
-# `number_prefix` + `paste` unmaintained advisories.
-regex      = { version = "1.10", optional = true }
+# Light deps (regex) gate `scrub` + `extract`; heavy ML deps below
+# gate `scrub-ner` + `scrub-ort`. The ML deps' transitive
+# `number_prefix` + `paste` unmaintained-track advisories are
+# ignored in deny.toml per α4. Pinned versions match CIRISLens
+# cirislens-core (source-of-truth for the lifted scrub/NER code).
+regex                = { version = "1.10", optional = true }
+# v0.6.0-α4 — ML loader / inference deps. `anyhow` + `log` are used
+# only inside the NER backends (CIRISLensCore convention) so they're
+# gated behind `scrub-ner` too.
+anyhow               = { version = "1", optional = true }
+log                  = { version = "0.4", optional = true }
+# parking_lot is used by the NER cache, which compiles unconditionally
+# (the cache is dormant when scrub-ner is off — is_configured() guard
+# short-circuits before the cache is touched). Small dep, well-maintained.
+parking_lot          = "0.12"
+candle-core          = { version = "0.10", optional = true }
+candle-nn            = { version = "0.10", optional = true }
+candle-transformers  = { version = "0.10", optional = true }
+tokenizers           = { version = "0.20", default-features = false, features = ["onig"], optional = true }
+hf-hub               = { version = "0.4", optional = true }
+ort                  = { version = "=2.0.0-rc.10", optional = true, default-features = false, features = ["std", "ndarray", "load-dynamic"] }
+ndarray              = { version = "0.16", optional = true }
 
 # v0.1.21 — sqlite backend (Phase 1 parity).
 # v0.1.9 — pinned to 0.31 to match ciris-verify-core's transitive
