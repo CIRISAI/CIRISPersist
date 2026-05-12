@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778599717580,
+  "lastUpdate": 1778602907358,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -8993,6 +8993,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23751689,
             "range": "± 241483",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "a14873037f164fef1ac95059ebed9d0f7cbb1cb9",
+          "message": "v0.6.0-α4: NER backend lift (XLM-R + DistilBERT via candle, ORT INT8 fast path)\n\nα4 ports the multilingual NER backends from CIRISLens\ncirislens-core/src/scrubber/ verbatim under `scrub-ner` +\n`scrub-ort` Cargo feature gates. ~1,550 LOC restored.\n\nNEW FILES (feature-gated)\n- src/pipeline/scrub/xlm_r_loader.rs — XLMRobertaModel backbone +\n  token-classification head (HF Davlan/xlm-roberta-base-wikiann-ner\n  shape). Local-dir + HF-hub loaders. `safetensors::mmap` path\n  uses `unsafe` (allowed at file level — same shape as\n  candle-transformers' own examples).\n- src/pipeline/scrub/distilbert_loader.rs — DistilBERT-multilingual\n  alternative (½ params, ½ inference cost, +DATE labels).\n  Attention-mask polarity inversion + reshape for candle's mask\n  semantics preserved.\n- src/pipeline/scrub/ort_loader.rs — ORT INT8 token-classifier\n  backbone (3-4× faster than candle on CPU).\n- src/pipeline/scrub/ner.rs (replaced α2 stub) — backend selector\n  via CIRISLENS_NER_BACKBONE env (candle / ort), batched\n  scrub_batch with in-process content-dedup cache (~98.8% dedup\n  ratio on production HF corpus), BIO collapse + char-offset span\n  replacement helpers.\n\nCARGO + DENY\n- Restored optional deps: candle-core 0.10, candle-nn,\n  candle-transformers, tokenizers 0.20, hf-hub 0.4, ort\n  2.0.0-rc.10, ndarray 0.16, plus anyhow + log + parking_lot.\n- Features: scrub-ner = scrub + ML deps, scrub-ort = scrub-ner +\n  ort/ndarray, default-pipeline-ml bundle.\n- deny.toml: added RUSTSEC-2025-0119 (number_prefix unmaintained,\n  transitive via indicatif → hf-hub) and RUSTSEC-2024-0436\n  (paste unmaintained, transitive via candle / ort macros).\n  Both unmaintained-track only, not exploitable.\n\nARCHITECTURAL CHANGE\n- lib.rs `#![forbid(unsafe_code)]` → `#![deny(unsafe_code)]`.\n  forbid prevents inner `#![allow]` overrides; the safetensors\n  mmap path is unavoidable in the ML ecosystem (every candle/ort\n  example uses it identically). Three files scoped:\n  xlm_r_loader, distilbert_loader, ort_loader. Non-NER code\n  remains effectively no-unsafe — every `#[allow(unsafe_code)]`\n  must appear at the top of a module file and be visible to\n  security audits.\n\nTEST GATING\n- pipeline::scrub::tests::full_traces_without_ner_rejects now\n  cfg-gated to `not(feature = \"scrub-ner\")` because when scrub-ner\n  is on, a cached HF model may legitimately satisfy\n  is_configured() (CIRISLENS_NER_MODEL_DIR or warm cache).\n\nVERIFICATION\n- cargo check passes on all 4 combos: light / scrub-ner / scrub-ort.\n- cargo clippy clean across all combos.\n- cargo-deny advisories green with the new ignores.\n- 53 pipeline tests pass under scrub-ner, 52 under light build\n  (one feature-gated NER test).\n\nNEXT: α5 — Engine API additions (get_features, get_classifications,\niter_features_by_cohort) + PyO3 wraps with catch_panic.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-12T11:13:34-05:00",
+          "tree_id": "a6aa3cc52912fabbbdc53b6b2b894477274be0e1",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/a14873037f164fef1ac95059ebed9d0f7cbb1cb9"
+        },
+        "date": 1778602906334,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101687,
+            "range": "± 503",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 242826,
+            "range": "± 2064",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 524002,
+            "range": "± 3044",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1853083,
+            "range": "± 10945",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 364,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1513,
+            "range": "± 39",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8214,
+            "range": "± 74",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 22097,
+            "range": "± 178",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 25166,
+            "range": "± 661",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 84453,
+            "range": "± 167",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 367,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3186,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9689,
+            "range": "± 137",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42403,
+            "range": "± 142",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 621,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2331472,
+            "range": "± 156684",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6656114,
+            "range": "± 183526",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23943591,
+            "range": "± 245792",
             "unit": "ns/iter"
           }
         ]
