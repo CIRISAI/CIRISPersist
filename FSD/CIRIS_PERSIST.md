@@ -12,7 +12,7 @@
 
 The CIRIS architecture has two services that, viewed honestly, are the same job at different scales:
 
-- **CIRISAgent** maintains a local Ed25519-signed audit chain (`audit_log` table) and a TSDB of service correlations (`service_correlations`), plus runtime state (`tasks`, `thoughts`), a memory graph (`graph_nodes`, `graph_edges`), and governance tables (`tickets`, `dsar_*`, `deferral_*`, `wa_cert`). All of it is written today in pure Python via `sqlite3` / `psycopg2` with a hand-rolled dialect adapter.
+- **CIRISAgent** maintains a local Ed25519-signed audit chain (`audit_log` table) and a TSDB of service correlations (`service_correlations`), plus runtime state (`tasks`, `thoughts`), a memory graph (`graph_nodes`, `graph_edges`), and governance tables (`tickets`, `dsar_*`, `agent_deferrals_*`, `wa_cert`). All of it is written today in pure Python via `sqlite3` / `psycopg2` with a hand-rolled dialect adapter.
 - **CIRISLens** ingests Ed25519-signed reasoning traces from agents, verifies signatures at the Rust edge (`cirislens-core` via PyO3), scrubs PII, and writes them to TimescaleDB hypertables (`accord_traces` today; `trace_events` + `trace_llm_calls` after the 2.7.8 cutover).
 
 The Proof-of-Benefit Federation FSD (`CIRISLens/FSD/PROOF_OF_BENEFIT_FEDERATION.md` §3.1) makes this overlap explicit: lens-side ingest+verify+scrub+score is "a function any peer can run on data the peer already has." The lens role isn't an authority — it's a *function*. Once that's true, both roles want the same primitives: signed event persistence with an audit chain, TSDB-shaped time-series, schema-versioned migrations, sqlite + postgres backends, multi-occurrence atomicity, and a verification path that can run in-process.
@@ -29,7 +29,7 @@ This FSD specifies a Rust crate, **`ciris-persist`**, that ultimately owns **all
 |---|---|
 | **Phase 1** (immediate) | Lens: `accord_traces` → `trace_events` + `trace_llm_calls`; `accord_public_keys`. Wire format ingest, Ed25519 verify, PII scrub. |
 | **Phase 2** (federation-trigger) | Agent: `audit_log`, `audit_roots`, `audit_signing_keys`, `service_correlations`. The signed-events-and-time-series subset of agent persistence. |
-| **Phase 3** (long-tail) | Agent: `tasks`, `thoughts`, `graph_nodes`, `graph_edges`, `tickets`, `dsar_*`, `deferral_*`, `wa_cert`, `feedback_mappings`, `consolidation_locks`, `queue_status` — runtime state, memory graph, governance. |
+| **Phase 3** (long-tail) | Agent: `tasks`, `thoughts`, `graph_nodes`, `graph_edges`, `tickets`, `dsar_*`, `agent_deferrals_*`, `wa_cert`, `feedback_mappings`, `consolidation_locks`, `queue_status` — runtime state, memory graph, governance. |
 | **Out of scope** | CIRISRegistry, CIRISPortal — external services with their own DBs and replication strategies. |
 
 The phases are differentiated by **migration risk**, not by architectural separation:
@@ -241,7 +241,7 @@ Schema-version of the *crate* bumps to `0.1.3`; schema-version of the *wire form
 
 ### 4.2 What stays Python on the agent through Phase 2
 
-Through Phase 2: `tasks`, `thoughts`, `graph_nodes`, `graph_edges`, `tickets`, `dsar_*`, `deferral_*`, `wa_cert`, identity, auth, queue_status, feedback_mappings, consolidation_locks. These are runtime state, memory graph, and governance plumbing — not signed events, not time-series. The Python DAOs in `ciris_engine/logic/persistence/models/` keep their current shape during Phase 2. The `db/dialect.py` adapter shrinks (it no longer has to handle audit_log + service_correlations) but doesn't go away.
+Through Phase 2: `tasks`, `thoughts`, `graph_nodes`, `graph_edges`, `tickets`, `dsar_*`, `agent_deferrals_*`, `wa_cert`, identity, auth, queue_status, feedback_mappings, consolidation_locks. These are runtime state, memory graph, and governance plumbing — not signed events, not time-series. The Python DAOs in `ciris_engine/logic/persistence/models/` keep their current shape during Phase 2. The `db/dialect.py` adapter shrinks (it no longer has to handle audit_log + service_correlations) but doesn't go away.
 
 **Phase 3 brings these under the crate** — see §5.
 
@@ -270,7 +270,7 @@ This is the longest-tail piece of the work. It is also the most disruptive — e
 | `tasks` (mutable, multi-occurrence, signed) | The signing fields (`signed_by`, `signature`, `signed_at`) ride on the same Ed25519 path as Phase 2 audit chain. |
 | `thoughts` (FK→tasks, multi-occurrence) | Hot-path interactive queries. Latency budget tighter than batch ingest. |
 | `graph_nodes`, `graph_edges` (memory graph, multi-scope) | Includes encrypted attributes (secrets management integration). The encryption boundary stays where it is; the persistence layer remains unaware of plaintext. |
-| `tickets`, `dsar_*`, `deferral_*` | Governance / WBD plumbing. Lower volume but full referential integrity needs. |
+| `tickets`, `dsar_*`, `agent_deferrals_*` | Governance / WBD plumbing. Lower volume but full referential integrity needs. **Naming note (CIRISPersist#31):** the agent-local deferral tables are `agent_deferrals_*` (not `deferral_*`) to disambiguate from CIRISNodeCore's federation-consensus deferral Contributions (`deferral_request` / `deferral_response` subtypes of the `contributions` table — see Appendix A). |
 | `wa_cert`, identity, authentication_store | Auth tables. Special care: secrets in row form. |
 | `queue_status`, `feedback_mappings`, `consolidation_locks` | Runtime coordination tables. |
 | `analytics.py` aggregations | Read-side migrates to Rust queries with serde-derived response structs. |
@@ -310,7 +310,7 @@ The Python `models/` package shrinks to thin call-through shims that exist only 
 Per-table cutover, one table at a time, with the agent's existing test suite as the gate. The order:
 
 1. **Lowest-FK-fanout first.** `feedback_mappings`, `consolidation_locks`, `queue_status` — no FKs in or out. Cut these over to validate the round-trip Python→Rust→Python pattern with minimal blast radius.
-2. **Governance tables next.** `wa_cert`, `tickets`, `dsar_*`, `deferral_*`. Lower volume, well-tested, mostly write-once-read-rarely.
+2. **Governance tables next.** `wa_cert`, `tickets`, `dsar_*`, `agent_deferrals_*`. Lower volume, well-tested, mostly write-once-read-rarely.
 3. **Memory graph.** `graph_nodes`, `graph_edges`. The traversal queries are the hardest part; this is also where the secrets-management integration lives, so the encryption boundary needs careful handling.
 4. **Tasks.** Multi-occurrence atomicity is the load-bearing concern. `try_claim_shared_task` becomes a Rust transactional primitive.
 5. **Thoughts.** Last because thoughts are the hottest path on the H3ERE pipeline; we want the rest of the persistence layer warmed up before we touch this.
@@ -363,7 +363,7 @@ We do not start Phase 3 because the architecture wants it. We start when there i
 | Step | Effort | Gates on |
 |---|---|---|
 | 5.1 Lowest-fanout tables (feedback_mappings, consolidation_locks, queue_status) | days | Phase 2 stable |
-| 5.2 Governance (wa_cert, tickets, dsar_*, deferral_*) | weeks | 5.1 stable |
+| 5.2 Governance (wa_cert, tickets, dsar_*, agent_deferrals_*) | weeks | 5.1 stable |
 | 5.3 Memory graph (graph_nodes, graph_edges + secrets integration) | weeks | 5.2 stable |
 | 5.4 Tasks (multi-occurrence atomicity) | weeks | 5.3 stable |
 | 5.5 Thoughts (hot path) | weeks | 5.4 stable |
@@ -408,7 +408,7 @@ End-state: `ciris_engine/logic/persistence/` directory contains a Rust-binding s
 | **2.2** | sqlite backend; iOS C ABI (signed-events surface only) | When iOS client is ready to consume Rust |
 | **2.3** | `peer-replicate` Reticulum hook | When PoB §3.2 transport lands |
 | **3.1** | Lowest-FK-fanout tables (`feedback_mappings`, `consolidation_locks`, `queue_status`) | Phase 2 stable for ≥30 days; iOS / latency trigger named (§5.9) |
-| **3.2** | Governance tables (`wa_cert`, `tickets`, `dsar_*`, `deferral_*`) | 3.1 stable |
+| **3.2** | Governance tables (`wa_cert`, `tickets`, `dsar_*`, `agent_deferrals_*`) | 3.1 stable |
 | **3.3** | Memory graph (`graph_nodes`, `graph_edges`) + secrets integration | 3.2 stable |
 | **3.4** | Tasks (multi-occurrence atomicity) | 3.3 stable |
 | **3.5** | Thoughts (H3ERE hot path) | 3.4 stable |
@@ -431,3 +431,78 @@ Phase 1 is committed work for this cycle. Phase 2 items are individually opt-in 
 ## 10. Closing note
 
 The agent already has a hash chain. The lens already has a Rust ingest edge. The wire format already carries the chain anchor on every action. **The work this FSD specifies is recognition of a structural alignment, not new construction.** Phase 1 is the lens cutover we have on the runway tonight, written into a crate that has the right shape from the start. Phase 2 is the §3.1 collapse made operational on the agent's signed-events and TSDB tables, no flag-day in sight. Phase 3 carries the collapse all the way through the agent's runtime-state, memory-graph, and governance tables — the architectural endpoint where every CIRIS federation primitive that needs durable state shares one persistence binary. We commit to the destination; we sequence the work so each phase stands on its own; we start Phase 3 only when there's a named operational reason that justifies the migration risk.
+
+---
+
+## Appendix A — Federation-consensus substrate (CIRISNodeCore)
+
+**Status:** addendum; closes CIRISPersist#30. Spec only — no implementation yet. Persist exposes the typed-write + read surfaces described here when CIRISNodeCore v0.1.0's Rust crate (`ciris-node-core`) begins implementation. Until then this appendix is the contract CIRISNodeCore writes against.
+
+### A.1 Why a separate table class
+
+CIRISNodeCore (`CIRISAI/CIRISNodeCore` — spec-only today; `MISSION.md` §2 enumerates 11 federation primitives) is the second-tier consensus crate. It implements Identity, Commons Credits, Expertise, Vote, Contribution, Truth-Grounding, Weighted Aggregate, Moderation, Slashing, Witness-Diversity, Reconsideration as **federation-consensus row classes** — audit-chain rows produced by the consensus crate per `CIRISNodeCore/SCHEMA.md` §3 envelope shape.
+
+These are **structurally distinct** from the Phase 3 AGENT-LOCAL tables (`tasks`, `thoughts`, `agent_deferrals_*`, etc.). The agent-local tables hold one agent's runtime state; the federation-consensus tables hold the federation's consensus output across N agents + N witnesses. Same persist crate, different write paths, different audit semantics. The disambiguation is the rationale for the `agent_deferrals_*` rename in §5.1 (CIRISPersist#31) — both row classes carry "deferral" as a domain term; the persist namespace separates them.
+
+CIRISNodeCore consumes CIRISPersist as substrate — same pattern CIRISLensCore established (`engine.steward_sign`, `engine.put_detection_event`, holds the `Engine` handle, never opens its own DB connection). The Cargo workspace pin shape is the same too: `ciris-node-core` adds `ciris-persist = "0.6"` (or whichever tag aligns with the substrate features it needs) to its `[dependencies]`.
+
+### A.2 Write surfaces (typed methods on `Engine`)
+
+One typed-write method per structurally-distinct row class. Inside the Contribution table, the `contribution_type` discriminator per `CIRISNodeCore/SCHEMA.md` §3.1 handles per-payload-shape variation. Same granularity convention CIRISLensCore established for `put_detection_event`: one method per row class, not per payload-shape.
+
+| Method | Row class | Spec reference |
+|---|---|---|
+| `engine.put_contribution(ContributionEnvelope)` | `contributions` (one logical table, discriminated rows) | `CIRISNodeCore/SCHEMA.md` §3 envelope, §4 payloads — Identity / Expertise / Vote / Contribution / Truth-Grounding / Reconsideration / Moderation / Slashing subtypes via `contribution_type` |
+| `engine.cast_vote(VoteEnvelope)` | `votes` | `CIRISNodeCore/SCHEMA.md` §5 |
+| `engine.update_credits_ledger(...)` | `credits_ledger` | `CIRISNodeCore/SCHEMA.md` §10 — derived-state write from a grounded outcome per `MISSION.md` §3.4 |
+| `engine.update_expertise_ledger(...)` | `expertise_ledger` | `CIRISNodeCore/SCHEMA.md` §10 — derived-state write per `MISSION.md` §3.7 |
+| `engine.put_moderation_event(...)` | `moderation_events` | `CIRISNodeCore/SCHEMA.md` §8 |
+| `engine.put_slashing_attestation(...)` | `slashing_attestations` | `CIRISNodeCore/SCHEMA.md` §8 |
+| `engine.put_reconsideration_request(...)` | `reconsideration_requests` | `CIRISNodeCore/SCHEMA.md` §9 |
+| `engine.put_reconsideration_attestation(...)` | `reconsideration_attestations` | `CIRISNodeCore/SCHEMA.md` §9 |
+
+Wire types (`ContributionEnvelope`, `VoteEnvelope`, etc.) live in `ciris-node-core`'s schema crate (per `CIRISNodeCore/SCHEMA.md` §3); persist accepts them via PyO3 JSON encoding + serde decode at the boundary, same shape as the v0.4.3 `put_detection_event` / `put_calibration_bundle` pattern (CIRISPersist#18).
+
+### A.3 Read surfaces
+
+| Read | Purpose | Spec reference |
+|---|---|---|
+| `engine.contributors_eligible_for_routing(domain, language)` | List contributors with non-zero Expertise in `(domain, language)`, filtered to Active tier. Used by `MISSION.md` §3.3 deferral routing (steps 1-2). | `MISSION.md` §3.8 (Active tier filter) |
+| `engine.read_vote_weight(contributor_id, domain, language, subject)` | Compute `Credits(domain, language, subject) × expertise_multiplier × active_tier_multiplier` for vote weighting. | `CIRISNodeCore/SCHEMA.md` §5.2 |
+| `engine.list_contributions(filter, cursor, limit)` + `list_votes` + `list_moderation_events` + `list_slashing_attestations` + `list_reconsideration_requests` + `list_reconsideration_attestations` | Bulk listing for monitoring dashboards + federation observability. Mirrors v0.5.5 §I bulk-list shape (cursor-paged newest-first). | `CIRISPersist#23` §I precedent |
+| `engine.pending_audit_chain(filter)` + `engine.canonical_audit_chain(filter)` | Split between pending (signed but not yet consensus-ratified) and canonical (federation-consensus-ratified) audit-chain rows. | `CIRISNodeCore/SCHEMA.md` §13.2 |
+| `engine.get_credits_ledger(contributor_id)` + `get_expertise_ledger(contributor_id)` | Point-lookup ledger reads. | `CIRISNodeCore/SCHEMA.md` §10 |
+
+### A.4 Schema migration shape
+
+The federation-consensus tables land under a new PostgreSQL schema: `cirisnode` (sibling to the existing `cirislens` + `cirislens_derived` schemas). One numbered migration introduces the full table set; subsequent migrations add columns / indexes additively per the CIRISPersist convention.
+
+Suggested migration: `V011__cirisnode_consensus.sql` (or whatever number is next when this lands). Tables:
+
+- `cirisnode.contributions` — one row per Contribution envelope, `contribution_type` discriminates payload shape.
+- `cirisnode.votes` — one row per VoteEnvelope.
+- `cirisnode.credits_ledger`, `cirisnode.expertise_ledger` — derived-state ledgers.
+- `cirisnode.moderation_events`, `cirisnode.slashing_attestations` — `SCHEMA.md` §8 attestation chains.
+- `cirisnode.reconsideration_requests`, `cirisnode.reconsideration_attestations` — `SCHEMA.md` §9 reconsideration flow.
+
+Each table carries the standard CIRISPersist audit columns (`signature`, `signing_key_id`, `signature_verified`, `original_content_hash`, `scrub_signature_classical`, `scrub_signature_pqc`, `scrub_key_id`, `scrub_timestamp`, `pqc_completed_at`, `persist_row_hash`). The hybrid Ed25519 + ML-DSA-65 scrub envelope on every row mirrors the federation directory shape from V004; the per-row hybrid signature mirrors the trace_events shape from V001.
+
+### A.5 Sequencing
+
+CIRISNodeCore v0.1.0 implementation cannot begin until this appendix's write+read surfaces are exposed in `ciris-persist`. Sequencing:
+
+1. **Now (v0.6.0):** Spec locked in this appendix; no code.
+2. **v0.6.x or v0.7.0 (CIRISNodeCore v0.1.0 cut-time):** `engine.put_contribution` + `engine.cast_vote` + the corresponding bulk-list reads + V011 migration. Same `[features] cirisnode = [...]` gating pattern as the existing `pyo3` / `server` features so deployments that don't need the federation-consensus surface skip the migration.
+3. **Later:** Ledger read primitives + reconsideration + moderation + slashing — granularly as CIRISNodeCore matures.
+
+The order matches `CIRISNodeCore/MISSION.md` §3.3 deferral routing (Contribution + Vote first; everything else compounds on those).
+
+### A.6 Sibling issues
+
+- `CIRISPersist#31` — `deferral_*` → `agent_deferrals_*` rename (closed by §5.1 update + this appendix's naming clarification).
+- `CIRISAI/CIRISEdge` — `MessageType` enum expansion for the 8 corresponding wire types (out of scope for persist; tracked in edge repo).
+- `CIRISAI/CIRISNodeCore/SCHEMA.md` + `MISSION.md` — the upstream spec this appendix accepts as input.
+
+---
+
+
