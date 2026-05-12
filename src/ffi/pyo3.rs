@@ -2739,6 +2739,79 @@ impl PyEngine {
         })
     }
 
+    // ── v0.6.0-α5: pipeline read surface ───────────────────────
+
+    /// v0.6.0 (CIRISPersist#19) — read typed Features for a
+    /// `(trace_id, thought_id)` pair from
+    /// `cirislens.trace_events.extracted_features` (V009 column).
+    ///
+    /// Returns JSON-encoded `Features` or `None`. `None` when the
+    /// trace/thought pair has no rows or the pipeline hasn't yet
+    /// run on those rows (pre-v0.6.0 / pipeline-skipped ingest).
+    #[cfg(feature = "extract")]
+    fn get_features(
+        &self,
+        py: Python<'_>,
+        trace_id: &str,
+        thought_id: &str,
+    ) -> PyResult<Option<String>> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let trace_id = trace_id.to_owned();
+            let thought_id = thought_id.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    let opt = backend
+                        .read_features(&trace_id, &thought_id)
+                        .await
+                        .map_err(|e| PyRuntimeError::new_err(format!("read_features: {e}")))?;
+                    match opt {
+                        None => Ok(None),
+                        Some(f) => Ok(Some(serde_json::to_string(&f).map_err(|e| {
+                            PyRuntimeError::new_err(format!("Features encode: {e}"))
+                        })?)),
+                    }
+                })
+            })
+        })
+    }
+
+    /// v0.6.0 (CIRISPersist#19) — read per-component classification
+    /// matches for a `(trace_id, thought_id)` pair from
+    /// `cirislens.trace_events.classifications` (V009 column).
+    ///
+    /// Returns JSON-encoded `Vec<Vec<ContentClassMatch>>` (outer per-
+    /// component, inner per-span-match). Empty array when the
+    /// pipeline hasn't yet run on those rows.
+    #[cfg(feature = "classify")]
+    fn get_classifications(
+        &self,
+        py: Python<'_>,
+        trace_id: &str,
+        thought_id: &str,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let trace_id = trace_id.to_owned();
+            let thought_id = thought_id.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    let cls = backend
+                        .read_classifications(&trace_id, &thought_id)
+                        .await
+                        .map_err(|e| {
+                            PyRuntimeError::new_err(format!("read_classifications: {e}"))
+                        })?;
+                    serde_json::to_string(&cls).map_err(|e| {
+                        PyRuntimeError::new_err(format!("classifications encode: {e}"))
+                    })
+                })
+            })
+        })
+    }
+
     // ── Section C: task-grouped listing ────────────────────────
 
     /// Page through tasks, each task carrying its component trace

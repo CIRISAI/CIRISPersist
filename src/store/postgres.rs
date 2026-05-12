@@ -828,6 +828,102 @@ impl Backend for PostgresBackend {
     }
 }
 
+// ─── Pipeline read surface (v0.6.0-α5, CIRISPersist#19) ───────────
+//
+// Inherent methods on `PostgresBackend` for reading the V009
+// pipeline JSONB columns (`extracted_features`, `classifications`).
+// Not part of the `Backend` trait — pipeline reads are postgres-only
+// for v0.6.0; memory + sqlite backends don't have to mirror this
+// surface. Promote to a trait method in v0.6.1 if a sovereign-mode
+// embedded pipeline emerges.
+
+impl PostgresBackend {
+    /// v0.6.0-α5 (CIRISPersist#19) — read typed [`Features`] for a
+    /// `(trace_id, thought_id)` pair from
+    /// `cirislens.trace_events.extracted_features` (V009 column).
+    ///
+    /// Returns `Ok(None)` when:
+    /// - The trace/thought pair has no rows, OR
+    /// - The pipeline hasn't yet run on those rows
+    ///   (`extracted_features IS NULL` — pre-v0.6.0 or
+    ///   pipeline-skipped ingest paths).
+    ///
+    /// Wire format: the JSONB column stores the serde-encoded
+    /// `Features` type (V009 contract). Wire shape changes within
+    /// v0.6.x are additive only; breaking shape changes get a new
+    /// JSONB column + migration.
+    #[cfg(feature = "extract")]
+    pub async fn read_features(
+        &self,
+        trace_id: &str,
+        thought_id: &str,
+    ) -> Result<Option<crate::pipeline::extract::Features>, Error> {
+        let client = self.get_client().await?;
+        let row_opt = client
+            .query_opt(
+                "SELECT extracted_features \
+                 FROM cirislens.trace_events \
+                 WHERE trace_id = $1 AND thought_id = $2 \
+                   AND extracted_features IS NOT NULL \
+                 LIMIT 1",
+                &[&trace_id, &thought_id],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("read_features: {e}")))?;
+        match row_opt {
+            None => Ok(None),
+            Some(row) => {
+                let v: serde_json::Value =
+                    row.safe_get_with("extracted_features", Error::Backend)?;
+                let features: crate::pipeline::extract::Features = serde_json::from_value(v)
+                    .map_err(|e| Error::Backend(format!("extracted_features JSONB decode: {e}")))?;
+                Ok(Some(features))
+            }
+        }
+    }
+
+    /// v0.6.0-α5 (CIRISPersist#19) — read per-component classification
+    /// matches for a `(trace_id, thought_id)` pair from
+    /// `cirislens.trace_events.classifications` (V009 column).
+    ///
+    /// Returns an empty vec when:
+    /// - The trace/thought pair has no rows, OR
+    /// - The pipeline hasn't yet run (`classifications IS NULL`).
+    ///
+    /// Outer vec is per-component (in the order the pipeline classify
+    /// stage emitted); inner vec is per-match within that component.
+    #[cfg(feature = "classify")]
+    pub async fn read_classifications(
+        &self,
+        trace_id: &str,
+        thought_id: &str,
+    ) -> Result<Vec<Vec<crate::pipeline::classify::ContentClassMatch>>, Error> {
+        let client = self.get_client().await?;
+        let row_opt = client
+            .query_opt(
+                "SELECT classifications \
+                 FROM cirislens.trace_events \
+                 WHERE trace_id = $1 AND thought_id = $2 \
+                   AND classifications IS NOT NULL \
+                 LIMIT 1",
+                &[&trace_id, &thought_id],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("read_classifications: {e}")))?;
+        match row_opt {
+            None => Ok(Vec::new()),
+            Some(row) => {
+                let v: serde_json::Value = row.safe_get_with("classifications", Error::Backend)?;
+                let parsed: Vec<Vec<crate::pipeline::classify::ContentClassMatch>> =
+                    serde_json::from_value(v).map_err(|e| {
+                        Error::Backend(format!("classifications JSONB decode: {e}"))
+                    })?;
+                Ok(parsed)
+            }
+        }
+    }
+}
+
 // ─── FederationDirectory impl (v0.2.0) ─────────────────────────────
 //
 // Postgres-backed federation directory. Same logical surface as the
@@ -8349,5 +8445,140 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, crate::read::Error::InvalidCursor(_)));
+    }
+
+    // ─── Pipeline read tests (v0.6.0-α5, CIRISPersist#19) ───────────
+
+    /// Insert a fixture trace + UPDATE extracted_features +
+    /// classifications, then read back via the new inherent
+    /// methods. Round-trip verifies V009 JSONB ↔ serde wire shapes.
+    #[cfg(all(feature = "extract", feature = "classify"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pipeline_read_features_and_classifications_round_trip() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let aid = format!("agent-pipe-rd-{}", uuid_like());
+        let tid = format!("tr-pipe-{}", uuid_like());
+        let thid = format!("th-{tid}");
+        let started = chrono::Utc::now();
+
+        // Build a minimal trace row carrying the (trace_id, thought_id)
+        // pair we'll write features for.
+        insert_section_a_fixture_trace(
+            &backend,
+            &tid,
+            &aid,
+            Some("Pipe"),
+            Some("moderation"),
+            started,
+            false,
+            0.5,
+            0.5,
+            1.0,
+        )
+        .await;
+
+        // Build a Features value via the extract module + write it
+        // into the V009 column directly. (Pipeline orchestration
+        // lands in a follow-up alpha; this exercises the round-trip
+        // wire shape only.)
+        let declared = crate::pipeline::extract::DeclaredCohortAxes {
+            agent_role: Some("ally".into()),
+            agent_template: Some("ally-v3-default".into()),
+            deployment_domain: Some("moderation".into()),
+            deployment_type: Some("production".into()),
+            deployment_region: Some("US".into()),
+            deployment_trust_mode: Some("federated_peer".into()),
+        };
+        let features = crate::pipeline::extract::extract_features(
+            &serde_json::json!({"components": []}),
+            declared,
+        );
+        let features_json = serde_json::to_value(&features).unwrap();
+
+        let cls: Vec<Vec<crate::pipeline::classify::ContentClassMatch>> =
+            vec![vec![crate::pipeline::classify::ContentClassMatch {
+                class: crate::pipeline::classify::ContentClass::EmailAddress,
+                method: crate::pipeline::classify::DetectionMethod::Regex,
+                sensitivity: crate::pipeline::classify::Sensitivity::Medium,
+                action: crate::pipeline::classify::Action::ScrubReplace,
+                matcher_id: "regex:email_v1".into(),
+                component_index: 0,
+                json_path: Some("$.task_description".into()),
+                span: Some((0, 16)),
+                confidence: 1.0,
+                learning: None,
+                secret_uuid: None,
+            }]];
+        let cls_json = serde_json::to_value(&cls).unwrap();
+
+        // UPDATE the (trace_id, thought_id) rows we just inserted so
+        // every row carries the pipeline JSONB.
+        let client = backend.pool.get().await.unwrap();
+        let n = client
+            .execute(
+                "UPDATE cirislens.trace_events \
+                 SET extracted_features = $1, classifications = $2 \
+                 WHERE trace_id = $3 AND thought_id = $4",
+                &[&features_json, &cls_json, &tid, &thid],
+            )
+            .await
+            .unwrap();
+        assert!(n > 0, "pipeline UPDATE touched at least one row");
+
+        let f_read = backend
+            .read_features(&tid, &thid)
+            .await
+            .unwrap()
+            .expect("features present");
+        assert_eq!(
+            f_read.declared.deployment_domain.as_deref(),
+            Some("moderation")
+        );
+
+        let c_read = backend.read_classifications(&tid, &thid).await.unwrap();
+        assert_eq!(c_read.len(), 1, "one component classified");
+        assert_eq!(c_read[0].len(), 1, "one match in that component");
+        assert_eq!(
+            c_read[0][0].class,
+            crate::pipeline::classify::ContentClass::EmailAddress
+        );
+        assert_eq!(c_read[0][0].matcher_id, "regex:email_v1");
+    }
+
+    /// Pre-pipeline rows return None / empty (V009 columns are
+    /// nullable and stay NULL until the pipeline writes them).
+    #[cfg(all(feature = "extract", feature = "classify"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pipeline_read_returns_none_for_pre_pipeline_row() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let aid = format!("agent-pipe-null-{}", uuid_like());
+        let tid = format!("tr-pipe-null-{}", uuid_like());
+        let thid = format!("th-{tid}");
+        let started = chrono::Utc::now();
+        insert_section_a_fixture_trace(
+            &backend, &tid, &aid, None, None, started, false, 0.5, 0.5, 1.0,
+        )
+        .await;
+
+        // No UPDATE → extracted_features stays NULL.
+        let f = backend.read_features(&tid, &thid).await.unwrap();
+        assert!(f.is_none(), "pre-pipeline row → None");
+
+        let c = backend.read_classifications(&tid, &thid).await.unwrap();
+        assert!(c.is_empty(), "pre-pipeline row → empty Vec");
     }
 }
