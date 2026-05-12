@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778547516251,
+  "lastUpdate": 1778548289508,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -8465,6 +8465,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25887016,
             "range": "± 115610",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "7c1770863d0aaa3e6724a2d96379efac0e65f67d",
+          "message": "0.5.8 — put_revocation/put_attestation Uuid binding fix + pre-push PG hardening\n\nREAL bug fix: put_revocation and put_attestation rejected\nString-bound revocation_id/attestation_id when tokio-postgres'\nprepared-statement type inference resolved $1::uuid to expect a\nuuid::Uuid value rather than text. Latent since v0.3.x — no prior\npostgres test exercised the put paths end-to-end (only SELECT-side\nattach_*_pqc_signature). §I round-trip test in v0.5.5 was the first\nto hit it, but v0.5.6/.7's hotfixes only touched test fixtures and\nmissed the underlying issue.\n\nFix: parse String → uuid::Uuid::parse_str at the persist boundary,\nbind the Uuid value directly. with-uuid-1 feature on tokio-postgres\nalready provides ToSql; just stop relying on the fragile &String →\n$::uuid cast path.\n\n```rust\nlet revocation_uuid = uuid::Uuid::parse_str(&row.revocation_id)?;\nclient.execute(\"... VALUES ($1, ...)\", &[&revocation_uuid, ...])\n```\n\nSame shape applied to put_attestation. Other $N::uuid sites\n(attach_*_pqc_signature, outbound queue ops) unchanged — they're\nSELECT paths that work in prod; will revisit if tests surface them.\n\nInvalid UUIDs now surface as Error::InvalidArgument (was opaque\nError::Backend serialization error) — strictly better for operators.\n\nPre-push hardening:\n- scripts/hooks/pre-push auto-discovers ciris-qa-postgres docker\n  container and runs read_section_* tests against it\n- Warns loudly when no live PG available (CIRIS_PERSIST_TEST_PG_URL\n  unset + no docker container) but doesn't fail — preserves\n  \"integration in CI\" historical contract\n- v0.5.5→v0.5.7 burned 2 release versions to fixture bugs local\n  `cargo test` silently skipped. This stops that pattern.\n\nVerification: 38/38 read_section_* tests pass against live\nciris-qa-postgres locally.\n\nLens team target: ciris-persist == 0.5.8.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-11T20:03:20-05:00",
+          "tree_id": "b1468ff17b75089eb22b2dea33f94f7831102afd",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/7c1770863d0aaa3e6724a2d96379efac0e65f67d"
+        },
+        "date": 1778548288634,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 95951,
+            "range": "± 2220",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 238666,
+            "range": "± 2441",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 521095,
+            "range": "± 21822",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1979230,
+            "range": "± 36741",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 326,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1305,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7377,
+            "range": "± 101",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 20772,
+            "range": "± 266",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24184,
+            "range": "± 293",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 88731,
+            "range": "± 946",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 318,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3212,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9559,
+            "range": "± 130",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 44214,
+            "range": "± 202",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 538,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2123956,
+            "range": "± 110055",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6421168,
+            "range": "± 133563",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23473667,
+            "range": "± 290933",
             "unit": "ns/iter"
           }
         ]
