@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778599211116,
+  "lastUpdate": 1778599437677,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -8729,6 +8729,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23807596,
             "range": "± 670122",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "b146b6650fe78068b4f233f4e13e866b928d4d74",
+          "message": "v0.6.0-α2: lift CIRISLens scrub module (fields + regex + walker) + cargo-deny fix\n\nα2 ports the JSON-walker + regex scrubber verbatim from\nCIRISLens/cirislens-core/src/scrubber/ under the `scrub` Cargo\nfeature. ~1,200 LOC across:\n\n- src/pipeline/scrub/fields.rs — SCRUB_FIELDS catalog (47 field\n  names; security boundary, intentionally code-only).\n- src/pipeline/scrub/regex.rs — 8 PII patterns + year-identifier\n  guard + count_year_residue + probe_match. Production regression\n  cases preserved verbatim (phone false-positive on timestamps,\n  year-identifier overfire on pure-digit IDs).\n- src/pipeline/scrub/walker.rs — depth-limited two-phase walker\n  (Phase 1 collect NER inputs, Phase 2 batched NER, Phase 3 inject\n  + regex). 30-depth limit + schema-label NER skip preserved.\n- src/pipeline/scrub/ner.rs — STUB returning NerNotConfigured.\n  Real Candle / ORT backends defer to α4 alongside scrub-ner /\n  scrub-ort features.\n- src/pipeline/scrub/mod.rs — scrub_trace + scrub_traces_batch +\n  ScrubError + ScrubStats + ScrubbedTrace. Uses persist's\n  crate::schema::TraceLevel (single source of truth across\n  ingest, scrub, and the Scrubber trait).\n\nThe sole behavioral change from lens-core is lazy_static →\nstd::sync::OnceLock (no new dep). 33 lifted tests pass under the\nnew feature gate.\n\nCARGO-DENY FIX\nα1 CI failed cargo-deny: number_prefix + paste unmaintained\nadvisories pulled in transitively by the candle / tokenizers /\nhf-hub / ort / ndarray deps I declared as optional. α2 removes\nthose deps + the scrub-ner / scrub-ort / default-pipeline-ml\nfeatures that referenced them — they'll come back in α4 alongside\nthe actual NER backend lift + a deny.toml ignore block scoped to\nthose two transitive advisories.\n\nPRE-PUSH HARDENING\nscripts/hooks/pre-push adds a cargo-deny advisories gate (when\ncargo-deny is installed locally). Catches this class of CI\nregression locally next time. Skipped silently when cargo-deny\nisn't installed.\n\nPIPELINE INTEGRATION\nThe new scrub functions are STANDALONE for now — they sit\nalongside persist's existing crate::scrub::Scrubber trait (the\nv0.1.x slot for the lens FastAPI callback). α5 wires the new\nDefaultScrubber impl into the Scrubber trait + Engine API.\n\nNEXT: α3 — extract module + typed Features struct lift from\ncirislens-core/src/extraction/.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-12T10:15:18-05:00",
+          "tree_id": "2d818b51bed2f9ae7b059f0661cfa0c13baba353",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/b146b6650fe78068b4f233f4e13e866b928d4d74"
+        },
+        "date": 1778599437223,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 108785,
+            "range": "± 302",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 260334,
+            "range": "± 1919",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 563544,
+            "range": "± 3296",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1999723,
+            "range": "± 55038",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 342,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1415,
+            "range": "± 24",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8243,
+            "range": "± 57",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23156,
+            "range": "± 198",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26397,
+            "range": "± 618",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91047,
+            "range": "± 7032",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 357,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3142,
+            "range": "± 16",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9528,
+            "range": "± 56",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42016,
+            "range": "± 191",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 632,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2321563,
+            "range": "± 91803",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7110316,
+            "range": "± 154092",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 26335913,
+            "range": "± 184506",
             "unit": "ns/iter"
           }
         ]
