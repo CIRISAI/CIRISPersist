@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778539888075,
+  "lastUpdate": 1778546070692,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -8069,6 +8069,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 24195205,
             "range": "± 319460",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "410669cc36d31eb70dc13da29385f467ba65aa0b",
+          "message": "0.5.5 — federation read primitives §C/D/G/H/I (closes CIRISPersist#23)\n\nv0.5.0 shipped §A/B/F/E (validated in prod via v0.5.3 bridge sweep).\nv0.5.5 closes #23 with the deferred batch: 5 additive primitives, no\nschema changes, no breaking API edits.\n\n§C list_tasks: TaskClass canonical derivation (qa_eval/discord/\nreal_user_*/wakeup_ritual/other) from task_id prefix, single-source\nacross federation peers. initial_observation extracted server-side\nfrom earliest THOUGHT_START task_description. Cursor: (earliest_at,\ntask_id), newest-first. Trace ordering within task: thought_depth ASC.\n\n§D list_llm_calls + aggregate_llm_costs: cursor-paged listing with\nagent/model/status/trace filters. Agent-side filters force JOIN to\ntrace_events. Cost rollup by_model/by_agent/by_domain + totals;\nevery SUM COALESCE'd to 0 proactively (CIRISPersist#24 hygiene).\n\n§G corpus_shape: 6 breakdowns per window — task_class, qa_language,\nqa_question_num, agent_name, agent_version (= agent_template),\nprimary_model, deployment_region. primary_model is per-trace\nmost-frequent LLM call model. stationarity_z_score reserved for\nfuture baseline-window API extension.\n\n§H aggregate_scrub_stats: envelopes_scrubbed + by_trace_level populate\ntoday; fields_scrubbed_total + by_entity_type gated on v0.6.0\npost-ingest classification pipeline (CIRISPersist#19). Shape locked\nnow so consumers don't churn when pipeline lands.\n\n§I list_federation_keys / list_attestations / list_revocations: bulk\nprimitives over cirislens.federation_* tables. Filters: revoked\n(EXISTS), pqc_completed (IS NOT NULL), per-key/attestation/revocation\nidentity refs. Items reuse crate::federation types — no duplicate\nschemas.\n\nTest coverage: 17 new integration tests (5 §C + 4 §D + 3 §G + 2 §H +\n3 §I). 222 lib tests pass (was 205).\n\nMemory + sqlite backends return NotImplemented per existing convention.\n\nAll PyO3 entry points wrapped in catch_panic from the start (v0.5.4\ndiscipline). Every Row::get goes through safe_get (postgres.rs\npre-commit gate already enforces).\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-11T19:25:54-05:00",
+          "tree_id": "329c405f19a1553bf996d41f0f9ce5b6bcbda30c",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/410669cc36d31eb70dc13da29385f467ba65aa0b"
+        },
+        "date": 1778546070132,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101452,
+            "range": "± 1522",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 242368,
+            "range": "± 729",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 524399,
+            "range": "± 1908",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1857986,
+            "range": "± 20760",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 372,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1595,
+            "range": "± 33",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8764,
+            "range": "± 20",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21174,
+            "range": "± 56",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24232,
+            "range": "± 52",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83610,
+            "range": "± 203",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 368,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3161,
+            "range": "± 32",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9606,
+            "range": "± 26",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42800,
+            "range": "± 164",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 622,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2282142,
+            "range": "± 118958",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6769352,
+            "range": "± 70356",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 24382627,
+            "range": "± 665013",
             "unit": "ns/iter"
           }
         ]
