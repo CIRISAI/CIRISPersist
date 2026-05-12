@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778604749550,
+  "lastUpdate": 1778604859772,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -9653,6 +9653,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23845742,
             "range": "± 839001",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "71c1a9c0af17e1d3abc78fbfe272ebadb71a16ef",
+          "message": "v0.6.1-α2: federation-stable wire types for SecretsService\n\n13 typed structs + 2 enums + 1 Default for the v0.6.1 wire surface\nper FSD §7.2.\n\nNEW SURFACE (src/secrets/types.rs)\n- SecretRecord — full encrypted-secret row shape (ciphertext + salt\n  + nonce + key_ref + metadata). Mirrors cirislens_secrets.secrets\n  V010 schema exactly. record_schema_version = \"1.0\" today; wire-\n  shape changes within v0.6.x are additive only.\n- EncryptedSecretRecord — wraps SecretRecord with optional\n  edge-side HMAC (federation-internal integrity attestation).\n- SecretReference — metadata-only listing shape (no ciphertext, no\n  key refs). For list_stored_secrets + the (filtered_text, refs)\n  return tuple of process_incoming_text.\n- SecretRecallResult — recall outcome (found + decrypted-value +\n  error message).\n- DecapsulationContext — audit-log context for the\n  decapsulate_secrets_in_parameters operation.\n- AccessLogEntry + AccessOp enum — row shape for\n  cirislens_secrets.access_log + 8-variant operation token\n  (Store/Retrieve/Recall/Forget/Encrypt/Decrypt/Reencrypt/Rotate).\n- SecretsListFilter (Default + AND-compose) — list_stored_secrets\n  filter (sensitivity / pattern / source_message_id / created\n  range).\n- SecretsServiceStats — health + observability summary\n  (total_secrets / active_filters / encryption_enabled /\n  hardware_key_active / rotation_count etc.).\n- RotationResult — reencrypt_all outcome (success + count +\n  per-UUID failures + duration_ms).\n- MasterKeyRef — Software{handle} | Hardware{key_id,descriptor}.\n  Adjacently-tagged JSON (matches ContentClass shape).\n- FilterUpdateRequest / FilterUpdateResult / FilterConfig — the\n  pattern catalog CRUD surface (whole-config replaces; field-\n  level deltas deferred to v0.6.x).\n\nAll types derive Serialize + Deserialize + Debug + Clone + (PartialEq\nwhere shape allows). Stable across the JSON / postgres / PyO3\nboundaries. Doc comments on every public field.\n\nALIGNMENT NOTE\nsecrets feature now implies `classify` (Sensitivity lives in\ncrate::pipeline::classify, shared with the pipeline taxonomy —\nzero-duplication).\n\nVERIFICATION\n- 17 secrets tests pass total (10 crypto + 7 types). Serde round-\n  trips locked for MasterKeyRef (Software + Hardware variants),\n  AccessOp snake_case, SecretReference, SecretRecallResult,\n  SecretsListFilter, FilterUpdateRequest.\n- cargo clippy --tests clean on secrets feature build.\n\nNEXT: α3 — SecretsService trait (18 methods).\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-12T11:46:24-05:00",
+          "tree_id": "a45838ce1f4c44c0a2fef1c86b74b98623b815b2",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/71c1a9c0af17e1d3abc78fbfe272ebadb71a16ef"
+        },
+        "date": 1778604859160,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 95745,
+            "range": "± 520",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 237951,
+            "range": "± 791",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 520464,
+            "range": "± 6853",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 2062272,
+            "range": "± 44124",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 325,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1292,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7626,
+            "range": "± 92",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 20566,
+            "range": "± 519",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 23979,
+            "range": "± 59",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 88568,
+            "range": "± 260",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 317,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3189,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9817,
+            "range": "± 47",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 44570,
+            "range": "± 269",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 539,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2174147,
+            "range": "± 55421",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6504682,
+            "range": "± 112636",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23682434,
+            "range": "± 246432",
             "unit": "ns/iter"
           }
         ]
