@@ -100,7 +100,7 @@ default-sovereign-light = ["scrub", "extract"]
 # upstream we'll add a `secrets-hw = ["secrets", "ciris-keyring/symmetric-derivation"]`
 # feature here. Until then the trait method exists but always
 # returns SecretsError::HardwareKeyUnavailable.
-secrets        = ["postgres", "ciris-crypto/aes-gcm", "ciris-crypto/kdf", "ciris-crypto/hmac", "ciris-crypto/random"]
+secrets        = ["postgres", "classify", "ciris-crypto/aes-gcm", "ciris-crypto/kdf", "ciris-crypto/hmac", "ciris-crypto/random"]
 secrets-server = ["secrets", "server"]
 
 # v0.1.3 — optional TLS for the Postgres connection pool. Defaults

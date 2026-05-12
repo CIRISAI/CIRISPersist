@@ -48,6 +48,16 @@
 #[cfg(feature = "secrets")]
 pub mod crypto;
 
+#[cfg(feature = "secrets")]
+pub mod types;
+
+#[cfg(feature = "secrets")]
+pub use types::{
+    AccessLogEntry, AccessOp, DecapsulationContext, EncryptedSecretRecord, FilterConfig,
+    FilterUpdateRequest, FilterUpdateResult, MasterKeyRef, RotationResult, SecretRecallResult,
+    SecretRecord, SecretReference, SecretsListFilter, SecretsServiceStats,
+};
+
 /// SecretsService-layer errors.
 ///
 /// THREAT_MODEL.md AV-15: stable `kind()` tokens for HTTP / PyO3
