@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778546070692,
+  "lastUpdate": 1778546957076,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -8201,6 +8201,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 24382627,
             "range": "± 665013",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "61b6ff4d14dfefd24a816efa14da3c914680f5d3",
+          "message": "0.5.6 — test fixture hotfix for v0.5.5 §I federation observability\n\nv0.5.5's tag-push CI surfaced two §I test fixture bugs against live\nPostgres (unit-only `cargo test` had passed because PG-gated tests\nearly-return without CIRIS_PERSIST_TEST_PG_URL).\n\n1. read_section_i_list_federation_keys_cursor: asserted\n   next_cursor.is_none() on an exact-fill page (4 keys, limit=2 →\n   page 2 yields 2 items with no more rows). Pagination contract\n   matching §A: cursor is None ONLY when items.len() < limit; impl\n   can't distinguish \"exactly limit remaining\" from \"more remain\"\n   without fetching limit+1. Fixed test: walk one extra empty page\n   and assert it has no cursor + zero items.\n\n2. read_section_i_list_revocations_round_trip: fixture set\n   original_content_hash = \"abc\" (3 hex chars, odd). The federation\n   persist layer rejects with InvalidArgument(\"Odd number of digits\").\n   Fixed to use a 64-char sha256-shaped hex placeholder.\n\nZero impl changes — every §C/D/G/H/I primitive's Rust code is the\nv0.5.5 code unchanged. The pagination contract was correct; only the\n§I test assertion was wrong about it.\n\nv0.5.5's PyPI publish was skipped because of these failures (no\nartifact reached PyPI). Build manifest WAS registered with the\nregistry for version=0.5.5, which is why this is v0.5.6 not a\nforce-moved v0.5.5 tag — manifest integrity discipline.\n\nLens team target: ciris-persist == 0.5.6.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-11T19:42:00-05:00",
+          "tree_id": "70bb40a839cbcb8ed962d4ff39b151ea8d9f8df5",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/61b6ff4d14dfefd24a816efa14da3c914680f5d3"
+        },
+        "date": 1778546956102,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101775,
+            "range": "± 209",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 242560,
+            "range": "± 5987",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 523487,
+            "range": "± 2056",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1857574,
+            "range": "± 8815",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 367,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1577,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8670,
+            "range": "± 33",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21171,
+            "range": "± 403",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24201,
+            "range": "± 104",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83516,
+            "range": "± 373",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 370,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3211,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9536,
+            "range": "± 24",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41379,
+            "range": "± 212",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 625,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2317699,
+            "range": "± 119732",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6706557,
+            "range": "± 219017",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 24057471,
+            "range": "± 583723",
             "unit": "ns/iter"
           }
         ]
