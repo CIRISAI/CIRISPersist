@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778603194714,
+  "lastUpdate": 1778603304294,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -9257,6 +9257,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25870010,
             "range": "± 480908",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "82fd51fddeb447f343fb3bc973a0b905fec4b182",
+          "message": "0.6.0 — post-ingest filter pipeline substrate (partial close CIRISPersist#19)\n\nBumps Cargo.toml 0.5.8 → 0.6.0 + CHANGELOG entry summarising the\nfive alpha checkpoints (α1..α5, all on main pre-tag):\n\nα1 — Foundation: classify taxonomy + Stage trait + V009 migration\nα2 — Scrub lift: verbatim from CIRISLens cirislens-core/scrubber/\nα3 — Extract lift: verbatim from CIRISLensCore src/extract/\nα4 — NER backends: XLM-R + DistilBERT (candle) + ORT INT8 fast path\nα5 — Engine read API: get_features + get_classifications PyO3 wraps\n\nCargo features per FSD §2.4: classify / scrub / extract /\nscrub-ner / scrub-ort / default-pipeline-ml / default-sovereign-\nlight. Light builds compile in seconds; ML feature builds add ~500MB\nof candle + tokenizers + hf-hub.\n\nWHAT'S NOT IN v0.6.0\n- Pipeline orchestration (receive_pipeline_envelope, Stage runner,\n  edge call site) — v0.6.2 per FSD §12.2 edge-cutover phase.\n- 18-method SecretsService trait + V010 secrets schema + HTTP API\n  + ciris-crypto facade — v0.6.1.\n- Proptests + differential tests — v0.6.0.x patches.\n\nLens / lens-core teams: target ciris-persist == 0.6.0 for the\nv0.6.x adoption track. Read API works against the V009 JSONB\ncolumns immediately; the pipeline orchestration that POPULATES\nthose columns lands when the edge cutover ships v0.6.2.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-12T11:20:17-05:00",
+          "tree_id": "74525f755558e9180d62532f3d58fd0f90c35513",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/82fd51fddeb447f343fb3bc973a0b905fec4b182"
+        },
+        "date": 1778603303222,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 105819,
+            "range": "± 1958",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 247247,
+            "range": "± 3410",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 528730,
+            "range": "± 2584",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1856041,
+            "range": "± 11004",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 370,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1501,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8629,
+            "range": "± 243",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21381,
+            "range": "± 65",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24438,
+            "range": "± 209",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83726,
+            "range": "± 341",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 363,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3099,
+            "range": "± 29",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9618,
+            "range": "± 46",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41827,
+            "range": "± 235",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 621,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2249924,
+            "range": "± 120095",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6625265,
+            "range": "± 207803",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23628422,
+            "range": "± 280814",
             "unit": "ns/iter"
           }
         ]
