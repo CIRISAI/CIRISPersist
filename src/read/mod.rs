@@ -36,12 +36,15 @@
 //!    scores locally, observe their own drift, verify their own peers.
 //!    No centralization assumed.
 //!
-//! ## v0.5.0 scope
+//! ## Scope by release
 //!
-//! Sections A (trace listing) + B (trace detail) + F (Coherence Ratchet
-//! inputs) + E (scoring factor aggregates), per
-//! `FSD/V0_5_0_FEDERATION_READ_PRIMITIVES.md`. Sections C / D / G / H / I
-//! ship in v0.5.1 after lens validates the v0.5.0 batch in production.
+//! - **v0.5.0** — Sections A (trace listing) + B (trace detail) +
+//!   F (Coherence Ratchet inputs) + E (scoring factor aggregates),
+//!   per `FSD/V0_5_0_FEDERATION_READ_PRIMITIVES.md`.
+//! - **v0.5.5** — Remaining sections from CIRISPersist#23: C (task-
+//!   grouped listing), D (LLM call surface), G (corpus shape),
+//!   H (privacy / scrub observability), I (federation observability
+//!   bulk lists). Additive only; no schema changes. Issue closed.
 //!
 //! ## Cursor pagination contract
 //!
@@ -67,11 +70,28 @@
 
 use std::future::Future;
 
+pub mod corpus;
+pub mod federation;
+pub mod llm;
 pub mod scoring;
+pub mod scrub;
+pub mod task;
 pub mod trace;
 pub mod types;
 
+pub use corpus::{CorpusShape, CorpusShapeFilter};
+pub use federation::{
+    AttestationCursor, AttestationFilter, AttestationListPage, FederationKeyCursor,
+    FederationKeyFilter, FederationKeyListPage, RevocationCursor, RevocationFilter,
+    RevocationListPage,
+};
+pub use llm::{
+    AgentCostStats, DomainCostStats, LlmCallCursor, LlmCallFilter, LlmCallListPage,
+    LlmCostAggregate, ModelCostStats, TotalCostStats,
+};
 pub use scoring::{AuditChainAggregate, CoherencePoint, RecoveryEvent, ScoringFactorAggregate};
+pub use scrub::ScrubAggregate;
+pub use task::{TaskClass, TaskCursor, TaskFilter, TaskGroup, TaskListPage};
 pub use trace::{
     DivergenceRow, HashChainGap, OverrideRateRow, TemporalDriftRow, TraceComponentRow, TraceDetail,
     TraceEnvelopeRefs, TraceListPage, TraceSummary,
@@ -126,6 +146,99 @@ pub trait ReadEngine: Send + Sync {
         &self,
         trace_id: &str,
     ) -> impl Future<Output = Result<Option<TraceDetail>, Error>> + Send;
+
+    // ── Section C — Task-grouped listing (CIRISPersist#23 §C) ──────
+
+    /// Page through tasks, each task carrying its component traces.
+    /// Drives task-axis views (qa-eval / discord / wakeup-ritual /
+    /// real-user pages) where the visible-page axis is task, not trace.
+    ///
+    /// Task ordering: `earliest_at DESC, task_id DESC` (newest-first
+    /// triage). Trace ordering within a task: `thought_depth ASC`
+    /// then `started_at ASC`. Cursor-paged; no OFFSET/LIMIT.
+    ///
+    /// `task_class` derivation is canonical via [`TaskClass::from_task_id`]
+    /// — every federation peer sees the same class for a given task_id.
+    fn list_tasks(
+        &self,
+        filter: TaskFilter,
+        cursor: Option<TaskCursor>,
+        limit: i64,
+    ) -> impl Future<Output = Result<TaskListPage, Error>> + Send;
+
+    // ── Section D — LLM call surface (CIRISPersist#23 §D) ──────────
+
+    /// Page through LLM call rows on `cirislens.trace_llm_calls`.
+    /// Used by cost / latency / model-breakdown dashboards and
+    /// prompt-hash analysis. Cursor-paged; newest-first.
+    fn list_llm_calls(
+        &self,
+        filter: LlmCallFilter,
+        cursor: Option<LlmCallCursor>,
+        limit: i64,
+    ) -> impl Future<Output = Result<LlmCallListPage, Error>> + Send;
+
+    /// Roll up LLM call costs by model, by agent, by deployment
+    /// domain, plus window-level totals. Replaces the lens-side raw
+    /// SQL cost-aggregation pass.
+    fn aggregate_llm_costs(
+        &self,
+        filter: LlmCallFilter,
+    ) -> impl Future<Output = Result<LlmCostAggregate, Error>> + Send;
+
+    // ── Section G — Corpus shape (CIRISPersist#23 §G) ──────────────
+
+    /// Corpus-shape rollup for a window. Returns distinct-trace
+    /// counts broken down by task_class, QA language / question num,
+    /// agent name + template, primary model, deployment region.
+    /// Drives `scripts/corpus_shape.py` and cohort dashboards.
+    fn corpus_shape(
+        &self,
+        filter: CorpusShapeFilter,
+    ) -> impl Future<Output = Result<CorpusShape, Error>> + Send;
+
+    // ── Section H — Privacy / scrub observability (CIRISPersist#23 §H) ──
+
+    /// Scrub-stats aggregate for a window. Drives privacy dashboards.
+    /// `envelopes_scrubbed` + `by_trace_level` are populated from
+    /// `cirislens.trace_events.pii_scrubbed`;
+    /// `fields_scrubbed_total` + `by_entity_type` are gated on the
+    /// v0.6.0 post-ingest classification pipeline (CIRISPersist#19).
+    fn aggregate_scrub_stats(
+        &self,
+        window: TimeWindow,
+    ) -> impl Future<Output = Result<ScrubAggregate, Error>> + Send;
+
+    // ── Section I — Federation observability bulk (CIRISPersist#23 §I) ──
+
+    /// Page through `cirislens.federation_keys`. Cursor-paged
+    /// newest-first by `(valid_from DESC, key_id DESC)`. Filters
+    /// compose AND-style; `revoked` and `pqc_completed` are SQL-side
+    /// EXISTS predicates / `pqc_completed_at IS NULL` checks.
+    fn list_federation_keys(
+        &self,
+        filter: FederationKeyFilter,
+        cursor: Option<FederationKeyCursor>,
+        limit: i64,
+    ) -> impl Future<Output = Result<FederationKeyListPage, Error>> + Send;
+
+    /// Page through `cirislens.federation_attestations`. Newest-first
+    /// by `(asserted_at, attestation_id)`.
+    fn list_attestations(
+        &self,
+        filter: AttestationFilter,
+        cursor: Option<AttestationCursor>,
+        limit: i64,
+    ) -> impl Future<Output = Result<AttestationListPage, Error>> + Send;
+
+    /// Page through `cirislens.federation_revocations`. Newest-first
+    /// by `(revoked_at, revocation_id)`.
+    fn list_revocations(
+        &self,
+        filter: RevocationFilter,
+        cursor: Option<RevocationCursor>,
+        limit: i64,
+    ) -> impl Future<Output = Result<RevocationListPage, Error>> + Send;
 
     // ── Section F — Coherence Ratchet inputs (CIRISPersist#23 §F) ──
 

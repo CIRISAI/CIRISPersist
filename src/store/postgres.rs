@@ -2882,6 +2882,1071 @@ impl crate::read::ReadEngine for PostgresBackend {
         }))
     }
 
+    /// Section C: task-grouped listing.
+    ///
+    /// Two-query design:
+    ///
+    /// 1. **Task page** — `cirislens.trace_events` grouped by `task_id`,
+    ///    yielding `(task_id, earliest_at, latest_at, initial_observation)`.
+    ///    The `initial_observation` column is extracted server-side from
+    ///    `MAX(payload->>'task_description') FILTER (WHERE event_type =
+    ///    'THOUGHT_START')` so the derivation is canonical across
+    ///    federation peers (CIRISPersist#23 §C requirement). The page
+    ///    cursor predicate uses PostgreSQL tuple-compare on
+    ///    `(earliest_at, task_id)`.
+    /// 2. **Traces for the page** — once we have the page's `task_id`
+    ///    list, re-run the §A summary SELECT against those task_ids
+    ///    only (one round-trip; `task_id = ANY($1::text[])`). Group the
+    ///    rows in Rust by `task_id`.
+    ///
+    /// Trace ordering within a task: `thought_depth ASC NULLS LAST`
+    /// then `started_at ASC` — reasoning chain reads top-to-bottom.
+    /// `TaskClass` is derived in Rust via [`crate::read::TaskClass::from_task_id`]
+    /// after the SQL fetch so the mapping is single-source.
+    async fn list_tasks(
+        &self,
+        filter: crate::read::TaskFilter,
+        cursor: Option<crate::read::TaskCursor>,
+        limit: i64,
+    ) -> Result<crate::read::TaskListPage, crate::read::Error> {
+        if !(1..=10_000).contains(&limit) {
+            return Err(crate::read::Error::InvalidArgument(format!(
+                "limit must be in [1, 10000], got {limit}"
+            )));
+        }
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
+
+        // Build WHERE clause matching task-level filter. task_id is
+        // required to be non-null (a trace without task_id is not a
+        // task; task-axis listing excludes it).
+        let mut where_parts: Vec<String> = vec!["task_id IS NOT NULL".to_owned()];
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+
+        if let Some(w) = filter.time_window {
+            params.push(Box::new(w.since));
+            where_parts.push(format!("ts >= ${}", params.len()));
+            params.push(Box::new(w.until));
+            where_parts.push(format!("ts < ${}", params.len()));
+        }
+        if let Some(h) = &filter.agent_id_hash {
+            params.push(Box::new(h.clone()));
+            where_parts.push(format!("agent_id_hash = ${}", params.len()));
+        }
+        if let Some(n) = &filter.agent_name {
+            params.push(Box::new(n.clone()));
+            where_parts.push(format!("agent_name = ${}", params.len()));
+        }
+        if let Some(d) = &filter.deployment_domain {
+            params.push(Box::new(d.clone()));
+            where_parts.push(format!("deployment_domain = ${}", params.len()));
+        }
+        // task_class derives from task_id prefix; translate the filter
+        // to a SQL prefix-match. Keep the prefix list aligned with
+        // TaskClass::from_task_id — change one, change the other.
+        if let Some(tc) = filter.task_class {
+            use crate::read::TaskClass;
+            let predicate = match tc {
+                TaskClass::QaEval => {
+                    "(task_id LIKE 'qa\\_%' ESCAPE '\\' OR task_id LIKE 'qa-eval%')"
+                }
+                TaskClass::Discord => "task_id LIKE 'discord\\_%' ESCAPE '\\'",
+                TaskClass::RealUserDiscord => {
+                    "task_id LIKE 'real\\_user\\_discord\\_%' ESCAPE '\\'"
+                }
+                TaskClass::RealUserCli => "task_id LIKE 'real\\_user\\_cli\\_%' ESCAPE '\\'",
+                TaskClass::RealUserApi => "task_id LIKE 'real\\_user\\_api\\_%' ESCAPE '\\'",
+                TaskClass::WakeupRitual => "position('wakeup' in task_id) > 0",
+                TaskClass::Other => {
+                    // Inverse of every recognized prefix. Keep this in
+                    // sync with TaskClass::from_task_id.
+                    "(task_id NOT LIKE 'qa\\_%' ESCAPE '\\' \
+                       AND task_id NOT LIKE 'qa-eval%' \
+                       AND task_id NOT LIKE 'discord\\_%' ESCAPE '\\' \
+                       AND task_id NOT LIKE 'real\\_user\\_discord\\_%' ESCAPE '\\' \
+                       AND task_id NOT LIKE 'real\\_user\\_cli\\_%' ESCAPE '\\' \
+                       AND task_id NOT LIKE 'real\\_user\\_api\\_%' ESCAPE '\\' \
+                       AND position('wakeup' in task_id) = 0)"
+                }
+            };
+            where_parts.push(predicate.to_owned());
+        }
+
+        let where_sql = format!("WHERE {}", where_parts.join(" AND "));
+
+        // Cursor predicate uses HAVING because earliest_at is an
+        // aggregate. Tuple compare: (MIN(ts), task_id) < (last_at, last_id).
+        let having_sql = match &cursor {
+            None => String::new(),
+            Some(c) => {
+                if c.version != "v1" {
+                    return Err(crate::read::Error::InvalidCursor(format!(
+                        "TaskCursor version {} unsupported; v0.5.5 ships v1",
+                        c.version
+                    )));
+                }
+                params.push(Box::new(c.last_earliest_at));
+                let p_at = params.len();
+                params.push(Box::new(c.last_task_id.clone()));
+                let p_id = params.len();
+                format!("HAVING (MIN(ts), task_id) < (${p_at}, ${p_id})")
+            }
+        };
+
+        params.push(Box::new(limit));
+        let p_limit = params.len();
+
+        let task_page_sql = format!(
+            "SELECT task_id, \
+                    MIN(ts) AS earliest_at, \
+                    MAX(ts) AS latest_at, \
+                    MAX(payload->>'task_description') \
+                        FILTER (WHERE event_type = 'THOUGHT_START') \
+                        AS initial_observation \
+             FROM cirislens.trace_events \
+             {where_sql} \
+             GROUP BY task_id \
+             {having_sql} \
+             ORDER BY earliest_at DESC, task_id DESC \
+             LIMIT ${p_limit}"
+        );
+
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let task_rows = client
+            .query(&task_page_sql, &params_ref[..])
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("list_tasks page: {e}")))?;
+
+        if task_rows.is_empty() {
+            return Ok(crate::read::TaskListPage {
+                items: Vec::new(),
+                next_cursor: None,
+            });
+        }
+
+        // Decode the page header rows (task_id, earliest_at, latest_at,
+        // initial_observation) before reaching for the per-trace SELECT.
+        struct TaskHeader {
+            task_id: String,
+            earliest_at: chrono::DateTime<chrono::Utc>,
+            latest_at: chrono::DateTime<chrono::Utc>,
+            initial_observation: Option<String>,
+        }
+        let mut headers: Vec<TaskHeader> = Vec::with_capacity(task_rows.len());
+        for row in &task_rows {
+            headers.push(TaskHeader {
+                task_id: row.safe_get("task_id")?,
+                earliest_at: row.safe_get("earliest_at")?,
+                latest_at: row.safe_get("latest_at")?,
+                initial_observation: row.safe_get("initial_observation")?,
+            });
+        }
+
+        // Fetch trace summaries for every task_id on this page.
+        // task_id = ANY($1::text[]) hits the task_id index;
+        // sub-aggregation is over trace_id.
+        let task_ids: Vec<String> = headers.iter().map(|h| h.task_id.clone()).collect();
+        let traces_sql = format!(
+            "SELECT MAX(task_id) AS _tg_task_id, \
+                    {select}, \
+                    MAX((payload->>'thought_depth')::int) \
+                        FILTER (WHERE event_type = 'THOUGHT_START') AS _tg_depth \
+             FROM cirislens.trace_events \
+             WHERE task_id = ANY($1::text[]) \
+             GROUP BY trace_id \
+             ORDER BY _tg_task_id ASC, \
+                      _tg_depth ASC NULLS LAST, \
+                      started_at ASC",
+            select = TRACE_SUMMARY_SELECT,
+        );
+
+        let trace_rows = client
+            .query(&traces_sql, &[&task_ids])
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("list_tasks traces: {e}")))?;
+
+        // Bucket trace summaries by their group's task_id.
+        let mut bucket: std::collections::HashMap<String, Vec<crate::read::TraceSummary>> =
+            std::collections::HashMap::with_capacity(headers.len());
+        for row in &trace_rows {
+            let tg_task_id: String = row.safe_get("_tg_task_id")?;
+            let summary = pg_row_to_trace_summary(row)?;
+            bucket.entry(tg_task_id).or_default().push(summary);
+        }
+
+        let items: Vec<crate::read::TaskGroup> = headers
+            .into_iter()
+            .map(|h| {
+                let traces = bucket.remove(&h.task_id).unwrap_or_default();
+                let task_class = crate::read::TaskClass::from_task_id(&h.task_id);
+                crate::read::TaskGroup {
+                    task_id: h.task_id,
+                    initial_observation: h.initial_observation,
+                    task_class,
+                    earliest_at: h.earliest_at,
+                    latest_at: h.latest_at,
+                    traces,
+                }
+            })
+            .collect();
+
+        let next_cursor = if items.len() == limit as usize {
+            let last = &items[items.len() - 1];
+            Some(crate::read::TaskCursor::from_trailing(
+                last.earliest_at,
+                last.task_id.clone(),
+            ))
+        } else {
+            None
+        };
+
+        Ok(crate::read::TaskListPage { items, next_cursor })
+    }
+
+    /// Section D: paged LLM call listing.
+    ///
+    /// Joins `cirislens.trace_llm_calls` to `cirislens.trace_events`
+    /// on `(trace_id, parent_event_id)` so filters on agent_id_hash /
+    /// agent_name / deployment_domain reach the parent event's
+    /// columns. Newest-first by `(ts, trace_id, attempt_index)`.
+    async fn list_llm_calls(
+        &self,
+        filter: crate::read::LlmCallFilter,
+        cursor: Option<crate::read::LlmCallCursor>,
+        limit: i64,
+    ) -> Result<crate::read::LlmCallListPage, crate::read::Error> {
+        if !(1..=10_000).contains(&limit) {
+            return Err(crate::read::Error::InvalidArgument(format!(
+                "limit must be in [1, 10000], got {limit}"
+            )));
+        }
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
+
+        let (join_sql, where_sql, params) = build_llm_filter_sql(&filter)?;
+        let mut params = params;
+
+        // Cursor predicate uses tuple compare. NULL parent_event_id
+        // doesn't matter — attempt_index disambiguates within trace.
+        let cursor_clause = match &cursor {
+            None => String::new(),
+            Some(c) => {
+                if c.version != "v1" {
+                    return Err(crate::read::Error::InvalidCursor(format!(
+                        "LlmCallCursor version {} unsupported; v0.5.5 ships v1",
+                        c.version
+                    )));
+                }
+                params.push(Box::new(c.last_ts));
+                let p_ts = params.len();
+                params.push(Box::new(c.last_trace_id.clone()));
+                let p_tid = params.len();
+                let attempt_i32 = i32::try_from(c.last_attempt_index).map_err(|_| {
+                    crate::read::Error::InvalidCursor(format!(
+                        "last_attempt_index {} out of i32 range",
+                        c.last_attempt_index
+                    ))
+                })?;
+                params.push(Box::new(attempt_i32));
+                let p_ai = params.len();
+                let prefix = if where_sql.is_empty() { "WHERE" } else { "AND" };
+                format!(
+                    "{prefix} (lc.ts, lc.trace_id, lc.attempt_index) < (${p_ts}, ${p_tid}, ${p_ai})"
+                )
+            }
+        };
+
+        params.push(Box::new(limit));
+        let p_limit = params.len();
+
+        let sql = format!(
+            "SELECT lc.trace_id, lc.thought_id, lc.task_id, lc.parent_event_id, \
+                    lc.parent_event_type, lc.parent_attempt_index, lc.attempt_index, lc.ts, \
+                    lc.duration_ms, lc.handler_name, lc.service_name, lc.model, lc.base_url, \
+                    lc.response_model, lc.prompt_tokens, lc.completion_tokens, lc.prompt_bytes, \
+                    lc.completion_bytes, lc.cost_usd, lc.status, lc.error_class, lc.attempt_count, \
+                    lc.retry_count, lc.prompt_hash, lc.prompt, lc.response_text \
+             FROM cirislens.trace_llm_calls lc \
+             {join_sql} \
+             {where_sql} {cursor_clause} \
+             ORDER BY lc.ts DESC, lc.trace_id DESC, lc.attempt_index DESC \
+             LIMIT ${p_limit}"
+        );
+
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let rows = client
+            .query(&sql, &params_ref[..])
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("list_llm_calls: {e}")))?;
+
+        let mut items: Vec<crate::store::types::TraceLlmCallRow> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            items.push(pg_row_to_llm_call_row(row)?);
+        }
+
+        let next_cursor = if items.len() == limit as usize {
+            let last = &items[items.len() - 1];
+            Some(crate::read::LlmCallCursor::from_trailing(
+                last.ts,
+                last.trace_id.clone(),
+                last.attempt_index,
+            ))
+        } else {
+            None
+        };
+
+        Ok(crate::read::LlmCallListPage { items, next_cursor })
+    }
+
+    /// Section D: rolled-up LLM cost aggregate.
+    ///
+    /// Four GROUP BY passes share the same WHERE filter — by_model,
+    /// by_agent, by_domain, and window totals. Each `SUM` is
+    /// `COALESCE`'d to 0 so empty-window inputs return zeros rather
+    /// than NULL (v0.5.1 / CIRISPersist#24 hygiene applied
+    /// proactively). Aggregates use the join-once CTE shape so the
+    /// trace_events ↔ trace_llm_calls join only runs once per call.
+    async fn aggregate_llm_costs(
+        &self,
+        filter: crate::read::LlmCallFilter,
+    ) -> Result<crate::read::LlmCostAggregate, crate::read::Error> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
+
+        let (join_sql, where_sql, params) = build_llm_filter_sql(&filter)?;
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+
+        // Per-model rollup. Group on model; rows where model IS NULL
+        // get bucketed into "<unknown>".
+        let sql_model = format!(
+            "SELECT COALESCE(lc.model, '<unknown>') AS k, \
+                    COUNT(*)::bigint AS call_count, \
+                    COALESCE(SUM(lc.prompt_tokens), 0)::bigint AS prompt_tokens, \
+                    COALESCE(SUM(lc.completion_tokens), 0)::bigint AS completion_tokens, \
+                    COALESCE(SUM(lc.cost_usd), 0)::float8 AS cost_usd, \
+                    COUNT(*) FILTER (WHERE lc.status != 'ok')::bigint AS error_count \
+             FROM cirislens.trace_llm_calls lc \
+             {join_sql} {where_sql} \
+             GROUP BY k"
+        );
+        let model_rows = client
+            .query(&sql_model, &params_ref[..])
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("agg_llm_costs by_model: {e}")))?;
+        let mut by_model: std::collections::HashMap<String, crate::read::ModelCostStats> =
+            std::collections::HashMap::with_capacity(model_rows.len());
+        for row in &model_rows {
+            let k: String = row.safe_get("k")?;
+            by_model.insert(
+                k.clone(),
+                crate::read::ModelCostStats {
+                    model: k,
+                    call_count: row.safe_get("call_count")?,
+                    prompt_tokens: row.safe_get("prompt_tokens")?,
+                    completion_tokens: row.safe_get("completion_tokens")?,
+                    cost_usd: row.safe_get("cost_usd")?,
+                    error_count: row.safe_get("error_count")?,
+                },
+            );
+        }
+
+        // Per-agent rollup. Requires the parent-event join (otherwise
+        // agent_id_hash isn't visible on the LLM call row).
+        let join_for_agg = if join_sql.is_empty() {
+            // Force-join trace_events so agent_id_hash/deployment_domain
+            // are reachable even when the caller's filter doesn't
+            // already require it.
+            "JOIN cirislens.trace_events e \
+               ON e.trace_id = lc.trace_id AND e.event_id = lc.parent_event_id"
+                .to_owned()
+        } else {
+            join_sql.clone()
+        };
+
+        let sql_agent = format!(
+            "SELECT e.agent_id_hash AS k, \
+                    MAX(e.agent_name) AS agent_name, \
+                    COUNT(*)::bigint AS call_count, \
+                    COALESCE(SUM(lc.prompt_tokens), 0)::bigint AS prompt_tokens, \
+                    COALESCE(SUM(lc.completion_tokens), 0)::bigint AS completion_tokens, \
+                    COALESCE(SUM(lc.cost_usd), 0)::float8 AS cost_usd \
+             FROM cirislens.trace_llm_calls lc \
+             {join_for_agg} {where_sql} \
+             GROUP BY k"
+        );
+        let agent_rows = client
+            .query(&sql_agent, &params_ref[..])
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("agg_llm_costs by_agent: {e}")))?;
+        let mut by_agent: std::collections::HashMap<String, crate::read::AgentCostStats> =
+            std::collections::HashMap::with_capacity(agent_rows.len());
+        for row in &agent_rows {
+            let k: String = row.safe_get("k")?;
+            by_agent.insert(
+                k.clone(),
+                crate::read::AgentCostStats {
+                    agent_id_hash: k,
+                    agent_name: row.safe_get("agent_name")?,
+                    call_count: row.safe_get("call_count")?,
+                    prompt_tokens: row.safe_get("prompt_tokens")?,
+                    completion_tokens: row.safe_get("completion_tokens")?,
+                    cost_usd: row.safe_get("cost_usd")?,
+                },
+            );
+        }
+
+        // Per-domain rollup.
+        let sql_domain = format!(
+            "SELECT COALESCE(e.deployment_domain, '<unknown>') AS k, \
+                    COUNT(*)::bigint AS call_count, \
+                    COALESCE(SUM(lc.cost_usd), 0)::float8 AS cost_usd \
+             FROM cirislens.trace_llm_calls lc \
+             {join_for_agg} {where_sql} \
+             GROUP BY k"
+        );
+        let domain_rows = client
+            .query(&sql_domain, &params_ref[..])
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("agg_llm_costs by_domain: {e}")))?;
+        let mut by_domain: std::collections::HashMap<String, crate::read::DomainCostStats> =
+            std::collections::HashMap::with_capacity(domain_rows.len());
+        for row in &domain_rows {
+            let k: String = row.safe_get("k")?;
+            by_domain.insert(
+                k.clone(),
+                crate::read::DomainCostStats {
+                    deployment_domain: k,
+                    call_count: row.safe_get("call_count")?,
+                    cost_usd: row.safe_get("cost_usd")?,
+                },
+            );
+        }
+
+        // Window totals. No GROUP BY — collapses to one row.
+        let sql_totals = format!(
+            "SELECT COUNT(*)::bigint AS call_count, \
+                    COALESCE(SUM(lc.prompt_tokens), 0)::bigint AS prompt_tokens, \
+                    COALESCE(SUM(lc.completion_tokens), 0)::bigint AS completion_tokens, \
+                    COALESCE(SUM(lc.cost_usd), 0)::float8 AS cost_usd, \
+                    COUNT(*) FILTER (WHERE lc.status != 'ok')::bigint AS error_count \
+             FROM cirislens.trace_llm_calls lc \
+             {join_sql} {where_sql}"
+        );
+        let totals_row = client
+            .query_one(&sql_totals, &params_ref[..])
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("agg_llm_costs totals: {e}")))?;
+        let totals = crate::read::TotalCostStats {
+            call_count: totals_row.safe_get("call_count")?,
+            prompt_tokens: totals_row.safe_get("prompt_tokens")?,
+            completion_tokens: totals_row.safe_get("completion_tokens")?,
+            cost_usd: totals_row.safe_get("cost_usd")?,
+            error_count: totals_row.safe_get("error_count")?,
+        };
+
+        Ok(crate::read::LlmCostAggregate {
+            time_window: filter.time_window,
+            by_model,
+            by_agent,
+            by_domain,
+            totals,
+        })
+    }
+
+    /// Section G: corpus shape rollup.
+    ///
+    /// Six GROUP BY passes share the same trace-set CTE (the distinct
+    /// `trace_id`s matching the filter within the window). Each
+    /// bucket map is computed at SQL layer (no client-side regex /
+    /// aggregation pass) so the rollup is deterministic across
+    /// federation peers. `stationarity_z_score` is reserved for the
+    /// future baseline-comparison API extension; v0.5.5 returns None.
+    async fn corpus_shape(
+        &self,
+        filter: crate::read::CorpusShapeFilter,
+    ) -> Result<crate::read::CorpusShape, crate::read::Error> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
+
+        // Build WHERE on trace_events. Window is required.
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        let mut where_parts: Vec<String> = Vec::new();
+        params.push(Box::new(filter.time_window.since));
+        where_parts.push(format!("ts >= ${}", params.len()));
+        params.push(Box::new(filter.time_window.until));
+        where_parts.push(format!("ts < ${}", params.len()));
+        if let Some(h) = &filter.agent_id_hash {
+            params.push(Box::new(h.clone()));
+            where_parts.push(format!("agent_id_hash = ${}", params.len()));
+        }
+        if let Some(n) = &filter.agent_name {
+            params.push(Box::new(n.clone()));
+            where_parts.push(format!("agent_name = ${}", params.len()));
+        }
+        if let Some(d) = &filter.deployment_domain {
+            params.push(Box::new(d.clone()));
+            where_parts.push(format!("deployment_domain = ${}", params.len()));
+        }
+        let where_sql = format!("WHERE {}", where_parts.join(" AND "));
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+
+        // Total distinct traces + by_task_class breakdown via task_id
+        // prefix matching. Each LIKE predicate aligns with
+        // TaskClass::from_task_id — keep them in sync.
+        let sql_totals = format!(
+            "WITH traces AS ( \
+                 SELECT DISTINCT trace_id, MAX(task_id) AS task_id, \
+                        MAX(agent_name) AS agent_name, \
+                        MAX(agent_template) AS agent_template, \
+                        MAX(deployment_region) AS deployment_region \
+                 FROM cirislens.trace_events {where_sql} \
+                 GROUP BY trace_id \
+             ) \
+             SELECT COUNT(*)::bigint AS total_traces, \
+                    COUNT(*) FILTER ( \
+                        WHERE task_id LIKE 'qa\\_%' ESCAPE '\\' \
+                           OR task_id LIKE 'qa-eval%' \
+                    )::bigint AS c_qa, \
+                    COUNT(*) FILTER ( \
+                        WHERE task_id LIKE 'real\\_user\\_discord\\_%' ESCAPE '\\' \
+                    )::bigint AS c_rud, \
+                    COUNT(*) FILTER ( \
+                        WHERE task_id LIKE 'real\\_user\\_cli\\_%' ESCAPE '\\' \
+                    )::bigint AS c_ruc, \
+                    COUNT(*) FILTER ( \
+                        WHERE task_id LIKE 'real\\_user\\_api\\_%' ESCAPE '\\' \
+                    )::bigint AS c_rua, \
+                    COUNT(*) FILTER ( \
+                        WHERE position('wakeup' in task_id) > 0 \
+                          AND task_id NOT LIKE 'real\\_user\\_%' ESCAPE '\\' \
+                    )::bigint AS c_wakeup, \
+                    COUNT(*) FILTER ( \
+                        WHERE task_id LIKE 'discord\\_%' ESCAPE '\\' \
+                    )::bigint AS c_discord, \
+                    COUNT(*) FILTER ( \
+                        WHERE task_id IS NOT NULL \
+                          AND task_id NOT LIKE 'qa\\_%' ESCAPE '\\' \
+                          AND task_id NOT LIKE 'qa-eval%' \
+                          AND task_id NOT LIKE 'discord\\_%' ESCAPE '\\' \
+                          AND task_id NOT LIKE 'real\\_user\\_discord\\_%' ESCAPE '\\' \
+                          AND task_id NOT LIKE 'real\\_user\\_cli\\_%' ESCAPE '\\' \
+                          AND task_id NOT LIKE 'real\\_user\\_api\\_%' ESCAPE '\\' \
+                          AND position('wakeup' in task_id) = 0 \
+                    )::bigint AS c_other \
+             FROM traces"
+        );
+        let totals_row = client
+            .query_one(&sql_totals, &params_ref[..])
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("corpus_shape totals: {e}")))?;
+        let total_traces: i64 = totals_row.safe_get("total_traces")?;
+        let mut by_task_class: std::collections::HashMap<crate::read::TaskClass, i64> =
+            std::collections::HashMap::new();
+        for (tc, col) in [
+            (crate::read::TaskClass::QaEval, "c_qa"),
+            (crate::read::TaskClass::RealUserDiscord, "c_rud"),
+            (crate::read::TaskClass::RealUserCli, "c_ruc"),
+            (crate::read::TaskClass::RealUserApi, "c_rua"),
+            (crate::read::TaskClass::WakeupRitual, "c_wakeup"),
+            (crate::read::TaskClass::Discord, "c_discord"),
+            (crate::read::TaskClass::Other, "c_other"),
+        ] {
+            let n: i64 = totals_row.safe_get(col)?;
+            if n > 0 {
+                by_task_class.insert(tc, n);
+            }
+        }
+
+        // QA breakdowns — extract language + question_num from
+        // qa_<lang>_<num> or qa-eval-<lang>-<num>. Reject malformed
+        // matches via NULL filter.
+        let sql_qa = format!(
+            "WITH traces AS ( \
+                 SELECT trace_id, MAX(task_id) AS task_id \
+                 FROM cirislens.trace_events {where_sql} \
+                 GROUP BY trace_id \
+             ) \
+             SELECT substring(task_id from '^qa[_-](?:eval[_-])?([a-z]+)[_-]') AS lang, \
+                    NULLIF(substring(task_id from '^qa[_-](?:eval[_-])?[a-z]+[_-]([0-9]+)'), '')::int \
+                        AS qnum, \
+                    COUNT(*)::bigint AS n \
+             FROM traces \
+             WHERE task_id LIKE 'qa\\_%' ESCAPE '\\' OR task_id LIKE 'qa-eval%' \
+             GROUP BY lang, qnum"
+        );
+        let qa_rows = client
+            .query(&sql_qa, &params_ref[..])
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("corpus_shape qa: {e}")))?;
+        let mut by_qa_language: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
+        let mut by_qa_question_num: std::collections::HashMap<i32, i64> =
+            std::collections::HashMap::new();
+        for row in &qa_rows {
+            let lang: Option<String> = row.safe_get("lang")?;
+            let qnum: Option<i32> = row.safe_get("qnum")?;
+            let n: i64 = row.safe_get("n")?;
+            if let Some(lang) = lang {
+                *by_qa_language.entry(lang).or_insert(0) += n;
+            }
+            if let Some(q) = qnum {
+                *by_qa_question_num.entry(q).or_insert(0) += n;
+            }
+        }
+
+        // by_agent_name + by_agent_version (= agent_template) +
+        // by_deployment_region: shared CTE, per-bucket GROUP BY.
+        let sql_agent = format!(
+            "WITH traces AS ( \
+                 SELECT trace_id, \
+                        MAX(agent_name) AS agent_name, \
+                        MAX(agent_template) AS agent_template, \
+                        MAX(deployment_region) AS deployment_region \
+                 FROM cirislens.trace_events {where_sql} \
+                 GROUP BY trace_id \
+             ) \
+             SELECT 'an' AS k, agent_name AS v, COUNT(*)::bigint AS n FROM traces \
+                 WHERE agent_name IS NOT NULL GROUP BY agent_name \
+             UNION ALL \
+             SELECT 'av', agent_template, COUNT(*) FROM traces \
+                 WHERE agent_template IS NOT NULL GROUP BY agent_template \
+             UNION ALL \
+             SELECT 'dr', deployment_region, COUNT(*) FROM traces \
+                 WHERE deployment_region IS NOT NULL GROUP BY deployment_region"
+        );
+        let agent_rows = client
+            .query(&sql_agent, &params_ref[..])
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("corpus_shape agent: {e}")))?;
+        let mut by_agent_name: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
+        let mut by_agent_version: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
+        let mut by_deployment_region: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
+        for row in &agent_rows {
+            let k: String = row.safe_get("k")?;
+            let v: String = row.safe_get("v")?;
+            let n: i64 = row.safe_get("n")?;
+            match k.as_str() {
+                "an" => {
+                    by_agent_name.insert(v, n);
+                }
+                "av" => {
+                    by_agent_version.insert(v, n);
+                }
+                "dr" => {
+                    by_deployment_region.insert(v, n);
+                }
+                _ => {}
+            }
+        }
+
+        // by_primary_model: for each trace in the window, find the
+        // model with the most LLM calls; count traces per model.
+        // Inline the where clause as a sub-CTE to scope LLM calls to
+        // the matching trace set.
+        let sql_model = format!(
+            "WITH traces AS ( \
+                 SELECT DISTINCT trace_id FROM cirislens.trace_events {where_sql} \
+             ), \
+             tm AS ( \
+                 SELECT lc.trace_id, lc.model, COUNT(*) AS n_calls \
+                 FROM cirislens.trace_llm_calls lc \
+                 JOIN traces t ON lc.trace_id = t.trace_id \
+                 WHERE lc.model IS NOT NULL \
+                 GROUP BY lc.trace_id, lc.model \
+             ), \
+             primary_model AS ( \
+                 SELECT DISTINCT ON (trace_id) trace_id, model \
+                 FROM tm \
+                 ORDER BY trace_id, n_calls DESC, model ASC \
+             ) \
+             SELECT model AS k, COUNT(*)::bigint AS n FROM primary_model GROUP BY model"
+        );
+        let model_rows = client
+            .query(&sql_model, &params_ref[..])
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("corpus_shape model: {e}")))?;
+        let mut by_primary_model: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
+        for row in &model_rows {
+            let k: String = row.safe_get("k")?;
+            let n: i64 = row.safe_get("n")?;
+            by_primary_model.insert(k, n);
+        }
+
+        Ok(crate::read::CorpusShape {
+            window: filter.time_window,
+            total_traces,
+            by_task_class,
+            by_qa_language,
+            by_qa_question_num,
+            by_agent_name,
+            by_agent_version,
+            by_primary_model,
+            by_deployment_region,
+            stationarity_z_score: None,
+        })
+    }
+
+    /// Section H: scrub-stats aggregate. Two GROUP BY passes — total
+    /// envelopes scrubbed + per-trace_level counts. Fields requiring
+    /// v0.6.0's post-ingest classification pipeline
+    /// (fields_scrubbed_total + by_entity_type) return zero/empty.
+    async fn aggregate_scrub_stats(
+        &self,
+        window: crate::read::TimeWindow,
+    ) -> Result<crate::read::ScrubAggregate, crate::read::Error> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
+
+        let sql = "WITH traces AS ( \
+                       SELECT trace_id, \
+                              BOOL_OR(pii_scrubbed) AS scrubbed, \
+                              MAX(trace_level) AS trace_level \
+                       FROM cirislens.trace_events \
+                       WHERE ts >= $1 AND ts < $2 \
+                       GROUP BY trace_id \
+                   ) \
+                   SELECT COUNT(*) FILTER (WHERE scrubbed)::bigint AS total_scrubbed, \
+                          COUNT(*) FILTER (WHERE scrubbed AND trace_level = 'generic')::bigint \
+                              AS c_generic, \
+                          COUNT(*) FILTER (WHERE scrubbed AND trace_level = 'detailed')::bigint \
+                              AS c_detailed, \
+                          COUNT(*) FILTER (WHERE scrubbed AND trace_level = 'full_traces')::bigint \
+                              AS c_full \
+                   FROM traces";
+
+        let row = client
+            .query_one(sql, &[&window.since, &window.until])
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("aggregate_scrub_stats: {e}")))?;
+
+        let envelopes_scrubbed: i64 = row.safe_get("total_scrubbed")?;
+        let mut by_trace_level: std::collections::HashMap<crate::schema::TraceLevel, i64> =
+            std::collections::HashMap::new();
+        for (lvl, col) in [
+            (crate::schema::TraceLevel::Generic, "c_generic"),
+            (crate::schema::TraceLevel::Detailed, "c_detailed"),
+            (crate::schema::TraceLevel::FullTraces, "c_full"),
+        ] {
+            let n: i64 = row.safe_get(col)?;
+            if n > 0 {
+                by_trace_level.insert(lvl, n);
+            }
+        }
+
+        Ok(crate::read::ScrubAggregate {
+            window,
+            envelopes_scrubbed,
+            // v0.5.5 limitation — see ScrubAggregate doc comment.
+            fields_scrubbed_total: 0,
+            by_entity_type: std::collections::HashMap::new(),
+            by_trace_level,
+        })
+    }
+
+    /// Section I: list federation_keys with filter + cursor pagination.
+    /// Newest-first by `(valid_from, key_id)`.
+    async fn list_federation_keys(
+        &self,
+        filter: crate::read::FederationKeyFilter,
+        cursor: Option<crate::read::FederationKeyCursor>,
+        limit: i64,
+    ) -> Result<crate::read::FederationKeyListPage, crate::read::Error> {
+        if !(1..=10_000).contains(&limit) {
+            return Err(crate::read::Error::InvalidArgument(format!(
+                "limit must be in [1, 10000], got {limit}"
+            )));
+        }
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
+
+        let mut where_parts: Vec<String> = Vec::new();
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        if let Some(h) = &filter.agent_id_hash {
+            params.push(Box::new(h.clone()));
+            where_parts.push(format!(
+                "(identity_type = 'agent' AND identity_ref = ${})",
+                params.len()
+            ));
+        }
+        if let Some(a) = &filter.algorithm {
+            params.push(Box::new(a.clone()));
+            where_parts.push(format!("algorithm = ${}", params.len()));
+        }
+        if let Some(revoked) = filter.revoked {
+            let op = if revoked { "EXISTS" } else { "NOT EXISTS" };
+            where_parts.push(format!(
+                "{op} (SELECT 1 FROM cirislens.federation_revocations r \
+                     WHERE r.revoked_key_id = cirislens.federation_keys.key_id)"
+            ));
+        }
+        if let Some(pqc) = filter.pqc_completed {
+            where_parts.push(if pqc {
+                "pqc_completed_at IS NOT NULL".to_owned()
+            } else {
+                "pqc_completed_at IS NULL".to_owned()
+            });
+        }
+        if let Some(c) = &cursor {
+            if c.version != "v1" {
+                return Err(crate::read::Error::InvalidCursor(format!(
+                    "FederationKeyCursor version {} unsupported; v0.5.5 ships v1",
+                    c.version
+                )));
+            }
+            params.push(Box::new(c.last_valid_from));
+            let p_at = params.len();
+            params.push(Box::new(c.last_key_id.clone()));
+            let p_id = params.len();
+            where_parts.push(format!("(valid_from, key_id) < (${p_at}, ${p_id})"));
+        }
+        let where_sql = if where_parts.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", where_parts.join(" AND "))
+        };
+        params.push(Box::new(limit));
+        let p_limit = params.len();
+        let sql = format!(
+            "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
+                    identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
+             FROM cirislens.federation_keys \
+             {where_sql} \
+             ORDER BY valid_from DESC, key_id DESC \
+             LIMIT ${p_limit}"
+        );
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let rows = client
+            .query(&sql, &params_ref[..])
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("list_federation_keys: {e}")))?;
+        let items: Result<Vec<crate::federation::KeyRecord>, crate::federation::Error> =
+            rows.into_iter().map(pg_row_to_key_record).collect();
+        let items =
+            items.map_err(|e| crate::read::Error::Backend(format!("decode KeyRecord: {e}")))?;
+
+        let next_cursor = if items.len() == limit as usize {
+            let last = &items[items.len() - 1];
+            Some(crate::read::FederationKeyCursor::from_trailing(
+                last.valid_from,
+                last.key_id.clone(),
+            ))
+        } else {
+            None
+        };
+        Ok(crate::read::FederationKeyListPage { items, next_cursor })
+    }
+
+    /// Section I: list federation_attestations.
+    async fn list_attestations(
+        &self,
+        filter: crate::read::AttestationFilter,
+        cursor: Option<crate::read::AttestationCursor>,
+        limit: i64,
+    ) -> Result<crate::read::AttestationListPage, crate::read::Error> {
+        if !(1..=10_000).contains(&limit) {
+            return Err(crate::read::Error::InvalidArgument(format!(
+                "limit must be in [1, 10000], got {limit}"
+            )));
+        }
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
+
+        let mut where_parts: Vec<String> = Vec::new();
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        if let Some(k) = &filter.attesting_key_id {
+            params.push(Box::new(k.clone()));
+            where_parts.push(format!("attesting_key_id = ${}", params.len()));
+        }
+        if let Some(k) = &filter.attested_key_id {
+            params.push(Box::new(k.clone()));
+            where_parts.push(format!("attested_key_id = ${}", params.len()));
+        }
+        if let Some(t) = &filter.attestation_type {
+            params.push(Box::new(t.clone()));
+            where_parts.push(format!("attestation_type = ${}", params.len()));
+        }
+        if let Some(pqc) = filter.pqc_completed {
+            where_parts.push(if pqc {
+                "pqc_completed_at IS NOT NULL".to_owned()
+            } else {
+                "pqc_completed_at IS NULL".to_owned()
+            });
+        }
+        if let Some(c) = &cursor {
+            if c.version != "v1" {
+                return Err(crate::read::Error::InvalidCursor(format!(
+                    "AttestationCursor version {} unsupported; v0.5.5 ships v1",
+                    c.version
+                )));
+            }
+            params.push(Box::new(c.last_asserted_at));
+            let p_at = params.len();
+            params.push(Box::new(c.last_attestation_id.clone()));
+            let p_id = params.len();
+            where_parts.push(format!(
+                "(asserted_at, attestation_id::text) < (${p_at}, ${p_id})"
+            ));
+        }
+        let where_sql = if where_parts.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", where_parts.join(" AND "))
+        };
+        params.push(Box::new(limit));
+        let p_limit = params.len();
+        let sql = format!(
+            "SELECT attestation_id::text AS attestation_id, attesting_key_id, attested_key_id, \
+                    attestation_type, weight, asserted_at, expires_at, attestation_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
+             FROM cirislens.federation_attestations \
+             {where_sql} \
+             ORDER BY asserted_at DESC, attestation_id DESC \
+             LIMIT ${p_limit}"
+        );
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let rows = client
+            .query(&sql, &params_ref[..])
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("list_attestations: {e}")))?;
+        let items: Result<Vec<crate::federation::Attestation>, crate::federation::Error> =
+            rows.into_iter().map(pg_row_to_attestation).collect();
+        let items =
+            items.map_err(|e| crate::read::Error::Backend(format!("decode Attestation: {e}")))?;
+        let next_cursor = if items.len() == limit as usize {
+            let last = &items[items.len() - 1];
+            Some(crate::read::AttestationCursor::from_trailing(
+                last.asserted_at,
+                last.attestation_id.clone(),
+            ))
+        } else {
+            None
+        };
+        Ok(crate::read::AttestationListPage { items, next_cursor })
+    }
+
+    /// Section I: list federation_revocations.
+    async fn list_revocations(
+        &self,
+        filter: crate::read::RevocationFilter,
+        cursor: Option<crate::read::RevocationCursor>,
+        limit: i64,
+    ) -> Result<crate::read::RevocationListPage, crate::read::Error> {
+        if !(1..=10_000).contains(&limit) {
+            return Err(crate::read::Error::InvalidArgument(format!(
+                "limit must be in [1, 10000], got {limit}"
+            )));
+        }
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
+
+        let mut where_parts: Vec<String> = Vec::new();
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        if let Some(k) = &filter.revoked_key_id {
+            params.push(Box::new(k.clone()));
+            where_parts.push(format!("revoked_key_id = ${}", params.len()));
+        }
+        if let Some(k) = &filter.revoking_key_id {
+            params.push(Box::new(k.clone()));
+            where_parts.push(format!("revoking_key_id = ${}", params.len()));
+        }
+        if let Some(pqc) = filter.pqc_completed {
+            where_parts.push(if pqc {
+                "pqc_completed_at IS NOT NULL".to_owned()
+            } else {
+                "pqc_completed_at IS NULL".to_owned()
+            });
+        }
+        if let Some(c) = &cursor {
+            if c.version != "v1" {
+                return Err(crate::read::Error::InvalidCursor(format!(
+                    "RevocationCursor version {} unsupported; v0.5.5 ships v1",
+                    c.version
+                )));
+            }
+            params.push(Box::new(c.last_revoked_at));
+            let p_at = params.len();
+            params.push(Box::new(c.last_revocation_id.clone()));
+            let p_id = params.len();
+            where_parts.push(format!(
+                "(revoked_at, revocation_id::text) < (${p_at}, ${p_id})"
+            ));
+        }
+        let where_sql = if where_parts.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", where_parts.join(" AND "))
+        };
+        params.push(Box::new(limit));
+        let p_limit = params.len();
+        let sql = format!(
+            "SELECT revocation_id::text AS revocation_id, revoked_key_id, revoking_key_id, reason, \
+                    revoked_at, effective_at, revocation_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
+             FROM cirislens.federation_revocations \
+             {where_sql} \
+             ORDER BY revoked_at DESC, revocation_id DESC \
+             LIMIT ${p_limit}"
+        );
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let rows = client
+            .query(&sql, &params_ref[..])
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("list_revocations: {e}")))?;
+        let items: Result<Vec<crate::federation::Revocation>, crate::federation::Error> =
+            rows.into_iter().map(pg_row_to_revocation).collect();
+        let items =
+            items.map_err(|e| crate::read::Error::Backend(format!("decode Revocation: {e}")))?;
+        let next_cursor = if items.len() == limit as usize {
+            let last = &items[items.len() - 1];
+            Some(crate::read::RevocationCursor::from_trailing(
+                last.revoked_at,
+                last.revocation_id.clone(),
+            ))
+        } else {
+            None
+        };
+        Ok(crate::read::RevocationListPage { items, next_cursor })
+    }
+
     /// Section F: cross-agent divergence z-scores within a deployment
     /// domain. Per-agent metric mean compared to the domain population
     /// mean+std (`STDDEV_SAMP`); rows ordered by `|z_score| DESC`
@@ -3705,6 +4770,89 @@ impl crate::read::ReadEngine for PostgresBackend {
 /// primitives. Section A's `list_trace_summaries` builds its own
 /// inline because it composes WHERE + HAVING (cursor) + ORDER BY +
 /// LIMIT in one place.
+/// v0.5.5 (CIRISPersist#23 §D) — build the JOIN + WHERE clauses + param
+/// vec for [`crate::read::LlmCallFilter`]. Filters that need parent
+/// trace_events columns (agent_id_hash / agent_name /
+/// deployment_domain) force a JOIN to `cirislens.trace_events` on
+/// `(trace_id, event_id)`. Returns `(join_sql, where_sql, params)`.
+/// `where_sql` is either empty or starts with `"WHERE "`.
+#[allow(clippy::type_complexity)]
+fn build_llm_filter_sql(
+    filter: &crate::read::LlmCallFilter,
+) -> Result<
+    (
+        String,
+        String,
+        Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+    ),
+    crate::read::Error,
+> {
+    let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+    let mut where_parts: Vec<String> = Vec::new();
+
+    let needs_join = filter.agent_id_hash.is_some()
+        || filter.agent_name.is_some()
+        || filter.deployment_domain.is_some();
+
+    if let Some(w) = filter.time_window {
+        params.push(Box::new(w.since));
+        where_parts.push(format!("lc.ts >= ${}", params.len()));
+        params.push(Box::new(w.until));
+        where_parts.push(format!("lc.ts < ${}", params.len()));
+    }
+    if let Some(h) = &filter.agent_id_hash {
+        params.push(Box::new(h.clone()));
+        where_parts.push(format!("e.agent_id_hash = ${}", params.len()));
+    }
+    if let Some(n) = &filter.agent_name {
+        params.push(Box::new(n.clone()));
+        where_parts.push(format!("e.agent_name = ${}", params.len()));
+    }
+    if let Some(d) = &filter.deployment_domain {
+        params.push(Box::new(d.clone()));
+        where_parts.push(format!("e.deployment_domain = ${}", params.len()));
+    }
+    if let Some(m) = &filter.model {
+        params.push(Box::new(m.clone()));
+        where_parts.push(format!("lc.model = ${}", params.len()));
+    }
+    if let Some(s) = filter.status {
+        let tok = match s {
+            crate::schema::LlmCallStatus::Ok => "ok",
+            crate::schema::LlmCallStatus::Timeout => "timeout",
+            crate::schema::LlmCallStatus::RateLimited => "rate_limited",
+            crate::schema::LlmCallStatus::ModelNotAvailable => "model_not_available",
+            crate::schema::LlmCallStatus::InstructorRetry => "instructor_retry",
+            crate::schema::LlmCallStatus::OtherError => "other_error",
+        };
+        params.push(Box::new(tok.to_owned()));
+        where_parts.push(format!("lc.status = ${}", params.len()));
+    }
+    if let Some(t) = &filter.trace_id {
+        params.push(Box::new(t.clone()));
+        where_parts.push(format!("lc.trace_id = ${}", params.len()));
+    }
+    if let Some(t) = &filter.thought_id {
+        params.push(Box::new(t.clone()));
+        where_parts.push(format!("lc.thought_id = ${}", params.len()));
+    }
+
+    let join_sql = if needs_join {
+        "JOIN cirislens.trace_events e \
+           ON e.trace_id = lc.trace_id AND e.event_id = lc.parent_event_id"
+            .to_owned()
+    } else {
+        String::new()
+    };
+
+    let where_sql = if where_parts.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", where_parts.join(" AND "))
+    };
+    Ok((join_sql, where_sql, params))
+}
+
 fn build_filter_where(
     filter: &crate::read::TraceFilter,
 ) -> Result<
@@ -5030,6 +6178,1350 @@ mod tests {
             .expect("detail present even without LLM calls");
         assert_eq!(detail.components.len(), 5);
         assert!(detail.llm_calls.is_empty());
+    }
+
+    // ─── ReadEngine §C tests (v0.5.5, CIRISPersist#23) ──────────────
+
+    /// Insert a fixture trace whose task_id is explicit. Reuses §A's
+    /// fixture builder but overrides task_id post-insert via a second
+    /// path: we can't customize task_id in
+    /// `insert_section_a_fixture_trace` (it hard-codes `task-<trace_id>`),
+    /// so this helper inserts directly with the explicit task_id.
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_section_c_fixture_trace(
+        backend: &PostgresBackend,
+        trace_id: &str,
+        task_id: &str,
+        agent_id_hash: &str,
+        agent_name: Option<&str>,
+        deployment_domain: Option<&str>,
+        started_at: chrono::DateTime<chrono::Utc>,
+        thought_depth: i32,
+        task_description: Option<&str>,
+    ) -> String {
+        let mk_row = |event_type: ReasoningEventType,
+                      ts_offset_ms: i64,
+                      payload: serde_json::Value|
+         -> TraceEventRow {
+            let payload_map: serde_json::Map<String, serde_json::Value> = match payload {
+                serde_json::Value::Object(m) => m.into_iter().collect(),
+                _ => serde_json::Map::new(),
+            };
+            TraceEventRow {
+                trace_id: trace_id.to_owned(),
+                thought_id: format!("th-{trace_id}"),
+                task_id: Some(task_id.to_owned()),
+                step_point: None,
+                event_type,
+                attempt_index: 0,
+                ts: started_at + chrono::Duration::milliseconds(ts_offset_ms),
+                agent_name: agent_name.map(str::to_owned),
+                agent_id_hash: agent_id_hash.to_owned(),
+                cognitive_state: Some("work".into()),
+                trace_level: crate::schema::TraceLevel::Generic,
+                payload: payload_map,
+                cost_llm_calls: None,
+                cost_tokens: None,
+                cost_usd: None,
+                signature: "AAAA".into(),
+                signing_key_id: "test-key".into(),
+                signature_verified: true,
+                schema_version: "2.7.0".into(),
+                pii_scrubbed: false,
+                original_content_hash: None,
+                scrub_signature: None,
+                scrub_key_id: None,
+                scrub_timestamp: None,
+                agent_role: Some("ally".into()),
+                agent_template: Some("ally-v3-default".into()),
+                deployment_domain: deployment_domain.map(str::to_owned),
+                deployment_type: Some("production".into()),
+                deployment_region: Some("US".into()),
+                deployment_trust_mode: Some("federated_peer".into()),
+            }
+        };
+
+        let ts_payload = match task_description {
+            Some(d) => serde_json::json!({
+                "thought_type": "standard",
+                "thought_depth": thought_depth,
+                "task_description": d,
+            }),
+            None => serde_json::json!({
+                "thought_type": "standard",
+                "thought_depth": thought_depth,
+            }),
+        };
+
+        let rows = vec![
+            mk_row(ReasoningEventType::ThoughtStart, 0, ts_payload),
+            mk_row(
+                ReasoningEventType::ActionResult,
+                10,
+                serde_json::json!({"action_executed": "speak", "success": true}),
+            ),
+        ];
+        backend.insert_trace_events_batch(&rows).await.unwrap();
+        trace_id.to_owned()
+    }
+
+    /// §C: TaskClass derivation table — verify each prefix maps to the
+    /// expected class. Pure-Rust unit; no DB.
+    #[test]
+    fn read_section_c_task_class_derivation() {
+        use crate::read::TaskClass;
+        assert_eq!(
+            TaskClass::from_task_id("qa_eng_001"),
+            TaskClass::QaEval,
+            "qa_ prefix"
+        );
+        assert_eq!(
+            TaskClass::from_task_id("qa-eval-batch-7"),
+            TaskClass::QaEval,
+            "qa-eval prefix"
+        );
+        assert_eq!(
+            TaskClass::from_task_id("discord_msg_42"),
+            TaskClass::Discord,
+            "discord_ prefix"
+        );
+        assert_eq!(
+            TaskClass::from_task_id("real_user_discord_abc"),
+            TaskClass::RealUserDiscord,
+            "real_user_discord_"
+        );
+        assert_eq!(
+            TaskClass::from_task_id("real_user_cli_xyz"),
+            TaskClass::RealUserCli,
+            "real_user_cli_"
+        );
+        assert_eq!(
+            TaskClass::from_task_id("real_user_api_post_/v1/agent"),
+            TaskClass::RealUserApi,
+            "real_user_api_"
+        );
+        assert_eq!(
+            TaskClass::from_task_id("wakeup_2026_03_01T00_00_00Z"),
+            TaskClass::WakeupRitual,
+            "wakeup_ prefix"
+        );
+        assert_eq!(
+            TaskClass::from_task_id("startup_wakeup_pre_op"),
+            TaskClass::WakeupRitual,
+            "wakeup substring (non-prefix)"
+        );
+        assert_eq!(
+            TaskClass::from_task_id("random-task-id-xyz"),
+            TaskClass::Other,
+            "no prefix → Other"
+        );
+    }
+
+    /// §C round-trip: insert three traces in three task_ids — one
+    /// qa_eval, one wakeup_ritual, one other. Read back via list_tasks;
+    /// verify shape, ordering, and task_class derivation.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_c_list_tasks_round_trip() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::read::ReadEngine;
+
+        let aid = format!("agent-§c-rt-{}", uuid_like());
+        let base = chrono::Utc::now() - chrono::Duration::hours(1);
+
+        let qa_task = format!("qa_eng_{}", uuid_like());
+        let wakeup_task = format!("wakeup_{}", uuid_like());
+        let other_task = format!("rand-{}", uuid_like());
+
+        insert_section_c_fixture_trace(
+            &backend,
+            &format!("tr-{}-1", uuid_like()),
+            &qa_task,
+            &aid,
+            Some("Scout"),
+            Some("moderation"),
+            base,
+            0,
+            Some("hello world"),
+        )
+        .await;
+        insert_section_c_fixture_trace(
+            &backend,
+            &format!("tr-{}-2", uuid_like()),
+            &wakeup_task,
+            &aid,
+            Some("Scout"),
+            Some("moderation"),
+            base + chrono::Duration::minutes(1),
+            0,
+            Some("startup self-check"),
+        )
+        .await;
+        insert_section_c_fixture_trace(
+            &backend,
+            &format!("tr-{}-3", uuid_like()),
+            &other_task,
+            &aid,
+            Some("Scout"),
+            Some("moderation"),
+            base + chrono::Duration::minutes(2),
+            0,
+            None,
+        )
+        .await;
+
+        let filter = crate::read::TaskFilter {
+            agent_id_hash: Some(aid.clone()),
+            ..Default::default()
+        };
+        let page = backend.list_tasks(filter, None, 100).await.unwrap();
+        assert_eq!(page.items.len(), 3, "three tasks for this agent");
+
+        // Newest-first ordering: other_task (latest) → wakeup → qa.
+        assert_eq!(page.items[0].task_id, other_task);
+        assert_eq!(page.items[0].task_class, crate::read::TaskClass::Other);
+        assert_eq!(page.items[0].initial_observation, None);
+        assert_eq!(page.items[1].task_id, wakeup_task);
+        assert_eq!(
+            page.items[1].task_class,
+            crate::read::TaskClass::WakeupRitual
+        );
+        assert_eq!(
+            page.items[1].initial_observation.as_deref(),
+            Some("startup self-check")
+        );
+        assert_eq!(page.items[2].task_id, qa_task);
+        assert_eq!(page.items[2].task_class, crate::read::TaskClass::QaEval);
+        assert_eq!(
+            page.items[2].initial_observation.as_deref(),
+            Some("hello world")
+        );
+
+        // Each task carries its one trace summary.
+        for tg in &page.items {
+            assert_eq!(tg.traces.len(), 1, "one trace per task in this fixture");
+            assert_eq!(tg.traces[0].agent_id_hash, aid);
+        }
+
+        // No more pages (items < limit → no cursor).
+        assert!(page.next_cursor.is_none());
+    }
+
+    /// §C cursor pagination: 5 tasks, limit=2, walk pages 1/2/3, no
+    /// overlap, no gaps, terminates with None.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_c_list_tasks_cursor_pagination() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::read::ReadEngine;
+
+        let aid = format!("agent-§c-cur-{}", uuid_like());
+        let base = chrono::Utc::now() - chrono::Duration::hours(1);
+
+        let mut task_ids: Vec<String> = Vec::new();
+        for i in 0..5 {
+            let task_id = format!("qa_seq_{}-{i}", uuid_like());
+            insert_section_c_fixture_trace(
+                &backend,
+                &format!("tr-{}-{i}", uuid_like()),
+                &task_id,
+                &aid,
+                None,
+                None,
+                base + chrono::Duration::minutes(i64::from(i)),
+                0,
+                None,
+            )
+            .await;
+            task_ids.push(task_id);
+        }
+        // Newest-first = reverse insertion.
+        task_ids.reverse();
+
+        let filter = crate::read::TaskFilter {
+            agent_id_hash: Some(aid.clone()),
+            ..Default::default()
+        };
+
+        let p1 = backend.list_tasks(filter.clone(), None, 2).await.unwrap();
+        assert_eq!(p1.items.len(), 2);
+        assert_eq!(p1.items[0].task_id, task_ids[0]);
+        assert_eq!(p1.items[1].task_id, task_ids[1]);
+        let c1 = p1.next_cursor.expect("cursor for page 2");
+
+        let p2 = backend
+            .list_tasks(filter.clone(), Some(c1), 2)
+            .await
+            .unwrap();
+        assert_eq!(p2.items.len(), 2);
+        assert_eq!(p2.items[0].task_id, task_ids[2]);
+        assert_eq!(p2.items[1].task_id, task_ids[3]);
+        let c2 = p2.next_cursor.expect("cursor for page 3");
+
+        let p3 = backend
+            .list_tasks(filter.clone(), Some(c2), 2)
+            .await
+            .unwrap();
+        assert_eq!(p3.items.len(), 1);
+        assert_eq!(p3.items[0].task_id, task_ids[4]);
+        assert!(p3.next_cursor.is_none(), "items < limit → no further pages");
+    }
+
+    /// §C: task_class filter — filter for QaEval, assert only qa-
+    /// prefixed tasks come back.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_c_list_tasks_task_class_filter() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::read::ReadEngine;
+
+        let aid = format!("agent-§c-tcf-{}", uuid_like());
+        let base = chrono::Utc::now() - chrono::Duration::hours(1);
+
+        let qa_a = format!("qa_a_{}", uuid_like());
+        let qa_b = format!("qa-eval-b-{}", uuid_like());
+        let wakeup = format!("wakeup_{}", uuid_like());
+        let discord = format!("discord_{}", uuid_like());
+
+        for (i, tid) in [&qa_a, &qa_b, &wakeup, &discord].iter().enumerate() {
+            insert_section_c_fixture_trace(
+                &backend,
+                &format!("tr-{}-{i}", uuid_like()),
+                tid,
+                &aid,
+                None,
+                None,
+                base + chrono::Duration::minutes(i as i64),
+                0,
+                None,
+            )
+            .await;
+        }
+
+        // Filter for QaEval: should return qa_a + qa_b only.
+        let filter = crate::read::TaskFilter {
+            agent_id_hash: Some(aid.clone()),
+            task_class: Some(crate::read::TaskClass::QaEval),
+            ..Default::default()
+        };
+        let page = backend.list_tasks(filter, None, 100).await.unwrap();
+        assert_eq!(page.items.len(), 2, "only QaEval tasks");
+        let ids: Vec<&str> = page.items.iter().map(|t| t.task_id.as_str()).collect();
+        assert!(ids.contains(&qa_a.as_str()));
+        assert!(ids.contains(&qa_b.as_str()));
+        for item in &page.items {
+            assert_eq!(item.task_class, crate::read::TaskClass::QaEval);
+        }
+
+        // Filter for Discord: should return discord only.
+        let filter = crate::read::TaskFilter {
+            agent_id_hash: Some(aid.clone()),
+            task_class: Some(crate::read::TaskClass::Discord),
+            ..Default::default()
+        };
+        let page = backend.list_tasks(filter, None, 100).await.unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].task_id, discord);
+
+        // Filter for Other: should return nothing (every fixture is
+        // recognized).
+        let filter = crate::read::TaskFilter {
+            agent_id_hash: Some(aid),
+            task_class: Some(crate::read::TaskClass::Other),
+            ..Default::default()
+        };
+        let page = backend.list_tasks(filter, None, 100).await.unwrap();
+        assert!(page.items.is_empty(), "no Other tasks in fixture");
+    }
+
+    /// §C: limit validation — out-of-range limit returns InvalidArgument.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_c_list_tasks_limit_validation() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::read::ReadEngine;
+
+        let res = backend
+            .list_tasks(crate::read::TaskFilter::default(), None, 0)
+            .await;
+        assert!(matches!(res, Err(crate::read::Error::InvalidArgument(_))));
+
+        let res = backend
+            .list_tasks(crate::read::TaskFilter::default(), None, 10_001)
+            .await;
+        assert!(matches!(res, Err(crate::read::Error::InvalidArgument(_))));
+    }
+
+    // ─── ReadEngine §D tests (v0.5.5, CIRISPersist#23) ──────────────
+
+    /// Insert a parent trace + one trace_llm_calls row pointing at the
+    /// DMA_RESULTS event. Returns the trace_id.
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_section_d_fixture_llm(
+        backend: &PostgresBackend,
+        trace_id: &str,
+        agent_id_hash: &str,
+        agent_name: Option<&str>,
+        deployment_domain: Option<&str>,
+        started: chrono::DateTime<chrono::Utc>,
+        model: &str,
+        cost_usd: f64,
+        prompt_tokens: i32,
+        completion_tokens: i32,
+        status: crate::schema::LlmCallStatus,
+    ) -> String {
+        insert_section_a_fixture_trace(
+            backend,
+            trace_id,
+            agent_id_hash,
+            agent_name,
+            deployment_domain,
+            started,
+            false,
+            0.83,
+            0.91,
+            1.42,
+        )
+        .await;
+
+        let client = backend.pool.get().await.unwrap();
+        let row = client
+            .query_one(
+                "SELECT event_id FROM cirislens.trace_events \
+                 WHERE trace_id = $1 AND event_type = 'DMA_RESULTS' LIMIT 1",
+                &[&trace_id],
+            )
+            .await
+            .unwrap();
+        let event_id: i64 = row.safe_get("event_id").unwrap();
+
+        let llm_row = crate::store::types::TraceLlmCallRow {
+            trace_id: trace_id.to_owned(),
+            thought_id: format!("th-{trace_id}"),
+            task_id: Some(format!("task-{trace_id}")),
+            parent_event_id: Some(event_id),
+            parent_event_type: ReasoningEventType::DmaResults,
+            parent_attempt_index: 0,
+            attempt_index: 0,
+            ts: started + chrono::Duration::milliseconds(15),
+            duration_ms: 1234.5,
+            handler_name: "EthicalPDMA".into(),
+            service_name: "openai".into(),
+            model: Some(model.to_owned()),
+            base_url: None,
+            response_model: None,
+            prompt_tokens: Some(prompt_tokens),
+            completion_tokens: Some(completion_tokens),
+            prompt_bytes: None,
+            completion_bytes: None,
+            cost_usd: Some(cost_usd),
+            status,
+            error_class: if matches!(status, crate::schema::LlmCallStatus::Ok) {
+                None
+            } else {
+                Some("error".to_owned())
+            },
+            attempt_count: Some(1),
+            retry_count: Some(0),
+            prompt_hash: Some("hash-§d".into()),
+            prompt: None,
+            response_text: None,
+        };
+        backend
+            .insert_trace_llm_calls_batch(&[llm_row])
+            .await
+            .unwrap();
+        trace_id.to_owned()
+    }
+
+    /// §D list_llm_calls round-trip: insert one LLM call, list it back,
+    /// fields match the fixture.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_d_list_llm_calls_round_trip() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::read::ReadEngine;
+
+        let aid = format!("agent-§d-rt-{}", uuid_like());
+        let tid = format!("trace-§d-rt-{}", uuid_like());
+        let started = chrono::Utc::now() - chrono::Duration::minutes(30);
+        insert_section_d_fixture_llm(
+            &backend,
+            &tid,
+            &aid,
+            Some("Scout-D"),
+            Some("moderation"),
+            started,
+            "gpt-4o",
+            0.024,
+            800,
+            150,
+            crate::schema::LlmCallStatus::Ok,
+        )
+        .await;
+
+        let filter = crate::read::LlmCallFilter {
+            agent_id_hash: Some(aid.clone()),
+            ..Default::default()
+        };
+        let page = backend.list_llm_calls(filter, None, 100).await.unwrap();
+        assert_eq!(page.items.len(), 1);
+        let r = &page.items[0];
+        assert_eq!(r.trace_id, tid);
+        assert_eq!(r.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(r.prompt_tokens, Some(800));
+        assert_eq!(r.completion_tokens, Some(150));
+        assert!((r.cost_usd.unwrap() - 0.024).abs() < 1e-9);
+        assert!(matches!(r.status, crate::schema::LlmCallStatus::Ok));
+        assert!(page.next_cursor.is_none(), "single row → no cursor");
+    }
+
+    /// §D cursor pagination: insert 5 LLM calls across 5 traces; page
+    /// through with limit=2; assert no gaps + newest-first.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_d_list_llm_calls_cursor_pagination() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::read::ReadEngine;
+
+        let aid = format!("agent-§d-cur-{}", uuid_like());
+        let base = chrono::Utc::now() - chrono::Duration::hours(1);
+        let mut tids: Vec<String> = Vec::new();
+        for i in 0..5 {
+            let tid = format!("trace-§d-{}-{i}", uuid_like());
+            insert_section_d_fixture_llm(
+                &backend,
+                &tid,
+                &aid,
+                None,
+                None,
+                base + chrono::Duration::minutes(i64::from(i)),
+                "gpt-4o",
+                0.01,
+                100,
+                50,
+                crate::schema::LlmCallStatus::Ok,
+            )
+            .await;
+            tids.push(tid);
+        }
+        tids.reverse(); // newest-first
+
+        let filter = crate::read::LlmCallFilter {
+            agent_id_hash: Some(aid.clone()),
+            ..Default::default()
+        };
+
+        let p1 = backend
+            .list_llm_calls(filter.clone(), None, 2)
+            .await
+            .unwrap();
+        assert_eq!(p1.items.len(), 2);
+        assert_eq!(p1.items[0].trace_id, tids[0]);
+        let c1 = p1.next_cursor.expect("page 2 cursor");
+
+        let p2 = backend
+            .list_llm_calls(filter.clone(), Some(c1), 2)
+            .await
+            .unwrap();
+        assert_eq!(p2.items.len(), 2);
+        assert_eq!(p2.items[0].trace_id, tids[2]);
+        let c2 = p2.next_cursor.expect("page 3 cursor");
+
+        let p3 = backend.list_llm_calls(filter, Some(c2), 2).await.unwrap();
+        assert_eq!(p3.items.len(), 1);
+        assert_eq!(p3.items[0].trace_id, tids[4]);
+        assert!(p3.next_cursor.is_none());
+    }
+
+    /// §D aggregate_llm_costs: 3 calls split across 2 models, 2 agents,
+    /// 2 domains, 1 failure. Every breakdown bucket + totals match.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_d_aggregate_llm_costs() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::read::ReadEngine;
+
+        let aid_a = format!("agent-§d-agg-A-{}", uuid_like());
+        let aid_b = format!("agent-§d-agg-B-{}", uuid_like());
+        let dom = format!("dom-§d-{}", uuid_like());
+        let other_dom = format!("dom-§d-other-{}", uuid_like());
+        let base = chrono::Utc::now() - chrono::Duration::hours(2);
+        let until = chrono::Utc::now();
+        let window =
+            crate::read::TimeWindow::new(base - chrono::Duration::minutes(1), until).unwrap();
+
+        // Three calls:
+        // (A, gpt-4o, dom, 0.024, 800/150, Ok)
+        // (A, gpt-4o, dom, 0.030, 1000/200, Timeout)
+        // (B, claude-3-5-sonnet, other_dom, 0.045, 1200/300, Ok)
+        insert_section_d_fixture_llm(
+            &backend,
+            &format!("trA1-{}", uuid_like()),
+            &aid_a,
+            Some("Scout-A"),
+            Some(&dom),
+            base,
+            "gpt-4o",
+            0.024,
+            800,
+            150,
+            crate::schema::LlmCallStatus::Ok,
+        )
+        .await;
+        insert_section_d_fixture_llm(
+            &backend,
+            &format!("trA2-{}", uuid_like()),
+            &aid_a,
+            Some("Scout-A"),
+            Some(&dom),
+            base + chrono::Duration::minutes(5),
+            "gpt-4o",
+            0.030,
+            1000,
+            200,
+            crate::schema::LlmCallStatus::Timeout,
+        )
+        .await;
+        insert_section_d_fixture_llm(
+            &backend,
+            &format!("trB-{}", uuid_like()),
+            &aid_b,
+            Some("Scout-B"),
+            Some(&other_dom),
+            base + chrono::Duration::minutes(10),
+            "claude-3-5-sonnet",
+            0.045,
+            1200,
+            300,
+            crate::schema::LlmCallStatus::Ok,
+        )
+        .await;
+
+        // Aggregate scoped to the two agents we inserted (otherwise
+        // the assertions might race with other test data).
+        let filter = crate::read::LlmCallFilter {
+            time_window: Some(window),
+            ..Default::default()
+        };
+        // narrow to one agent at a time to isolate the bucket math
+        let only_a = crate::read::LlmCallFilter {
+            time_window: Some(window),
+            agent_id_hash: Some(aid_a.clone()),
+            ..Default::default()
+        };
+        let agg = backend.aggregate_llm_costs(only_a).await.unwrap();
+        assert_eq!(agg.totals.call_count, 2);
+        assert_eq!(agg.totals.prompt_tokens, 1800);
+        assert_eq!(agg.totals.completion_tokens, 350);
+        assert!((agg.totals.cost_usd - 0.054).abs() < 1e-9);
+        assert_eq!(agg.totals.error_count, 1, "one Timeout call");
+
+        let m_gpt = agg.by_model.get("gpt-4o").expect("gpt-4o bucket");
+        assert_eq!(m_gpt.call_count, 2);
+        assert!((m_gpt.cost_usd - 0.054).abs() < 1e-9);
+        assert_eq!(m_gpt.error_count, 1);
+
+        let a_a = agg.by_agent.get(&aid_a).expect("agent A bucket");
+        assert_eq!(a_a.call_count, 2);
+        assert!((a_a.cost_usd - 0.054).abs() < 1e-9);
+
+        // Same scope but filter on agent B; assert independent rollup.
+        let only_b = crate::read::LlmCallFilter {
+            time_window: Some(window),
+            agent_id_hash: Some(aid_b),
+            ..Default::default()
+        };
+        let agg_b = backend.aggregate_llm_costs(only_b).await.unwrap();
+        assert_eq!(agg_b.totals.call_count, 1);
+        let _ = filter; // touch to silence unused-var lint on the broader filter
+    }
+
+    /// §D empty-window aggregate: no rows match → every bucket map is
+    /// empty AND totals are all zero (no NULL hazard, COALESCE
+    /// hygiene from v0.5.1 / CIRISPersist#24 applied).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_d_aggregate_llm_costs_empty_window() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::read::ReadEngine;
+
+        // Far-future window guaranteed to be empty.
+        let since = chrono::Utc::now() + chrono::Duration::days(365);
+        let until = since + chrono::Duration::hours(1);
+        let filter = crate::read::LlmCallFilter {
+            time_window: Some(crate::read::TimeWindow::new(since, until).unwrap()),
+            ..Default::default()
+        };
+        let agg = backend.aggregate_llm_costs(filter).await.unwrap();
+        assert_eq!(agg.totals.call_count, 0);
+        assert_eq!(agg.totals.prompt_tokens, 0);
+        assert_eq!(agg.totals.completion_tokens, 0);
+        assert_eq!(agg.totals.cost_usd, 0.0);
+        assert_eq!(agg.totals.error_count, 0);
+        assert!(agg.by_model.is_empty());
+        assert!(agg.by_agent.is_empty());
+        assert!(agg.by_domain.is_empty());
+    }
+
+    // ─── ReadEngine §G tests (v0.5.5, CIRISPersist#23) ──────────────
+
+    /// §G corpus_shape: insert traces across multiple task_classes,
+    /// agent_names, agent_templates, deployment_regions, and primary
+    /// models; assert every bucket reflects the fixture.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_g_corpus_shape_round_trip() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::read::ReadEngine;
+
+        let aid = format!("agent-§g-rt-{}", uuid_like());
+        let base = chrono::Utc::now() - chrono::Duration::hours(1);
+        let until = chrono::Utc::now() + chrono::Duration::minutes(1);
+        let window =
+            crate::read::TimeWindow::new(base - chrono::Duration::minutes(1), until).unwrap();
+
+        // QA-eval English question 1 + 2 + Spanish question 1.
+        let qa_en1 = format!("qa_eng_1_{}", uuid_like());
+        let qa_en2 = format!("qa_eng_2_{}", uuid_like());
+        let qa_es1 = format!("qa_spa_1_{}", uuid_like());
+        // Wakeup ritual.
+        let wakeup = format!("wakeup_{}", uuid_like());
+        // Other (random).
+        let other = format!("misc-{}", uuid_like());
+
+        for (i, tid) in [&qa_en1, &qa_en2, &qa_es1, &wakeup, &other]
+            .iter()
+            .enumerate()
+        {
+            insert_section_c_fixture_trace(
+                &backend,
+                &format!("tr-§g-{}-{i}", uuid_like()),
+                tid,
+                &aid,
+                Some("Scout-G"),
+                Some("moderation"),
+                base + chrono::Duration::minutes(i as i64),
+                0,
+                None,
+            )
+            .await;
+        }
+
+        let shape = backend
+            .corpus_shape(crate::read::CorpusShapeFilter {
+                time_window: window,
+                agent_id_hash: Some(aid),
+                agent_name: None,
+                deployment_domain: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(shape.total_traces, 5, "five fixture traces");
+
+        // task_class buckets.
+        assert_eq!(
+            shape.by_task_class.get(&crate::read::TaskClass::QaEval),
+            Some(&3i64)
+        );
+        assert_eq!(
+            shape
+                .by_task_class
+                .get(&crate::read::TaskClass::WakeupRitual),
+            Some(&1)
+        );
+        assert_eq!(
+            shape.by_task_class.get(&crate::read::TaskClass::Other),
+            Some(&1)
+        );
+        assert!(!shape
+            .by_task_class
+            .contains_key(&crate::read::TaskClass::Discord));
+
+        // QA language: 2 eng + 1 spa.
+        assert_eq!(shape.by_qa_language.get("eng"), Some(&2i64));
+        assert_eq!(shape.by_qa_language.get("spa"), Some(&1));
+        // QA question_num: 2 → q1 (eng_1 + spa_1), 1 → q2 (eng_2).
+        assert_eq!(shape.by_qa_question_num.get(&1), Some(&2i64));
+        assert_eq!(shape.by_qa_question_num.get(&2), Some(&1));
+
+        // agent_name + agent_version (= agent_template).
+        assert_eq!(shape.by_agent_name.get("Scout-G"), Some(&5i64));
+        assert_eq!(shape.by_agent_version.get("ally-v3-default"), Some(&5i64));
+        assert_eq!(shape.by_deployment_region.get("US"), Some(&5i64));
+
+        // No LLM calls in §C fixtures → empty primary_model map.
+        assert!(shape.by_primary_model.is_empty());
+
+        assert!(
+            shape.stationarity_z_score.is_none(),
+            "v0.5.5 returns None for stationarity (no baseline arg)"
+        );
+    }
+
+    /// §G empty window: total_traces=0 + every map empty (no NULL hazard).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_g_corpus_shape_empty_window() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::read::ReadEngine;
+
+        let since = chrono::Utc::now() + chrono::Duration::days(365);
+        let until = since + chrono::Duration::hours(1);
+        let shape = backend
+            .corpus_shape(crate::read::CorpusShapeFilter {
+                time_window: crate::read::TimeWindow::new(since, until).unwrap(),
+                agent_id_hash: None,
+                agent_name: None,
+                deployment_domain: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(shape.total_traces, 0);
+        assert!(shape.by_task_class.is_empty());
+        assert!(shape.by_qa_language.is_empty());
+        assert!(shape.by_qa_question_num.is_empty());
+        assert!(shape.by_agent_name.is_empty());
+        assert!(shape.by_agent_version.is_empty());
+        assert!(shape.by_primary_model.is_empty());
+        assert!(shape.by_deployment_region.is_empty());
+    }
+
+    /// §G primary_model: insert two traces, one with mostly gpt-4o,
+    /// one with mostly claude-3-5-sonnet; assert by_primary_model
+    /// reflects the per-trace most-frequent model.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_g_corpus_shape_primary_model() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::read::ReadEngine;
+
+        let aid = format!("agent-§g-pm-{}", uuid_like());
+        let base = chrono::Utc::now() - chrono::Duration::hours(1);
+        let until = chrono::Utc::now() + chrono::Duration::minutes(1);
+        let window =
+            crate::read::TimeWindow::new(base - chrono::Duration::minutes(1), until).unwrap();
+
+        // Trace 1: 2 gpt-4o + 1 claude → primary = gpt-4o
+        let t1 = format!("tr-§g-pm1-{}", uuid_like());
+        insert_section_d_fixture_llm(
+            &backend,
+            &t1,
+            &aid,
+            Some("Scout"),
+            Some("dom"),
+            base,
+            "gpt-4o",
+            0.01,
+            100,
+            50,
+            crate::schema::LlmCallStatus::Ok,
+        )
+        .await;
+        // Add a second gpt-4o + a claude row by directly inserting
+        // additional LLM calls referencing the same trace.
+        let client = backend.pool.get().await.unwrap();
+        let parent_event_id: i64 = client
+            .query_one(
+                "SELECT event_id FROM cirislens.trace_events \
+                 WHERE trace_id = $1 AND event_type = 'DMA_RESULTS' LIMIT 1",
+                &[&t1],
+            )
+            .await
+            .unwrap()
+            .safe_get("event_id")
+            .unwrap();
+        let extra_rows = [("gpt-4o", 1u32), ("claude-3-5-sonnet", 2u32)];
+        for (model, ai) in extra_rows.iter() {
+            let r = crate::store::types::TraceLlmCallRow {
+                trace_id: t1.clone(),
+                thought_id: format!("th-{t1}"),
+                task_id: Some(format!("task-{t1}")),
+                parent_event_id: Some(parent_event_id),
+                parent_event_type: ReasoningEventType::DmaResults,
+                parent_attempt_index: 0,
+                attempt_index: *ai,
+                ts: base + chrono::Duration::milliseconds(20 + i64::from(*ai)),
+                duration_ms: 100.0,
+                handler_name: "EthicalPDMA".into(),
+                service_name: "openai".into(),
+                model: Some((*model).to_owned()),
+                base_url: None,
+                response_model: None,
+                prompt_tokens: Some(100),
+                completion_tokens: Some(50),
+                prompt_bytes: None,
+                completion_bytes: None,
+                cost_usd: Some(0.005),
+                status: crate::schema::LlmCallStatus::Ok,
+                error_class: None,
+                attempt_count: Some(1),
+                retry_count: Some(0),
+                prompt_hash: Some("hash".into()),
+                prompt: None,
+                response_text: None,
+            };
+            backend.insert_trace_llm_calls_batch(&[r]).await.unwrap();
+        }
+
+        // Trace 2: 1 claude call → primary = claude
+        let t2 = format!("tr-§g-pm2-{}", uuid_like());
+        insert_section_d_fixture_llm(
+            &backend,
+            &t2,
+            &aid,
+            Some("Scout"),
+            Some("dom"),
+            base + chrono::Duration::minutes(5),
+            "claude-3-5-sonnet",
+            0.02,
+            100,
+            50,
+            crate::schema::LlmCallStatus::Ok,
+        )
+        .await;
+
+        let shape = backend
+            .corpus_shape(crate::read::CorpusShapeFilter {
+                time_window: window,
+                agent_id_hash: Some(aid),
+                agent_name: None,
+                deployment_domain: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(shape.total_traces, 2);
+        assert_eq!(shape.by_primary_model.get("gpt-4o"), Some(&1i64));
+        assert_eq!(shape.by_primary_model.get("claude-3-5-sonnet"), Some(&1i64));
+    }
+
+    // ─── ReadEngine §H tests (v0.5.5, CIRISPersist#23) ──────────────
+
+    /// Insert a single-event trace with controllable pii_scrubbed +
+    /// trace_level. Lighter than the 5-component §A fixture; §H only
+    /// cares about pii_scrubbed + trace_level.
+    async fn insert_section_h_fixture_scrubbed_trace(
+        backend: &PostgresBackend,
+        trace_id: &str,
+        agent_id_hash: &str,
+        started: chrono::DateTime<chrono::Utc>,
+        pii_scrubbed: bool,
+        trace_level: crate::schema::TraceLevel,
+    ) {
+        let row = TraceEventRow {
+            trace_id: trace_id.to_owned(),
+            thought_id: format!("th-{trace_id}"),
+            task_id: Some(format!("task-{trace_id}")),
+            step_point: None,
+            event_type: ReasoningEventType::ThoughtStart,
+            attempt_index: 0,
+            ts: started,
+            agent_name: Some("Scout-H".into()),
+            agent_id_hash: agent_id_hash.to_owned(),
+            cognitive_state: Some("work".into()),
+            trace_level,
+            payload: serde_json::Map::new(),
+            cost_llm_calls: None,
+            cost_tokens: None,
+            cost_usd: None,
+            signature: "AAAA".into(),
+            signing_key_id: "test-key".into(),
+            signature_verified: true,
+            schema_version: "2.7.0".into(),
+            pii_scrubbed,
+            original_content_hash: None,
+            scrub_signature: None,
+            scrub_key_id: None,
+            scrub_timestamp: None,
+            agent_role: Some("ally".into()),
+            agent_template: Some("ally-v3-default".into()),
+            deployment_domain: Some("moderation".into()),
+            deployment_type: Some("production".into()),
+            deployment_region: Some("US".into()),
+            deployment_trust_mode: Some("federated_peer".into()),
+        };
+        backend.insert_trace_events_batch(&[row]).await.unwrap();
+    }
+
+    /// §H round-trip: insert 3 scrubbed traces (1 Generic, 2 Detailed)
+    /// + 1 unscrubbed; assert envelopes_scrubbed=3 and by_trace_level
+    /// reflects the levels.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_h_aggregate_scrub_stats_round_trip() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::read::ReadEngine;
+
+        let aid = format!("agent-§h-{}", uuid_like());
+        let base = chrono::Utc::now() - chrono::Duration::hours(1);
+        let until = chrono::Utc::now() + chrono::Duration::minutes(1);
+        let window =
+            crate::read::TimeWindow::new(base - chrono::Duration::minutes(1), until).unwrap();
+
+        insert_section_h_fixture_scrubbed_trace(
+            &backend,
+            &format!("tr-h-g-{}", uuid_like()),
+            &aid,
+            base,
+            true,
+            crate::schema::TraceLevel::Generic,
+        )
+        .await;
+        insert_section_h_fixture_scrubbed_trace(
+            &backend,
+            &format!("tr-h-d1-{}", uuid_like()),
+            &aid,
+            base + chrono::Duration::minutes(1),
+            true,
+            crate::schema::TraceLevel::Detailed,
+        )
+        .await;
+        insert_section_h_fixture_scrubbed_trace(
+            &backend,
+            &format!("tr-h-d2-{}", uuid_like()),
+            &aid,
+            base + chrono::Duration::minutes(2),
+            true,
+            crate::schema::TraceLevel::Detailed,
+        )
+        .await;
+        insert_section_h_fixture_scrubbed_trace(
+            &backend,
+            &format!("tr-h-u-{}", uuid_like()),
+            &aid,
+            base + chrono::Duration::minutes(3),
+            false,
+            crate::schema::TraceLevel::Generic,
+        )
+        .await;
+
+        // Note: aggregate_scrub_stats(window) doesn't filter by agent —
+        // it's a global window aggregate. So we need to assert "at least
+        // these counts", not "exactly these counts" (other tests may
+        // share the window). Tighten by clamping the window to just our
+        // fixture range.
+        let agg = backend.aggregate_scrub_stats(window).await.unwrap();
+        assert!(
+            agg.envelopes_scrubbed >= 3,
+            "at least 3 scrubbed; got {}",
+            agg.envelopes_scrubbed
+        );
+        assert!(
+            agg.by_trace_level
+                .get(&crate::schema::TraceLevel::Detailed)
+                .copied()
+                .unwrap_or(0)
+                >= 2
+        );
+        assert!(
+            agg.by_trace_level
+                .get(&crate::schema::TraceLevel::Generic)
+                .copied()
+                .unwrap_or(0)
+                >= 1
+        );
+
+        // v0.5.5 limitations: until v0.6.0 ships the classification
+        // pipeline, these MUST be 0/empty.
+        assert_eq!(agg.fields_scrubbed_total, 0);
+        assert!(agg.by_entity_type.is_empty());
+    }
+
+    /// §H empty window: zeroes + empty maps.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_h_aggregate_scrub_stats_empty_window() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::read::ReadEngine;
+
+        let since = chrono::Utc::now() + chrono::Duration::days(365);
+        let until = since + chrono::Duration::hours(1);
+        let window = crate::read::TimeWindow::new(since, until).unwrap();
+        let agg = backend.aggregate_scrub_stats(window).await.unwrap();
+        assert_eq!(agg.envelopes_scrubbed, 0);
+        assert_eq!(agg.fields_scrubbed_total, 0);
+        assert!(agg.by_entity_type.is_empty());
+        assert!(agg.by_trace_level.is_empty());
+    }
+
+    // ─── ReadEngine §I tests (v0.5.5, CIRISPersist#23) ──────────────
+
+    /// Build a federation KeyRecord with controllable valid_from /
+    /// pqc_completed.
+    fn fix_section_i_key(
+        key_id: &str,
+        identity_ref: &str,
+        valid_from: chrono::DateTime<chrono::Utc>,
+        pqc_completed: bool,
+    ) -> crate::federation::KeyRecord {
+        crate::federation::KeyRecord {
+            key_id: key_id.into(),
+            pubkey_ed25519_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: crate::federation::types::algorithm::HYBRID.into(),
+            identity_type: crate::federation::types::identity_type::AGENT.into(),
+            identity_ref: identity_ref.into(),
+            valid_from,
+            valid_until: None,
+            registration_envelope: serde_json::json!({"id": key_id}),
+            original_content_hash: "deadbeef".into(),
+            scrub_signature_classical: "c2lnbmF0dXJl".into(),
+            scrub_signature_pqc: if pqc_completed {
+                Some("c2ln".into())
+            } else {
+                None
+            },
+            scrub_key_id: key_id.into(),
+            scrub_timestamp: valid_from,
+            pqc_completed_at: if pqc_completed {
+                Some(valid_from)
+            } else {
+                None
+            },
+            persist_row_hash: String::new(),
+        }
+    }
+
+    /// §I list_federation_keys round-trip + cursor pagination.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_i_list_federation_keys_cursor() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+        use crate::read::ReadEngine;
+
+        // Build 4 distinct keys for one identity_ref so the filter
+        // narrows to our fixture set. valid_from staggered so cursor
+        // ordering is deterministic.
+        let identity = format!("agent-§i-{}", uuid_like());
+        let base = chrono::Utc::now() - chrono::Duration::hours(2);
+        let mut key_ids: Vec<String> = Vec::new();
+        for i in 0..4 {
+            let kid = format!("k-§i-{}-{i}", uuid_like());
+            let key = fix_section_i_key(
+                &kid,
+                &identity,
+                base + chrono::Duration::minutes(i64::from(i)),
+                i % 2 == 0, // alternate pqc_completed
+            );
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord { record: key })
+                .await
+                .unwrap();
+            key_ids.push(kid);
+        }
+        key_ids.reverse(); // newest-first
+
+        let filter = crate::read::FederationKeyFilter {
+            agent_id_hash: Some(identity.clone()),
+            ..Default::default()
+        };
+
+        // Page 1
+        let p1 = backend
+            .list_federation_keys(filter.clone(), None, 2)
+            .await
+            .unwrap();
+        assert_eq!(p1.items.len(), 2);
+        assert_eq!(p1.items[0].key_id, key_ids[0]);
+        assert_eq!(p1.items[1].key_id, key_ids[1]);
+        let c1 = p1.next_cursor.expect("page 2 cursor");
+
+        // Page 2
+        let p2 = backend
+            .list_federation_keys(filter.clone(), Some(c1), 2)
+            .await
+            .unwrap();
+        assert_eq!(p2.items.len(), 2);
+        assert_eq!(p2.items[0].key_id, key_ids[2]);
+        assert_eq!(p2.items[1].key_id, key_ids[3]);
+        assert!(p2.next_cursor.is_none(), "exact-match page → no cursor");
+
+        // PQC filter: should return only 2 keys (i=0, i=2 had pqc=true,
+        // i.e. key_ids[3] and key_ids[1] after reverse).
+        let pqc_filter = crate::read::FederationKeyFilter {
+            agent_id_hash: Some(identity.clone()),
+            pqc_completed: Some(true),
+            ..Default::default()
+        };
+        let pqc_page = backend
+            .list_federation_keys(pqc_filter, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(pqc_page.items.len(), 2, "two pqc-complete keys");
+        for k in &pqc_page.items {
+            assert!(k.pqc_completed_at.is_some());
+        }
+    }
+
+    /// §I list_revocations round-trip.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_i_list_revocations_round_trip() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+        use crate::read::ReadEngine;
+
+        let identity = format!("agent-§i-rev-{}", uuid_like());
+        let now = chrono::Utc::now();
+
+        // Need attesting key + revoking key + a target key for the
+        // revocation FK shape.
+        let revoking_id = format!("revoke-§i-{}", uuid_like());
+        let revoked_id = format!("victim-§i-{}", uuid_like());
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: fix_section_i_key(&revoking_id, &identity, now, false),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: fix_section_i_key(
+                    &revoked_id,
+                    &identity,
+                    now - chrono::Duration::minutes(1),
+                    false,
+                ),
+            })
+            .await
+            .unwrap();
+
+        let rev_id = format!("rev-§i-{}", uuid_like());
+        let rev = crate::federation::Revocation {
+            revocation_id: rev_id.clone(),
+            revoked_key_id: revoked_id.clone(),
+            revoking_key_id: revoking_id.clone(),
+            reason: Some("test".into()),
+            revoked_at: now,
+            effective_at: now,
+            revocation_envelope: serde_json::json!({"id": rev_id}),
+            original_content_hash: "abc".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: revoking_id.clone(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+        };
+        backend
+            .put_revocation(crate::federation::SignedRevocation { revocation: rev })
+            .await
+            .unwrap();
+
+        let page = backend
+            .list_revocations(
+                crate::read::RevocationFilter {
+                    revoked_key_id: Some(revoked_id.clone()),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].revoked_key_id, revoked_id);
+        assert_eq!(page.items[0].revoking_key_id, revoking_id);
+    }
+
+    /// §I limit validation.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_i_limit_validation() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::read::ReadEngine;
+
+        for limit in [0i64, -1, 10_001] {
+            let res = backend
+                .list_federation_keys(crate::read::FederationKeyFilter::default(), None, limit)
+                .await;
+            assert!(
+                matches!(res, Err(crate::read::Error::InvalidArgument(_))),
+                "limit={limit} should be rejected"
+            );
+        }
     }
 
     // ─── ReadEngine §F tests (v0.5.0, CIRISPersist#23) ──────────────

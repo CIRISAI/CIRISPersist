@@ -1,0 +1,186 @@
+//! Section I — Federation observability bulk primitives.
+//!
+//! The existing federation directory primitives (`lookup_public_key`,
+//! `list_attestations_for`, `revocations_for`) are point-lookup
+//! shaped — keyed on a single identity or key_id. Monitoring dashboards
+//! need bulk-list primitives that page through the whole directory
+//! with multi-field filters.
+//!
+//! Three list primitives, each cursor-paged newest-first:
+//!
+//! - [`super::ReadEngine::list_federation_keys`] — over
+//!   `cirislens.federation_keys`.
+//! - [`super::ReadEngine::list_attestations`] — over
+//!   `cirislens.federation_attestations`.
+//! - [`super::ReadEngine::list_revocations`] — over
+//!   `cirislens.federation_revocations`.
+//!
+//! Item types reuse the existing [`crate::federation::KeyRecord`],
+//! [`crate::federation::Attestation`], [`crate::federation::Revocation`]
+//! shapes — no duplicate types.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+use crate::federation::{Attestation, KeyRecord, Revocation};
+
+// ─── Federation keys ───────────────────────────────────────────────
+
+/// Filter for [`super::ReadEngine::list_federation_keys`]. Composes
+/// AND-style; every field is optional.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FederationKeyFilter {
+    /// Filter by agent identity (matches `identity_ref` when
+    /// `identity_type = 'agent'`).
+    pub agent_id_hash: Option<String>,
+
+    /// Filter by algorithm (`"ed25519"` / `"ml_dsa_65"` / hybrid).
+    pub algorithm: Option<String>,
+
+    /// Filter by revocation status. `Some(true)` returns only keys
+    /// that appear in `cirislens.federation_revocations`;
+    /// `Some(false)` returns only un-revoked keys. `None` returns
+    /// both.
+    pub revoked: Option<bool>,
+
+    /// Filter by PQC completion. `Some(true)` returns keys whose
+    /// `pqc_completed_at IS NOT NULL`; `Some(false)` returns only
+    /// hybrid-pending keys.
+    pub pqc_completed: Option<bool>,
+}
+
+/// Opaque cursor for [`super::ReadEngine::list_federation_keys`].
+///
+/// Ordered by `(valid_from DESC, key_id DESC)` — newest-registered
+/// first. Tuple cursor for unique tiebreak.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FederationKeyCursor {
+    /// Cursor format version. v0.5.5 ships `"v1"`.
+    pub version: String,
+    /// `valid_from` of the trailing row.
+    pub last_valid_from: DateTime<Utc>,
+    /// `key_id` of the trailing row.
+    pub last_key_id: String,
+}
+
+impl FederationKeyCursor {
+    /// Construct a v1 cursor.
+    pub fn from_trailing(last_valid_from: DateTime<Utc>, last_key_id: String) -> Self {
+        FederationKeyCursor {
+            version: "v1".to_owned(),
+            last_valid_from,
+            last_key_id,
+        }
+    }
+}
+
+/// One page of [`KeyRecord`]s.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FederationKeyListPage {
+    /// Key records in `(valid_from DESC, key_id DESC)` order.
+    pub items: Vec<KeyRecord>,
+    /// Cursor for the next page; `None` at end of stream.
+    pub next_cursor: Option<FederationKeyCursor>,
+}
+
+// ─── Attestations ──────────────────────────────────────────────────
+
+/// Filter for [`super::ReadEngine::list_attestations`]. Composes
+/// AND-style.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttestationFilter {
+    /// Filter by the key id that DID the attesting.
+    pub attesting_key_id: Option<String>,
+
+    /// Filter by the key id that WAS attested.
+    pub attested_key_id: Option<String>,
+
+    /// Filter by attestation_type token (e.g. `"identity"`,
+    /// `"capability"`).
+    pub attestation_type: Option<String>,
+
+    /// Filter by PQC completion.
+    pub pqc_completed: Option<bool>,
+}
+
+/// Opaque cursor for [`super::ReadEngine::list_attestations`].
+///
+/// Ordered by `(asserted_at DESC, attestation_id DESC)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttestationCursor {
+    /// Cursor format version. v0.5.5 ships `"v1"`.
+    pub version: String,
+    /// `asserted_at` of the trailing row.
+    pub last_asserted_at: DateTime<Utc>,
+    /// `attestation_id` of the trailing row.
+    pub last_attestation_id: String,
+}
+
+impl AttestationCursor {
+    /// Construct a v1 cursor.
+    pub fn from_trailing(last_asserted_at: DateTime<Utc>, last_attestation_id: String) -> Self {
+        AttestationCursor {
+            version: "v1".to_owned(),
+            last_asserted_at,
+            last_attestation_id,
+        }
+    }
+}
+
+/// One page of [`Attestation`]s.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttestationListPage {
+    /// Attestations in `(asserted_at DESC, attestation_id DESC)` order.
+    pub items: Vec<Attestation>,
+    /// Cursor for the next page.
+    pub next_cursor: Option<AttestationCursor>,
+}
+
+// ─── Revocations ───────────────────────────────────────────────────
+
+/// Filter for [`super::ReadEngine::list_revocations`]. Composes
+/// AND-style.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevocationFilter {
+    /// Filter by the key id that WAS revoked.
+    pub revoked_key_id: Option<String>,
+
+    /// Filter by the key id that DID the revoking.
+    pub revoking_key_id: Option<String>,
+
+    /// Filter by PQC completion.
+    pub pqc_completed: Option<bool>,
+}
+
+/// Opaque cursor for [`super::ReadEngine::list_revocations`].
+///
+/// Ordered by `(revoked_at DESC, revocation_id DESC)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevocationCursor {
+    /// Cursor format version. v0.5.5 ships `"v1"`.
+    pub version: String,
+    /// `revoked_at` of the trailing row.
+    pub last_revoked_at: DateTime<Utc>,
+    /// `revocation_id` of the trailing row.
+    pub last_revocation_id: String,
+}
+
+impl RevocationCursor {
+    /// Construct a v1 cursor.
+    pub fn from_trailing(last_revoked_at: DateTime<Utc>, last_revocation_id: String) -> Self {
+        RevocationCursor {
+            version: "v1".to_owned(),
+            last_revoked_at,
+            last_revocation_id,
+        }
+    }
+}
+
+/// One page of [`Revocation`]s.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RevocationListPage {
+    /// Revocations in `(revoked_at DESC, revocation_id DESC)` order.
+    pub items: Vec<Revocation>,
+    /// Cursor for the next page.
+    pub next_cursor: Option<RevocationCursor>,
+}

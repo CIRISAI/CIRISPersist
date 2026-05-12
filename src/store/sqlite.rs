@@ -2305,6 +2305,88 @@ impl crate::read::ReadEngine for SqliteBackend {
         ))
     }
 
+    async fn list_tasks(
+        &self,
+        _filter: crate::read::TaskFilter,
+        _cursor: Option<crate::read::TaskCursor>,
+        _limit: i64,
+    ) -> Result<crate::read::TaskListPage, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "list_tasks (sqlite v0.5.5; v0.6.x sovereign-mode track)",
+        ))
+    }
+
+    async fn list_llm_calls(
+        &self,
+        _filter: crate::read::LlmCallFilter,
+        _cursor: Option<crate::read::LlmCallCursor>,
+        _limit: i64,
+    ) -> Result<crate::read::LlmCallListPage, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "list_llm_calls (sqlite v0.5.5; v0.6.x sovereign-mode track)",
+        ))
+    }
+
+    async fn aggregate_llm_costs(
+        &self,
+        _filter: crate::read::LlmCallFilter,
+    ) -> Result<crate::read::LlmCostAggregate, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "aggregate_llm_costs (sqlite v0.5.5; v0.6.x sovereign-mode track)",
+        ))
+    }
+
+    async fn corpus_shape(
+        &self,
+        _filter: crate::read::CorpusShapeFilter,
+    ) -> Result<crate::read::CorpusShape, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "corpus_shape (sqlite v0.5.5; v0.6.x sovereign-mode track)",
+        ))
+    }
+
+    async fn aggregate_scrub_stats(
+        &self,
+        _window: crate::read::TimeWindow,
+    ) -> Result<crate::read::ScrubAggregate, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "aggregate_scrub_stats (sqlite v0.5.5; v0.6.x sovereign-mode track)",
+        ))
+    }
+
+    async fn list_federation_keys(
+        &self,
+        _filter: crate::read::FederationKeyFilter,
+        _cursor: Option<crate::read::FederationKeyCursor>,
+        _limit: i64,
+    ) -> Result<crate::read::FederationKeyListPage, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "list_federation_keys (sqlite v0.5.5; v0.6.x sovereign-mode track)",
+        ))
+    }
+
+    async fn list_attestations(
+        &self,
+        _filter: crate::read::AttestationFilter,
+        _cursor: Option<crate::read::AttestationCursor>,
+        _limit: i64,
+    ) -> Result<crate::read::AttestationListPage, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "list_attestations (sqlite v0.5.5; v0.6.x sovereign-mode track)",
+        ))
+    }
+
+    async fn list_revocations(
+        &self,
+        _filter: crate::read::RevocationFilter,
+        _cursor: Option<crate::read::RevocationCursor>,
+        _limit: i64,
+    ) -> Result<crate::read::RevocationListPage, crate::read::Error> {
+        Err(crate::read::Error::NotImplemented(
+            "list_revocations (sqlite v0.5.5; v0.6.x sovereign-mode track)",
+        ))
+    }
+
     async fn cross_agent_divergence(
         &self,
         _deployment_domain: &str,

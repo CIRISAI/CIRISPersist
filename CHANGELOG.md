@@ -5,6 +5,155 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.5.5] — 2026-05-11
+
+**Federation read primitives §C/D/G/H/I — closes CIRISPersist#23.**
+v0.5.0 shipped §A/B/F/E (validated in production via the v0.5.3
+bridge sweep, 50× §E baseline calls, zero failures). v0.5.5 closes
+the issue with the deferred batch — five additive primitives, no
+schema changes, no breaking API edits.
+
+### Section C — Task-grouped listing
+
+```rust
+pub fn list_tasks(filter: TaskFilter, cursor: Option<TaskCursor>, limit: i64)
+    -> Result<TaskListPage, Error>
+```
+
+`TaskClass::from_task_id` is the canonical task-id → class mapping
+(qa_eval / discord / real_user_* / wakeup_ritual / other) — every
+federation peer sees the same class for the same `task_id`.
+`initial_observation` extracts the earliest THOUGHT_START's
+`task_description` payload field at SQL layer so it's a server-side
+constant. Cursor: `(earliest_at, task_id)` tuple, newest-first.
+Trace ordering within a task: `thought_depth ASC NULLS LAST` →
+reasoning chain reads top-to-bottom.
+
+PyO3: `Engine.list_tasks(filter_json, cursor_json, limit) -> str`.
+
+### Section D — LLM call surface
+
+```rust
+pub fn list_llm_calls(filter: LlmCallFilter, cursor, limit) -> Result<LlmCallListPage, ...>;
+pub fn aggregate_llm_costs(filter: LlmCallFilter) -> Result<LlmCostAggregate, ...>;
+```
+
+`list_llm_calls`: cursor-paged listing of `cirislens.trace_llm_calls`,
+filterable by time / agent / model / status / trace / thought.
+Cursor: `(ts, trace_id, attempt_index)` tuple. Agent-side filters
+force a JOIN to `trace_events` on `(trace_id, parent_event_id)` so
+`agent_id_hash` / `agent_name` / `deployment_domain` reach the
+parent row.
+
+`aggregate_llm_costs`: rollup by_model, by_agent, by_domain, plus
+window-level totals. Four SQL passes share the same WHERE filter;
+every `SUM` is `COALESCE`'d to 0 (CIRISPersist#24 hygiene applied
+proactively — empty-window inputs return zeros, not NULL panics).
+
+PyO3: `Engine.list_llm_calls`, `Engine.aggregate_llm_costs`.
+
+### Section G — Corpus shape
+
+```rust
+pub fn corpus_shape(filter: CorpusShapeFilter) -> Result<CorpusShape, ...>;
+```
+
+Six breakdowns per window: by_task_class, by_qa_language,
+by_qa_question_num, by_agent_name, by_agent_version (= agent_template),
+by_primary_model, by_deployment_region. `primary_model` is the
+per-trace most-frequent LLM call model (ties broken alphabetically).
+QA breakdowns extract `qa_<lang>_<num>` via Postgres regex.
+`stationarity_z_score` reserved for a future baseline-comparison
+API extension — v0.5.5 returns `None` (lens can compute by calling
+`corpus_shape` twice and comparing distributions).
+
+PyO3: `Engine.corpus_shape(filter_json) -> str`.
+
+### Section H — Privacy / scrub observability
+
+```rust
+pub fn aggregate_scrub_stats(window: TimeWindow) -> Result<ScrubAggregate, ...>;
+```
+
+`envelopes_scrubbed` (distinct traces with `pii_scrubbed = true`)
+and `by_trace_level` populate from `cirislens.trace_events` today.
+`fields_scrubbed_total` and `by_entity_type` are gated on v0.6.0's
+post-ingest classification pipeline (CIRISPersist#19) — they
+return `0` / empty until the pipeline lands the per-entity taxonomy.
+The shape is locked now so consumers don't churn when the v0.6.0
+pipeline arrives.
+
+PyO3: `Engine.aggregate_scrub_stats(since_iso8601, until_iso8601) -> str`.
+
+### Section I — Federation observability bulk
+
+```rust
+pub fn list_federation_keys(filter, cursor, limit) -> Result<FederationKeyListPage, ...>;
+pub fn list_attestations    (filter, cursor, limit) -> Result<AttestationListPage, ...>;
+pub fn list_revocations     (filter, cursor, limit) -> Result<RevocationListPage, ...>;
+```
+
+Bulk-list primitives over `cirislens.federation_{keys,attestations,
+revocations}`. Filters compose AND-style:
+
+- **Keys**: `agent_id_hash`, `algorithm`, `revoked`, `pqc_completed`.
+  `revoked` is a `EXISTS` predicate against `federation_revocations`;
+  `pqc_completed` checks `pqc_completed_at IS NOT NULL`.
+- **Attestations**: `attesting_key_id`, `attested_key_id`,
+  `attestation_type`, `pqc_completed`.
+- **Revocations**: `revoked_key_id`, `revoking_key_id`,
+  `pqc_completed`.
+
+Each newest-first by its respective `(timestamp, id)` tuple cursor.
+Item types reuse `crate::federation::{KeyRecord, Attestation,
+Revocation}` — no duplicate schemas.
+
+PyO3: `Engine.list_federation_keys`, `Engine.list_attestations`,
+`Engine.list_revocations`.
+
+### Test coverage
+
+17 new integration tests across §C/D/G/H/I:
+
+- §C: TaskClass derivation table (pure-Rust unit), list_tasks
+  round-trip, cursor pagination across 5 tasks, task_class filter,
+  limit validation. **5 tests.**
+- §D: list_llm_calls round-trip, cursor pagination across 5 calls,
+  aggregate_llm_costs by model/agent/domain/totals, empty-window
+  aggregate returns all zeros. **4 tests.**
+- §G: corpus_shape round-trip with mixed task classes + QA buckets,
+  empty-window shape, primary_model derivation across multi-call
+  traces. **3 tests.**
+- §H: aggregate_scrub_stats round-trip with mixed trace levels,
+  empty-window. **2 tests.**
+- §I: list_federation_keys round-trip + cursor + pqc filter,
+  list_revocations round-trip, limit validation. **3 tests.**
+
+Total: 222 lib tests pass (was 205 in v0.5.4).
+
+### What you get
+
+- Lens / lens-core / sovereign agents: every dashboard primitive
+  (`/repository/traces`, `/repository/tasks`, cost dashboards,
+  corpus drift, privacy dashboards, federation directory monitoring)
+  now has a typed persist-owned endpoint. The historical
+  `cirislens_reader` direct-SQL carve-out can retire.
+- Federation peers: task classification, QA language extraction,
+  primary-model derivation are SQL-side and identical across every
+  consumer. No drift between lens vs. partner site implementations.
+- v0.6.0 unblocker: §H's shape is committed; once the post-ingest
+  pipeline lands per-entity classification, consumers see real
+  values without API changes.
+
+### Upgrade
+
+```toml
+ciris-persist = "0.5.5"
+```
+
+Additive only. Zero breaking changes. Existing v0.5.0 primitives
+unchanged.
+
 ## [0.5.4] — 2026-05-11
 
 **Crate-wide panic-isolation sweep completion + Python regression test

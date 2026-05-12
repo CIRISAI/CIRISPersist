@@ -2739,6 +2739,282 @@ impl PyEngine {
         })
     }
 
+    // ── Section C: task-grouped listing ────────────────────────
+
+    /// Page through tasks, each task carrying its component trace
+    /// summaries. Drives task-axis views (qa-eval, discord, wakeup,
+    /// real-user). Returns JSON-encoded `TaskListPage`.
+    ///
+    /// `task_class` filtering (qa_eval / discord / real_user_* /
+    /// wakeup_ritual / other) is server-side via the canonical
+    /// task_id-prefix mapping in `crate::read::TaskClass::from_task_id`.
+    /// Cursor-paged; no OFFSET/LIMIT.
+    fn list_tasks(
+        &self,
+        py: Python<'_>,
+        filter_json: &str,
+        cursor_json: Option<&str>,
+        limit: i64,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let filter: crate::read::TaskFilter = serde_json::from_str(filter_json)
+                .map_err(|e| PyValueError::new_err(format!("TaskFilter JSON decode: {e}")))?;
+            let cursor: Option<crate::read::TaskCursor> =
+                match cursor_json {
+                    None => None,
+                    Some(s) => Some(serde_json::from_str(s).map_err(|e| {
+                        PyValueError::new_err(format!("TaskCursor JSON decode: {e}"))
+                    })?),
+                };
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::read::ReadEngine;
+                    let page = backend
+                        .list_tasks(filter, cursor, limit)
+                        .await
+                        .map_err(read_err_to_py)?;
+                    serde_json::to_string(&page)
+                        .map_err(|e| PyRuntimeError::new_err(format!("TaskListPage encode: {e}")))
+                })
+            })
+        })
+    }
+
+    // ── Section D: LLM call surface ─────────────────────────────
+
+    /// Page through `cirislens.trace_llm_calls` rows. Filters compose
+    /// AND-style; cursor-paged newest-first. Returns JSON-encoded
+    /// `LlmCallListPage`.
+    fn list_llm_calls(
+        &self,
+        py: Python<'_>,
+        filter_json: &str,
+        cursor_json: Option<&str>,
+        limit: i64,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let filter: crate::read::LlmCallFilter = serde_json::from_str(filter_json)
+                .map_err(|e| PyValueError::new_err(format!("LlmCallFilter JSON decode: {e}")))?;
+            let cursor: Option<crate::read::LlmCallCursor> = match cursor_json {
+                None => None,
+                Some(s) => Some(serde_json::from_str(s).map_err(|e| {
+                    PyValueError::new_err(format!("LlmCallCursor JSON decode: {e}"))
+                })?),
+            };
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::read::ReadEngine;
+                    let page = backend
+                        .list_llm_calls(filter, cursor, limit)
+                        .await
+                        .map_err(read_err_to_py)?;
+                    serde_json::to_string(&page).map_err(|e| {
+                        PyRuntimeError::new_err(format!("LlmCallListPage encode: {e}"))
+                    })
+                })
+            })
+        })
+    }
+
+    /// Cost rollup by model / agent / deployment domain + window
+    /// totals. Returns JSON-encoded `LlmCostAggregate`.
+    fn aggregate_llm_costs(&self, py: Python<'_>, filter_json: &str) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let filter: crate::read::LlmCallFilter = serde_json::from_str(filter_json)
+                .map_err(|e| PyValueError::new_err(format!("LlmCallFilter JSON decode: {e}")))?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::read::ReadEngine;
+                    let agg = backend
+                        .aggregate_llm_costs(filter)
+                        .await
+                        .map_err(read_err_to_py)?;
+                    serde_json::to_string(&agg).map_err(|e| {
+                        PyRuntimeError::new_err(format!("LlmCostAggregate encode: {e}"))
+                    })
+                })
+            })
+        })
+    }
+
+    // ── Section G: corpus shape ─────────────────────────────────
+
+    /// Corpus-shape rollup for a window — distinct trace counts by
+    /// task_class, QA language / question_num, agent name / version,
+    /// primary model, deployment region. Returns JSON-encoded
+    /// `CorpusShape`.
+    fn corpus_shape(&self, py: Python<'_>, filter_json: &str) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let filter: crate::read::CorpusShapeFilter = serde_json::from_str(filter_json)
+                .map_err(|e| {
+                    PyValueError::new_err(format!("CorpusShapeFilter JSON decode: {e}"))
+                })?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::read::ReadEngine;
+                    let shape = backend.corpus_shape(filter).await.map_err(read_err_to_py)?;
+                    serde_json::to_string(&shape)
+                        .map_err(|e| PyRuntimeError::new_err(format!("CorpusShape encode: {e}")))
+                })
+            })
+        })
+    }
+
+    // ── Section H: privacy / scrub observability ────────────────
+
+    /// Scrub-stats aggregate for a window. Drives privacy dashboards.
+    /// Returns JSON-encoded `ScrubAggregate`.
+    ///
+    /// `since_iso8601` + `until_iso8601` parse via RFC3339.
+    fn aggregate_scrub_stats(
+        &self,
+        py: Python<'_>,
+        since_iso8601: &str,
+        until_iso8601: &str,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let since = chrono::DateTime::parse_from_rfc3339(since_iso8601)
+                .map_err(|e| PyValueError::new_err(format!("since RFC3339: {e}")))?
+                .with_timezone(&chrono::Utc);
+            let until = chrono::DateTime::parse_from_rfc3339(until_iso8601)
+                .map_err(|e| PyValueError::new_err(format!("until RFC3339: {e}")))?
+                .with_timezone(&chrono::Utc);
+            let window = crate::read::TimeWindow::new(since, until).map_err(read_err_to_py)?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::read::ReadEngine;
+                    let agg = backend
+                        .aggregate_scrub_stats(window)
+                        .await
+                        .map_err(read_err_to_py)?;
+                    serde_json::to_string(&agg)
+                        .map_err(|e| PyRuntimeError::new_err(format!("ScrubAggregate encode: {e}")))
+                })
+            })
+        })
+    }
+
+    // ── Section I: federation observability bulk ─────────────────
+
+    /// Bulk-list federation_keys with filter + cursor pagination.
+    /// Returns JSON-encoded `FederationKeyListPage`.
+    fn list_federation_keys(
+        &self,
+        py: Python<'_>,
+        filter_json: &str,
+        cursor_json: Option<&str>,
+        limit: i64,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let filter: crate::read::FederationKeyFilter = serde_json::from_str(filter_json)
+                .map_err(|e| {
+                    PyValueError::new_err(format!("FederationKeyFilter JSON decode: {e}"))
+                })?;
+            let cursor: Option<crate::read::FederationKeyCursor> = match cursor_json {
+                None => None,
+                Some(s) => Some(serde_json::from_str(s).map_err(|e| {
+                    PyValueError::new_err(format!("FederationKeyCursor JSON decode: {e}"))
+                })?),
+            };
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::read::ReadEngine;
+                    let page = backend
+                        .list_federation_keys(filter, cursor, limit)
+                        .await
+                        .map_err(read_err_to_py)?;
+                    serde_json::to_string(&page).map_err(|e| {
+                        PyRuntimeError::new_err(format!("FederationKeyListPage encode: {e}"))
+                    })
+                })
+            })
+        })
+    }
+
+    /// Bulk-list federation_attestations. Returns JSON-encoded
+    /// `AttestationListPage`.
+    fn list_attestations(
+        &self,
+        py: Python<'_>,
+        filter_json: &str,
+        cursor_json: Option<&str>,
+        limit: i64,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let filter: crate::read::AttestationFilter = serde_json::from_str(filter_json)
+                .map_err(|e| {
+                    PyValueError::new_err(format!("AttestationFilter JSON decode: {e}"))
+                })?;
+            let cursor: Option<crate::read::AttestationCursor> = match cursor_json {
+                None => None,
+                Some(s) => Some(serde_json::from_str(s).map_err(|e| {
+                    PyValueError::new_err(format!("AttestationCursor JSON decode: {e}"))
+                })?),
+            };
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::read::ReadEngine;
+                    let page = backend
+                        .list_attestations(filter, cursor, limit)
+                        .await
+                        .map_err(read_err_to_py)?;
+                    serde_json::to_string(&page).map_err(|e| {
+                        PyRuntimeError::new_err(format!("AttestationListPage encode: {e}"))
+                    })
+                })
+            })
+        })
+    }
+
+    /// Bulk-list federation_revocations. Returns JSON-encoded
+    /// `RevocationListPage`.
+    fn list_revocations(
+        &self,
+        py: Python<'_>,
+        filter_json: &str,
+        cursor_json: Option<&str>,
+        limit: i64,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let filter: crate::read::RevocationFilter = serde_json::from_str(filter_json)
+                .map_err(|e| PyValueError::new_err(format!("RevocationFilter JSON decode: {e}")))?;
+            let cursor: Option<crate::read::RevocationCursor> = match cursor_json {
+                None => None,
+                Some(s) => Some(serde_json::from_str(s).map_err(|e| {
+                    PyValueError::new_err(format!("RevocationCursor JSON decode: {e}"))
+                })?),
+            };
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::read::ReadEngine;
+                    let page = backend
+                        .list_revocations(filter, cursor, limit)
+                        .await
+                        .map_err(read_err_to_py)?;
+                    serde_json::to_string(&page).map_err(|e| {
+                        PyRuntimeError::new_err(format!("RevocationListPage encode: {e}"))
+                    })
+                })
+            })
+        })
+    }
+
     // ── Section F: Coherence Ratchet inputs ─────────────────────
 
     /// Cross-agent divergence z-scores. `metric` is one of
