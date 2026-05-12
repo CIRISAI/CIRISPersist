@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778602907358,
+  "lastUpdate": 1778603194714,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -9125,6 +9125,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23943591,
             "range": "± 245792",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "f7737609190d3a4620fca805078a557d664dbabd",
+          "message": "v0.6.0-α5: Engine API for pipeline reads — get_features + get_classifications\n\nα5 wires the pipeline's typed reads to the Engine PyO3 surface. Two\nnew inherent methods on PostgresBackend + their PyO3 wraps:\n\nPG INHERENT METHODS (not on the Backend trait — pipeline reads are\npostgres-only for v0.6.0; memory/sqlite don't have to mirror)\n- read_features(trace_id, thought_id) -> Option<Features>:\n  SELECT extracted_features FROM cirislens.trace_events\n  WHERE trace_id=$1 AND thought_id=$2 AND extracted_features IS NOT NULL.\n  Returns None when the pipeline hasn't run on those rows.\n  Feature-gated on `extract`.\n- read_classifications(trace_id, thought_id) -> Vec<Vec<ContentClassMatch>>:\n  Same shape against the `classifications` JSONB column. Returns\n  empty Vec when pre-pipeline. Feature-gated on `classify`.\n\nPYO3 WRAPS (in src/ffi/pyo3.rs alongside §A/B/C/D/E/F/G/H/I reads)\n- Engine.get_features(trace_id, thought_id) -> str | None\n- Engine.get_classifications(trace_id, thought_id) -> str\nBoth JSON-encoded; both wrapped in catch_panic (v0.5.3 contract).\n\nV009 ROUND-TRIP VERIFIED\nTwo new PG-gated integration tests:\n- pipeline_read_features_and_classifications_round_trip: insert\n  fixture trace + UPDATE the V009 columns with serde-encoded\n  Features + Vec<Vec<ContentClassMatch>> + read back via the new\n  inherent methods. Verifies the wire shape contract (V009 JSONB ↔\n  serde) is round-trip stable.\n- pipeline_read_returns_none_for_pre_pipeline_row: insert without\n  UPDATE → extracted_features stays NULL → read_features returns\n  None + read_classifications returns []. Confirms the\n  rollback-safe / pre-v0.6.0 path stays valid.\n\nBoth tests pass against the local ciris-qa-postgres container.\n\nPIPELINE ORCHESTRATION DEFERRED\nEngine.receive_pipeline_envelope (FSD §5.4) and the\niter_features_by_cohort streaming reader land in v0.6.0-α6 /\nv0.6.1 alongside the actual stage execution + PipelineEnvelope\nwire format. v0.6.0 stops at the read surface — consumers can read\nback features the bridge / lens-core writes via raw SQL until the\nedge cutover (FSD §12.2 v0.5.1).\n\nNEXT: α6 — Property + differential tests (port from\ncirislens-core/src/scrubber/proptests.rs), then v0.6.0 final\nrelease (Cargo.toml bump + CHANGELOG + tag).\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-12T11:18:34-05:00",
+          "tree_id": "63b1b7a0cb94b3ad978f1034f427109232370ebf",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/f7737609190d3a4620fca805078a557d664dbabd"
+        },
+        "date": 1778603193920,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 110209,
+            "range": "± 932",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 262006,
+            "range": "± 6614",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 562626,
+            "range": "± 11181",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1991101,
+            "range": "± 8610",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 350,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1423,
+            "range": "± 37",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8161,
+            "range": "± 43",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23221,
+            "range": "± 101",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26447,
+            "range": "± 303",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91067,
+            "range": "± 239",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 385,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3288,
+            "range": "± 172",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9746,
+            "range": "± 29",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42281,
+            "range": "± 295",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 634,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2278415,
+            "range": "± 108007",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7043669,
+            "range": "± 167198",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25870010,
+            "range": "± 480908",
             "unit": "ns/iter"
           }
         ]
