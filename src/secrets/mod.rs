@@ -49,6 +49,9 @@
 pub mod crypto;
 
 #[cfg(feature = "secrets")]
+pub mod postgres;
+
+#[cfg(feature = "secrets")]
 pub mod service;
 
 #[cfg(feature = "secrets")]
