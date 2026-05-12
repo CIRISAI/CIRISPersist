@@ -5,6 +5,111 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.6.0] — 2026-05-12
+
+**Post-ingest filter pipeline substrate — partial close of CIRISPersist#19.**
+The pipeline track lands in five alpha checkpoints (α1..α5, all on
+main pre-tag). Secrets module + edge cutover deferred to v0.6.1 +
+v0.6.2 per the locked
+[FSD POST_INGEST_FILTER_PIPELINE.md](FSD/POST_INGEST_FILTER_PIPELINE.md)
+§12 migration plan.
+
+### What landed (α1..α5)
+
+- **α1 — Foundation:** `classify` taxonomy (36-variant `ContentClass`
+  + `DetectionMethod` + `Sensitivity` + `Action` + `LearningState`
+  + `ContentClassMatch`), `Stage` trait, `PipelineState`,
+  `pipeline::Error` with stable `kind()` tokens. V009 migration adds
+  `extracted_features` + `classifications` + `pipeline_metadata`
+  JSONB columns to `cirislens.trace_events` — all nullable so
+  pre-pipeline rows stay valid (FSD §12.7 rollback-safe).
+- **α2 — Scrub lift:** verbatim port of CIRISLens
+  `cirislens-core/src/scrubber/` (fields catalog, regex catalog with
+  production-corpus false-positive guards, depth-limited JSON walker
+  with two-phase NER batch shape, NER stub). ~1,200 LOC under the
+  `scrub` feature gate. 33 lifted unit tests pass.
+- **α3 — Extract lift:** verbatim port of CIRISLensCore
+  `src/extract/` (typed `Features` struct with `DeclaredCohortAxes` +
+  `StepTimestamps` + `ObservationWeights` + `ModelClass`,
+  `extract_features` static walker, `resolve_json_path` utility).
+  ~700 LOC under the `extract` feature gate. Serde-roundtrip stable
+  for the V009 JSONB columns.
+- **α4 — NER backends:** verbatim port of XLM-RoBERTa (candle) +
+  DistilBERT-multilingual + ORT INT8 backends. ~1,550 LOC behind
+  `scrub-ner` / `scrub-ort` feature gates. Cache-deduped batch
+  inference (~98.8% dedup ratio on production HF corpus). `lib.rs`
+  relaxed `forbid(unsafe_code)` → `deny(unsafe_code)` so the three
+  safetensors-mmap loader files can scope-allow unsafe at the file
+  level — non-NER code stays effectively unsafe-free. `deny.toml`
+  ignores `RUSTSEC-2025-0119` (number_prefix unmaintained) +
+  `RUSTSEC-2024-0436` (paste unmaintained), both transitive-only
+  through the ML deps.
+- **α5 — Engine read API:** `Engine.get_features(trace_id,
+  thought_id)` + `Engine.get_classifications(trace_id, thought_id)`
+  PyO3 methods + the inherent PG implementations behind them. Read
+  the V009 JSONB columns; return `None` / empty when pipeline
+  hasn't run on those rows. Pipeline ORCHESTRATION
+  (`Engine.receive_pipeline_envelope`, the per-stage runner) lands
+  with v0.6.1's edge cutover — v0.6.0 ships the read surface only.
+
+### Cargo features (FSD §2.4 shape)
+
+```toml
+classify       = ["dep:regex"]                         # ContentClass + matchers
+scrub          = ["classify"]                          # regex scrubber + walker
+extract        = ["scrub"]                             # typed Features
+scrub-ner      = ["scrub", "dep:anyhow", "dep:log",    # multilingual NER
+                  "dep:candle-core", "dep:candle-nn",
+                  "dep:candle-transformers",
+                  "dep:tokenizers", "dep:hf-hub"]
+scrub-ort      = ["scrub-ner", "dep:ort", "dep:ndarray"]  # ORT INT8 fast path
+
+default-pipeline-ml     = ["scrub-ner", "extract"]     # production lens / edge
+default-sovereign-light = ["scrub", "extract"]         # Pi-class / sovereign
+```
+
+### Threat model
+
+No new vectors. The pipeline operates on already-verified
+`BatchEnvelope`s (after `verify_hybrid`); its outputs are stored
+under the same `cirislens.trace_events` AV-9 cross-agent dedup
+discipline. The `deny.toml` advisory ignores are both
+unmaintained-track (not exploitable), scoped to feature-gated ML
+deps.
+
+### Verification
+
+- 53 pipeline tests pass under `scrub-ner` build, 52 under light
+  build (one feature-gated NER test).
+- 230+ lib tests total across all feature combinations.
+- 38 PG-gated tests pass against live `ciris-qa-postgres` (pre-push
+  hook gate).
+- cargo-deny / clippy / fmt clean across all feature combos.
+
+### Upgrade
+
+```toml
+ciris-persist = "0.6.0"
+```
+
+Pipeline reads activate when consumers enable the `extract` /
+`classify` features. The pre-v0.6.0 ingest path is unchanged
+(V009 columns are nullable; legacy rows have `extracted_features
+IS NULL`). Lens / lens-core target this version for adoption
+tracking; secrets module + edge cutover land in v0.6.1.
+
+### What's next
+
+- **v0.6.0.x patches:** α6 — proptests port from
+  `cirislens-core/src/scrubber/proptests.rs` (~184 LOC) +
+  `differential` tests vs `AdaptiveFilterService`.
+- **v0.6.1:** `crate::secrets::SecretsService` (18-method trait +
+  V010 migration, `cirislens_secrets` schema 4 tables + HTTP API +
+  ciris-crypto facade). Per FSD §12.1 — prerequisite (ciris-crypto
+  v2.0.2 `aes-gcm`/`kdf`/`hmac`/`random` features) already met.
+- **v0.6.2:** Engine pipeline orchestration —
+  `receive_pipeline_envelope`, `Stage` runner, edge call site.
+
 ## [0.5.8] — 2026-05-12
 
 **Real production bug fix: `put_revocation` + `put_attestation`
