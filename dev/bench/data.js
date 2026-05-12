@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778605111414,
+  "lastUpdate": 1778622497918,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -9917,6 +9917,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23644684,
             "range": "± 1098581",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "8d3d19f94dbab915da23ae98ce36af1af64a8ef0",
+          "message": "v0.6.1-α5: PostgresSecretsBackend — 18-method impl with audit + master-key lifecycle\n\nConcrete SecretsService impl backed by cirislens_secrets.* (V010\nschema). ~1,150 LOC + 200 LOC smoke test.\n\nWHAT'S IMPLEMENTED (16 of 18 methods, full)\nCRUD:\n  store_secret           — UUID gen + per-secret salt/nonce, derive\n                           secret_key via PBKDF2 from active master,\n                           AES-256-GCM encrypt, insert. access_log + 1.\n  retrieve_secret        — find by description, decrypt with derived\n                           secret_key, bump access_count + last_accessed.\n  recall_secret          — UUID lookup, optional decrypt; metadata-only\n                           path doesn't decrypt. Returns SecretRecallResult.\n  list_stored_secrets    — filter (sensitivity / pattern /\n                           source_message_id / created range) + cursor-less\n                           DESC pagination.\n  forget_secret          — DELETE + audit + return existed-flag.\n\nDirect crypto:\n  encrypt                — fresh salt+nonce, derive, encrypt, pack\n                           base64(salt || nonce || ciphertext).\n  decrypt                — reverse of above; rejects short ciphertext.\n\nFilter config CRUD:\n  get_filter_config      — read 'global' row.\n  update_filter_config   — INSERT ON CONFLICT bump version atomic.\n\nAudit + observability:\n  get_service_stats      — total / active_filters / matches_today /\n                           last_rotation / rotation_count via aggregate\n                           SQL.\n  is_healthy             — pool conn + active master key check.\n  get_access_logs        — global tail or per-secret-uuid filter.\n\nKey rotation:\n  reencrypt_all          — load all secrets, derive new per-secret\n                           keys from new master, transactional UPDATE +\n                           master_key_meta lifecycle (deactivate old,\n                           activate new). Returns RotationResult with\n                           per-UUID failure list + duration_ms.\n  rotate_master_key      — generate new master (or use supplied bytes),\n                           INSERT master_key_meta row, store key bytes\n                           in in-process software_keys map. Activates\n                           immediately on first-key path.\n  test_encryption        — encrypt + decrypt round-trip with known\n                           plaintext.\n  migrate_to_hardware_key — returns HardwareKeyUnavailable as specced\n                            (waits on ciris-keyring upstream).\n\nSTUBBED (2 methods, return Internal)\n- process_incoming_text         — needs pipeline classify catalog\n- decapsulate_secrets_in_parameters — needs JSON walker + placeholder\n                                     subst\nBoth land properly in v0.6.2 alongside pipeline orchestration.\n\nAUDIT INVARIANT\nEvery method writes one access_log row via secrets_audit() helper.\nThe helper is the only access_log writer in the module so the\ndiscipline is auditable in one place. Best-effort writes (audit-fail\ndoesn't mask the caller's primary error).\n\nMASTER-KEY LIFECYCLE (v0.6.1-α5 in-memory storage)\nSoftware master keys live in a process-lifetime HashMap keyed by\nkey_ref. master_key_meta row tracks lifecycle (created_at /\nactivated_at / deactivated_at / rotated_to). When the process\nrestarts the in-memory map is empty and active_master_key() returns\nCrypto(\"master key {key_ref} has no in-memory bytes\"). Persistent\nsoftware key storage via ciris-keyring is a v0.6.1.x follow-up;\nhardware-key path is v0.6.x once ciris-keyring/symmetric-derivation\nships upstream.\n\nVERIFICATION\nsecrets_round_trip_full_lifecycle (gated on CIRIS_PERSIST_TEST_PG_URL):\n  rotate_master_key →\n  encrypt + decrypt round-trip →\n  test_encryption →\n  store_secret + retrieve_secret →\n  list_stored_secrets →\n  recall_secret (decrypt=true) →\n  forget_secret →\n  recall after forget returns found=false →\n  get_access_logs has >=5 entries →\n  get_service_stats encryption_enabled=true →\n  is_healthy=true →\n  migrate_to_hardware_key returns HardwareKeyUnavailable →\n  process_incoming_text + decapsulate stubs return Internal\n\nAll pass against live ciris-qa-postgres.\n\ncargo clippy --tests clean across all feature combos.\n\nNEXT: α6 — Engine.secrets() accessor + PyO3 wraps for the 18\nmethods (catch_panic + JSON encoding, matching v0.5.3 discipline).\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-12T16:40:14-05:00",
+          "tree_id": "aeb031960b91caa73c7e9a6bf405206066f06942",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/8d3d19f94dbab915da23ae98ce36af1af64a8ef0"
+        },
+        "date": 1778622496799,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 95849,
+            "range": "± 426",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 243506,
+            "range": "± 7738",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 521516,
+            "range": "± 3018",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1952013,
+            "range": "± 23302",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 324,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1287,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7706,
+            "range": "± 98",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 20530,
+            "range": "± 57",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 23947,
+            "range": "± 40",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 88478,
+            "range": "± 148",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 320,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3235,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9774,
+            "range": "± 23",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 44255,
+            "range": "± 153",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 538,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2130648,
+            "range": "± 230420",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6710599,
+            "range": "± 487212",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23459020,
+            "range": "± 821898",
             "unit": "ns/iter"
           }
         ]
