@@ -49,12 +49,20 @@
 #[cfg(feature = "classify")]
 pub mod classify;
 
+#[cfg(feature = "extract")]
+pub mod extract;
+
 #[cfg(feature = "scrub")]
 pub mod scrub;
 
 #[cfg(feature = "classify")]
 pub use classify::{
     Action, ContentClass, ContentClassMatch, DetectionMethod, LearningState, Sensitivity,
+};
+
+#[cfg(feature = "extract")]
+pub use extract::{
+    extract_features, DeclaredCohortAxes, Features, ModelClass, ObservationWeights, StepTimestamps,
 };
 
 #[cfg(feature = "scrub")]
