@@ -91,6 +91,26 @@ if [ -z "${CIRIS_PERSIST_TEST_PG_URL:-}" ]; then
     fi
 fi
 
+# v0.6.0-α2 — cargo-deny advisories gate. v0.6.0-α1 burned a CI run
+# on a transitive `number_prefix` / `paste` unmaintained advisory
+# pulled in by heavy ML deps; pre-push catches that class now if
+# cargo-deny is installed (it's a separate binary, not a cargo
+# subcommand). Skip silently when not installed.
+if command -v cargo-deny >/dev/null 2>&1; then
+    echo "─── pre-push: cargo-deny check advisories ───"
+    if ! cargo deny check advisories --hide-inclusion-graph 2>&1 | tail -20; then
+        echo
+        echo "✗ cargo-deny found advisories." >&2
+        echo "  Add an ignore block to deny.toml or remove the offending dep." >&2
+        echo "  Bypass (NOT for routine use): git push --no-verify" >&2
+        exit 1
+    fi
+    echo "✓ cargo-deny advisories clean"
+else
+    echo "  ⚠ cargo-deny not installed locally (\`cargo install cargo-deny\`)"
+    echo "    skipping advisory gate — CI will catch it."
+fi
+
 if [ -n "${CIRIS_PERSIST_TEST_PG_URL:-}" ]; then
     if ! cargo test --features postgres,pyo3,server --lib read_section -- --quiet 2>&1 | tail -10; then
         echo

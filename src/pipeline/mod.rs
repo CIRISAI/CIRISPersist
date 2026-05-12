@@ -49,10 +49,16 @@
 #[cfg(feature = "classify")]
 pub mod classify;
 
+#[cfg(feature = "scrub")]
+pub mod scrub;
+
 #[cfg(feature = "classify")]
 pub use classify::{
     Action, ContentClass, ContentClassMatch, DetectionMethod, LearningState, Sensitivity,
 };
+
+#[cfg(feature = "scrub")]
+pub use scrub::{scrub_trace, scrub_traces_batch, ScrubError, ScrubStats, ScrubbedTrace};
 
 // ─── Pipeline orchestration scaffolding (v0.6.0-α2 lands real stages) ──
 
