@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778603940807,
+  "lastUpdate": 1778604749550,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -9521,6 +9521,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25878603,
             "range": "± 151493",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "5ff57a55edc3e00c6196a491749cc60f7fc92435",
+          "message": "v0.6.1-α1: secrets module skeleton + V010 migration + crypto facade\n\nFoundation commit for the federated SecretsService (FSD §7).\n\nNEW SURFACE\n- src/secrets/mod.rs — SecretsError with 8 stable kind() tokens\n  (AV-15 HTTP/PyO3 sanitization convention). Trait + wire types\n  land in α2/α3.\n- src/secrets/crypto.rs — the SOLE import site of ciris_crypto::*\n  in persist (FSD §7.5a crypto-through-ciris-crypto invariant).\n  Wraps:\n    - random_bytes / random_nonce / random_salt / random_master_key\n    - derive_secret_key (PBKDF2-HMAC-SHA-256, 600k iters per OWASP 2023)\n    - encrypt / decrypt (AES-256-GCM, 32-byte key + 12-byte nonce)\n    - hmac_sha256 (for filter-config + audit-log integrity)\n  All errors map to SecretsError (mostly ::Crypto). Length-check\n  gates on every wrapper reject malformed inputs as\n  SecretsError::InvalidArgument.\n\nCARGO FEATURES\n- secrets: postgres + ciris-crypto's aes-gcm/kdf/hmac/random features.\n  Zero direct primitive deps in our Cargo.toml; the boundary is\n  one file (crypto.rs).\n- secrets-server: secrets + server (HTTP API for federated CRUD).\n- secrets-hw DEFERRED: hardware-key migration waits on a\n  symmetric-derivation feature in ciris-keyring upstream. Until\n  then migrate_to_hardware_key returns HardwareKeyUnavailable.\n\nV010 MIGRATION (cirislens_secrets schema + cirislens_pseudonyms)\nFive tables per FSD §7.3:\n  cirislens_secrets.secrets              — encrypted-payload store\n  cirislens_secrets.access_log           — auditable access trail\n  cirislens_secrets.master_key_meta      — master-key lifecycle\n  cirislens_secrets.filter_config        — pattern-catalog CRUD\n  public.cirislens_pseudonyms            — stable Pseudonymize map\n\nEach table fully commented + indexed for the expected access\npaths. All NEW; orthogonal to V009 pipeline columns.\n\nVerified: V010 applies cleanly via the existing run_migrations\ngate, all five tables present after first PG-backed test.\n\nVERIFICATION\n- 10 secrets tests pass: AES-GCM round-trip + auth-tag rejection\n  on tampered ciphertext + wrong-nonce rejection + PBKDF2\n  determinism + salt-divergence + HMAC consistency.\n- cargo check clean on secrets feature build.\n- cargo clippy --tests clean.\n\nNEXT: α2 wire types (SecretReference / SecretRecallResult / etc.)\n+ α3 SecretsService trait. Engine + PyO3 wiring lands in α6.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-12T11:42:59-05:00",
+          "tree_id": "08a22ba573743ba0897d63653609da7ebe151191",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/5ff57a55edc3e00c6196a491749cc60f7fc92435"
+        },
+        "date": 1778604748360,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101779,
+            "range": "± 808",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 243129,
+            "range": "± 491",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 526597,
+            "range": "± 1707",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1857887,
+            "range": "± 13496",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 375,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1557,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8680,
+            "range": "± 46",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21192,
+            "range": "± 705",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24252,
+            "range": "± 77",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83578,
+            "range": "± 202",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 374,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3092,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9408,
+            "range": "± 46",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42567,
+            "range": "± 252",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 621,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2323957,
+            "range": "± 203668",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6685975,
+            "range": "± 200871",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23845742,
+            "range": "± 839001",
             "unit": "ns/iter"
           }
         ]
