@@ -5,6 +5,96 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.5.8] — 2026-05-12
+
+**Real production bug fix: `put_revocation` + `put_attestation`
+String→UUID binding rejection.** Surfaced via the v0.5.5 §I round-
+trip test. v0.5.6/v0.5.7's hotfixes only touched test fixtures and
+missed the underlying issue — the existing impl is wrong, not the
+tests.
+
+### The bug
+
+`put_revocation` and `put_attestation` both write to `UUID`-typed
+columns via `$1::uuid` cast on a `&String` param:
+
+```sql
+INSERT INTO cirislens.federation_revocations (revocation_id, ...)
+VALUES ($1::uuid, $2, ...)
+```
+
+```rust
+&[&row.revocation_id /* String */, ...]
+```
+
+Some `tokio-postgres` / `postgres-types` version combinations refuse
+to serialize `&String` against a `$1::uuid` cast param — the driver's
+type-check sees the inferred `UUID` column type and rejects `String`
+even though the explicit `::uuid` cast would have accepted `TEXT`.
+Result: `Backend("insert revocation: error serializing parameter 0")`.
+
+The bug was latent since v0.3.x — no prior PG test exercised
+`put_revocation` or `put_attestation` end-to-end (only the read-side
+`attach_*_pqc_signature` SELECT paths). The §I round-trip test added
+in v0.5.5 was the first to exercise the put path under live Postgres.
+
+### The fix
+
+Parse `String → uuid::Uuid` at the persist boundary, bind the
+`Uuid` value directly. The `with-uuid-1` feature on tokio-postgres
+already provides the `ToSql` impl; we just stop relying on the
+fragile `&String → $::uuid` cast path:
+
+```rust
+let revocation_uuid = uuid::Uuid::parse_str(&row.revocation_id)?;
+client.execute(
+    "... VALUES ($1, $2, ...)",   // no ::uuid cast needed now
+    &[&revocation_uuid, ...]
+)
+```
+
+Same fix applied to `put_attestation`. Other `$N::uuid` sites
+(`attach_*_pqc_signature`, outbound queue ops) are unchanged for now
+— they're SELECT-by-id paths where bind-as-Uuid hasn't been observed
+to fail in production. Will revisit if test coverage surfaces them.
+
+API-level surface: callers still pass `revocation_id: String` /
+`attestation_id: String` on the public `Revocation` / `Attestation`
+types — parsing is internal. Invalid UUIDs now surface as
+`Error::InvalidArgument` (was: `Error::Backend` with opaque
+serialization error message) — strictly better error class for
+operators.
+
+### Pre-push hardening
+
+`scripts/hooks/pre-push` now auto-discovers a local Postgres
+container (`ciris-qa-postgres` by name, the dev convention) and
+runs the `read_section_*` PG-gated tests against it before pushing.
+When no live PG is reachable, it warns but doesn't fail (preserving
+the historical "integration in CI" contract). Two release versions
+burned in 30min to fixture bugs that local `cargo test` silently
+skipped — this stops that pattern.
+
+### Verification
+
+Locally: 38 / 38 `read_section_*` tests pass against the live
+`ciris-qa-postgres` Docker container (`docker inspect`-discovered
+DSN). Same matrix CI will exercise.
+
+### Upgrade
+
+```toml
+ciris-persist = "0.5.8"
+```
+
+If you're a caller that ever called `put_revocation` or
+`put_attestation` in postgres-backed deployments — you probably
+wanted v0.5.8. v0.5.5/.6/.7's published tag exists but the
+`put_revocation`/`put_attestation` paths were never working
+end-to-end in those releases anyway.
+
+Lens / lens-core teams: target `ciris-persist == 0.5.8` for adoption.
+
 ## [0.5.7] — 2026-05-12
 
 **Second §I test fixture hotfix.** v0.5.6 fixed the cursor + hex

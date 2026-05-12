@@ -994,6 +994,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             ))
         })?;
 
+        // v0.5.8 — parse attestation_id to uuid::Uuid before binding;
+        // see put_revocation comment for context (the same `$1::uuid`
+        // String-binding rejection applies here).
+        let attestation_uuid = uuid::Uuid::parse_str(&row.attestation_id).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!(
+                "attestation_id is not a valid UUID: {e}"
+            ))
+        })?;
+
         // postgres-types doesn't have a built-in for f64→NUMERIC; cast
         // weight to f64 and let postgres convert.
         client
@@ -1003,9 +1012,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash\
-                 ) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
                 &[
-                    &row.attestation_id,
+                    &attestation_uuid,
                     &row.attesting_key_id,
                     &row.attested_key_id,
                     &row.attestation_type,
@@ -1105,6 +1114,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             ))
         })?;
 
+        // v0.5.8 — parse revocation_id to uuid::Uuid before binding.
+        // Some tokio-postgres / postgres-types version combinations
+        // refuse to serialize &String against a `$1::uuid` cast param
+        // (driver's type-check sees the inferred UUID column type and
+        // rejects String). Parsing to Uuid + binding via the
+        // with-uuid-1 feature sidesteps the inference question.
+        let revocation_uuid = uuid::Uuid::parse_str(&row.revocation_id).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!(
+                "revocation_id is not a valid UUID: {e}"
+            ))
+        })?;
+
         client
             .execute(
                 "INSERT INTO cirislens.federation_revocations (\
@@ -1112,9 +1133,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     revoked_at, effective_at, revocation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash\
-                 ) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
                 &[
-                    &row.revocation_id,
+                    &revocation_uuid,
                     &row.revoked_key_id,
                     &row.revoking_key_id,
                     &row.reason,

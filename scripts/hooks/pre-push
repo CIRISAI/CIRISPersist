@@ -64,4 +64,47 @@ if ! cargo test --features postgres,pyo3,server --lib --quiet 2>&1 | tail -10; t
     exit 1
 fi
 
+# v0.5.8 — PG-gated tests early-return when CIRIS_PERSIST_TEST_PG_URL
+# is unset, so fixture bugs in §A/B/C/D/E/F/G/H/I tests slip through
+# local cargo test and only surface in CI. Try to discover a local
+# Postgres (the ciris-qa-postgres docker container is the common dev
+# setup) and re-run the read-engine tests against it.
+#
+# Bypass: if docker / live PG isn't reachable, we warn but don't
+# fail — historical contract is "unit tests must pass, integration
+# tests run in CI." Don't break the historical contract; just nag.
+echo "─── pre-push: PG integration sweep (if available) ───"
+if [ -z "${CIRIS_PERSIST_TEST_PG_URL:-}" ]; then
+    # Heuristic: look for the ciris-qa-postgres container.
+    if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null \
+        | grep -q '^ciris-qa-postgres$'; then
+        PG_USER=$(docker inspect ciris-qa-postgres --format '{{range .Config.Env}}{{println .}}{{end}}' \
+            | grep '^POSTGRES_USER=' | cut -d= -f2)
+        PG_PASS=$(docker inspect ciris-qa-postgres --format '{{range .Config.Env}}{{println .}}{{end}}' \
+            | grep '^POSTGRES_PASSWORD=' | cut -d= -f2)
+        PG_DB=$(docker inspect ciris-qa-postgres --format '{{range .Config.Env}}{{println .}}{{end}}' \
+            | grep '^POSTGRES_DB=' | cut -d= -f2)
+        if [ -n "${PG_USER}" ] && [ -n "${PG_PASS}" ] && [ -n "${PG_DB}" ]; then
+            export CIRIS_PERSIST_TEST_PG_URL="postgres://${PG_USER}:${PG_PASS}@localhost:5432/${PG_DB}"
+            echo "  using ciris-qa-postgres container → ${PG_USER}@localhost:5432/${PG_DB}"
+        fi
+    fi
+fi
+
+if [ -n "${CIRIS_PERSIST_TEST_PG_URL:-}" ]; then
+    if ! cargo test --features postgres,pyo3,server --lib read_section -- --quiet 2>&1 | tail -10; then
+        echo
+        echo "✗ PG integration tests failing against live Postgres." >&2
+        echo "  These would have failed CI; fix before pushing." >&2
+        echo "  Bypass (NOT for routine use): git push --no-verify" >&2
+        exit 1
+    fi
+    echo "✓ PG integration tests passed"
+else
+    echo "  ⚠ no live Postgres available (CIRIS_PERSIST_TEST_PG_URL unset"
+    echo "    and ciris-qa-postgres container not running) — §A/B/C/D/E/F/G/H/I"
+    echo "    tests will run only in CI. Two release versions burned to fixture"
+    echo "    bugs in v0.5.5/.6/.7; consider \`docker start ciris-qa-postgres\`."
+fi
+
 echo "✓ pre-push tests passed"
