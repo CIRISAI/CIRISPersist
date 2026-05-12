@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778546957076,
+  "lastUpdate": 1778547516251,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -8333,6 +8333,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 24057471,
             "range": "± 583723",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "2cbeb958442446ceb2448e6371430888a0f89545",
+          "message": "0.5.7 — second §I test fixture hotfix (UUID cast for revocation_id)\n\nv0.5.6 fixed the cursor + hex-decode fixture bugs but missed one:\nrevocation_id is ::uuid-cast in put_revocation's INSERT SQL\n($1::uuid). My test's `format!(\"rev-§i-{}\", uuid_like())` is a\nhex-timestamp token, not a UUID, so the tokio_postgres serializer\nrejects parameter 0.\n\nFix: use uuid::Uuid::new_v4() which the rest of the test suite\nalready uses for derived-schema inserts (detection_id etc).\n\nZero impl changes from v0.5.5/v0.5.6 — same shape of test-fixture fix.\nManifest-integrity discipline applies again (v0.5.6's build-manifest\nwas registered before publish-pypi was skipped), hence v0.5.7.\n\nLens team target: ciris-persist == 0.5.7.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-11T19:50:54-05:00",
+          "tree_id": "2843cb6135ebab838f67ddcdf1d84ed27b78bc80",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/2cbeb958442446ceb2448e6371430888a0f89545"
+        },
+        "date": 1778547515869,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 108770,
+            "range": "± 202",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 260053,
+            "range": "± 2256",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 561756,
+            "range": "± 13141",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1991392,
+            "range": "± 23708",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 332,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1346,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8203,
+            "range": "± 18",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23119,
+            "range": "± 855",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26347,
+            "range": "± 267",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91105,
+            "range": "± 1454",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 348,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3148,
+            "range": "± 20",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9817,
+            "range": "± 43",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42103,
+            "range": "± 242",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 643,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2261169,
+            "range": "± 38439",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7025294,
+            "range": "± 961925",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25887016,
+            "range": "± 115610",
             "unit": "ns/iter"
           }
         ]
