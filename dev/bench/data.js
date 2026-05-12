@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778599437677,
+  "lastUpdate": 1778599717580,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -8861,6 +8861,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 26335913,
             "range": "± 184506",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "6cd4f365d1f7b05b65f1168297ad4a7286e6545f",
+          "message": "v0.6.0-α3: lift CIRISLensCore extract module — typed Features struct\n\nα3 ports CIRISLensCore/src/extract/ verbatim into\nsrc/pipeline/extract/ under the `extract` Cargo feature. ~700 LOC:\n\n- src/pipeline/extract/features.rs — typed Features struct with\n  Serialize+Deserialize derives so it round-trips through the\n  cirislens.trace_events.extracted_features JSONB column (V009).\n  Sub-types: DeclaredCohortAxes (5-tuple cohort key per\n  RATCHET 2026-05-04 lock), StepTimestamps (8 event_type slots),\n  ObservationWeights (privacy-safe counts only, no text),\n  ModelClass (Unknown / Named — Phase 1 open-ended bucketing).\n\n- src/pipeline/extract/json_path.rs — dot-notation path resolver +\n  value_to_string / float / int / bool coercions. Reusable from\n  future v0.6.x dynamic-field extraction rules.\n\n- src/pipeline/extract/static_extract.rs — extract_features(trace,\n  declared) walks components and populates Features:\n  - Concern #1: step timestamps lifted by event_type\n  - Concern #2: observation weights (memory_count, context_tokens,\n    conversation_turns, alternatives_considered,\n    conscience_checks_count) with multi-fallback field-name\n    discipline preserved verbatim\n  - Concern #3 (schema-driven dynamic rules): NOT ported — kept\n    static per CIRISLensCore OQ-09 closure\n  - Concern #4: full-component JSON blobs for the 6 result\n    event_types\n\nADAPTATIONS FROM LENS-CORE\n- HashMap<&'static str, Value> → HashMap<String, Value> (Serialize\n  doesn't support &'static str map keys).\n- ModelClass derives Default (Unknown variant) — clippy clean.\n- All sub-types Serialize+Deserialize for JSONB round-trip.\n\nPre-pipeline rows stay valid: V009 columns are NULLABLE, and\nextract_features is only invoked on the pipeline path; legacy\ningest paths skip extract entirely.\n\n47 pipeline tests pass (was 33 in α2 + 14 extract tests).\nPre-push PG sweep green against ciris-qa-postgres locally.\n\nNEXT: α4 — feature-gated NER backend modules (xlm_r_loader,\ndistilbert_loader, ort_loader, ner.rs filled in) behind scrub-ner\n+ scrub-ort features. Restores the heavy ML deps + a deny.toml\nignore block for the transitive `number_prefix` / `paste`\nunmaintained advisories.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-12T10:19:45-05:00",
+          "tree_id": "32921d03c4cd5ec338984a45b92f94a37bf518ad",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/6cd4f365d1f7b05b65f1168297ad4a7286e6545f"
+        },
+        "date": 1778599717146,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 103463,
+            "range": "± 419",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 244365,
+            "range": "± 1125",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 526092,
+            "range": "± 1870",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1853342,
+            "range": "± 21205",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 374,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1454,
+            "range": "± 45",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8220,
+            "range": "± 30",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21210,
+            "range": "± 36",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24230,
+            "range": "± 50",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83562,
+            "range": "± 571",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 381,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3061,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9471,
+            "range": "± 60",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42018,
+            "range": "± 174",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2260030,
+            "range": "± 92457",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6610700,
+            "range": "± 109007",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23751689,
+            "range": "± 241483",
             "unit": "ns/iter"
           }
         ]
