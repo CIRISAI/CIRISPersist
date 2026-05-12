@@ -33,7 +33,7 @@ CREATE SCHEMA IF NOT EXISTS cirislens_secrets;
 
 -- ── secrets — the encrypted-payload store ────────────────────────────
 
-CREATE TABLE cirislens_secrets.secrets (
+CREATE TABLE IF NOT EXISTS cirislens_secrets.secrets (
     -- Stable UUID; this is what `{SECRET:uuid:description}` placeholders
     -- and `recall_secret(uuid, ...)` reference.
     secret_uuid                   UUID PRIMARY KEY,
@@ -91,10 +91,10 @@ CREATE TABLE cirislens_secrets.secrets (
     record_schema_version         TEXT NOT NULL DEFAULT '1.0'
 );
 
-CREATE INDEX secrets_created_at        ON cirislens_secrets.secrets (created_at);
-CREATE INDEX secrets_sensitivity       ON cirislens_secrets.secrets (sensitivity_level);
-CREATE INDEX secrets_pattern           ON cirislens_secrets.secrets (detected_pattern);
-CREATE INDEX secrets_source_message    ON cirislens_secrets.secrets (source_message_id)
+CREATE INDEX IF NOT EXISTS secrets_created_at        ON cirislens_secrets.secrets (created_at);
+CREATE INDEX IF NOT EXISTS secrets_sensitivity       ON cirislens_secrets.secrets (sensitivity_level);
+CREATE INDEX IF NOT EXISTS secrets_pattern           ON cirislens_secrets.secrets (detected_pattern);
+CREATE INDEX IF NOT EXISTS secrets_source_message    ON cirislens_secrets.secrets (source_message_id)
     WHERE source_message_id IS NOT NULL;
 
 COMMENT ON TABLE cirislens_secrets.secrets IS
@@ -102,7 +102,7 @@ COMMENT ON TABLE cirislens_secrets.secrets IS
 
 -- ── access_log — auditable access trail ──────────────────────────────
 
-CREATE TABLE cirislens_secrets.access_log (
+CREATE TABLE IF NOT EXISTS cirislens_secrets.access_log (
     log_id        BIGSERIAL PRIMARY KEY,
 
     -- NULL for direct encrypt/decrypt ops (no specific row referenced).
@@ -138,11 +138,11 @@ CREATE TABLE cirislens_secrets.access_log (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX access_log_secret_uuid ON cirislens_secrets.access_log (secret_uuid)
+CREATE INDEX IF NOT EXISTS access_log_secret_uuid ON cirislens_secrets.access_log (secret_uuid)
     WHERE secret_uuid IS NOT NULL;
-CREATE INDEX access_log_accessor    ON cirislens_secrets.access_log (accessor);
-CREATE INDEX access_log_created_at  ON cirislens_secrets.access_log (created_at);
-CREATE INDEX access_log_trace_id    ON cirislens_secrets.access_log (trace_id)
+CREATE INDEX IF NOT EXISTS access_log_accessor    ON cirislens_secrets.access_log (accessor);
+CREATE INDEX IF NOT EXISTS access_log_created_at  ON cirislens_secrets.access_log (created_at);
+CREATE INDEX IF NOT EXISTS access_log_trace_id    ON cirislens_secrets.access_log (trace_id)
     WHERE trace_id IS NOT NULL;
 
 COMMENT ON TABLE cirislens_secrets.access_log IS
@@ -150,7 +150,7 @@ COMMENT ON TABLE cirislens_secrets.access_log IS
 
 -- ── master_key_meta — master-key lifecycle ──────────────────────────
 
-CREATE TABLE cirislens_secrets.master_key_meta (
+CREATE TABLE IF NOT EXISTS cirislens_secrets.master_key_meta (
     -- Opaque key reference. Software keys: random UUID at generation
     -- time. Hardware keys: TPM/Keystore-supplied descriptor.
     key_ref       TEXT PRIMARY KEY,
@@ -178,7 +178,7 @@ CREATE TABLE cirislens_secrets.master_key_meta (
 
 -- Partial index for the current active key — the per-secret encrypt
 -- path looks this up on every store.
-CREATE INDEX master_key_active ON cirislens_secrets.master_key_meta (activated_at)
+CREATE INDEX IF NOT EXISTS master_key_active ON cirislens_secrets.master_key_meta (activated_at)
     WHERE deactivated_at IS NULL;
 
 COMMENT ON TABLE cirislens_secrets.master_key_meta IS
@@ -186,7 +186,7 @@ COMMENT ON TABLE cirislens_secrets.master_key_meta IS
 
 -- ── filter_config — pattern catalog CRUD ────────────────────────────
 
-CREATE TABLE cirislens_secrets.filter_config (
+CREATE TABLE IF NOT EXISTS cirislens_secrets.filter_config (
     -- 'global' or per-deployment id. PRIMARY-KEYED so update_filter_config
     -- writes versioned rows.
     config_id     TEXT PRIMARY KEY,
@@ -204,7 +204,7 @@ COMMENT ON TABLE cirislens_secrets.filter_config IS
 
 -- ── cirislens_pseudonyms — Pseudonymize mapping ─────────────────────
 
-CREATE TABLE cirislens_pseudonyms (
+CREATE TABLE IF NOT EXISTS cirislens_pseudonyms (
     -- SHA-256 of the original identifier (stable across hashes).
     original_hash  BYTEA PRIMARY KEY,
 
@@ -219,7 +219,7 @@ CREATE TABLE cirislens_pseudonyms (
     created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX cirislens_pseudonyms_class ON cirislens_pseudonyms (class);
+CREATE INDEX IF NOT EXISTS cirislens_pseudonyms_class ON cirislens_pseudonyms (class);
 
 COMMENT ON TABLE cirislens_pseudonyms IS
     'v0.6.1 (CIRISPersist#19) — stable Pseudonymize mappings for Action::Pseudonymize. Same hash → same pseudonym across federation peers.';

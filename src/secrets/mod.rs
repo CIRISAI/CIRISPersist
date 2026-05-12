@@ -49,7 +49,13 @@
 pub mod crypto;
 
 #[cfg(feature = "secrets")]
+pub mod service;
+
+#[cfg(feature = "secrets")]
 pub mod types;
+
+#[cfg(feature = "secrets")]
+pub use service::SecretsService;
 
 #[cfg(feature = "secrets")]
 pub use types::{
