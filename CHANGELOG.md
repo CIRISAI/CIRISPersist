@@ -5,6 +5,29 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.5.7] — 2026-05-12
+
+**Second §I test fixture hotfix.** v0.5.6 fixed the cursor + hex
+fixture bugs but missed one: `revocation_id` is `::uuid`-cast in
+`put_revocation`'s INSERT SQL, so the test's `format!("rev-§i-{}",
+uuid_like())` (a hex-timestamp token, not a UUID) fails parameter
+serialization at the postgres driver. Fixed to use `uuid::Uuid::new_v4()`
+which the rest of the test suite already uses for derived-schema
+inserts.
+
+Zero impl changes from v0.5.5 / v0.5.6 — same single-line test
+fixture fix as v0.5.6 was. Manifest-integrity discipline applies
+again (v0.5.6's build-manifest was registered with the registry
+before publish-pypi was skipped), hence v0.5.7.
+
+Lens / lens-core teams: target `ciris-persist == 0.5.7` for adoption.
+
+### Upgrade
+
+```toml
+ciris-persist = "0.5.7"
+```
+
 ## [0.5.6] — 2026-05-12
 
 **Test fixture hotfix for v0.5.5 §I federation observability tests.**

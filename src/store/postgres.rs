@@ -7475,7 +7475,9 @@ mod tests {
             .await
             .unwrap();
 
-        let rev_id = format!("rev-§i-{}", uuid_like());
+        // revocation_id column is `::uuid` cast in put_revocation —
+        // must be a valid UUID string, not the uuid_like() hex token.
+        let rev_id = uuid::Uuid::new_v4().to_string();
         let rev = crate::federation::Revocation {
             revocation_id: rev_id.clone(),
             revoked_key_id: revoked_id.clone(),
