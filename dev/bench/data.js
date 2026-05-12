@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778604859772,
+  "lastUpdate": 1778605111414,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -9785,6 +9785,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23682434,
             "range": "± 246432",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "b8e9c3af42ee784eb0f0ee523ea66aac07fe8d16",
+          "message": "v0.6.1-α3: SecretsService trait (18 methods) + V010 idempotency fix\n\nα3 lands the federation surface contract per FSD §7.1. Method\nsignatures only — concrete impl is α5 (PostgresSecretsBackend).\n\nNEW SURFACE (src/secrets/service.rs)\nSecretsService trait — 18 methods:\n  CRUD (5):       store_secret, retrieve_secret, recall_secret,\n                  list_stored_secrets, forget_secret\n  Detection (2):  process_incoming_text, decapsulate_secrets_in_parameters\n  Direct crypto (2): encrypt, decrypt\n  Filter config (2): get_filter_config, update_filter_config\n  Audit + obs (3): get_service_stats, is_healthy, get_access_logs\n  Key rotation (4): reencrypt_all, rotate_master_key, test_encryption,\n                    migrate_to_hardware_key\n\nPattern: impl Future<...> + Send GAT (matches ReadEngine /\nDerivedSchema convention). NO async_trait dep — Rust 1.75+ GATs\nsuffice. Doc comments cite both the CIRISAgent SecretsServiceProtocol\n§3.1 numbering AND the FSD §7.1 contract.\n\nAudit invariant (in doc comment): every method MUST write a row to\ncirislens_secrets.access_log before returning (including on failure).\nAuditable accountability surface; the PG impl handles this in a\nsingle transaction per call.\n\nV010 IDEMPOTENCY FIX\nα1's V010 migration had bare CREATE TABLE / CREATE INDEX (no IF NOT\nEXISTS). The av26_concurrent_boot_advisory_lock test caught this on\nCI: 10 concurrent workers race-applying migrations all hit\n[42P07] duplicate_table on V010.\n\nFix: add IF NOT EXISTS to every CREATE TABLE + CREATE INDEX in\nV010 (matches the V001 convention which has IF NOT EXISTS\nthroughout). Idempotent now; concurrent workers safely re-run if\nthe advisory lock + refinery schema_history don't fully serialize.\n\nVERIFICATION\n- 17 secrets tests pass.\n- cargo clippy --tests clean on all 4 feature combos.\n- V010 reapplies cleanly against live ciris-qa-postgres.\n\nNEXT: α5 PostgresSecretsBackend impl (full 18-method impl with\naccess_log writes + master_key lifecycle). α4 (crypto facade) is\nalready landed in α1.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-12T11:49:53-05:00",
+          "tree_id": "5b6e012e3da95d8479e133a8b4c185877ecbad45",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/b8e9c3af42ee784eb0f0ee523ea66aac07fe8d16"
+        },
+        "date": 1778605110958,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 104965,
+            "range": "± 813",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 245813,
+            "range": "± 2764",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 528468,
+            "range": "± 1857",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1864266,
+            "range": "± 14003",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 372,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1526,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8717,
+            "range": "± 27",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21127,
+            "range": "± 40",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24178,
+            "range": "± 52",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83565,
+            "range": "± 179",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 371,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3157,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9468,
+            "range": "± 47",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41913,
+            "range": "± 261",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 622,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2223430,
+            "range": "± 129384",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6571054,
+            "range": "± 304704",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23644684,
+            "range": "± 1098581",
             "unit": "ns/iter"
           }
         ]
