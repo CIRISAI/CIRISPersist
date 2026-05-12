@@ -5,6 +5,107 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.6.1] — 2026-05-12
+
+**Federated SecretsService — substrate cut (CIRISPersist#19).**
+v0.6.0 landed the pipeline substrate; v0.6.1 lands the federated
+`SecretsService` ("secrets are on us"). Five alpha checkpoints
+(α1..α6, secrets-server α7 deferred to v0.6.1.x).
+
+### What landed (α1..α6)
+
+- **α1 — Foundation** (commit `5ff57a5`): `secrets` + `secrets-server`
+  Cargo features. V010 migration with `cirislens_secrets` schema +
+  `cirislens_pseudonyms` (5 tables). `SecretsError` with 8 stable
+  `kind()` tokens. `src/secrets/crypto.rs` — the sole import site
+  of `ciris_crypto::*` (FSD §7.5a invariant): AES-256-GCM encrypt /
+  decrypt, PBKDF2-HMAC-SHA-256 derive (600k iters per OWASP 2023),
+  HMAC-SHA-256, OS-RNG. Persist takes **zero direct primitive deps**.
+- **α2 — Wire types** (commit `71c1a9c`): 13 federation-stable
+  structs + 2 enums per FSD §7.2 — `SecretRecord`,
+  `EncryptedSecretRecord`, `SecretReference`, `SecretRecallResult`,
+  `DecapsulationContext`, `AccessLogEntry`, `AccessOp`,
+  `SecretsListFilter`, `SecretsServiceStats`, `RotationResult`,
+  `MasterKeyRef`, `FilterConfig` + `FilterUpdateRequest/Result`.
+  All serde-stable across PyO3 / HTTP / postgres-JSONB boundaries.
+- **α3 — Trait surface + V010 idempotency** (commit `b8e9c3a`): the
+  18-method `SecretsService` trait per FSD §7.1 using `impl Future<...>
+  + Send` GATs. Fix V010 migration to use `IF NOT EXISTS` everywhere
+  (av26 concurrent-boot test caught the gap).
+- **α4 — Crypto facade**: shipped as part of α1.
+- **α5 — PostgresSecretsBackend** (commit `8d3d19f`): the 18-method
+  impl. CRUD with per-secret salt+nonce + PBKDF2 derive; transactional
+  `reencrypt_all` with master_key_meta lifecycle; access_log writes
+  on every call (audit invariant). 2 methods (`process_incoming_text`,
+  `decapsulate_secrets_in_parameters`) stub to `SecretsError::Internal`
+  pending v0.6.2 pipeline orchestration; `migrate_to_hardware_key`
+  returns `HardwareKeyUnavailable` (waits on `ciris-keyring/
+  symmetric-derivation` upstream). Full-lifecycle smoke test passes
+  against live ciris-qa-postgres.
+- **α6 — Engine PyO3 surface**: 18 PyO3 methods on `Engine`
+  (`secrets_store_secret`, `secrets_encrypt`, etc.). Each wrapped in
+  `catch_panic` (v0.5.3 contract); JSON-encoded results;
+  `SecretsError` → `PyErr` via `secrets_err_to_py`.
+
+### What's deferred
+
+- **α7 — HTTP API behind `secrets-server`**: federation-stable HTTP
+  endpoints per FSD §8 (POST `/api/v1/secrets/store`, etc.). The
+  PyO3 surface from α6 is sufficient for lens / agent / bridge
+  consumers; HTTP comes in v0.6.1.x or v0.6.2 with the edge cutover.
+- **`secrets-hw` Cargo feature + `migrate_to_hardware_key` impl**:
+  waits on `ciris-keyring/symmetric-derivation` upstream in
+  CIRISVerify. The trait method exists; v0.6.1 returns
+  `HardwareKeyUnavailable`.
+- **Pipeline-integrated `process_incoming_text` /
+  `decapsulate_secrets_in_parameters`**: v0.6.2 alongside pipeline
+  orchestration. Today's stubs return `SecretsError::Internal`.
+
+### Feature gates
+
+```toml
+secrets        = ["postgres", "classify",
+                  "ciris-crypto/aes-gcm", "ciris-crypto/kdf",
+                  "ciris-crypto/hmac", "ciris-crypto/random"]
+secrets-server = ["secrets", "server"]   # HTTP — α7 deferred
+```
+
+### Threat model
+
+No new vectors. Every `SecretsService` operation appends one
+`access_log` row before returning (FSD §7.1 audit invariant). The
+crypto facade in `src/secrets/crypto.rs` is the **only** import
+site of `ciris_crypto::*` in persist — auditable boundary. The
+in-memory software-key store loses keys on process restart;
+persistent storage via `ciris-keyring` is a v0.6.1.x follow-up.
+`lib.rs` retains `#![deny(unsafe_code)]` (no new unsafe surface).
+
+### Verification
+
+- 17 secrets unit tests (10 crypto + 7 types).
+- 1 PG-gated full-lifecycle smoke test: rotate → encrypt → store →
+  retrieve → list → recall → forget → audit-log → stats → health.
+- cargo-deny / clippy / fmt clean across all feature combos.
+- 18 PyO3 wraps compile + catch_panic-wrapped.
+
+### Upgrade
+
+```toml
+ciris-persist = "0.6.1"
+```
+
+Pipeline reads from v0.6.0 are unchanged. SecretsService activates
+behind `secrets` feature. Lens / agent target this version for the
+secrets-substrate adoption track.
+
+### What's next
+
+- **v0.6.1.x**: persistent software-key storage via `ciris-keyring`
+  (HMAC + secret-derivation feature add upstream). HTTP API behind
+  `secrets-server` once edge surface is defined.
+- **v0.6.2**: pipeline orchestration — `Engine.receive_pipeline_envelope`,
+  Stage runner, `process_incoming_text` + `decapsulate_*` real impls.
+
 ## [0.6.0] — 2026-05-12
 
 **Post-ingest filter pipeline substrate — partial close of CIRISPersist#19.**

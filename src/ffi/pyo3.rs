@@ -3369,6 +3369,494 @@ impl PyEngine {
             })
         })
     }
+
+    // ── v0.6.1: SecretsService PyO3 surface (CIRISPersist#19) ──────────
+    //
+    // 18 methods wrapping the SecretsService trait. Each goes through
+    // catch_panic (v0.5.3 contract) + JSON-encodes the result.
+    // SecretsError translates to PyErr via secrets_err_to_py at the
+    // boundary.
+
+    /// v0.6.1 — Store a manually-keyed secret. AES-256-GCM encrypts
+    /// under the active master key; audited.
+    #[cfg(feature = "secrets")]
+    fn secrets_store_secret(
+        &self,
+        py: Python<'_>,
+        key: &str,
+        value: &str,
+        accessor: &str,
+    ) -> PyResult<()> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let key = key.to_owned();
+            let value = value.to_owned();
+            let accessor = accessor.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::secrets::SecretsService;
+                    backend
+                        .store_secret(key, value, accessor)
+                        .await
+                        .map_err(secrets_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v0.6.1 — Retrieve a manually-keyed secret. Returns plaintext
+    /// or `None`.
+    #[cfg(feature = "secrets")]
+    fn secrets_retrieve_secret(
+        &self,
+        py: Python<'_>,
+        key: &str,
+        accessor: &str,
+    ) -> PyResult<Option<String>> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let key = key.to_owned();
+            let accessor = accessor.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::secrets::SecretsService;
+                    backend
+                        .retrieve_secret(&key, accessor)
+                        .await
+                        .map_err(secrets_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v0.6.1 — Recall a detected secret by UUID. Returns
+    /// JSON-encoded `SecretRecallResult` or `None`.
+    #[cfg(feature = "secrets")]
+    fn secrets_recall_secret(
+        &self,
+        py: Python<'_>,
+        uuid: &str,
+        purpose: &str,
+        accessor: &str,
+        decrypt: bool,
+    ) -> PyResult<Option<String>> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let uuid = uuid.to_owned();
+            let purpose = purpose.to_owned();
+            let accessor = accessor.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::secrets::SecretsService;
+                    let opt = backend
+                        .recall_secret(&uuid, purpose, accessor, decrypt)
+                        .await
+                        .map_err(secrets_err_to_py)?;
+                    match opt {
+                        None => Ok(None),
+                        Some(r) => Ok(Some(serde_json::to_string(&r).map_err(|e| {
+                            PyRuntimeError::new_err(format!("SecretRecallResult encode: {e}"))
+                        })?)),
+                    }
+                })
+            })
+        })
+    }
+
+    /// v0.6.1 — Metadata-only listing. Returns JSON array of
+    /// `SecretReference`.
+    #[cfg(feature = "secrets")]
+    fn secrets_list_stored(
+        &self,
+        py: Python<'_>,
+        limit: usize,
+        filter_json: &str,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let filter: crate::secrets::SecretsListFilter = serde_json::from_str(filter_json)
+                .map_err(|e| {
+                    PyValueError::new_err(format!("SecretsListFilter JSON decode: {e}"))
+                })?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::secrets::SecretsService;
+                    let refs = backend
+                        .list_stored_secrets(limit, filter)
+                        .await
+                        .map_err(secrets_err_to_py)?;
+                    serde_json::to_string(&refs).map_err(|e| {
+                        PyRuntimeError::new_err(format!("Vec<SecretReference> encode: {e}"))
+                    })
+                })
+            })
+        })
+    }
+
+    /// v0.6.1 — Audited delete. Returns `true` if the secret existed.
+    #[cfg(feature = "secrets")]
+    fn secrets_forget_secret(&self, py: Python<'_>, uuid: &str, accessor: &str) -> PyResult<bool> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let uuid = uuid.to_owned();
+            let accessor = accessor.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::secrets::SecretsService;
+                    backend
+                        .forget_secret(&uuid, accessor)
+                        .await
+                        .map_err(secrets_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v0.6.1 — Stub: v0.6.2 wires this with the pipeline classify
+    /// stage. Until then returns SecretsError::Internal.
+    #[cfg(feature = "secrets")]
+    fn secrets_process_incoming_text(
+        &self,
+        py: Python<'_>,
+        text: &str,
+        source_message_id: &str,
+        accessor: &str,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let text = text.to_owned();
+            let smi = source_message_id.to_owned();
+            let accessor = accessor.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::secrets::SecretsService;
+                    let (filtered, refs) = backend
+                        .process_incoming_text(&text, &smi, accessor)
+                        .await
+                        .map_err(secrets_err_to_py)?;
+                    let body = serde_json::json!({
+                        "filtered_text": filtered,
+                        "refs": refs,
+                    });
+                    serde_json::to_string(&body).map_err(|e| {
+                        PyRuntimeError::new_err(format!("process_incoming_text encode: {e}"))
+                    })
+                })
+            })
+        })
+    }
+
+    /// v0.6.1 — Stub: v0.6.2 wires this. Returns SecretsError::Internal.
+    #[cfg(feature = "secrets")]
+    fn secrets_decapsulate(
+        &self,
+        py: Python<'_>,
+        action_type: &str,
+        action_params_json: &str,
+        ctx_json: &str,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let action_type = action_type.to_owned();
+            let action_params: serde_json::Value = serde_json::from_str(action_params_json)
+                .map_err(|e| PyValueError::new_err(format!("action_params decode: {e}")))?;
+            let ctx: crate::secrets::DecapsulationContext = serde_json::from_str(ctx_json)
+                .map_err(|e| PyValueError::new_err(format!("DecapsulationContext decode: {e}")))?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::secrets::SecretsService;
+                    let out = backend
+                        .decapsulate_secrets_in_parameters(&action_type, action_params, ctx)
+                        .await
+                        .map_err(secrets_err_to_py)?;
+                    serde_json::to_string(&out)
+                        .map_err(|e| PyRuntimeError::new_err(format!("decapsulate encode: {e}")))
+                })
+            })
+        })
+    }
+
+    /// v0.6.1 — Direct AES-GCM encrypt. Returns
+    /// `base64(salt || nonce || ciphertext)`.
+    #[cfg(feature = "secrets")]
+    fn secrets_encrypt(&self, py: Python<'_>, plaintext: &str) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let pt = plaintext.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::secrets::SecretsService;
+                    backend.encrypt(&pt).await.map_err(secrets_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v0.6.1 — Direct AES-GCM decrypt.
+    #[cfg(feature = "secrets")]
+    fn secrets_decrypt(&self, py: Python<'_>, ciphertext: &str) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let ct = ciphertext.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::secrets::SecretsService;
+                    backend.decrypt(&ct).await.map_err(secrets_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v0.6.1 — Read current filter pattern catalog. Returns
+    /// JSON-encoded `FilterConfig`.
+    #[cfg(feature = "secrets")]
+    fn secrets_get_filter_config(&self, py: Python<'_>) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::secrets::SecretsService;
+                    let cfg = backend
+                        .get_filter_config()
+                        .await
+                        .map_err(secrets_err_to_py)?;
+                    serde_json::to_string(&cfg)
+                        .map_err(|e| PyRuntimeError::new_err(format!("FilterConfig encode: {e}")))
+                })
+            })
+        })
+    }
+
+    /// v0.6.1 — Write a new filter pattern catalog. Returns
+    /// JSON-encoded `FilterUpdateResult`.
+    #[cfg(feature = "secrets")]
+    fn secrets_update_filter_config(
+        &self,
+        py: Python<'_>,
+        updates_json: &str,
+        accessor: &str,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let req: crate::secrets::FilterUpdateRequest = serde_json::from_str(updates_json)
+                .map_err(|e| PyValueError::new_err(format!("FilterUpdateRequest decode: {e}")))?;
+            let accessor = accessor.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::secrets::SecretsService;
+                    let res = backend
+                        .update_filter_config(req, accessor)
+                        .await
+                        .map_err(secrets_err_to_py)?;
+                    serde_json::to_string(&res).map_err(|e| {
+                        PyRuntimeError::new_err(format!("FilterUpdateResult encode: {e}"))
+                    })
+                })
+            })
+        })
+    }
+
+    /// v0.6.1 — Service-wide observability stats. Returns
+    /// JSON-encoded `SecretsServiceStats`.
+    #[cfg(feature = "secrets")]
+    fn secrets_get_service_stats(&self, py: Python<'_>) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::secrets::SecretsService;
+                    let s = backend
+                        .get_service_stats()
+                        .await
+                        .map_err(secrets_err_to_py)?;
+                    serde_json::to_string(&s).map_err(|e| {
+                        PyRuntimeError::new_err(format!("SecretsServiceStats encode: {e}"))
+                    })
+                })
+            })
+        })
+    }
+
+    /// v0.6.1 — Liveness probe.
+    #[cfg(feature = "secrets")]
+    fn secrets_is_healthy(&self, py: Python<'_>) -> PyResult<bool> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::secrets::SecretsService;
+                    backend.is_healthy().await.map_err(secrets_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v0.6.1 — Audit-log query. `secret_uuid=None` returns the
+    /// global tail. Returns JSON array of `AccessLogEntry`.
+    #[cfg(feature = "secrets")]
+    fn secrets_get_access_logs(
+        &self,
+        py: Python<'_>,
+        secret_uuid: Option<&str>,
+        limit: usize,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let uuid = secret_uuid.map(str::to_owned);
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::secrets::SecretsService;
+                    let logs = backend
+                        .get_access_logs(uuid.as_deref(), limit)
+                        .await
+                        .map_err(secrets_err_to_py)?;
+                    serde_json::to_string(&logs).map_err(|e| {
+                        PyRuntimeError::new_err(format!("Vec<AccessLogEntry> encode: {e}"))
+                    })
+                })
+            })
+        })
+    }
+
+    /// v0.6.1 — Re-encrypt every stored secret under a new master.
+    /// Atomic. Returns JSON-encoded `RotationResult`.
+    #[cfg(feature = "secrets")]
+    fn secrets_reencrypt_all(
+        &self,
+        py: Python<'_>,
+        new_master_key_ref_json: &str,
+        accessor: &str,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let key_ref: crate::secrets::MasterKeyRef =
+                serde_json::from_str(new_master_key_ref_json)
+                    .map_err(|e| PyValueError::new_err(format!("MasterKeyRef decode: {e}")))?;
+            let accessor = accessor.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::secrets::SecretsService;
+                    let res = backend
+                        .reencrypt_all(key_ref, accessor)
+                        .await
+                        .map_err(secrets_err_to_py)?;
+                    serde_json::to_string(&res)
+                        .map_err(|e| PyRuntimeError::new_err(format!("RotationResult encode: {e}")))
+                })
+            })
+        })
+    }
+
+    /// v0.6.1 — Generate a fresh master key (or use supplied bytes).
+    /// `new_master_b64` is `Some(base64(32-byte key))` or `None` to
+    /// auto-generate. Returns JSON-encoded `MasterKeyRef`.
+    #[cfg(feature = "secrets")]
+    fn secrets_rotate_master_key(
+        &self,
+        py: Python<'_>,
+        new_master_b64: Option<&str>,
+        accessor: &str,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let new_master: Option<Vec<u8>> = match new_master_b64 {
+                None => None,
+                Some(s) => {
+                    use base64::engine::general_purpose::STANDARD as BASE64;
+                    use base64::Engine as _;
+                    Some(BASE64.decode(s).map_err(|e| {
+                        PyValueError::new_err(format!("new_master base64 decode: {e}"))
+                    })?)
+                }
+            };
+            let accessor = accessor.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::secrets::SecretsService;
+                    let r = backend
+                        .rotate_master_key(new_master, accessor)
+                        .await
+                        .map_err(secrets_err_to_py)?;
+                    serde_json::to_string(&r)
+                        .map_err(|e| PyRuntimeError::new_err(format!("MasterKeyRef encode: {e}")))
+                })
+            })
+        })
+    }
+
+    /// v0.6.1 — Encrypt-decrypt round-trip health check.
+    #[cfg(feature = "secrets")]
+    fn secrets_test_encryption(&self, py: Python<'_>) -> PyResult<bool> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::secrets::SecretsService;
+                    backend.test_encryption().await.map_err(secrets_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v0.6.1 — Migrate master key to CIRISVerify hardware path.
+    /// Returns SecretsError::HardwareKeyUnavailable in v0.6.1 (waits
+    /// on ciris-keyring/symmetric-derivation upstream).
+    #[cfg(feature = "secrets")]
+    fn secrets_migrate_to_hardware_key(&self, py: Python<'_>, accessor: &str) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let accessor = accessor.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::secrets::SecretsService;
+                    let r = backend
+                        .migrate_to_hardware_key(accessor)
+                        .await
+                        .map_err(secrets_err_to_py)?;
+                    serde_json::to_string(&r)
+                        .map_err(|e| PyRuntimeError::new_err(format!("MasterKeyRef encode: {e}")))
+                })
+            })
+        })
+    }
+}
+
+/// v0.6.1 — Bridge `secrets::SecretsError` → `PyErr` at the FFI
+/// boundary. InvalidArgument / NotAuthorized / NotFound → ValueError
+/// (caller-fault 4xx-shape). Crypto / Backend / Internal /
+/// HardwareKeyUnavailable / RotationConflict → RuntimeError
+/// (server-fault 5xx-shape).
+#[cfg(feature = "secrets")]
+fn secrets_err_to_py(e: crate::secrets::SecretsError) -> PyErr {
+    use crate::secrets::SecretsError;
+    match e {
+        SecretsError::InvalidArgument(_)
+        | SecretsError::NotAuthorized(_)
+        | SecretsError::NotFound(_) => PyValueError::new_err(e.to_string()),
+        SecretsError::Crypto(_)
+        | SecretsError::Backend(_)
+        | SecretsError::Internal(_)
+        | SecretsError::HardwareKeyUnavailable(_)
+        | SecretsError::RotationConflict(_) => PyRuntimeError::new_err(e.to_string()),
+    }
 }
 
 /// v0.4.2 — Bridge `signing::StewardSignerError` → `PyErr` at the
