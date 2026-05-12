@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778622497918,
+  "lastUpdate": 1778622685757,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -10049,6 +10049,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23459020,
             "range": "± 821898",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "8e1c68ae01c35412bd42e242b220177657dcdc63",
+          "message": "0.6.1 — federated SecretsService substrate (CIRISPersist#19 partial close)\n\nBumps Cargo.toml 0.6.0 → 0.6.1 + CHANGELOG entry summarising six\nalpha checkpoints (α1..α6, all on main pre-tag).\n\nα1 — Foundation: secrets / secrets-server features + V010\n     migration (5 tables) + crypto facade\nα2 — Wire types: 13 structs + 2 enums per FSD §7.2\nα3 — SecretsService trait + V010 idempotency fix\nα5 — PostgresSecretsBackend 18-method impl + full-lifecycle smoke test\nα6 — Engine PyO3 surface (18 methods, catch_panic-wrapped)\n\nWhat's NOT in v0.6.1:\n- secrets-hw migrate_to_hardware_key (waits on\n  ciris-keyring/symmetric-derivation upstream)\n- HTTP API behind secrets-server (v0.6.1.x or v0.6.2)\n- process_incoming_text + decapsulate_secrets_in_parameters real\n  impls (v0.6.2 with pipeline orchestration; today returns Internal)\n\nLens / agent target ciris-persist == 0.6.1 for the secrets-substrate\nadoption track. PyO3 surface works against the V010 schema today;\nHTTP federation surface lights up when secrets-server lands.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-12T16:43:17-05:00",
+          "tree_id": "ad9c44a72d728a07c61ae41365582e2f41fd70da",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/8e1c68ae01c35412bd42e242b220177657dcdc63"
+        },
+        "date": 1778622685023,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 95682,
+            "range": "± 241",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 237973,
+            "range": "± 1421",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 521135,
+            "range": "± 2990",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1951926,
+            "range": "± 24016",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 325,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1305,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7277,
+            "range": "± 84",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 20514,
+            "range": "± 40",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 23966,
+            "range": "± 693",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 88436,
+            "range": "± 115",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 317,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3206,
+            "range": "± 67",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9692,
+            "range": "± 23",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 44729,
+            "range": "± 1046",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 544,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2066177,
+            "range": "± 37856",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6402807,
+            "range": "± 63824",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23532047,
+            "range": "± 124716",
             "unit": "ns/iter"
           }
         ]
