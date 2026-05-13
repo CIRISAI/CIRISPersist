@@ -1,8 +1,12 @@
-//! PostgreSQL impl of [`NodeCoreService`] (v0.7.0-α4).
+//! PostgreSQL impl of [`NodeCoreService`] (v0.7.0-α4; verify gate
+//! made real in v0.7.1).
 //!
 //! Concrete impl backed by `cirisnode.*` (V011 schema). Every
-//! typed-write goes through a `verify_envelope_signature` gate
-//! before INSERT (audit-envelope invariant from FSD Appendix A.2).
+//! typed-write goes through [`super::verify::verify_envelope_signed`]
+//! before INSERT — the envelope is canonicalized (signature field
+//! stripped) and the contributor-identity Ed25519 pubkey verifies
+//! over those bytes. Persist refuses to insert on verify failure;
+//! `signature_verified = TRUE` is gated on the real verify pass.
 //! Reads follow the v0.5.5 §I cursor-paged newest-first shape.
 
 use chrono::{DateTime, Utc};
@@ -59,32 +63,13 @@ fn parse_id(s: &str) -> Result<Uuid, Error> {
         .map_err(|e| Error::InvalidArgument(format!("id parse: {e} (id={s}) — expected UUID")))
 }
 
-/// v0.7.0-α4 signature-verify stub. Real impl threads
-/// `verify_hybrid_via_directory` from v0.4.1 once the caller-side
-/// canonicalization for cirisnode envelopes is locked. For now: parse
-/// the signature fields, require ed25519 to be base64-decodable,
-/// require signed_at to be non-zero. Production wiring lands in a
-/// v0.7.0.x patch once the canonical-bytes spec is settled.
-fn verify_envelope_signature(sig: &HybridSignature) -> Result<(), Error> {
-    use base64::engine::general_purpose::STANDARD as BASE64;
-    use base64::Engine as _;
-    if sig.ed25519.is_empty() {
-        return Err(Error::Signature("ed25519 signature missing".into()));
-    }
-    BASE64
-        .decode(&sig.ed25519)
-        .map_err(|e| Error::Signature(format!("ed25519 not base64: {e}")))?;
-    if let Some(ml) = &sig.ml_dsa_65 {
-        BASE64
-            .decode(ml)
-            .map_err(|e| Error::Signature(format!("ml_dsa_65 not base64: {e}")))?;
-    }
-    // signed_at non-default (DateTime::default() is the UNIX epoch).
-    if sig.signed_at.timestamp() <= 0 {
-        return Err(Error::Signature("signed_at unset".into()));
-    }
-    Ok(())
-}
+// v0.7.1 — the stub `verify_envelope_signature` (which did not
+// actually verify the signature) was replaced by
+// `super::verify::verify_envelope_signed`. Each typed-write below
+// calls that helper with the envelope + the contributor identity
+// field (which IS the Ed25519 pubkey per SCHEMA.md §2.2). Persist
+// refuses to INSERT on verify failure, and `signature_verified` is
+// set to TRUE only after the verify gate passes.
 
 /// Translate tokio_postgres errors into typed Error variants.
 /// `unique_violation` 23505 → Conflict; FK violation 23503 →
@@ -115,7 +100,7 @@ fn map_pg_error(e: tokio_postgres::Error, op: &str) -> Error {
 
 impl NodeCoreService for PostgresBackend {
     async fn put_contribution(&self, env: ContributionEnvelope) -> Result<(), Error> {
-        verify_envelope_signature(&env.signature)?;
+        super::verify::verify_envelope_signed(&env, &env.signature, &env.author_id)?;
         let id = parse_id(&env.contribution_id)?;
         let subject_kind = env.subject.subject.as_deref().ok_or_else(|| {
             Error::InvalidArgument(
@@ -159,7 +144,7 @@ impl NodeCoreService for PostgresBackend {
     }
 
     async fn cast_vote(&self, env: VoteEnvelope) -> Result<(), Error> {
-        verify_envelope_signature(&env.signature)?;
+        super::verify::verify_envelope_signed(&env, &env.signature, &env.voter_id)?;
         let id = parse_id(&env.vote_id)?;
         let contribution_id = match &env.contribution_id {
             Some(c) => Some(parse_id(c)?),
@@ -269,7 +254,7 @@ impl NodeCoreService for PostgresBackend {
     }
 
     async fn put_moderation_event(&self, event: ModerationEvent) -> Result<(), Error> {
-        verify_envelope_signature(&event.signature)?;
+        super::verify::verify_envelope_signed(&event, &event.signature, &event.accuser_id)?;
         let id = parse_id(&event.moderation_id)?;
         let client = self
             .pool()
@@ -299,7 +284,7 @@ impl NodeCoreService for PostgresBackend {
     }
 
     async fn put_slashing_attestation(&self, att: SlashingAttestation) -> Result<(), Error> {
-        verify_envelope_signature(&att.signature)?;
+        super::verify::verify_envelope_signed(&att, &att.signature, &att.adjudicator_id)?;
         let id = parse_id(&att.slashing_id)?;
         let moderation_id = parse_id(&att.moderation_id)?;
         let client = self
@@ -330,7 +315,7 @@ impl NodeCoreService for PostgresBackend {
     }
 
     async fn put_reconsideration_request(&self, req: ReconsiderationRequest) -> Result<(), Error> {
-        verify_envelope_signature(&req.signature)?;
+        super::verify::verify_envelope_signed(&req, &req.signature, &req.requester_id)?;
         let id = parse_id(&req.request_id)?;
         let slashing_id = parse_id(&req.slashing_id)?;
         let client = self
@@ -364,7 +349,7 @@ impl NodeCoreService for PostgresBackend {
         &self,
         att: ReconsiderationAttestation,
     ) -> Result<(), Error> {
-        verify_envelope_signature(&att.signature)?;
+        super::verify::verify_envelope_signed(&att, &att.signature, &att.adjudicator_id)?;
         let id = parse_id(&att.reconsideration_id)?;
         let request_id = parse_id(&att.request_id)?;
         let client = self
@@ -794,11 +779,29 @@ mod tests {
         std::env::var("CIRIS_PERSIST_TEST_PG_URL").ok()
     }
 
-    fn fix_sig() -> HybridSignature {
+    /// v0.7.1 — produce the contributor's base64-encoded Ed25519
+    /// pubkey from a deterministic seed (for tests). Per
+    /// `SCHEMA.md` §2.2, the pubkey doubles as the contributor_id.
+    fn pubkey_b64(key: &ed25519_dalek::SigningKey) -> String {
         use base64::engine::general_purpose::STANDARD as BASE64;
         use base64::Engine as _;
+        BASE64.encode(key.verifying_key().to_bytes())
+    }
+
+    /// v0.7.1 — sign canonical bytes of an envelope and stamp the
+    /// signature field. Generic over the typed-envelope shape.
+    fn sign_envelope<T: serde::Serialize>(
+        env: &T,
+        key: &ed25519_dalek::SigningKey,
+    ) -> HybridSignature {
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine as _;
+        use ed25519_dalek::Signer as _;
+        let canonical =
+            super::super::verify::canonical_bytes_for_envelope(env).expect("canonical bytes");
+        let sig = key.sign(&canonical);
         HybridSignature {
-            ed25519: BASE64.encode([0u8; 64]),
+            ed25519: BASE64.encode(sig.to_bytes()),
             ml_dsa_65: None,
             signed_at: Utc::now(),
         }
@@ -818,18 +821,23 @@ mod tests {
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
 
-        let author = "test-author-cirisnode";
-        let voter = "test-voter-cirisnode";
+        // v0.7.1 — contributors are now identified by their Ed25519
+        // pubkey (SCHEMA.md §2.2). The pubkey IS the contributor_id;
+        // signature verification is self-signed against it.
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xA1; 32]);
+        let voter_key = ed25519_dalek::SigningKey::from_bytes(&[0xB2; 32]);
+        let author = pubkey_b64(&author_key);
+        let voter = pubkey_b64(&voter_key);
         let domain = format!("test-dom-{}", Uuid::new_v4());
         let language = "en";
         let subject_kind = "arc_question";
 
         // 1. put_contribution
         let contribution_id = Uuid::new_v4();
-        let env = ContributionEnvelope {
+        let mut env = ContributionEnvelope {
             contribution_id: contribution_id.to_string(),
             contribution_type: ContributionType::Proposal,
-            author_id: author.into(),
+            author_id: author.clone(),
             subject: Cell {
                 domain: domain.clone(),
                 language: language.into(),
@@ -837,23 +845,40 @@ mod tests {
             },
             payload: serde_json::json!({"question_id": "test_q01"}),
             witness_set: None,
-            signature: fix_sig(),
+            signature: HybridSignature {
+                ed25519: String::new(),
+                ml_dsa_65: None,
+                signed_at: Utc::now(),
+            },
             submitted_at: Utc::now(),
         };
+        env.signature = sign_envelope(&env, &author_key);
         backend.put_contribution(env.clone()).await.unwrap();
 
         // 1b. duplicate → Conflict
-        let dup = backend.put_contribution(env).await.unwrap_err();
+        let dup = backend.put_contribution(env.clone()).await.unwrap_err();
         assert!(
             matches!(dup, Error::Conflict(_)),
             "expected Conflict, got: {dup:?}"
         );
 
+        // 1c. v0.7.1: tampered envelope rejects with Signature.
+        let mut tampered = env.clone();
+        tampered.contribution_id = Uuid::new_v4().to_string();
+        tampered.payload = serde_json::json!({"q": "TAMPERED"});
+        // Keep the original signature — won't match canonical bytes
+        // of the tampered envelope.
+        let tampered_err = backend.put_contribution(tampered).await.unwrap_err();
+        assert!(
+            matches!(tampered_err, Error::Signature(_)),
+            "expected Signature on tampered envelope, got: {tampered_err:?}"
+        );
+
         // 2. cast_vote
         let vote_id = Uuid::new_v4();
-        let vote = VoteEnvelope {
+        let mut vote = VoteEnvelope {
             vote_id: vote_id.to_string(),
-            voter_id: voter.into(),
+            voter_id: voter.clone(),
             contribution_id: Some(contribution_id.to_string()),
             cell: Cell {
                 domain: domain.clone(),
@@ -862,15 +887,20 @@ mod tests {
             },
             score: serde_json::json!({"verdict": "approve", "magnitude": 1.0}),
             rationale: Some("test".into()),
-            signature: fix_sig(),
+            signature: HybridSignature {
+                ed25519: String::new(),
+                ml_dsa_65: None,
+                signed_at: Utc::now(),
+            },
             cast_at: Utc::now(),
         };
+        vote.signature = sign_envelope(&vote, &voter_key);
         backend.cast_vote(vote).await.unwrap();
 
         // 3. update_credits_ledger
         backend
             .update_credits_ledger(CreditsUpdate {
-                contributor_id: voter.into(),
+                contributor_id: voter.clone(),
                 domain: domain.clone(),
                 language: language.into(),
                 subject: subject_kind.into(),
@@ -883,7 +913,7 @@ mod tests {
         // 4. update_expertise_ledger
         backend
             .update_expertise_ledger(ExpertiseUpdate {
-                contributor_id: voter.into(),
+                contributor_id: voter.clone(),
                 domain: domain.clone(),
                 language: language.into(),
                 new_expertise: 0.5,
@@ -904,7 +934,7 @@ mod tests {
 
         // 6. read_vote_weight
         let vw = backend
-            .read_vote_weight(voter, &domain, language, subject_kind)
+            .read_vote_weight(&voter, &domain, language, subject_kind)
             .await
             .unwrap()
             .expect("vote weight present");
@@ -945,7 +975,7 @@ mod tests {
 
         // 9. get_credits_ledger
         let cl = backend
-            .get_credits_ledger(voter, &domain, language, subject_kind)
+            .get_credits_ledger(&voter, &domain, language, subject_kind)
             .await
             .unwrap()
             .expect("credits present");
@@ -953,7 +983,7 @@ mod tests {
 
         // 10. get_expertise_ledger
         let el = backend
-            .get_expertise_ledger(voter, &domain, language)
+            .get_expertise_ledger(&voter, &domain, language)
             .await
             .unwrap()
             .expect("expertise present");

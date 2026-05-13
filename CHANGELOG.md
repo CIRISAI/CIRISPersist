@@ -5,6 +5,77 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.7.1] — 2026-05-12
+
+**Real envelope signature verification (closes the v0.7.0 caveat).**
+v0.7.0-α4 shipped a structural stub: `verify_envelope_signature`
+checked that the signature fields were base64-decodable and that
+`signed_at` was non-zero, but did not actually verify the signature
+against any pubkey. v0.7.1 makes verification real and gates
+`signature_verified = TRUE` on a passing verify.
+
+### Model
+
+Per `CIRISNodeCore/SCHEMA.md` §2.2, every `ContributorId`
+(`author_id`, `voter_id`, `accuser_id`, `adjudicator_id`,
+`requester_id`) **IS** the Ed25519 public key — base64-encoded.
+Federation-consensus envelopes are self-signed against the
+identity-as-pubkey embedded in the envelope itself; persist does
+not need a federation_keys directory lookup for cirisnode-track
+verification (in contrast to the v0.4.1 outbound-envelope path
+that uses `verify_hybrid_via_directory`).
+
+This corrects the v0.7.0 CHANGELOG note about "threading
+verify_hybrid_via_directory" — the schema's identity model is
+self-signed, so the directory variant is not the right primitive
+for this track. Persist still owns one canonicalization rule (via
+`verify::canonical::canonicalize_envelope_for_signing`); only the
+key-lookup path differs.
+
+### What landed
+
+- New `src/cirisnode/verify.rs` module with:
+  - `canonical_bytes_for_envelope<T: Serialize>(envelope)` —
+    serialize to JSON Value, strip the `signature` field, run the
+    persist-owned Python-compatible canonicalizer. Same rule the
+    agent / lens / edge envelopes use.
+  - `verify_envelope_signed<T: Serialize>(envelope, sig, pubkey)` —
+    canonicalize, then `verify_hybrid` with
+    `HybridPolicy::Ed25519Fallback`. Hybrid envelopes (Ed25519 +
+    ML-DSA-65) accepted via the upstream impl; classical-only
+    accepted under fallback (per-contributor PQC key registration
+    lands in a later release).
+- `PostgresBackend::NodeCoreService` impl: all 6 typed-writes that
+  carry signatures now call `verify_envelope_signed` before INSERT.
+  `signature_verified = TRUE` is gated on the verify pass; persist
+  refuses to insert on failure.
+- Integration test now uses real `ed25519_dalek` signing keys; the
+  test contributor + voter identities ARE base64-encoded Ed25519
+  pubkeys (matches the schema). New tamper-rejection assertion:
+  mutating the envelope payload after sign rejects with
+  `Error::Signature`.
+
+### Tests
+
+- 13/13 cirisnode tests pass — 5 new verify-module tests
+  (round-trip, tampered payload, wrong pubkey, empty signature,
+  malformed base64) + 7 types tests + 1 error-kind + 1 full
+  lifecycle integration test (real Ed25519 sign + tamper rejection)
+  against live `ciris-qa-postgres`.
+- Full lib test suite: 228/228 pass (was 223 in v0.7.0; +5 new
+  verify tests). Clippy `-D warnings` clean across `cirisnode
+  postgres pyo3` feature matrix.
+
+### Still deferred
+
+- ML-DSA-65 hybrid verification for contributor envelopes requires
+  per-contributor PQC key registration (the cirisnode track does
+  not yet have a PQC pubkey field on contributor identity).
+  Classical Ed25519 verification is sufficient for v0.7.1.
+- Tightening `HybridPolicy::Ed25519Fallback` → `HybridPolicy::Strict`
+  is a CIRISNodeCore-track decision deferred until the PQC pubkey
+  rollout completes federation-side.
+
 ## [0.7.0] — 2026-05-12
 
 **CIRISNodeCore federation-consensus substrate (CIRISPersist#30).**

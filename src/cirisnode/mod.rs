@@ -59,6 +59,7 @@
 pub mod postgres;
 pub mod service;
 pub mod types;
+pub mod verify;
 
 pub use service::NodeCoreService;
 pub use types::{
