@@ -55,6 +55,16 @@
 //! - **v0.7.0-α5**: Engine PyO3 wraps.
 //! - **v0.7.0**: release tag.
 
+pub mod types;
+
+pub use types::{
+    Cell, ContributionEnvelope, ContributionListPage, ContributionType, ContributionsFilter,
+    CreditsLedgerEntry, CreditsUpdate, DiversityProof, ExpertiseLedgerEntry, ExpertiseUpdate,
+    HybridSignature, ListCursor, ModerationEvent, ReconsiderationAttestation,
+    ReconsiderationRequest, RoutableContributor, SlashingAttestation, VoteEnvelope, VoteListPage,
+    VoteWeight, VotesFilter, Witness, WitnessSet,
+};
+
 /// Federation-consensus-layer errors.
 ///
 /// THREAT_MODEL.md AV-15: stable `kind()` tokens for HTTP / PyO3
