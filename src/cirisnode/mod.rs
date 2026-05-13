@@ -55,8 +55,10 @@
 //! - **v0.7.0-α5**: Engine PyO3 wraps.
 //! - **v0.7.0**: release tag.
 
+pub mod service;
 pub mod types;
 
+pub use service::NodeCoreService;
 pub use types::{
     Cell, ContributionEnvelope, ContributionListPage, ContributionType, ContributionsFilter,
     CreditsLedgerEntry, CreditsUpdate, DiversityProof, ExpertiseLedgerEntry, ExpertiseUpdate,
