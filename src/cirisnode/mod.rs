@@ -55,6 +55,8 @@
 //! - **v0.7.0-α5**: Engine PyO3 wraps.
 //! - **v0.7.0**: release tag.
 
+#[cfg(feature = "postgres")]
+pub mod postgres;
 pub mod service;
 pub mod types;
 

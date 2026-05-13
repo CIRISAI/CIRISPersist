@@ -5,6 +5,99 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.7.0] — 2026-05-12
+
+**CIRISNodeCore federation-consensus substrate (CIRISPersist#30).**
+Clean-break release on a new track: persist becomes the federation-stable
+host for the six federation-consensus row classes (Contribution, Vote,
+Ledger, Moderation, Slashing, Reconsideration) that CIRISNodeCore
+produces. Distinct from the v0.6.x lens/agent/bridge substrate —
+different consumer ecosystem, different Cargo feature (`cirisnode`),
+different PostgreSQL schema (`cirisnode.*`). Implementation of FSD
+Appendix A.
+
+### What landed (α1..α5)
+
+- **α1 — Foundation** (commit `3df9618`): `cirisnode` Cargo feature.
+  V011 migration with 8 tables under the `cirisnode` schema
+  (contributions, votes, credits_ledger, expertise_ledger,
+  moderation_events, slashing_attestations, reconsideration_requests,
+  reconsideration_attestations). `IF NOT EXISTS` on every CREATE
+  (v0.6.1-α3 idempotency discipline). Module skeleton + `Error` type
+  with 8 stable `kind()` tokens (THREAT_MODEL.md AV-15).
+- **α2 — Wire types** (commit `2cf5f90` + Cell-fix follow-up):
+  24 federation-stable structs + 2 enums per
+  `CIRISNodeCore/SCHEMA.md` §3–§10 — `ContributionEnvelope`,
+  `VoteEnvelope`, `Cell`, `RoutableContributor`, `VoteWeight`,
+  `CreditsUpdate`/`CreditsLedgerEntry`, `ExpertiseUpdate`/
+  `ExpertiseLedgerEntry`, `ModerationEvent`, `SlashingAttestation`,
+  `ReconsiderationRequest`/`ReconsiderationAttestation`,
+  `HybridSignature`, `Witness`/`WitnessSet`, `DiversityProof`,
+  `ListCursor`, plus list-page + filter shapes. NodeCore feedback:
+  `Cell.subject` is `Option<String>` (Expertise paths use `None`).
+- **α3 — Trait surface** (commit `5f884a4`): 13-method
+  `NodeCoreService` trait — 8 typed-writes + 5 read clusters,
+  `impl Future<...> + Send` GAT pattern (no `async_trait` dep).
+  Audit-envelope invariant documented: every typed-write verifies
+  hybrid signature before INSERT.
+- **α4 — PostgresBackend impl**: `NodeCoreService for
+  PostgresBackend`. 8 typed-writes (verify-then-INSERT, idempotent
+  ledger UPSERT). 5 read clusters: `routable_contributors` (uses
+  the partial index on `(domain, language, is_active)`),
+  `read_vote_weight` (SCHEMA.md §5.2 — Credits ×
+  expertise_multiplier × active_tier_multiplier),
+  `list_contributions` / `list_votes` (cursor-paged newest-first
+  per v0.5.5 §I shape with dynamic filter composition),
+  `get_credits_ledger` / `get_expertise_ledger` point-lookups.
+  Typed error mapping via `SqlState`: 23505 → Conflict, 23503 →
+  InvalidArgument FK, 23514 → InvalidArgument CHECK. Full lifecycle
+  integration test passes against live `ciris-qa-postgres`.
+- **α5 — Engine PyO3 surface**: 14 PyO3 methods on `Engine`
+  (`cirisnode_put_contribution`, `cirisnode_cast_vote`,
+  `cirisnode_update_credits_ledger`, etc.). Each wrapped in
+  `catch_panic` (v0.5.3 contract); JSON-encoded inputs + outputs;
+  `cirisnode::Error` → `PyErr` via `cirisnode_err_to_py` with stable
+  kind() tokens at the boundary.
+
+### Signature verification — placeholder
+
+The α4 `verify_envelope_signature` is a structural stub: it parses
+the `HybridSignature` fields and rejects malformed inputs, but does
+not yet thread `verify_hybrid_via_directory` (v0.4.1 surface). Full
+canonicalization-aware verification lands in a v0.7.0.x patch once
+the CIRISNodeCore canonical-bytes spec is locked. Rows currently
+INSERT with `signature_verified = TRUE`; the patch will gate that
+flag on the real directory check.
+
+### Track distinction (v0.6.x vs v0.7.0)
+
+v0.6.0 / v0.6.1 / v0.6.2 are the lens/agent/bridge track (pipeline
+orchestration, federated secrets, taxonomy, scrub/extract lift from
+CIRISLens). v0.7.0 is the **CIRISNodeCore track** — distinct
+consumer, distinct schema, distinct feature gate. They ship from
+the same crate but never share write paths. See
+`FSD/CIRIS_PERSIST.md` Appendix A for the rationale and §A.5 for
+sequencing.
+
+### Tests
+
+- 8/8 cirisnode tests pass — 1 error-kind-stability, 6 serde
+  round-trip, 1 full-lifecycle integration test against live
+  `ciris-qa-postgres` (`put_contribution` → `cast_vote` → ledger
+  updates → `routable_contributors` → `read_vote_weight` →
+  `list_*` → `get_*`).
+- Conflict semantics verified (duplicate `contribution_id` →
+  `Error::Conflict`).
+- Full lib test suite green; clippy `-D warnings` clean across the
+  `cirisnode postgres pyo3` feature matrix.
+
+### Closes
+
+- CIRISPersist#30 (FSD Appendix A spec + impl).
+- CIRISPersist#31 (`deferral_*` → `agent_deferrals_*` rename
+  landed in the v0.6.x track but referenced from Appendix A.1 for
+  context).
+
 ## [0.6.1] — 2026-05-12
 
 **Federated SecretsService — substrate cut (CIRISPersist#19).**

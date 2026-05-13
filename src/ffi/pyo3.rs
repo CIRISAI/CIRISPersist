@@ -3837,6 +3837,414 @@ impl PyEngine {
             })
         })
     }
+
+    // ── v0.7.0-α5: NodeCoreService PyO3 surface (CIRISPersist#30) ─────
+    //
+    // 8 typed-writes + 6 reads wrapping NodeCoreService. Inputs come
+    // across the FFI as JSON strings (typed envelope shapes from
+    // CIRISNodeCore/SCHEMA.md); outputs encode the same way. Errors
+    // route through cirisnode_err_to_py for stable kind() tokens.
+
+    /// v0.7.0 — Verify-and-insert a Contribution envelope.
+    #[cfg(feature = "cirisnode")]
+    fn cirisnode_put_contribution(&self, py: Python<'_>, envelope_json: &str) -> PyResult<()> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let env: crate::cirisnode::ContributionEnvelope = serde_json::from_str(envelope_json)
+                .map_err(|e| {
+                PyValueError::new_err(format!("ContributionEnvelope decode: {e}"))
+            })?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::cirisnode::NodeCoreService;
+                    backend
+                        .put_contribution(env)
+                        .await
+                        .map_err(cirisnode_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v0.7.0 — Verify-and-insert a Vote envelope.
+    #[cfg(feature = "cirisnode")]
+    fn cirisnode_cast_vote(&self, py: Python<'_>, envelope_json: &str) -> PyResult<()> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let env: crate::cirisnode::VoteEnvelope = serde_json::from_str(envelope_json)
+                .map_err(|e| PyValueError::new_err(format!("VoteEnvelope decode: {e}")))?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::cirisnode::NodeCoreService;
+                    backend.cast_vote(env).await.map_err(cirisnode_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v0.7.0 — Upsert one row in credits_ledger.
+    #[cfg(feature = "cirisnode")]
+    fn cirisnode_update_credits_ledger(&self, py: Python<'_>, update_json: &str) -> PyResult<()> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let update: crate::cirisnode::CreditsUpdate = serde_json::from_str(update_json)
+                .map_err(|e| PyValueError::new_err(format!("CreditsUpdate decode: {e}")))?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::cirisnode::NodeCoreService;
+                    backend
+                        .update_credits_ledger(update)
+                        .await
+                        .map_err(cirisnode_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v0.7.0 — Upsert one row in expertise_ledger.
+    #[cfg(feature = "cirisnode")]
+    fn cirisnode_update_expertise_ledger(&self, py: Python<'_>, update_json: &str) -> PyResult<()> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let update: crate::cirisnode::ExpertiseUpdate = serde_json::from_str(update_json)
+                .map_err(|e| PyValueError::new_err(format!("ExpertiseUpdate decode: {e}")))?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::cirisnode::NodeCoreService;
+                    backend
+                        .update_expertise_ledger(update)
+                        .await
+                        .map_err(cirisnode_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v0.7.0 — Verify-and-insert a ModerationEvent.
+    #[cfg(feature = "cirisnode")]
+    fn cirisnode_put_moderation_event(&self, py: Python<'_>, event_json: &str) -> PyResult<()> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let event: crate::cirisnode::ModerationEvent = serde_json::from_str(event_json)
+                .map_err(|e| PyValueError::new_err(format!("ModerationEvent decode: {e}")))?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::cirisnode::NodeCoreService;
+                    backend
+                        .put_moderation_event(event)
+                        .await
+                        .map_err(cirisnode_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v0.7.0 — Verify-and-insert a SlashingAttestation.
+    #[cfg(feature = "cirisnode")]
+    fn cirisnode_put_slashing_attestation(&self, py: Python<'_>, att_json: &str) -> PyResult<()> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let att: crate::cirisnode::SlashingAttestation = serde_json::from_str(att_json)
+                .map_err(|e| PyValueError::new_err(format!("SlashingAttestation decode: {e}")))?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::cirisnode::NodeCoreService;
+                    backend
+                        .put_slashing_attestation(att)
+                        .await
+                        .map_err(cirisnode_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v0.7.0 — Verify-and-insert a ReconsiderationRequest.
+    #[cfg(feature = "cirisnode")]
+    fn cirisnode_put_reconsideration_request(
+        &self,
+        py: Python<'_>,
+        req_json: &str,
+    ) -> PyResult<()> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let req: crate::cirisnode::ReconsiderationRequest = serde_json::from_str(req_json)
+                .map_err(|e| {
+                    PyValueError::new_err(format!("ReconsiderationRequest decode: {e}"))
+                })?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::cirisnode::NodeCoreService;
+                    backend
+                        .put_reconsideration_request(req)
+                        .await
+                        .map_err(cirisnode_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v0.7.0 — Verify-and-insert a ReconsiderationAttestation.
+    #[cfg(feature = "cirisnode")]
+    fn cirisnode_put_reconsideration_attestation(
+        &self,
+        py: Python<'_>,
+        att_json: &str,
+    ) -> PyResult<()> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let att: crate::cirisnode::ReconsiderationAttestation = serde_json::from_str(att_json)
+                .map_err(|e| {
+                    PyValueError::new_err(format!("ReconsiderationAttestation decode: {e}"))
+                })?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::cirisnode::NodeCoreService;
+                    backend
+                        .put_reconsideration_attestation(att)
+                        .await
+                        .map_err(cirisnode_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v0.7.0 — List active routable contributors for `(domain,
+    /// language)`. Returns JSON array of `RoutableContributor`.
+    #[cfg(feature = "cirisnode")]
+    fn cirisnode_routable_contributors(
+        &self,
+        py: Python<'_>,
+        domain: &str,
+        language: &str,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let domain = domain.to_owned();
+            let language = language.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::cirisnode::NodeCoreService;
+                    let rows = backend
+                        .routable_contributors(&domain, &language)
+                        .await
+                        .map_err(cirisnode_err_to_py)?;
+                    serde_json::to_string(&rows).map_err(|e| {
+                        PyRuntimeError::new_err(format!("RoutableContributor encode: {e}"))
+                    })
+                })
+            })
+        })
+    }
+
+    /// v0.7.0 — Compute `Credits × expertise_multiplier ×
+    /// active_tier_multiplier` for vote-weighting per SCHEMA.md §5.2.
+    /// Returns JSON-encoded `VoteWeight` or `None`.
+    #[cfg(feature = "cirisnode")]
+    fn cirisnode_read_vote_weight(
+        &self,
+        py: Python<'_>,
+        contributor_id: &str,
+        domain: &str,
+        language: &str,
+        subject: &str,
+    ) -> PyResult<Option<String>> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let contributor_id = contributor_id.to_owned();
+            let domain = domain.to_owned();
+            let language = language.to_owned();
+            let subject = subject.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::cirisnode::NodeCoreService;
+                    let opt = backend
+                        .read_vote_weight(&contributor_id, &domain, &language, &subject)
+                        .await
+                        .map_err(cirisnode_err_to_py)?;
+                    match opt {
+                        None => Ok(None),
+                        Some(w) => Ok(Some(serde_json::to_string(&w).map_err(|e| {
+                            PyRuntimeError::new_err(format!("VoteWeight encode: {e}"))
+                        })?)),
+                    }
+                })
+            })
+        })
+    }
+
+    /// v0.7.0 — Page through `cirisnode.contributions`. Returns JSON
+    /// `ContributionListPage` (items + optional next_cursor).
+    #[cfg(feature = "cirisnode")]
+    fn cirisnode_list_contributions(
+        &self,
+        py: Python<'_>,
+        filter_json: &str,
+        cursor_json: Option<&str>,
+        limit: i64,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let filter: crate::cirisnode::ContributionsFilter = serde_json::from_str(filter_json)
+                .map_err(|e| {
+                PyValueError::new_err(format!("ContributionsFilter decode: {e}"))
+            })?;
+            let cursor: Option<crate::cirisnode::ListCursor> = match cursor_json {
+                None => None,
+                Some(s) => Some(
+                    serde_json::from_str(s)
+                        .map_err(|e| PyValueError::new_err(format!("ListCursor decode: {e}")))?,
+                ),
+            };
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::cirisnode::NodeCoreService;
+                    let page = backend
+                        .list_contributions(filter, cursor, limit)
+                        .await
+                        .map_err(cirisnode_err_to_py)?;
+                    serde_json::to_string(&page).map_err(|e| {
+                        PyRuntimeError::new_err(format!("ContributionListPage encode: {e}"))
+                    })
+                })
+            })
+        })
+    }
+
+    /// v0.7.0 — Page through `cirisnode.votes`. Returns JSON
+    /// `VoteListPage`.
+    #[cfg(feature = "cirisnode")]
+    fn cirisnode_list_votes(
+        &self,
+        py: Python<'_>,
+        filter_json: &str,
+        cursor_json: Option<&str>,
+        limit: i64,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let filter: crate::cirisnode::VotesFilter = serde_json::from_str(filter_json)
+                .map_err(|e| PyValueError::new_err(format!("VotesFilter decode: {e}")))?;
+            let cursor: Option<crate::cirisnode::ListCursor> = match cursor_json {
+                None => None,
+                Some(s) => Some(
+                    serde_json::from_str(s)
+                        .map_err(|e| PyValueError::new_err(format!("ListCursor decode: {e}")))?,
+                ),
+            };
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::cirisnode::NodeCoreService;
+                    let page = backend
+                        .list_votes(filter, cursor, limit)
+                        .await
+                        .map_err(cirisnode_err_to_py)?;
+                    serde_json::to_string(&page)
+                        .map_err(|e| PyRuntimeError::new_err(format!("VoteListPage encode: {e}")))
+                })
+            })
+        })
+    }
+
+    /// v0.7.0 — Point-lookup one Credits ledger row.
+    #[cfg(feature = "cirisnode")]
+    fn cirisnode_get_credits_ledger(
+        &self,
+        py: Python<'_>,
+        contributor_id: &str,
+        domain: &str,
+        language: &str,
+        subject: &str,
+    ) -> PyResult<Option<String>> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let contributor_id = contributor_id.to_owned();
+            let domain = domain.to_owned();
+            let language = language.to_owned();
+            let subject = subject.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::cirisnode::NodeCoreService;
+                    let opt = backend
+                        .get_credits_ledger(&contributor_id, &domain, &language, &subject)
+                        .await
+                        .map_err(cirisnode_err_to_py)?;
+                    match opt {
+                        None => Ok(None),
+                        Some(r) => Ok(Some(serde_json::to_string(&r).map_err(|e| {
+                            PyRuntimeError::new_err(format!("CreditsLedgerEntry encode: {e}"))
+                        })?)),
+                    }
+                })
+            })
+        })
+    }
+
+    /// v0.7.0 — Point-lookup one Expertise ledger row.
+    #[cfg(feature = "cirisnode")]
+    fn cirisnode_get_expertise_ledger(
+        &self,
+        py: Python<'_>,
+        contributor_id: &str,
+        domain: &str,
+        language: &str,
+    ) -> PyResult<Option<String>> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let contributor_id = contributor_id.to_owned();
+            let domain = domain.to_owned();
+            let language = language.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::cirisnode::NodeCoreService;
+                    let opt = backend
+                        .get_expertise_ledger(&contributor_id, &domain, &language)
+                        .await
+                        .map_err(cirisnode_err_to_py)?;
+                    match opt {
+                        None => Ok(None),
+                        Some(r) => Ok(Some(serde_json::to_string(&r).map_err(|e| {
+                            PyRuntimeError::new_err(format!("ExpertiseLedgerEntry encode: {e}"))
+                        })?)),
+                    }
+                })
+            })
+        })
+    }
+}
+
+/// v0.7.0 — Bridge `cirisnode::Error` → `PyErr` at the FFI boundary.
+/// InvalidArgument / NotAuthorized / Signature / Conflict / NotFound →
+/// ValueError (caller-fault 4xx-shape). Backend / NotImplemented /
+/// Internal → RuntimeError (server-fault 5xx-shape). The stable kind()
+/// token crosses the boundary; verbose detail goes to tracing only.
+#[cfg(feature = "cirisnode")]
+fn cirisnode_err_to_py(e: crate::cirisnode::Error) -> PyErr {
+    let kind = e.kind();
+    tracing::warn!(error = %e, kind = kind, "cirisnode error");
+    match e {
+        crate::cirisnode::Error::InvalidArgument(_)
+        | crate::cirisnode::Error::NotAuthorized(_)
+        | crate::cirisnode::Error::Signature(_)
+        | crate::cirisnode::Error::Conflict(_)
+        | crate::cirisnode::Error::NotFound(_) => PyValueError::new_err(kind),
+        crate::cirisnode::Error::Backend(_)
+        | crate::cirisnode::Error::NotImplemented(_)
+        | crate::cirisnode::Error::Internal(_) => PyRuntimeError::new_err(kind),
+    }
 }
 
 /// v0.6.1 — Bridge `secrets::SecretsError` → `PyErr` at the FFI

@@ -26,23 +26,28 @@ use serde::{Deserialize, Serialize};
 
 // ─── envelope-level shared types ────────────────────────────────────
 
-/// `(domain, language, subject_kind)` tuple — the
+/// `(domain, language, subject?)` tuple — the
 /// CIRISNodeCore/SCHEMA.md §2.5 cell that scopes every Contribution,
 /// Vote, Ledger entry, and Expertise attestation.
 ///
-/// For Vote envelopes, `subject` is the contribution's
-/// `subject_kind` (e.g. `"arc_question"`, `"proposed_battery"`); for
-/// ledger reads it's the per-subject Credits bucket id (e.g.
-/// `"arc_question"`, `"prompt_edit"`).
+/// For Contribution / Vote envelopes + Credits ledger entries,
+/// `subject` is the `subject_kind` (e.g. `"arc_question"`,
+/// `"proposed_battery"`, `"prompt_edit"`) — required.
+///
+/// For Expertise attestation + Expertise ledger entries, the cell
+/// is `(domain, language)` only per SCHEMA.md §7 / §10 — `subject`
+/// is `None`. Forcing a required `subject` here would make Expertise
+/// callers carry a dummy value; the Option lets one type cover
+/// both shapes cleanly.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Cell {
     /// Federation domain (e.g. `"mental_health"`).
     pub domain: String,
     /// BCP-47 language tag (e.g. `"am"`, `"en"`, `"sw"`).
     pub language: String,
-    /// `subject_kind` for Contribution / Vote envelopes; per-subject
-    /// Credits bucket id for Ledger entries.
-    pub subject: String,
+    /// `subject_kind` for Contribution / Vote / Credits paths;
+    /// `None` for Expertise paths per SCHEMA.md §7 / §10.
+    pub subject: Option<String>,
 }
 
 /// Hybrid signature pair — classical Ed25519 + post-quantum ML-DSA-65.
@@ -424,10 +429,21 @@ mod tests {
 
     #[test]
     fn cell_round_trip() {
+        // With subject (Contribution / Vote / Credits path).
         let c = Cell {
             domain: "mental_health".into(),
             language: "am".into(),
-            subject: "arc_question".into(),
+            subject: Some("arc_question".into()),
+        };
+        let s = serde_json::to_string(&c).unwrap();
+        let back: Cell = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, c);
+
+        // Without subject (Expertise path per SCHEMA.md §7 / §10).
+        let c = Cell {
+            domain: "mental_health".into(),
+            language: "am".into(),
+            subject: None,
         };
         let s = serde_json::to_string(&c).unwrap();
         let back: Cell = serde_json::from_str(&s).unwrap();
@@ -443,7 +459,7 @@ mod tests {
             subject: Cell {
                 domain: "mental_health".into(),
                 language: "am".into(),
-                subject: "arc_question".into(),
+                subject: Some("arc_question".into()),
             },
             payload: serde_json::json!({"question_id": "am_mh_v4_q01"}),
             witness_set: None,
