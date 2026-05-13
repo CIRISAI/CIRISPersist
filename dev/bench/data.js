@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778639457853,
+  "lastUpdate": 1778683558696,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -10973,6 +10973,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23790957,
             "range": "± 476092",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "fdb67add2fcf85b1c3587c92eefd39d15bcc92d8",
+          "message": "0.7.2 — canonical-promotion attestation (CIRISPersist#32)\n\nCloses the v0.7.0 is_canonical write-side gap. CIRISNodeCore's\nsubstrate-contract test against v0.7.1 confirmed all 14 methods\nsufficient for routine federation-consensus operations EXCEPT\npromoting rows from pending → canonical (MISSION.md §3.4\ntruth-grounding loop). v0.7.2 closes the gap with a signed-\nattestation envelope per issue #32 Option B.\n\nWhat landed:\n\n- V012 migration: new cirisnode.promotion_attestations table with\n  the standard CIRISPersist audit envelope columns plus target_kind\n  (CHECK against 5 enum variants), target_ids UUID[] (bulk-promote\n  per attestation), attested_by (consensus crate identity), and\n  aggregate_evidence JSONB. GIN index on target_ids for reverse\n  \"which attestations promoted this row?\" lookups.\n\n- New wire types:\n  - TargetRowKind enum (5 variants — Contribution, Vote,\n    ModerationEvent, SlashingAttestation, ReconsiderationAttestation;\n    ReconsiderationRequest is intentionally absent — its canonical\n    lifecycle is carried by the paired attestation).\n  - PromotionAttestation struct.\n\n- New trait method: NodeCoreService::put_promotion_attestation\n  (9th typed-write).\n\n- PostgresBackend impl:\n  - Verify gate via v0.7.1 verify_envelope_signed (signer is\n    attested_by — consensus crate identity).\n  - Empty target_ids → InvalidArgument.\n  - Transactional: BEGIN → INSERT attestation row → UPDATE target\n    rows (is_canonical = TRUE, canonicalized_at = NOW() via WHERE\n    id = ANY($1::uuid[])) → assert affected-row count matches\n    target_ids.len() (else rollback) → COMMIT.\n  - Table + column names come from the typed TargetRowKind enum —\n    no caller-controlled SQL injection surface.\n\n- PyO3 wrap: Engine.cirisnode_put_promotion_attestation(att_json).\n\nTests:\n\n- New promotion_attestation_round_trip integration test against\n  live ciris-qa-postgres: bulk-promote 2 contributions with one\n  attestation, verify is_canonical flips; assert duplicate → Conflict,\n  empty target_ids → InvalidArgument, phantom target → InvalidArgument\n  WITH proof of rollback (re-using same attestation_id with a valid\n  target succeeds, confirming the prior INSERT was not persisted).\n- 14/14 cirisnode tests pass; 229/229 full lib suite; clippy\n  -D warnings clean across cirisnode postgres pyo3.\n\nCloses CIRISPersist#32.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-13T09:35:27-05:00",
+          "tree_id": "b1f9e047ead7c7bb395ddb4b8441f6beb2847a23",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/fdb67add2fcf85b1c3587c92eefd39d15bcc92d8"
+        },
+        "date": 1778683557728,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 114031,
+            "range": "± 495",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 265582,
+            "range": "± 6682",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 566714,
+            "range": "± 5637",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 2002568,
+            "range": "± 7029",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 341,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1503,
+            "range": "± 24",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8244,
+            "range": "± 57",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23167,
+            "range": "± 88",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26427,
+            "range": "± 1028",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91036,
+            "range": "± 488",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 367,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3071,
+            "range": "± 42",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9850,
+            "range": "± 523",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42414,
+            "range": "± 152",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 656,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2280405,
+            "range": "± 109219",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7031746,
+            "range": "± 167876",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25852202,
+            "range": "± 592247",
             "unit": "ns/iter"
           }
         ]
