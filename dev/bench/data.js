@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778711181810,
+  "lastUpdate": 1778711759528,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -11897,6 +11897,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25824118,
             "range": "± 131129",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "1d2fbd9904861174915e8c940630c4bcc0b725ba",
+          "message": "0.8.3 — incident records substrate (closes #37); Phase 1B Postgres complete\n\nLast of the v0.8.x Phase 1B substrate cuts on the Postgres side.\nAbsorbs CIRISAgent's IncidentManagementService — correlation-keyed\ndedup + open→investigating→resolved→closed state machine.\n\nV016 migration: cirislens.incident_records. Partial index on\n(tenant_id, state, last_seen_at) WHERE state IN ('open',\n'investigating') for hot-path queries. GIN on correlation_keys.\n\nIncidentService trait — 4 methods:\n- record_incident: AV-56 bounds-check, then JSONB ?| dedup probe\n  vs open/investigating incidents in (tenant, category); bumps\n  occurrences on match, fresh INSERT otherwise.\n- transition_state: FOR UPDATE current, AV-55 forward-ladder\n  assert, stamp resolved_at + notes on Resolved/Closed.\n- list_incidents: tenant-scoped cursor-paged.\n- correlate: reverse-lookup via GIN.\n\nThreat-model additions (docs/THREAT_MODEL.md §4):\n- AV-55 — state-machine bypass: regressive transitions reject as\n  InvalidTransition; closed incidents don't dedup new records.\n- AV-56 — correlation_keys abuse: max 32 keys × 256 bytes each.\n\nPyO3: 4 Engine.incident_* methods.\n\nTests: 8/8 incident tests + 330/330 full lib pass against live\nciris-qa-postgres. Clippy -D warnings clean.\n\nPhase 1B Postgres substrate is COMPLETE:\n| #34 v0.8.0 cirisgraph (Memory + Config)        | 9/9 ✓\n| #35 v0.8.1 cirisaudit (hash-chain)             | 12/12 ✓\n| #36 v0.8.2 telemetry + tsdb_consolidation      | 7/7 ✓\n| #37 v0.8.3 cirisincident                       | 8/8 ✓\n\nNOT yet ready for CIRISAgent 2.9.0 cutover: CIRISAgent supports\nboth PostgreSQL AND SQLite (CIRIS_DB_URL dialect switch — Postgres\nfor federated, SQLite default for sovereign-mode / Pi-class / iOS\ndevice). The v0.6.1+ Rust substrate (secrets, cirisgraph,\ncirisaudit, telemetry, cirisincident, cirisnode) is Postgres-only\nas of v0.8.3. SQLite parity is the next major phase before the\nagent team can adopt persist on the full deployment matrix.\n\nTrait surfaces + wire types + schema designs ARE locked at v0.8.3;\nSQLite impls slot in behind the same Backend-style traits without\nbreaking the consumer API. v0.9.0 will be the SQLite parity cut.\n\nCloses CIRISPersist#37.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-13T17:27:46-05:00",
+          "tree_id": "0614a9612d20034ed80c4fe00068b054cbd18cb7",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/1d2fbd9904861174915e8c940630c4bcc0b725ba"
+        },
+        "date": 1778711758508,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 109277,
+            "range": "± 326",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 260354,
+            "range": "± 902",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 561662,
+            "range": "± 2523",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1989726,
+            "range": "± 9847",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 344,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1495,
+            "range": "± 35",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7389,
+            "range": "± 32",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23260,
+            "range": "± 46",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26492,
+            "range": "± 86",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91073,
+            "range": "± 159",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 352,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3259,
+            "range": "± 36",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9769,
+            "range": "± 26",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41711,
+            "range": "± 84",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 631,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2289230,
+            "range": "± 177475",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7155020,
+            "range": "± 95481",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 26375109,
+            "range": "± 398822",
             "unit": "ns/iter"
           }
         ]
