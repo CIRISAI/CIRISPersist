@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778685026579,
+  "lastUpdate": 1778688391057,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -11369,6 +11369,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 26049666,
             "range": "± 386535",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "c72c9b37b022d35dc3359665d4392d6076c12993",
+          "message": "0.7.5 — Pipeline orchestrator + PipelineEnvelope wire types (CIRISPersist#33 pieces 1+2)\n\nSubstrate foundation for CIRISEdge#3. v0.6.0 lifted the per-stage\nmatcher/walker code from CIRISLens under classify/scrub/extract\nfeatures; v0.7.4 wired extract_features inline into receive_and_persist.\nv0.7.5 adds the orchestrator surface and federation-internal wire\nshapes edge needs to compose PipelineEnvelopes.\n\nWhat landed:\n\n- Pipeline orchestrator in src/pipeline/mod.rs:\n  - PipelineBuilder + Pipeline composing registered Stage impls\n    in declaration order; sequential run via Pipeline::run.\n  - Dependency validation at build time (Error::MissingDependency\n    when a stage names an unadded upstream).\n  - ErasedStage object-safe shim auto-impl'd for every T: Stage,\n    lets the builder hold Vec<Box<dyn ErasedStage>> without forcing\n    async_trait onto the public trait.\n  - Stage failures short-circuit (FSD §3.3 step 3 — no partial-\n    success path).\n\n- PipelineState extended per FSD §5.1:\n  - features: Option<Features> (extract output, FSD-shaped)\n  - encrypted_secrets: Vec<EncryptedSecretRecord> (reserved for\n    EncryptAndStoreStage)\n  - pii_scrubbed invariant flag (FSD §4.3 invariant 4)\n  - stages_executed switched from Vec<&'static str> to Vec<String>\n    so wire-format PipelineMetadata can carry without conversion.\n\n- New src/pipeline/types.rs (federation-internal wire shapes,\n  FSD §4.3):\n  - PipelineEnvelope { pipeline_schema_version, envelope,\n    sidecar, edge_signature, edge_key_id, edge_pqc_key_id }\n  - PipelineSidecar { classifications, features,\n    encrypted_secrets, pipeline_metadata } — all fields feature-\n    gated.\n  - PipelineMetadata { stages_executed, fields_modified,\n    pii_scrubbed, secrets_encrypted, pipeline_duration_ms,\n    edge_build_id }.\n  - HybridSignatureBlock locally defined (decoupled from the\n    federation-consensus cirisnode::HybridSignature track).\n\n- ExtractStage concrete Stage impl wrapping v0.6.0\n  extract_features. Produces state.features from the first\n  CompleteTrace in env.events (matches FSD §5.1 single-Option\n  shape; multi-trace batches retain per-trace extract from\n  v0.7.4's inline path).\n\n- minimal_pipeline() factory — ExtractStage only. Full FSD §5.2\n  default_pipeline(secrets) wiring Classify → Scrub →\n  EncryptAndStore → Extract waits on subsequent #33 patches\n  (ClassifyStage matcher catalog, ScrubStage adapter,\n  EncryptAndStoreStage glue).\n\nTests:\n- 7 pipeline orchestrator unit tests (error-kind stability,\n  PipelineBuilder rejects missing dep, stage_names declaration\n  order, minimal_pipeline runs ExtractStage on empty batch).\n- 4 wire-type serde tests in pipeline::types (schema-version\n  constant, metadata zeroing, HybridSignatureBlock round-trip,\n  None ml_dsa_65 omitted on the wire).\n- 294/294 full lib pass against live ciris-qa-postgres.\n  Clippy -D warnings clean across postgres extract classify\n  pyo3 cirisnode secrets scrub.\n\nStill deferred from CIRISPersist#33 (tracked for v0.7.x+):\n- Concrete ClassifyStage (needs matcher catalog).\n- Concrete ScrubStage (adapter over existing Scrubber trait).\n- EncryptAndStoreStage (orphan-secret invariant + SecretsService\n  integration).\n- Engine::receive_pipeline_envelope HTTP handler (FSD §4.3\n  invariants 1-7).\n- FederatedSecretsClient (HTTP client mirroring SecretsService).\n- Role tag enforcement on federation_keys.\n\nReferences CIRISPersist#33 (this work — pieces 1+2 landed);\nCIRISEdge#3 (substrate prerequisite that drove the issue).\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-13T10:58:13-05:00",
+          "tree_id": "b20e2d7983f2cf0f0b0c6ec5875ebef1122c072d",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/c72c9b37b022d35dc3359665d4392d6076c12993"
+        },
+        "date": 1778688390501,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 108565,
+            "range": "± 273",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 259932,
+            "range": "± 635",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 561660,
+            "range": "± 6658",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1996895,
+            "range": "± 14150",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 339,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1487,
+            "range": "± 34",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8196,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23170,
+            "range": "± 50",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26399,
+            "range": "± 86",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91033,
+            "range": "± 278",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 351,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3096,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9423,
+            "range": "± 48",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41576,
+            "range": "± 158",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 657,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2279029,
+            "range": "± 58521",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7149244,
+            "range": "± 51968",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 26384840,
+            "range": "± 172689",
             "unit": "ns/iter"
           }
         ]
