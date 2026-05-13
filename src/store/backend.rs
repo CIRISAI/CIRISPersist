@@ -57,6 +57,23 @@ pub trait Backend: Send + Sync {
         rows: &[TraceLlmCallRow],
     ) -> impl Future<Output = Result<usize, Error>> + Send;
 
+    /// v0.7.4 (CIRISPersist#19) — batch-UPDATE the V009
+    /// `extracted_features` column for `(trace_id, thought_id)` pairs.
+    /// Called from `IngestPipeline::receive_and_persist` post-insert
+    /// when the `extract` pipeline stage runs.
+    ///
+    /// Default impl returns 0 (no-op) — memory + sqlite backends
+    /// don't have the V009 column. Postgres backend overrides with
+    /// the real UNNEST'd UPDATE.
+    #[cfg(feature = "extract")]
+    fn update_features_batch(
+        &self,
+        updates: &[(String, String, crate::pipeline::extract::Features)],
+    ) -> impl Future<Output = Result<u64, Error>> + Send {
+        let _ = updates;
+        async { Ok(0) }
+    }
+
     /// Look up a verifying key by `signature_key_id`
     /// (`accord_public_keys` table).
     fn lookup_public_key(

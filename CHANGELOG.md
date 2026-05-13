@@ -5,6 +5,81 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.7.4] — 2026-05-13
+
+**Pipeline orchestration — extract wired into receive_and_persist
+(closes CIRISPersist#19).** v0.6.0 absorbed the scrub/extract/classify
+substrate (modules + V009 migration + `get_features` /
+`get_classifications` read API + scrub wired into ingest). v0.6.1
+added SecretsService. The remaining gap from issue #19 was the
+**extract orchestration**: extract was not actually called during
+`receive_and_persist`, so V009's `extracted_features` column stayed
+NULL in production and consumers' `get_features` calls always
+returned `None`. v0.7.4 closes the gap.
+
+### What landed
+
+- **New `Backend::update_features_batch` trait method** — gated on
+  the `extract` feature. Default impl returns 0 (no-op) so memory
+  + sqlite backends silently skip; PostgreSQL backend overrides
+  with a real `UPDATE ... FROM (SELECT UNNEST(...))` round-trip
+  that touches every named `(trace_id, thought_id)` row.
+- **Wire extract into `IngestPipeline::receive_and_persist`** —
+  after the trace_events INSERT batch, iterate the verified
+  `CompleteTrace` events, build `DeclaredCohortAxes` from each
+  trace's `deployment_profile` block (V006 denormalized fields,
+  required at trace_schema_version 2.7.9), call
+  `pipeline::extract::extract_features(trace_json, declared)`,
+  and batch-UPDATE all rows in one round-trip. Feature-gated on
+  `extract`.
+- **Non-fatal failure mode** — if the post-insert UPDATE fails
+  (e.g. transient PG hiccup), persist logs a structured warn and
+  returns the BatchSummary successfully. The trace_events rows
+  already landed; an extract miss leaves `extracted_features`
+  NULL, which matches the pre-v0.7.4 production state. Dropping
+  verified agent testimony on the floor for a downstream-enrichment
+  failure would be the wrong trade-off.
+- **Trace-level serialize errors** are also non-fatal: skip that
+  one trace's extract, log, continue with the rest of the batch.
+
+### Tests
+
+- New `update_features_batch_round_trip` integration test against
+  live `ciris-qa-postgres`: insert 2 fixture traces with distinct
+  cohort axes (moderation/production/US vs research/staging/EU),
+  batch-update both with the corresponding `Features`, read back
+  each via `read_features`, assert the cohort axes round-tripped.
+  Covers the empty-fast-path (`update_features_batch(&[])` returns
+  0 without hitting the DB).
+- Existing happy-path ingest tests unchanged — the new code path
+  is feature-gated on `extract`; memory-backend tests don't compile
+  in the extract code (they use the no-op default).
+- 268/268 lib pass; clippy `-D warnings` clean across
+  `postgres extract classify pyo3 cirisnode`.
+
+### What's still deferred from issue #19
+
+- **Classify wiring** — the `pipeline::classify` module ships
+  types (ContentClass / ContentClassMatch / etc.) but no matcher
+  implementations yet. Wiring requires writing the regex/NER
+  matcher catalog first. Tracked separately; consumers reading
+  `classifications` via `read_classifications` still get empty
+  vec.
+- **`iter_features_by_cohort` streaming API** — RATCHET-side
+  calibration consumers can read `extracted_features` directly
+  via the `cirislens_reader` role for v0.7.4. A typed iterator
+  remains a downstream nice-to-have.
+- **Schema contract bump** to v0.3.3 — the `extracted_features`
+  column shape is unchanged from v0.6.0's V009; no bump required
+  for v0.7.4.
+
+### Closes
+
+CIRISPersist#19 — the post-ingest filter pipeline ask. v0.6.0
+absorbed the substrate; v0.7.4 wires extract into the live
+ingest path. Classify matchers + `iter_features_by_cohort` are
+downstream follow-ups (not blocking the substrate ask).
+
 ## [0.7.3] — 2026-05-13
 
 **CI hygiene — re-publish v0.7.2 features to PyPI.** v0.7.2 tag CI

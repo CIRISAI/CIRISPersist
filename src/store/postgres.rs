@@ -508,6 +508,53 @@ impl Backend for PostgresBackend {
         Ok(inserted as usize)
     }
 
+    /// v0.7.4 (CIRISPersist#19) — batch-UPDATE the V009
+    /// `extracted_features` column for `(trace_id, thought_id)` pairs
+    /// the post-ingest pipeline ran extract on. Called from
+    /// `IngestPipeline::receive_and_persist` after the row INSERT.
+    ///
+    /// Bulk path uses `UNNEST` of three arrays — single round-trip
+    /// regardless of batch size. Returns the affected-row count;
+    /// caller uses for diagnostic / metrics purposes (count drift
+    /// signals INSERT/UPDATE skew, not a hard failure).
+    ///
+    /// Idempotent: re-running with the same inputs replaces the JSONB
+    /// value (UPDATE-by-equality, no Conflict surface).
+    #[cfg(feature = "extract")]
+    async fn update_features_batch(
+        &self,
+        updates: &[(String, String, crate::pipeline::extract::Features)],
+    ) -> Result<u64, Error> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        let trace_ids: Vec<&str> = updates.iter().map(|(t, _, _)| t.as_str()).collect();
+        let thought_ids: Vec<&str> = updates.iter().map(|(_, th, _)| th.as_str()).collect();
+        let features_json: Vec<serde_json::Value> = updates
+            .iter()
+            .map(|(_, _, f)| serde_json::to_value(f))
+            .collect::<Result<_, _>>()
+            .map_err(|e| Error::Backend(format!("features serialize: {e}")))?;
+
+        let client = self.get_client().await?;
+        let n = client
+            .execute(
+                "UPDATE cirislens.trace_events AS t \
+                 SET extracted_features = u.features \
+                 FROM (\
+                     SELECT \
+                         UNNEST($1::text[]) AS trace_id, \
+                         UNNEST($2::text[]) AS thought_id, \
+                         UNNEST($3::jsonb[]) AS features\
+                 ) AS u \
+                 WHERE t.trace_id = u.trace_id AND t.thought_id = u.thought_id",
+                &[&trace_ids, &thought_ids, &features_json],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("update_features_batch: {e}")))?;
+        Ok(n)
+    }
+
     async fn lookup_public_key(&self, key_id: &str) -> Result<Option<VerifyingKey>, Error> {
         // v0.4.0 (lens#8 ASK 2) — federation_keys is the canonical
         // pubkey directory. The v0.2.1 dual-read fallback to
@@ -8550,6 +8597,107 @@ mod tests {
             crate::pipeline::classify::ContentClass::EmailAddress
         );
         assert_eq!(c_read[0][0].matcher_id, "regex:email_v1");
+    }
+
+    /// v0.7.4 (CIRISPersist#19) — `Backend::update_features_batch`
+    /// UPDATEs the V009 `extracted_features` column via UNNEST'd
+    /// arrays in a single round-trip. This is the post-insert path
+    /// that `IngestPipeline::receive_and_persist` calls.
+    ///
+    /// Test: insert 2 fixture traces → batch-update both with
+    /// distinct Features → read_features returns the right value
+    /// per trace. Also covers empty-update fast-path (returns 0
+    /// without hitting the DB).
+    #[cfg(all(feature = "extract", feature = "classify"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn update_features_batch_round_trip() {
+        use crate::store::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let aid = format!("agent-uf-{}", uuid_like());
+        let tid_a = format!("tr-uf-a-{}", uuid_like());
+        let thid_a = format!("th-{tid_a}");
+        let tid_b = format!("tr-uf-b-{}", uuid_like());
+        let thid_b = format!("th-{tid_b}");
+        let started = chrono::Utc::now();
+        for tid in [&tid_a, &tid_b] {
+            insert_section_a_fixture_trace(
+                &backend,
+                tid,
+                &aid,
+                Some("UF"),
+                Some("moderation"),
+                started,
+                false,
+                0.5,
+                0.5,
+                1.0,
+            )
+            .await;
+        }
+
+        // Empty fast-path: returns 0, doesn't error.
+        let zero = backend.update_features_batch(&[]).await.unwrap();
+        assert_eq!(zero, 0);
+
+        let declared_a = crate::pipeline::extract::DeclaredCohortAxes {
+            agent_role: Some("ally".into()),
+            agent_template: Some("ally-v3-default".into()),
+            deployment_domain: Some("moderation".into()),
+            deployment_type: Some("production".into()),
+            deployment_region: Some("US".into()),
+            deployment_trust_mode: Some("federated_peer".into()),
+        };
+        let declared_b = crate::pipeline::extract::DeclaredCohortAxes {
+            agent_role: Some("scout".into()),
+            agent_template: Some("scout-v1".into()),
+            deployment_domain: Some("research".into()),
+            deployment_type: Some("staging".into()),
+            deployment_region: Some("EU".into()),
+            deployment_trust_mode: Some("sovereign".into()),
+        };
+        let features_a = crate::pipeline::extract::extract_features(
+            &serde_json::json!({"components": []}),
+            declared_a,
+        );
+        let features_b = crate::pipeline::extract::extract_features(
+            &serde_json::json!({"components": []}),
+            declared_b,
+        );
+
+        let n = backend
+            .update_features_batch(&[
+                (tid_a.clone(), thid_a.clone(), features_a),
+                (tid_b.clone(), thid_b.clone(), features_b),
+            ])
+            .await
+            .unwrap();
+        // Each (trace_id, thought_id) maps to N component rows in
+        // the fixture; the UPDATE touches every matching row.
+        assert!(n >= 2, "expected at least one row per trace, got {n}");
+
+        let f_a = backend
+            .read_features(&tid_a, &thid_a)
+            .await
+            .unwrap()
+            .expect("features_a present");
+        assert_eq!(
+            f_a.declared.deployment_domain.as_deref(),
+            Some("moderation")
+        );
+        let f_b = backend
+            .read_features(&tid_b, &thid_b)
+            .await
+            .unwrap()
+            .expect("features_b present");
+        assert_eq!(f_b.declared.deployment_domain.as_deref(), Some("research"));
+        assert_eq!(f_b.declared.agent_role.as_deref(), Some("scout"));
     }
 
     /// Pre-pipeline rows return None / empty (V009 columns are

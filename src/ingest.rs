@@ -301,6 +301,63 @@ where
             .await
             .map_err(IngestError::Store)?;
 
+        // 6. v0.7.4 (CIRISPersist#19) — post-insert: run the extract
+        //    stage and batch-UPDATE the V009 `extracted_features`
+        //    column for every (trace_id, thought_id) pair we just
+        //    inserted. Feature-gated on `extract`; backends that
+        //    don't have V009 (memory, sqlite) silently no-op via the
+        //    Backend trait default impl. Failures here log + skip
+        //    the UPDATE rather than failing the whole ingest: the
+        //    canonical row already landed, and stale features are
+        //    less bad than dropping verified testimony on the floor.
+        //    (Pre-v0.7.4 production rows had this column NULL too,
+        //    so the consumer contract handles None gracefully.)
+        #[cfg(feature = "extract")]
+        if !env.events.is_empty() {
+            let mut updates: Vec<(String, String, crate::pipeline::extract::Features)> =
+                Vec::with_capacity(env.events.len());
+            for event in &env.events {
+                match event {
+                    BatchEvent::CompleteTrace { trace, .. } => {
+                        let declared = trace
+                            .deployment_profile
+                            .as_ref()
+                            .map(|p| crate::pipeline::extract::DeclaredCohortAxes {
+                                agent_role: Some(p.agent_role.clone()),
+                                agent_template: Some(p.agent_template.clone()),
+                                deployment_domain: Some(p.deployment_domain.clone()),
+                                deployment_type: Some(p.deployment_type.clone()),
+                                deployment_region: p.deployment_region.clone(),
+                                deployment_trust_mode: Some(p.deployment_trust_mode.clone()),
+                            })
+                            .unwrap_or_default();
+                        // Non-fatal: serialize never realistically fails
+                        // for a verified CompleteTrace, but if it does,
+                        // skip extract for THIS trace rather than failing
+                        // the whole batch (the row already landed).
+                        let trace_json = match serde_json::to_value(trace) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::warn!(error = %e, trace_id = %trace.trace_id,
+                                    "trace serialize for extract failed; skipping");
+                                continue;
+                            }
+                        };
+                        let features =
+                            crate::pipeline::extract::extract_features(&trace_json, declared);
+                        updates.push((trace.trace_id.clone(), trace.thought_id.clone(), features));
+                    }
+                }
+            }
+            // Non-fatal: log + continue on error. The trace_events row
+            // already landed; an extract miss leaves the column NULL,
+            // matching the pre-v0.7.4 production state.
+            if let Err(e) = self.backend.update_features_batch(&updates).await {
+                tracing::warn!(error = %e, count = updates.len(),
+                    "pipeline extract UPDATE failed; rows landed with extracted_features=NULL");
+            }
+        }
+
         Ok(BatchSummary {
             envelopes_processed: env.events.len(),
             trace_events_inserted: event_report.inserted,
