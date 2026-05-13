@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778683558696,
+  "lastUpdate": 1778684385773,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -11105,6 +11105,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25852202,
             "range": "± 592247",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "aab67a310dd86f8b7bab668fad6ca31f1f545718",
+          "message": "0.7.3 — CI hygiene: harden macos cargo install against poisoned cache\n\nv0.7.2 tag CI failed on darwin-aarch64 (no postgres): the macos-14\nrunner image ships a rustup-init stub at /Users/runner/.cargo/bin/cargo\nthat lazy-installs the toolchain on first use. dtolnay/rust-toolchain\ninstalls the real cargo over the stub, but Swatinem/rust-cache@v2\nrestored a cached ~/.cargo/bin/ (created from an earlier run when\nthe stub was the only cargo there), overwriting the freshly-installed\nreal cargo. Result: `cargo test` invoked the stub and exited 1\nbefore the test even loaded.\n\nThe failing macos test gate blocked `Publish wheel to PyPI` on the\nv0.7.2 tag CI — wheels built (3 matrix arches) but didn't upload.\n\nv0.7.3 ships:\n\n- .github/workflows/ci.yml: cache-bin: false on darwin-aarch64-test\n  + ios-build. Disables the ~/.cargo/bin/ portion of the rust-cache\n  so the dtolnay-installed cargo stays intact across cache restore.\n  Build cache (registry + target) is unaffected — only the small\n  fast-to-rebuild bin layer is excluded.\n- which cargo / cargo --version diagnostic step before each macos\n  test/build, so this class of regression surfaces with a clear\n  signal at the right place if it ever recurs.\n\nFunctionally identical to v0.7.2 — same code, same V012 migration,\nsame put_promotion_attestation trait method. Only the CI workflow\nchanged; the release re-publishes v0.7.2's features to PyPI.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-13T09:51:17-05:00",
+          "tree_id": "f0d89bc8d9f90205313da468de2e83ec9cd1addb",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/aab67a310dd86f8b7bab668fad6ca31f1f545718"
+        },
+        "date": 1778684385086,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 110987,
+            "range": "± 1079",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 251940,
+            "range": "± 2147",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 533111,
+            "range": "± 4699",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1859294,
+            "range": "± 11962",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 345,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1426,
+            "range": "± 41",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8247,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21193,
+            "range": "± 97",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24215,
+            "range": "± 463",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83598,
+            "range": "± 627",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 377,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3148,
+            "range": "± 20",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9504,
+            "range": "± 39",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41397,
+            "range": "± 729",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 628,
+            "range": "± 20",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2368761,
+            "range": "± 82705",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6823789,
+            "range": "± 271241",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23817182,
+            "range": "± 179810",
             "unit": "ns/iter"
           }
         ]
