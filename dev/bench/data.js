@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778634401258,
+  "lastUpdate": 1778634496634,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -10577,6 +10577,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25963266,
             "range": "± 179223",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "5f884a41f96dd1462360513c3508c999e2243bc4",
+          "message": "v0.7.0-α3: NodeCoreService trait — 8 typed-writes + 5 read clusters\n\nFederation-consensus surface contract per FSD Appendix A.2 + A.3.\nMethod signatures only — concrete impl is α4 (PostgresBackend).\n\nWRITES (8 methods)\n- put_contribution(ContributionEnvelope)\n- cast_vote(VoteEnvelope)\n- update_credits_ledger(CreditsUpdate)\n- update_expertise_ledger(ExpertiseUpdate)\n- put_moderation_event(ModerationEvent)\n- put_slashing_attestation(SlashingAttestation)\n- put_reconsideration_request(ReconsiderationRequest)\n- put_reconsideration_attestation(ReconsiderationAttestation)\n\nEach typed-write MUST verify the row's hybrid signature against the\nfederation directory before INSERT (matches federation_keys discipline\nfrom v0.4.x; reject with Error::Signature on mismatch). Inserts\ndefault to is_canonical=false (pending) per SCHEMA.md §13.2;\ncanonical-promotion is a CIRISNodeCore-side pass.\n\nREADS (5 clusters, 5 methods)\n- routable_contributors(domain, language) — routing eligibility\n  per MISSION.md §3.3 step 1-2\n- read_vote_weight(contributor, domain, language, subject) — SCHEMA.md\n  §5.2 weight computation\n- list_contributions(filter, cursor, limit) + list_votes — cursor-\n  paged newest-first per v0.5.5 §I shape. Both accept is_canonical\n  filter for SCHEMA.md §13.2 pending-vs-canonical split (folds cluster\n  3 into clusters 4 + the list_* methods).\n- get_credits_ledger(contributor, cell, subject) +\n  get_expertise_ledger(contributor, domain, language) — point lookups\n\nPattern: impl Future<...> + Send GAT. Mirrors ReadEngine /\nDerivedSchema / SecretsService convention. No async_trait dep.\n\nPer the audit-envelope invariant in the trait doc: PG impl threads\nverify_hybrid_via_directory (v0.4.1 surface) on every typed-write.\n\nNEXT: α4 — PostgresBackend NodeCoreService impl.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-12T20:00:00-05:00",
+          "tree_id": "52393cb791907555e18795d05e5354eeb50874ee",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/5f884a41f96dd1462360513c3508c999e2243bc4"
+        },
+        "date": 1778634496164,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 108704,
+            "range": "± 247",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 260753,
+            "range": "± 6138",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 561975,
+            "range": "± 2026",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1995813,
+            "range": "± 11721",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 344,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1409,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8195,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23171,
+            "range": "± 44",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26449,
+            "range": "± 643",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91043,
+            "range": "± 240",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 368,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3153,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9676,
+            "range": "± 26",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42195,
+            "range": "± 164",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 633,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2267233,
+            "range": "± 88556",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7077221,
+            "range": "± 422368",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25913603,
+            "range": "± 168219",
             "unit": "ns/iter"
           }
         ]
