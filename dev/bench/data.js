@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778709033661,
+  "lastUpdate": 1778709818767,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -11633,6 +11633,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23598323,
             "range": "± 110950",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "29abf17e5faee489187dd371ce7cf0c3549d4c4d",
+          "message": "0.8.1 — hash-chained audit log: AuditService absorption (closes #35)\n\nStep 1B continuation. Absorbs CIRISAgent's GraphAuditService write\npath. Per-tenant monotonic sequence_number + sha256 prev_hash chain\nenforces ordering AND tamper-evidence.\n\nWhat landed:\n\n- V014 migration: cirislens.audit_log with per-tenant monotonic\n  sequence (UNIQUE), 32-byte prev_hash + entry_hash BYTEA, audit\n  envelope columns. action_type / subject indexes for correlation.\n\n- Wire types: AuditEntry (hashes serialized as base64 on JSON wire,\n  BYTEA on disk), AuditFilter (tenant-required AV-51), AuditCursor\n  v1 on (recorded_at, entry_id), AuditListPage, ChainVerification\n  with ChainVerifyOutcome { Ok | Break { at_sequence, reason,\n  detail } } + ChainBreakReason enum (EntryHashMismatch |\n  PrevHashMismatch | SequenceGap | SignatureFailure |\n  GenesisPrevHashNotZero).\n\n- AuditService trait — 3 methods:\n  - record_entry: re-derive entry_hash, verify signature, FOR\n    UPDATE on tail row, assert prev_hash + seq monotonicity, INSERT.\n  - list_entries: tenant-scoped cursor-paged listing.\n  - verify_chain: end-to-end chain walk with typed break diagnostic.\n\n- audit::verify helpers:\n  - compute_entry_hash strips signature AND entry_hash (self-\n    referential field) before sha256.\n  - verify_entry_signature uses verify_hybrid against actor_id\n    (which IS the Ed25519 pubkey per v0.7.1 self-signed model).\n  - truncate_to_micros convenience — Postgres TIMESTAMPTZ is\n    microsecond-precision, callers MUST truncate recorded_at\n    before signing or pre/post-storage canonical bytes diverge.\n    Documented.\n\n- PostgresBackend impl: transactional INSERT-and-validate; reuses\n  persist's canonicalize_envelope_for_signing + verify_hybrid\n  primitives so audit inherits the v0.4.1+ verify stack.\n\n- PyO3 surface: 3 Engine.audit_* methods. JSON-in / JSON-out;\n  catch_panic discipline; audit::Error → PyErr with stable kind()\n  tokens.\n\nThreat-model additions (docs/THREAT_MODEL.md §4):\n\n- AV-49 — hash-chain integrity: entry_hash re-derive + prev_hash\n  match + sequence continuity + signature verify, all gated at\n  record_entry. Signature binds to canonical bytes that INCLUDE\n  entry_hash, so a downstream rewrite invalidates upstream\n  signature too.\n- AV-50 — chain fork detection: verify_chain walks end-to-end\n  and surfaces typed breaks. Five distinct break categories.\n- AV-51 — tenant isolation: empty tenant_id rejects pre-SQL;\n  every read pins tenant_id in WHERE. Federation-admin cross-\n  tenant deferred to v0.9.x auth_tokens.\n\nTests: 12/12 audit tests pass against live ciris-qa-postgres\ncovering full lifecycle (genesis → chain extend → replay reject →\ngap reject → wrong-prev reject → verify_chain Ok → tenant\nisolation → empty-tenant reject → tamper detection via\nEntryHashMismatch). 315/315 full lib pass; clippy -D warnings\nclean across cirisaudit cirisgraph postgres pyo3 cirisnode\nsecrets extract classify scrub.\n\nUnblocks CIRISAgent's GraphAuditService migration (Phase 1B\ncontinuation). v0.8.2 (telemetry + tsdb_consolidation) is the\nnext stop on the v0.8.x roadmap.\n\nCloses CIRISPersist#35.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-13T16:55:58-05:00",
+          "tree_id": "a5cb6c2098be3366f5b58ee6e913958a2909d506",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/29abf17e5faee489187dd371ce7cf0c3549d4c4d"
+        },
+        "date": 1778709818332,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 108662,
+            "range": "± 1326",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 260034,
+            "range": "± 1001",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 561449,
+            "range": "± 4182",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1994068,
+            "range": "± 9090",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 370,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1576,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8144,
+            "range": "± 192",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23139,
+            "range": "± 200",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26372,
+            "range": "± 608",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91029,
+            "range": "± 319",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 372,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3147,
+            "range": "± 20",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9763,
+            "range": "± 243",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42111,
+            "range": "± 150",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 632,
+            "range": "± 47",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2263521,
+            "range": "± 35178",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7031327,
+            "range": "± 56707",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25925662,
+            "range": "± 264534",
             "unit": "ns/iter"
           }
         ]
