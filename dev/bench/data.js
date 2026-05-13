@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778712644012,
+  "lastUpdate": 1778712917399,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -12293,6 +12293,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23711728,
             "range": "± 140910",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "a21076325027254230af669e5df7f1cc9407a916",
+          "message": "0.8.6 — telemetry SQLite parity (issue #38 α3)\n\nThird of the SQLite parity cuts. TSDB consolidation + raw metrics\nabsorbed onto SQLite with byte-for-byte AV-52/53/54 semantics.\n\n- src/telemetry/sqlite.rs: SqliteTelemetryBackend impl of\n  TelemetryService — 4 methods including the full consolidate_period\n  rollup (acquire lock → aggregate → UPSERT summary → TEMPORAL_NEXT\n  edge → delete raw → release).\n- Summary nodes UPSERT directly against cirisgraph_nodes (shared\n  schema with v0.8.4 cirisgraph sqlite).\n- Bulk insert: UNNEST'd PG INSERT … SELECT translates to a\n  prepared-statement loop inside BEGIN IMMEDIATE transaction\n  (atomic + serialized via SQLite's RESERVED lock).\n- Stale-lock break: INTERVAL '3600 seconds' → datetime('now',\n  '-3600 seconds') embedded literal (compile-time constant).\n- JSONB labels → TEXT JSON; PG @> predicate → per-key\n  json_extract equality checks for labels_contains.\n\nSubtle bug surfaced + fixed during integration test:\nchrono's default serde for DateTime<Utc> emits nanosecond\nprecision, but fmt_datetime uses microsecond. Stored summary\nattributes had nanos; prior-period probe bound had micros. Lex\ncompare on RFC 3339: '7' (nanos digit) < 'Z' (Z-suffix) at the\nprecision boundary, falsely matching every summary as its own\npredecessor → spurious TEMPORAL_NEXT edges. Fix: truncate\nperiod_start/period_end to microseconds before serializing summary\nattributes (helper duplicated locally to keep telemetry feature\ndecoupled from cirisaudit).\n\nTests: 2/2 telemetry SQLite tests pass (full-lifecycle + lock\ncontention). 348/348 lib pass across both backends; clippy clean.\n\nReferences CIRISPersist#38.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-13T17:47:36-05:00",
+          "tree_id": "28dc9ee0c85ab451f90478cfb109ce3dc6e062e7",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/a21076325027254230af669e5df7f1cc9407a916"
+        },
+        "date": 1778712916995,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 108566,
+            "range": "± 972",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 259688,
+            "range": "± 604",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 561645,
+            "range": "± 2026",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1997107,
+            "range": "± 14760",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 370,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1511,
+            "range": "± 28",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8206,
+            "range": "± 22",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23141,
+            "range": "± 90",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26357,
+            "range": "± 71",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 90996,
+            "range": "± 408",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 367,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3222,
+            "range": "± 18",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9941,
+            "range": "± 193",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42542,
+            "range": "± 733",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 648,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2236594,
+            "range": "± 155792",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7066707,
+            "range": "± 932219",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 26129475,
+            "range": "± 128833",
             "unit": "ns/iter"
           }
         ]
