@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778709818767,
+  "lastUpdate": 1778711181810,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -11765,6 +11765,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25925662,
             "range": "± 264534",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "41075049d85a0b1aa79b8cf3f7e5ae47fe503aa3",
+          "message": "0.8.2 — telemetry + TSDB consolidation substrate (closes #36)\n\nStep 1B continuation. Absorbs CIRISAgent's TelemetryService +\nTSDBConsolidationService write/read paths. Two-storage-shape design:\nraw observations land in cirisgraph.telemetry_metrics (24h-lived,\nno audit envelope); 6h consolidator rolls them up into tsdb_summary\nnodes in cirisgraph.nodes (V013) with TEMPORAL_NEXT edges between\nadjacent summaries.\n\nWhy split raw vs summary: high-frequency writes don't fit\nversioned/audited graph-node semantics. Flat-table fast path for\nraw; rolled-up summary carries the audit envelope on behalf of\nthe period it summarizes.\n\nV015 migration:\n- cirisgraph.telemetry_metrics — raw observations + 24h TTL;\n  indexed (tenant, name, observed_at) for window scans;\n  expires_at index for reaping path.\n- cirisgraph.consolidation_locks — multi-instance coordination;\n  PK (period_start, tenant_id); locked_at index for AV-53 stale-\n  lock detection.\n\nWire types: MetricObservation, MetricSummary, MetricFilter,\nMetricCursor, MetricListPage, ConsolidationRequest,\nConsolidationOutcome.\n\nTelemetryService trait — 4 methods:\n- record_metric / record_metrics_batch (UNNEST'd bulk insert)\n- list_metrics (tenant-scoped cursor-paged)\n- consolidate_period (lock-acquire → aggregate → upsert-summary →\n  TEMPORAL_NEXT-edge → delete-raw → release-lock flow)\n\nPostgresBackend impl:\n- Aggregation via GROUP BY metric_name with SUM/MIN/MAX/AVG +\n  COUNT(DISTINCT labels) for cardinality observability.\n- Summary node UPSERT mirrors cirisgraph::upsert_node SQL —\n  version-bumps on re-rollup (idempotent).\n- Prior-period lookup via attributes @> {metric_name, tenant_id}\n  + period_start < req.period_start; guarantees TEMPORAL_NEXT\n  source node exists (AV-54), avoids self-edges on re-rollup.\n- Stale-lock auto-break via interval-embedded UPDATE; compile-\n  time STALE_LOCK_SECONDS constant, no injection surface.\n- Failure-path lock release prevents orphans on transient errors.\n\nPyO3: 4 Engine.telemetry_* methods. JSON-in/out; catch_panic;\ntelemetry::Error → PyErr via telemetry_err_to_py.\n\nThreat-model additions (docs/THREAT_MODEL.md §4):\n- AV-52 — labels JSONB size cap (default 4 KiB, configurable);\n  bulk path validates pre-I/O. Cardinality cap observability-only\n  via unique_label_combinations field; runtime enforcement\n  deferred.\n- AV-53 — consolidation lock starvation: stale locks (>1h)\n  auto-break with broke_stale_lock telemetry signal.\n- AV-54 — TEMPORAL_NEXT chain integrity: pre-write lookup\n  confirms prior summary exists.\n\nTests: 7/7 telemetry tests pass against live ciris-qa-postgres\nincluding full-lifecycle (record × 7 → AV-52 reject → list with\nfilters → consolidate period A → idempotent re-run → period B\nwith TEMPORAL_NEXT to period A's summaries) + lock-contention\ntest (planted fresh lock blocks new acquirer with ran=false).\n322/322 full lib pass; clippy -D warnings clean across telemetry\ncirisaudit cirisgraph postgres pyo3 cirisnode secrets extract\nclassify scrub.\n\nCloses CIRISPersist#36.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-13T17:18:22-05:00",
+          "tree_id": "68f0f7b24af4e18ebed8d6f0ea4cfde0b11a41af",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/41075049d85a0b1aa79b8cf3f7e5ae47fe503aa3"
+        },
+        "date": 1778711181360,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 109005,
+            "range": "± 1933",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 259760,
+            "range": "± 1756",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 560213,
+            "range": "± 3921",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1990123,
+            "range": "± 4855",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 335,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1421,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8150,
+            "range": "± 44",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23260,
+            "range": "± 61",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26471,
+            "range": "± 88",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91089,
+            "range": "± 334",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 366,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3143,
+            "range": "± 17",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9798,
+            "range": "± 27",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42390,
+            "range": "± 154",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 632,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2265107,
+            "range": "± 170236",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7037220,
+            "range": "± 185056",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25824118,
+            "range": "± 131129",
             "unit": "ns/iter"
           }
         ]
