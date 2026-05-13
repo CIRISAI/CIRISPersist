@@ -40,6 +40,8 @@
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod service;
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
 pub mod types;
 pub mod verify;
 

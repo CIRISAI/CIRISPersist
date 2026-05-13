@@ -5,6 +5,41 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.8.5] — 2026-05-13
+
+**cirisaudit SQLite parity** (v0.9.0 cut α2 toward CIRISPersist#38).
+
+- `src/audit/sqlite.rs` — `SqliteAuditBackend` impl of `AuditService`.
+  Hash-chain semantics (AV-49 entry_hash re-derive, AV-50
+  verify_chain typed breaks, AV-51 tenant isolation) preserved
+  byte-for-byte.
+- Per-tenant tail-lock translation: Postgres `SELECT … FOR UPDATE`
+  → SQLite `BEGIN IMMEDIATE` (database-level RESERVED lock). Coarser
+  than per-row, but combined with v0.8.4's `PRAGMA busy_timeout =
+  30000` serializes writers safely without deadlock risk.
+- Dialect translations: BYTEA → BLOB (32-byte sha256 hashes raw),
+  TIMESTAMPTZ → RFC 3339 TEXT, JSONB payload → TEXT JSON, UUID →
+  TEXT. Same shape as v0.8.4 cirisgraph SQLite.
+- `migrations/sqlite/lens/V014__cirislens_audit_log.sql` — flat
+  schema (`cirislens_audit_log` table).
+- `cirisaudit = []` decoupled from `["postgres"]`.
+
+Tests: new `cirisaudit_sqlite_round_trip_full_lifecycle` against
+in-memory SQLite mirrors the v0.8.1 Postgres lifecycle (genesis →
+replay reject → gap reject → wrong-prev reject → 3-entry chain →
+verify_chain Ok → tenant isolation → empty-tenant reject → direct-
+UPDATE tamper surfaces EntryHashMismatch). 346/346 lib pass across
+both backends.
+
+| v0.9.0 roadmap | Postgres | SQLite |
+|---|---|---|
+| secrets | ✓ | pending |
+| cirisnode | ✓ | pending |
+| cirisgraph | ✓ | ✓ v0.8.4 |
+| **cirisaudit** | ✓ | **✓ v0.8.5** |
+| telemetry | ✓ | pending |
+| cirisincident | ✓ | pending |
+
 ## [0.8.4] — 2026-05-13
 
 **cirisgraph SQLite parity + iOS-conditional rusqlite (v0.9.0 cut α1

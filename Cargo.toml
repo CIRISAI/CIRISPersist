@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "0.8.4"
+version = "0.8.5"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -131,7 +131,7 @@ cirisgraph     = []
 # sequence_number + sha256 prev_hash chain; signature verify uses a
 # self-signed model (actor_id IS the Ed25519 pubkey, base64-encoded).
 # Threat model AV-49 / AV-50 / AV-51.
-cirisaudit     = ["postgres"]
+cirisaudit     = []
 
 # v0.8.2 (CIRISPersist#36) — telemetry + TSDB consolidation. Absorbs
 # the agent's TelemetryService + TSDBConsolidationService surfaces.
