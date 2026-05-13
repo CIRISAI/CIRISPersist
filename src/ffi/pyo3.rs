@@ -4473,6 +4473,116 @@ impl PyEngine {
             })
         })
     }
+
+    // ── v0.8.1: audit-log PyO3 surface (CIRISPersist#35) ─────────────
+    //
+    // 3 methods wrapping AuditService. JSON-in / JSON-out across the
+    // FFI boundary; catch_panic discipline; audit::Error → PyErr via
+    // audit_err_to_py with stable kind() tokens.
+
+    /// v0.8.1 — Verify-and-insert one audit entry. Persist enforces
+    /// hash-chain integrity (AV-49) + sequence monotonicity + signature.
+    #[cfg(feature = "cirisaudit")]
+    fn audit_record_entry(&self, py: Python<'_>, entry_json: &str) -> PyResult<()> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let entry: crate::audit::AuditEntry = serde_json::from_str(entry_json)
+                .map_err(|e| PyValueError::new_err(format!("AuditEntry decode: {e}")))?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::audit::AuditService;
+                    backend.record_entry(entry).await.map_err(audit_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v0.8.1 — List audit entries scoped to one tenant. Returns
+    /// JSON `AuditListPage`. AV-51: filter MUST name a tenant.
+    #[cfg(feature = "cirisaudit")]
+    fn audit_list_entries(
+        &self,
+        py: Python<'_>,
+        filter_json: &str,
+        cursor_json: Option<&str>,
+        limit: i64,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let filter: crate::audit::AuditFilter = serde_json::from_str(filter_json)
+                .map_err(|e| PyValueError::new_err(format!("AuditFilter decode: {e}")))?;
+            let cursor: Option<crate::audit::types::AuditCursor> = match cursor_json {
+                None => None,
+                Some(s) => Some(
+                    serde_json::from_str(s)
+                        .map_err(|e| PyValueError::new_err(format!("AuditCursor decode: {e}")))?,
+                ),
+            };
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::audit::AuditService;
+                    let page = backend
+                        .list_entries(filter, cursor, limit)
+                        .await
+                        .map_err(audit_err_to_py)?;
+                    serde_json::to_string(&page)
+                        .map_err(|e| PyRuntimeError::new_err(format!("AuditListPage encode: {e}")))
+                })
+            })
+        })
+    }
+
+    /// v0.8.1 — AV-50 chain-walk verify. Returns JSON
+    /// `ChainVerification` with typed break diagnostic on first
+    /// observed integrity violation.
+    #[cfg(feature = "cirisaudit")]
+    fn audit_verify_chain(
+        &self,
+        py: Python<'_>,
+        tenant_id: &str,
+        from_sequence: i64,
+        to_sequence: Option<i64>,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let tenant_id = tenant_id.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::audit::AuditService;
+                    let verif = backend
+                        .verify_chain(&tenant_id, from_sequence, to_sequence)
+                        .await
+                        .map_err(audit_err_to_py)?;
+                    serde_json::to_string(&verif).map_err(|e| {
+                        PyRuntimeError::new_err(format!("ChainVerification encode: {e}"))
+                    })
+                })
+            })
+        })
+    }
+}
+
+/// v0.8.1 — Bridge `audit::Error` → `PyErr` at the FFI boundary.
+/// InvalidArgument / ChainIntegrity / Signature / Conflict / NotFound
+/// → ValueError (caller-fault 4xx-shape). Backend / NotImplemented /
+/// Internal → RuntimeError (server-fault 5xx-shape).
+#[cfg(feature = "cirisaudit")]
+fn audit_err_to_py(e: crate::audit::Error) -> PyErr {
+    let kind = e.kind();
+    tracing::warn!(error = %e, kind = kind, "audit error");
+    match e {
+        crate::audit::Error::InvalidArgument(_)
+        | crate::audit::Error::ChainIntegrity(_)
+        | crate::audit::Error::Signature(_)
+        | crate::audit::Error::Conflict(_)
+        | crate::audit::Error::NotFound(_) => PyValueError::new_err(kind),
+        crate::audit::Error::Backend(_)
+        | crate::audit::Error::NotImplemented(_)
+        | crate::audit::Error::Internal(_) => PyRuntimeError::new_err(kind),
+    }
 }
 
 /// v0.8.0 — Bridge `graph::Error` → `PyErr` at the FFI boundary.

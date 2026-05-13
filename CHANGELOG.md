@@ -5,6 +5,103 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.8.1] — 2026-05-13
+
+**Hash-chained audit log substrate (closes CIRISPersist#35).**
+Absorbs CIRISAgent's GraphAuditService write path. Per-tenant
+monotonic `sequence_number` + sha256 `prev_hash` chain enforces
+entry ordering AND tamper-evidence. Step 1B continuation of the
+4-step substrate-substitution migration.
+
+### What landed
+
+- **V014 migration** — `cirislens.audit_log` table with per-tenant
+  monotonic `sequence_number` (UNIQUE constraint), 32-byte
+  `prev_hash` / `entry_hash` BYTEA columns (sha256 of canonical
+  bytes), action_type / subject_kind / subject_id correlation
+  index path, standard audit-envelope columns. GIN-on-attributes
+  not needed at audit-log layer (queries filter by tenant +
+  action + actor, not by payload).
+- **Wire types**:
+  - `AuditEntry` — full row shape with hashes serialized as
+    base64 strings on the JSON wire (BYTEA on disk).
+  - `AuditFilter` (tenant-required), `AuditCursor` (v1 cursor on
+    `(recorded_at, entry_id)`), `AuditListPage`.
+  - `ChainVerification` + `ChainVerifyOutcome::{Ok, Break {
+    at_sequence, reason, detail }}` with `ChainBreakReason` enum:
+    `EntryHashMismatch | PrevHashMismatch | SequenceGap |
+    SignatureFailure | GenesisPrevHashNotZero`.
+- **`AuditService` trait** — 3 methods:
+  - `record_entry` — re-derives `entry_hash`, verifies signature
+    (self-signed against `actor_id` per v0.7.1 model), serializes
+    writers within tenant via `SELECT … FOR UPDATE` on the tail,
+    asserts `prev_hash` chain + sequence monotonicity, INSERTs.
+  - `list_entries` — tenant-scoped cursor-paged listing (AV-51).
+  - `verify_chain` — end-to-end chain walk with typed break
+    diagnostic on first observed integrity violation.
+- **Hash-chain verify helpers** (`audit::verify`):
+  - `canonical_bytes_for_entry` — reuses the persist-wide
+    canonicalizer.
+  - `compute_entry_hash` — strips `signature` AND `entry_hash`
+    (self-referential field) before sha256-ing.
+  - `verify_entry_signature` — verify_hybrid against `actor_id`,
+    HybridPolicy::Ed25519Fallback (per-actor ML-DSA-65 keys land
+    with federation-wide PQC rollout).
+  - `truncate_to_micros(DateTime<Utc>) -> DateTime<Utc>` —
+    convenience for callers; Postgres TIMESTAMPTZ is
+    microsecond-precision, so callers MUST truncate `recorded_at`
+    before computing entry_hash + signing (else post-storage
+    round-trip hash differs from pre-storage one). Documented.
+- **PostgresBackend impl**: transactional INSERT-and-validate;
+  reuses persist's existing `canonicalize_envelope_for_signing`
+  + `verify_hybrid` primitives so the audit log inherits the
+  v0.4.1+ verify stack.
+- **PyO3 surface** — 3 `Engine.audit_*` methods. JSON-in /
+  JSON-out; `catch_panic` discipline; `audit::Error → PyErr` via
+  `audit_err_to_py` with stable kind() tokens.
+
+### Threat-model anchors (THREAT_MODEL.md §4)
+
+- **AV-49** — hash-chain integrity: re-derive + prev-hash match +
+  sequence continuity + signature verify, all gated at
+  `record_entry`. The `entry_hash` is bound by the signature (it's
+  in the canonical bytes that get signed) so a downstream rewrite
+  that tampers with one entry's `prev_hash` invalidates the
+  upstream signature too.
+- **AV-50** — chain fork detection: `verify_chain` walks
+  end-to-end and surfaces typed breaks. Five distinct break
+  categories let consumers route alerts appropriately.
+- **AV-51** — tenant isolation: empty `tenant_id` filter rejects
+  pre-SQL; every read pins `tenant_id` in WHERE. Federation-admin
+  cross-tenant reads deferred to v0.9.x auth_tokens.
+
+### Tests
+
+- 12/12 audit tests pass against live `ciris-qa-postgres`:
+  error-kind stability + genesis-sentinel lock + 4 type-level
+  serde tests + 5 verify-helper unit tests + 1 full-lifecycle
+  integration test covering: genesis insert → replay reject
+  (ChainIntegrity OR Conflict) → sequence-gap reject → wrong-prev
+  reject → 3-entry chain build → verify_chain Ok → list
+  tenant-scoped → AV-51 cross-tenant returns empty (no leak) →
+  AV-51 empty-tenant rejects → tamper detection via direct UPDATE
+  surfaces `EntryHashMismatch` break at the right sequence.
+- 315/315 full lib pass; clippy `-D warnings` clean across
+  `cirisaudit cirisgraph postgres pyo3 cirisnode secrets extract
+  classify scrub`.
+
+### Unblocks (CIRISAgent migration)
+
+- `AuditService` (GraphAuditService) — full write + verify parity
+  via the trait.
+- Distinct from cirisgraph: audit log is a separate hash-chained
+  store, not graph rows. CIRISAgent's existing audit chain (the
+  `audit_signing.py` path) maps directly onto this surface.
+
+### References
+
+CIRISPersist#35 (closes). Threat model: AV-49..AV-51.
+
 ## [0.8.0] — 2026-05-13
 
 **Graph substrate — cirisgraph module (closes CIRISPersist#34).**

@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -123,6 +123,13 @@ cirisnode      = ["postgres"]
 # CozoDB/kuzu/indradb dep weight (verified via deepwiki traversal-
 # pattern inspection of CIRISAgent's live code).
 cirisgraph     = ["postgres"]
+
+# v0.8.1 (CIRISPersist#35) — hash-chained audit log. Absorbs the
+# agent's GraphAuditService write path. Per-tenant monotonic
+# sequence_number + sha256 prev_hash chain; signature verify uses a
+# self-signed model (actor_id IS the Ed25519 pubkey, base64-encoded).
+# Threat model AV-49 / AV-50 / AV-51.
+cirisaudit     = ["postgres"]
 
 # v0.1.3 — optional TLS for the Postgres connection pool. Defaults
 # to no-TLS (deployments where the lens process and Postgres are
