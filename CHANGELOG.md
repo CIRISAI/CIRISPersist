@@ -5,6 +5,118 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.8.0] — 2026-05-13
+
+**Graph substrate — cirisgraph module (closes CIRISPersist#34).**
+Absorbs CIRISAgent's `LocalGraphMemoryService` + `GraphConfigService`
+off the agent's homegrown SQLite/Postgres + hand-rolled SQL. Step 1B
+of the 4-step substrate-substitution migration trajectory (persist
+→ edge → lens-core → node-core).
+
+### Why Postgres + recursive CTEs (and not an embedded graph DB)
+
+Verified via deepwiki against CIRISAgent's live code: the actual
+graph workload is **point lookup by `(node_id, scope)`, time-window
+scans on `updated_at`, predicate filters on JSONB attributes,
+direct-edge retrieval per node, and bounded procedural k-hop
+traversal** (`max_depth ∈ [1, 16]`). NO Cypher/Datalog requirement.
+Postgres + recursive CTE on (node, edge) tables with a GIN index on
+JSONB attributes handles every pattern at substrate-grade
+reliability. Pulling in CozoDB / kuzu / indradb adds an embedded
+engine + separate backup story + Rust dep weight for zero query
+expressiveness gain. Decision documented in
+`docs/THREAT_MODEL.md` AV-45..AV-48 + `migrations/postgres/lens/V013…sql`.
+
+### What landed
+
+- **V013 migration** — new `cirisgraph` schema:
+  - `cirisgraph.nodes` (node_id, scope, node_type, attributes JSONB,
+    version, updated_by, updated_at, created_at + audit envelope).
+    PK is `(node_id, scope)` — same id may live in multiple scopes.
+    Indexes: `(node_type, scope)`, `(updated_at)`, GIN on
+    `attributes` for predicate push-down.
+  - `cirisgraph.edges` (edge_id UUID PK, source/target node_id,
+    scope, relationship, weight, attributes). NO FK on source/target
+    so eventual-consistency writes work; k-hop CTE tolerates
+    dangling edges.
+- **Wire types** — `GraphNode`, `GraphEdge`, `GraphScope`
+  (Local/Identity/Environment/Community per CIRISAgent's enum),
+  `EdgeDirection`, `NodeFilter`, `NodeListPage`, `TraversalConfig`,
+  `KhopEntry`, `ListCursor` (local v1 cursor matching v0.5.5 §I
+  shape). Schema parity with CIRISAgent's `graph_nodes` /
+  `graph_edges` (verified column-by-column via deepwiki).
+- **`GraphService` trait** — 7 methods: `upsert_node` (AV-48
+  optimistic-concurrency gate via `expected_version`), `upsert_edge`,
+  `delete_node` (hard with edge cascade, or soft via `_deleted`
+  JSONB marker), `get_node`, `get_edges_for_node` (directional +
+  relationship-allow-list), `traverse_k_hop` (AV-46 bounded
+  recursive CTE with BFS shortest-path semantics), `query_nodes`
+  (cursor-paged newest-first, AV-47 scope-required).
+- **PostgresBackend impl** — UNNEST'd UPDATE pattern matching
+  v0.7.4's surface; recursive CTE for k-hop with per-level fan-out
+  bound; dynamic filter composition for `query_nodes`; typed
+  SqlState mapping (23505→Conflict, 23503→InvalidArgument FK,
+  23514→InvalidArgument CHECK).
+- **PyO3 surface** — 7 `Engine.cirisgraph_*` methods. JSON-in /
+  JSON-out across FFI; `catch_panic` discipline; `cirisgraph::Error
+  → PyErr` via `cirisgraph_err_to_py` with stable kind() tokens.
+
+### Threat-model anchors (THREAT_MODEL.md §4)
+
+- **AV-45** — attributes JSONB size cap (default 1 MiB; configurable
+  via `CIRIS_PERSIST_GRAPH_MAX_ATTRIBUTES_BYTES`); enforced at the
+  trait surface before binding to the SQL.
+- **AV-46** — k-hop depth bound at `MAX_KHOP_DEPTH = 16` absolute
+  cap; required non-empty `edge_relationships` allow-list (no
+  wildcard traversal); per-level fan-out limit (default 1024) inside
+  the CTE.
+- **AV-47** — scope leakage prevention: every read takes
+  `GraphScope` non-optionally at the type level; `query_nodes`
+  refuses `NodeFilter` with `scope = None`.
+- **AV-48** — UPSERT-by-version replay safety: `expected_version`
+  must match current row's `version`; mismatch returns
+  `Error::Conflict`; new rows pass `expected_version = 0`.
+
+### Tests
+
+- 9/9 cirisgraph tests pass against live `ciris-qa-postgres`:
+  error-kind stability + MAX_KHOP_DEPTH lock + 7 type-level serde
+  tests + 1 full-lifecycle integration test covering:
+  - upsert × 3 → get round-trip
+  - AV-48 version-conflict rejection (expected_version=0 for
+    existing row → `Error::Conflict`)
+  - successful update with correct expected_version
+  - AV-45 oversized-attributes rejection (2 MiB > 1 MiB cap →
+    `Error::InvalidArgument`)
+  - 3-edge cycle (a→b→c→a) with mixed relationships (OWNS,
+    SUMMARIZES)
+  - get_edges_for_node directional (Outgoing / Incoming / Both)
+  - relationship-allow-list filter
+  - AV-46 traverse_k_hop bounds (depth > 16 rejects; empty
+    relationships rejects)
+  - 2-hop traverse (a→b→c) returns 3 entries with BFS depth tags
+  - query_nodes with scope + type filter
+  - AV-47 scope-required rejection
+  - hard-delete cascade (node + edges)
+- 303/303 full lib pass; clippy `-D warnings` clean across
+  `cirisgraph postgres pyo3 cirisnode secrets extract classify scrub`.
+
+### Unblocks (CIRISAgent migration Phase 1B)
+
+- `MemoryService` (LocalGraphMemoryService) — full read/write parity
+  via `GraphService` trait
+- `ConfigService` (GraphConfigService) — config nodes use
+  `node_type = 'config'` on the same tables
+- Future v0.8.2: `TelemetryService` + `TSDBConsolidationService`
+  write `TSDB_DATA` / `TSDB_SUMMARY` nodes here, with `SUMMARIZES`
+  / `TEMPORAL_NEXT` edges in `cirisgraph.edges`
+
+### References
+
+CIRISPersist#34 (closes — substrate cut). Migration roadmap:
+`memory/project_migration_roadmap.md`. Threat model:
+`docs/THREAT_MODEL.md` AV-45..AV-48.
+
 ## [0.7.5] — 2026-05-13
 
 **Pipeline orchestrator + PipelineEnvelope wire types** —

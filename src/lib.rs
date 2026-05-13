@@ -42,6 +42,8 @@ pub mod cirisnode;
 pub mod derived;
 pub mod federation;
 pub mod ffi;
+#[cfg(feature = "cirisgraph")]
+pub mod graph;
 pub mod ingest;
 pub mod journal;
 pub mod manifest;

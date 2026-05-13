@@ -4249,6 +4249,250 @@ impl PyEngine {
             })
         })
     }
+
+    // ── v0.8.0-α5: cirisgraph PyO3 surface (CIRISPersist#34) ──────────
+    //
+    // 7 methods wrapping GraphService. JSON-in / JSON-out across the
+    // FFI boundary; catch_panic discipline; cirisgraph::Error → PyErr
+    // via cirisgraph_err_to_py with stable kind() tokens.
+
+    /// v0.8.0 — Upsert a graph node with AV-48 optimistic-concurrency
+    /// gate. Pass `expected_version = 0` for new rows; current
+    /// version for updates.
+    #[cfg(feature = "cirisgraph")]
+    fn cirisgraph_upsert_node(
+        &self,
+        py: Python<'_>,
+        node_json: &str,
+        expected_version: i32,
+    ) -> PyResult<()> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let node: crate::graph::GraphNode = serde_json::from_str(node_json)
+                .map_err(|e| PyValueError::new_err(format!("GraphNode decode: {e}")))?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::graph::GraphService;
+                    backend
+                        .upsert_node(node, expected_version)
+                        .await
+                        .map_err(cirisgraph_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v0.8.0 — Insert a directed edge. Idempotent on edge_id.
+    #[cfg(feature = "cirisgraph")]
+    fn cirisgraph_upsert_edge(&self, py: Python<'_>, edge_json: &str) -> PyResult<()> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let edge: crate::graph::GraphEdge = serde_json::from_str(edge_json)
+                .map_err(|e| PyValueError::new_err(format!("GraphEdge decode: {e}")))?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::graph::GraphService;
+                    backend
+                        .upsert_edge(edge)
+                        .await
+                        .map_err(cirisgraph_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v0.8.0 — Soft- or hard-delete a node. Hard delete cascades
+    /// edges. Returns `true` if a row was affected.
+    #[cfg(feature = "cirisgraph")]
+    fn cirisgraph_delete_node(
+        &self,
+        py: Python<'_>,
+        node_id: &str,
+        scope: &str,
+        hard: bool,
+    ) -> PyResult<bool> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let node_id = node_id.to_owned();
+            let scope = crate::graph::GraphScope::from_sql_str(scope)
+                .ok_or_else(|| PyValueError::new_err(format!("unknown GraphScope: {scope}")))?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::graph::GraphService;
+                    backend
+                        .delete_node(&node_id, scope, hard)
+                        .await
+                        .map_err(cirisgraph_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v0.8.0 — Point-lookup one node. Returns JSON `GraphNode` or
+    /// `None`.
+    #[cfg(feature = "cirisgraph")]
+    fn cirisgraph_get_node(
+        &self,
+        py: Python<'_>,
+        node_id: &str,
+        scope: &str,
+    ) -> PyResult<Option<String>> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let node_id = node_id.to_owned();
+            let scope = crate::graph::GraphScope::from_sql_str(scope)
+                .ok_or_else(|| PyValueError::new_err(format!("unknown GraphScope: {scope}")))?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::graph::GraphService;
+                    let opt = backend
+                        .get_node(&node_id, scope)
+                        .await
+                        .map_err(cirisgraph_err_to_py)?;
+                    match opt {
+                        None => Ok(None),
+                        Some(n) => Ok(Some(serde_json::to_string(&n).map_err(|e| {
+                            PyRuntimeError::new_err(format!("GraphNode encode: {e}"))
+                        })?)),
+                    }
+                })
+            })
+        })
+    }
+
+    /// v0.8.0 — Incident edges from a node. Returns JSON array of
+    /// `GraphEdge`. `direction` is `"outgoing"` | `"incoming"` |
+    /// `"both"`; `relationship_filter` is None for "all" or a
+    /// JSON-encoded `[String]` array.
+    #[cfg(feature = "cirisgraph")]
+    fn cirisgraph_get_edges_for_node(
+        &self,
+        py: Python<'_>,
+        node_id: &str,
+        scope: &str,
+        direction: &str,
+        relationship_filter_json: Option<&str>,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let node_id = node_id.to_owned();
+            let scope = crate::graph::GraphScope::from_sql_str(scope)
+                .ok_or_else(|| PyValueError::new_err(format!("unknown GraphScope: {scope}")))?;
+            let direction: crate::graph::EdgeDirection =
+                serde_json::from_str(&format!("\"{direction}\""))
+                    .map_err(|e| PyValueError::new_err(format!("EdgeDirection decode: {e}")))?;
+            let rel_filter: Option<Vec<String>> = match relationship_filter_json {
+                None => None,
+                Some(s) => Some(serde_json::from_str(s).map_err(|e| {
+                    PyValueError::new_err(format!("relationship_filter decode: {e}"))
+                })?),
+            };
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::graph::GraphService;
+                    let edges = backend
+                        .get_edges_for_node(&node_id, scope, direction, rel_filter.as_deref())
+                        .await
+                        .map_err(cirisgraph_err_to_py)?;
+                    serde_json::to_string(&edges)
+                        .map_err(|e| PyRuntimeError::new_err(format!("Vec<GraphEdge> encode: {e}")))
+                })
+            })
+        })
+    }
+
+    /// v0.8.0 — AV-46 bounded k-hop traversal. Returns JSON array of
+    /// `KhopEntry`.
+    #[cfg(feature = "cirisgraph")]
+    fn cirisgraph_traverse_k_hop(
+        &self,
+        py: Python<'_>,
+        start_node_id: &str,
+        scope: &str,
+        config_json: &str,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let start_node_id = start_node_id.to_owned();
+            let scope = crate::graph::GraphScope::from_sql_str(scope)
+                .ok_or_else(|| PyValueError::new_err(format!("unknown GraphScope: {scope}")))?;
+            let cfg: crate::graph::TraversalConfig = serde_json::from_str(config_json)
+                .map_err(|e| PyValueError::new_err(format!("TraversalConfig decode: {e}")))?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::graph::GraphService;
+                    let entries = backend
+                        .traverse_k_hop(&start_node_id, scope, cfg)
+                        .await
+                        .map_err(cirisgraph_err_to_py)?;
+                    serde_json::to_string(&entries)
+                        .map_err(|e| PyRuntimeError::new_err(format!("Vec<KhopEntry> encode: {e}")))
+                })
+            })
+        })
+    }
+
+    /// v0.8.0 — Cursor-paged node listing. Returns JSON
+    /// `NodeListPage`. AV-47: filter MUST name a scope.
+    #[cfg(feature = "cirisgraph")]
+    fn cirisgraph_query_nodes(
+        &self,
+        py: Python<'_>,
+        filter_json: &str,
+        cursor_json: Option<&str>,
+        limit: i64,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let filter: crate::graph::NodeFilter = serde_json::from_str(filter_json)
+                .map_err(|e| PyValueError::new_err(format!("NodeFilter decode: {e}")))?;
+            let cursor: Option<crate::graph::ListCursor> = match cursor_json {
+                None => None,
+                Some(s) => Some(
+                    serde_json::from_str(s)
+                        .map_err(|e| PyValueError::new_err(format!("ListCursor decode: {e}")))?,
+                ),
+            };
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::graph::GraphService;
+                    let page = backend
+                        .query_nodes(filter, cursor, limit)
+                        .await
+                        .map_err(cirisgraph_err_to_py)?;
+                    serde_json::to_string(&page)
+                        .map_err(|e| PyRuntimeError::new_err(format!("NodeListPage encode: {e}")))
+                })
+            })
+        })
+    }
+}
+
+/// v0.8.0 — Bridge `graph::Error` → `PyErr` at the FFI boundary.
+/// InvalidArgument / NotAuthorized / Conflict / NotFound → ValueError
+/// (caller-fault 4xx-shape). Backend / NotImplemented / Internal →
+/// RuntimeError (server-fault 5xx-shape). The stable kind() token
+/// crosses the boundary; verbose detail goes to tracing only.
+#[cfg(feature = "cirisgraph")]
+fn cirisgraph_err_to_py(e: crate::graph::Error) -> PyErr {
+    let kind = e.kind();
+    tracing::warn!(error = %e, kind = kind, "cirisgraph error");
+    match e {
+        crate::graph::Error::InvalidArgument(_)
+        | crate::graph::Error::NotAuthorized(_)
+        | crate::graph::Error::Conflict(_)
+        | crate::graph::Error::NotFound(_) => PyValueError::new_err(kind),
+        crate::graph::Error::Backend(_)
+        | crate::graph::Error::NotImplemented(_)
+        | crate::graph::Error::Internal(_) => PyRuntimeError::new_err(kind),
+    }
 }
 
 /// v0.7.0 — Bridge `cirisnode::Error` → `PyErr` at the FFI boundary.
