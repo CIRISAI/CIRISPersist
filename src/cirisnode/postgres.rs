@@ -16,8 +16,9 @@ use super::service::NodeCoreService;
 use super::types::{
     Cell, ContributionEnvelope, ContributionListPage, ContributionType, ContributionsFilter,
     CreditsLedgerEntry, CreditsUpdate, ExpertiseLedgerEntry, ExpertiseUpdate, HybridSignature,
-    ListCursor, ModerationEvent, ReconsiderationAttestation, ReconsiderationRequest,
-    RoutableContributor, SlashingAttestation, VoteEnvelope, VoteListPage, VoteWeight, VotesFilter,
+    ListCursor, ModerationEvent, PromotionAttestation, ReconsiderationAttestation,
+    ReconsiderationRequest, RoutableContributor, SlashingAttestation, TargetRowKind, VoteEnvelope,
+    VoteListPage, VoteWeight, VotesFilter,
 };
 use super::Error;
 use crate::store::postgres::PostgresBackend;
@@ -376,6 +377,100 @@ impl NodeCoreService for PostgresBackend {
             )
             .await
             .map_err(|e| map_pg_error(e, "put_reconsideration_attestation"))?;
+        Ok(())
+    }
+
+    async fn put_promotion_attestation(&self, att: PromotionAttestation) -> Result<(), Error> {
+        if att.target_ids.is_empty() {
+            return Err(Error::InvalidArgument(
+                "target_ids must not be empty".into(),
+            ));
+        }
+        super::verify::verify_envelope_signed(&att, &att.signature, &att.attested_by)?;
+        let attestation_id = parse_id(&att.attestation_id)?;
+        let target_uuids = att
+            .target_ids
+            .iter()
+            .map(|s| parse_id(s))
+            .collect::<Result<Vec<Uuid>, _>>()?;
+
+        // (table_name, id_column) for the UPDATE step. Pinned to
+        // table identifiers — no caller-controlled SQL injection
+        // surface, since target_kind is the typed enum.
+        let (table, id_col) = match att.target_kind {
+            TargetRowKind::Contribution => ("cirisnode.contributions", "contribution_id"),
+            TargetRowKind::Vote => ("cirisnode.votes", "vote_id"),
+            TargetRowKind::ModerationEvent => ("cirisnode.moderation_events", "moderation_id"),
+            TargetRowKind::SlashingAttestation => {
+                ("cirisnode.slashing_attestations", "slashing_id")
+            }
+            TargetRowKind::ReconsiderationAttestation => (
+                "cirisnode.reconsideration_attestations",
+                "reconsideration_id",
+            ),
+        };
+        let target_kind_str = match att.target_kind {
+            TargetRowKind::Contribution => "contribution",
+            TargetRowKind::Vote => "vote",
+            TargetRowKind::ModerationEvent => "moderation_event",
+            TargetRowKind::SlashingAttestation => "slashing_attestation",
+            TargetRowKind::ReconsiderationAttestation => "reconsideration_attestation",
+        };
+
+        let mut client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| Error::Backend(format!("begin: {e}")))?;
+
+        tx.execute(
+            "INSERT INTO cirisnode.promotion_attestations (\
+                attestation_id, target_kind, target_ids, attested_by, \
+                aggregate_evidence, attested_at, signature, signing_key_id, \
+                signature_verified, persist_row_hash\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE, $9)",
+            &[
+                &attestation_id,
+                &target_kind_str,
+                &target_uuids,
+                &att.attested_by,
+                &att.aggregate_evidence,
+                &att.attested_at,
+                &att.signature.ed25519,
+                &att.attested_by,
+                &att.signature.ed25519,
+            ],
+        )
+        .await
+        .map_err(|e| map_pg_error(e, "put_promotion_attestation"))?;
+
+        // Transactionally flip is_canonical + canonicalized_at. The
+        // affected-row count must match target_ids.len() — if any
+        // target doesn't exist, we rollback. The table/column names
+        // come from the typed enum above (no injection surface).
+        let update_sql = format!(
+            "UPDATE {table} SET is_canonical = TRUE, canonicalized_at = NOW() \
+             WHERE {id_col} = ANY($1::uuid[])"
+        );
+        let affected = tx
+            .execute(&update_sql, &[&target_uuids])
+            .await
+            .map_err(|e| map_pg_error(e, "put_promotion_attestation UPDATE"))?;
+        if affected as usize != target_uuids.len() {
+            return Err(Error::InvalidArgument(format!(
+                "target_ids contains rows not present in {table}: \
+                 named {} targets, UPDATE affected {affected}",
+                target_uuids.len()
+            )));
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| Error::Backend(format!("commit: {e}")))?;
         Ok(())
     }
 
@@ -989,5 +1084,201 @@ mod tests {
             .expect("expertise present");
         assert!((el.expertise - 0.5).abs() < 1e-9);
         assert!(el.is_active);
+    }
+
+    /// v0.7.2 (CIRISPersist#32) — round-trip the canonical-promotion
+    /// path: insert 2 pending contributions, promote both via one
+    /// PromotionAttestation, verify is_canonical flips + the
+    /// attestation row lands. Also covers: empty target_ids rejects;
+    /// unknown target rejects; duplicate attestation_id conflicts.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn promotion_attestation_round_trip() {
+        use crate::cirisnode::{PromotionAttestation, TargetRowKind};
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0x77; 32]);
+        let consensus_key = ed25519_dalek::SigningKey::from_bytes(&[0x88; 32]);
+        let author = pubkey_b64(&author_key);
+        let consensus = pubkey_b64(&consensus_key);
+        let domain = format!("promo-dom-{}", Uuid::new_v4());
+
+        // INSERT 2 pending contributions.
+        let mut contribution_ids = Vec::new();
+        for _ in 0..2 {
+            let cid = Uuid::new_v4();
+            let mut env = ContributionEnvelope {
+                contribution_id: cid.to_string(),
+                contribution_type: ContributionType::Proposal,
+                author_id: author.clone(),
+                subject: Cell {
+                    domain: domain.clone(),
+                    language: "en".into(),
+                    subject: Some("arc_question".into()),
+                },
+                payload: serde_json::json!({"q": "test"}),
+                witness_set: None,
+                signature: HybridSignature {
+                    ed25519: String::new(),
+                    ml_dsa_65: None,
+                    signed_at: Utc::now(),
+                },
+                submitted_at: Utc::now(),
+            };
+            env.signature = sign_envelope(&env, &author_key);
+            backend.put_contribution(env).await.unwrap();
+            contribution_ids.push(cid.to_string());
+        }
+
+        // Promote both with one attestation.
+        let attestation_id = Uuid::new_v4();
+        let mut att = PromotionAttestation {
+            attestation_id: attestation_id.to_string(),
+            target_kind: TargetRowKind::Contribution,
+            target_ids: contribution_ids.clone(),
+            attested_by: consensus.clone(),
+            aggregate_evidence: serde_json::json!({
+                "threshold": "policy-A",
+                "votes_for": 12,
+                "witness_count": 3,
+            }),
+            signature: HybridSignature {
+                ed25519: String::new(),
+                ml_dsa_65: None,
+                signed_at: Utc::now(),
+            },
+            attested_at: Utc::now(),
+        };
+        att.signature = sign_envelope(&att, &consensus_key);
+        backend
+            .put_promotion_attestation(att.clone())
+            .await
+            .unwrap();
+
+        // Verify both targets are now canonical.
+        let page = backend
+            .list_contributions(
+                ContributionsFilter {
+                    domain: Some(domain.clone()),
+                    is_canonical: Some(true),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.items.len(),
+            2,
+            "both contributions should be canonical"
+        );
+
+        // Duplicate attestation_id → Conflict.
+        let dup_err = backend.put_promotion_attestation(att).await.unwrap_err();
+        assert!(
+            matches!(dup_err, Error::Conflict(_)),
+            "expected Conflict on duplicate attestation, got: {dup_err:?}"
+        );
+
+        // Empty target_ids → InvalidArgument.
+        let mut empty_att = PromotionAttestation {
+            attestation_id: Uuid::new_v4().to_string(),
+            target_kind: TargetRowKind::Contribution,
+            target_ids: vec![],
+            attested_by: consensus.clone(),
+            aggregate_evidence: serde_json::json!({}),
+            signature: HybridSignature {
+                ed25519: String::new(),
+                ml_dsa_65: None,
+                signed_at: Utc::now(),
+            },
+            attested_at: Utc::now(),
+        };
+        empty_att.signature = sign_envelope(&empty_att, &consensus_key);
+        let empty_err = backend
+            .put_promotion_attestation(empty_att)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(empty_err, Error::InvalidArgument(_)),
+            "expected InvalidArgument on empty target_ids, got: {empty_err:?}"
+        );
+
+        // Unknown target_id → InvalidArgument; transaction rolls back
+        // so the attestation row must NOT be persisted.
+        let phantom_id = Uuid::new_v4();
+        let phantom_attestation_id = Uuid::new_v4();
+        let mut phantom_att = PromotionAttestation {
+            attestation_id: phantom_attestation_id.to_string(),
+            target_kind: TargetRowKind::Contribution,
+            target_ids: vec![phantom_id.to_string()],
+            attested_by: consensus.clone(),
+            aggregate_evidence: serde_json::json!({}),
+            signature: HybridSignature {
+                ed25519: String::new(),
+                ml_dsa_65: None,
+                signed_at: Utc::now(),
+            },
+            attested_at: Utc::now(),
+        };
+        phantom_att.signature = sign_envelope(&phantom_att, &consensus_key);
+        let phantom_err = backend
+            .put_promotion_attestation(phantom_att)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(phantom_err, Error::InvalidArgument(_)),
+            "expected InvalidArgument on phantom target, got: {phantom_err:?}"
+        );
+        // Confirm rollback: attempt re-using the same attestation_id
+        // with a valid target now succeeds (proving the prior INSERT
+        // was rolled back, not persisted).
+        let recovery_cid = Uuid::new_v4();
+        let mut recovery_env = ContributionEnvelope {
+            contribution_id: recovery_cid.to_string(),
+            contribution_type: ContributionType::Proposal,
+            author_id: author.clone(),
+            subject: Cell {
+                domain: domain.clone(),
+                language: "en".into(),
+                subject: Some("arc_question".into()),
+            },
+            payload: serde_json::json!({"q": "recovery"}),
+            witness_set: None,
+            signature: HybridSignature {
+                ed25519: String::new(),
+                ml_dsa_65: None,
+                signed_at: Utc::now(),
+            },
+            submitted_at: Utc::now(),
+        };
+        recovery_env.signature = sign_envelope(&recovery_env, &author_key);
+        backend.put_contribution(recovery_env).await.unwrap();
+
+        let mut recovery_att = PromotionAttestation {
+            attestation_id: phantom_attestation_id.to_string(),
+            target_kind: TargetRowKind::Contribution,
+            target_ids: vec![recovery_cid.to_string()],
+            attested_by: consensus,
+            aggregate_evidence: serde_json::json!({}),
+            signature: HybridSignature {
+                ed25519: String::new(),
+                ml_dsa_65: None,
+                signed_at: Utc::now(),
+            },
+            attested_at: Utc::now(),
+        };
+        recovery_att.signature = sign_envelope(&recovery_att, &consensus_key);
+        backend
+            .put_promotion_attestation(recovery_att)
+            .await
+            .expect("attestation row was rolled back, so re-use must succeed");
     }
 }

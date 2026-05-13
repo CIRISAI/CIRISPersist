@@ -4016,6 +4016,31 @@ impl PyEngine {
         })
     }
 
+    /// v0.7.2 (CIRISPersist#32) — Verify-and-insert a
+    /// `PromotionAttestation` AND transactionally flip the named
+    /// target rows' `is_canonical` to TRUE. Caller passes the
+    /// envelope as JSON; on success, the named targets are
+    /// canonical-tier and the attestation row is written to
+    /// `cirisnode.promotion_attestations`.
+    #[cfg(feature = "cirisnode")]
+    fn cirisnode_put_promotion_attestation(&self, py: Python<'_>, att_json: &str) -> PyResult<()> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let att: crate::cirisnode::PromotionAttestation = serde_json::from_str(att_json)
+                .map_err(|e| PyValueError::new_err(format!("PromotionAttestation decode: {e}")))?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::cirisnode::NodeCoreService;
+                    backend
+                        .put_promotion_attestation(att)
+                        .await
+                        .map_err(cirisnode_err_to_py)
+                })
+            })
+        })
+    }
+
     /// v0.7.0 — List active routable contributors for `(domain,
     /// language)`. Returns JSON array of `RoutableContributor`.
     #[cfg(feature = "cirisnode")]

@@ -11,8 +11,8 @@ use std::future::Future;
 use super::types::{
     ContributionEnvelope, ContributionListPage, ContributionsFilter, CreditsLedgerEntry,
     CreditsUpdate, ExpertiseLedgerEntry, ExpertiseUpdate, ListCursor, ModerationEvent,
-    ReconsiderationAttestation, ReconsiderationRequest, RoutableContributor, SlashingAttestation,
-    VoteEnvelope, VoteListPage, VoteWeight, VotesFilter,
+    PromotionAttestation, ReconsiderationAttestation, ReconsiderationRequest, RoutableContributor,
+    SlashingAttestation, VoteEnvelope, VoteListPage, VoteWeight, VotesFilter,
 };
 use super::Error;
 
@@ -94,6 +94,27 @@ pub trait NodeCoreService: Send + Sync {
     fn put_reconsideration_attestation(
         &self,
         att: ReconsiderationAttestation,
+    ) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// v0.7.2 (CIRISPersist#32) — verify-and-insert a
+    /// [`PromotionAttestation`], AND transactionally flip the named
+    /// target rows from `is_canonical=FALSE` to `is_canonical=TRUE`
+    /// (with `canonicalized_at = NOW()`).
+    ///
+    /// The transaction asserts that every named target_id exists in
+    /// the table corresponding to `att.target_kind` — if the
+    /// affected-row count does not equal `att.target_ids.len()`,
+    /// the entire transaction rolls back with
+    /// [`Error::InvalidArgument`] and no rows are mutated.
+    ///
+    /// Idempotency: targets already in canonical state (TRUE) still
+    /// match the affected-row count (the UPDATE no-ops on them);
+    /// callers retrying after a partial network failure get the
+    /// same Conflict on `attestation_id` if the attestation row
+    /// already INSERTed.
+    fn put_promotion_attestation(
+        &self,
+        att: PromotionAttestation,
     ) -> impl Future<Output = Result<(), Error>> + Send;
 
     // ── Read cluster 1: routing-eligibility (FSD A.3) ───────────────

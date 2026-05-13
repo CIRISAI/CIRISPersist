@@ -65,9 +65,9 @@ pub use service::NodeCoreService;
 pub use types::{
     Cell, ContributionEnvelope, ContributionListPage, ContributionType, ContributionsFilter,
     CreditsLedgerEntry, CreditsUpdate, DiversityProof, ExpertiseLedgerEntry, ExpertiseUpdate,
-    HybridSignature, ListCursor, ModerationEvent, ReconsiderationAttestation,
-    ReconsiderationRequest, RoutableContributor, SlashingAttestation, VoteEnvelope, VoteListPage,
-    VoteWeight, VotesFilter, Witness, WitnessSet,
+    HybridSignature, ListCursor, ModerationEvent, PromotionAttestation, ReconsiderationAttestation,
+    ReconsiderationRequest, RoutableContributor, SlashingAttestation, TargetRowKind, VoteEnvelope,
+    VoteListPage, VoteWeight, VotesFilter, Witness, WitnessSet,
 };
 
 /// Federation-consensus-layer errors.

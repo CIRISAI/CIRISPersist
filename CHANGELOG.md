@@ -5,6 +5,76 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.7.2] — 2026-05-13
+
+**Canonical-promotion attestation (closes CIRISPersist#32).**
+The v0.7.0 `is_canonical` column was readable via the
+`ContributionsFilter`/`VotesFilter` `is_canonical` field but had no
+typed-write to flip it. CIRISNodeCore's substrate-contract test
+confirmed all 14 v0.7.1 methods sufficient for routine operations
+EXCEPT canonical promotion (MISSION.md §3.4 truth-grounding loop).
+v0.7.2 closes the gap with a signed-attestation envelope per
+issue #32 Option B.
+
+### What landed
+
+- **V012 migration** — new `cirisnode.promotion_attestations`
+  table with the standard CIRISPersist audit envelope columns
+  (signature, signing_key_id, signature_verified, scrub_*, etc.),
+  plus `target_kind` (CHECK against 5 enum variants), `target_ids
+  UUID[]` (bulk-promote per attestation), `attested_by` (consensus
+  crate identity), and `aggregate_evidence JSONB` (policy-shaped
+  threshold-crossing details). GIN index on `target_ids` for
+  "which attestations promoted this row?" reverse lookups during
+  truth-grounding-loop audits.
+- **New wire types** in `src/cirisnode/types.rs`:
+  - `TargetRowKind` enum — 5 variants (`Contribution`, `Vote`,
+    `ModerationEvent`, `SlashingAttestation`,
+    `ReconsiderationAttestation`). `ReconsiderationRequest` is
+    absent — request lifecycle is carried by the paired
+    ReconsiderationAttestation, no separate promotion needed.
+  - `PromotionAttestation` struct — `attestation_id`,
+    `target_kind`, `target_ids`, `attested_by`,
+    `aggregate_evidence`, `signature`, `attested_at`.
+- **New trait method** — `NodeCoreService::put_promotion_attestation`,
+  9th typed-write on the trait. Documents the transactional
+  invariant: every named target_id must exist, or the whole
+  transaction rolls back (no partial promotion).
+- **PostgresBackend impl**:
+  - Verify gate via v0.7.1 `verify_envelope_signed` (signer is
+    `attested_by` — consensus crate identity, base64-encoded
+    Ed25519 pubkey per SCHEMA.md §2.2).
+  - Empty `target_ids` → `Error::InvalidArgument`.
+  - BEGIN → INSERT promotion_attestations → UPDATE target rows
+    (`is_canonical = TRUE`, `canonicalized_at = NOW()` via `WHERE
+    id = ANY($1::uuid[])`) → assert affected-row count matches
+    `target_ids.len()` (else rollback with InvalidArgument) → COMMIT.
+  - Idempotency: targets already canonical still match the
+    affected-row count (UPDATE no-ops on them).
+  - Table + column names come from the typed `TargetRowKind` enum
+    — no caller-controlled SQL injection surface.
+- **PyO3 wrap** — `Engine.cirisnode_put_promotion_attestation(att_json)`,
+  same `catch_panic` + JSON-in + `cirisnode_err_to_py` discipline
+  as the v0.7.0-α5 surface.
+
+### Tests
+
+- New `promotion_attestation_round_trip` integration test against
+  live `ciris-qa-postgres`: insert 2 pending contributions, bulk-
+  promote both with one attestation, verify both flip to canonical
+  via the existing `is_canonical=Some(true)` filter; assert
+  duplicate `attestation_id` → Conflict, empty `target_ids` →
+  InvalidArgument, phantom target → InvalidArgument **with proof
+  of rollback** (re-using the same attestation_id with a valid
+  target succeeds, confirming the prior INSERT did not persist).
+- 14/14 cirisnode tests pass; 229/229 full lib suite pass; clippy
+  `-D warnings` clean across `cirisnode postgres pyo3`.
+
+### Closes
+
+CIRISPersist#32 — NodeCoreService gap: no write method to promote
+rows from pending to canonical.
+
 ## [0.7.1] — 2026-05-12
 
 **Real envelope signature verification (closes the v0.7.0 caveat).**

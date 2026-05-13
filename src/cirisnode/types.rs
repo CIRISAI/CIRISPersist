@@ -262,6 +262,62 @@ pub struct ReconsiderationAttestation {
     pub signature: HybridSignature,
 }
 
+// ─── Canonical-promotion (v0.7.2, CIRISPersist#32) ─────────────────
+
+/// Which V011 row class a [`PromotionAttestation`] targets. The 5
+/// variants correspond to V011 tables that ship with an
+/// `is_canonical` column. Reconsideration **requests** are
+/// intentionally absent — their canonical lifecycle is carried by
+/// the paired ReconsiderationAttestation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetRowKind {
+    Contribution,
+    Vote,
+    ModerationEvent,
+    SlashingAttestation,
+    ReconsiderationAttestation,
+}
+
+/// Signed federation-consensus attestation that promotes target
+/// rows from `is_canonical=FALSE` to `is_canonical=TRUE`. v0.7.2
+/// (CIRISPersist#32) — closes the write-side gap exposed by
+/// CIRISNodeCore's substrate-contract test.
+///
+/// Persist enforces transactionally: the attestation row is
+/// INSERTed AND the target rows' `is_canonical` flag is flipped to
+/// TRUE with `canonicalized_at = NOW()` in the SAME transaction.
+/// Partial promotion is impossible — either every named target
+/// flips or none do.
+///
+/// Bulk shape per issue #32: one attestation can name N target_ids
+/// of the same target_kind. Cross-kind promotion requires N
+/// attestations.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PromotionAttestation {
+    /// ULID.
+    pub attestation_id: String,
+    /// Which V011 row class is being promoted.
+    pub target_kind: TargetRowKind,
+    /// IDs of the target rows. All must exist in the corresponding
+    /// V011 table; the transactional UPDATE asserts that the
+    /// affected-row count matches `target_ids.len()`.
+    pub target_ids: Vec<String>,
+    /// Identity (Ed25519 pubkey, base64) of the consensus crate
+    /// instance that signed this attestation. Per SCHEMA.md §2.2,
+    /// the identity IS the pubkey — verify is self-signed.
+    pub attested_by: String,
+    /// Threshold-crossing details the consensus crate used to
+    /// decide promotion (vote tallies, witness counts, time
+    /// windows, etc.). Free-form per-policy.
+    pub aggregate_evidence: serde_json::Value,
+    /// Hybrid Ed25519 + ML-DSA-65 signature over the canonical
+    /// envelope (signature field stripped).
+    pub signature: HybridSignature,
+    /// Caller-asserted wall-clock at signing time.
+    pub attested_at: DateTime<Utc>,
+}
+
 // ─── Ledger types (SCHEMA.md §10) ───────────────────────────────────
 
 /// One row from `cirisnode.credits_ledger`. Read-view shape.
