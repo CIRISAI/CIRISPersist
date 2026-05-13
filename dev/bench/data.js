@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778634166127,
+  "lastUpdate": 1778634401258,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -10445,6 +10445,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23660029,
             "range": "± 415287",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "2cf5f9089ef0983a5c5619e0fb12bc76d3b2540b",
+          "message": "v0.7.0-α2: cirisnode wire types — ContributionEnvelope + 12 supporting structs\n\nPer FSD Appendix A.2/A.3 + CIRISNodeCore/SCHEMA.md §3-§10. ~400 LOC\nof types covering every row class V011 introduces.\n\nENVELOPE-LEVEL\n- Cell — (domain, language, subject) tuple per SCHEMA.md §2.5\n- HybridSignature — Ed25519 + ML-DSA-65 + signed_at\n- Witness, DiversityProof, WitnessSet — SCHEMA.md §6\n- ContributionType — 7-variant snake_case enum (deferral_request /\n  deferral_response / proposal / wa_candidacy / expertise_attestation\n  / moderation_event / reconsideration_request)\n- ContributionEnvelope — the common shell per SCHEMA.md §3\n\nPER-ROW-CLASS WIRE TYPES\n- VoteEnvelope (SCHEMA.md §5)\n- ModerationEvent + SlashingAttestation (SCHEMA.md §8)\n- ReconsiderationRequest + ReconsiderationAttestation (SCHEMA.md §9)\n- CreditsLedgerEntry + ExpertiseLedgerEntry (SCHEMA.md §10 read view)\n- CreditsUpdate + ExpertiseUpdate (write inputs)\n\nREAD-SIDE\n- ContributionsFilter + VotesFilter — AND-style filter, every field\n  optional, is_canonical for §13.2 pending-vs-canonical split\n- ListCursor — (last_ts, last_id) tuple, v1 version tag\n- ContributionListPage + VoteListPage\n- RoutableContributor — routing-eligibility result row\n- VoteWeight — SCHEMA.md §5.2 computed-at-aggregation result\n\nPAYLOAD TYPING\nPer-subject-kind payloads (§4.1–§4.10 — arc_question / proposed_battery\n/ prompt_edit / accord_edit / failure_pattern / free_form etc.) stored\nas serde_json::Value. Persist is the substrate; the per-payload type\ntaxonomy lives in ciris-node-core's schema crate.\n\nEQ DERIVES\nStructs containing f64 fields (Witness, WitnessSet, ContributionEnvelope,\nVoteEnvelope, etc.) drop the Eq derive — PartialEq only.\n\nDOC-COMMENT TRADEOFF\n#![allow(missing_docs)] at file top. Per-field semantics live in\nCIRISNodeCore/SCHEMA.md (source of truth); copy-pasting would just\nrot. v0.7.0-α2 follow-up can add curated rustdoc cross-references\nonce the surface settles.\n\nVERIFICATION\n- 7 serde round-trip tests (contribution_type snake_case, cell,\n  ContributionEnvelope, ListCursor, RoutableContributor, ledger).\n- cargo clippy --tests clean across all feature combos.\n\nNEXT: α3 — NodeCoreService trait surface (8 typed-writes + 5 read\nclusters, impl Future + Send GAT).\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-12T19:58:29-05:00",
+          "tree_id": "a648fe4704f4d4604b0789a13770cc1ca067b529",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/2cf5f9089ef0983a5c5619e0fb12bc76d3b2540b"
+        },
+        "date": 1778634400828,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 114342,
+            "range": "± 1253",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 265958,
+            "range": "± 1199",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 567867,
+            "range": "± 1482",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1999219,
+            "range": "± 7730",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 339,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1497,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8240,
+            "range": "± 31",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23135,
+            "range": "± 90",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26386,
+            "range": "± 45",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91027,
+            "range": "± 833",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 363,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3159,
+            "range": "± 67",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9792,
+            "range": "± 27",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42389,
+            "range": "± 159",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 632,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2275543,
+            "range": "± 58515",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7049041,
+            "range": "± 56499",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25963266,
+            "range": "± 179223",
             "unit": "ns/iter"
           }
         ]
