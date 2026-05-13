@@ -5,6 +5,105 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.7.5] — 2026-05-13
+
+**Pipeline orchestrator + PipelineEnvelope wire types** —
+substrate foundation for CIRISEdge#3 / CIRISPersist#33 pieces 1+2.
+v0.6.0 lifted the per-stage matcher / walker code from CIRISLens
+under `classify` / `scrub` / `extract` features. v0.7.4 wired
+`extract_features` inline into `IngestPipeline::receive_and_persist`.
+v0.7.5 adds the orchestrator surface and the federation-internal
+wire shapes that edge needs to compose `PipelineEnvelope`s.
+
+### What landed
+
+- **`Pipeline` orchestrator** in `src/pipeline/mod.rs`:
+  composes registered `Stage` impls in declaration order; runs
+  them sequentially via `Pipeline::run(&mut env, &mut state)`.
+  `PipelineBuilder` validates declared `Stage::dependencies` at
+  build time — a stage that names a dependency not added earlier
+  fails with `Error::MissingDependency` (no runtime surprise).
+  Stage failures short-circuit the run (FSD §3.3 step 3 — no
+  partial-success path).
+- **`ErasedStage` shim** — object-safe projection of the GAT-style
+  `Stage` trait. Auto-impl'd for every `T: Stage`. Lets the
+  builder hold `Vec<Box<dyn ErasedStage>>` without forcing
+  `async_trait` onto the public trait.
+- **`PipelineState` extended** per FSD §5.1: now carries
+  `features: Option<Features>` (extract output),
+  `encrypted_secrets: Vec<EncryptedSecretRecord>` (reserved for
+  EncryptAndStoreStage), and a `pii_scrubbed` invariant flag.
+  `stages_executed` changed from `Vec<&'static str>` to
+  `Vec<String>` so wire-format `PipelineMetadata::stages_executed`
+  can carry the same values without conversion.
+- **`src/pipeline/types.rs`** — federation-internal wire shapes
+  per FSD §4.3:
+  - `PipelineEnvelope` — `pipeline_schema_version` (currently
+    `"1.0"`), inner `BatchEnvelope`, `PipelineSidecar`,
+    `edge_signature` (`HybridSignatureBlock`), `edge_key_id`,
+    optional `edge_pqc_key_id`.
+  - `PipelineSidecar` — `classifications`, `Option<Features>`,
+    `encrypted_secrets`, `pipeline_metadata`. All fields
+    feature-gated so sovereign-mode + scrub-only builds compose
+    without dragging the secrets/classify deps.
+  - `PipelineMetadata` — `stages_executed`, `fields_modified`,
+    `pii_scrubbed`, `secrets_encrypted`, `pipeline_duration_ms`,
+    `edge_build_id`.
+  - `HybridSignatureBlock` — Ed25519 + optional ML-DSA-65
+    base64 + `signed_at` timestamp; locally defined so the
+    pipeline track stays decoupled from the federation-consensus
+    `cirisnode::HybridSignature` track.
+- **`ExtractStage`** concrete `Stage` impl wrapping
+  v0.6.0 `extract_features`. Produces `state.features` from the
+  first `CompleteTrace` in the envelope (matches FSD §5.1
+  single-Option shape — multi-trace batches in the legacy
+  inline path retain per-trace extract from v0.7.4).
+- **`minimal_pipeline()`** factory — wires `ExtractStage` only.
+  The full FSD §5.2 `default_pipeline(secrets)` wiring Classify
+  → Scrub → EncryptAndStore → Extract is deferred (Classify
+  matchers + EncryptAndStoreStage live in subsequent #33
+  patches).
+
+### Tests
+
+- 7 pipeline orchestrator unit tests: error-kind stability,
+  `PipelineState::default()` empties, `PipelineBuilder` rejects
+  missing deps, `Pipeline::stage_names()` reports declaration
+  order, `minimal_pipeline()` runs `ExtractStage` on an empty
+  batch (records stage in `stages_executed`, no features
+  populated since no traces).
+- 4 wire-type serde tests in `pipeline::types`:
+  schema-version constant locked, `PipelineMetadata::new` zeroed,
+  `HybridSignatureBlock` round-trip + `None ml_dsa_65` correctly
+  omitted, `PipelineMetadata` round-trip preserves fields.
+- 294/294 full lib pass against live `ciris-qa-postgres`.
+  Clippy `-D warnings` clean across `postgres extract classify
+  pyo3 cirisnode secrets scrub`.
+
+### Still deferred from CIRISPersist#33
+
+- **Concrete `ClassifyStage`** — requires the matcher catalog
+  (regex / NER) that ships types-only in v0.7.5. Tracked.
+- **Concrete `ScrubStage`** — needs an adapter over the existing
+  `crate::scrub::Scrubber` trait that the inline path uses; the
+  pipeline wrapper is mechanical but bookkeeping-heavy.
+- **`EncryptAndStoreStage`** — needs orphan-secret invariant glue
+  + integration with `SecretsService` for the encrypt phase.
+- **`Engine::receive_pipeline_envelope`** — verify-and-store
+  HTTP handler accepting a `PipelineEnvelope`. Per FSD §4.3
+  invariants 1–7.
+- **`FederatedSecretsClient`** — HTTP client mirroring
+  `SecretsService` for the agent's `SecretsServiceProtocol`
+  cutover.
+- **Role tag enforcement** — `cirislens_secrets_writer` /
+  `_reader` / `_admin` on `federation_keys` + middleware.
+
+### References
+
+CIRISPersist#33 (this work — pieces 1+2 landed; 3+4+5 tracked
+for subsequent v0.7.x patches). CIRISEdge#3 — substrate
+prerequisite that drove the issue.
+
 ## [0.7.4] — 2026-05-13
 
 **Pipeline orchestration — extract wired into receive_and_persist
