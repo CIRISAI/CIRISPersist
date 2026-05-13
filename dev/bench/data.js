@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778688391057,
+  "lastUpdate": 1778709033661,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -11501,6 +11501,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 26384840,
             "range": "± 172689",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "0ce2449fc9692d151658df7e478b37ab0901d339",
+          "message": "0.8.0 — cirisgraph substrate: MemoryService + ConfigService absorption (closes #34)\n\nStep 1B of the CIRISAgent migration trajectory (persist → edge →\nlens-core → node-core). Absorbs CIRISAgent's LocalGraphMemoryService\n+ GraphConfigService off the agent's homegrown SQLite/Postgres +\nhand-rolled SQL.\n\nWhy Postgres + recursive CTEs (no embedded graph DB):\n\nVerified via deepwiki against CIRISAgent's live code: actual workload\nis point lookup by (node_id, scope), time-window scans on updated_at,\npredicate filters on JSONB attributes, direct-edge retrieval per\nnode, and bounded procedural k-hop traversal (max_depth ∈ [1, 16]).\nNO Cypher/Datalog requirement. Postgres + recursive CTE + GIN on\nJSONB handles every pattern at substrate-grade reliability. Pulling\nin CozoDB / kuzu / indradb buys zero query expressiveness for the\nworkload and costs deployment simplicity.\n\nWhat landed:\n\n- V013 migration: cirisgraph schema with nodes + edges tables.\n  Schema parity with CIRISAgent's graph_nodes / graph_edges\n  (verified column-by-column via deepwiki). Audit envelope columns\n  added on persist side. GIN index on attributes for predicate\n  push-down; (node_type, scope) + (updated_at) B-tree indexes.\n\n- Wire types: GraphNode, GraphEdge, GraphScope (Local/Identity/\n  Environment/Community), EdgeDirection, NodeFilter, NodeListPage,\n  TraversalConfig, KhopEntry, ListCursor (local v1 cursor, same\n  shape as cirisnode track — refactor to shared module deferred\n  to v0.9.x once a third consumer emerges).\n\n- GraphService trait — 7 methods (3 writes + 4 reads) with\n  impl Future<...> + Send GAT pattern matching NodeCoreService /\n  SecretsService discipline. upsert_node carries AV-48\n  expected_version gate; traverse_k_hop bounds AV-46 depth +\n  relationship allow-list; query_nodes refuses None scope per AV-47.\n\n- PostgresBackend impl: UNNEST'd UPDATE patterns matching v0.7.4\n  shape; recursive CTE for k-hop BFS with per-level fan-out bound;\n  dynamic filter composition for query_nodes; typed SqlState\n  mapping (23505→Conflict, 23503→InvalidArgument FK,\n  23514→InvalidArgument CHECK).\n\n- PyO3 surface: 7 Engine.cirisgraph_* methods. JSON-in / JSON-out\n  across FFI; catch_panic discipline; cirisgraph::Error → PyErr\n  via cirisgraph_err_to_py with stable kind() tokens.\n\nThreat-model additions (docs/THREAT_MODEL.md §4):\n\n- AV-45 — attributes JSONB size cap (default 1 MiB; configurable\n  via CIRIS_PERSIST_GRAPH_MAX_ATTRIBUTES_BYTES).\n- AV-46 — k-hop depth bound at MAX_KHOP_DEPTH=16 + required\n  non-empty edge_relationships allow-list + per-level fan-out limit.\n- AV-47 — scope leakage prevention: GraphScope required at type\n  level on every read.\n- AV-48 — UPSERT-by-version replay safety (expected_version\n  optimistic-concurrency gate).\n\nTests: 9/9 cirisgraph tests pass against live ciris-qa-postgres\nincluding 1 full-lifecycle integration test (upsert / version\nconflict / size-cap reject / 3-edge cycle / directional edges /\nrelationship filter / k-hop bounds / 2-hop traverse / scope-required\n/ hard cascade delete). 303/303 full lib pass; clippy -D warnings\nclean across cirisgraph postgres pyo3 cirisnode secrets extract\nclassify scrub.\n\nUnblocks CIRISAgent Phase 1B for MemoryService + ConfigService.\nFuture v0.8.2 (telemetry + tsdb_consolidation) writes TSDB_DATA /\nTSDB_SUMMARY nodes here with SUMMARIZES / TEMPORAL_NEXT edges.\n\nCloses CIRISPersist#34.\nReferences memory/project_migration_roadmap.md for the 4-step\nsubstrate-substitution sequence (Step 0 content stabilization done\nin CIRISAgent 2.8.10; Step 1A Phase 1A already shippable at v0.7.5;\nStep 1B starts here).\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-13T16:42:31-05:00",
+          "tree_id": "787869f65351d0b0df628d03830153d2ceae4706",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/0ce2449fc9692d151658df7e478b37ab0901d339"
+        },
+        "date": 1778709033254,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 107084,
+            "range": "± 430",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 248089,
+            "range": "± 1131",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 528903,
+            "range": "± 1614",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1855739,
+            "range": "± 15330",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 343,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1424,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8225,
+            "range": "± 34",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21156,
+            "range": "± 33",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24220,
+            "range": "± 249",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83514,
+            "range": "± 232",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 378,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3107,
+            "range": "± 30",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9843,
+            "range": "± 23",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42551,
+            "range": "± 160",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2219445,
+            "range": "± 47321",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6562824,
+            "range": "± 270331",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23598323,
+            "range": "± 110950",
             "unit": "ns/iter"
           }
         ]
