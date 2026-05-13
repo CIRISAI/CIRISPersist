@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778712380534,
+  "lastUpdate": 1778712644012,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -12161,6 +12161,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25895522,
             "range": "± 239534",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "89e3903bf213ae0989ce863b977b10f22f30ce53",
+          "message": "0.8.5 — cirisaudit SQLite parity (issue #38 α2)\n\nSecond of the SQLite parity cuts. Hash-chain audit log absorbed onto\nSQLite with byte-for-byte AV-49/AV-50/AV-51 semantics.\n\n- src/audit/sqlite.rs: SqliteAuditBackend impl of AuditService.\n- Per-tenant tail-lock translation: PG FOR UPDATE → SQLite BEGIN\n  IMMEDIATE (database-level RESERVED lock + busy_timeout=30000\n  from v0.8.4 = safe writer serialization without deadlock).\n- BYTEA → BLOB (32-byte sha256 raw); TIMESTAMPTZ → RFC 3339 TEXT;\n  JSONB payload → TEXT JSON.\n- migrations/sqlite/lens/V014__cirislens_audit_log.sql (flat\n  schema; cirislens_audit_log table).\n- cirisaudit = [] feature gate; pairs with either backend.\n\nTests: new cirisaudit_sqlite_round_trip_full_lifecycle mirrors the\nv0.8.1 Postgres lifecycle exactly (genesis → replay reject →\nsequence-gap reject → wrong-prev reject → 3-entry chain →\nverify_chain Ok → tenant isolation → empty-tenant reject → direct-\nUPDATE tamper surfaces EntryHashMismatch via verify_chain).\n\n346/346 lib pass against both backends; clippy -D warnings clean\nacross cirisaudit cirisgraph postgres sqlite pyo3 cirisnode\nsecrets telemetry cirisincident extract classify scrub.\n\nReferences CIRISPersist#38.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-13T17:42:54-05:00",
+          "tree_id": "930010f179c867eecc58bf96e567cf3842e6bfef",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/89e3903bf213ae0989ce863b977b10f22f30ce53"
+        },
+        "date": 1778712643605,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 109002,
+            "range": "± 825",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 249964,
+            "range": "± 1309",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 532680,
+            "range": "± 1502",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1866434,
+            "range": "± 7761",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 346,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1413,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8279,
+            "range": "± 159",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21138,
+            "range": "± 241",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24178,
+            "range": "± 92",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83535,
+            "range": "± 401",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 376,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3205,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9731,
+            "range": "± 22",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42321,
+            "range": "± 181",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2247383,
+            "range": "± 54851",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6606049,
+            "range": "± 80792",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23711728,
+            "range": "± 140910",
             "unit": "ns/iter"
           }
         ]
