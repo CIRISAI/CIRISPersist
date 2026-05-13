@@ -5,6 +5,35 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.7.3] — 2026-05-13
+
+**CI hygiene — re-publish v0.7.2 features to PyPI.** v0.7.2 tag CI
+failed on the `darwin-aarch64 (no postgres)` job: the macos-14
+runner image ships a `rustup-init` stub at
+`/Users/runner/.cargo/bin/cargo` that falls through to lazy
+toolchain install. `Swatinem/rust-cache@v2` restored a cached
+`~/.cargo/bin/` (created from an earlier run when the stub was the
+only cargo), overwriting the dtolnay-installed real cargo. Result:
+`cargo test` invoked the stub and exited 1 before the test even
+loaded. The failing test gate blocked the `Publish wheel to PyPI`
+step on the v0.7.2 tag CI; wheels built successfully (3 matrix
+arches), but didn't upload.
+
+v0.7.3 ships:
+
+- `.github/workflows/ci.yml`: `cache-bin: false` on the
+  `darwin-aarch64-test` and `ios-build` jobs. Disables the
+  `~/.cargo/bin/` portion of the rust-cache so the dtolnay-installed
+  cargo stays intact across cache restore. Build cache (registry +
+  target) is unaffected — only the small fast-to-rebuild bin layer
+  is excluded. Adds a `which cargo` diagnostic step before each
+  build/test to surface this class of regression at the right place
+  if it ever recurs.
+
+Functionally identical to v0.7.2 — same code, same V012 migration,
+same `put_promotion_attestation` trait method. Only the CI workflow
+changed.
+
 ## [0.7.2] — 2026-05-13
 
 **Canonical-promotion attestation (closes CIRISPersist#32).**

@@ -84,7 +84,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # v0.7.2 — `cache-bin: false` on macos-14: the runner image
+      # ships a rustup stub at `/Users/runner/.cargo/bin/cargo` that
+      # falls through to `rustup-init` when the toolchain isn't
+      # installed locally. dtolnay's action installs the real cargo
+      # over it, but the rust-cache restore was overwriting the
+      # freshly-installed cargo with the stub from cached
+      # `~/.cargo/bin/`. Disabling bin caching keeps the dtolnay-
+      # installed cargo intact. Build cache (registry + target) is
+      # unaffected. (v0.7.0/v0.7.1 main CI + v0.7.2 tag CI flakes.)
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+      - name: which cargo (diagnostic)
+        run: |
+          which cargo
+          cargo --version
       - name: cargo test (no postgres feature)
         run: cargo test --features server
 
@@ -99,6 +114,12 @@ jobs:
         with:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+      - name: which cargo (diagnostic)
+        run: |
+          which cargo
+          cargo --version
       - name: cargo build (ios device)
         run: cargo build --target aarch64-apple-ios --no-default-features
       - name: cargo build (ios simulator)
