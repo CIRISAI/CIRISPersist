@@ -5,6 +5,86 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.9.0] — 2026-05-13
+
+**CIRISAgent 2.9.0 adoption cut — 6 of 22 services absorbed with
+SQLite + Postgres parity across the full deployment matrix.**
+
+This release closes the substrate-readiness gap that blocks
+CIRISAgent's Phase 1B migration on sovereign-mode / Pi-class / iOS
+device deployments (CIRIS_DB_URL = SQLite). Every v0.8.x trait
+surface now runs against both backends; the agent team can `pip
+install ciris-persist==0.9.0` and begin the substrate cutover
+without fragmenting their deployment shapes.
+
+### Substrate-bound services absorbed (Postgres + SQLite both)
+
+| Persist module | CIRISAgent service absorbed | Substrate releases |
+|---|---|---|
+| **cirisgraph** | MemoryService (LocalGraphMemoryService) + ConfigService (GraphConfigService) | v0.8.0 PG, v0.8.4 SQLite |
+| **cirisaudit** | AuditService (hash-chained, Ed25519-signed) | v0.8.1 PG, v0.8.5 SQLite |
+| **telemetry** | TelemetryService + TSDBConsolidationService (6h rollup) | v0.8.2 PG, v0.8.6 SQLite |
+| **cirisincident** | IncidentManagementService (correlation + state machine) | v0.8.3 PG, v0.8.7 SQLite |
+
+That's **6 of the 22 CIRISAgent services** covered by 4 persist
+modules. The remaining 16 are either reasoning-bound (stay in
+Python: WiseAuthority, Visibility, Consent, SelfObservation, LLM,
+RuntimeControl, AdaptiveFilter-LLM-tuning-half) or process-local
+infrastructure (TimeService, ShutdownService, InitializationService,
+ResourceMonitor, TaskScheduler, DatabaseMaintenance).
+
+### iOS hardening (CIRISVerify v1.6.4 lesson applied)
+
+- `rusqlite` is target-conditional in Cargo.toml: `bundled` feature
+  on non-iOS targets (clean manylinux wheels); no `bundled` on iOS
+  (links against system libsqlite3 — bundled would duplicate
+  sqlite3 symbols with iOS's system one, tripping `libRPAC.dylib`
+  (SQLiteDatabaseTracking) assertions).
+- `SqliteBackend` connection-init pragmas include
+  `busy_timeout = 30000` (matches CIRISAgent iOS 30s timeout —
+  universal-hygiene applied per the user's "if the pattern helps
+  with other platforms, apply universally" guidance).
+
+### What's DEFERRED to v0.9.1+
+
+- **secrets SQLite** (v0.6.1 module) — Postgres ships; SQLite parity
+  is ~1100 LOC of careful crypto-path port. Tracked as v0.9.1 cut.
+  Agent team can adopt v0.9.0 for the 4 modules above and keep
+  their existing in-process `ciris_engine/logic/secrets/` while
+  v0.9.1 lands.
+- **cirisnode SQLite** (v0.7.x module) — Postgres ships; SQLite
+  parity tracked as v0.9.2 cut. **CIRISAgent v2.9.0 does NOT consume
+  cirisnode** (cirisnode is the CIRISNodeCore consumer track for
+  federation-consensus rows; the agent only uses
+  `ciris_adapters/cirisnode/` as an HTTP shipper which gets replaced
+  by CIRISNodeCore in Step 4 of the 4-step migration trajectory).
+- **Pipeline orchestrator HTTP route** (CIRISPersist#33 pieces 3-5
+  — HTTP ingest handler, FederatedSecretsClient, role-tag
+  enforcement) — substantial server-side work, deferred.
+
+### Tests
+
+- **349/349 lib pass against live PG** (`ciris-qa-postgres`).
+- **All SQLite tests pass against in-memory SQLite** (per-module
+  full-lifecycle integration tests).
+- Clippy `-D warnings` clean across the full feature matrix:
+  `cirisaudit cirisgraph postgres sqlite pyo3 cirisnode secrets
+  telemetry cirisincident extract classify scrub`.
+- Pre-push hook runs both backends; CI matrix expanded to include
+  `darwin-aarch64 (no postgres)` SQLite-only build.
+
+### References
+
+- CIRISPersist#34 / #35 / #36 / #37 — Postgres substrate cuts
+  (closed in v0.8.0–v0.8.3).
+- CIRISPersist#38 — SQLite parity tracking. v0.9.0 closes the
+  4-of-6 module pieces; v0.9.1 secrets SQLite + v0.9.2 cirisnode
+  SQLite tracked separately.
+- CIRISVerify v1.6.4 — iOS rusqlite-bundled symbol-duplication
+  fix establishing the pattern v0.9.0 inherits.
+- `memory/project_migration_roadmap.md` — the 4-step substrate-
+  substitution sequence (persist → edge → lens-core → node-core).
+
 ## [0.8.7] — 2026-05-13
 
 **cirisincident SQLite parity** (v0.9.0 cut α4 toward CIRISPersist#38).
