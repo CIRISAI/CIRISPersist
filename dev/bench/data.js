@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778713130238,
+  "lastUpdate": 1778713387539,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -12557,6 +12557,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25867360,
             "range": "± 855219",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "ba29508c9764322dc81b4b80cf09a1f35ab8db7a",
+          "message": "0.9.0 — CIRISAgent 2.9.0 adoption cut: 6 of 22 services absorbed with full SQLite + Postgres parity\n\nThis release closes the substrate-readiness gap that blocks\nCIRISAgent's Phase 1B migration on sovereign-mode / Pi-class / iOS\ndevice deployments. Every v0.8.x trait surface runs against both\nbackends; agent team can `pip install ciris-persist==0.9.0` and\nbegin the substrate cutover without fragmenting deployment shapes.\n\nSubstrate-bound services absorbed (Postgres + SQLite both):\n\n| Persist module  | CIRISAgent service absorbed                              |\n| cirisgraph      | MemoryService + ConfigService                            |\n| cirisaudit      | AuditService (hash-chained, Ed25519-signed)              |\n| telemetry       | TelemetryService + TSDBConsolidationService (6h rollup)  |\n| cirisincident   | IncidentManagementService                                |\n\n6 of 22 services covered by 4 modules. Remaining 16: reasoning-\nbound (stay in Python) or process-local infrastructure.\n\niOS hardening (CIRISVerify v1.6.4 lesson applied at v0.8.4):\n- rusqlite target-conditional; bundled on non-iOS, system-linked\n  on iOS (avoids libRPAC.dylib symbol-duplication assertions).\n- SqliteBackend PRAGMA busy_timeout = 30000 (matches agent iOS\n  30s timeout, applied universally as good hygiene).\n\nWhat's DEFERRED to v0.9.1+ (tracked as new issues):\n- secrets SQLite (CIRISPersist#39): ~1100 LOC crypto-path port;\n  not agent-blocking — agent keeps existing in-process\n  ciris_engine/logic/secrets/ while v0.9.1 lands.\n- cirisnode SQLite (CIRISPersist#40): not agent-blocking — agent\n  v2.9.0 doesn't consume cirisnode (NodeCoreCore consumer track).\n\nTests: 349/349 lib pass against live ciris-qa-postgres; all SQLite\ntests pass against in-memory SQLite (per-module full-lifecycle).\nClippy -D warnings clean across the full feature matrix.\n\nCloses the SQLite parity arc started in CIRISPersist#38 for the\n4 agent-blocking modules; #39 + #40 track the remaining 2.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-13T17:55:10-05:00",
+          "tree_id": "be615e38fa4d921a1c1830e3eecbe5099cb685bb",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/ba29508c9764322dc81b4b80cf09a1f35ab8db7a"
+        },
+        "date": 1778713386446,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101747,
+            "range": "± 742",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 242384,
+            "range": "± 600",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 523827,
+            "range": "± 1223",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1850308,
+            "range": "± 20408",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 346,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1548,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8201,
+            "range": "± 29",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21220,
+            "range": "± 538",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24284,
+            "range": "± 86",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83571,
+            "range": "± 301",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 360,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3111,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9561,
+            "range": "± 22",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42036,
+            "range": "± 105",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 621,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2250345,
+            "range": "± 117708",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6631645,
+            "range": "± 147569",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23768855,
+            "range": "± 966248",
             "unit": "ns/iter"
           }
         ]
