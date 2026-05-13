@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778711759528,
+  "lastUpdate": 1778712380534,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -12029,6 +12029,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 26375109,
             "range": "± 398822",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "3636d3553a7b1b69bac9529e2fa4cbfc4bac9771",
+          "message": "0.8.4 — cirisgraph SQLite parity + iOS-conditional rusqlite (issue #38 α1)\n\nFirst piece of the v0.9.0 SQLite parity cut. Closes the gap between\nv0.6.1+ Postgres-only substrate and CIRISAgent's full deployment\nmatrix (Postgres federated; SQLite sovereign-mode / Pi / iOS).\n\niOS-hardening (CIRISVerify v1.6.4 lesson):\n- Cargo.toml: rusqlite is target-conditional. On iOS, drop `bundled`\n  feature (links system libsqlite3); on non-iOS, keep `bundled` for\n  clean manylinux wheels. Bundled rusqlite duplicates sqlite3 symbols\n  with iOS's system libsqlite3 → Apple's libRPAC.dylib (Database-\n  Tracking) sees two dylibs and asserts. Same fix CIRISVerify made.\n- SqliteBackend: PRAGMA busy_timeout = 30000 (matches CIRISAgent's\n  iOS 30s timeout; universal hygiene).\n- SqliteBackend::conn_handle() public accessor for sibling modules\n  to share the connection.\n\ncirisgraph SQLite impl:\n- Feature gate cirisgraph = [] (was = [\"postgres\"]); now pairs with\n  either backend.\n- src/graph/sqlite.rs: SqliteGraphBackend implements GraphService\n  with all 7 methods + same AV-45..AV-48 semantics.\n- Dialect translations: JSONB → TEXT (canonical JSON), GIN →\n  expression-indexed json_extract, text[] params → json_each(?)\n  joins, UUID → TEXT, TIMESTAMPTZ → RFC 3339, NOW() →\n  datetime('now', 'subsec').\n- Recursive CTE restructured for SQLite (no nested-LIMIT in\n  recursive arm; per-level fan-out moves to outer LIMIT —\n  max_depth × per_level_limit upper bound preserves AV-46\n  intent).\n- New migrations/sqlite/lens/V013__cirisgraph_nodes_edges.sql.\n\nTests: new cirisgraph_sqlite_round_trip_full_lifecycle mirrors the\nv0.8.0 Postgres test exactly (13 assertions covering upsert, AV-48\nversion conflict, AV-45 size cap, edges, AV-46 bounds, k-hop via\nrecursive CTE, AV-47 scope required, hard cascade). 345/345 full\nlib pass against both backends; clippy -D warnings clean across the\nfull feature matrix including sqlite.\n\nv0.9.0 roadmap (issue #38) progress:\n  secrets (v0.6.1) Postgres ✓  SQLite pending\n  cirisnode (v0.7.x) Postgres ✓  SQLite pending\n  cirisgraph (v0.8.0) Postgres ✓  SQLite ✓ (v0.8.4)\n  cirisaudit (v0.8.1) Postgres ✓  SQLite pending\n  telemetry (v0.8.2) Postgres ✓  SQLite pending\n  cirisincident (v0.8.3) Postgres ✓  SQLite pending\n\nReferences CIRISPersist#38.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-13T17:38:23-05:00",
+          "tree_id": "e3d12b795c91baf7cea4c494a5debd686aa5d6d8",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/3636d3553a7b1b69bac9529e2fa4cbfc4bac9771"
+        },
+        "date": 1778712380122,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 122401,
+            "range": "± 944",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 274110,
+            "range": "± 597",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 575212,
+            "range": "± 10584",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 2019252,
+            "range": "± 4395",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 337,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1402,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8196,
+            "range": "± 70",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23238,
+            "range": "± 56",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26464,
+            "range": "± 56",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91045,
+            "range": "± 479",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 364,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3140,
+            "range": "± 17",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 10060,
+            "range": "± 24",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42536,
+            "range": "± 218",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 635,
+            "range": "± 18",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2252449,
+            "range": "± 73600",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7046888,
+            "range": "± 145492",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25895522,
+            "range": "± 239534",
             "unit": "ns/iter"
           }
         ]
