@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778638986907,
+  "lastUpdate": 1778639457853,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -10841,6 +10841,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 32150415,
             "range": "± 28306123",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "18494fd4d250eb92555b0452fceb4fa407678a0d",
+          "message": "0.7.1 — real envelope signature verification\n\nCloses the v0.7.0 caveat. The v0.7.0-α4 verify_envelope_signature was\na structural stub: it checked that signature fields were base64-decodable\nand signed_at was non-zero, but did not actually verify the signature\nagainst any pubkey. v0.7.1 makes verification real and gates\nsignature_verified = TRUE on a passing verify.\n\nModel:\n\nPer CIRISNodeCore/SCHEMA.md §2.2, every ContributorId (author_id,\nvoter_id, accuser_id, adjudicator_id, requester_id) IS the Ed25519\npublic key — base64-encoded. Federation-consensus envelopes are\nself-signed against the identity-as-pubkey embedded in the envelope\nitself; persist does not need a federation_keys directory lookup\nfor cirisnode-track verification.\n\nThis corrects the v0.7.0 CHANGELOG note about \"threading\nverify_hybrid_via_directory\" — the schema's identity model is\nself-signed, so the directory variant is not the right primitive\nfor this track. Persist still owns one canonicalization rule (via\nverify::canonical::canonicalize_envelope_for_signing); only the\nkey-lookup path differs from the v0.4.1 outbound track.\n\nWhat landed:\n\n- New src/cirisnode/verify.rs with canonical_bytes_for_envelope +\n  verify_envelope_signed. Reuses the persist-owned Python-compatible\n  canonicalizer; calls verify_hybrid with HybridPolicy::Ed25519Fallback.\n- All 6 typed-writes that carry signatures (put_contribution,\n  cast_vote, put_moderation_event, put_slashing_attestation,\n  put_reconsideration_request, put_reconsideration_attestation)\n  call verify_envelope_signed before INSERT. signature_verified =\n  TRUE is gated on the verify pass; persist refuses to insert on\n  failure.\n- Integration test uses real ed25519_dalek signing keys; test\n  contributor + voter identities ARE base64-encoded Ed25519\n  pubkeys (matches the schema). New tamper-rejection assertion:\n  mutating payload after sign rejects with Error::Signature.\n\nTests:\n- 13/13 cirisnode tests pass — 5 new verify-module tests\n  (round-trip, tampered payload, wrong pubkey, empty signature,\n  malformed base64) + 7 types tests + 1 error-kind + 1 full\n  lifecycle integration test against live ciris-qa-postgres.\n- Full lib test suite: 228/228 pass (+5 from v0.7.0). Clippy\n  -D warnings clean across cirisnode postgres pyo3 feature matrix.\n\nStill deferred:\n- ML-DSA-65 hybrid verification for contributor envelopes requires\n  per-contributor PQC key registration; classical Ed25519 verify\n  is sufficient for v0.7.1.\n- Tightening to HybridPolicy::Strict is deferred until the PQC\n  pubkey rollout completes federation-side.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-12T21:22:48-05:00",
+          "tree_id": "ebfcaec490302402dc014e979eae7ac23f625a60",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/18494fd4d250eb92555b0452fceb4fa407678a0d"
+        },
+        "date": 1778639456766,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101651,
+            "range": "± 611",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 243118,
+            "range": "± 1687",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 525150,
+            "range": "± 1566",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1856088,
+            "range": "± 22563",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 343,
+            "range": "± 18",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1498,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8211,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21178,
+            "range": "± 262",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24224,
+            "range": "± 702",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83547,
+            "range": "± 159",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 395,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3166,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9760,
+            "range": "± 40",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42323,
+            "range": "± 132",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 625,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2490495,
+            "range": "± 301953",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6771162,
+            "range": "± 200565",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23790957,
+            "range": "± 476092",
             "unit": "ns/iter"
           }
         ]
