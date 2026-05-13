@@ -69,6 +69,13 @@ pub struct SqliteBackend {
 }
 
 impl SqliteBackend {
+    /// Shared connection handle. Used by sibling modules
+    /// (cirisgraph SQLite impl in v0.8.4+) that ride on the same
+    /// underlying SQLite file/in-memory connection.
+    pub fn conn_handle(&self) -> std::sync::Arc<tokio::sync::Mutex<Connection>> {
+        self.conn.clone()
+    }
+
     /// Open (or create) a file-backed SQLite database.
     ///
     /// Path is passed verbatim to `rusqlite::Connection::open`. Use
@@ -99,10 +106,21 @@ impl SqliteBackend {
             // Foreign keys are off by default in SQLite for backwards
             // compat — turn them on so any future FK constraints we
             // declare actually fire. None today, but good hygiene.
+            //
+            // v0.8.4: `busy_timeout = 30000` (ms) matches the
+            // CIRISAgent iOS connection-open default. Per the
+            // hard-won-victory lesson in
+            // `ciris_engine/logic/persistence/db/core.py` —
+            // contended SQLite operations should wait up to 30s
+            // for the lock rather than fail-fast with SQLITE_BUSY.
+            // Applies universally (not iOS-specific) — good
+            // hygiene on Pi-class deployments + dev laptops with
+            // background indexers touching the WAL.
             conn.execute_batch(
                 "PRAGMA foreign_keys = ON;\n\
                  PRAGMA journal_mode = WAL;\n\
-                 PRAGMA synchronous = NORMAL;",
+                 PRAGMA synchronous = NORMAL;\n\
+                 PRAGMA busy_timeout = 30000;",
             )?;
             Ok(conn)
         })

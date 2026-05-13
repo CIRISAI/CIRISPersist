@@ -1,0 +1,898 @@
+//! SQLite impl of [`GraphService`] (v0.8.4, CIRISPersist#38).
+//!
+//! Mirrors the v0.8.0 Postgres impl with SQLite-dialect translations:
+//! JSONB → TEXT (canonical JSON via serde_json), GIN-on-attributes →
+//! expression-indexed `json_extract`, UUID → TEXT, TIMESTAMPTZ →
+//! RFC 3339 TEXT. Recursive CTE shape is identical (SQLite 3.8.3+
+//! supports `WITH RECURSIVE`); the only structural difference is
+//! that SQLite doesn't bind `text[]` params natively — the
+//! relationship allow-list goes via a `json_each(?)` join against
+//! a JSON-array param.
+//!
+//! # AV anchors (same set as Postgres impl)
+//!
+//! - **AV-45** — attributes size cap at the trait surface (default
+//!   1 MiB; configurable via `CIRIS_PERSIST_GRAPH_MAX_ATTRIBUTES_BYTES`).
+//! - **AV-46** — k-hop depth bound `MAX_KHOP_DEPTH=16` + required
+//!   non-empty edge_relationships allow-list.
+//! - **AV-47** — scope required in every read.
+//! - **AV-48** — optimistic-concurrency `expected_version` gate via
+//!   `UPDATE … WHERE version = ?`.
+
+use std::sync::Arc;
+
+use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
+use tokio::sync::Mutex;
+
+use super::service::GraphService;
+use super::types::{
+    EdgeDirection, GraphEdge, GraphNode, GraphScope, KhopEntry, ListCursor, NodeFilter,
+    NodeListPage, TraversalConfig,
+};
+use super::{Error, DEFAULT_MAX_ATTRIBUTES_BYTES, MAX_KHOP_DEPTH};
+
+/// SQLite-backed [`GraphService`] impl. Wraps an `Arc<Mutex<Connection>>`
+/// matching the Phase 1 [`crate::store::sqlite::SqliteBackend`] pattern —
+/// rusqlite is synchronous, so every method runs the SQL inside
+/// `tokio::task::spawn_blocking`.
+pub struct SqliteGraphBackend {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl SqliteGraphBackend {
+    /// Construct from an existing connection handle. Typical usage
+    /// shares the same connection with
+    /// [`crate::store::sqlite::SqliteBackend`].
+    pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
+        Self { conn }
+    }
+}
+
+fn map_sqlite_error(e: rusqlite::Error, op: &str) -> Error {
+    use rusqlite::ErrorCode;
+    if let rusqlite::Error::SqliteFailure(err, _) = &e {
+        match err.code {
+            ErrorCode::ConstraintViolation => {
+                return Error::Conflict(format!("{op}: {e}"));
+            }
+            ErrorCode::TypeMismatch => {
+                return Error::InvalidArgument(format!("{op}: {e}"));
+            }
+            _ => {}
+        }
+    }
+    Error::Backend(format!("{op}: {e}"))
+}
+
+fn max_attributes_bytes() -> usize {
+    std::env::var("CIRIS_PERSIST_GRAPH_MAX_ATTRIBUTES_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_MAX_ATTRIBUTES_BYTES)
+}
+
+/// AV-45: cap attributes size + return canonical JSON text for the
+/// SQLite TEXT column.
+fn encode_attributes(attrs: &serde_json::Value) -> Result<String, Error> {
+    let s = serde_json::to_string(attrs)
+        .map_err(|e| Error::Internal(format!("attributes serialize: {e}")))?;
+    let cap = max_attributes_bytes();
+    if s.len() > cap {
+        return Err(Error::InvalidArgument(format!(
+            "attributes too large: {} bytes exceeds cap of {}",
+            s.len(),
+            cap
+        )));
+    }
+    Ok(s)
+}
+
+fn decode_attributes(s: &str) -> Result<serde_json::Value, Error> {
+    serde_json::from_str(s).map_err(|e| Error::Backend(format!("attributes JSON decode: {e}")))
+}
+
+fn parse_datetime(s: &str) -> Result<chrono::DateTime<chrono::Utc>, Error> {
+    // SQLite stores RFC 3339 / SQLite-default `YYYY-MM-DD HH:MM:SS.sssssssss`
+    // depending on how the row was written. chrono's `parse_from_rfc3339`
+    // handles the rusqlite-emit shape; for the column-default
+    // `datetime('now', 'subsec')` form (which uses SQLite's space
+    // separator), normalize to RFC 3339 first.
+    let normalized = if s.contains('T') {
+        s.to_owned()
+    } else {
+        format!("{}+00:00", s.replacen(' ', "T", 1))
+    };
+    chrono::DateTime::parse_from_rfc3339(&normalized)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .map_err(|e| Error::Backend(format!("datetime parse: {e} (raw={s})")))
+}
+
+fn fmt_datetime(dt: chrono::DateTime<chrono::Utc>) -> String {
+    dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+}
+
+fn decode_node_row(row: &rusqlite::Row<'_>) -> Result<GraphNode, Error> {
+    let scope_str: String = row
+        .get("scope")
+        .map_err(|e| Error::Backend(format!("decode scope: {e}")))?;
+    let scope = GraphScope::from_sql_str(&scope_str)
+        .ok_or_else(|| Error::Backend(format!("unknown scope: {scope_str}")))?;
+    let attrs_str: String = row
+        .get("attributes")
+        .map_err(|e| Error::Backend(format!("decode attributes: {e}")))?;
+    let updated_at_str: String = row
+        .get("updated_at")
+        .map_err(|e| Error::Backend(format!("decode updated_at: {e}")))?;
+    let created_at_str: String = row
+        .get("created_at")
+        .map_err(|e| Error::Backend(format!("decode created_at: {e}")))?;
+    Ok(GraphNode {
+        node_id: row
+            .get("node_id")
+            .map_err(|e| Error::Backend(format!("decode node_id: {e}")))?,
+        scope,
+        node_type: row
+            .get("node_type")
+            .map_err(|e| Error::Backend(format!("decode node_type: {e}")))?,
+        attributes: decode_attributes(&attrs_str)?,
+        version: row
+            .get("version")
+            .map_err(|e| Error::Backend(format!("decode version: {e}")))?,
+        updated_by: row
+            .get("updated_by")
+            .map_err(|e| Error::Backend(format!("decode updated_by: {e}")))?,
+        updated_at: parse_datetime(&updated_at_str)?,
+        created_at: parse_datetime(&created_at_str)?,
+        signature: row
+            .get::<_, Option<String>>("signature")
+            .map_err(|e| Error::Backend(format!("decode signature: {e}")))?,
+        signing_key_id: row
+            .get::<_, Option<String>>("signing_key_id")
+            .map_err(|e| Error::Backend(format!("decode signing_key_id: {e}")))?,
+        signature_verified: {
+            let v: i64 = row
+                .get("signature_verified")
+                .map_err(|e| Error::Backend(format!("decode signature_verified: {e}")))?;
+            v != 0
+        },
+    })
+}
+
+fn decode_edge_row(row: &rusqlite::Row<'_>) -> Result<GraphEdge, Error> {
+    let scope_str: String = row
+        .get("scope")
+        .map_err(|e| Error::Backend(format!("decode edge scope: {e}")))?;
+    let scope = GraphScope::from_sql_str(&scope_str)
+        .ok_or_else(|| Error::Backend(format!("unknown edge scope: {scope_str}")))?;
+    let attrs_str: String = row
+        .get("attributes")
+        .map_err(|e| Error::Backend(format!("decode edge attributes: {e}")))?;
+    let created_at_str: String = row
+        .get("created_at")
+        .map_err(|e| Error::Backend(format!("decode edge created_at: {e}")))?;
+    Ok(GraphEdge {
+        edge_id: row
+            .get("edge_id")
+            .map_err(|e| Error::Backend(format!("decode edge_id: {e}")))?,
+        source_node_id: row
+            .get("source_node_id")
+            .map_err(|e| Error::Backend(format!("decode source: {e}")))?,
+        target_node_id: row
+            .get("target_node_id")
+            .map_err(|e| Error::Backend(format!("decode target: {e}")))?,
+        scope,
+        relationship: row
+            .get("relationship")
+            .map_err(|e| Error::Backend(format!("decode relationship: {e}")))?,
+        weight: row
+            .get("weight")
+            .map_err(|e| Error::Backend(format!("decode weight: {e}")))?,
+        attributes: decode_attributes(&attrs_str)?,
+        created_at: parse_datetime(&created_at_str)?,
+    })
+}
+
+impl GraphService for SqliteGraphBackend {
+    async fn upsert_node(&self, node: GraphNode, expected_version: i32) -> Result<(), Error> {
+        if expected_version < 0 {
+            return Err(Error::InvalidArgument(
+                "expected_version must be >= 0".into(),
+            ));
+        }
+        if node.version < 1 {
+            return Err(Error::InvalidArgument("node.version must be >= 1".into()));
+        }
+        let attrs = encode_attributes(&node.attributes)?;
+        let scope_str = node.scope.as_sql_str().to_owned();
+        let sig_verified_int: i64 = if node.signature_verified { 1 } else { 0 };
+        let updated_at = fmt_datetime(chrono::Utc::now());
+        let conn = self.conn.clone();
+        let node_id = node.node_id;
+        let node_type = node.node_type;
+        let updated_by = node.updated_by;
+        let signature = node.signature;
+        let signing_key_id = node.signing_key_id;
+        let persist_row_hash = signature.clone();
+        let version = node.version;
+        tokio::task::spawn_blocking(move || -> Result<(), Error> {
+            let guard = conn.blocking_lock();
+            let affected = guard
+                .execute(
+                    "INSERT INTO cirisgraph_nodes (\
+                        node_id, scope, node_type, attributes, version, \
+                        updated_by, updated_at, signature, signing_key_id, \
+                        signature_verified, persist_row_hash\
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                     ON CONFLICT (node_id, scope) DO UPDATE SET \
+                        node_type = excluded.node_type, \
+                        attributes = excluded.attributes, \
+                        version = cirisgraph_nodes.version + 1, \
+                        updated_by = excluded.updated_by, \
+                        updated_at = excluded.updated_at, \
+                        signature = excluded.signature, \
+                        signing_key_id = excluded.signing_key_id, \
+                        signature_verified = excluded.signature_verified, \
+                        persist_row_hash = excluded.persist_row_hash \
+                     WHERE cirisgraph_nodes.version = ?12",
+                    params![
+                        node_id,
+                        scope_str,
+                        node_type,
+                        attrs,
+                        version,
+                        updated_by,
+                        updated_at,
+                        signature,
+                        signing_key_id,
+                        sig_verified_int,
+                        persist_row_hash,
+                        expected_version,
+                    ],
+                )
+                .map_err(|e| map_sqlite_error(e, "upsert_node"))?;
+            // AV-48: SQLite returns affected=1 for both INSERT and
+            // matched UPDATE; affected=0 means the ON CONFLICT
+            // WHERE clause didn't match → version mismatch.
+            // Distinguish fresh-insert (expected_version=0, no
+            // existing row) from version-mismatched-update by
+            // re-checking: if affected=0 AND a row exists, it's a
+            // version conflict.
+            if affected == 0 {
+                let exists: bool = guard
+                    .query_row(
+                        "SELECT 1 FROM cirisgraph_nodes WHERE node_id = ?1 AND scope = ?2",
+                        params![&node_id, &scope_str],
+                        |_| Ok(true),
+                    )
+                    .optional()
+                    .map_err(|e| map_sqlite_error(e, "upsert_node post-check"))?
+                    .unwrap_or(false);
+                if exists {
+                    return Err(Error::Conflict(format!(
+                        "version mismatch: expected_version={expected_version} did not match \
+                         current row for ({node_id}, {scope_str})"
+                    )));
+                }
+            }
+            let _ = guard;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+    }
+
+    async fn upsert_edge(&self, edge: GraphEdge) -> Result<(), Error> {
+        let attrs = encode_attributes(&edge.attributes)?;
+        let scope_str = edge.scope.as_sql_str().to_owned();
+        let conn = self.conn.clone();
+        let edge_id = edge.edge_id;
+        let source = edge.source_node_id;
+        let target = edge.target_node_id;
+        let relationship = edge.relationship;
+        let weight = edge.weight;
+        tokio::task::spawn_blocking(move || -> Result<(), Error> {
+            let guard = conn.blocking_lock();
+            guard
+                .execute(
+                    "INSERT INTO cirisgraph_edges (\
+                        edge_id, source_node_id, target_node_id, scope, \
+                        relationship, weight, attributes\
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                     ON CONFLICT (edge_id) DO NOTHING",
+                    params![
+                        edge_id,
+                        source,
+                        target,
+                        scope_str,
+                        relationship,
+                        weight,
+                        attrs
+                    ],
+                )
+                .map_err(|e| map_sqlite_error(e, "upsert_edge"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+    }
+
+    async fn delete_node(
+        &self,
+        node_id: &str,
+        scope: GraphScope,
+        hard: bool,
+    ) -> Result<bool, Error> {
+        let conn = self.conn.clone();
+        let node_id = node_id.to_owned();
+        let scope_str = scope.as_sql_str().to_owned();
+        tokio::task::spawn_blocking(move || -> Result<bool, Error> {
+            let guard = conn.blocking_lock();
+            if hard {
+                guard
+                    .execute(
+                        "DELETE FROM cirisgraph_edges \
+                         WHERE (source_node_id = ?1 OR target_node_id = ?1) AND scope = ?2",
+                        params![&node_id, &scope_str],
+                    )
+                    .map_err(|e| map_sqlite_error(e, "delete_node (edges)"))?;
+                let n = guard
+                    .execute(
+                        "DELETE FROM cirisgraph_nodes WHERE node_id = ?1 AND scope = ?2",
+                        params![&node_id, &scope_str],
+                    )
+                    .map_err(|e| map_sqlite_error(e, "delete_node"))?;
+                Ok(n > 0)
+            } else {
+                let now = fmt_datetime(chrono::Utc::now());
+                let n = guard
+                    .execute(
+                        "UPDATE cirisgraph_nodes SET \
+                            attributes = json_set(attributes, '$._deleted', json('true')), \
+                            version = version + 1, \
+                            updated_at = ?1 \
+                         WHERE node_id = ?2 AND scope = ?3",
+                        params![now, &node_id, &scope_str],
+                    )
+                    .map_err(|e| map_sqlite_error(e, "soft delete_node"))?;
+                Ok(n > 0)
+            }
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+    }
+
+    async fn get_node(&self, node_id: &str, scope: GraphScope) -> Result<Option<GraphNode>, Error> {
+        let conn = self.conn.clone();
+        let node_id = node_id.to_owned();
+        let scope_str = scope.as_sql_str().to_owned();
+        tokio::task::spawn_blocking(move || -> Result<Option<GraphNode>, Error> {
+            let guard = conn.blocking_lock();
+            let mut stmt = guard
+                .prepare(
+                    "SELECT node_id, scope, node_type, attributes, version, \
+                            updated_by, updated_at, created_at, \
+                            signature, signing_key_id, signature_verified \
+                     FROM cirisgraph_nodes \
+                     WHERE node_id = ?1 AND scope = ?2",
+                )
+                .map_err(|e| map_sqlite_error(e, "get_node prepare"))?;
+            let row_opt = stmt
+                .query_row(params![&node_id, &scope_str], |row| {
+                    Ok(decode_node_row(row))
+                })
+                .optional()
+                .map_err(|e| map_sqlite_error(e, "get_node"))?;
+            match row_opt {
+                None => Ok(None),
+                Some(Ok(node)) => Ok(Some(node)),
+                Some(Err(e)) => Err(e),
+            }
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+    }
+
+    async fn get_edges_for_node(
+        &self,
+        node_id: &str,
+        scope: GraphScope,
+        direction: EdgeDirection,
+        relationship_filter: Option<&[String]>,
+    ) -> Result<Vec<GraphEdge>, Error> {
+        let where_dir = match direction {
+            EdgeDirection::Outgoing => "source_node_id = ?1 AND scope = ?2",
+            EdgeDirection::Incoming => "target_node_id = ?1 AND scope = ?2",
+            EdgeDirection::Both => "(source_node_id = ?1 OR target_node_id = ?1) AND scope = ?2",
+        };
+        let conn = self.conn.clone();
+        let node_id = node_id.to_owned();
+        let scope_str = scope.as_sql_str().to_owned();
+        let rels: Option<Vec<String>> = relationship_filter
+            .filter(|r| !r.is_empty())
+            .map(|r| r.to_vec());
+        tokio::task::spawn_blocking(move || -> Result<Vec<GraphEdge>, Error> {
+            let guard = conn.blocking_lock();
+            let sql_base = format!(
+                "SELECT edge_id, source_node_id, target_node_id, scope, \
+                        relationship, weight, attributes, created_at \
+                 FROM cirisgraph_edges \
+                 WHERE {where_dir}"
+            );
+            let (sql, params_vec): (String, Vec<SqlValue>) = match rels {
+                None => (
+                    format!("{sql_base} ORDER BY created_at DESC"),
+                    vec![SqlValue::Text(node_id), SqlValue::Text(scope_str)],
+                ),
+                Some(rels) => {
+                    // SQLite doesn't bind text[]; pass as JSON array
+                    // + use json_each to expand. Filter via
+                    // `relationship IN (SELECT value FROM
+                    // json_each(?))`.
+                    let rels_json = serde_json::to_string(&rels).map_err(|e| {
+                        Error::Internal(format!("relationship_filter serialize: {e}"))
+                    })?;
+                    (
+                        format!(
+                            "{sql_base} AND relationship IN (SELECT value FROM json_each(?3)) \
+                             ORDER BY created_at DESC"
+                        ),
+                        vec![
+                            SqlValue::Text(node_id),
+                            SqlValue::Text(scope_str),
+                            SqlValue::Text(rels_json),
+                        ],
+                    )
+                }
+            };
+            let mut stmt = guard
+                .prepare(&sql)
+                .map_err(|e| map_sqlite_error(e, "get_edges_for_node prepare"))?;
+            let rows_iter = stmt
+                .query_map(params_from_iter(params_vec.iter()), |row| {
+                    Ok(decode_edge_row(row))
+                })
+                .map_err(|e| map_sqlite_error(e, "get_edges_for_node query"))?;
+            let mut out = Vec::new();
+            for r in rows_iter {
+                out.push(r.map_err(|e| map_sqlite_error(e, "get_edges_for_node row"))??);
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+    }
+
+    async fn traverse_k_hop(
+        &self,
+        start_node_id: &str,
+        scope: GraphScope,
+        cfg: TraversalConfig,
+    ) -> Result<Vec<KhopEntry>, Error> {
+        // Same AV-46 bounds as Postgres impl.
+        if cfg.max_depth == 0 {
+            return Err(Error::InvalidArgument("max_depth must be >= 1".into()));
+        }
+        if cfg.max_depth > MAX_KHOP_DEPTH {
+            return Err(Error::InvalidArgument(format!(
+                "max_depth {} exceeds bound MAX_KHOP_DEPTH={}",
+                cfg.max_depth, MAX_KHOP_DEPTH
+            )));
+        }
+        if cfg.edge_relationships.is_empty() {
+            return Err(Error::InvalidArgument(
+                "edge_relationships must be non-empty (no wildcard traversal)".into(),
+            ));
+        }
+        if cfg.per_level_limit == 0 {
+            return Err(Error::InvalidArgument(
+                "per_level_limit must be >= 1".into(),
+            ));
+        }
+
+        // SQLite's recursive CTE syntax forbids LIMIT inside the
+        // recursive arm + doesn't allow it to reference `frontier`
+        // from a subquery. We restructure: the recursive arm joins
+        // frontier+edges directly (no subquery), and the per-level
+        // fan-out bound moves to an OUTER LIMIT on the join'd row
+        // set (caller can post-filter if even tighter bounds are
+        // needed). `max_depth` still strictly bounds the
+        // recursion. AV-46's primary defense (depth cap) is
+        // preserved; per-level fan-out is best-effort on SQLite.
+        let (next_node_expr, edge_join) = match cfg.direction {
+            EdgeDirection::Outgoing => (
+                "e.target_node_id",
+                "JOIN cirisgraph_edges e ON e.source_node_id = f.node_id AND e.scope = ?2 \
+                 AND e.relationship IN (SELECT value FROM json_each(?3))",
+            ),
+            EdgeDirection::Incoming => (
+                "e.source_node_id",
+                "JOIN cirisgraph_edges e ON e.target_node_id = f.node_id AND e.scope = ?2 \
+                 AND e.relationship IN (SELECT value FROM json_each(?3))",
+            ),
+            EdgeDirection::Both => (
+                "CASE WHEN e.source_node_id = f.node_id THEN e.target_node_id \
+                 ELSE e.source_node_id END",
+                "JOIN cirisgraph_edges e ON \
+                    (e.source_node_id = f.node_id OR e.target_node_id = f.node_id) \
+                    AND e.scope = ?2 \
+                    AND e.relationship IN (SELECT value FROM json_each(?3))",
+            ),
+        };
+        let sql = format!(
+            "WITH RECURSIVE frontier(node_id, scope, depth) AS (\
+                SELECT node_id, scope, 0 \
+                FROM cirisgraph_nodes \
+                WHERE node_id = ?1 AND scope = ?2 \
+              UNION \
+                SELECT {next_node_expr}, ?2, f.depth + 1 \
+                FROM frontier f \
+                {edge_join} \
+                WHERE f.depth < ?4\
+            ) \
+            SELECT n.node_id, n.scope, n.node_type, n.attributes, n.version, \
+                   n.updated_by, n.updated_at, n.created_at, \
+                   n.signature, n.signing_key_id, n.signature_verified, \
+                   MIN(f.depth) AS depth \
+            FROM frontier f \
+            JOIN cirisgraph_nodes n ON n.node_id = f.node_id AND n.scope = f.scope \
+            GROUP BY n.node_id, n.scope, n.node_type, n.attributes, n.version, \
+                     n.updated_by, n.updated_at, n.created_at, \
+                     n.signature, n.signing_key_id, n.signature_verified \
+            ORDER BY depth ASC, n.node_id ASC \
+            LIMIT ?5"
+        );
+
+        let rels_json = serde_json::to_string(&cfg.edge_relationships)
+            .map_err(|e| Error::Internal(format!("rels serialize: {e}")))?;
+        let max_depth_i64 = cfg.max_depth as i64;
+        // SQLite outer-LIMIT bound: max_depth × per_level_limit upper
+        // estimate. Conservative — keeps a runaway query bounded by
+        // the same product the Postgres impl bounds.
+        let outer_limit = max_depth_i64.saturating_mul(cfg.per_level_limit as i64);
+        let conn = self.conn.clone();
+        let start_id = start_node_id.to_owned();
+        let scope_str = scope.as_sql_str().to_owned();
+        tokio::task::spawn_blocking(move || -> Result<Vec<KhopEntry>, Error> {
+            let guard = conn.blocking_lock();
+            let mut stmt = guard
+                .prepare(&sql)
+                .map_err(|e| map_sqlite_error(e, "traverse_k_hop prepare"))?;
+            let rows_iter = stmt
+                .query_map(
+                    params![start_id, scope_str, rels_json, max_depth_i64, outer_limit],
+                    |row| {
+                        let depth: i64 = row.get("depth")?;
+                        Ok((depth, decode_node_row(row)))
+                    },
+                )
+                .map_err(|e| map_sqlite_error(e, "traverse_k_hop query"))?;
+            let mut out = Vec::new();
+            for r in rows_iter {
+                let (depth, node_res) = r.map_err(|e| map_sqlite_error(e, "khop row"))?;
+                out.push(KhopEntry {
+                    node: node_res?,
+                    depth: depth as usize,
+                });
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+    }
+
+    async fn query_nodes(
+        &self,
+        filter: NodeFilter,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<NodeListPage, Error> {
+        let scope = filter
+            .scope
+            .ok_or_else(|| Error::InvalidArgument("NodeFilter.scope is required (AV-47)".into()))?;
+        if !(1..=10_000).contains(&limit) {
+            return Err(Error::InvalidArgument(format!(
+                "limit must be in [1, 10000], got {limit}"
+            )));
+        }
+
+        let mut where_parts: Vec<String> = vec!["scope = ?".to_string()];
+        let scope_str = scope.as_sql_str().to_owned();
+        let mut params: Vec<SqlValue> = vec![SqlValue::Text(scope_str)];
+
+        if let Some(nt) = filter.node_type {
+            params.push(SqlValue::Text(nt));
+            where_parts.push("node_type = ?".to_string());
+        }
+        if let Some(contains) = filter.attributes_contains {
+            // SQLite has no native JSONB containment. Translate
+            // `attributes @> {k: v}` to per-key `json_extract` equals
+            // checks. Only top-level object key/value pairs supported
+            // in this filter shape — caller can pre-filter complex
+            // attrs in application code.
+            if let Some(obj) = contains.as_object() {
+                for (k, v) in obj {
+                    let json_path = format!("$.{k}");
+                    let v_str = serde_json::to_string(v).map_err(|e| {
+                        Error::Internal(format!("attributes_contains serialize: {e}"))
+                    })?;
+                    params.push(SqlValue::Text(json_path));
+                    params.push(SqlValue::Text(v_str));
+                    where_parts.push(format!(
+                        "json_extract(attributes, ?{}) = json(?{})",
+                        params.len() - 1,
+                        params.len()
+                    ));
+                }
+            } else {
+                return Err(Error::InvalidArgument(
+                    "attributes_contains must be a JSON object".into(),
+                ));
+            }
+        }
+        if let Some(after) = filter.updated_after {
+            params.push(SqlValue::Text(fmt_datetime(after)));
+            where_parts.push("updated_at >= ?".to_string());
+        }
+        if let Some(before) = filter.updated_before {
+            params.push(SqlValue::Text(fmt_datetime(before)));
+            where_parts.push("updated_at <= ?".to_string());
+        }
+        if let Some(cur) = &cursor {
+            if cur.version != "v1" {
+                return Err(Error::InvalidArgument(format!(
+                    "ListCursor version {} unsupported (expected v1)",
+                    cur.version
+                )));
+            }
+            params.push(SqlValue::Text(fmt_datetime(cur.last_ts)));
+            params.push(SqlValue::Text(cur.last_id.clone()));
+            where_parts.push("(updated_at, node_id) < (?, ?)".to_string());
+        }
+        params.push(SqlValue::Integer(limit));
+        let where_sql = where_parts.join(" AND ");
+        let sql = format!(
+            "SELECT node_id, scope, node_type, attributes, version, \
+                    updated_by, updated_at, created_at, \
+                    signature, signing_key_id, signature_verified \
+             FROM cirisgraph_nodes \
+             WHERE {where_sql} \
+             ORDER BY updated_at DESC, node_id DESC \
+             LIMIT ?"
+        );
+
+        let conn = self.conn.clone();
+        let limit_usize = limit as usize;
+        tokio::task::spawn_blocking(move || -> Result<NodeListPage, Error> {
+            let guard = conn.blocking_lock();
+            let mut stmt = guard
+                .prepare(&sql)
+                .map_err(|e| map_sqlite_error(e, "query_nodes prepare"))?;
+            let rows_iter = stmt
+                .query_map(params_from_iter(params.iter()), |row| {
+                    Ok(decode_node_row(row))
+                })
+                .map_err(|e| map_sqlite_error(e, "query_nodes query"))?;
+            let mut items: Vec<GraphNode> = Vec::new();
+            for r in rows_iter {
+                items.push(r.map_err(|e| map_sqlite_error(e, "query_nodes row"))??);
+            }
+            let next_cursor = if items.len() == limit_usize {
+                items
+                    .last()
+                    .map(|last| ListCursor::from_trailing(last.updated_at, last.node_id.clone()))
+            } else {
+                None
+            };
+            Ok(NodeListPage { items, next_cursor })
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::sqlite::SqliteBackend;
+    use crate::store::Backend;
+    use uuid::Uuid;
+
+    async fn fresh_backend() -> (SqliteBackend, SqliteGraphBackend) {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let graph = SqliteGraphBackend::new(backend.conn_handle());
+        (backend, graph)
+    }
+
+    fn fixture_node(node_id: &str, scope: GraphScope, node_type: &str) -> GraphNode {
+        GraphNode {
+            node_id: node_id.to_owned(),
+            scope,
+            node_type: node_type.to_owned(),
+            attributes: serde_json::json!({"created_in": "test"}),
+            version: 1,
+            updated_by: "test-runner".into(),
+            updated_at: chrono::Utc::now(),
+            created_at: chrono::Utc::now(),
+            signature: None,
+            signing_key_id: None,
+            signature_verified: false,
+        }
+    }
+
+    fn fixture_edge(src: &str, dst: &str, scope: GraphScope, rel: &str) -> GraphEdge {
+        GraphEdge {
+            edge_id: Uuid::new_v4().to_string(),
+            source_node_id: src.to_owned(),
+            target_node_id: dst.to_owned(),
+            scope,
+            relationship: rel.to_owned(),
+            weight: None,
+            attributes: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// v0.8.4 SQLite parity: same lifecycle as the v0.8.0 Postgres
+    /// test (upsert → get → version conflict → AV-45 → edges → AV-46
+    /// → k-hop → query → AV-47 → cascade delete) — all via SQLite.
+    #[tokio::test]
+    async fn cirisgraph_sqlite_round_trip_full_lifecycle() {
+        let (_b, graph) = fresh_backend().await;
+
+        let suffix = Uuid::new_v4().simple().to_string();
+        let n_a = format!("test:a-{suffix}");
+        let n_b = format!("test:b-{suffix}");
+        let n_c = format!("test:c-{suffix}");
+
+        // 1. Insert 3 nodes.
+        for nid in [&n_a, &n_b, &n_c] {
+            graph
+                .upsert_node(fixture_node(nid, GraphScope::Local, "test"), 0)
+                .await
+                .unwrap();
+        }
+
+        // 2. get_node round-trip.
+        let got = graph
+            .get_node(&n_a, GraphScope::Local)
+            .await
+            .unwrap()
+            .expect("node a");
+        assert_eq!(got.node_id, n_a);
+        assert_eq!(got.version, 1);
+
+        // 3. AV-48: version conflict.
+        let conflict = graph
+            .upsert_node(fixture_node(&n_a, GraphScope::Local, "test"), 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(conflict, Error::Conflict(_)));
+
+        // 4. Update with correct version succeeds.
+        let mut updated = got.clone();
+        updated.attributes = serde_json::json!({"updated": true});
+        graph.upsert_node(updated, 1).await.unwrap();
+        let post = graph
+            .get_node(&n_a, GraphScope::Local)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(post.version, 2);
+
+        // 5. AV-45: oversized attributes reject.
+        let mut huge = fixture_node("test:huge", GraphScope::Local, "test");
+        huge.attributes = serde_json::json!({"payload": "x".repeat(2 * 1024 * 1024)});
+        let too_big = graph.upsert_node(huge, 0).await.unwrap_err();
+        assert!(matches!(too_big, Error::InvalidArgument(_)));
+
+        // 6. Edges: a -OWNS-> b -OWNS-> c -SUMMARIZES-> a (cycle).
+        graph
+            .upsert_edge(fixture_edge(&n_a, &n_b, GraphScope::Local, "OWNS"))
+            .await
+            .unwrap();
+        graph
+            .upsert_edge(fixture_edge(&n_b, &n_c, GraphScope::Local, "OWNS"))
+            .await
+            .unwrap();
+        graph
+            .upsert_edge(fixture_edge(&n_c, &n_a, GraphScope::Local, "SUMMARIZES"))
+            .await
+            .unwrap();
+
+        // 7. Directional edges.
+        let out = graph
+            .get_edges_for_node(&n_a, GraphScope::Local, EdgeDirection::Outgoing, None)
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        let in_ = graph
+            .get_edges_for_node(&n_a, GraphScope::Local, EdgeDirection::Incoming, None)
+            .await
+            .unwrap();
+        assert_eq!(in_.len(), 1);
+
+        // 8. Relationship filter (json_each path).
+        let only_sum = graph
+            .get_edges_for_node(
+                &n_a,
+                GraphScope::Local,
+                EdgeDirection::Both,
+                Some(&["SUMMARIZES".to_owned()]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(only_sum.len(), 1);
+        assert_eq!(only_sum[0].relationship, "SUMMARIZES");
+
+        // 9. AV-46 bounds.
+        let bad_depth = graph
+            .traverse_k_hop(
+                &n_a,
+                GraphScope::Local,
+                TraversalConfig {
+                    max_depth: MAX_KHOP_DEPTH + 1,
+                    edge_relationships: vec!["OWNS".into()],
+                    direction: EdgeDirection::Outgoing,
+                    per_level_limit: 1024,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(bad_depth, Error::InvalidArgument(_)));
+
+        // 10. Real 2-hop traverse via recursive CTE.
+        let khop = graph
+            .traverse_k_hop(
+                &n_a,
+                GraphScope::Local,
+                TraversalConfig {
+                    max_depth: 3,
+                    edge_relationships: vec!["OWNS".into()],
+                    direction: EdgeDirection::Outgoing,
+                    per_level_limit: 1024,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(khop.len(), 3);
+        assert_eq!(khop[0].depth, 0);
+        assert_eq!(khop[0].node.node_id, n_a);
+        assert!(khop.iter().any(|e| e.node.node_id == n_b && e.depth == 1));
+        assert!(khop.iter().any(|e| e.node.node_id == n_c && e.depth == 2));
+
+        // 11. query_nodes with scope + type.
+        let page = graph
+            .query_nodes(
+                NodeFilter {
+                    scope: Some(GraphScope::Local),
+                    node_type: Some("test".into()),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        assert!(page.items.len() >= 3);
+
+        // 12. AV-47 None scope rejects.
+        let no_scope = graph
+            .query_nodes(NodeFilter::default(), None, 10)
+            .await
+            .unwrap_err();
+        assert!(matches!(no_scope, Error::InvalidArgument(_)));
+
+        // 13. Hard cascade delete.
+        let deleted = graph
+            .delete_node(&n_a, GraphScope::Local, true)
+            .await
+            .unwrap();
+        assert!(deleted);
+        assert!(graph
+            .get_node(&n_a, GraphScope::Local)
+            .await
+            .unwrap()
+            .is_none());
+    }
+}

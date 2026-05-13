@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "0.8.3"
+version = "0.8.4"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -117,12 +117,14 @@ cirisnode      = ["postgres"]
 # v0.8.0 (CIRISPersist#34) — graph services absorption track. Powers
 # the agent's MemoryService + ConfigService migration off
 # `ciris_engine/logic/persistence/` SQLite/Postgres + hand-rolled
-# SQL. Postgres-backed (recursive CTEs for k-hop, GIN on JSONB
-# attributes); NO embedded graph DB engine — actual workload is
-# point lookup + time-window scan + bounded k-hop, doesn't justify
-# CozoDB/kuzu/indradb dep weight (verified via deepwiki traversal-
-# pattern inspection of CIRISAgent's live code).
-cirisgraph     = ["postgres"]
+# SQL. Backend-agnostic at the trait surface; pair `cirisgraph` with
+# either `postgres` (recursive CTEs + GIN on JSONB) or `sqlite`
+# (v0.8.4 — recursive CTEs + expression-indexed json_extract) per
+# deployment shape. NO embedded graph DB engine — verified via
+# deepwiki against CIRISAgent's live query patterns: point lookup
+# + time-window scan + bounded k-hop doesn't justify CozoDB / kuzu /
+# indradb dep weight.
+cirisgraph     = []
 
 # v0.8.1 (CIRISPersist#35) — hash-chained audit log. Absorbs the
 # agent's GraphAuditService write path. Per-tenant monotonic
@@ -289,10 +291,22 @@ ndarray              = { version = "0.16", optional = true }
 # v0.1.9 — pinned to 0.31 to match ciris-verify-core's transitive
 # rusqlite. Both crates declare `links = "sqlite3"`, so cargo's
 # resolver requires a single libsqlite3-sys version across the
-# workspace. The `bundled` feature builds libsqlite3 from source so
-# manylinux wheels don't need a system libsqlite3-dev; `chrono` adds
-# DateTime<Utc> ToSql/FromSql impls (TEXT round-trip via RFC 3339);
-# `serde_json` adds Value ToSql for the payload JSONB-as-TEXT column.
+# workspace. `chrono` adds DateTime<Utc> ToSql/FromSql impls (TEXT
+# round-trip via RFC 3339); `serde_json` adds Value ToSql for the
+# payload JSONB-as-TEXT column.
+#
+# v0.8.4 — `bundled` feature is target-conditional. On non-iOS
+# (Linux / macOS desktop / Windows / Android) the `bundled` feature
+# builds libsqlite3 from source so manylinux wheels don't need a
+# system libsqlite3-dev. On iOS, bundled rusqlite duplicates sqlite3
+# symbols with iOS's system libsqlite3 — Apple's `libRPAC.dylib`
+# (SQLiteDatabaseTracking) sees two sqlite3 dylibs and asserts
+# (CIRISVerify v1.6.4 hit + fixed this same trap). On iOS we link
+# against the system one instead. Both Cargo target tables below
+# resolve to the same dep entry; cargo unifies on the version pin.
+rusqlite = { version = "0.31", features = ["chrono", "serde_json"], optional = true }
+
+[target.'cfg(not(target_os = "ios"))'.dependencies]
 rusqlite = { version = "0.31", features = ["bundled", "chrono", "serde_json"], optional = true }
 
 # Phase 1 robustness — local journal for outage tolerance (FSD §3.4)

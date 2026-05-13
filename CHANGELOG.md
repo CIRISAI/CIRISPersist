@@ -5,6 +5,96 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.8.4] — 2026-05-13
+
+**cirisgraph SQLite parity + iOS-conditional rusqlite (v0.9.0 cut α1
+toward CIRISPersist#38).** First piece of the SQLite parity track
+that closes the gap between persist's v0.6.1+ Postgres-only modules
+and CIRISAgent's full deployment matrix (Postgres for federated;
+SQLite default for sovereign-mode / Pi-class / iOS device).
+
+### What landed
+
+- **iOS-conditional `rusqlite`** — Cargo.toml splits the `rusqlite`
+  dep across `cfg(target_os = "ios")` (no `bundled` feature; links
+  against iOS's system libsqlite3) and `cfg(not(target_os =
+  "ios"))` (keeps `bundled` for clean manylinux wheel builds). This
+  is the **exact same fix CIRISVerify v1.6.4 made** for Apple's
+  `libRPAC.dylib` (SQLiteDatabaseTracking) — bundled rusqlite
+  duplicates sqlite3 symbols, which trips libRPAC's two-dylib
+  assertion on iOS. Per deepwiki inspection of CIRISAgent's hard-
+  won-victory pattern.
+- **`PRAGMA busy_timeout = 30000`** added to `SqliteBackend`
+  connection-init pragmas (matches CIRISAgent's iOS 30s timeout;
+  applies universally — Pi-class + dev-laptop SQLite workloads
+  benefit from the wait-don't-fail-fast behavior).
+- **`SqliteBackend::conn_handle()`** — public accessor for the
+  shared `Arc<Mutex<Connection>>` so sibling modules ride the same
+  underlying connection.
+- **`cirisgraph = []`** feature decoupled from `["postgres"]` — the
+  trait surface is backend-agnostic; pair `cirisgraph` with either
+  `postgres` or `sqlite` per deployment shape.
+- **`src/graph/sqlite.rs`** — `SqliteGraphBackend` impl of
+  `GraphService`. Same 7 methods, same AV-45..AV-48 semantics.
+  Dialect translations: JSONB→TEXT (canonical JSON), GIN→
+  expression-indexed `json_extract` predicates, `text[]` params→
+  `json_each(?)` joins, UUID→TEXT (36-char hyphenated), TIMESTAMPTZ→
+  RFC 3339 TEXT, `NOW()`→`datetime('now', 'subsec')`. Recursive
+  CTE shape restructured for SQLite (no nested-LIMIT in recursive
+  arm; per-level fan-out moves to outer LIMIT — `max_depth ×
+  per_level_limit` upper bound).
+- **`migrations/sqlite/lens/V013__cirisgraph_nodes_edges.sql`** —
+  flat schema (no PG "schema" namespace; tables prefixed
+  `cirisgraph_nodes` / `cirisgraph_edges`).
+
+### Tests
+
+- New `graph::sqlite::tests::cirisgraph_sqlite_round_trip_full_lifecycle`
+  in-memory SQLite test mirrors the v0.8.0 Postgres lifecycle test
+  exactly: 13 assertions covering upsert × 3 → get → AV-48 version
+  conflict → update with correct version → AV-45 oversize reject →
+  3-edge cycle (`OWNS`/`SUMMARIZES`) → directional edges →
+  relationship-allowlist filter (via `json_each`) → AV-46 bounds →
+  2-hop traverse via recursive CTE → query_nodes with scope+type →
+  AV-47 None-scope reject → hard cascade delete.
+- 345/345 full lib pass against **both backends** (live
+  ciris-qa-postgres + in-memory SQLite); clippy `-D warnings`
+  clean across the full feature matrix including `sqlite`.
+
+### Why SQLite parity matters for v2.9.0 cutover
+
+CIRISAgent's `CIRIS_DB_URL` env-var dialect switch lets operators
+choose backend at deployment time. SQLite is the default for
+sovereign-mode (single-agent + lens on a Pi), Pi-class deployments,
+and iOS-device deployments. Postgres-only v0.6.1+ substrate would
+fragment the agent's deployment matrix on adoption. v0.8.4 closes
+the first piece (cirisgraph); subsequent v0.8.x alphas add SQLite
+parity for cirisaudit (#35 follow-on), telemetry (#36),
+cirisincident (#37), secrets (#19), then v0.9.0 ships as the
+agent-ready cut.
+
+### v0.9.0 roadmap (issue #38)
+
+| Module | Postgres | SQLite |
+|---|---|---|
+| secrets (v0.6.1) | ✓ | pending |
+| cirisnode (v0.7.x) | ✓ | pending |
+| **cirisgraph (v0.8.0)** | ✓ | **✓ v0.8.4** |
+| cirisaudit (v0.8.1) | ✓ | pending |
+| telemetry (v0.8.2) | ✓ | pending |
+| cirisincident (v0.8.3) | ✓ | pending |
+
+### References
+
+CIRISPersist#38 (tracking — substrate prerequisite for CIRISAgent
+2.9.0 adoption). CIRISVerify v1.6.4 changelog — same iOS rusqlite
+fix established the pattern. CIRISAgent's iOS SQLite hard-won
+victory (deepwiki, `ciris_engine/logic/persistence/db/core.py`) —
+the Rust-relevant pieces (system SQLite on iOS, WAL, busy_timeout
+30s) ported here; Python-specific pieces (GC-suppressing
+connection/cursor proxies, thread-local handles) don't translate
+to Rust's typed connection-pool model.
+
 ## [0.8.3] — 2026-05-13
 
 **Incident records substrate (closes CIRISPersist#37).** Last of
