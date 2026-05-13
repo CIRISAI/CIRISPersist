@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "0.8.5"
+version = "0.8.6"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -140,7 +140,7 @@ cirisaudit     = []
 # TEMPORAL_NEXT / TEMPORAL_PREV edges. Per-period consolidation lock
 # in cirisgraph.consolidation_locks. Depends on cirisgraph for the
 # summary-node write path. Threat model AV-52 / AV-53 / AV-54.
-telemetry      = ["cirisgraph"]
+telemetry      = ["cirisgraph"]  # no `postgres` or `sqlite` requirement — pairs with either via cirisgraph
 
 # v0.8.3 (CIRISPersist#37) — incident records. Absorbs the agent's
 # IncidentManagementService: correlation-keyed deduplication on

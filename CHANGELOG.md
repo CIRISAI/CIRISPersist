@@ -5,6 +5,44 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.8.6] — 2026-05-13
+
+**telemetry SQLite parity** (v0.9.0 cut α3 toward CIRISPersist#38).
+
+- `src/telemetry/sqlite.rs` — `SqliteTelemetryBackend` impl of
+  `TelemetryService` (4 methods including the full
+  `consolidate_period` rollup). Summary nodes UPSERT directly
+  against `cirisgraph_nodes` (shared schema with v0.8.4).
+- Dialect translations: `UNNEST'd INSERT … SELECT` →
+  prepared-statement loop in `BEGIN IMMEDIATE` transaction;
+  `INTERVAL '3600 seconds'` → `datetime('now', '-3600 seconds')`;
+  JSONB labels → TEXT JSON; PG `attributes @> {predicate}` →
+  per-key `json_extract` equality checks.
+- **Subtle bug + fix on prior-period probe**: chrono's default serde
+  for `DateTime<Utc>` emits nanosecond precision, but `fmt_datetime`
+  uses microsecond. Stored attributes JSON had nanos; query bound
+  had micros. Lex compare on RFC 3339: `'7' (nanos digit) < 'Z'
+  (Z-suffix)` at the precision boundary, falsely matching every
+  summary as its own predecessor and creating spurious
+  TEMPORAL_NEXT edges. Fix: truncate `period_start`/`period_end` to
+  microseconds before serializing summary attributes.
+- `migrations/sqlite/lens/V015__cirisgraph_telemetry.sql`.
+- `telemetry = ["cirisgraph"]` — no backend requirement; pairs via
+  cirisgraph.
+
+Tests: 2/2 telemetry SQLite tests (full lifecycle + AV-53 lock
+contention) against in-memory SQLite. 348/348 lib pass across both
+backends.
+
+| v0.9.0 roadmap | Postgres | SQLite |
+|---|---|---|
+| secrets | ✓ | pending |
+| cirisnode | ✓ | pending |
+| cirisgraph | ✓ | ✓ v0.8.4 |
+| cirisaudit | ✓ | ✓ v0.8.5 |
+| **telemetry** | ✓ | **✓ v0.8.6** |
+| cirisincident | ✓ | pending |
+
 ## [0.8.5] — 2026-05-13
 
 **cirisaudit SQLite parity** (v0.9.0 cut α2 toward CIRISPersist#38).
