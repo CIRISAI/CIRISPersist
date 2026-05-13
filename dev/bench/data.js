@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778622685757,
+  "lastUpdate": 1778632609602,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -10181,6 +10181,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23532047,
             "range": "± 124716",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "9d77d3c5b0548e846ab44b674dd05761038b18e5",
+          "message": "FSD: lock v0.7.0 as the federation-consensus impl cut (Appendix A.5)\n\nCloser reading of today's release cadence: v0.6.0 + v0.6.1 are\nsubstrate work for lens / agent / bridge consumers, not\nCIRISNodeCore. The federation-consensus typed-writes (Appendix A.2 —\nput_contribution / cast_vote / update_credits_ledger /\nupdate_expertise_ledger / put_moderation_event /\nput_slashing_attestation / put_reconsideration_* / read_vote_weight\n/ routable_contributors + V011 migration) are still pending.\n\nAppendix A.5 (Sequencing) updated:\n\n- v0.6.0 (shipped): spec locked; pipeline read substrate.\n- v0.6.1 (shipped): federated SecretsService substrate.\n- v0.6.2 (next): pipeline orchestration. Closes lens/agent track.\n  NO CIRISNodeCore surface.\n- v0.7.0 (CIRISNodeCore v0.1.0 cut-time): full Appendix A.2 surface\n  — V011 migration + 8 typed-writes + 5 read clusters + `cirisnode`\n  Cargo feature gating.\n- v0.7.x: ledger / reconsideration / moderation / slashing refinements.\n\nWhy v0.7.0 not v0.6.3: the v0.6.x track is the lens/agent/bridge\nsubstrate (finished at v0.6.2). v0.7.0 announces a new federation-\nconsensus substrate cleanly. CIRISNodeCore pins ^0.7.0;\nlens/agent/bridge stay on ^0.6.x or upgrade for the union surface.\n\nSpec-only change. No impl impact.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-12T19:29:22-05:00",
+          "tree_id": "621a3b1ba40a33867ac38b32d752a1532f2f5e32",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/9d77d3c5b0548e846ab44b674dd05761038b18e5"
+        },
+        "date": 1778632609255,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 103452,
+            "range": "± 328",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 244787,
+            "range": "± 802",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 525754,
+            "range": "± 1951",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1852133,
+            "range": "± 19448",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 346,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1497,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8234,
+            "range": "± 60",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21172,
+            "range": "± 107",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24203,
+            "range": "± 34",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83500,
+            "range": "± 2385",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 364,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3083,
+            "range": "± 16",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9599,
+            "range": "± 54",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41908,
+            "range": "± 162",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2375362,
+            "range": "± 113975",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6814398,
+            "range": "± 217027",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23967010,
+            "range": "± 274100",
             "unit": "ns/iter"
           }
         ]
