@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "0.8.2"
+version = "0.8.3"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -139,6 +139,12 @@ cirisaudit     = ["postgres"]
 # in cirisgraph.consolidation_locks. Depends on cirisgraph for the
 # summary-node write path. Threat model AV-52 / AV-53 / AV-54.
 telemetry      = ["cirisgraph"]
+
+# v0.8.3 (CIRISPersist#37) — incident records. Absorbs the agent's
+# IncidentManagementService: correlation-keyed deduplication on
+# record + open→investigating→resolved→closed state machine.
+# Threat model AV-55 / AV-56.
+cirisincident  = ["postgres"]
 
 # v0.1.3 — optional TLS for the Postgres connection pool. Defaults
 # to no-TLS (deployments where the lens process and Postgres are

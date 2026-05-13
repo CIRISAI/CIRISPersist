@@ -5,6 +5,96 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.8.3] — 2026-05-13
+
+**Incident records substrate (closes CIRISPersist#37).** Last of
+the five v0.8.x Phase 1B Postgres substrate cuts. Absorbs
+CIRISAgent's `IncidentManagementService` — correlation-keyed dedup
+on record + open→investigating→resolved→closed state machine.
+
+### What landed
+
+- **V016 migration** — `cirislens.incident_records` with severity
+  CHECK (`info | warning | error | critical`), state CHECK (`open
+  | investigating | resolved | closed`), JSONB `correlation_keys`
+  array. Partial index on `(tenant_id, state, last_seen_at) WHERE
+  state IN ('open', 'investigating')` keeps the hot-path open-
+  incidents query small even as resolved/closed accumulate. GIN
+  index on `correlation_keys` serves the reverse-lookup path.
+- **Wire types** — `Incident`, `IncidentState` (snake_case serde,
+  4-step monotonic ladder), `IncidentSeverity`, `IncidentFilter`,
+  `IncidentCursor`, `IncidentListPage`, `IncidentTransition`,
+  `IncidentRef` (lightweight reference for `correlate` results).
+- **`IncidentService` trait** — 4 methods:
+  - `record_incident` — correlation-keyed dedup probe within
+    `(tenant_id, category)`; bumps `occurrences` + `last_seen_at`
+    on existing OPEN/INVESTIGATING match, else inserts fresh row.
+    AV-56 bounds enforced before any SQL.
+  - `transition_state` — reads current state under `FOR UPDATE`,
+    asserts forward ladder progress (AV-55), stamps
+    `resolved_at` + `resolution_notes` on Resolved/Closed
+    transitions.
+  - `list_incidents` — tenant-scoped cursor-paged listing with
+    state / severity / category / `has_correlation_keys` filters.
+  - `correlate` — reverse-lookup via GIN on `correlation_keys`.
+- **PostgresBackend impl** — JSONB `?|` for dedup probe (any-key
+  overlap), `?` for single-key correlate, `?&` for filter
+  containment.
+- **PyO3 surface** — 4 `Engine.incident_*` methods.
+
+### Threat-model anchors (THREAT_MODEL.md §4)
+
+- **AV-55** — state-machine bypass: `transition_state` reads
+  current under FOR UPDATE, asserts `current.rank() < new.rank()`,
+  rejects regressive/same-state transitions with
+  `InvalidTransition`. Closed incidents do NOT dedup against new
+  records (dedup probe gated on open/investigating only).
+- **AV-56** — correlation_keys abuse: max 32 keys per incident,
+  max 256 bytes per key; empty strings rejected. Enforced at
+  trait surface before SQL.
+
+### Tests
+
+- 8/8 incident tests against live `ciris-qa-postgres`:
+  state-ladder monotonicity unit tests + sql round-trip + serde
+  + 1 full-lifecycle integration test covering insert → dedup
+  (overlapping keys bump occurrences) → cross-category isolation
+  (same keys, different category, new row) → AV-56 oversized
+  rejects → AV-55 forward transitions → AV-55 backflow reject →
+  notes-required reject → resolved+closed transitions → closed
+  incidents don't dedup new records → correlate + list filters →
+  tenant isolation → NotFound on missing incident.
+- 330/330 full lib pass (+8 from v0.8.2); clippy `-D warnings`
+  clean across the full feature matrix.
+
+### Phase 1B substrate cuts — complete (Postgres side)
+
+| Issue | Release | Service absorbed | Tests | Status |
+|---|---|---|---|---|
+| #34 | v0.8.0 | MemoryService + ConfigService (cirisgraph) | 9/9 | ✓ |
+| #35 | v0.8.1 | AuditService (cirisaudit) | 12/12 | ✓ |
+| #36 | v0.8.2 | TelemetryService + TSDBConsolidationService | 7/7 | ✓ |
+| #37 | v0.8.3 | IncidentManagementService | 8/8 | ✓ |
+
+### NOT YET ready for CIRISAgent 2.9.0 cutover
+
+CIRISAgent supports both **PostgreSQL AND SQLite** backends
+(`CIRIS_DB_URL` env-var dialect switch — Postgres for federated
+deployments, SQLite default for sovereign-mode / Pi-class /
+iOS-device deployments). The v0.6.1+ Rust substrate (secrets,
+cirisgraph, cirisaudit, telemetry, cirisincident, cirisnode) is
+**Postgres-only** as of v0.8.3. SQLite parity is required before
+the agent team can adopt persist on the full deployment matrix.
+
+The v0.8.x trait surfaces + wire types + schema designs ARE
+locked at v0.8.3 — SQLite impls slot in behind the same
+`Backend`-style traits without breaking the consumer API.
+Tracking: **v0.9.0 SQLite parity cut** (next issue to file).
+
+### Closes
+
+CIRISPersist#37.
+
 ## [0.8.2] — 2026-05-13
 
 **Telemetry + TSDB consolidation substrate (closes CIRISPersist#36).**

@@ -46,6 +46,8 @@ pub mod federation;
 pub mod ffi;
 #[cfg(feature = "cirisgraph")]
 pub mod graph;
+#[cfg(feature = "cirisincident")]
+pub mod incident;
 pub mod ingest;
 pub mod journal;
 pub mod manifest;

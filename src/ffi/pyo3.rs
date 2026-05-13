@@ -4669,6 +4669,128 @@ impl PyEngine {
             })
         })
     }
+
+    // ── v0.8.3: incident PyO3 surface (CIRISPersist#37) ──────────────
+    //
+    // 4 methods wrapping IncidentService.
+
+    /// v0.8.3 — Record an incident (correlation-keyed dedup; bumps
+    /// occurrences on existing open match). Returns the
+    /// `incident_id` of the row that took the write.
+    #[cfg(feature = "cirisincident")]
+    fn incident_record(&self, py: Python<'_>, incident_json: &str) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let inc: crate::incident::Incident = serde_json::from_str(incident_json)
+                .map_err(|e| PyValueError::new_err(format!("Incident decode: {e}")))?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::incident::IncidentService;
+                    backend
+                        .record_incident(inc)
+                        .await
+                        .map_err(incident_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v0.8.3 — AV-55 state-machine transition. Notes required for
+    /// Resolved/Closed targets.
+    #[cfg(feature = "cirisincident")]
+    fn incident_transition(&self, py: Python<'_>, transition_json: &str) -> PyResult<()> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let t: crate::incident::IncidentTransition = serde_json::from_str(transition_json)
+                .map_err(|e| PyValueError::new_err(format!("IncidentTransition decode: {e}")))?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::incident::IncidentService;
+                    backend
+                        .transition_state(t)
+                        .await
+                        .map_err(incident_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v0.8.3 — Cursor-paged tenant-scoped incident listing.
+    #[cfg(feature = "cirisincident")]
+    fn incident_list(
+        &self,
+        py: Python<'_>,
+        filter_json: &str,
+        cursor_json: Option<&str>,
+        limit: i64,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let filter: crate::incident::IncidentFilter = serde_json::from_str(filter_json)
+                .map_err(|e| PyValueError::new_err(format!("IncidentFilter decode: {e}")))?;
+            let cursor: Option<crate::incident::types::IncidentCursor> =
+                match cursor_json {
+                    None => None,
+                    Some(s) => Some(serde_json::from_str(s).map_err(|e| {
+                        PyValueError::new_err(format!("IncidentCursor decode: {e}"))
+                    })?),
+                };
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::incident::IncidentService;
+                    let page = backend
+                        .list_incidents(filter, cursor, limit)
+                        .await
+                        .map_err(incident_err_to_py)?;
+                    serde_json::to_string(&page).map_err(|e| {
+                        PyRuntimeError::new_err(format!("IncidentListPage encode: {e}"))
+                    })
+                })
+            })
+        })
+    }
+
+    /// v0.8.3 — Reverse-lookup incidents naming a given correlation
+    /// key. Returns JSON array of `IncidentRef`.
+    #[cfg(feature = "cirisincident")]
+    fn incident_correlate(&self, py: Python<'_>, tenant_id: &str, key: &str) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let tenant_id = tenant_id.to_owned();
+            let key = key.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::incident::IncidentService;
+                    let refs = backend
+                        .correlate(&tenant_id, &key)
+                        .await
+                        .map_err(incident_err_to_py)?;
+                    serde_json::to_string(&refs).map_err(|e| {
+                        PyRuntimeError::new_err(format!("Vec<IncidentRef> encode: {e}"))
+                    })
+                })
+            })
+        })
+    }
+}
+
+/// v0.8.3 — Bridge `incident::Error` → `PyErr` at the FFI boundary.
+#[cfg(feature = "cirisincident")]
+fn incident_err_to_py(e: crate::incident::Error) -> PyErr {
+    let kind = e.kind();
+    tracing::warn!(error = %e, kind = kind, "incident error");
+    match e {
+        crate::incident::Error::InvalidArgument(_)
+        | crate::incident::Error::InvalidTransition(_)
+        | crate::incident::Error::NotFound(_) => PyValueError::new_err(kind),
+        crate::incident::Error::Backend(_)
+        | crate::incident::Error::NotImplemented(_)
+        | crate::incident::Error::Internal(_) => PyRuntimeError::new_err(kind),
+    }
 }
 
 /// v0.8.2 — Bridge `telemetry::Error` → `PyErr` at the FFI boundary.
