@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778634496634,
+  "lastUpdate": 1778638986907,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -10709,6 +10709,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25913603,
             "range": "± 168219",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "dd5c65344b28bec28cd8eefbc4f3bc3a74aad06d",
+          "message": "0.7.0 — CIRISNodeCore federation-consensus substrate (CIRISPersist#30)\n\nClean-break release on a new track. Persist becomes the federation-stable\nhost for the six federation-consensus row classes (Contribution, Vote,\nLedger, Moderation, Slashing, Reconsideration) that CIRISNodeCore\nproduces. Distinct from the v0.6.x lens/agent/bridge substrate —\ndifferent consumer ecosystem, different Cargo feature (`cirisnode`),\ndifferent PostgreSQL schema (`cirisnode.*`). Implements FSD Appendix A.\n\nα4 — PostgresBackend impl:\n\n- 8 typed-writes (put_contribution, cast_vote, update_credits_ledger,\n  update_expertise_ledger, put_moderation_event,\n  put_slashing_attestation, put_reconsideration_request,\n  put_reconsideration_attestation). Each verifies hybrid signature\n  structure before INSERT; ledger writes are idempotent UPSERTs.\n- 5 read clusters: routable_contributors (partial-index path),\n  read_vote_weight (SCHEMA.md §5.2 — Credits × expertise_multiplier\n  × active_tier_multiplier), list_contributions / list_votes\n  (cursor-paged newest-first per v0.5.5 §I shape), get_credits_ledger\n  / get_expertise_ledger point-lookups.\n- Typed error mapping via SqlState: 23505 → Conflict, 23503 →\n  InvalidArgument FK, 23514 → InvalidArgument CHECK.\n\nα5 — Engine PyO3 surface:\n\n- 14 PyO3 methods on Engine wrapping NodeCoreService. JSON-encoded\n  inputs + outputs across the FFI boundary; catch_panic (v0.5.3\n  contract); cirisnode::Error → PyErr via cirisnode_err_to_py with\n  stable kind() tokens.\n\nα2 follow-up — Cell.subject is now Option<String> per NodeCore\nfeedback (SCHEMA.md §7 Expertise paths use cell with only\n{domain, language}, no subject).\n\nTests:\n- 8/8 cirisnode tests pass — 1 error-kind stability, 6 serde\n  round-trip, 1 full-lifecycle integration test against live\n  ciris-qa-postgres (put_contribution → cast_vote → ledger updates\n  → routable_contributors → read_vote_weight → list_* → get_*).\n- Full lib test suite: 223/223 pass. Clippy -D warnings clean\n  across cirisnode postgres pyo3 feature matrix.\n\nSignature verification is a structural stub in v0.7.0; full\ncanonicalization-aware verify_hybrid_via_directory threading lands\nin a v0.7.0.x patch once the CIRISNodeCore canonical-bytes spec is\nlocked. Rows currently INSERT with signature_verified = TRUE; the\npatch will gate that flag on the real directory check.\n\nCloses CIRISPersist#30 (FSD Appendix A spec + impl).\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-12T21:13:32-05:00",
+          "tree_id": "14965d5e6c69af2dfa41e1d35e24ea2b8394b5ea",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/dd5c65344b28bec28cd8eefbc4f3bc3a74aad06d"
+        },
+        "date": 1778638985905,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 84433,
+            "range": "± 236",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 202233,
+            "range": "± 3460",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 436331,
+            "range": "± 6830",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1548508,
+            "range": "± 6580",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 261,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1141,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 6324,
+            "range": "± 185",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 17963,
+            "range": "± 26",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 20500,
+            "range": "± 60",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 70573,
+            "range": "± 84",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 294,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 2657,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 7753,
+            "range": "± 232",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 33782,
+            "range": "± 121",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 535,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2252110,
+            "range": "± 11919804",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 5901797,
+            "range": "± 20328331",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 32150415,
+            "range": "± 28306123",
             "unit": "ns/iter"
           }
         ]
