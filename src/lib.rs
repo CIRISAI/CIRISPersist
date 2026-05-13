@@ -37,6 +37,8 @@
 //! `FSD/PLATFORM_ARCHITECTURE.md` for the layered shape this module
 //! tree implements.
 
+#[cfg(feature = "cirisnode")]
+pub mod cirisnode;
 pub mod derived;
 pub mod federation;
 pub mod ffi;
