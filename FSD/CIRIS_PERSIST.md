@@ -489,13 +489,21 @@ Each table carries the standard CIRISPersist audit columns (`signature`, `signin
 
 ### A.5 Sequencing
 
-CIRISNodeCore v0.1.0 implementation cannot begin until this appendix's write+read surfaces are exposed in `ciris-persist`. Sequencing:
+CIRISNodeCore v0.1.0 implementation cannot begin until this appendix's write+read surfaces are exposed in `ciris-persist`. The v0.6.x track is reserved for the **lens / agent / bridge** substrate (pipeline + secrets + orchestration); the federation-consensus substrate ships as **v0.7.0**, a clean major-minor break so CIRISNodeCore has an unambiguous pin target. Sequencing:
 
-1. **Now (v0.6.0):** Spec locked in this appendix; no code.
-2. **v0.6.x or v0.7.0 (CIRISNodeCore v0.1.0 cut-time):** `engine.put_contribution` + `engine.cast_vote` + the corresponding bulk-list reads + V011 migration. Same `[features] cirisnode = [...]` gating pattern as the existing `pyo3` / `server` features so deployments that don't need the federation-consensus surface skip the migration.
-3. **Later:** Ledger read primitives + reconsideration + moderation + slashing — granularly as CIRISNodeCore matures.
+1. **v0.6.0 (shipped 2026-05-12):** Spec locked in this appendix; no code. Pipeline read substrate (lens track).
+2. **v0.6.1 (shipped 2026-05-12):** Federated SecretsService substrate (agent / lens / bridge track). No CIRISNodeCore surface.
+3. **v0.6.2 (next, lens/agent track closure):** Pipeline orchestration — `Engine.receive_pipeline_envelope`, Stage runner, real `process_incoming_text` / `decapsulate_secrets_in_parameters` impls, `secrets-server` HTTP API. Closes CIRISPersist#19 fully. **No CIRISNodeCore surface.**
+4. **v0.7.0 (CIRISNodeCore v0.1.0 cut-time):** Full Appendix A.2 federation-consensus substrate. Includes:
+   - V011 migration — `cirisnode` schema with the 7 tables enumerated in §A.4.
+   - All 8 typed-write methods on `Engine` (`put_contribution`, `cast_vote`, `update_credits_ledger`, `update_expertise_ledger`, `put_moderation_event`, `put_slashing_attestation`, `put_reconsideration_request`, `put_reconsideration_attestation`).
+   - All 5 read-surface clusters from §A.3 (routing-eligibility + vote-weighting + bulk-list + pending-vs-canonical split + ledger point lookups).
+   - New `cirisnode` Cargo feature gating the migration + the surface; deployments that don't need the federation-consensus path skip it.
+5. **v0.7.x patches:** Ledger read primitive refinements + reconsideration + moderation + slashing — granularly as CIRISNodeCore matures.
 
 The order matches `CIRISNodeCore/MISSION.md` §3.3 deferral routing (Contribution + Vote first; everything else compounds on those).
+
+**Why v0.7.0, not v0.6.3:** the v0.6.x track is the lens/agent/bridge substrate and is conceptually finished at v0.6.2. v0.7.0 announces a new federation-consensus substrate cleanly. CIRISNodeCore pins `^0.7.0`; lens / agent stay on `^0.6.x` or upgrade to `^0.7.0` for the union surface. The minor-version axis is the deployment-surface axis.
 
 ### A.6 Sibling issues
 
