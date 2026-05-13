@@ -5,6 +5,103 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.8.2] — 2026-05-13
+
+**Telemetry + TSDB consolidation substrate (closes CIRISPersist#36).**
+Absorbs CIRISAgent's `TelemetryService` + `TSDBConsolidationService`
+write/read paths. Step 1B continuation — the third of five v0.8.x
+substrate cuts (cirisgraph #34 ✓, cirisaudit #35 ✓, telemetry #36 ✓,
+incidents #37 pending, auth_tokens v0.9.x).
+
+### Two-storage-shape design
+
+Raw observations land in `cirisgraph.telemetry_metrics` (high-
+frequency, 24h-lived, no audit envelope — ephemeral); the 6-hour
+consolidator rolls them up into `tsdb_summary` nodes in
+`cirisgraph.nodes` (V013) with `TEMPORAL_NEXT` / `TEMPORAL_PREV`
+edges between adjacent summaries. Splitting raw + summary keeps the
+cirisgraph write path cheap + auditable for the agent's semantic
+graph; gives telemetry a flat-table fast path; lets the rolled-up
+summary carry the audit envelope on behalf of the period it
+summarizes.
+
+### What landed
+
+- **V015 migration** — two new tables in the cirisgraph schema:
+  - `cirisgraph.telemetry_metrics` — raw observations; index on
+    `(tenant_id, metric_name, observed_at)` for window scans;
+    partial-key index on `expires_at` for the reaping path.
+  - `cirisgraph.consolidation_locks` — multi-instance coordination;
+    PK `(period_start, tenant_id)`; `locked_at` index for AV-53
+    stale-lock detection.
+- **Wire types** — `MetricObservation`, `MetricSummary`,
+  `MetricFilter`, `MetricCursor`, `MetricListPage`,
+  `ConsolidationRequest`, `ConsolidationOutcome { ran,
+  broke_stale_lock, metrics_consolidated, summaries_written,
+  edges_created, raw_metrics_deleted }`.
+- **`TelemetryService` trait** — 4 methods: `record_metric`,
+  `record_metrics_batch` (UNNEST-backed bulk insert),
+  `list_metrics` (tenant-scoped cursor-paged), `consolidate_period`
+  (the lock-acquire → aggregate → upsert-summary → write-edge →
+  delete-raw → release-lock flow).
+- **PostgresBackend impl**:
+  - Aggregation via SQL `GROUP BY metric_name` with
+    `SUM/MIN/MAX/AVG/COUNT(DISTINCT labels)` for label-cardinality
+    observability (AV-52 telemetry signal).
+  - Summary node UPSERT mirrors cirisgraph's `upsert_node` SQL
+    shape — version-bumps on re-rollup (idempotent).
+  - Prior-period lookup via `attributes @> {metric_name,
+    tenant_id} AND (attributes->>'period_start')::timestamptz <
+    period_start` — guarantees the TEMPORAL_NEXT source node exists
+    (AV-54) and avoids self-edges on re-rollup.
+  - Stale-lock auto-break via `UPDATE … WHERE locked_at < NOW() -
+    INTERVAL '3600 seconds'` with the interval embedded (compile-
+    time constant, no injection surface).
+- **PyO3 surface** — 4 `Engine.telemetry_*` methods. JSON-in /
+  JSON-out; `catch_panic` discipline; `telemetry::Error → PyErr`
+  via `telemetry_err_to_py`.
+
+### Threat-model anchors (THREAT_MODEL.md §4)
+
+- **AV-52** — labels JSONB size cap (default 4 KiB; configurable);
+  bulk path validates every row BEFORE any I/O. Cardinality cap
+  per-(tenant, metric_name) is observability-only via
+  `unique_label_combinations` field on summaries — runtime
+  enforcement deferred until a real consumer trips the soft limit.
+- **AV-53** — consolidation lock starvation: stale locks (>1h)
+  auto-break with telemetry-actionable signal in
+  `broke_stale_lock: true`. Failure-path lock release prevents
+  orphaned locks on transient rollup errors.
+- **AV-54** — TEMPORAL_NEXT chain integrity: pre-write lookup
+  confirms prior summary exists; idempotent on re-rollup.
+
+### Tests
+
+- 7/7 telemetry tests against live `ciris-qa-postgres`:
+  - 3 unit tests (error-kind stability, AV-52 default cap, AV-53
+    stale threshold)
+  - 2 serde round-trip tests
+  - 1 full-lifecycle integration test covering record × 7 → AV-52
+    oversized-labels reject → list with time-window + tenant
+    filter → empty-tenant reject → consolidate period A
+    (7 metrics → 3 summaries → 0 edges → 7 raw deleted) →
+    idempotent re-run → write metrics in period B → consolidate
+    period B (2 summaries + 2 TEMPORAL_NEXT edges to period A)
+  - 1 lock-contention test (plant a fresh lock, confirm
+    `consolidate_period` returns `ran=false`)
+- 322/322 full lib pass (+7 from v0.8.1); clippy `-D warnings`
+  clean across the full feature matrix.
+
+### Unblocks (CIRISAgent migration)
+
+- `TelemetryService` — record + list paths via the trait.
+- `TSDBConsolidationService` — `consolidate_period` is the
+  direct port of the agent's 6h rollup.
+
+### References
+
+CIRISPersist#36 (closes). Threat model: AV-52..AV-54.
+
 ## [0.8.1] — 2026-05-13
 
 **Hash-chained audit log substrate (closes CIRISPersist#35).**

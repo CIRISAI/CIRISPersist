@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "0.8.1"
+version = "0.8.2"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -130,6 +130,15 @@ cirisgraph     = ["postgres"]
 # self-signed model (actor_id IS the Ed25519 pubkey, base64-encoded).
 # Threat model AV-49 / AV-50 / AV-51.
 cirisaudit     = ["postgres"]
+
+# v0.8.2 (CIRISPersist#36) — telemetry + TSDB consolidation. Absorbs
+# the agent's TelemetryService + TSDBConsolidationService surfaces.
+# Raw metrics in cirisgraph.telemetry_metrics (24h-lived); summaries
+# in cirisgraph.nodes with node_type='tsdb_summary' linked by
+# TEMPORAL_NEXT / TEMPORAL_PREV edges. Per-period consolidation lock
+# in cirisgraph.consolidation_locks. Depends on cirisgraph for the
+# summary-node write path. Threat model AV-52 / AV-53 / AV-54.
+telemetry      = ["cirisgraph"]
 
 # v0.1.3 — optional TLS for the Postgres connection pool. Defaults
 # to no-TLS (deployments where the lens process and Postgres are

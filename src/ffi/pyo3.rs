@@ -4563,6 +4563,126 @@ impl PyEngine {
             })
         })
     }
+
+    // ── v0.8.2: telemetry PyO3 surface (CIRISPersist#36) ─────────────
+    //
+    // 4 methods wrapping TelemetryService.
+
+    /// v0.8.2 — Record one telemetry observation.
+    #[cfg(feature = "telemetry")]
+    fn telemetry_record_metric(&self, py: Python<'_>, obs_json: &str) -> PyResult<()> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let obs: crate::telemetry::MetricObservation = serde_json::from_str(obs_json)
+                .map_err(|e| PyValueError::new_err(format!("MetricObservation decode: {e}")))?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::telemetry::TelemetryService;
+                    backend
+                        .record_metric(obs)
+                        .await
+                        .map_err(telemetry_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v0.8.2 — Bulk-record N observations. Returns affected row count.
+    #[cfg(feature = "telemetry")]
+    fn telemetry_record_metrics_batch(&self, py: Python<'_>, obs_json: &str) -> PyResult<u64> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let obs: Vec<crate::telemetry::MetricObservation> = serde_json::from_str(obs_json)
+                .map_err(|e| {
+                    PyValueError::new_err(format!("Vec<MetricObservation> decode: {e}"))
+                })?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::telemetry::TelemetryService;
+                    backend
+                        .record_metrics_batch(&obs)
+                        .await
+                        .map_err(telemetry_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v0.8.2 — Cursor-paged tenant-scoped metric listing.
+    #[cfg(feature = "telemetry")]
+    fn telemetry_list_metrics(
+        &self,
+        py: Python<'_>,
+        filter_json: &str,
+        cursor_json: Option<&str>,
+        limit: i64,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let filter: crate::telemetry::MetricFilter = serde_json::from_str(filter_json)
+                .map_err(|e| PyValueError::new_err(format!("MetricFilter decode: {e}")))?;
+            let cursor: Option<crate::telemetry::types::MetricCursor> = match cursor_json {
+                None => None,
+                Some(s) => Some(
+                    serde_json::from_str(s)
+                        .map_err(|e| PyValueError::new_err(format!("MetricCursor decode: {e}")))?,
+                ),
+            };
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::telemetry::TelemetryService;
+                    let page = backend
+                        .list_metrics(filter, cursor, limit)
+                        .await
+                        .map_err(telemetry_err_to_py)?;
+                    serde_json::to_string(&page)
+                        .map_err(|e| PyRuntimeError::new_err(format!("MetricListPage encode: {e}")))
+                })
+            })
+        })
+    }
+
+    /// v0.8.2 — Run 6-hour rollup for one (period, tenant) window.
+    /// AV-53 stale-lock auto-break; AV-54 TEMPORAL_NEXT chain.
+    /// Returns JSON `ConsolidationOutcome`.
+    #[cfg(feature = "telemetry")]
+    fn telemetry_consolidate_period(&self, py: Python<'_>, req_json: &str) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend.clone();
+            let runtime = self.runtime.clone();
+            let req: crate::telemetry::ConsolidationRequest = serde_json::from_str(req_json)
+                .map_err(|e| PyValueError::new_err(format!("ConsolidationRequest decode: {e}")))?;
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::telemetry::TelemetryService;
+                    let outcome = backend
+                        .consolidate_period(req)
+                        .await
+                        .map_err(telemetry_err_to_py)?;
+                    serde_json::to_string(&outcome).map_err(|e| {
+                        PyRuntimeError::new_err(format!("ConsolidationOutcome encode: {e}"))
+                    })
+                })
+            })
+        })
+    }
+}
+
+/// v0.8.2 — Bridge `telemetry::Error` → `PyErr` at the FFI boundary.
+#[cfg(feature = "telemetry")]
+fn telemetry_err_to_py(e: crate::telemetry::Error) -> PyErr {
+    let kind = e.kind();
+    tracing::warn!(error = %e, kind = kind, "telemetry error");
+    match e {
+        crate::telemetry::Error::InvalidArgument(_)
+        | crate::telemetry::Error::LockContention(_) => PyValueError::new_err(kind),
+        crate::telemetry::Error::Backend(_)
+        | crate::telemetry::Error::NotImplemented(_)
+        | crate::telemetry::Error::Internal(_) => PyRuntimeError::new_err(kind),
+    }
 }
 
 /// v0.8.1 — Bridge `audit::Error` → `PyErr` at the FFI boundary.

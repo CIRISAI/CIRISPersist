@@ -62,6 +62,8 @@ pub mod secrets;
 pub mod server;
 pub mod signing;
 pub mod store;
+#[cfg(feature = "telemetry")]
+pub mod telemetry;
 pub mod verify;
 
 pub use ingest::{BatchSummary, IngestError, IngestPipeline};
