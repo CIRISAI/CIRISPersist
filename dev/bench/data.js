@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778712917399,
+  "lastUpdate": 1778713130238,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -12425,6 +12425,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 26129475,
             "range": "± 128833",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "86278052fdc1888307c4f90588950011f15a2fa3",
+          "message": "0.8.7 — cirisincident SQLite parity (issue #38 α4)\n\nFourth of the SQLite parity cuts. Correlation-keyed dedup + state\nmachine absorbed onto SQLite with byte-for-byte AV-55/AV-56\nsemantics.\n\n- src/incident/sqlite.rs: SqliteIncidentBackend impl of\n  IncidentService (4 methods).\n- JSONB ?| / ?& / ? operators translate to EXISTS-style\n  json_each subqueries. Dedup probe joins json_each on BOTH the\n  existing row's keys array AND the new incident's keys array.\n- State transitions use BEGIN IMMEDIATE for serialization (matches\n  v0.8.5 audit pattern).\n- Partial index WHERE state IN ('open', 'investigating') ports\n  directly (SQLite supports partial indexes).\n- cirisincident = [] feature gate.\n\nTests: full-lifecycle test (dedup, cross-category isolation,\nAV-56 oversized reject, state machine forward/backflow/notes-\nrequired, closed-no-dedup, correlate, list filters, tenant\nisolation, NotFound on missing). 349/349 lib pass across both\nbackends.\n\nv0.9.0 roadmap: secrets + cirisnode remain.\n\nReferences CIRISPersist#38.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-13T17:50:49-05:00",
+          "tree_id": "5aa90e89ae6243661a292f9fc5b7067ed8c2b416",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/86278052fdc1888307c4f90588950011f15a2fa3"
+        },
+        "date": 1778713129807,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 108814,
+            "range": "± 362",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 260531,
+            "range": "± 886",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 561856,
+            "range": "± 2649",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1991776,
+            "range": "± 4109",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 341,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1392,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8364,
+            "range": "± 47",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23172,
+            "range": "± 183",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26418,
+            "range": "± 283",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91409,
+            "range": "± 4527",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 365,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3183,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9856,
+            "range": "± 34",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41622,
+            "range": "± 167",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 635,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2246213,
+            "range": "± 17421",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7053591,
+            "range": "± 47411",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25867360,
+            "range": "± 855219",
             "unit": "ns/iter"
           }
         ]
