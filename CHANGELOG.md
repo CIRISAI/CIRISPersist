@@ -5,6 +5,39 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.8.7] — 2026-05-13
+
+**cirisincident SQLite parity** (v0.9.0 cut α4 toward CIRISPersist#38).
+
+- `src/incident/sqlite.rs` — `SqliteIncidentBackend` impl of
+  `IncidentService` (4 methods, AV-55 + AV-56 preserved).
+- JSONB-array `?|` / `?&` / `?` operators translate to
+  `EXISTS (SELECT 1 FROM json_each(correlation_keys) WHERE …)`
+  subqueries. Dedup probe joins `json_each` on both the existing
+  row's keys array AND the new incident's keys array.
+- State-machine `FOR UPDATE` semantics → `BEGIN IMMEDIATE` (same
+  pattern as cirisaudit SQLite).
+- Partial index `WHERE state IN ('open', 'investigating')` ports
+  directly (SQLite supports partial indexes).
+- `cirisincident = []` decoupled.
+
+Tests: 1/1 cirisincident SQLite test (full lifecycle) against
+in-memory SQLite. 349/349 lib pass across both backends.
+
+| v0.9.0 roadmap | Postgres | SQLite |
+|---|---|---|
+| secrets | ✓ | pending |
+| cirisnode | ✓ | pending |
+| cirisgraph | ✓ | ✓ v0.8.4 |
+| cirisaudit | ✓ | ✓ v0.8.5 |
+| telemetry | ✓ | ✓ v0.8.6 |
+| **cirisincident** | ✓ | **✓ v0.8.7** |
+
+Two modules remain before the v0.9.0 cut: secrets (v0.6.1) +
+cirisnode (v0.7.x). Both have crypto + signing-verify paths that
+are dialect-agnostic, so the SQLite work is migration + row-shape
+translation only.
+
 ## [0.8.6] — 2026-05-13
 
 **telemetry SQLite parity** (v0.9.0 cut α3 toward CIRISPersist#38).
