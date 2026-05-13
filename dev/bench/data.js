@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778684385773,
+  "lastUpdate": 1778685026579,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -11237,6 +11237,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23817182,
             "range": "± 179810",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "e53ab03434eae36b63c021f4777e2a353ec695a1",
+          "message": "0.7.4 — pipeline orchestration: extract wired into receive_and_persist (closes #19)\n\nv0.6.0 absorbed the scrub/extract/classify substrate (modules + V009\nmigration + get_features/get_classifications read API + scrub wired\ninto ingest). v0.6.1 added SecretsService. The remaining gap from\nissue #19 was the extract orchestration: extract was not actually\ncalled during receive_and_persist, so V009's extracted_features\ncolumn stayed NULL in production and consumers' get_features calls\nalways returned None. v0.7.4 closes the gap.\n\nWhat landed:\n\n- New Backend::update_features_batch trait method (extract-gated).\n  Default impl returns 0 (no-op) — memory + sqlite backends silently\n  skip. PostgresBackend overrides with a single-round-trip UPDATE\n  ... FROM (SELECT UNNEST(...)) that touches every named (trace_id,\n  thought_id) row.\n\n- Wire extract into IngestPipeline::receive_and_persist: after the\n  trace_events INSERT batch, iterate the verified CompleteTrace\n  events, build DeclaredCohortAxes from each trace's deployment_profile\n  block (V006 denormalized fields, required at 2.7.9), call\n  pipeline::extract::extract_features(trace_json, declared), and\n  batch-UPDATE all rows.\n\n- Non-fatal failure mode: if the post-insert UPDATE fails (transient\n  PG hiccup) or a single trace fails to serialize, log a structured\n  warn and continue. The trace_events rows already landed; an\n  extract miss leaves extracted_features NULL, which matches the\n  pre-v0.7.4 production state. Dropping verified agent testimony\n  for a downstream-enrichment failure would be the wrong trade-off.\n\nTests:\n\n- New update_features_batch_round_trip integration test against\n  live ciris-qa-postgres: insert 2 fixture traces with distinct\n  cohort axes (moderation/production/US vs research/staging/EU),\n  batch-update both with the corresponding Features, read back\n  each via read_features, assert the cohort axes round-tripped.\n  Covers the empty-fast-path (zero-len input returns 0 without\n  hitting the DB).\n- 268/268 lib pass; clippy -D warnings clean across postgres\n  extract classify pyo3 cirisnode.\n\nStill deferred from issue #19 (downstream follow-ups, not blocking\nthe substrate ask):\n- Classify wiring (classify module ships types only; matchers\n  unimplemented).\n- iter_features_by_cohort streaming API (cirislens_reader role\n  + SQL is sufficient for RATCHET in the interim).\n\nCloses CIRISPersist#19 — the post-ingest filter pipeline ask.\nv0.6.0 absorbed the substrate; v0.7.4 wires extract into the live\ningest path.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-13T09:59:07-05:00",
+          "tree_id": "a9a86c30254e680140f24ae22c524c1e96d5c559",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/e53ab03434eae36b63c021f4777e2a353ec695a1"
+        },
+        "date": 1778685026131,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 108660,
+            "range": "± 288",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 259229,
+            "range": "± 1103",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 561111,
+            "range": "± 1526",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1987459,
+            "range": "± 3841",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 352,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1451,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8246,
+            "range": "± 116",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23181,
+            "range": "± 245",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26393,
+            "range": "± 74",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91055,
+            "range": "± 445",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 367,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3193,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9883,
+            "range": "± 20",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 43167,
+            "range": "± 104",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 637,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2259712,
+            "range": "± 183415",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7037415,
+            "range": "± 339442",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 26049666,
+            "range": "± 386535",
             "unit": "ns/iter"
           }
         ]
