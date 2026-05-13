@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778632609602,
+  "lastUpdate": 1778634166127,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -10313,6 +10313,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23967010,
             "range": "± 274100",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "3df96189d65819918841511a9f71222586e1e704",
+          "message": "v0.7.0-α1: cirisnode feature + V011 migration + module skeleton\n\nFoundation commit for the CIRISNodeCore federation-consensus\nsubstrate (FSD Appendix A). Distinct track from v0.6.x — different\nconsumer ecosystem (CIRISNodeCore vs lens/agent/bridge), different\nCargo feature (cirisnode), different PostgreSQL schema (cirisnode.*\nvs cirislens.*).\n\nNEW SURFACE\n- src/cirisnode/mod.rs — cirisnode::Error with 8 stable kind()\n  tokens (cirisnode_invalid_argument / not_authorized / signature /\n  conflict / not_found / backend / not_implemented / internal).\n  Mirrors the kind() discipline from read::Error, pipeline::Error,\n  secrets::SecretsError. Wire types + trait surface land in α2/α3.\n\nCARGO FEATURE\n- cirisnode = [\"postgres\"] — declared. Implies postgres because the\n  V011 migration + the typed-write path require pg. No new external\n  deps yet (ciris-crypto + uuid + serde_json are already pulled\n  transitively by the secrets / federation features).\n\nV011 MIGRATION — cirisnode schema with 8 tables\n- contributions             — Contribution envelope rows, 7-variant\n                              contribution_type discriminator\n- votes                     — VoteEnvelope rows, optional FK to\n                              contribution_id\n- credits_ledger            — derived per (contributor, cell, subject)\n- expertise_ledger          — derived per (contributor, cell), with\n                              is_active flag for routing\n- moderation_events         — accusation chain\n- slashing_attestations     — adjudication outcomes (FK→moderation)\n- reconsideration_requests  — reverse-prior-slashing\n- reconsideration_attestations — reconsideration outcomes\n\nEvery row carries the standard CIRISPersist audit envelope columns\n(signature + signing_key_id + signature_verified +\noriginal_content_hash + scrub_signature_classical/pqc + scrub_key_id\n+ scrub_timestamp + pqc_completed_at + persist_row_hash). Mirrors\nthe federation_directory V004 shape + the trace_events V001 shape.\n\nis_canonical + canonicalized_at columns on the audit-chain tables\nimplement the SCHEMA.md §13.2 pending-vs-canonical split. The\ncanonical-promotion pass (CIRISNodeCore-side) flips is_canonical\nwhen the audit chain qualifies.\n\nIF NOT EXISTS on every CREATE per v0.6.1-α3 lesson learned\n(idempotent multi-worker boot).\n\nVERIFICATION\n- 1 unit test (error kinds).\n- V011 applies cleanly against live ciris-qa-postgres; all 8\n  tables present after first PG-test run.\n- cargo clippy --tests clean on cirisnode feature build.\n\nNEXT: α2 wire types (ContributionEnvelope + 7 payload variants +\nVoteEnvelope + WitnessSet + ExpertiseAttestation + ModerationEvent +\nSlashingAttestation + ReconsiderationRequest/Attestation + Ledger\ntypes) per CIRISNodeCore/SCHEMA.md §3-10.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-12T19:54:41-05:00",
+          "tree_id": "eecf2f0fad0217607cae8721f65465c331127393",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/3df96189d65819918841511a9f71222586e1e704"
+        },
+        "date": 1778634165081,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 95749,
+            "range": "± 205",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 237975,
+            "range": "± 645",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 520813,
+            "range": "± 3940",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 2006421,
+            "range": "± 42511",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 329,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1296,
+            "range": "± 123",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7216,
+            "range": "± 56",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 20549,
+            "range": "± 483",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 23982,
+            "range": "± 90",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 88517,
+            "range": "± 177",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 317,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3188,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9772,
+            "range": "± 55",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 44258,
+            "range": "± 142",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 545,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2127396,
+            "range": "± 55831",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6529990,
+            "range": "± 122942",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23660029,
+            "range": "± 415287",
             "unit": "ns/iter"
           }
         ]
