@@ -306,14 +306,30 @@ ndarray              = { version = "0.16", optional = true }
 # resolve to the same dep entry; cargo unifies on the version pin.
 rusqlite = { version = "0.31", features = ["chrono", "serde_json"], optional = true }
 
-[target.'cfg(not(target_os = "ios"))'.dependencies]
-rusqlite = { version = "0.31", features = ["bundled", "chrono", "serde_json"], optional = true }
-
 # Phase 1 robustness — local journal for outage tolerance (FSD §3.4)
 redb = "4"
 
 # Async runtime — phase 1+
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "signal", "time"] }
+
+# v0.9.0 — iOS-specific rusqlite override. Cargo MERGES the features
+# list from `[dependencies]` and from any matching
+# `[target.cfg(...)'.dependencies]` table that the current build
+# target matches. On non-iOS, this target table adds `bundled` →
+# resolved feature set is `bundled + chrono + serde_json`. On iOS,
+# this table doesn't apply, so the base `chrono + serde_json`
+# (system-linked libsqlite3) wins. Both produce the desired shape
+# per CIRISVerify v1.6.4's libRPAC fix.
+#
+# Bug history (closed v0.9.0): v0.8.4 placed this target table
+# BEFORE `redb`/`tokio` in Cargo.toml — which silently swept those
+# deps into the iOS-excluded scope. iOS device builds compiled
+# fine on every other target, but tag CI's iOS job failed with
+# "cannot find module or crate `tokio`" — blocking PyPI publish.
+# Position now pinned at the END of `[dependencies]`, after every
+# platform-independent dep.
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+rusqlite = { version = "0.31", features = ["bundled", "chrono", "serde_json"], optional = true }
 
 [dev-dependencies]
 # Mission category §4: canonicalization parity. Used to validate our
