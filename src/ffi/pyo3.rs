@@ -3645,19 +3645,33 @@ impl PyEngine {
         accessor: &str,
     ) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let key = key.to_owned();
             let value = value.to_owned();
             let accessor = accessor.to_owned();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::secrets::SecretsService;
-                    backend
-                        .store_secret(key, value, accessor)
-                        .await
-                        .map_err(secrets_err_to_py)
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        backend
+                            .store_secret(key, value, accessor)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::secrets::sqlite::SqliteSecretsBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        backend
+                            .store_secret(key, value, accessor)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
             })
         })
     }
@@ -3672,18 +3686,32 @@ impl PyEngine {
         accessor: &str,
     ) -> PyResult<Option<String>> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let key = key.to_owned();
             let accessor = accessor.to_owned();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::secrets::SecretsService;
-                    backend
-                        .retrieve_secret(&key, accessor)
-                        .await
-                        .map_err(secrets_err_to_py)
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        backend
+                            .retrieve_secret(&key, accessor)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::secrets::sqlite::SqliteSecretsBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        backend
+                            .retrieve_secret(&key, accessor)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
             })
         })
     }
@@ -3700,25 +3728,45 @@ impl PyEngine {
         decrypt: bool,
     ) -> PyResult<Option<String>> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let uuid = uuid.to_owned();
             let purpose = purpose.to_owned();
             let accessor = accessor.to_owned();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::secrets::SecretsService;
-                    let opt = backend
-                        .recall_secret(&uuid, purpose, accessor, decrypt)
-                        .await
-                        .map_err(secrets_err_to_py)?;
-                    match opt {
-                        None => Ok(None),
-                        Some(r) => Ok(Some(serde_json::to_string(&r).map_err(|e| {
-                            PyRuntimeError::new_err(format!("SecretRecallResult encode: {e}"))
-                        })?)),
-                    }
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        let opt = backend
+                            .recall_secret(&uuid, purpose, accessor, decrypt)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match opt {
+                            None => Ok(None),
+                            Some(r) => Ok(Some(serde_json::to_string(&r).map_err(|e| {
+                                PyRuntimeError::new_err(format!("SecretRecallResult encode: {e}"))
+                            })?)),
+                        }
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::secrets::sqlite::SqliteSecretsBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        let opt = backend
+                            .recall_secret(&uuid, purpose, accessor, decrypt)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match opt {
+                            None => Ok(None),
+                            Some(r) => Ok(Some(serde_json::to_string(&r).map_err(|e| {
+                                PyRuntimeError::new_err(format!("SecretRecallResult encode: {e}"))
+                            })?)),
+                        }
+                    })
+                }
             })
         })
     }
@@ -3733,23 +3781,40 @@ impl PyEngine {
         filter_json: &str,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let filter: crate::secrets::SecretsListFilter = serde_json::from_str(filter_json)
                 .map_err(|e| {
                     PyValueError::new_err(format!("SecretsListFilter JSON decode: {e}"))
                 })?;
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::secrets::SecretsService;
-                    let refs = backend
-                        .list_stored_secrets(limit, filter)
-                        .await
-                        .map_err(secrets_err_to_py)?;
-                    serde_json::to_string(&refs).map_err(|e| {
-                        PyRuntimeError::new_err(format!("Vec<SecretReference> encode: {e}"))
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        let refs = backend
+                            .list_stored_secrets(limit, filter)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&refs).map_err(|e| {
+                            PyRuntimeError::new_err(format!("Vec<SecretReference> encode: {e}"))
+                        })
                     })
-                })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::secrets::sqlite::SqliteSecretsBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        let refs = backend
+                            .list_stored_secrets(limit, filter)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&refs).map_err(|e| {
+                            PyRuntimeError::new_err(format!("Vec<SecretReference> encode: {e}"))
+                        })
+                    })
+                }
             })
         })
     }
@@ -3758,18 +3823,32 @@ impl PyEngine {
     #[cfg(feature = "secrets")]
     fn secrets_forget_secret(&self, py: Python<'_>, uuid: &str, accessor: &str) -> PyResult<bool> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let uuid = uuid.to_owned();
             let accessor = accessor.to_owned();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::secrets::SecretsService;
-                    backend
-                        .forget_secret(&uuid, accessor)
-                        .await
-                        .map_err(secrets_err_to_py)
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        backend
+                            .forget_secret(&uuid, accessor)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::secrets::sqlite::SqliteSecretsBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        backend
+                            .forget_secret(&uuid, accessor)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
             })
         })
     }
@@ -3785,26 +3864,47 @@ impl PyEngine {
         accessor: &str,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let text = text.to_owned();
             let smi = source_message_id.to_owned();
             let accessor = accessor.to_owned();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::secrets::SecretsService;
-                    let (filtered, refs) = backend
-                        .process_incoming_text(&text, &smi, accessor)
-                        .await
-                        .map_err(secrets_err_to_py)?;
-                    let body = serde_json::json!({
-                        "filtered_text": filtered,
-                        "refs": refs,
-                    });
-                    serde_json::to_string(&body).map_err(|e| {
-                        PyRuntimeError::new_err(format!("process_incoming_text encode: {e}"))
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        let (filtered, refs) = backend
+                            .process_incoming_text(&text, &smi, accessor)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        let body = serde_json::json!({
+                            "filtered_text": filtered,
+                            "refs": refs,
+                        });
+                        serde_json::to_string(&body).map_err(|e| {
+                            PyRuntimeError::new_err(format!("process_incoming_text encode: {e}"))
+                        })
                     })
-                })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::secrets::sqlite::SqliteSecretsBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        let (filtered, refs) = backend
+                            .process_incoming_text(&text, &smi, accessor)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        let body = serde_json::json!({
+                            "filtered_text": filtered,
+                            "refs": refs,
+                        });
+                        serde_json::to_string(&body).map_err(|e| {
+                            PyRuntimeError::new_err(format!("process_incoming_text encode: {e}"))
+                        })
+                    })
+                }
             })
         })
     }
@@ -3819,23 +3919,41 @@ impl PyEngine {
         ctx_json: &str,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let action_type = action_type.to_owned();
             let action_params: serde_json::Value = serde_json::from_str(action_params_json)
                 .map_err(|e| PyValueError::new_err(format!("action_params decode: {e}")))?;
             let ctx: crate::secrets::DecapsulationContext = serde_json::from_str(ctx_json)
                 .map_err(|e| PyValueError::new_err(format!("DecapsulationContext decode: {e}")))?;
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::secrets::SecretsService;
-                    let out = backend
-                        .decapsulate_secrets_in_parameters(&action_type, action_params, ctx)
-                        .await
-                        .map_err(secrets_err_to_py)?;
-                    serde_json::to_string(&out)
-                        .map_err(|e| PyRuntimeError::new_err(format!("decapsulate encode: {e}")))
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        let out = backend
+                            .decapsulate_secrets_in_parameters(&action_type, action_params, ctx)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&out).map_err(|e| {
+                            PyRuntimeError::new_err(format!("decapsulate encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::secrets::sqlite::SqliteSecretsBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        let out = backend
+                            .decapsulate_secrets_in_parameters(&action_type, action_params, ctx)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&out).map_err(|e| {
+                            PyRuntimeError::new_err(format!("decapsulate encode: {e}"))
+                        })
+                    })
+                }
             })
         })
     }
@@ -3845,14 +3963,31 @@ impl PyEngine {
     #[cfg(feature = "secrets")]
     fn secrets_encrypt(&self, py: Python<'_>, plaintext: &str) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let pt = plaintext.to_owned();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::secrets::SecretsService;
-                    backend.encrypt(&pt).await.map_err(secrets_err_to_py)
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        backend
+                            .encrypt(&pt)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::secrets::sqlite::SqliteSecretsBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        backend
+                            .encrypt(&pt)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
             })
         })
     }
@@ -3861,14 +3996,31 @@ impl PyEngine {
     #[cfg(feature = "secrets")]
     fn secrets_decrypt(&self, py: Python<'_>, ciphertext: &str) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let ct = ciphertext.to_owned();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::secrets::SecretsService;
-                    backend.decrypt(&ct).await.map_err(secrets_err_to_py)
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        backend
+                            .decrypt(&ct)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::secrets::sqlite::SqliteSecretsBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        backend
+                            .decrypt(&ct)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
             })
         })
     }
@@ -3878,18 +4030,36 @@ impl PyEngine {
     #[cfg(feature = "secrets")]
     fn secrets_get_filter_config(&self, py: Python<'_>) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::secrets::SecretsService;
-                    let cfg = backend
-                        .get_filter_config()
-                        .await
-                        .map_err(secrets_err_to_py)?;
-                    serde_json::to_string(&cfg)
-                        .map_err(|e| PyRuntimeError::new_err(format!("FilterConfig encode: {e}")))
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        let cfg = backend
+                            .get_filter_config()
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&cfg).map_err(|e| {
+                            PyRuntimeError::new_err(format!("FilterConfig encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::secrets::sqlite::SqliteSecretsBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        let cfg = backend
+                            .get_filter_config()
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&cfg).map_err(|e| {
+                            PyRuntimeError::new_err(format!("FilterConfig encode: {e}"))
+                        })
+                    })
+                }
             })
         })
     }
@@ -3904,22 +4074,39 @@ impl PyEngine {
         accessor: &str,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let req: crate::secrets::FilterUpdateRequest = serde_json::from_str(updates_json)
                 .map_err(|e| PyValueError::new_err(format!("FilterUpdateRequest decode: {e}")))?;
             let accessor = accessor.to_owned();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::secrets::SecretsService;
-                    let res = backend
-                        .update_filter_config(req, accessor)
-                        .await
-                        .map_err(secrets_err_to_py)?;
-                    serde_json::to_string(&res).map_err(|e| {
-                        PyRuntimeError::new_err(format!("FilterUpdateResult encode: {e}"))
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        let res = backend
+                            .update_filter_config(req, accessor)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&res).map_err(|e| {
+                            PyRuntimeError::new_err(format!("FilterUpdateResult encode: {e}"))
+                        })
                     })
-                })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::secrets::sqlite::SqliteSecretsBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        let res = backend
+                            .update_filter_config(req, accessor)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&res).map_err(|e| {
+                            PyRuntimeError::new_err(format!("FilterUpdateResult encode: {e}"))
+                        })
+                    })
+                }
             })
         })
     }
@@ -3929,19 +4116,36 @@ impl PyEngine {
     #[cfg(feature = "secrets")]
     fn secrets_get_service_stats(&self, py: Python<'_>) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::secrets::SecretsService;
-                    let s = backend
-                        .get_service_stats()
-                        .await
-                        .map_err(secrets_err_to_py)?;
-                    serde_json::to_string(&s).map_err(|e| {
-                        PyRuntimeError::new_err(format!("SecretsServiceStats encode: {e}"))
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        let s = backend
+                            .get_service_stats()
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&s).map_err(|e| {
+                            PyRuntimeError::new_err(format!("SecretsServiceStats encode: {e}"))
+                        })
                     })
-                })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::secrets::sqlite::SqliteSecretsBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        let s = backend
+                            .get_service_stats()
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&s).map_err(|e| {
+                            PyRuntimeError::new_err(format!("SecretsServiceStats encode: {e}"))
+                        })
+                    })
+                }
             })
         })
     }
@@ -3950,13 +4154,30 @@ impl PyEngine {
     #[cfg(feature = "secrets")]
     fn secrets_is_healthy(&self, py: Python<'_>) -> PyResult<bool> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::secrets::SecretsService;
-                    backend.is_healthy().await.map_err(secrets_err_to_py)
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        backend
+                            .is_healthy()
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::secrets::sqlite::SqliteSecretsBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        backend
+                            .is_healthy()
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
             })
         })
     }
@@ -3971,20 +4192,37 @@ impl PyEngine {
         limit: usize,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let uuid = secret_uuid.map(str::to_owned);
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::secrets::SecretsService;
-                    let logs = backend
-                        .get_access_logs(uuid.as_deref(), limit)
-                        .await
-                        .map_err(secrets_err_to_py)?;
-                    serde_json::to_string(&logs).map_err(|e| {
-                        PyRuntimeError::new_err(format!("Vec<AccessLogEntry> encode: {e}"))
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        let logs = backend
+                            .get_access_logs(uuid.as_deref(), limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&logs).map_err(|e| {
+                            PyRuntimeError::new_err(format!("Vec<AccessLogEntry> encode: {e}"))
+                        })
                     })
-                })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::secrets::sqlite::SqliteSecretsBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        let logs = backend
+                            .get_access_logs(uuid.as_deref(), limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&logs).map_err(|e| {
+                            PyRuntimeError::new_err(format!("Vec<AccessLogEntry> encode: {e}"))
+                        })
+                    })
+                }
             })
         })
     }
@@ -3999,22 +4237,40 @@ impl PyEngine {
         accessor: &str,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let key_ref: crate::secrets::MasterKeyRef =
                 serde_json::from_str(new_master_key_ref_json)
                     .map_err(|e| PyValueError::new_err(format!("MasterKeyRef decode: {e}")))?;
             let accessor = accessor.to_owned();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::secrets::SecretsService;
-                    let res = backend
-                        .reencrypt_all(key_ref, accessor)
-                        .await
-                        .map_err(secrets_err_to_py)?;
-                    serde_json::to_string(&res)
-                        .map_err(|e| PyRuntimeError::new_err(format!("RotationResult encode: {e}")))
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        let res = backend
+                            .reencrypt_all(key_ref, accessor)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&res).map_err(|e| {
+                            PyRuntimeError::new_err(format!("RotationResult encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::secrets::sqlite::SqliteSecretsBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        let res = backend
+                            .reencrypt_all(key_ref, accessor)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&res).map_err(|e| {
+                            PyRuntimeError::new_err(format!("RotationResult encode: {e}"))
+                        })
+                    })
+                }
             })
         })
     }
@@ -4030,7 +4286,6 @@ impl PyEngine {
         accessor: &str,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let new_master: Option<Vec<u8>> = match new_master_b64 {
                 None => None,
@@ -4043,16 +4298,35 @@ impl PyEngine {
                 }
             };
             let accessor = accessor.to_owned();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::secrets::SecretsService;
-                    let r = backend
-                        .rotate_master_key(new_master, accessor)
-                        .await
-                        .map_err(secrets_err_to_py)?;
-                    serde_json::to_string(&r)
-                        .map_err(|e| PyRuntimeError::new_err(format!("MasterKeyRef encode: {e}")))
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        let r = backend
+                            .rotate_master_key(new_master, accessor)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&r).map_err(|e| {
+                            PyRuntimeError::new_err(format!("MasterKeyRef encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::secrets::sqlite::SqliteSecretsBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        let r = backend
+                            .rotate_master_key(new_master, accessor)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&r).map_err(|e| {
+                            PyRuntimeError::new_err(format!("MasterKeyRef encode: {e}"))
+                        })
+                    })
+                }
             })
         })
     }
@@ -4061,13 +4335,30 @@ impl PyEngine {
     #[cfg(feature = "secrets")]
     fn secrets_test_encryption(&self, py: Python<'_>) -> PyResult<bool> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::secrets::SecretsService;
-                    backend.test_encryption().await.map_err(secrets_err_to_py)
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        backend
+                            .test_encryption()
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::secrets::sqlite::SqliteSecretsBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        backend
+                            .test_encryption()
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
             })
         })
     }
@@ -4078,19 +4369,37 @@ impl PyEngine {
     #[cfg(feature = "secrets")]
     fn secrets_migrate_to_hardware_key(&self, py: Python<'_>, accessor: &str) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let accessor = accessor.to_owned();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::secrets::SecretsService;
-                    let r = backend
-                        .migrate_to_hardware_key(accessor)
-                        .await
-                        .map_err(secrets_err_to_py)?;
-                    serde_json::to_string(&r)
-                        .map_err(|e| PyRuntimeError::new_err(format!("MasterKeyRef encode: {e}")))
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        let r = backend
+                            .migrate_to_hardware_key(accessor)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&r).map_err(|e| {
+                            PyRuntimeError::new_err(format!("MasterKeyRef encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::secrets::sqlite::SqliteSecretsBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        let r = backend
+                            .migrate_to_hardware_key(accessor)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&r).map_err(|e| {
+                            PyRuntimeError::new_err(format!("MasterKeyRef encode: {e}"))
+                        })
+                    })
+                }
             })
         })
     }
@@ -4106,20 +4415,34 @@ impl PyEngine {
     #[cfg(feature = "cirisnode")]
     fn cirisnode_put_contribution(&self, py: Python<'_>, envelope_json: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let env: crate::cirisnode::ContributionEnvelope = serde_json::from_str(envelope_json)
                 .map_err(|e| {
                 PyValueError::new_err(format!("ContributionEnvelope decode: {e}"))
             })?;
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::cirisnode::NodeCoreService;
-                    backend
-                        .put_contribution(env)
-                        .await
-                        .map_err(cirisnode_err_to_py)
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        backend
+                            .put_contribution(env)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        backend
+                            .put_contribution(env)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
             })
         })
     }
@@ -4128,15 +4451,32 @@ impl PyEngine {
     #[cfg(feature = "cirisnode")]
     fn cirisnode_cast_vote(&self, py: Python<'_>, envelope_json: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let env: crate::cirisnode::VoteEnvelope = serde_json::from_str(envelope_json)
                 .map_err(|e| PyValueError::new_err(format!("VoteEnvelope decode: {e}")))?;
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::cirisnode::NodeCoreService;
-                    backend.cast_vote(env).await.map_err(cirisnode_err_to_py)
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        backend
+                            .cast_vote(env)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        backend
+                            .cast_vote(env)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
             })
         })
     }
@@ -4145,18 +4485,32 @@ impl PyEngine {
     #[cfg(feature = "cirisnode")]
     fn cirisnode_update_credits_ledger(&self, py: Python<'_>, update_json: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let update: crate::cirisnode::CreditsUpdate = serde_json::from_str(update_json)
                 .map_err(|e| PyValueError::new_err(format!("CreditsUpdate decode: {e}")))?;
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::cirisnode::NodeCoreService;
-                    backend
-                        .update_credits_ledger(update)
-                        .await
-                        .map_err(cirisnode_err_to_py)
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        backend
+                            .update_credits_ledger(update)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        backend
+                            .update_credits_ledger(update)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
             })
         })
     }
@@ -4165,18 +4519,32 @@ impl PyEngine {
     #[cfg(feature = "cirisnode")]
     fn cirisnode_update_expertise_ledger(&self, py: Python<'_>, update_json: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let update: crate::cirisnode::ExpertiseUpdate = serde_json::from_str(update_json)
                 .map_err(|e| PyValueError::new_err(format!("ExpertiseUpdate decode: {e}")))?;
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::cirisnode::NodeCoreService;
-                    backend
-                        .update_expertise_ledger(update)
-                        .await
-                        .map_err(cirisnode_err_to_py)
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        backend
+                            .update_expertise_ledger(update)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        backend
+                            .update_expertise_ledger(update)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
             })
         })
     }
@@ -4185,18 +4553,32 @@ impl PyEngine {
     #[cfg(feature = "cirisnode")]
     fn cirisnode_put_moderation_event(&self, py: Python<'_>, event_json: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let event: crate::cirisnode::ModerationEvent = serde_json::from_str(event_json)
                 .map_err(|e| PyValueError::new_err(format!("ModerationEvent decode: {e}")))?;
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::cirisnode::NodeCoreService;
-                    backend
-                        .put_moderation_event(event)
-                        .await
-                        .map_err(cirisnode_err_to_py)
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        backend
+                            .put_moderation_event(event)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        backend
+                            .put_moderation_event(event)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
             })
         })
     }
@@ -4205,18 +4587,32 @@ impl PyEngine {
     #[cfg(feature = "cirisnode")]
     fn cirisnode_put_slashing_attestation(&self, py: Python<'_>, att_json: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let att: crate::cirisnode::SlashingAttestation = serde_json::from_str(att_json)
                 .map_err(|e| PyValueError::new_err(format!("SlashingAttestation decode: {e}")))?;
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::cirisnode::NodeCoreService;
-                    backend
-                        .put_slashing_attestation(att)
-                        .await
-                        .map_err(cirisnode_err_to_py)
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        backend
+                            .put_slashing_attestation(att)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        backend
+                            .put_slashing_attestation(att)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
             })
         })
     }
@@ -4229,20 +4625,34 @@ impl PyEngine {
         req_json: &str,
     ) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let req: crate::cirisnode::ReconsiderationRequest = serde_json::from_str(req_json)
                 .map_err(|e| {
                     PyValueError::new_err(format!("ReconsiderationRequest decode: {e}"))
                 })?;
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::cirisnode::NodeCoreService;
-                    backend
-                        .put_reconsideration_request(req)
-                        .await
-                        .map_err(cirisnode_err_to_py)
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        backend
+                            .put_reconsideration_request(req)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        backend
+                            .put_reconsideration_request(req)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
             })
         })
     }
@@ -4255,20 +4665,34 @@ impl PyEngine {
         att_json: &str,
     ) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let att: crate::cirisnode::ReconsiderationAttestation = serde_json::from_str(att_json)
                 .map_err(|e| {
                     PyValueError::new_err(format!("ReconsiderationAttestation decode: {e}"))
                 })?;
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::cirisnode::NodeCoreService;
-                    backend
-                        .put_reconsideration_attestation(att)
-                        .await
-                        .map_err(cirisnode_err_to_py)
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        backend
+                            .put_reconsideration_attestation(att)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        backend
+                            .put_reconsideration_attestation(att)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
             })
         })
     }
@@ -4282,18 +4706,32 @@ impl PyEngine {
     #[cfg(feature = "cirisnode")]
     fn cirisnode_put_promotion_attestation(&self, py: Python<'_>, att_json: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let att: crate::cirisnode::PromotionAttestation = serde_json::from_str(att_json)
                 .map_err(|e| PyValueError::new_err(format!("PromotionAttestation decode: {e}")))?;
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::cirisnode::NodeCoreService;
-                    backend
-                        .put_promotion_attestation(att)
-                        .await
-                        .map_err(cirisnode_err_to_py)
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        backend
+                            .put_promotion_attestation(att)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        backend
+                            .put_promotion_attestation(att)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
             })
         })
     }
@@ -4308,21 +4746,38 @@ impl PyEngine {
         language: &str,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let domain = domain.to_owned();
             let language = language.to_owned();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::cirisnode::NodeCoreService;
-                    let rows = backend
-                        .routable_contributors(&domain, &language)
-                        .await
-                        .map_err(cirisnode_err_to_py)?;
-                    serde_json::to_string(&rows).map_err(|e| {
-                        PyRuntimeError::new_err(format!("RoutableContributor encode: {e}"))
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        let rows = backend
+                            .routable_contributors(&domain, &language)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&rows).map_err(|e| {
+                            PyRuntimeError::new_err(format!("RoutableContributor encode: {e}"))
+                        })
                     })
-                })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        let rows = backend
+                            .routable_contributors(&domain, &language)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&rows).map_err(|e| {
+                            PyRuntimeError::new_err(format!("RoutableContributor encode: {e}"))
+                        })
+                    })
+                }
             })
         })
     }
@@ -4340,26 +4795,46 @@ impl PyEngine {
         subject: &str,
     ) -> PyResult<Option<String>> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let contributor_id = contributor_id.to_owned();
             let domain = domain.to_owned();
             let language = language.to_owned();
             let subject = subject.to_owned();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::cirisnode::NodeCoreService;
-                    let opt = backend
-                        .read_vote_weight(&contributor_id, &domain, &language, &subject)
-                        .await
-                        .map_err(cirisnode_err_to_py)?;
-                    match opt {
-                        None => Ok(None),
-                        Some(w) => Ok(Some(serde_json::to_string(&w).map_err(|e| {
-                            PyRuntimeError::new_err(format!("VoteWeight encode: {e}"))
-                        })?)),
-                    }
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        let opt = backend
+                            .read_vote_weight(&contributor_id, &domain, &language, &subject)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match opt {
+                            None => Ok(None),
+                            Some(w) => Ok(Some(serde_json::to_string(&w).map_err(|e| {
+                                PyRuntimeError::new_err(format!("VoteWeight encode: {e}"))
+                            })?)),
+                        }
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        let opt = backend
+                            .read_vote_weight(&contributor_id, &domain, &language, &subject)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match opt {
+                            None => Ok(None),
+                            Some(w) => Ok(Some(serde_json::to_string(&w).map_err(|e| {
+                                PyRuntimeError::new_err(format!("VoteWeight encode: {e}"))
+                            })?)),
+                        }
+                    })
+                }
             })
         })
     }
@@ -4375,7 +4850,6 @@ impl PyEngine {
         limit: i64,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let filter: crate::cirisnode::ContributionsFilter = serde_json::from_str(filter_json)
                 .map_err(|e| {
@@ -4388,17 +4862,35 @@ impl PyEngine {
                         .map_err(|e| PyValueError::new_err(format!("ListCursor decode: {e}")))?,
                 ),
             };
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::cirisnode::NodeCoreService;
-                    let page = backend
-                        .list_contributions(filter, cursor, limit)
-                        .await
-                        .map_err(cirisnode_err_to_py)?;
-                    serde_json::to_string(&page).map_err(|e| {
-                        PyRuntimeError::new_err(format!("ContributionListPage encode: {e}"))
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        let page = backend
+                            .list_contributions(filter, cursor, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&page).map_err(|e| {
+                            PyRuntimeError::new_err(format!("ContributionListPage encode: {e}"))
+                        })
                     })
-                })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        let page = backend
+                            .list_contributions(filter, cursor, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&page).map_err(|e| {
+                            PyRuntimeError::new_err(format!("ContributionListPage encode: {e}"))
+                        })
+                    })
+                }
             })
         })
     }
@@ -4414,7 +4906,6 @@ impl PyEngine {
         limit: i64,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let filter: crate::cirisnode::VotesFilter = serde_json::from_str(filter_json)
                 .map_err(|e| PyValueError::new_err(format!("VotesFilter decode: {e}")))?;
@@ -4425,16 +4916,35 @@ impl PyEngine {
                         .map_err(|e| PyValueError::new_err(format!("ListCursor decode: {e}")))?,
                 ),
             };
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::cirisnode::NodeCoreService;
-                    let page = backend
-                        .list_votes(filter, cursor, limit)
-                        .await
-                        .map_err(cirisnode_err_to_py)?;
-                    serde_json::to_string(&page)
-                        .map_err(|e| PyRuntimeError::new_err(format!("VoteListPage encode: {e}")))
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        let page = backend
+                            .list_votes(filter, cursor, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&page).map_err(|e| {
+                            PyRuntimeError::new_err(format!("VoteListPage encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        let page = backend
+                            .list_votes(filter, cursor, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&page).map_err(|e| {
+                            PyRuntimeError::new_err(format!("VoteListPage encode: {e}"))
+                        })
+                    })
+                }
             })
         })
     }
@@ -4450,26 +4960,46 @@ impl PyEngine {
         subject: &str,
     ) -> PyResult<Option<String>> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let contributor_id = contributor_id.to_owned();
             let domain = domain.to_owned();
             let language = language.to_owned();
             let subject = subject.to_owned();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::cirisnode::NodeCoreService;
-                    let opt = backend
-                        .get_credits_ledger(&contributor_id, &domain, &language, &subject)
-                        .await
-                        .map_err(cirisnode_err_to_py)?;
-                    match opt {
-                        None => Ok(None),
-                        Some(r) => Ok(Some(serde_json::to_string(&r).map_err(|e| {
-                            PyRuntimeError::new_err(format!("CreditsLedgerEntry encode: {e}"))
-                        })?)),
-                    }
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        let opt = backend
+                            .get_credits_ledger(&contributor_id, &domain, &language, &subject)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match opt {
+                            None => Ok(None),
+                            Some(r) => Ok(Some(serde_json::to_string(&r).map_err(|e| {
+                                PyRuntimeError::new_err(format!("CreditsLedgerEntry encode: {e}"))
+                            })?)),
+                        }
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        let opt = backend
+                            .get_credits_ledger(&contributor_id, &domain, &language, &subject)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match opt {
+                            None => Ok(None),
+                            Some(r) => Ok(Some(serde_json::to_string(&r).map_err(|e| {
+                                PyRuntimeError::new_err(format!("CreditsLedgerEntry encode: {e}"))
+                            })?)),
+                        }
+                    })
+                }
             })
         })
     }
@@ -4484,25 +5014,45 @@ impl PyEngine {
         language: &str,
     ) -> PyResult<Option<String>> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let contributor_id = contributor_id.to_owned();
             let domain = domain.to_owned();
             let language = language.to_owned();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::cirisnode::NodeCoreService;
-                    let opt = backend
-                        .get_expertise_ledger(&contributor_id, &domain, &language)
-                        .await
-                        .map_err(cirisnode_err_to_py)?;
-                    match opt {
-                        None => Ok(None),
-                        Some(r) => Ok(Some(serde_json::to_string(&r).map_err(|e| {
-                            PyRuntimeError::new_err(format!("ExpertiseLedgerEntry encode: {e}"))
-                        })?)),
-                    }
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        let opt = backend
+                            .get_expertise_ledger(&contributor_id, &domain, &language)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match opt {
+                            None => Ok(None),
+                            Some(r) => Ok(Some(serde_json::to_string(&r).map_err(|e| {
+                                PyRuntimeError::new_err(format!("ExpertiseLedgerEntry encode: {e}"))
+                            })?)),
+                        }
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        let opt = backend
+                            .get_expertise_ledger(&contributor_id, &domain, &language)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match opt {
+                            None => Ok(None),
+                            Some(r) => Ok(Some(serde_json::to_string(&r).map_err(|e| {
+                                PyRuntimeError::new_err(format!("ExpertiseLedgerEntry encode: {e}"))
+                            })?)),
+                        }
+                    })
+                }
             })
         })
     }
@@ -4524,18 +5074,31 @@ impl PyEngine {
         expected_version: i32,
     ) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let node: crate::graph::GraphNode = serde_json::from_str(node_json)
                 .map_err(|e| PyValueError::new_err(format!("GraphNode decode: {e}")))?;
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::graph::GraphService;
-                    backend
-                        .upsert_node(node, expected_version)
-                        .await
-                        .map_err(cirisgraph_err_to_py)
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::graph::GraphService;
+                        backend
+                            .upsert_node(node, expected_version)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::graph::sqlite::SqliteGraphBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::graph::GraphService;
+                        backend
+                            .upsert_node(node, expected_version)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
             })
         })
     }
@@ -4544,18 +5107,31 @@ impl PyEngine {
     #[cfg(feature = "cirisgraph")]
     fn cirisgraph_upsert_edge(&self, py: Python<'_>, edge_json: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let edge: crate::graph::GraphEdge = serde_json::from_str(edge_json)
                 .map_err(|e| PyValueError::new_err(format!("GraphEdge decode: {e}")))?;
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::graph::GraphService;
-                    backend
-                        .upsert_edge(edge)
-                        .await
-                        .map_err(cirisgraph_err_to_py)
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::graph::GraphService;
+                        backend
+                            .upsert_edge(edge)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::graph::sqlite::SqliteGraphBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::graph::GraphService;
+                        backend
+                            .upsert_edge(edge)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
             })
         })
     }
@@ -4571,19 +5147,32 @@ impl PyEngine {
         hard: bool,
     ) -> PyResult<bool> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let node_id = node_id.to_owned();
             let scope = crate::graph::GraphScope::from_sql_str(scope)
                 .ok_or_else(|| PyValueError::new_err(format!("unknown GraphScope: {scope}")))?;
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::graph::GraphService;
-                    backend
-                        .delete_node(&node_id, scope, hard)
-                        .await
-                        .map_err(cirisgraph_err_to_py)
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::graph::GraphService;
+                        backend
+                            .delete_node(&node_id, scope, hard)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::graph::sqlite::SqliteGraphBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::graph::GraphService;
+                        backend
+                            .delete_node(&node_id, scope, hard)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
             })
         })
     }
@@ -4598,25 +5187,44 @@ impl PyEngine {
         scope: &str,
     ) -> PyResult<Option<String>> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let node_id = node_id.to_owned();
             let scope = crate::graph::GraphScope::from_sql_str(scope)
                 .ok_or_else(|| PyValueError::new_err(format!("unknown GraphScope: {scope}")))?;
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::graph::GraphService;
-                    let opt = backend
-                        .get_node(&node_id, scope)
-                        .await
-                        .map_err(cirisgraph_err_to_py)?;
-                    match opt {
-                        None => Ok(None),
-                        Some(n) => Ok(Some(serde_json::to_string(&n).map_err(|e| {
-                            PyRuntimeError::new_err(format!("GraphNode encode: {e}"))
-                        })?)),
-                    }
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::graph::GraphService;
+                        let opt = backend
+                            .get_node(&node_id, scope)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match opt {
+                            None => Ok(None),
+                            Some(n) => Ok(Some(serde_json::to_string(&n).map_err(|e| {
+                                PyRuntimeError::new_err(format!("GraphNode encode: {e}"))
+                            })?)),
+                        }
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::graph::sqlite::SqliteGraphBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::graph::GraphService;
+                        let opt = backend
+                            .get_node(&node_id, scope)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match opt {
+                            None => Ok(None),
+                            Some(n) => Ok(Some(serde_json::to_string(&n).map_err(|e| {
+                                PyRuntimeError::new_err(format!("GraphNode encode: {e}"))
+                            })?)),
+                        }
+                    })
+                }
             })
         })
     }
@@ -4635,7 +5243,6 @@ impl PyEngine {
         relationship_filter_json: Option<&str>,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let node_id = node_id.to_owned();
             let scope = crate::graph::GraphScope::from_sql_str(scope)
@@ -4649,16 +5256,34 @@ impl PyEngine {
                     PyValueError::new_err(format!("relationship_filter decode: {e}"))
                 })?),
             };
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::graph::GraphService;
-                    let edges = backend
-                        .get_edges_for_node(&node_id, scope, direction, rel_filter.as_deref())
-                        .await
-                        .map_err(cirisgraph_err_to_py)?;
-                    serde_json::to_string(&edges)
-                        .map_err(|e| PyRuntimeError::new_err(format!("Vec<GraphEdge> encode: {e}")))
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::graph::GraphService;
+                        let edges = backend
+                            .get_edges_for_node(&node_id, scope, direction, rel_filter.as_deref())
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&edges).map_err(|e| {
+                            PyRuntimeError::new_err(format!("Vec<GraphEdge> encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::graph::sqlite::SqliteGraphBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::graph::GraphService;
+                        let edges = backend
+                            .get_edges_for_node(&node_id, scope, direction, rel_filter.as_deref())
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&edges).map_err(|e| {
+                            PyRuntimeError::new_err(format!("Vec<GraphEdge> encode: {e}"))
+                        })
+                    })
+                }
             })
         })
     }
@@ -4674,23 +5299,40 @@ impl PyEngine {
         config_json: &str,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let start_node_id = start_node_id.to_owned();
             let scope = crate::graph::GraphScope::from_sql_str(scope)
                 .ok_or_else(|| PyValueError::new_err(format!("unknown GraphScope: {scope}")))?;
             let cfg: crate::graph::TraversalConfig = serde_json::from_str(config_json)
                 .map_err(|e| PyValueError::new_err(format!("TraversalConfig decode: {e}")))?;
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::graph::GraphService;
-                    let entries = backend
-                        .traverse_k_hop(&start_node_id, scope, cfg)
-                        .await
-                        .map_err(cirisgraph_err_to_py)?;
-                    serde_json::to_string(&entries)
-                        .map_err(|e| PyRuntimeError::new_err(format!("Vec<KhopEntry> encode: {e}")))
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::graph::GraphService;
+                        let entries = backend
+                            .traverse_k_hop(&start_node_id, scope, cfg)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&entries).map_err(|e| {
+                            PyRuntimeError::new_err(format!("Vec<KhopEntry> encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::graph::sqlite::SqliteGraphBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::graph::GraphService;
+                        let entries = backend
+                            .traverse_k_hop(&start_node_id, scope, cfg)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&entries).map_err(|e| {
+                            PyRuntimeError::new_err(format!("Vec<KhopEntry> encode: {e}"))
+                        })
+                    })
+                }
             })
         })
     }
@@ -4706,7 +5348,6 @@ impl PyEngine {
         limit: i64,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let filter: crate::graph::NodeFilter = serde_json::from_str(filter_json)
                 .map_err(|e| PyValueError::new_err(format!("NodeFilter decode: {e}")))?;
@@ -4717,16 +5358,34 @@ impl PyEngine {
                         .map_err(|e| PyValueError::new_err(format!("ListCursor decode: {e}")))?,
                 ),
             };
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::graph::GraphService;
-                    let page = backend
-                        .query_nodes(filter, cursor, limit)
-                        .await
-                        .map_err(cirisgraph_err_to_py)?;
-                    serde_json::to_string(&page)
-                        .map_err(|e| PyRuntimeError::new_err(format!("NodeListPage encode: {e}")))
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::graph::GraphService;
+                        let page = backend
+                            .query_nodes(filter, cursor, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&page).map_err(|e| {
+                            PyRuntimeError::new_err(format!("NodeListPage encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::graph::sqlite::SqliteGraphBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::graph::GraphService;
+                        let page = backend
+                            .query_nodes(filter, cursor, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&page).map_err(|e| {
+                            PyRuntimeError::new_err(format!("NodeListPage encode: {e}"))
+                        })
+                    })
+                }
             })
         })
     }
@@ -4742,15 +5401,31 @@ impl PyEngine {
     #[cfg(feature = "cirisaudit")]
     fn audit_record_entry(&self, py: Python<'_>, entry_json: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let entry: crate::audit::AuditEntry = serde_json::from_str(entry_json)
                 .map_err(|e| PyValueError::new_err(format!("AuditEntry decode: {e}")))?;
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::audit::AuditService;
-                    backend.record_entry(entry).await.map_err(audit_err_to_py)
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::audit::AuditService;
+                        backend
+                            .record_entry(entry)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::audit::sqlite::SqliteAuditBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::audit::AuditService;
+                        backend
+                            .record_entry(entry)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
             })
         })
     }
@@ -4766,7 +5441,6 @@ impl PyEngine {
         limit: i64,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let filter: crate::audit::AuditFilter = serde_json::from_str(filter_json)
                 .map_err(|e| PyValueError::new_err(format!("AuditFilter decode: {e}")))?;
@@ -4777,16 +5451,34 @@ impl PyEngine {
                         .map_err(|e| PyValueError::new_err(format!("AuditCursor decode: {e}")))?,
                 ),
             };
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::audit::AuditService;
-                    let page = backend
-                        .list_entries(filter, cursor, limit)
-                        .await
-                        .map_err(audit_err_to_py)?;
-                    serde_json::to_string(&page)
-                        .map_err(|e| PyRuntimeError::new_err(format!("AuditListPage encode: {e}")))
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::audit::AuditService;
+                        let page = backend
+                            .list_entries(filter, cursor, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&page).map_err(|e| {
+                            PyRuntimeError::new_err(format!("AuditListPage encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::audit::sqlite::SqliteAuditBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::audit::AuditService;
+                        let page = backend
+                            .list_entries(filter, cursor, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&page).map_err(|e| {
+                            PyRuntimeError::new_err(format!("AuditListPage encode: {e}"))
+                        })
+                    })
+                }
             })
         })
     }
@@ -4803,20 +5495,36 @@ impl PyEngine {
         to_sequence: Option<i64>,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let tenant_id = tenant_id.to_owned();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::audit::AuditService;
-                    let verif = backend
-                        .verify_chain(&tenant_id, from_sequence, to_sequence)
-                        .await
-                        .map_err(audit_err_to_py)?;
-                    serde_json::to_string(&verif).map_err(|e| {
-                        PyRuntimeError::new_err(format!("ChainVerification encode: {e}"))
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::audit::AuditService;
+                        let verif = backend
+                            .verify_chain(&tenant_id, from_sequence, to_sequence)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&verif).map_err(|e| {
+                            PyRuntimeError::new_err(format!("ChainVerification encode: {e}"))
+                        })
                     })
-                })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::audit::sqlite::SqliteAuditBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::audit::AuditService;
+                        let verif = backend
+                            .verify_chain(&tenant_id, from_sequence, to_sequence)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&verif).map_err(|e| {
+                            PyRuntimeError::new_err(format!("ChainVerification encode: {e}"))
+                        })
+                    })
+                }
             })
         })
     }
@@ -4829,18 +5537,32 @@ impl PyEngine {
     #[cfg(feature = "telemetry")]
     fn telemetry_record_metric(&self, py: Python<'_>, obs_json: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let obs: crate::telemetry::MetricObservation = serde_json::from_str(obs_json)
                 .map_err(|e| PyValueError::new_err(format!("MetricObservation decode: {e}")))?;
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::telemetry::TelemetryService;
-                    backend
-                        .record_metric(obs)
-                        .await
-                        .map_err(telemetry_err_to_py)
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::telemetry::TelemetryService;
+                        backend
+                            .record_metric(obs)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::telemetry::sqlite::SqliteTelemetryBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::telemetry::TelemetryService;
+                        backend
+                            .record_metric(obs)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
             })
         })
     }
@@ -4849,20 +5571,34 @@ impl PyEngine {
     #[cfg(feature = "telemetry")]
     fn telemetry_record_metrics_batch(&self, py: Python<'_>, obs_json: &str) -> PyResult<u64> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let obs: Vec<crate::telemetry::MetricObservation> = serde_json::from_str(obs_json)
                 .map_err(|e| {
                     PyValueError::new_err(format!("Vec<MetricObservation> decode: {e}"))
                 })?;
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::telemetry::TelemetryService;
-                    backend
-                        .record_metrics_batch(&obs)
-                        .await
-                        .map_err(telemetry_err_to_py)
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::telemetry::TelemetryService;
+                        backend
+                            .record_metrics_batch(&obs)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::telemetry::sqlite::SqliteTelemetryBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::telemetry::TelemetryService;
+                        backend
+                            .record_metrics_batch(&obs)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
             })
         })
     }
@@ -4877,7 +5613,6 @@ impl PyEngine {
         limit: i64,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let filter: crate::telemetry::MetricFilter = serde_json::from_str(filter_json)
                 .map_err(|e| PyValueError::new_err(format!("MetricFilter decode: {e}")))?;
@@ -4888,16 +5623,35 @@ impl PyEngine {
                         .map_err(|e| PyValueError::new_err(format!("MetricCursor decode: {e}")))?,
                 ),
             };
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::telemetry::TelemetryService;
-                    let page = backend
-                        .list_metrics(filter, cursor, limit)
-                        .await
-                        .map_err(telemetry_err_to_py)?;
-                    serde_json::to_string(&page)
-                        .map_err(|e| PyRuntimeError::new_err(format!("MetricListPage encode: {e}")))
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::telemetry::TelemetryService;
+                        let page = backend
+                            .list_metrics(filter, cursor, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&page).map_err(|e| {
+                            PyRuntimeError::new_err(format!("MetricListPage encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::telemetry::sqlite::SqliteTelemetryBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::telemetry::TelemetryService;
+                        let page = backend
+                            .list_metrics(filter, cursor, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&page).map_err(|e| {
+                            PyRuntimeError::new_err(format!("MetricListPage encode: {e}"))
+                        })
+                    })
+                }
             })
         })
     }
@@ -4908,21 +5662,38 @@ impl PyEngine {
     #[cfg(feature = "telemetry")]
     fn telemetry_consolidate_period(&self, py: Python<'_>, req_json: &str) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let req: crate::telemetry::ConsolidationRequest = serde_json::from_str(req_json)
                 .map_err(|e| PyValueError::new_err(format!("ConsolidationRequest decode: {e}")))?;
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::telemetry::TelemetryService;
-                    let outcome = backend
-                        .consolidate_period(req)
-                        .await
-                        .map_err(telemetry_err_to_py)?;
-                    serde_json::to_string(&outcome).map_err(|e| {
-                        PyRuntimeError::new_err(format!("ConsolidationOutcome encode: {e}"))
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::telemetry::TelemetryService;
+                        let outcome = backend
+                            .consolidate_period(req)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&outcome).map_err(|e| {
+                            PyRuntimeError::new_err(format!("ConsolidationOutcome encode: {e}"))
+                        })
                     })
-                })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::telemetry::sqlite::SqliteTelemetryBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::telemetry::TelemetryService;
+                        let outcome = backend
+                            .consolidate_period(req)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&outcome).map_err(|e| {
+                            PyRuntimeError::new_err(format!("ConsolidationOutcome encode: {e}"))
+                        })
+                    })
+                }
             })
         })
     }
@@ -4937,18 +5708,32 @@ impl PyEngine {
     #[cfg(feature = "cirisincident")]
     fn incident_record(&self, py: Python<'_>, incident_json: &str) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let inc: crate::incident::Incident = serde_json::from_str(incident_json)
                 .map_err(|e| PyValueError::new_err(format!("Incident decode: {e}")))?;
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::incident::IncidentService;
-                    backend
-                        .record_incident(inc)
-                        .await
-                        .map_err(incident_err_to_py)
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::incident::IncidentService;
+                        backend
+                            .record_incident(inc)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::incident::sqlite::SqliteIncidentBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::incident::IncidentService;
+                        backend
+                            .record_incident(inc)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
             })
         })
     }
@@ -4958,18 +5743,32 @@ impl PyEngine {
     #[cfg(feature = "cirisincident")]
     fn incident_transition(&self, py: Python<'_>, transition_json: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let t: crate::incident::IncidentTransition = serde_json::from_str(transition_json)
                 .map_err(|e| PyValueError::new_err(format!("IncidentTransition decode: {e}")))?;
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::incident::IncidentService;
-                    backend
-                        .transition_state(t)
-                        .await
-                        .map_err(incident_err_to_py)
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::incident::IncidentService;
+                        backend
+                            .transition_state(t)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::incident::sqlite::SqliteIncidentBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::incident::IncidentService;
+                        backend
+                            .transition_state(t)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
             })
         })
     }
@@ -4984,7 +5783,6 @@ impl PyEngine {
         limit: i64,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let filter: crate::incident::IncidentFilter = serde_json::from_str(filter_json)
                 .map_err(|e| PyValueError::new_err(format!("IncidentFilter decode: {e}")))?;
@@ -4995,17 +5793,35 @@ impl PyEngine {
                         PyValueError::new_err(format!("IncidentCursor decode: {e}"))
                     })?),
                 };
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::incident::IncidentService;
-                    let page = backend
-                        .list_incidents(filter, cursor, limit)
-                        .await
-                        .map_err(incident_err_to_py)?;
-                    serde_json::to_string(&page).map_err(|e| {
-                        PyRuntimeError::new_err(format!("IncidentListPage encode: {e}"))
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::incident::IncidentService;
+                        let page = backend
+                            .list_incidents(filter, cursor, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&page).map_err(|e| {
+                            PyRuntimeError::new_err(format!("IncidentListPage encode: {e}"))
+                        })
                     })
-                })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::incident::sqlite::SqliteIncidentBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::incident::IncidentService;
+                        let page = backend
+                            .list_incidents(filter, cursor, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&page).map_err(|e| {
+                            PyRuntimeError::new_err(format!("IncidentListPage encode: {e}"))
+                        })
+                    })
+                }
             })
         })
     }
@@ -5015,28 +5831,54 @@ impl PyEngine {
     #[cfg(feature = "cirisincident")]
     fn incident_correlate(&self, py: Python<'_>, tenant_id: &str, key: &str) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let tenant_id = tenant_id.to_owned();
             let key = key.to_owned();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::incident::IncidentService;
-                    let refs = backend
-                        .correlate(&tenant_id, &key)
-                        .await
-                        .map_err(incident_err_to_py)?;
-                    serde_json::to_string(&refs).map_err(|e| {
-                        PyRuntimeError::new_err(format!("Vec<IncidentRef> encode: {e}"))
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::incident::IncidentService;
+                        let refs = backend
+                            .correlate(&tenant_id, &key)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&refs).map_err(|e| {
+                            PyRuntimeError::new_err(format!("Vec<IncidentRef> encode: {e}"))
+                        })
                     })
-                })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::incident::sqlite::SqliteIncidentBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::incident::IncidentService;
+                        let refs = backend
+                            .correlate(&tenant_id, &key)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&refs).map_err(|e| {
+                            PyRuntimeError::new_err(format!("Vec<IncidentRef> encode: {e}"))
+                        })
+                    })
+                }
             })
         })
     }
 }
 
 /// v0.8.3 — Bridge `incident::Error` → `PyErr` at the FFI boundary.
+///
+/// v1.0.0 (CIRISPersist#193) — superseded for substrate-pyo3 dispatch by
+/// [`translate_error_kind`], which maps `Error::kind()` tokens onto the
+/// retry-typed exception hierarchy (NotFound / Conflict / Transient /
+/// Permanent). Kept around because callers outside the substrate-pyo3
+/// surface still link against it; the verify / attestation /
+/// federation-keys methods (still PG-only in v1.0.0) and v1.1.0 will
+/// decide whether to retire or thread it.
 #[cfg(feature = "cirisincident")]
+#[allow(dead_code)]
 fn incident_err_to_py(e: crate::incident::Error) -> PyErr {
     let kind = e.kind();
     tracing::warn!(error = %e, kind = kind, "incident error");
@@ -5051,7 +5893,11 @@ fn incident_err_to_py(e: crate::incident::Error) -> PyErr {
 }
 
 /// v0.8.2 — Bridge `telemetry::Error` → `PyErr` at the FFI boundary.
+///
+/// v1.0.0 — superseded for substrate-pyo3 dispatch by
+/// [`translate_error_kind`]; see the comment on `incident_err_to_py`.
 #[cfg(feature = "telemetry")]
+#[allow(dead_code)]
 fn telemetry_err_to_py(e: crate::telemetry::Error) -> PyErr {
     let kind = e.kind();
     tracing::warn!(error = %e, kind = kind, "telemetry error");
@@ -5068,7 +5914,10 @@ fn telemetry_err_to_py(e: crate::telemetry::Error) -> PyErr {
 /// InvalidArgument / ChainIntegrity / Signature / Conflict / NotFound
 /// → ValueError (caller-fault 4xx-shape). Backend / NotImplemented /
 /// Internal → RuntimeError (server-fault 5xx-shape).
+/// v1.0.0 — superseded for substrate-pyo3 dispatch by
+/// [`translate_error_kind`]; see the comment on `incident_err_to_py`.
 #[cfg(feature = "cirisaudit")]
+#[allow(dead_code)]
 fn audit_err_to_py(e: crate::audit::Error) -> PyErr {
     let kind = e.kind();
     tracing::warn!(error = %e, kind = kind, "audit error");
@@ -5089,7 +5938,10 @@ fn audit_err_to_py(e: crate::audit::Error) -> PyErr {
 /// (caller-fault 4xx-shape). Backend / NotImplemented / Internal →
 /// RuntimeError (server-fault 5xx-shape). The stable kind() token
 /// crosses the boundary; verbose detail goes to tracing only.
+/// v1.0.0 — superseded for substrate-pyo3 dispatch by
+/// [`translate_error_kind`]; see the comment on `incident_err_to_py`.
 #[cfg(feature = "cirisgraph")]
+#[allow(dead_code)]
 fn cirisgraph_err_to_py(e: crate::graph::Error) -> PyErr {
     let kind = e.kind();
     tracing::warn!(error = %e, kind = kind, "cirisgraph error");
@@ -5109,7 +5961,10 @@ fn cirisgraph_err_to_py(e: crate::graph::Error) -> PyErr {
 /// ValueError (caller-fault 4xx-shape). Backend / NotImplemented /
 /// Internal → RuntimeError (server-fault 5xx-shape). The stable kind()
 /// token crosses the boundary; verbose detail goes to tracing only.
+/// v1.0.0 — superseded for substrate-pyo3 dispatch by
+/// [`translate_error_kind`]; see the comment on `incident_err_to_py`.
 #[cfg(feature = "cirisnode")]
+#[allow(dead_code)]
 fn cirisnode_err_to_py(e: crate::cirisnode::Error) -> PyErr {
     let kind = e.kind();
     tracing::warn!(error = %e, kind = kind, "cirisnode error");
@@ -5130,7 +5985,10 @@ fn cirisnode_err_to_py(e: crate::cirisnode::Error) -> PyErr {
 /// (caller-fault 4xx-shape). Crypto / Backend / Internal /
 /// HardwareKeyUnavailable / RotationConflict → RuntimeError
 /// (server-fault 5xx-shape).
+/// v1.0.0 — superseded for substrate-pyo3 dispatch by
+/// [`translate_error_kind`]; see the comment on `incident_err_to_py`.
 #[cfg(feature = "secrets")]
+#[allow(dead_code)]
 fn secrets_err_to_py(e: crate::secrets::SecretsError) -> PyErr {
     use crate::secrets::SecretsError;
     match e {
