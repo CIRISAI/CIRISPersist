@@ -5,6 +5,80 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.9.3] — 2026-05-13
+
+**SecretsService SQLite parity (closes CIRISPersist#39).** The
+`secrets` feature now compiles + runs on the SQLite backend, on a par
+with the v0.6.1-α5 Postgres impl. CIRISAgent's sovereign-mode / iOS /
+Pi deployments — which ship persist with SQLite-only — can now adopt
+the full `SecretsServiceProtocol` surface (18 methods) without
+needing a Postgres daemon.
+
+### What landed
+
+- **`secrets` feature decoupled from `postgres`.** Cargo.toml feature
+  is now `secrets = ["classify", "ciris-crypto/aes-gcm",
+  "ciris-crypto/kdf", "ciris-crypto/hmac", "ciris-crypto/random"]`.
+  Either backend (or both) can be enabled alongside `secrets`; the
+  trait + crypto facade + key cache are backend-agnostic.
+- **`migrations/sqlite/lens/V010__cirislens_secrets.sql`** — 5-table
+  schema with dialect translations:
+  - `cirislens_secrets_secrets` (BYTEA→BLOB ciphertext/salt/nonce,
+    TEXT[]→TEXT JSON-array for auto_decapsulate_for_actions, UUID→
+    TEXT 36-char hyphenated, TIMESTAMPTZ→RFC 3339 TEXT).
+  - `cirislens_secrets_access_log` (BIGSERIAL→INTEGER PRIMARY KEY
+    AUTOINCREMENT log_id; same CHECK on `operation`).
+  - `cirislens_secrets_master_key_meta` (self-referencing
+    `rotated_to`; same partial index on the active row).
+  - `cirislens_secrets_filter_config` (JSONB→TEXT canonical JSON).
+  - `cirislens_pseudonyms` (BLOB original_hash PK).
+- **`src/secrets/key_cache.rs`** — process-static software master-key
+  cache extracted from the Postgres impl so both backends share one
+  in-memory key store. No behavioral change for Postgres callers.
+- **`src/secrets/sqlite.rs`** — `SqliteSecretsBackend` with all 18
+  `SecretsService` trait methods. Per-call `tokio::task::
+  spawn_blocking` around the shared `Arc<Mutex<rusqlite::Connection>>`
+  handle; `BEGIN IMMEDIATE` (database-level RESERVED lock) replaces
+  Postgres `SELECT … FOR UPDATE` for the `reencrypt_all` rotation
+  transaction. The 8 `operation` CHECK-constraint values, the audit
+  invariant (every method writes a log row before returning), and
+  the wire-type round-trip behavior match the Postgres impl 1:1.
+- **`process_incoming_text` + `decapsulate_secrets_in_parameters`**
+  stub to `SecretsError::Internal("v0.9.3 SQLite: pipeline
+  orchestration deferred …")` — same behavior as the Postgres v0.6.1-
+  α5 stubs (these wait on the v0.6.2 pipeline orchestration that
+  CIRISPersist#33 tracks).
+- **`migrate_to_hardware_key`** returns `HardwareKeyUnavailable`,
+  same as Postgres. Lands when `ciris-keyring/symmetric-derivation`
+  feature ships upstream.
+
+### Crypto invariant unchanged
+
+The single import site of `ciris_crypto::*` is still
+`src/secrets/crypto.rs`. The SQLite impl routes through that facade
+byte-for-byte identically to the Postgres impl. Persist takes ZERO
+direct primitive deps; the boundary is auditable in one file (FSD
+§7.5a — crypto-through-ciris-crypto).
+
+### Tests
+
+`secrets::sqlite::tests::secrets_sqlite_round_trip_full_lifecycle`
+exercises 13 phases against an in-memory SQLite: rotate → encrypt /
+decrypt direct → store / retrieve → list / recall / forget →
+filter_config CRUD → audit-log readback → service stats / health →
+the two pipeline-stage stubs. Mirrors the Postgres lifecycle test
+exactly. All 18 secrets-module tests pass with `--features "secrets
+sqlite"`; no regression with `--features "secrets postgres"` or
+`--features "secrets sqlite postgres"`.
+
+### Why v0.9.3 isn't tagged yet
+
+CIRISRegistry#13 (HTTP 500 on `/v1/builds` POST for ciris-persist —
+likely missing `trusted_primitive_keys` row) is still blocking the
+v0.9.2 publish workflow. Per user direction, v0.9.3 lands on `main`
+now so downstream consumers can read the source; the tag + PyPI
+publish will follow once the registry side unblocks.
+
 ## [0.9.2] — 2026-05-14
 
 **Multi-target build registration via `ciris-build-sign register`

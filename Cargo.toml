@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "0.9.2"
+version = "0.9.3"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -100,7 +100,7 @@ default-sovereign-light = ["scrub", "extract"]
 # upstream we'll add a `secrets-hw = ["secrets", "ciris-keyring/symmetric-derivation"]`
 # feature here. Until then the trait method exists but always
 # returns SecretsError::HardwareKeyUnavailable.
-secrets        = ["postgres", "classify", "ciris-crypto/aes-gcm", "ciris-crypto/kdf", "ciris-crypto/hmac", "ciris-crypto/random"]
+secrets        = [ "classify", "ciris-crypto/aes-gcm", "ciris-crypto/kdf", "ciris-crypto/hmac", "ciris-crypto/random"]
 secrets-server = ["secrets", "server"]
 
 # v0.7.0 (CIRISPersist#19 sibling track; FSD CIRIS_PERSIST.md Appendix A) —

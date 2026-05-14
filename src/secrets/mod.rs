@@ -49,10 +49,16 @@
 pub mod crypto;
 
 #[cfg(feature = "secrets")]
+pub(crate) mod key_cache;
+
+#[cfg(all(feature = "secrets", feature = "postgres"))]
 pub mod postgres;
 
 #[cfg(feature = "secrets")]
 pub mod service;
+
+#[cfg(all(feature = "secrets", feature = "sqlite"))]
+pub mod sqlite;
 
 #[cfg(feature = "secrets")]
 pub mod types;

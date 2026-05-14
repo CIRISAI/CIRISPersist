@@ -206,27 +206,11 @@ impl PostgresBackend {
     }
 }
 
-/// In-memory master-key bytes. Keyed by `key_ref`. v0.6.1 stores
-/// software keys here for the lifetime of the process; rotation
-/// inserts the new key. The hardware-key path replaces this with
-/// CIRISVerify TPM/Keystore lookups when `secrets-hw` lands.
-fn software_keys() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>> {
-    static CELL: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>> =
-        std::sync::OnceLock::new();
-    CELL.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-fn software_keys_get(key_ref: &str) -> Option<Vec<u8>> {
-    software_keys().lock().ok()?.get(key_ref).cloned()
-}
-
-fn software_keys_put(key_ref: String, bytes: Vec<u8>) -> Result<(), SecretsError> {
-    let mut g = software_keys()
-        .lock()
-        .map_err(|_| SecretsError::Internal("software_keys mutex poisoned".into()))?;
-    g.insert(key_ref, bytes);
-    Ok(())
-}
+// v0.9.3: software-key cache extracted to `secrets::key_cache` so
+// both the Postgres + SQLite backends share the same in-memory
+// store. Wired in via `use super::key_cache::{software_keys_get,
+// software_keys_put}`.
+use super::key_cache::{software_keys_get, software_keys_put};
 
 struct MasterKey {
     key_ref: String,
