@@ -20,6 +20,7 @@ use super::types::{
 use super::SecretsError;
 use crate::pipeline::classify::Sensitivity;
 use crate::store::postgres::PostgresBackend;
+use crate::ClaimResult;
 
 // ─── helpers ────────────────────────────────────────────────────────
 
@@ -993,6 +994,147 @@ impl SecretsService for PostgresBackend {
         Err(SecretsError::HardwareKeyUnavailable(
             "secrets-hw feature pending ciris-keyring/symmetric-derivation upstream".into(),
         ))
+    }
+
+    async fn try_claim_secret(
+        &self,
+        plaintext: &str,
+        description: &str,
+        sensitivity: Sensitivity,
+        auto_decapsulate_for_actions: Vec<String>,
+        accessor: String,
+    ) -> Result<ClaimResult<SecretReference>, SecretsError> {
+        // Compute HMAC-SHA256(active_master_key, plaintext) — the
+        // dedup key. Routes through the secrets::crypto facade
+        // (FSD §7.5a; the sole import site of ciris_crypto::hmac).
+        let master = self.active_master_key().await?;
+        let content_hmac = crypto::hmac_sha256(&master.bytes, plaintext.as_bytes()).to_vec();
+
+        // Generate the fresh row's crypto state. Salt + nonce stay
+        // unique per attempt — only the content_hmac collides on
+        // race.
+        let secret_uuid = Uuid::new_v4();
+        let salt = crypto::random_salt()?;
+        let nonce = crypto::random_nonce()?;
+        let secret_key = crypto::derive_secret_key(&master.bytes, &salt)?;
+        let ciphertext = crypto::encrypt(&secret_key, &nonce, plaintext.as_bytes())?;
+        let sensitivity_tag = sensitivity_str(sensitivity).to_owned();
+
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| SecretsError::Backend(format!("pool: {e}")))?;
+
+        // Atomic claim: INSERT, suppressing on content_hmac conflict.
+        // RETURNING fires only on a successful insert; the empty-row
+        // case below means another caller already won.
+        let claim_row = client
+            .query_opt(
+                "INSERT INTO cirislens_secrets.secrets (\
+                    secret_uuid, encrypted_value, encryption_key_ref, salt, nonce, \
+                    description, sensitivity_level, detected_pattern, \
+                    auto_decapsulate_for_actions, content_hmac \
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+                 ON CONFLICT (content_hmac) DO NOTHING \
+                 RETURNING secret_uuid::text, description, context_hint, sensitivity_level, \
+                           detected_pattern, auto_decapsulate_for_actions, \
+                           created_at, last_accessed",
+                &[
+                    &secret_uuid,
+                    &ciphertext,
+                    &master.key_ref,
+                    &salt.to_vec(),
+                    &nonce.to_vec(),
+                    &description,
+                    &sensitivity_tag,
+                    &"manual",
+                    &auto_decapsulate_for_actions,
+                    &content_hmac,
+                ],
+            )
+            .await
+            .map_err(|e| SecretsError::Backend(format!("try_claim_secret insert: {e}")));
+
+        let (outcome, audit_uuid) = match claim_row {
+            Ok(Some(row)) => {
+                // We won the race — decode and return Stored.
+                let sensitivity_str_v: String = row.get(3);
+                let reference = SecretReference {
+                    uuid: row.get(0),
+                    description: row.get(1),
+                    context_hint: row.get(2),
+                    sensitivity: sensitivity_from_str(&sensitivity_str_v)?,
+                    detected_pattern: row.get(4),
+                    auto_decapsulate_actions: row.get(5),
+                    created_at: row.get(6),
+                    last_accessed: row.get(7),
+                };
+                (Ok(ClaimResult::Stored(reference)), Some(secret_uuid))
+            }
+            Ok(None) => {
+                // Conflict — another caller already claimed this
+                // content_hmac. Fetch the existing row's reference.
+                let existing = client
+                    .query_one(
+                        "SELECT secret_uuid::text, description, context_hint, sensitivity_level, \
+                                detected_pattern, auto_decapsulate_for_actions, \
+                                created_at, last_accessed \
+                         FROM cirislens_secrets.secrets \
+                         WHERE content_hmac = $1",
+                        &[&content_hmac],
+                    )
+                    .await
+                    .map_err(|e| {
+                        SecretsError::Backend(format!("try_claim_secret conflict-recovery: {e}"))
+                    })?;
+                let sensitivity_str_v: String = existing.get(3);
+                let reference = SecretReference {
+                    uuid: existing.get(0),
+                    description: existing.get(1),
+                    context_hint: existing.get(2),
+                    sensitivity: sensitivity_from_str(&sensitivity_str_v)?,
+                    detected_pattern: existing.get(4),
+                    auto_decapsulate_actions: existing.get(5),
+                    created_at: existing.get(6),
+                    last_accessed: existing.get(7),
+                };
+                let existing_uuid = Uuid::parse_str(&reference.uuid)
+                    .map_err(|e| SecretsError::Internal(format!("uuid parse: {e}")))?;
+                (
+                    Ok(ClaimResult::AlreadyClaimed(reference)),
+                    Some(existing_uuid),
+                )
+            }
+            Err(e) => (Err(e), None),
+        };
+
+        // Audit invariant: every method writes a row to access_log
+        // before returning. Both Stored + AlreadyClaimed audit as
+        // `store`; the success flag stays true (no error), and the
+        // purpose surfaces the outcome for post-hoc reconstruction.
+        let (success, err_msg, purpose) = match &outcome {
+            Ok(ClaimResult::Stored(_)) => (
+                true,
+                None,
+                format!("try_claim_secret stored: {description}"),
+            ),
+            Ok(ClaimResult::AlreadyClaimed(_)) => (
+                true,
+                None,
+                format!("try_claim_secret already_claimed: {description}"),
+            ),
+            Err(e) => (false, Some(e.to_string()), description.to_owned()),
+        };
+        let mut record = AuditRecord::new(AccessOp::Store, &accessor).with_purpose(purpose);
+        if let Some(uuid) = audit_uuid {
+            record = record.with_secret(uuid);
+        }
+        let _ = self
+            .secrets_audit(record, success, err_msg.as_deref())
+            .await;
+
+        outcome
     }
 }
 

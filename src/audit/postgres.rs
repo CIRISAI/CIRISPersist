@@ -9,12 +9,13 @@
 
 use super::service::AuditService;
 use super::types::{
-    AuditCursor, AuditEntry, AuditFilter, AuditListPage, ChainBreakReason, ChainVerification,
-    ChainVerifyOutcome,
+    AuditCursor, AuditEntry, AuditEventRef, AuditFilter, AuditListPage, ChainBreakReason,
+    ChainVerification, ChainVerifyOutcome,
 };
 use super::verify::{compute_entry_hash, verify_entry_signature};
 use super::{Error, GENESIS_PREV_HASH};
 use crate::store::postgres::PostgresBackend;
+use crate::ClaimResult;
 
 fn map_pg_error(e: tokio_postgres::Error, op: &str) -> Error {
     use tokio_postgres::error::SqlState;
@@ -490,6 +491,237 @@ impl AuditService for PostgresBackend {
             entries_walked: walked,
             outcome: ChainVerifyOutcome::Ok,
         })
+    }
+
+    async fn try_claim_event(
+        &self,
+        content_hash: [u8; 32],
+        entry: AuditEntry,
+        accessor: String,
+    ) -> Result<ClaimResult<AuditEventRef>, Error> {
+        // accessor surfaces into tracing only — actor_id is the
+        // cryptographic identity (self-signed model).
+        let _ = accessor;
+
+        // Same input gates as record_entry. The first-write path is
+        // identical to record_entry; the conflict path short-
+        // circuits the chain checks because the EXISTING row was
+        // already chain-verified at insert time.
+        if entry.sequence_number < 1 {
+            return Err(Error::InvalidArgument(
+                "sequence_number must be >= 1".into(),
+            ));
+        }
+        if entry.tenant_id.is_empty() {
+            return Err(Error::InvalidArgument("tenant_id must be non-empty".into()));
+        }
+        if entry.prev_hash.len() != 32 {
+            return Err(Error::InvalidArgument(format!(
+                "prev_hash must be 32 bytes, got {}",
+                entry.prev_hash.len()
+            )));
+        }
+        if entry.entry_hash.len() != 32 {
+            return Err(Error::InvalidArgument(format!(
+                "entry_hash must be 32 bytes, got {}",
+                entry.entry_hash.len()
+            )));
+        }
+
+        let derived = compute_entry_hash(&entry)?;
+        if derived.as_slice() != entry.entry_hash.as_slice() {
+            return Err(Error::ChainIntegrity(
+                "entry_hash mismatch: caller-claimed differs from canonical-bytes derivation"
+                    .into(),
+            ));
+        }
+        verify_entry_signature(&entry)?;
+
+        let entry_uuid = parse_entry_id(&entry.entry_id)?;
+        let content_hash_vec = content_hash.to_vec();
+
+        let mut client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+
+        // Fast path: optimistic claim outside of a transaction.
+        // PG ON CONFLICT (content_hash) DO NOTHING gives us the
+        // atomic insert-or-skip we need; the conflict path falls
+        // through to a SELECT below.
+        //
+        // On clean insert we still need chain-integrity gates. We
+        // do those inside a transaction with FOR UPDATE on the
+        // tail; if the gates fail, we ROLLBACK.
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| Error::Backend(format!("begin tx: {e}")))?;
+
+        // First, check if a row with this content_hash already
+        // exists — that's the cheap "already-claimed" path. We do
+        // this under the transaction so the result is consistent
+        // with the subsequent INSERT attempt.
+        let existing = tx
+            .query_opt(
+                "SELECT entry_id, tenant_id, sequence_number \
+                 FROM cirislens.audit_log \
+                 WHERE content_hash = $1",
+                &[&content_hash_vec],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "try_claim_event lookup"))?;
+
+        if let Some(row) = existing {
+            let existing_uuid: uuid::Uuid = row
+                .try_get("entry_id")
+                .map_err(|e| Error::Backend(format!("decode entry_id: {e}")))?;
+            let reference = AuditEventRef {
+                entry_id: existing_uuid.to_string(),
+                tenant_id: row
+                    .try_get("tenant_id")
+                    .map_err(|e| Error::Backend(format!("decode tenant_id: {e}")))?,
+                sequence_number: row
+                    .try_get("sequence_number")
+                    .map_err(|e| Error::Backend(format!("decode seq: {e}")))?,
+            };
+            tx.commit()
+                .await
+                .map_err(|e| Error::Backend(format!("commit: {e}")))?;
+            return Ok(ClaimResult::AlreadyClaimed(reference));
+        }
+
+        // No prior claim — run the same chain gates as record_entry
+        // before INSERTing. Tail-read under FOR UPDATE serializes
+        // concurrent writers within one tenant.
+        let tail = tx
+            .query_opt(
+                "SELECT sequence_number, entry_hash \
+                 FROM cirislens.audit_log \
+                 WHERE tenant_id = $1 \
+                 ORDER BY sequence_number DESC \
+                 LIMIT 1 \
+                 FOR UPDATE",
+                &[&entry.tenant_id],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "try_claim_event tail read"))?;
+
+        if let Some(row) = tail {
+            let prev_seq: i64 = row
+                .try_get("sequence_number")
+                .map_err(|e| Error::Backend(format!("decode prev seq: {e}")))?;
+            let prev_hash: Vec<u8> = row
+                .try_get("entry_hash")
+                .map_err(|e| Error::Backend(format!("decode prev hash: {e}")))?;
+            if entry.sequence_number != prev_seq + 1 {
+                return Err(Error::ChainIntegrity(format!(
+                    "sequence gap: expected {} but got {}",
+                    prev_seq + 1,
+                    entry.sequence_number
+                )));
+            }
+            if entry.prev_hash.as_slice() != prev_hash.as_slice() {
+                return Err(Error::ChainIntegrity(format!(
+                    "prev_hash mismatch at sequence {} for tenant {}",
+                    entry.sequence_number, entry.tenant_id
+                )));
+            }
+        } else {
+            if entry.sequence_number != 1 {
+                return Err(Error::ChainIntegrity(format!(
+                    "first entry for tenant {} must have sequence_number=1, got {}",
+                    entry.tenant_id, entry.sequence_number
+                )));
+            }
+            if entry.prev_hash.as_slice() != GENESIS_PREV_HASH.as_slice() {
+                return Err(Error::ChainIntegrity(
+                    "first entry must have prev_hash = GENESIS_PREV_HASH (32 zero bytes)".into(),
+                ));
+            }
+        }
+
+        // Atomic insert. Between the lookup above and this INSERT
+        // another transaction could have committed the same
+        // content_hash — ON CONFLICT DO NOTHING handles that
+        // gracefully (the SELECT below recovers the reference).
+        let inserted = tx
+            .query_opt(
+                "INSERT INTO cirislens.audit_log (\
+                    entry_id, sequence_number, tenant_id, actor_id, \
+                    action_type, subject_kind, subject_id, payload, \
+                    prev_hash, entry_hash, recorded_at, \
+                    signature, signing_key_id, signature_verified, persist_row_hash, \
+                    content_hash\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, TRUE, $14, $15) \
+                 ON CONFLICT (content_hash) DO NOTHING \
+                 RETURNING entry_id, tenant_id, sequence_number",
+                &[
+                    &entry_uuid,
+                    &entry.sequence_number,
+                    &entry.tenant_id,
+                    &entry.actor_id,
+                    &entry.action_type,
+                    &entry.subject_kind,
+                    &entry.subject_id,
+                    &entry.payload,
+                    &entry.prev_hash,
+                    &entry.entry_hash,
+                    &entry.recorded_at,
+                    &entry.signature,
+                    &entry.actor_id,
+                    &entry.signature,
+                    &content_hash_vec,
+                ],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "try_claim_event insert"))?;
+
+        let result = if let Some(row) = inserted {
+            let returned_uuid: uuid::Uuid = row
+                .try_get("entry_id")
+                .map_err(|e| Error::Backend(format!("decode entry_id: {e}")))?;
+            ClaimResult::Stored(AuditEventRef {
+                entry_id: returned_uuid.to_string(),
+                tenant_id: row
+                    .try_get("tenant_id")
+                    .map_err(|e| Error::Backend(format!("decode tenant_id: {e}")))?,
+                sequence_number: row
+                    .try_get("sequence_number")
+                    .map_err(|e| Error::Backend(format!("decode seq: {e}")))?,
+            })
+        } else {
+            // Race-loss: another tx committed the same content_hash
+            // between our SELECT and INSERT. Recover the existing
+            // reference via a second SELECT.
+            let row = tx
+                .query_one(
+                    "SELECT entry_id, tenant_id, sequence_number \
+                     FROM cirislens.audit_log \
+                     WHERE content_hash = $1",
+                    &[&content_hash_vec],
+                )
+                .await
+                .map_err(|e| map_pg_error(e, "try_claim_event conflict-recovery"))?;
+            let returned_uuid: uuid::Uuid = row
+                .try_get("entry_id")
+                .map_err(|e| Error::Backend(format!("decode entry_id: {e}")))?;
+            ClaimResult::AlreadyClaimed(AuditEventRef {
+                entry_id: returned_uuid.to_string(),
+                tenant_id: row
+                    .try_get("tenant_id")
+                    .map_err(|e| Error::Backend(format!("decode tenant_id: {e}")))?,
+                sequence_number: row
+                    .try_get("sequence_number")
+                    .map_err(|e| Error::Backend(format!("decode seq: {e}")))?,
+            })
+        };
+
+        tx.commit()
+            .await
+            .map_err(|e| Error::Backend(format!("commit: {e}")))?;
+        Ok(result)
     }
 }
 

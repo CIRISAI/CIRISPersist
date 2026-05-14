@@ -23,11 +23,12 @@ use tokio::sync::Mutex;
 
 use super::service::AuditService;
 use super::types::{
-    AuditCursor, AuditEntry, AuditFilter, AuditListPage, ChainBreakReason, ChainVerification,
-    ChainVerifyOutcome,
+    AuditCursor, AuditEntry, AuditEventRef, AuditFilter, AuditListPage, ChainBreakReason,
+    ChainVerification, ChainVerifyOutcome,
 };
 use super::verify::{compute_entry_hash, verify_entry_signature};
 use super::{Error, GENESIS_PREV_HASH};
+use crate::ClaimResult;
 
 /// SQLite-backed [`AuditService`] impl. Wraps an
 /// `Arc<Mutex<Connection>>` shared with
@@ -510,6 +511,223 @@ impl AuditService for SqliteAuditBackend {
         .await
         .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
     }
+
+    async fn try_claim_event(
+        &self,
+        content_hash: [u8; 32],
+        entry: AuditEntry,
+        accessor: String,
+    ) -> Result<ClaimResult<AuditEventRef>, Error> {
+        let _ = accessor; // surfaced into tracing only; actor_id is the identity
+
+        // Same input gates as record_entry.
+        if entry.sequence_number < 1 {
+            return Err(Error::InvalidArgument(
+                "sequence_number must be >= 1".into(),
+            ));
+        }
+        if entry.tenant_id.is_empty() {
+            return Err(Error::InvalidArgument("tenant_id must be non-empty".into()));
+        }
+        if entry.prev_hash.len() != 32 {
+            return Err(Error::InvalidArgument(format!(
+                "prev_hash must be 32 bytes, got {}",
+                entry.prev_hash.len()
+            )));
+        }
+        if entry.entry_hash.len() != 32 {
+            return Err(Error::InvalidArgument(format!(
+                "entry_hash must be 32 bytes, got {}",
+                entry.entry_hash.len()
+            )));
+        }
+        let derived = compute_entry_hash(&entry)?;
+        if derived.as_slice() != entry.entry_hash.as_slice() {
+            return Err(Error::ChainIntegrity(
+                "entry_hash mismatch: caller-claimed differs from canonical-bytes derivation"
+                    .into(),
+            ));
+        }
+        verify_entry_signature(&entry)?;
+
+        let payload_str = serde_json::to_string(&entry.payload)
+            .map_err(|e| Error::Internal(format!("payload serialize: {e}")))?;
+        let recorded_at = fmt_datetime(entry.recorded_at);
+        let content_hash_vec = content_hash.to_vec();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<ClaimResult<AuditEventRef>, Error> {
+            let mut guard = conn.blocking_lock();
+            let tx = guard
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| map_sqlite_error(e, "try_claim_event begin tx"))?;
+
+            // Already-claimed lookup before chain checks — cheaper
+            // than running the full validation path when the row
+            // already exists.
+            let existing: Option<(String, String, i64)> = tx
+                .query_row(
+                    "SELECT entry_id, tenant_id, sequence_number \
+                     FROM cirislens_audit_log \
+                     WHERE content_hash = ?1",
+                    params![content_hash_vec],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| map_sqlite_error(e, "try_claim_event lookup"))?;
+
+            if let Some((entry_id, tenant_id, sequence_number)) = existing {
+                tx.commit()
+                    .map_err(|e| map_sqlite_error(e, "try_claim_event commit"))?;
+                return Ok(ClaimResult::AlreadyClaimed(AuditEventRef {
+                    entry_id,
+                    tenant_id,
+                    sequence_number,
+                }));
+            }
+
+            // Chain gates on first-write path.
+            let tail = tx
+                .query_row(
+                    "SELECT sequence_number, entry_hash FROM cirislens_audit_log \
+                     WHERE tenant_id = ?1 \
+                     ORDER BY sequence_number DESC LIMIT 1",
+                    params![entry.tenant_id],
+                    |row| {
+                        let seq: i64 = row.get(0)?;
+                        let hash: Vec<u8> = row.get(1)?;
+                        Ok((seq, hash))
+                    },
+                )
+                .optional()
+                .map_err(|e| map_sqlite_error(e, "try_claim_event tail read"))?;
+
+            if let Some((prev_seq, prev_hash)) = tail {
+                if entry.sequence_number != prev_seq + 1 {
+                    return Err(Error::ChainIntegrity(format!(
+                        "sequence gap: expected {} but got {}",
+                        prev_seq + 1,
+                        entry.sequence_number
+                    )));
+                }
+                if entry.prev_hash.as_slice() != prev_hash.as_slice() {
+                    return Err(Error::ChainIntegrity(format!(
+                        "prev_hash mismatch at sequence {} for tenant {}",
+                        entry.sequence_number, entry.tenant_id
+                    )));
+                }
+            } else {
+                if entry.sequence_number != 1 {
+                    return Err(Error::ChainIntegrity(format!(
+                        "first entry for tenant {} must have sequence_number=1, got {}",
+                        entry.tenant_id, entry.sequence_number
+                    )));
+                }
+                if entry.prev_hash.as_slice() != GENESIS_PREV_HASH.as_slice() {
+                    return Err(Error::ChainIntegrity(
+                        "first entry must have prev_hash = GENESIS_PREV_HASH (32 zero bytes)"
+                            .into(),
+                    ));
+                }
+            }
+
+            // Atomic INSERT OR IGNORE on content_hash. SQLite's
+            // INSERT OR IGNORE suppresses both UNIQUE failures —
+            // the content_hash one (our race-loss case) AND the
+            // (tenant_id, sequence_number) one (would happen if a
+            // racing writer claimed the same seq under a different
+            // content_hash, which is a true chain violation that
+            // we DON'T want to swallow).
+            //
+            // To distinguish: we run a SELECT by content_hash after
+            // the INSERT and check whether the entry_id matches our
+            // attempted entry_id. If it doesn't, our INSERT was
+            // suppressed by the content_hash UNIQUE (race-loss);
+            // if no row matches our content_hash at all, the
+            // suppression was for (tenant, seq) instead — surface
+            // as Conflict.
+            tx.execute(
+                "INSERT OR IGNORE INTO cirislens_audit_log (\
+                    entry_id, sequence_number, tenant_id, actor_id, \
+                    action_type, subject_kind, subject_id, payload, \
+                    prev_hash, entry_hash, recorded_at, \
+                    signature, signing_key_id, signature_verified, persist_row_hash, \
+                    content_hash\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1, ?14, ?15)",
+                params![
+                    entry.entry_id,
+                    entry.sequence_number,
+                    entry.tenant_id,
+                    entry.actor_id,
+                    entry.action_type,
+                    entry.subject_kind,
+                    entry.subject_id,
+                    payload_str,
+                    entry.prev_hash,
+                    entry.entry_hash,
+                    recorded_at,
+                    entry.signature,
+                    entry.actor_id,
+                    entry.signature,
+                    content_hash_vec,
+                ],
+            )
+            .map_err(|e| map_sqlite_error(e, "try_claim_event insert"))?;
+
+            // Read-back to determine outcome.
+            let row = tx
+                .query_row(
+                    "SELECT entry_id, tenant_id, sequence_number \
+                     FROM cirislens_audit_log \
+                     WHERE content_hash = ?1",
+                    params![content_hash_vec],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| map_sqlite_error(e, "try_claim_event read-back"))?;
+
+            let result = match row {
+                None => {
+                    // INSERT OR IGNORE swallowed a non-content_hash
+                    // constraint failure (most likely (tenant_id,
+                    // sequence_number) UNIQUE — a true chain
+                    // collision, not our atomic-claim case).
+                    return Err(Error::Conflict(
+                        "try_claim_event: (tenant_id, sequence_number) already claimed by a different content_hash".into(),
+                    ));
+                }
+                Some((entry_id, tenant_id, sequence_number)) => {
+                    let ref_ = AuditEventRef {
+                        entry_id: entry_id.clone(),
+                        tenant_id,
+                        sequence_number,
+                    };
+                    if entry_id == entry.entry_id {
+                        ClaimResult::Stored(ref_)
+                    } else {
+                        ClaimResult::AlreadyClaimed(ref_)
+                    }
+                }
+            };
+
+            tx.commit()
+                .map_err(|e| map_sqlite_error(e, "try_claim_event commit"))?;
+            Ok(result)
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+    }
 }
 
 #[cfg(test)]
@@ -688,5 +906,94 @@ mod tests {
             }
             other => panic!("expected Break, got {other:?}"),
         }
+    }
+
+    /// v1.0.0 (CIRISAgent#756 #2): two concurrent `try_claim_event`
+    /// calls with the same content_hash resolve to one `Stored` +
+    /// one `AlreadyClaimed` carrying the same `AuditEventRef`, with
+    /// exactly one row landing in the table.
+    #[tokio::test]
+    async fn try_claim_event_race_dedups_to_one_row() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let conn_handle = backend.conn_handle();
+
+        let a = std::sync::Arc::new(SqliteAuditBackend::new(conn_handle.clone()));
+        let b = std::sync::Arc::new(SqliteAuditBackend::new(conn_handle.clone()));
+
+        let key = SigningKey::from_bytes(&[0xC3; 32]);
+        let tenant = format!("audit-race-{}", Uuid::new_v4().simple());
+
+        // Both callers must build IDENTICAL signed entries — the
+        // first writer's seq + prev_hash + entry_hash + signature
+        // are what will appear in the row regardless of who wins
+        // the race. The agent's pattern is: deterministic envelope
+        // canonicalization → same hash → same entry_id and
+        // signature on both sides.
+        let entry = build_and_sign(&key, &tenant, 1, GENESIS_PREV_HASH.to_vec(), "task_signed");
+        // content_hash is caller-computed (sha256 of canonical
+        // envelope bytes). For this test we just hash a stable
+        // string — the value doesn't matter beyond being identical
+        // on both sides.
+        let content_hash: [u8; 32] = {
+            use sha2::Digest as _;
+            let mut h = sha2::Sha256::new();
+            h.update(b"shared-envelope-bytes");
+            h.finalize().into()
+        };
+
+        let entry_a = entry.clone();
+        let entry_b = entry.clone();
+        let a2 = a.clone();
+        let b2 = b.clone();
+        let fut_a = async move {
+            a2.try_claim_event(content_hash, entry_a, "worker-a".into())
+                .await
+        };
+        let fut_b = async move {
+            b2.try_claim_event(content_hash, entry_b, "worker-b".into())
+                .await
+        };
+
+        let (r_a, r_b) = tokio::join!(fut_a, fut_b);
+        let r_a = r_a.expect("a try_claim_event");
+        let r_b = r_b.expect("b try_claim_event");
+
+        let stored_count = [&r_a, &r_b]
+            .iter()
+            .filter(|r| matches!(r, ClaimResult::Stored(_)))
+            .count();
+        let claimed_count = [&r_a, &r_b]
+            .iter()
+            .filter(|r| matches!(r, ClaimResult::AlreadyClaimed(_)))
+            .count();
+        assert_eq!(stored_count, 1, "exactly one Stored expected");
+        assert_eq!(claimed_count, 1, "exactly one AlreadyClaimed expected");
+        assert_eq!(
+            r_a.reference().entry_id,
+            r_b.reference().entry_id,
+            "both outcomes must reference the same row"
+        );
+        assert_eq!(r_a.reference().sequence_number, 1);
+        assert_eq!(r_a.reference().tenant_id, tenant);
+
+        // List back: exactly one entry for the tenant.
+        let page = a
+            .list_entries(
+                AuditFilter {
+                    tenant_id: tenant.clone(),
+                    action_type: None,
+                    actor_id: None,
+                    subject_kind: None,
+                    subject_id: None,
+                    recorded_after: None,
+                    recorded_before: None,
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1, "exactly one audit row expected");
     }
 }

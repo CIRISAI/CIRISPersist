@@ -18,8 +18,11 @@
 
 use std::future::Future;
 
-use super::types::{AuditCursor, AuditEntry, AuditFilter, AuditListPage, ChainVerification};
+use super::types::{
+    AuditCursor, AuditEntry, AuditEventRef, AuditFilter, AuditListPage, ChainVerification,
+};
 use super::Error;
+use crate::ClaimResult;
 
 /// Hash-chained audit trail surface (v0.8.1). 3 methods: write
 /// (with full chain-integrity + signature gate), list (cursor-paged,
@@ -63,4 +66,46 @@ pub trait AuditService: Send + Sync {
         from_sequence: i64,
         to_sequence: Option<i64>,
     ) -> impl Future<Output = Result<ChainVerification, Error>> + Send;
+
+    /// Atomic-claim variant of [`AuditService::record_entry`]
+    /// (v1.0.0; CIRISAgent#756 concern #2).
+    ///
+    /// Caller supplies `content_hash` (typically
+    /// `sha256(canonical_envelope_bytes)`); implementations INSERT
+    /// the audit row with the hash as the unique key. On race the
+    /// first writer wins (`ClaimResult::Stored`); subsequent writers
+    /// observe the UNIQUE conflict and receive the existing row's
+    /// reference (`ClaimResult::AlreadyClaimed`).
+    ///
+    /// Unlike [`crate::secrets::SecretsService::try_claim_secret`],
+    /// the hash is caller-computed (not derived from a master key)
+    /// because audit content isn't sensitive — sha256 is fine for
+    /// dedup AND public auditability.
+    ///
+    /// `accessor` is a free-form observability tag surfaced into
+    /// tracing only; the cryptographic actor identity remains
+    /// `entry.actor_id` (self-signed: actor_id IS the pubkey).
+    ///
+    /// # Determinism guarantee
+    ///
+    /// Implementations MUST be atomic — two concurrent callers
+    /// passing the same `content_hash` end up with one row, not
+    /// two. PG backend: `INSERT … ON CONFLICT (content_hash) DO
+    /// NOTHING RETURNING …`; SQLite: `INSERT OR IGNORE …` plus a
+    /// follow-up SELECT on conflict.
+    ///
+    /// # Default impl
+    ///
+    /// Returns [`Error::NotImplemented`] — backends without the
+    /// content-hash UNIQUE column (legacy stubs, in-memory test
+    /// shims) opt into the surface explicitly.
+    fn try_claim_event(
+        &self,
+        content_hash: [u8; 32],
+        entry: AuditEntry,
+        accessor: String,
+    ) -> impl Future<Output = Result<ClaimResult<AuditEventRef>, Error>> + Send {
+        let _ = (content_hash, entry, accessor);
+        async { Err(Error::NotImplemented("try_claim_event")) }
+    }
 }

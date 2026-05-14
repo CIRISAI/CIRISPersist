@@ -143,6 +143,24 @@ pub struct ChainVerification {
     pub outcome: ChainVerifyOutcome,
 }
 
+/// Stable reference to an audit log row (v1.0.0; CIRISAgent#756 #2).
+///
+/// Returned by [`super::AuditService::try_claim_event`] inside a
+/// [`crate::ClaimResult`]. Identifies a row uniquely across the
+/// federation: `(tenant_id, sequence_number)` is the per-tenant
+/// natural key (UNIQUE on V014), `entry_id` is the global UUID.
+/// Callers attach downstream work to whichever of the three handles
+/// matches their addressing scheme.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditEventRef {
+    /// `cirislens.audit_log.entry_id` (UUID v4, 36-char hyphenated).
+    pub entry_id: String,
+    /// `cirislens.audit_log.tenant_id` — the chain selector.
+    pub tenant_id: String,
+    /// Per-tenant monotonic sequence number.
+    pub sequence_number: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

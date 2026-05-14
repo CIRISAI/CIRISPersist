@@ -50,6 +50,7 @@ use super::types::{
 };
 use super::SecretsError;
 use crate::pipeline::classify::Sensitivity;
+use crate::ClaimResult;
 
 // ─── helpers ────────────────────────────────────────────────────────
 
@@ -1372,6 +1373,146 @@ impl SecretsService for SqliteSecretsBackend {
             "v0.9.3 SQLite: same as v0.6.1 Postgres — waits on ciris-keyring/symmetric-derivation upstream".into(),
         ))
     }
+
+    async fn try_claim_secret(
+        &self,
+        plaintext: &str,
+        description: &str,
+        sensitivity: Sensitivity,
+        auto_decapsulate_for_actions: Vec<String>,
+        accessor: String,
+    ) -> Result<ClaimResult<SecretReference>, SecretsError> {
+        // Dedup key (FSD §7.5a — facade routing).
+        let master = self.active_master_key().await?;
+        let content_hmac = crypto::hmac_sha256(&master.bytes, plaintext.as_bytes()).to_vec();
+
+        // Fresh per-attempt crypto state. salt + nonce stay unique
+        // per call; only content_hmac collides on race.
+        let secret_uuid = Uuid::new_v4();
+        let salt = crypto::random_salt()?;
+        let nonce = crypto::random_nonce()?;
+        let secret_key = crypto::derive_secret_key(&master.bytes, &salt)?;
+        let ciphertext = crypto::encrypt(&secret_key, &nonce, plaintext.as_bytes())?;
+        let sensitivity_tag = sensitivity_str(sensitivity).to_owned();
+        let actions_json = serde_json::to_string(&auto_decapsulate_for_actions)
+            .map_err(|e| SecretsError::Internal(format!("actions serialize: {e}")))?;
+
+        let conn = self.conn.clone();
+        let secret_uuid_str = secret_uuid.to_string();
+        let key_ref = master.key_ref.clone();
+        let salt_vec = salt.to_vec();
+        let nonce_vec = nonce.to_vec();
+        let description_owned = description.to_owned();
+        let content_hmac_for_tx = content_hmac.clone();
+
+        // Atomic claim: INSERT OR IGNORE — SQLite suppresses the
+        // INSERT on UNIQUE conflict and reports 0 changes. The
+        // follow-up SELECT fetches the existing row (whether ours
+        // or another caller's) by content_hmac.
+        type ClaimRow = (
+            String,
+            String,
+            Option<String>,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+        );
+        let (won, row): (bool, ClaimRow) =
+            tokio::task::spawn_blocking(move || -> Result<(bool, ClaimRow), SecretsError> {
+                let guard = conn.blocking_lock();
+                let changed = guard
+                    .execute(
+                        "INSERT OR IGNORE INTO cirislens_secrets_secrets (\
+                            secret_uuid, encrypted_value, encryption_key_ref, salt, nonce, \
+                            description, sensitivity_level, detected_pattern, \
+                            auto_decapsulate_for_actions, content_hmac \
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        params![
+                            secret_uuid_str,
+                            ciphertext,
+                            key_ref,
+                            salt_vec,
+                            nonce_vec,
+                            description_owned,
+                            sensitivity_tag,
+                            "manual",
+                            actions_json,
+                            content_hmac_for_tx,
+                        ],
+                    )
+                    .map_err(|e| map_sqlite_error(e, "try_claim_secret insert"))?;
+                let won = changed > 0;
+                let row = guard
+                    .query_row(
+                        "SELECT secret_uuid, description, context_hint, sensitivity_level, \
+                                detected_pattern, auto_decapsulate_for_actions, \
+                                created_at, last_accessed \
+                         FROM cirislens_secrets_secrets \
+                         WHERE content_hmac = ?1",
+                        params![content_hmac_for_tx],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, String>(4)?,
+                                row.get::<_, String>(5)?,
+                                row.get::<_, String>(6)?,
+                                row.get::<_, Option<String>>(7)?,
+                            ))
+                        },
+                    )
+                    .map_err(|e| map_sqlite_error(e, "try_claim_secret conflict-recovery"))?;
+                Ok((won, row))
+            })
+            .await
+            .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))??;
+
+        let (uuid_str, desc, ctx_hint, sens_str, pattern, actions_str, created_str, accessed_str) =
+            row;
+        let last_accessed = match accessed_str {
+            Some(s) => Some(parse_datetime(&s)?),
+            None => None,
+        };
+        let reference = SecretReference {
+            uuid: uuid_str.clone(),
+            description: desc,
+            context_hint: ctx_hint,
+            sensitivity: sensitivity_from_str(&sens_str)?,
+            detected_pattern: pattern,
+            auto_decapsulate_actions: parse_actions(&actions_str)?,
+            created_at: parse_datetime(&created_str)?,
+            last_accessed,
+        };
+        let row_uuid = Uuid::parse_str(&uuid_str)
+            .map_err(|e| SecretsError::Internal(format!("uuid parse: {e}")))?;
+
+        let outcome = if won {
+            ClaimResult::Stored(reference.clone())
+        } else {
+            ClaimResult::AlreadyClaimed(reference.clone())
+        };
+
+        let purpose = if won {
+            format!("try_claim_secret stored: {description}")
+        } else {
+            format!("try_claim_secret already_claimed: {description}")
+        };
+        let _ = self
+            .secrets_audit(
+                AuditRecord::new(AccessOp::Store, &accessor)
+                    .with_secret(row_uuid)
+                    .with_purpose(purpose),
+                true,
+                None,
+            )
+            .await;
+
+        Ok(outcome)
+    }
 }
 
 #[cfg(test)]
@@ -1551,5 +1692,102 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SecretsError::Internal(_)));
+    }
+
+    /// v1.0.0 (CIRISAgent#756 #2): two concurrent `try_claim_secret`
+    /// calls on the same plaintext resolve to one `Stored` + one
+    /// `AlreadyClaimed` carrying the same `SecretReference`, with
+    /// exactly one row landing in the table.
+    #[tokio::test]
+    async fn try_claim_secret_race_dedups_to_one_row() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let conn_handle = backend.conn_handle();
+
+        // Two SqliteSecretsBackend instances sharing the same
+        // Arc<Mutex<Connection>> — they race against the SAME
+        // sqlite database, which is the production sharing model.
+        let a = std::sync::Arc::new(SqliteSecretsBackend::new(conn_handle.clone()));
+        let b = std::sync::Arc::new(SqliteSecretsBackend::new(conn_handle.clone()));
+
+        // Bootstrap an active master key. Master-key rotation drives
+        // the HMAC dedup key — without it `try_claim_secret` returns
+        // Crypto(no active master key).
+        a.rotate_master_key(None, "test".into()).await.unwrap();
+
+        const PLAINTEXT: &str = "shared-envelope-plaintext-v1";
+        const DESCRIPTION: &str = "racing-workers-test";
+
+        let a2 = a.clone();
+        let b2 = b.clone();
+        let fut_a = async move {
+            a2.try_claim_secret(
+                PLAINTEXT,
+                DESCRIPTION,
+                Sensitivity::Medium,
+                vec!["tool".into()],
+                "worker-a".into(),
+            )
+            .await
+        };
+        let fut_b = async move {
+            b2.try_claim_secret(
+                PLAINTEXT,
+                DESCRIPTION,
+                Sensitivity::Medium,
+                vec!["tool".into()],
+                "worker-b".into(),
+            )
+            .await
+        };
+
+        let (r_a, r_b) = tokio::join!(fut_a, fut_b);
+        let r_a = r_a.expect("a try_claim_secret");
+        let r_b = r_b.expect("b try_claim_secret");
+
+        // Exactly one Stored + one AlreadyClaimed; both reference
+        // the same UUID (the winning row).
+        let stored_count = [&r_a, &r_b]
+            .iter()
+            .filter(|r| matches!(r, ClaimResult::Stored(_)))
+            .count();
+        let claimed_count = [&r_a, &r_b]
+            .iter()
+            .filter(|r| matches!(r, ClaimResult::AlreadyClaimed(_)))
+            .count();
+        assert_eq!(stored_count, 1, "exactly one Stored expected");
+        assert_eq!(claimed_count, 1, "exactly one AlreadyClaimed expected");
+        assert_eq!(
+            r_a.reference().uuid,
+            r_b.reference().uuid,
+            "both outcomes must reference the same row"
+        );
+
+        // The table has exactly one row matching this description
+        // (and one row matching the content_hmac, but description
+        // is the user-visible projection).
+        let listed = a
+            .list_stored_secrets(
+                100,
+                SecretsListFilter {
+                    pattern: None,
+                    sensitivity: None,
+                    source_message_id: None,
+                    created_after: None,
+                    created_before: None,
+                },
+            )
+            .await
+            .expect("list_stored_secrets");
+        let our_rows: Vec<_> = listed
+            .iter()
+            .filter(|r| r.description == DESCRIPTION)
+            .collect();
+        assert_eq!(
+            our_rows.len(),
+            1,
+            "exactly one row expected, found {}",
+            our_rows.len()
+        );
     }
 }

@@ -105,3 +105,60 @@ pub enum Error {
 
 /// Crate-wide `Result` alias.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Outcome of an atomic-claim attempt (v1.0.0; CIRISAgent#756 concern #2).
+///
+/// The atomic-claim primitive — `SecretsService::try_claim_secret` and
+/// `AuditService::try_claim_event` — lets N concurrent workers process
+/// the same envelope without writing N rows. The first caller to land
+/// the INSERT receives `Stored(ref)`; every subsequent caller hashing
+/// to the same content-key receives `AlreadyClaimed(ref)` carrying the
+/// EXISTING row's reference (not a new one). Either way the caller
+/// gets a stable identifier to attach downstream work to.
+///
+/// Both arms carry the same reference type so callers don't branch
+/// on the outcome unless they specifically care which worker won
+/// (e.g., for "who emitted this audit event first" attribution).
+///
+/// # Determinism guarantee
+///
+/// Implementations MUST be atomic at the database level: a concurrent
+/// race between two workers running the same content key resolves to
+/// exactly one inserted row + one `AlreadyClaimed` return. Both
+/// backends (PG `ON CONFLICT DO NOTHING` + follow-up SELECT; SQLite
+/// `INSERT OR IGNORE` + follow-up SELECT) satisfy this under the
+/// content-hash UNIQUE constraint added in V017.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimResult<R> {
+    /// This caller's INSERT landed first. The embedded reference
+    /// points to the row this caller just wrote.
+    Stored(R),
+    /// Another caller already wrote a row with this content hash;
+    /// the embedded reference points to the EXISTING row. The
+    /// caller's INSERT was suppressed (PG `ON CONFLICT DO NOTHING`
+    /// or SQLite `INSERT OR IGNORE`) — no row was created by this
+    /// call.
+    AlreadyClaimed(R),
+}
+
+impl<R> ClaimResult<R> {
+    /// Borrow the embedded reference regardless of outcome — useful
+    /// when the caller doesn't care who won the race.
+    pub fn reference(&self) -> &R {
+        match self {
+            ClaimResult::Stored(r) | ClaimResult::AlreadyClaimed(r) => r,
+        }
+    }
+
+    /// Consume into the embedded reference regardless of outcome.
+    pub fn into_reference(self) -> R {
+        match self {
+            ClaimResult::Stored(r) | ClaimResult::AlreadyClaimed(r) => r,
+        }
+    }
+
+    /// `true` when THIS caller's INSERT landed (the race winner).
+    pub fn was_stored(&self) -> bool {
+        matches!(self, ClaimResult::Stored(_))
+    }
+}

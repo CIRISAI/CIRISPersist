@@ -23,6 +23,8 @@ use super::types::{
     SecretsServiceStats,
 };
 use super::SecretsError;
+use crate::pipeline::classify::Sensitivity;
+use crate::ClaimResult;
 
 /// Federated SecretsService — 18 methods covering CRUD, detection,
 /// decapsulation, direct crypto, filter config, audit, and key
@@ -212,4 +214,62 @@ pub trait SecretsService: Send + Sync {
         &self,
         accessor: String,
     ) -> impl Future<Output = Result<MasterKeyRef, SecretsError>> + Send;
+
+    // ── Atomic-claim (v1.0.0, CIRISAgent#756 concern #2) ──────────────
+
+    /// Atomic-claim variant of [`SecretsService::store_secret`]
+    /// (v1.0.0; CIRISAgent#756 concern #2). Race-safe write
+    /// semantics for N concurrent workers processing the same
+    /// envelope.
+    ///
+    /// Computes
+    /// `content_hmac = HMAC-SHA256(active_master_key, plaintext)`,
+    /// attempts an INSERT with the hmac as the unique key. On
+    /// conflict (another caller already stored this plaintext under
+    /// the same master key), returns
+    /// [`ClaimResult::AlreadyClaimed`] with the existing row's
+    /// [`SecretReference`]. On clean insert, returns
+    /// [`ClaimResult::Stored`].
+    ///
+    /// Implementations MUST be atomic — two concurrent callers
+    /// running the same plaintext through the INSERT race end up
+    /// with one row, not two. PG backend uses
+    /// `INSERT … ON CONFLICT (content_hmac) DO NOTHING RETURNING …`;
+    /// SQLite uses `INSERT OR IGNORE …` plus a follow-up SELECT on
+    /// conflict.
+    ///
+    /// # Master-key rotation
+    ///
+    /// The HMAC is computed under whichever master key is active at
+    /// the time of the call. After rotation, the same plaintext
+    /// produces a different HMAC and would re-claim. This is
+    /// intentional: rotation is the boundary where dedup state
+    /// resets.
+    ///
+    /// # Default impl
+    ///
+    /// Returns [`SecretsError::Internal`] — backends without the
+    /// V017 content_hmac column (legacy in-memory shims) opt into
+    /// the surface explicitly.
+    fn try_claim_secret(
+        &self,
+        plaintext: &str,
+        description: &str,
+        sensitivity: Sensitivity,
+        auto_decapsulate_for_actions: Vec<String>,
+        accessor: String,
+    ) -> impl Future<Output = Result<ClaimResult<SecretReference>, SecretsError>> + Send {
+        let _ = (
+            plaintext,
+            description,
+            sensitivity,
+            auto_decapsulate_for_actions,
+            accessor,
+        );
+        async {
+            Err(SecretsError::Internal(
+                "try_claim_secret not implemented for this backend".into(),
+            ))
+        }
+    }
 }

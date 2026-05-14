@@ -93,3 +93,8 @@ pub use crate::federation::{
     Attestation, HybridPendingRow, KeyRecord, Revocation, SignedAttestation, SignedKeyRecord,
     SignedRevocation,
 };
+
+// Atomic-claim primitive (v1.0.0; CIRISAgent#756 concern #2). Returned
+// by SecretsService::try_claim_secret + AuditService::try_claim_event;
+// federation peers calling either path need the typed outcome enum.
+pub use crate::ClaimResult;

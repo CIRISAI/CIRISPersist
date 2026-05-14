@@ -46,7 +46,9 @@ pub mod types;
 pub mod verify;
 
 pub use service::AuditService;
-pub use types::{AuditEntry, AuditFilter, AuditListPage, ChainVerification, ChainVerifyOutcome};
+pub use types::{
+    AuditEntry, AuditEventRef, AuditFilter, AuditListPage, ChainVerification, ChainVerifyOutcome,
+};
 
 /// audit-layer errors.
 ///
