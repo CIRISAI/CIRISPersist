@@ -13,8 +13,8 @@ use tokio::sync::Mutex;
 
 use super::service::TelemetryService;
 use super::types::{
-    ConsolidationOutcome, ConsolidationRequest, MetricCursor, MetricFilter, MetricListPage,
-    MetricObservation, MetricSummary,
+    ConsolidationLevel, ConsolidationOutcome, ConsolidationRequest, MetricCursor, MetricFilter,
+    MetricListPage, MetricObservation, MetricSummary,
 };
 use super::{Error, DEFAULT_MAX_LABELS_BYTES, STALE_LOCK_SECONDS};
 
@@ -428,15 +428,22 @@ impl TelemetryService for SqliteTelemetryBackend {
     }
 }
 
-fn run_rollup(
-    conn: &mut Connection,
+struct AggRow {
+    metric_name: String,
+    sum_v: f64,
+    min_v: f64,
+    max_v: f64,
+    avg_v: f64,
+    count_v: i64,
+    unique_labels: i64,
+}
+
+fn aggregate_basic_from_raw(
+    conn: &Connection,
     req: &ConsolidationRequest,
     period_start_str: &str,
     period_end_str: &str,
-) -> Result<ConsolidationOutcome, Error> {
-    // 1. Aggregate by metric_name. SQLite's COUNT(DISTINCT) on TEXT
-    //    works directly — labels is canonical-JSON string, so two
-    //    rows with identical labels share the same string.
+) -> Result<Vec<AggRow>, Error> {
     let mut stmt = conn
         .prepare(
             "SELECT metric_name, \
@@ -452,16 +459,6 @@ fn run_rollup(
              GROUP BY metric_name",
         )
         .map_err(|e| map_sqlite_error(e, "rollup aggregate prepare"))?;
-
-    struct AggRow {
-        metric_name: String,
-        sum_v: f64,
-        min_v: f64,
-        max_v: f64,
-        avg_v: f64,
-        count_v: i64,
-        unique_labels: i64,
-    }
     let rows: Vec<AggRow> = stmt
         .query_map(
             params![req.tenant_id, period_start_str, period_end_str],
@@ -480,7 +477,89 @@ fn run_rollup(
         .map_err(|e| map_sqlite_error(e, "rollup aggregate query"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| map_sqlite_error(e, "rollup aggregate collect"))?;
-    drop(stmt);
+    Ok(rows)
+}
+
+/// Higher-tier rollup: read prior-tier summary rows from
+/// `cirisgraph_nodes` (filtered by `consolidation_level`) and
+/// aggregate them per metric_name. SQLite stores summary attributes
+/// as TEXT, so numeric fields come back via json_extract as REAL/INT.
+fn aggregate_higher_tier(
+    conn: &Connection,
+    req: &ConsolidationRequest,
+    period_start_str: &str,
+    period_end_str: &str,
+    input_tier: ConsolidationLevel,
+) -> Result<Vec<AggRow>, Error> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT json_extract(attributes, '$.metric_name')                     AS metric_name, \
+                    SUM(CAST(json_extract(attributes, '$.sum') AS REAL))           AS sum_v, \
+                    MIN(CAST(json_extract(attributes, '$.min') AS REAL))           AS min_v, \
+                    MAX(CAST(json_extract(attributes, '$.max') AS REAL))           AS max_v, \
+                    SUM(CAST(json_extract(attributes, '$.count') AS INTEGER))      AS count_v, \
+                    SUM(CAST(json_extract(attributes, '$.unique_label_combinations') AS INTEGER)) AS unique_labels \
+             FROM cirisgraph_nodes \
+             WHERE node_type = 'tsdb_summary' AND scope = 'ENVIRONMENT' \
+               AND consolidation_level = ?1 \
+               AND json_extract(attributes, '$.tenant_id') = ?2 \
+               AND json_extract(attributes, '$.period_start') >= ?3 \
+               AND json_extract(attributes, '$.period_end')   <= ?4 \
+             GROUP BY json_extract(attributes, '$.metric_name')",
+        )
+        .map_err(|e| map_sqlite_error(e, "rollup higher tier prepare"))?;
+    let rows: Vec<AggRow> = stmt
+        .query_map(
+            params![
+                input_tier.as_str(),
+                req.tenant_id,
+                period_start_str,
+                period_end_str,
+            ],
+            |row| {
+                // SELECT: 0=metric_name, 1=sum_v, 2=min_v, 3=max_v,
+                //         4=count_v, 5=unique_labels. avg is derived.
+                let count_v: i64 = row.get(4)?;
+                let sum_v: f64 = row.get(1)?;
+                let avg_v = if count_v > 0 {
+                    sum_v / count_v as f64
+                } else {
+                    0.0
+                };
+                Ok(AggRow {
+                    metric_name: row.get(0)?,
+                    sum_v,
+                    min_v: row.get(2)?,
+                    max_v: row.get(3)?,
+                    avg_v,
+                    count_v,
+                    unique_labels: row.get(5)?,
+                })
+            },
+        )
+        .map_err(|e| map_sqlite_error(e, "rollup higher tier query"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| map_sqlite_error(e, "rollup higher tier collect"))?;
+    Ok(rows)
+}
+
+fn run_rollup(
+    conn: &mut Connection,
+    req: &ConsolidationRequest,
+    period_start_str: &str,
+    period_end_str: &str,
+) -> Result<ConsolidationOutcome, Error> {
+    // 1. Aggregate by metric_name — source depends on tier.
+    //    Basic = raw observations; higher tiers = prior-tier summaries.
+    //    SQLite's COUNT(DISTINCT) on TEXT works directly for the basic
+    //    path — labels is canonical-JSON string, so identical labels
+    //    share the same string.
+    let rows: Vec<AggRow> = match req.level.input_tier() {
+        None => aggregate_basic_from_raw(conn, req, period_start_str, period_end_str)?,
+        Some(input_tier) => {
+            aggregate_higher_tier(conn, req, period_start_str, period_end_str, input_tier)?
+        }
+    };
 
     let metrics_consolidated: i64 = rows.iter().map(|r| r.count_v).sum();
     let mut summaries_written: i64 = 0;
@@ -512,6 +591,7 @@ fn run_rollup(
             avg: agg.avg_v,
             count: agg.count_v,
             unique_label_combinations: agg.unique_labels,
+            consolidation_level: req.level,
         };
         let summary_node_id = summary_node_id(&summary);
         let attributes_str = serde_json::to_string(&summary)
@@ -530,17 +610,19 @@ fn run_rollup(
         let expected_version = current_version.unwrap_or(0);
 
         // UPSERT — same shape as cirisgraph sqlite::upsert_node.
+        // V019: consolidation_level is a real column.
         let affected = conn
             .execute(
                 "INSERT INTO cirisgraph_nodes (\
                     node_id, scope, node_type, attributes, version, \
-                    updated_by, updated_at, persist_row_hash\
-                 ) VALUES (?1, 'ENVIRONMENT', 'tsdb_summary', ?2, 1, ?3, ?4, ?5) \
+                    updated_by, updated_at, persist_row_hash, consolidation_level\
+                 ) VALUES (?1, 'ENVIRONMENT', 'tsdb_summary', ?2, 1, ?3, ?4, ?5, ?7) \
                  ON CONFLICT (node_id, scope) DO UPDATE SET \
                     attributes = excluded.attributes, \
                     version = cirisgraph_nodes.version + 1, \
                     updated_by = excluded.updated_by, \
-                    updated_at = excluded.updated_at \
+                    updated_at = excluded.updated_at, \
+                    consolidation_level = excluded.consolidation_level \
                  WHERE cirisgraph_nodes.version = ?6",
                 params![
                     summary_node_id,
@@ -549,6 +631,7 @@ fn run_rollup(
                     now_str,
                     "tsdb_summary_v0.8.6",
                     expected_version,
+                    req.level.as_str(),
                 ],
             )
             .map_err(|e| map_sqlite_error(e, "rollup upsert summary node"))?;
@@ -558,16 +641,24 @@ fn run_rollup(
 
         // AV-54: prior period's summary → TEMPORAL_NEXT edge.
         // SQLite json_extract on attributes for the predicate.
+        // Chain stays tier-local (basic→basic, daily→daily, …) per
+        // CIRISAgent#756 Q7.
         let prior_node_id_opt: Option<String> = conn
             .query_row(
                 "SELECT node_id FROM cirisgraph_nodes \
                  WHERE node_type = 'tsdb_summary' AND scope = 'ENVIRONMENT' \
+                   AND consolidation_level = ?4 \
                    AND json_extract(attributes, '$.metric_name') = ?1 \
                    AND json_extract(attributes, '$.tenant_id')   = ?2 \
                    AND json_extract(attributes, '$.period_start') < ?3 \
                  ORDER BY json_extract(attributes, '$.period_start') DESC \
                  LIMIT 1",
-                params![agg.metric_name, req.tenant_id, period_start_str],
+                params![
+                    agg.metric_name,
+                    req.tenant_id,
+                    period_start_str,
+                    req.level.as_str()
+                ],
                 |row| row.get::<_, String>(0),
             )
             .optional()
@@ -594,14 +685,20 @@ fn run_rollup(
         }
     }
 
-    let raw_metrics_deleted = conn
-        .execute(
+    // Only the Basic tier touches the raw observations table.
+    // Higher tiers aggregate prior-tier summaries; raw rows are
+    // already gone by the time those run.
+    let raw_metrics_deleted = if matches!(req.level, ConsolidationLevel::Basic) {
+        conn.execute(
             "DELETE FROM cirisgraph_telemetry_metrics \
              WHERE tenant_id = ?1 \
                AND observed_at >= ?2 AND observed_at < ?3",
             params![req.tenant_id, period_start_str, period_end_str],
         )
-        .map_err(|e| map_sqlite_error(e, "rollup delete raw"))?;
+        .map_err(|e| map_sqlite_error(e, "rollup delete raw"))?
+    } else {
+        0
+    };
 
     Ok(ConsolidationOutcome {
         metrics_consolidated,
@@ -614,8 +711,11 @@ fn run_rollup(
 }
 
 fn summary_node_id(summary: &MetricSummary) -> String {
+    // V019: tier prefix prevents collisions between basic/daily/
+    // weekly/monthly summaries for the same (tenant, metric, period).
     format!(
-        "tsdb:{}:{}:{}",
+        "tsdb:{}:{}:{}:{}",
+        summary.consolidation_level.as_str(),
         summary.tenant_id,
         summary.metric_name,
         summary.period_start.to_rfc3339()
@@ -744,6 +844,7 @@ mod tests {
                 period_start: period_a_start,
                 period_end: period_a_end,
                 locked_by: "test-worker-1".into(),
+                level: ConsolidationLevel::Basic,
             })
             .await
             .unwrap();
@@ -760,6 +861,7 @@ mod tests {
                 period_start: period_a_start,
                 period_end: period_a_end,
                 locked_by: "test-worker-1".into(),
+                level: ConsolidationLevel::Basic,
             })
             .await
             .unwrap();
@@ -790,6 +892,7 @@ mod tests {
                 period_start: period_b_start,
                 period_end: period_b_end,
                 locked_by: "test-worker-1".into(),
+                level: ConsolidationLevel::Basic,
             })
             .await
             .unwrap();
@@ -829,10 +932,150 @@ mod tests {
                 period_start,
                 period_end,
                 locked_by: "test-blocked-worker".into(),
+                level: ConsolidationLevel::Basic,
             })
             .await
             .unwrap();
         assert!(!outcome.ran);
         assert!(!outcome.broke_stale_lock);
+    }
+
+    /// v1.0.0 (CIRISAgent#756 Q7) — Basic-tier single-window sanity:
+    /// 4 raw observations across a 6h window produce one MetricSummary
+    /// with level=Basic, count=4. Asserts the consolidation_level
+    /// column lands on the underlying node row too.
+    #[tokio::test]
+    async fn telemetry_sqlite_basic_tier_writes_level_column() {
+        let (b, tlm) = fresh_backend().await;
+        let tenant = format!("tier-{}", uuid::Uuid::new_v4().simple());
+        let p_start = chrono::Utc::now() - Duration::hours(12);
+        let p_end = p_start + Duration::hours(6);
+
+        let batch = (0..4)
+            .map(|i| {
+                obs(
+                    "qps",
+                    &tenant,
+                    (i as f64 + 1.0) * 10.0,
+                    p_start + Duration::minutes(i as i64 * 30),
+                )
+            })
+            .collect::<Vec<_>>();
+        tlm.record_metrics_batch(&batch).await.unwrap();
+
+        let out = tlm
+            .consolidate_period(ConsolidationRequest {
+                tenant_id: tenant.clone(),
+                period_start: p_start,
+                period_end: p_end,
+                locked_by: "tier-worker".into(),
+                level: ConsolidationLevel::Basic,
+            })
+            .await
+            .unwrap();
+        assert!(out.ran);
+        assert_eq!(out.summaries_written, 1);
+        assert_eq!(out.metrics_consolidated, 4);
+        assert_eq!(out.raw_metrics_deleted, 4);
+
+        // Verify the column landed.
+        let conn = b.conn_handle();
+        let guard = conn.lock().await;
+        let (lvl, attrs_str): (String, String) = guard
+            .query_row(
+                "SELECT consolidation_level, attributes FROM cirisgraph_nodes \
+                 WHERE node_type = 'tsdb_summary' \
+                   AND json_extract(attributes, '$.tenant_id') = ?1 \
+                   AND json_extract(attributes, '$.metric_name') = 'qps'",
+                params![tenant],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(lvl, "basic");
+        let attrs: serde_json::Value = serde_json::from_str(&attrs_str).unwrap();
+        assert_eq!(attrs["consolidation_level"], "basic");
+        assert_eq!(attrs["count"].as_i64(), Some(4));
+    }
+
+    /// v1.0.0 (CIRISAgent#756 Q7) — Daily-tier rollup: 4 basic-tier
+    /// 6h summaries spanning a day → one daily-tier summary per
+    /// metric. Sum/count/min/max math is asserted; raw table is NOT
+    /// touched by the daily pass.
+    #[tokio::test]
+    async fn telemetry_sqlite_daily_tier_rolls_up_basic() {
+        let (b, tlm) = fresh_backend().await;
+        let tenant = format!("tier-{}", uuid::Uuid::new_v4().simple());
+        let day_start = chrono::Utc::now() - Duration::days(2);
+        let day_end = day_start + Duration::hours(24);
+
+        // 4 basic-tier 6h windows fill the day; 3 raw obs each.
+        for i in 0..4 {
+            let p_start = day_start + Duration::hours(i * 6);
+            let p_end = p_start + Duration::hours(6);
+            let batch = vec![
+                obs("rpm", &tenant, 10.0, p_start),
+                obs("rpm", &tenant, 20.0, p_start + Duration::minutes(60)),
+                obs("rpm", &tenant, 30.0, p_start + Duration::minutes(120)),
+            ];
+            tlm.record_metrics_batch(&batch).await.unwrap();
+            let out = tlm
+                .consolidate_period(ConsolidationRequest {
+                    tenant_id: tenant.clone(),
+                    period_start: p_start,
+                    period_end: p_end,
+                    locked_by: "tier-worker".into(),
+                    level: ConsolidationLevel::Basic,
+                })
+                .await
+                .unwrap();
+            assert!(out.ran);
+            assert_eq!(out.summaries_written, 1);
+            assert_eq!(out.metrics_consolidated, 3);
+        }
+
+        // Roll up to daily.
+        let out_daily = tlm
+            .consolidate_period(ConsolidationRequest {
+                tenant_id: tenant.clone(),
+                period_start: day_start,
+                period_end: day_end,
+                locked_by: "tier-worker".into(),
+                level: ConsolidationLevel::Daily,
+            })
+            .await
+            .unwrap();
+        assert!(out_daily.ran);
+        assert_eq!(out_daily.summaries_written, 1);
+        assert_eq!(
+            out_daily.metrics_consolidated, 12,
+            "4 basic summaries × 3 raw obs each = 12 total count"
+        );
+        assert_eq!(
+            out_daily.raw_metrics_deleted, 0,
+            "higher tiers don't touch the raw table"
+        );
+
+        // Verify the daily row.
+        let conn = b.conn_handle();
+        let guard = conn.lock().await;
+        let (lvl, attrs_str): (String, String) = guard
+            .query_row(
+                "SELECT consolidation_level, attributes FROM cirisgraph_nodes \
+                 WHERE node_type = 'tsdb_summary' \
+                   AND consolidation_level = 'daily' \
+                   AND json_extract(attributes, '$.tenant_id') = ?1 \
+                   AND json_extract(attributes, '$.metric_name') = 'rpm'",
+                params![tenant],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(lvl, "daily");
+        let attrs: serde_json::Value = serde_json::from_str(&attrs_str).unwrap();
+        assert_eq!(attrs["consolidation_level"], "daily");
+        assert_eq!(attrs["count"].as_i64(), Some(12));
+        assert_eq!(attrs["sum"].as_f64(), Some(240.0)); // (10+20+30)*4
+        assert_eq!(attrs["min"].as_f64(), Some(10.0));
+        assert_eq!(attrs["max"].as_f64(), Some(30.0));
+        assert_eq!(attrs["avg"].as_f64(), Some(20.0));
     }
 }

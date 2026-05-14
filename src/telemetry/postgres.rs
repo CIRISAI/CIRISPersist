@@ -8,8 +8,8 @@ use chrono::{DateTime, Duration, Utc};
 
 use super::service::TelemetryService;
 use super::types::{
-    ConsolidationOutcome, ConsolidationRequest, MetricCursor, MetricFilter, MetricListPage,
-    MetricObservation, MetricSummary,
+    ConsolidationLevel, ConsolidationOutcome, ConsolidationRequest, MetricCursor, MetricFilter,
+    MetricListPage, MetricObservation, MetricSummary,
 };
 use super::{Error, DEFAULT_MAX_LABELS_BYTES, STALE_LOCK_SECONDS};
 use crate::store::postgres::PostgresBackend;
@@ -397,12 +397,22 @@ impl TelemetryService for PostgresBackend {
 /// in `[period_start, period_end)`, writes one tsdb_summary node per
 /// metric_name to `cirisgraph.nodes`, creates TEMPORAL_NEXT edges
 /// from prior periods' summaries, deletes raw rows.
-async fn run_rollup(
+/// Aggregate row shared by both rollup paths (raw vs. tier-summary).
+struct AggRow {
+    metric_name: String,
+    sum_v: f64,
+    min_v: f64,
+    max_v: f64,
+    avg_v: f64,
+    count_v: i64,
+    unique_labels: i64,
+}
+
+async fn aggregate_basic_from_raw(
     client: &mut deadpool_postgres::Object,
     req: &ConsolidationRequest,
-) -> Result<ConsolidationOutcome, Error> {
-    // 1. Aggregate by metric_name.
-    let agg_rows = client
+) -> Result<Vec<AggRow>, Error> {
+    let rows = client
         .query(
             "SELECT metric_name, \
                     SUM(value) AS sum_v, \
@@ -419,11 +429,116 @@ async fn run_rollup(
         )
         .await
         .map_err(|e| map_pg_error(e, "rollup aggregate"))?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        out.push(AggRow {
+            metric_name: r
+                .try_get("metric_name")
+                .map_err(|e| Error::Backend(format!("decode metric_name: {e}")))?,
+            sum_v: r
+                .try_get("sum_v")
+                .map_err(|e| Error::Backend(format!("decode sum_v: {e}")))?,
+            min_v: r
+                .try_get("min_v")
+                .map_err(|e| Error::Backend(format!("decode min_v: {e}")))?,
+            max_v: r
+                .try_get("max_v")
+                .map_err(|e| Error::Backend(format!("decode max_v: {e}")))?,
+            avg_v: r
+                .try_get("avg_v")
+                .map_err(|e| Error::Backend(format!("decode avg_v: {e}")))?,
+            count_v: r
+                .try_get("count_v")
+                .map_err(|e| Error::Backend(format!("decode count_v: {e}")))?,
+            unique_labels: r
+                .try_get("unique_labels")
+                .map_err(|e| Error::Backend(format!("decode unique_labels: {e}")))?,
+        });
+    }
+    Ok(out)
+}
 
-    let metrics_consolidated: i64 = agg_rows
-        .iter()
-        .map(|r| r.try_get::<_, i64>("count_v").unwrap_or(0))
-        .sum();
+/// Roll up the previous tier's summary rows. Per (metric_name + tenant)
+/// group: new count = sum(input counts), new sum = sum(input sums),
+/// new min = min(input mins), new max = max(input maxes), new avg =
+/// new sum / new count.
+async fn aggregate_higher_tier(
+    client: &mut deadpool_postgres::Object,
+    req: &ConsolidationRequest,
+    input_tier: ConsolidationLevel,
+) -> Result<Vec<AggRow>, Error> {
+    let rows = client
+        .query(
+            "SELECT attributes->>'metric_name'                              AS metric_name, \
+                    SUM((attributes->>'sum')::float8)                        AS sum_v, \
+                    MIN((attributes->>'min')::float8)                        AS min_v, \
+                    MAX((attributes->>'max')::float8)                        AS max_v, \
+                    SUM((attributes->>'count')::bigint)                      AS count_v, \
+                    SUM((attributes->>'unique_label_combinations')::bigint)  AS unique_labels \
+             FROM cirisgraph.nodes \
+             WHERE node_type = 'tsdb_summary' AND scope = 'ENVIRONMENT' \
+               AND consolidation_level = $1 \
+               AND attributes->>'tenant_id' = $2 \
+               AND ((attributes->>'period_start')::timestamptz) >= $3 \
+               AND ((attributes->>'period_end')::timestamptz)   <= $4 \
+             GROUP BY attributes->>'metric_name'",
+            &[
+                &input_tier.as_str(),
+                &req.tenant_id,
+                &req.period_start,
+                &req.period_end,
+            ],
+        )
+        .await
+        .map_err(|e| map_pg_error(e, "rollup aggregate higher tier"))?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let count_v: i64 = r
+            .try_get("count_v")
+            .map_err(|e| Error::Backend(format!("decode count_v: {e}")))?;
+        let sum_v: f64 = r
+            .try_get("sum_v")
+            .map_err(|e| Error::Backend(format!("decode sum_v: {e}")))?;
+        let avg_v = if count_v > 0 {
+            sum_v / count_v as f64
+        } else {
+            0.0
+        };
+        out.push(AggRow {
+            metric_name: r
+                .try_get("metric_name")
+                .map_err(|e| Error::Backend(format!("decode metric_name: {e}")))?,
+            sum_v,
+            min_v: r
+                .try_get("min_v")
+                .map_err(|e| Error::Backend(format!("decode min_v: {e}")))?,
+            max_v: r
+                .try_get("max_v")
+                .map_err(|e| Error::Backend(format!("decode max_v: {e}")))?,
+            avg_v,
+            count_v,
+            unique_labels: r
+                .try_get("unique_labels")
+                .map_err(|e| Error::Backend(format!("decode unique_labels: {e}")))?,
+        });
+    }
+    Ok(out)
+}
+
+async fn run_rollup(
+    client: &mut deadpool_postgres::Object,
+    req: &ConsolidationRequest,
+) -> Result<ConsolidationOutcome, Error> {
+    // 1. Aggregate by metric_name — source depends on tier.
+    //    Basic: raw observations.
+    //    Daily/Weekly/Monthly: previous tier's summary rows in the
+    //    same period window.
+    let agg_rows = match req.level.input_tier() {
+        None => aggregate_basic_from_raw(client, req).await?,
+        Some(input_tier) => aggregate_higher_tier(client, req, input_tier).await?,
+    };
+
+    let metrics_consolidated: i64 = agg_rows.iter().map(|r| r.count_v).sum();
 
     let mut summaries_written: i64 = 0;
     let mut edges_created: i64 = 0;
@@ -431,32 +546,19 @@ async fn run_rollup(
     // 2. For each metric, UPSERT a tsdb_summary node + write
     //    TEMPORAL_NEXT edge from prior period if present.
     for row in &agg_rows {
-        let metric_name: String = row
-            .try_get("metric_name")
-            .map_err(|e| Error::Backend(format!("decode metric_name: {e}")))?;
+        let metric_name = row.metric_name.clone();
         let summary = MetricSummary {
             metric_name: metric_name.clone(),
             tenant_id: req.tenant_id.clone(),
             period_start: req.period_start,
             period_end: req.period_end,
-            sum: row
-                .try_get::<_, f64>("sum_v")
-                .map_err(|e| Error::Backend(format!("decode sum: {e}")))?,
-            min: row
-                .try_get::<_, f64>("min_v")
-                .map_err(|e| Error::Backend(format!("decode min: {e}")))?,
-            max: row
-                .try_get::<_, f64>("max_v")
-                .map_err(|e| Error::Backend(format!("decode max: {e}")))?,
-            avg: row
-                .try_get::<_, f64>("avg_v")
-                .map_err(|e| Error::Backend(format!("decode avg: {e}")))?,
-            count: row
-                .try_get::<_, i64>("count_v")
-                .map_err(|e| Error::Backend(format!("decode count: {e}")))?,
-            unique_label_combinations: row
-                .try_get::<_, i64>("unique_labels")
-                .map_err(|e| Error::Backend(format!("decode unique_labels: {e}")))?,
+            sum: row.sum_v,
+            min: row.min_v,
+            max: row.max_v,
+            avg: row.avg_v,
+            count: row.count_v,
+            unique_label_combinations: row.unique_labels,
+            consolidation_level: req.level,
         };
 
         let summary_node_id = summary_node_id(&summary);
@@ -479,18 +581,21 @@ async fn run_rollup(
         // UPSERT mirrors cirisgraph's upsert_node SQL shape — keeps
         // version-bump semantics aligned. The summary node carries
         // a `version` of N → N+1 on each rollup re-run; first write
-        // lands at version=1.
+        // lands at version=1. V019: consolidation_level is a real
+        // column (the value lives in attributes too, but the column
+        // is the indexable surface for the rollup probes).
         let affected = client
             .execute(
                 "INSERT INTO cirisgraph.nodes (\
                     node_id, scope, node_type, attributes, version, \
-                    updated_by, updated_at, persist_row_hash\
-                 ) VALUES ($1, 'ENVIRONMENT', 'tsdb_summary', $2, 1, $3, NOW(), $4) \
+                    updated_by, updated_at, persist_row_hash, consolidation_level\
+                 ) VALUES ($1, 'ENVIRONMENT', 'tsdb_summary', $2, 1, $3, NOW(), $4, $6) \
                  ON CONFLICT (node_id, scope) DO UPDATE SET \
                     attributes = EXCLUDED.attributes, \
                     version = cirisgraph.nodes.version + 1, \
                     updated_by = EXCLUDED.updated_by, \
-                    updated_at = NOW() \
+                    updated_at = NOW(), \
+                    consolidation_level = EXCLUDED.consolidation_level \
                  WHERE cirisgraph.nodes.version = $5",
                 &[
                     &summary_node_id,
@@ -498,6 +603,7 @@ async fn run_rollup(
                     &req.locked_by,
                     &"tsdb_summary_v0.8.2",
                     &expected_version,
+                    &req.level.as_str(),
                 ],
             )
             .await
@@ -509,11 +615,13 @@ async fn run_rollup(
         // AV-54: TEMPORAL_NEXT edge from prior period's summary
         // node (if it exists). Look for a summary whose
         // period_start is the most recent one BEFORE this period
-        // for the same metric_name + tenant.
+        // for the same metric_name + tenant + level (chain stays
+        // tier-local — basic → basic, daily → daily, etc.).
         let prior_node_id_opt: Option<String> = client
             .query_opt(
                 "SELECT node_id FROM cirisgraph.nodes \
                  WHERE node_type = 'tsdb_summary' AND scope = 'ENVIRONMENT' \
+                   AND consolidation_level = $3 \
                    AND attributes @> $1 \
                    AND (attributes->>'period_start')::timestamptz < $2 \
                  ORDER BY (attributes->>'period_start')::timestamptz DESC \
@@ -524,6 +632,7 @@ async fn run_rollup(
                         "tenant_id": req.tenant_id,
                     }),
                     &req.period_start,
+                    &req.level.as_str(),
                 ],
             )
             .await
@@ -558,17 +667,24 @@ async fn run_rollup(
         }
     }
 
-    // 3. Delete raw rows in the window. Doing this LAST so a
-    //    transient failure in the summary write doesn't lose data.
-    let raw_metrics_deleted = client
-        .execute(
-            "DELETE FROM cirisgraph.telemetry_metrics \
-             WHERE tenant_id = $1 \
-               AND observed_at >= $2 AND observed_at < $3",
-            &[&req.tenant_id, &req.period_start, &req.period_end],
-        )
-        .await
-        .map_err(|e| map_pg_error(e, "rollup delete raw"))?;
+    // 3. Delete raw rows in the window — only on the Basic tier.
+    //    Higher tiers aggregate prior-tier summaries; the raw
+    //    table is already empty by the time they run. Doing this
+    //    LAST so a transient failure in the summary write doesn't
+    //    lose data.
+    let raw_metrics_deleted: u64 = if matches!(req.level, ConsolidationLevel::Basic) {
+        client
+            .execute(
+                "DELETE FROM cirisgraph.telemetry_metrics \
+                 WHERE tenant_id = $1 \
+                   AND observed_at >= $2 AND observed_at < $3",
+                &[&req.tenant_id, &req.period_start, &req.period_end],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "rollup delete raw"))?
+    } else {
+        0
+    };
 
     Ok(ConsolidationOutcome {
         metrics_consolidated,
@@ -581,12 +697,16 @@ async fn run_rollup(
 }
 
 /// Stable node_id for a tsdb_summary. Format:
-/// `tsdb:{tenant_id}:{metric_name}:{period_start_iso8601}`. The
-/// timestamp uses RFC 3339 so lexicographic ordering matches
-/// chronological ordering — convenient for the prior-period join.
+/// `tsdb:{level}:{tenant_id}:{metric_name}:{period_start_iso8601}`.
+/// Level is part of the key so different tiers' summaries for the
+/// same (tenant, metric, period_start) don't collide on the
+/// (node_id, scope) primary key. The timestamp uses RFC 3339 so
+/// lexicographic ordering matches chronological ordering —
+/// convenient for the prior-period join.
 fn summary_node_id(summary: &MetricSummary) -> String {
     format!(
-        "tsdb:{}:{}:{}",
+        "tsdb:{}:{}:{}:{}",
+        summary.consolidation_level.as_str(),
         summary.tenant_id,
         summary.metric_name,
         summary.period_start.to_rfc3339()
@@ -717,6 +837,7 @@ mod tests {
             period_start: period_a_start,
             period_end: period_a_end,
             locked_by: "test-worker-1".into(),
+            level: ConsolidationLevel::Basic,
         };
         let out_a = backend.consolidate_period(req_a.clone()).await.unwrap();
         assert!(out_a.ran);
@@ -776,6 +897,7 @@ mod tests {
                 period_start: period_b_start,
                 period_end: period_b_end,
                 locked_by: "test-worker-1".into(),
+                level: ConsolidationLevel::Basic,
             })
             .await
             .unwrap();
@@ -796,6 +918,7 @@ mod tests {
                 period_start: period_b_start,
                 period_end: period_b_end,
                 locked_by: "test-worker-2".into(),
+                level: ConsolidationLevel::Basic,
             })
             .await
             .unwrap();
@@ -842,6 +965,7 @@ mod tests {
                 period_start,
                 period_end,
                 locked_by: "test-blocked-worker".into(),
+                level: ConsolidationLevel::Basic,
             })
             .await
             .unwrap();
@@ -858,5 +982,96 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    /// v1.0.0 (CIRISAgent#756 Q7) — Daily tier rollup. Four basic-
+    /// tier summaries spanning a day → one daily-tier summary per
+    /// metric. Asserts the input counts/sums roll up correctly.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn telemetry_daily_tier_rolls_up_basic() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let tenant = format!("tier-{}", uuid::Uuid::new_v4().simple());
+        let day_start = Utc::now() - Duration::days(2);
+        let day_end = day_start + Duration::hours(24);
+
+        // 4 basic-tier 6h windows fill the day.
+        for i in 0..4 {
+            let p_start = day_start + Duration::hours(i * 6);
+            let p_end = p_start + Duration::hours(6);
+            // 3 raw observations per window.
+            let batch = vec![
+                obs("rpm", &tenant, 10.0, p_start),
+                obs("rpm", &tenant, 20.0, p_start + Duration::minutes(60)),
+                obs("rpm", &tenant, 30.0, p_start + Duration::minutes(120)),
+            ];
+            backend.record_metrics_batch(&batch).await.unwrap();
+            let out = backend
+                .consolidate_period(ConsolidationRequest {
+                    tenant_id: tenant.clone(),
+                    period_start: p_start,
+                    period_end: p_end,
+                    locked_by: "tier-worker".into(),
+                    level: ConsolidationLevel::Basic,
+                })
+                .await
+                .unwrap();
+            assert!(out.ran);
+            assert_eq!(out.summaries_written, 1);
+            assert_eq!(out.metrics_consolidated, 3);
+        }
+
+        // Now roll up the day → daily tier.
+        let out_daily = backend
+            .consolidate_period(ConsolidationRequest {
+                tenant_id: tenant.clone(),
+                period_start: day_start,
+                period_end: day_end,
+                locked_by: "tier-worker".into(),
+                level: ConsolidationLevel::Daily,
+            })
+            .await
+            .unwrap();
+        assert!(out_daily.ran);
+        assert_eq!(out_daily.summaries_written, 1, "one daily summary for rpm");
+        assert_eq!(
+            out_daily.metrics_consolidated, 12,
+            "4 basic summaries × 3 raw obs each = 12 total count"
+        );
+        assert_eq!(
+            out_daily.raw_metrics_deleted, 0,
+            "higher tiers don't touch the raw table"
+        );
+
+        // Verify the daily summary row carries consolidation_level='daily'.
+        let client = backend.pool().get().await.unwrap();
+        let row = client
+            .query_one(
+                "SELECT consolidation_level, attributes \
+                 FROM cirisgraph.nodes \
+                 WHERE node_type = 'tsdb_summary' \
+                   AND consolidation_level = 'daily' \
+                   AND attributes->>'tenant_id' = $1 \
+                   AND attributes->>'metric_name' = 'rpm'",
+                &[&tenant],
+            )
+            .await
+            .unwrap();
+        let lvl: String = row.get("consolidation_level");
+        assert_eq!(lvl, "daily");
+        let attrs: serde_json::Value = row.get("attributes");
+        assert_eq!(attrs["consolidation_level"], "daily");
+        assert_eq!(attrs["count"].as_i64(), Some(12));
+        assert_eq!(attrs["sum"].as_f64(), Some(240.0)); // (10+20+30)*4
+        assert_eq!(attrs["min"].as_f64(), Some(10.0));
+        assert_eq!(attrs["max"].as_f64(), Some(30.0));
+        assert_eq!(attrs["avg"].as_f64(), Some(20.0));
     }
 }

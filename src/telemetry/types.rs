@@ -5,6 +5,72 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Telemetry consolidation tier (CIRISAgent#756 Q7).
+///
+/// Multi-tier rollup pattern — different tiers compact raw
+/// observations at different period granularities. Load-bearing
+/// for 4GB RAM target on sovereign-mode / Pi deployments (the
+/// agent's TSDBConsolidationService tier strategy).
+///
+/// Wire shape: snake_case strings (matches agent's TSDB vocab).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsolidationLevel {
+    /// 6-hour basic tier — raw observations compacted to per-metric
+    /// summaries within a 6-hour window. Highest resolution; held
+    /// for short retention.
+    #[default]
+    Basic,
+    /// Daily tier — 24-hour windows. Rolls up basic tiers.
+    Daily,
+    /// Weekly tier — 7-day windows. Rolls up daily tiers.
+    Weekly,
+    /// Monthly tier — calendar-month windows. Rolls up weekly tiers.
+    /// Lowest resolution; longest retention.
+    Monthly,
+}
+
+impl ConsolidationLevel {
+    /// Wire-shape token (snake_case). Matches the serde representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConsolidationLevel::Basic => "basic",
+            ConsolidationLevel::Daily => "daily",
+            ConsolidationLevel::Weekly => "weekly",
+            ConsolidationLevel::Monthly => "monthly",
+        }
+    }
+
+    /// Parse a wire-shape token. Returns `None` for unknown values.
+    pub fn from_wire_str(s: &str) -> Option<Self> {
+        match s {
+            "basic" => Some(ConsolidationLevel::Basic),
+            "daily" => Some(ConsolidationLevel::Daily),
+            "weekly" => Some(ConsolidationLevel::Weekly),
+            "monthly" => Some(ConsolidationLevel::Monthly),
+            _ => None,
+        }
+    }
+
+    /// The tier this tier rolls up FROM. `Basic` rolls up from raw
+    /// observations (no input tier — returns `None`); higher tiers
+    /// roll up from the previous tier's summaries.
+    pub fn input_tier(self) -> Option<Self> {
+        match self {
+            ConsolidationLevel::Basic => None,
+            ConsolidationLevel::Daily => Some(ConsolidationLevel::Basic),
+            ConsolidationLevel::Weekly => Some(ConsolidationLevel::Daily),
+            ConsolidationLevel::Monthly => Some(ConsolidationLevel::Weekly),
+        }
+    }
+}
+
+impl std::fmt::Display for ConsolidationLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// One raw observation. Mirrors `cirisgraph.telemetry_metrics` row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetricObservation {
@@ -41,6 +107,11 @@ pub struct MetricSummary {
     /// combinations seen across the window. High cardinality is a
     /// signal of label-axis abuse.
     pub unique_label_combinations: i64,
+    /// CIRISAgent#756 Q7 — which tier this summary belongs to.
+    /// `Basic` (default) means raw observations; higher tiers are
+    /// rollups of the previous tier's summaries.
+    #[serde(default)]
+    pub consolidation_level: ConsolidationLevel,
 }
 
 /// Filter for `TelemetryService::list_metrics`. `tenant_id` is
@@ -94,6 +165,12 @@ pub struct ConsolidationRequest {
     /// Identifier for the worker invoking the consolidation —
     /// stored on the lock row + summary attributes for forensics.
     pub locked_by: String,
+    /// CIRISAgent#756 Q7 — which tier to write. `Basic` (default)
+    /// aggregates raw observations in the window; higher tiers
+    /// aggregate the previous tier's summaries. Wire-default keeps
+    /// existing JSON callers (e.g. PyO3) on Basic without changes.
+    #[serde(default)]
+    pub level: ConsolidationLevel,
 }
 
 /// Result of one `consolidate_period` call.
@@ -150,5 +227,49 @@ mod tests {
         let s = serde_json::to_string(&o).unwrap();
         let back: ConsolidationOutcome = serde_json::from_str(&s).unwrap();
         assert_eq!(o, back);
+    }
+
+    #[test]
+    fn consolidation_level_wire_round_trip() {
+        for lvl in [
+            ConsolidationLevel::Basic,
+            ConsolidationLevel::Daily,
+            ConsolidationLevel::Weekly,
+            ConsolidationLevel::Monthly,
+        ] {
+            let s = serde_json::to_string(&lvl).unwrap();
+            let back: ConsolidationLevel = serde_json::from_str(&s).unwrap();
+            assert_eq!(lvl, back);
+            assert_eq!(ConsolidationLevel::from_wire_str(lvl.as_str()), Some(lvl));
+            assert_eq!(lvl.to_string(), lvl.as_str());
+        }
+        assert_eq!(ConsolidationLevel::from_wire_str("bogus"), None);
+        assert_eq!(ConsolidationLevel::default(), ConsolidationLevel::Basic);
+    }
+
+    #[test]
+    fn consolidation_level_input_tier_chain() {
+        assert_eq!(ConsolidationLevel::Basic.input_tier(), None);
+        assert_eq!(
+            ConsolidationLevel::Daily.input_tier(),
+            Some(ConsolidationLevel::Basic)
+        );
+        assert_eq!(
+            ConsolidationLevel::Weekly.input_tier(),
+            Some(ConsolidationLevel::Daily)
+        );
+        assert_eq!(
+            ConsolidationLevel::Monthly.input_tier(),
+            Some(ConsolidationLevel::Weekly)
+        );
+    }
+
+    #[test]
+    fn consolidation_request_default_level_is_basic() {
+        // Wire compatibility: existing JSON without `level` parses as
+        // Basic (matches the PyO3 wrapper's no-level behavior).
+        let json = r#"{"tenant_id":"t","period_start":"2026-01-01T00:00:00Z","period_end":"2026-01-01T06:00:00Z","locked_by":"w"}"#;
+        let req: ConsolidationRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.level, ConsolidationLevel::Basic);
     }
 }
