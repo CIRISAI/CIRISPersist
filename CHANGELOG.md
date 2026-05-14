@@ -5,6 +5,27 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.0.1] — 2026-05-14
+
+**v1.0.0 with CI test fixup.** v1.0.0 tag CI hit two issues that
+gated the wheel publish; this is the first usable 1.x wheel on PyPI.
+
+- `migrations/postgres/lens/V019` — drop nested `BEGIN`/`COMMIT`
+  (refinery wraps each migration in its own tx; nested interacts
+  poorly with tokio-postgres expression-index parsing) + drop
+  `::timestamptz` cast on `(attributes->>'period_start')` (STABLE
+  function, rejected as index expression with SQLSTATE 42P17).
+  Canonical RFC 3339 strings sort lexicographically equivalently
+  for the same offset.
+- `tests/qa_harness.rs::av26_concurrent_boot_advisory_lock` —
+  bumped `schema_history` count expectation 1..=16 → 1..=19 to
+  match V017 (atomic-claim) + V018 (action_type CHECK) + V019
+  (consolidation_level) additions.
+
+No surface or behavioral changes from v1.0.0. The v1.0.0 tag stays
+on the same commit (`8067a87`) as a record of the substrate-
+completion cut; v1.0.1 is the first published wheel of the 1.x series.
+
 ## [1.0.0] — 2026-05-14
 
 **Substrate-completion + CIRISAgent v2.9.0 adoption cut.** The "1.0"
