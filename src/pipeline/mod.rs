@@ -467,30 +467,382 @@ impl Stage for ExtractStage {
     }
 }
 
+// ─── v1.0.0 (CIRISPersist#33): ClassifyStage ──────────────────────────
+
+/// Concrete [`Stage`] for content-class classification.
+///
+/// # Status (v1.0.0)
+///
+/// The `crate::pipeline::classify` module ships the full **taxonomy**
+/// (D1–D5 types per FSD §6.1) but no concrete matcher functions —
+/// regex / length / count / frequency / NER matcher impls are scoped
+/// to v0.6.x post-#33. This stage therefore **records that classify
+/// ran** but populates one empty `Vec<ContentClassMatch>` per
+/// component (the FSD §4.3 invariant 5 shape: outer-vec length =
+/// component count). Downstream stages still see well-formed state.
+///
+/// When matcher impls land, the inner loop here is the single edit
+/// site — swap the empty-vec push for a per-component dispatch into
+/// the matcher catalog.
+#[cfg(feature = "classify")]
+pub struct ClassifyStage;
+
+#[cfg(feature = "classify")]
+impl ClassifyStage {
+    /// Construct a stage with the default (v1.0.0: empty) matcher
+    /// catalog.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(feature = "classify")]
+impl Default for ClassifyStage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "classify")]
+impl Stage for ClassifyStage {
+    fn name(&self) -> &'static str {
+        "classify"
+    }
+
+    // See `ExtractStage::run` for the `impl Future + Send + 'a`
+    // pattern + the `manual_async_fn` lint suppression rationale.
+    #[allow(clippy::manual_async_fn)]
+    fn run<'a>(
+        &'a self,
+        env: &'a mut BatchEnvelope,
+        state: &'a mut PipelineState,
+    ) -> impl Future<Output = Result<(), Error>> + Send + 'a {
+        async move {
+            // FSD §4.3 invariant 5: classifications.len() MUST equal
+            // the inner envelope's component count. Push one empty
+            // vec per component so downstream invariant-checkers see
+            // the correct outer-vec length even when no matchers
+            // fired (matcher catalog is empty in v1.0.0).
+            for event in &env.events {
+                let crate::schema::BatchEvent::CompleteTrace { trace, .. } = event;
+                for _component in &trace.components {
+                    // TODO(post-#33): dispatch into the matcher
+                    // catalog — `classify::run_matchers(component_text, idx)`
+                    // — and push the returned `Vec<ContentClassMatch>`.
+                    state.classifications.push(Vec::new());
+                }
+            }
+            state.stages_executed.push("classify".to_string());
+            Ok(())
+        }
+    }
+}
+
+// ─── v1.0.0 (CIRISPersist#33): ScrubStage ────────────────────────────
+
+/// Concrete [`Stage`] wrapping the v0.6.0 `scrub_trace` walker.
+///
+/// Runs the configured scrub pass (regex catalog + walker + optional
+/// NER per `scrub-ner` feature) over every `CompleteTrace` inside
+/// the in-flight [`BatchEnvelope`]. Mutates the envelope in place;
+/// totals scrub stats into `state.fields_modified` and flips
+/// `state.pii_scrubbed = true` if any field was modified.
+///
+/// # Trace-level handling
+///
+/// The underlying [`scrub_trace`](scrub::scrub_trace) routes by
+/// [`crate::schema::TraceLevel`]:
+/// - `Generic`     → pass-through (no scrub).
+/// - `Detailed`    → regex + walker pass.
+/// - `FullTraces`  → regex + walker + NER (fails loud without NER).
+///
+/// # Failure semantics
+///
+/// Any [`ScrubError`](scrub::ScrubError) surfaces as
+/// [`Error::StageExternal`] — the orchestrator short-circuits the
+/// pipeline (FSD §3.3 step 3 — partial scrubs MUST fail ingest).
+#[cfg(feature = "scrub")]
+pub struct ScrubStage;
+
+#[cfg(feature = "scrub")]
+impl ScrubStage {
+    /// Construct a stage with default scrubber settings.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(feature = "scrub")]
+impl Default for ScrubStage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "scrub")]
+impl Stage for ScrubStage {
+    fn name(&self) -> &'static str {
+        "scrub"
+    }
+
+    fn dependencies(&self) -> &'static [&'static str] {
+        &["classify"]
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn run<'a>(
+        &'a self,
+        env: &'a mut BatchEnvelope,
+        state: &'a mut PipelineState,
+    ) -> impl Future<Output = Result<(), Error>> + Send + 'a {
+        async move {
+            let env_level = env.trace_level;
+            for event in env.events.iter_mut() {
+                let crate::schema::BatchEvent::CompleteTrace { trace, .. } = event;
+                // Serialize the trace, scrub, deserialize the result
+                // back over the original. scrub_trace consumes its
+                // input and returns owned JSON — the only way to
+                // mutate the typed envelope in place is round-trip.
+                let trace_json = serde_json::to_value(&*trace).map_err(|e| {
+                    Error::Internal(format!("ScrubStage: trace serialize failed: {e}"))
+                })?;
+                let scrubbed = scrub::scrub_trace(trace_json, env_level).map_err(|e| {
+                    Error::StageExternal {
+                        stage: "scrub",
+                        reason: e.to_string(),
+                    }
+                })?;
+                state.fields_modified += scrubbed.stats.fields_modified;
+                let new_trace: crate::schema::CompleteTrace =
+                    serde_json::from_value(scrubbed.value).map_err(|e| {
+                        Error::Internal(format!(
+                            "ScrubStage: scrubbed trace deserialize failed: {e}"
+                        ))
+                    })?;
+                *trace = new_trace;
+            }
+            if state.fields_modified > 0 {
+                state.pii_scrubbed = true;
+            }
+            state.stages_executed.push("scrub".to_string());
+            Ok(())
+        }
+    }
+}
+
+// ─── v1.0.0 (CIRISPersist#33): EncryptAndStoreStage ─────────────────
+
+/// Concrete [`Stage`] that walks `state.classifications` for matches
+/// tagged `Action::EncryptAndStore`, calls
+/// [`SecretsService::store_secret`](crate::secrets::SecretsService::store_secret)
+/// on each, replaces the matched span in the envelope with the
+/// canonical `{SECRET:uuid:description}` placeholder, and records
+/// the resulting [`EncryptedSecretRecord`](crate::secrets::types::EncryptedSecretRecord)
+/// in `state.encrypted_secrets`.
+///
+/// # Status (v1.0.0)
+///
+/// **Stubbed.** [`ContentClassMatch`](classify::ContentClassMatch)
+/// does not currently carry the pre-scrub cleartext span content —
+/// only `(component_index, json_path, span)`. By the time this stage
+/// runs (per FSD §2.3 + §5.2 canonical order: Classify → Scrub →
+/// EncryptAndStore → Extract), the scrub pass has already replaced
+/// the span with `[REDACTED]` markers, so we can't recover the
+/// cleartext to encrypt it.
+///
+/// Resolution (post-v1.0.0): teach the classify matcher catalog to
+/// capture the pre-scrub cleartext into `ContentClassMatch` (new
+/// field, additive). This stage's body then walks classifications
+/// for `Action::EncryptAndStore` and calls
+/// `secrets.store_secret(...)` per match.
+///
+/// For v1.0.0, the stage:
+/// - Records itself in `state.stages_executed`.
+/// - Iterates `state.classifications` and observes zero
+///   `Action::EncryptAndStore` matches (classify is stubbed in
+///   v1.0.0 — empty per-component vecs).
+/// - Leaves `state.encrypted_secrets` empty.
+///
+/// The agent team ships against the stub: pipeline composition is
+/// valid; the encrypt path activates the moment classify + cleartext
+/// capture land.
+#[cfg(all(feature = "secrets", feature = "scrub"))]
+pub struct EncryptAndStoreStage<S: crate::secrets::SecretsService> {
+    secrets: std::sync::Arc<S>,
+    actor_id: String,
+}
+
+#[cfg(all(feature = "secrets", feature = "scrub"))]
+impl<S: crate::secrets::SecretsService> EncryptAndStoreStage<S> {
+    /// Construct an EncryptAndStoreStage with a shared
+    /// [`SecretsService`](crate::secrets::SecretsService) handle and
+    /// an actor id (audit-log attribution — typically
+    /// `"pipeline:edge"` for edge-mode or `"pipeline:embedded"` for
+    /// sovereign-mode embedded).
+    pub fn new(secrets: std::sync::Arc<S>, actor_id: impl Into<String>) -> Self {
+        Self {
+            secrets,
+            actor_id: actor_id.into(),
+        }
+    }
+}
+
+#[cfg(all(feature = "secrets", feature = "scrub"))]
+impl<S: crate::secrets::SecretsService + Send + Sync + 'static> Stage for EncryptAndStoreStage<S> {
+    fn name(&self) -> &'static str {
+        "encrypt_and_store"
+    }
+
+    fn dependencies(&self) -> &'static [&'static str] {
+        &["scrub"]
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn run<'a>(
+        &'a self,
+        _env: &'a mut BatchEnvelope,
+        state: &'a mut PipelineState,
+    ) -> impl Future<Output = Result<(), Error>> + Send + 'a {
+        async move {
+            // v1.0.0: stub. ContentClassMatch doesn't yet carry the
+            // pre-scrub cleartext, so even if classify had matches
+            // tagged Action::EncryptAndStore, we couldn't recover
+            // the plaintext to encrypt.
+            //
+            // Walk for any future-shape matches and surface a clear
+            // error if one appears (defensive — should never fire
+            // until classify learns cleartext capture).
+            let mut encrypt_count = 0usize;
+            for per_component in &state.classifications {
+                for m in per_component {
+                    if matches!(m.action, classify::Action::EncryptAndStore) {
+                        encrypt_count += 1;
+                    }
+                }
+            }
+            if encrypt_count > 0 {
+                // Touch `self` so the unused-field lint doesn't fire
+                // on `secrets` + `actor_id` before the path activates.
+                let _ = (&self.secrets, &self.actor_id);
+                return Err(Error::Internal(format!(
+                    "EncryptAndStoreStage: ContentClassMatch cleartext capture not yet \
+                     wired in v1.0.0; deferred until ClassifyStage carries pre-scrub spans \
+                     (observed {encrypt_count} EncryptAndStore-tagged matches)"
+                )));
+            }
+            state.stages_executed.push("encrypt_and_store".to_string());
+            Ok(())
+        }
+    }
+}
+
 // ─── v0.7.5: default pipeline factories ─────────────────────────────
 
 /// Minimal pipeline factory — wires the stages persist has concrete
 /// implementations for in v0.7.5. Currently: `extract` only.
 ///
-/// The full FSD §5.2 `default_pipeline(secrets)` factory wiring
-/// Classify → Scrub → EncryptAndStore → Extract waits on:
-/// - **Classify**: ClassifyStage + matcher catalog (regex + NER
-///   matchers are types-only in v0.7.5; matcher impls are
-///   downstream of CIRISPersist#33).
-/// - **Scrub**: ScrubStage adapter over the existing
-///   [`crate::scrub::Scrubber`] trait (the v0.6.0 lift). Plumbing
-///   layered onto the existing scrub_batch path.
-/// - **EncryptAndStore**: requires a [`SecretsService`](crate::secrets::SecretsService)
-///   handle plus orphan-secret invariant glue.
+/// The full FSD §5.2 inbound factory wiring Classify → Scrub →
+/// EncryptAndStore → Extract is in [`default_inbound_pipeline`]
+/// when all four features are enabled. The SPEAK-side scan/swap
+/// factory is [`default_outbound_pipeline`] (Classify + Scrub only
+/// — see its doc for the asymmetric stage set).
 ///
-/// Use this for unit tests + sovereign-mode embedded contexts
-/// where only extract is needed.
+/// Use `minimal_pipeline` for unit tests + sovereign-mode embedded
+/// contexts where only extract is needed.
 #[cfg(feature = "extract")]
 pub fn minimal_pipeline() -> Pipeline {
     PipelineBuilder::new()
         .add_stage(ExtractStage::new())
         .build()
         .expect("minimal_pipeline: ExtractStage has no dependencies, build must succeed")
+}
+
+/// FSD §5.2 default pipeline — Classify → Scrub → EncryptAndStore →
+/// Extract. Closes CIRISPersist#33 parts 1-2 for v1.0.0.
+///
+/// Requires the full feature set (`classify`, `scrub`, `extract`,
+/// `secrets`). Pass a shared [`SecretsService`](crate::secrets::SecretsService)
+/// handle for the encrypt-and-store stage's `store_secret` calls;
+/// `actor_id` is the audit-log accessor token (typically
+/// `"pipeline:edge"` or `"pipeline:embedded"`).
+///
+/// # v1.0.0 caveats
+///
+/// - `ClassifyStage` populates empty per-component classification
+///   vecs (the matcher catalog ships post-#33).
+/// - `EncryptAndStoreStage` records itself but does not write any
+///   secrets (`ContentClassMatch` doesn't yet carry pre-scrub
+///   cleartext — see the stage's doc comment).
+/// - `ScrubStage` + `ExtractStage` are live and produce real output.
+///
+/// # Direction
+///
+/// Inbound: envelope received from network → verified → pipelined
+/// → stored. Use [`default_outbound_pipeline`] for the SPEAK-side
+/// scan/swap path that runs before the agent emits an envelope to
+/// the network (CIRISAgent#756 concern #1).
+#[cfg(all(
+    feature = "classify",
+    feature = "scrub",
+    feature = "extract",
+    feature = "secrets"
+))]
+pub fn default_inbound_pipeline<S>(
+    secrets: std::sync::Arc<S>,
+    actor_id: impl Into<String>,
+) -> Pipeline
+where
+    S: crate::secrets::SecretsService + Send + Sync + 'static,
+{
+    PipelineBuilder::new()
+        .add_stage(ClassifyStage::new())
+        .add_stage(ScrubStage::new())
+        .add_stage(EncryptAndStoreStage::new(secrets, actor_id))
+        .add_stage(ExtractStage::new())
+        .build()
+        .expect(
+            "default_inbound_pipeline: Classify → Scrub → EncryptAndStore → Extract \
+             dependency chain is valid",
+        )
+}
+
+/// Outbound SPEAK-side scan/swap pipeline factory (CIRISAgent#756
+/// concern #1, FSD §5.2 bidirectional).
+///
+/// Runs Classify + Scrub only — the asymmetric set versus
+/// [`default_inbound_pipeline`]:
+///
+/// - **No EncryptAndStore.** Outbound envelopes are emitted to the
+///   network; storing secrets the agent is *speaking* would be
+///   contradictory (the recipient would still see the cleartext on
+///   the wire if we encrypted-and-substituted, and storing the
+///   secret locally invites later leakage). Outbound policy is
+///   detect-and-scrub-or-block; never detect-and-store.
+/// - **No Extract.** Features are stored alongside inbound traces
+///   for corpus + drift detection. Outbound envelopes aren't corpus
+///   rows; the agent's own VisibilityService handles outbound
+///   observability separately.
+///
+/// What runs:
+///
+/// - `ClassifyStage` populates `state.classifications` with detected
+///   spans so the agent's policy layer (AdaptiveFilterService policy
+///   side) can decide whether to send / block / redact / defer.
+/// - `ScrubStage` redacts payload spans in-place (`fields_modified`
+///   counted, `pii_scrubbed` flag set). On a successful run the
+///   envelope is safe to emit; the agent reads the sidecar to
+///   decide whether to gate the send.
+///
+/// Requires the `classify` + `scrub` features (not `secrets` or
+/// `extract`). Use this on the SPEAK path BEFORE handing the
+/// envelope to the outbound adapter.
+#[cfg(all(feature = "classify", feature = "scrub"))]
+pub fn default_outbound_pipeline() -> Pipeline {
+    PipelineBuilder::new()
+        .add_stage(ClassifyStage::new())
+        .add_stage(ScrubStage::new())
+        .build()
+        .expect("default_outbound_pipeline: Classify → Scrub dependency chain is valid")
 }
 
 #[cfg(test)]
@@ -611,5 +963,372 @@ mod tests {
         p.run(&mut env, &mut state).await.unwrap();
         assert_eq!(state.stages_executed, vec!["extract".to_string()]);
         assert!(state.features.is_none(), "empty batch has no features");
+    }
+
+    // ── v1.0.0 (CIRISPersist#33): test helpers for the new stages ──
+
+    /// Build a BatchEnvelope carrying one CompleteTrace with one
+    /// component whose payload contains both a regex-detectable PII
+    /// span (email) and a year (also caught by the regex pass —
+    /// stresses ScrubStage's residue check).
+    #[cfg(any(feature = "classify", feature = "scrub"))]
+    fn fixture_envelope_with_pii(level: crate::schema::TraceLevel) -> BatchEnvelope {
+        let mut data = serde_json::Map::new();
+        data.insert(
+            "task_description".to_string(),
+            serde_json::Value::String(
+                "Contact alice@example.com about the 1989 incident.".to_string(),
+            ),
+        );
+        let component = crate::schema::TraceComponent {
+            component_type: crate::schema::ComponentType::Conscience,
+            event_type: crate::schema::ReasoningEventType::ThoughtStart,
+            timestamp: "2026-04-30T00:16:00Z".parse().unwrap(),
+            data,
+            agent_id_hash: None,
+        };
+        let trace = crate::schema::CompleteTrace {
+            trace_id: "trace-test".into(),
+            thought_id: "th_test".into(),
+            task_id: Some("task_test".into()),
+            agent_id_hash: "deadbeef".into(),
+            started_at: "2026-04-30T00:15:53Z".parse().unwrap(),
+            completed_at: "2026-04-30T00:16:12Z".parse().unwrap(),
+            trace_level: level,
+            trace_schema_version: crate::schema::SchemaVersion::parse("2.7.0").unwrap(),
+            components: vec![component],
+            deployment_profile: None,
+            signature: "AAAA".into(),
+            signature_key_id: "ciris-agent-key:dead".into(),
+        };
+        BatchEnvelope {
+            events: vec![crate::schema::BatchEvent::CompleteTrace {
+                trace,
+                trace_level: level,
+            }],
+            batch_timestamp: chrono::Utc::now(),
+            consent_timestamp: chrono::Utc::now(),
+            trace_level: level,
+            trace_schema_version: crate::schema::SchemaVersion::parse("2.7.0").unwrap(),
+            correlation_metadata: None,
+        }
+    }
+
+    /// v1.0.0: ClassifyStage runs and records its name, populating
+    /// one (empty in v1.0.0 — matcher catalog ships post-#33)
+    /// per-component classification vec. FSD §4.3 invariant 5:
+    /// outer-vec length equals component count.
+    #[cfg(feature = "classify")]
+    #[tokio::test]
+    async fn classify_stage_populates_classifications() {
+        let p = PipelineBuilder::new()
+            .add_stage(ClassifyStage::new())
+            .build()
+            .unwrap();
+        let mut env = fixture_envelope_with_pii(crate::schema::TraceLevel::Generic);
+        let mut state = PipelineState::default();
+        p.run(&mut env, &mut state).await.unwrap();
+        assert_eq!(state.stages_executed, vec!["classify".to_string()]);
+        // One CompleteTrace with one component → one outer entry.
+        assert_eq!(state.classifications.len(), 1);
+        // Inner vec is empty until matcher catalog lands post-#33.
+        assert!(state.classifications[0].is_empty());
+    }
+
+    /// v1.0.0: ScrubStage runs after ClassifyStage, mutates the
+    /// envelope in place, and flips `pii_scrubbed` once the regex
+    /// pass catches the embedded email + year. `fields_modified`
+    /// must be > 0.
+    #[cfg(all(feature = "classify", feature = "scrub"))]
+    #[tokio::test]
+    async fn scrub_stage_mutates_envelope_and_sets_pii_scrubbed() {
+        let p = PipelineBuilder::new()
+            .add_stage(ClassifyStage::new())
+            .add_stage(ScrubStage::new())
+            .build()
+            .unwrap();
+        let mut env = fixture_envelope_with_pii(crate::schema::TraceLevel::Detailed);
+        let mut state = PipelineState::default();
+        p.run(&mut env, &mut state).await.unwrap();
+        assert_eq!(
+            state.stages_executed,
+            vec!["classify".to_string(), "scrub".to_string()]
+        );
+        assert!(state.fields_modified > 0, "regex pass should have fired");
+        assert!(
+            state.pii_scrubbed,
+            "pii_scrubbed must follow fields_modified > 0"
+        );
+        // The original text must no longer appear; redaction marker
+        // must be present.
+        let crate::schema::BatchEvent::CompleteTrace { trace, .. } = &env.events[0];
+        let text = trace.components[0].data["task_description"]
+            .as_str()
+            .unwrap();
+        assert!(!text.contains("alice@example.com"));
+        assert!(!text.contains("1989"));
+        assert!(text.contains("[EMAIL]") || text.contains("[YEAR]"));
+    }
+
+    /// v1.0.0: default_inbound_pipeline factory wires all four stages
+    /// in canonical order. The EncryptAndStoreStage is stubbed
+    /// (cleartext capture deferred — see stage doc) so encrypted_secrets
+    /// stays empty, but the stage still records itself.
+    #[cfg(all(
+        feature = "classify",
+        feature = "scrub",
+        feature = "extract",
+        feature = "secrets"
+    ))]
+    #[tokio::test]
+    async fn default_inbound_pipeline_runs_all_four_stages() {
+        use std::future::Future;
+
+        // Tiny in-test SecretsService — every method returns either
+        // Ok of a stubbed value or NotImplemented. Only present so
+        // EncryptAndStoreStage has something to hold; v1.0.0 stub
+        // never actually calls into it.
+        struct MockSecrets;
+
+        impl crate::secrets::SecretsService for MockSecrets {
+            fn store_secret(
+                &self,
+                _key: String,
+                _value: String,
+                _accessor: String,
+            ) -> impl Future<Output = Result<(), crate::secrets::SecretsError>> + Send {
+                async { Ok(()) }
+            }
+            fn retrieve_secret(
+                &self,
+                _key: &str,
+                _accessor: String,
+            ) -> impl Future<Output = Result<Option<String>, crate::secrets::SecretsError>> + Send
+            {
+                async { Ok(None) }
+            }
+            fn recall_secret(
+                &self,
+                _uuid: &str,
+                _purpose: String,
+                _accessor: String,
+                _decrypt: bool,
+            ) -> impl Future<
+                Output = Result<
+                    Option<crate::secrets::types::SecretRecallResult>,
+                    crate::secrets::SecretsError,
+                >,
+            > + Send {
+                async { Ok(None) }
+            }
+            fn list_stored_secrets(
+                &self,
+                _limit: usize,
+                _filter: crate::secrets::types::SecretsListFilter,
+            ) -> impl Future<
+                Output = Result<
+                    Vec<crate::secrets::types::SecretReference>,
+                    crate::secrets::SecretsError,
+                >,
+            > + Send {
+                async { Ok(Vec::new()) }
+            }
+            fn forget_secret(
+                &self,
+                _uuid: &str,
+                _accessor: String,
+            ) -> impl Future<Output = Result<bool, crate::secrets::SecretsError>> + Send
+            {
+                async { Ok(false) }
+            }
+            fn process_incoming_text(
+                &self,
+                _text: &str,
+                _source_message_id: &str,
+                _accessor: String,
+            ) -> impl Future<
+                Output = Result<
+                    (String, Vec<crate::secrets::types::SecretReference>),
+                    crate::secrets::SecretsError,
+                >,
+            > + Send {
+                async { Err(crate::secrets::SecretsError::Internal("mock".into())) }
+            }
+            fn decapsulate_secrets_in_parameters(
+                &self,
+                _action_type: &str,
+                params: serde_json::Value,
+                _ctx: crate::secrets::types::DecapsulationContext,
+            ) -> impl Future<Output = Result<serde_json::Value, crate::secrets::SecretsError>> + Send
+            {
+                async move { Ok(params) }
+            }
+            fn encrypt(
+                &self,
+                _plaintext: &str,
+            ) -> impl Future<Output = Result<String, crate::secrets::SecretsError>> + Send
+            {
+                async { Ok(String::new()) }
+            }
+            fn decrypt(
+                &self,
+                _ciphertext: &str,
+            ) -> impl Future<Output = Result<String, crate::secrets::SecretsError>> + Send
+            {
+                async { Ok(String::new()) }
+            }
+            fn get_filter_config(
+                &self,
+            ) -> impl Future<
+                Output = Result<crate::secrets::types::FilterConfig, crate::secrets::SecretsError>,
+            > + Send {
+                async {
+                    Err(crate::secrets::SecretsError::Internal(
+                        "mock filter config".into(),
+                    ))
+                }
+            }
+            fn update_filter_config(
+                &self,
+                _updates: crate::secrets::types::FilterUpdateRequest,
+                _accessor: String,
+            ) -> impl Future<
+                Output = Result<
+                    crate::secrets::types::FilterUpdateResult,
+                    crate::secrets::SecretsError,
+                >,
+            > + Send {
+                async {
+                    Err(crate::secrets::SecretsError::Internal(
+                        "mock filter update".into(),
+                    ))
+                }
+            }
+            fn get_service_stats(
+                &self,
+            ) -> impl Future<
+                Output = Result<
+                    crate::secrets::types::SecretsServiceStats,
+                    crate::secrets::SecretsError,
+                >,
+            > + Send {
+                async { Err(crate::secrets::SecretsError::Internal("mock stats".into())) }
+            }
+            fn is_healthy(
+                &self,
+            ) -> impl Future<Output = Result<bool, crate::secrets::SecretsError>> + Send
+            {
+                async { Ok(true) }
+            }
+            fn get_access_logs(
+                &self,
+                _secret_uuid: Option<&str>,
+                _limit: usize,
+            ) -> impl Future<
+                Output = Result<
+                    Vec<crate::secrets::types::AccessLogEntry>,
+                    crate::secrets::SecretsError,
+                >,
+            > + Send {
+                async { Ok(Vec::new()) }
+            }
+            fn reencrypt_all(
+                &self,
+                _new_master_key_ref: crate::secrets::types::MasterKeyRef,
+                _accessor: String,
+            ) -> impl Future<
+                Output = Result<
+                    crate::secrets::types::RotationResult,
+                    crate::secrets::SecretsError,
+                >,
+            > + Send {
+                async {
+                    Err(crate::secrets::SecretsError::Internal(
+                        "mock reencrypt".into(),
+                    ))
+                }
+            }
+            fn rotate_master_key(
+                &self,
+                _new_master: Option<Vec<u8>>,
+                _accessor: String,
+            ) -> impl Future<
+                Output = Result<crate::secrets::types::MasterKeyRef, crate::secrets::SecretsError>,
+            > + Send {
+                async { Err(crate::secrets::SecretsError::Internal("mock rotate".into())) }
+            }
+            fn test_encryption(
+                &self,
+            ) -> impl Future<Output = Result<bool, crate::secrets::SecretsError>> + Send
+            {
+                async { Ok(true) }
+            }
+            fn migrate_to_hardware_key(
+                &self,
+                _accessor: String,
+            ) -> impl Future<
+                Output = Result<crate::secrets::types::MasterKeyRef, crate::secrets::SecretsError>,
+            > + Send {
+                async {
+                    Err(crate::secrets::SecretsError::HardwareKeyUnavailable(
+                        "mock".into(),
+                    ))
+                }
+            }
+        }
+
+        let secrets = std::sync::Arc::new(MockSecrets);
+        let p = default_inbound_pipeline(secrets, "pipeline:test");
+        assert_eq!(
+            p.stage_names(),
+            vec!["classify", "scrub", "encrypt_and_store", "extract"]
+        );
+
+        let mut env = fixture_envelope_with_pii(crate::schema::TraceLevel::Detailed);
+        let mut state = PipelineState::default();
+        p.run(&mut env, &mut state).await.unwrap();
+
+        assert_eq!(
+            state.stages_executed,
+            vec![
+                "classify".to_string(),
+                "scrub".to_string(),
+                "encrypt_and_store".to_string(),
+                "extract".to_string()
+            ]
+        );
+        // v1.0.0 stub: no encrypted secrets land.
+        assert!(state.encrypted_secrets.is_empty());
+        // Scrub + extract are real — should have produced output.
+        assert!(state.pii_scrubbed);
+        assert!(state.features.is_some());
+    }
+
+    /// v1.0.0: default_outbound_pipeline wires Classify + Scrub only
+    /// — the asymmetric SPEAK-side stage set per CIRISAgent#756
+    /// concern #1. No EncryptAndStore (outbound never stores
+    /// secrets) and no Extract (outbound isn't a corpus row).
+    #[cfg(all(feature = "classify", feature = "scrub"))]
+    #[tokio::test]
+    async fn default_outbound_pipeline_runs_classify_then_scrub_only() {
+        let p = default_outbound_pipeline();
+        assert_eq!(p.stage_names(), vec!["classify", "scrub"]);
+
+        let mut env = fixture_envelope_with_pii(crate::schema::TraceLevel::Detailed);
+        let mut state = PipelineState::default();
+        p.run(&mut env, &mut state).await.unwrap();
+
+        assert_eq!(
+            state.stages_executed,
+            vec!["classify".to_string(), "scrub".to_string()]
+        );
+        // Scrub is live — should have redacted.
+        assert!(state.pii_scrubbed);
+        // No extract ran — features stays None.
+        #[cfg(feature = "extract")]
+        assert!(state.features.is_none());
+        // No encrypt_and_store ran — encrypted_secrets stays empty.
+        #[cfg(feature = "secrets")]
+        assert!(state.encrypted_secrets.is_empty());
     }
 }
