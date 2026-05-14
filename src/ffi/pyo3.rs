@@ -32,8 +32,138 @@ use tokio::runtime::Runtime;
 
 use crate::ingest::{IngestError, IngestPipeline};
 use crate::scrub::{NullScrubber, ScrubError, Scrubber};
+#[cfg(feature = "sqlite")]
+use crate::store::SqliteBackend;
 use crate::store::{Backend, PostgresBackend};
 use crate::verify::PythonJsonDumpsCanonicalizer;
+
+// ---------------------------------------------------------------------------
+// v1.0.0-scaffold (CIRISPersist#193 + #194) — backend dispatch, typed
+// exception hierarchy, URL-sniff constructor. The PyEngine method bodies
+// still hard-code the Postgres path; a follow-up agent ports the 112
+// method bodies onto the SQLite arm. This module-scope block sets up the
+// structural shell that compiles cleanly under both feature sets:
+//
+//     cargo check --features "pyo3"         (Postgres-only, existing)
+//     cargo check --features "pyo3 sqlite"  (Postgres + SQLite, new)
+//
+// The Postgres path is byte-for-byte identical to v0.9.x — every method
+// goes through `backend_postgres_unwrap()` which returns the inner
+// `Arc<PostgresBackend>`. The SQLite arm is constructable + migrates
+// cleanly but `backend_postgres_unwrap()` panics on it — the follow-up
+// agent's job is to replace each `self.backend_postgres_unwrap()` call
+// site with a real `match &self.backend { … }` dispatch.
+// ---------------------------------------------------------------------------
+
+/// Backend selector for [`PyEngine`]. Constructor sniffs the URL prefix
+/// and instantiates exactly one arm; every method matches on this to
+/// dispatch to the right concrete impl.
+///
+/// CIRISAgent#755 Option A: URL-sniff single Engine class, internal enum
+/// dispatch. Smallest agent-side diff — the Python API is identical
+/// across backends.
+pub(crate) enum BackendDispatch {
+    Postgres(Arc<PostgresBackend>),
+    /// v1.0.0-scaffold: the SQLite arm is constructable + migrates
+    /// cleanly, but no method body reads it yet — every PyEngine
+    /// method still goes through `backend_postgres_unwrap()` which
+    /// panics on this arm. The follow-up porting agent (CIRISPersist#193
+    /// continuation) replaces each unwrap call site with a real
+    /// `match &self.backend { … }` dispatch, at which point this
+    /// `#[allow(dead_code)]` comes off.
+    #[cfg(feature = "sqlite")]
+    #[allow(dead_code)]
+    Sqlite(Arc<SqliteBackend>),
+}
+
+// ---------------------------------------------------------------------------
+// Typed Python exception hierarchy (CIRISPersist#194).
+//
+// Granularity is per **retry policy** rather than per **module**:
+//   - NotFound   — caller's row id wasn't there; don't retry, surface 404
+//   - Conflict   — uniqueness / version / state conflict; don't retry,
+//                  surface 409
+//   - Transient  — backend connection / timeout / pool exhaustion; the
+//                  caller MAY retry with backoff (lens HTTP handler turns
+//                  this into 503)
+//   - Permanent  — invalid arguments, signature failures, crypto errors,
+//                  rotation conflicts, "not authorized," hardware
+//                  unavailable, not-implemented; the caller MUST NOT
+//                  retry; surface 4xx / 5xx as appropriate
+//
+// All four derive from a common [`PersistError`] base so callers can
+// `except PersistError:` if they want the umbrella, or branch on the
+// specific subclass for retry decisions. Per-module subclasses
+// (`AuditNotFound`, `CirisGraphConflict`, …) are explicitly out of scope
+// for 1.0.0 — retry granularity beats module granularity for HTTP
+// surfaces.
+// ---------------------------------------------------------------------------
+
+#[allow(missing_docs)] // pyo3::create_exception emits items without doc-comments
+mod persist_errors {
+    pyo3::create_exception!(ciris_persist, PersistError, pyo3::exceptions::PyException);
+    pyo3::create_exception!(ciris_persist, NotFound, super::persist_errors::PersistError);
+    pyo3::create_exception!(ciris_persist, Conflict, super::persist_errors::PersistError);
+    pyo3::create_exception!(
+        ciris_persist,
+        Transient,
+        super::persist_errors::PersistError
+    );
+    pyo3::create_exception!(
+        ciris_persist,
+        Permanent,
+        super::persist_errors::PersistError
+    );
+}
+pub use persist_errors::{Conflict, NotFound, Permanent, PersistError, Transient};
+
+/// v1.0.0-scaffold helper — map a stable substrate error `kind()` token
+/// (e.g. `"audit_not_found"`, `"cirisgraph_conflict"`, `"secrets_backend"`)
+/// onto the right typed Python exception class.
+///
+/// The follow-up porting agent threads this through every
+/// `err.kind()`-aware `map_err` site (currently those sites use
+/// `PyRuntimeError::new_err(format!(…))` or `PyValueError::new_err(kind)`
+/// — both work but lose the retry-policy granularity that lens HTTP
+/// handlers want).
+///
+/// AV-15 / AV-43 (THREAT_MODEL.md): `kind` is a closed-set `&'static str`
+/// produced by the substrate's `Error::kind()` impl; no
+/// attacker-controlled string leaks across the FFI boundary. `msg` is the
+/// human-readable payload (already-tracing'd at the substrate layer); the
+/// Python exception carries both.
+#[allow(dead_code)] // wired by the follow-up porting agent; scaffold pass leaves
+                    // existing `PyRuntimeError`/`PyValueError` sites untouched
+pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
+    match kind {
+        // NotFound family — substrate told us the row isn't there.
+        "secrets_not_found"
+        | "audit_not_found"
+        | "cirisnode_not_found"
+        | "incident_not_found"
+        | "cirisgraph_not_found"
+        | "telemetry_not_found" => NotFound::new_err(msg),
+
+        // Conflict family — uniqueness / version / state-transition
+        // conflict; caller MUST NOT retry, MUST re-read.
+        "secrets_conflict"
+        | "cirisnode_conflict"
+        | "incident_conflict"
+        | "audit_conflict"
+        | "cirisgraph_conflict" => Conflict::new_err(msg),
+
+        // Transient family — backend connection / timeout / pool
+        // exhaustion; caller MAY retry with backoff.
+        "secrets_backend" | "audit_backend" | "cirisnode_backend" | "incident_backend"
+        | "cirisgraph_backend" | "telemetry_backend" => Transient::new_err(msg),
+
+        // Default — Permanent. Covers invalid arguments, signature
+        // failures, crypto errors, rotation conflicts, "not authorized,"
+        // hardware unavailable, not-implemented, and any unknown
+        // future kind. Conservative: when in doubt, don't retry.
+        _ => Permanent::new_err(msg),
+    }
+}
 
 /// `ciris_persist.Engine` — one instance per (DSN, scrubber)
 /// configuration.
@@ -44,7 +174,14 @@ use crate::verify::PythonJsonDumpsCanonicalizer;
 /// hand off to other workers via `py.allow_threads`.
 #[pyclass(name = "Engine", module = "ciris_persist")]
 pub struct PyEngine {
-    backend: Arc<PostgresBackend>,
+    /// v1.0.0-scaffold (CIRISPersist#193): was `Arc<PostgresBackend>`;
+    /// now an enum dispatch over Postgres / SQLite. The scaffold pass
+    /// leaves every method body's `self.backend_postgres_unwrap().clone()` site routed
+    /// through `backend_postgres_unwrap()` so the existing PG path is
+    /// byte-for-byte identical. The follow-up porting agent replaces
+    /// each unwrap call with a real `match &self.backend { … }`
+    /// dispatch that hits the SQLite arm.
+    backend: BackendDispatch,
     runtime: Arc<Runtime>,
     scrubber: Arc<dyn Scrubber>,
     signer: Arc<dyn HardwareSigner>,
@@ -72,6 +209,40 @@ pub struct PyEngine {
     /// / `put_attestation` / `put_revocation` can clone and own its
     /// own reference for the duration of the cold-path sign.
     steward_signer: Option<Arc<crate::signing::StewardSigner>>,
+}
+
+impl PyEngine {
+    /// v1.0.0-scaffold (CIRISPersist#193) — scaffold helper that returns
+    /// the inner [`Arc<PostgresBackend>`] from the [`BackendDispatch`]
+    /// arm, **panicking on the SQLite arm**.
+    ///
+    /// This is the migration shim that lets the 112 existing method
+    /// bodies keep their `self.backend_postgres_unwrap().clone()` shape during the
+    /// scaffold pass. Each call site reads
+    /// `self.backend_postgres_unwrap().clone()`; the follow-up porting
+    /// agent's job is to replace each call site with a real
+    /// `match &self.backend { … }` that dispatches to the SQLite arm
+    /// as well.
+    ///
+    /// **Why panic, not typed error?** A SQLite-arm call to this
+    /// helper means the follow-up agent missed a call site — that's a
+    /// bug, not a runtime condition. PyO3's `catch_panic` trampoline
+    /// (see [`catch_panic`] further down) converts the panic into a
+    /// `LensQueryError` at the FFI boundary, so the Python caller sees
+    /// a typed exception rather than a process abort. Once every call
+    /// site is ported, this helper goes away.
+    #[allow(dead_code)] // unused when sqlite feature is off — every call site is PG
+    fn backend_postgres_unwrap(&self) -> &Arc<PostgresBackend> {
+        match &self.backend {
+            BackendDispatch::Postgres(b) => b,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(_) => panic!(
+                "v1.0.0-scaffold: backend_postgres_unwrap called on Sqlite arm — \
+                 follow-up porting agent (CIRISPersist#193) must replace this call site \
+                 with a `match &self.backend {{ … }}` that dispatches both arms"
+            ),
+        }
+    }
 }
 
 #[pymethods]
@@ -131,19 +302,96 @@ impl PyEngine {
             Runtime::new().map_err(|e| PyRuntimeError::new_err(format!("tokio runtime: {e}")))?;
         let runtime = Arc::new(runtime);
 
-        // Connect + migrate inside the runtime.
-        let backend = py.detach(|| {
-            runtime.block_on(async {
-                let backend = PostgresBackend::connect(dsn)
-                    .await
-                    .map_err(|e| PyRuntimeError::new_err(format!("connect: {e}")))?;
-                backend
-                    .run_migrations()
-                    .await
-                    .map_err(|e| PyRuntimeError::new_err(format!("migrations: {e}")))?;
-                Ok::<_, PyErr>(Arc::new(backend))
-            })
-        })?;
+        // v1.0.0-scaffold (CIRISPersist#193) — URL-sniff backend
+        // construction. `dsn` retains its name for the Python kwarg
+        // (back-compat: `Engine(dsn="postgresql://…", …)`) but now
+        // accepts either:
+        //   * `postgresql://…` / `postgres://…`  → PostgresBackend
+        //   * `sqlite:///path.db` / `sqlite::memory:` → SqliteBackend
+        //     (only when the `sqlite` feature is compiled in)
+        // Anything else → ValueError. Other arms compile to the right
+        // arm of [`BackendDispatch`]; method bodies still hard-code
+        // the Postgres path (follow-up agent ports them).
+        //
+        // `pg_backend_for_sweep` captures the Arc<PostgresBackend> for
+        // the v0.3.2 cold-path PQC sweep that fires further down — that
+        // primitive is Postgres-only today; on the SQLite arm we
+        // simply skip the sweep (it's a Postgres-table migration
+        // artifact that doesn't exist on the SQLite schema).
+        #[allow(unused_variables)] // borrowed only when steward_signer + sweep are wired
+        let pg_backend_for_sweep: Option<Arc<PostgresBackend>>;
+        let backend: BackendDispatch =
+            if dsn.starts_with("postgresql://") || dsn.starts_with("postgres://") {
+                let pg = py.detach(|| {
+                    runtime.block_on(async {
+                        let pg = PostgresBackend::connect(dsn)
+                            .await
+                            .map_err(|e| PyRuntimeError::new_err(format!("connect: {e}")))?;
+                        pg.run_migrations()
+                            .await
+                            .map_err(|e| PyRuntimeError::new_err(format!("migrations: {e}")))?;
+                        Ok::<_, PyErr>(Arc::new(pg))
+                    })
+                })?;
+                pg_backend_for_sweep = Some(pg.clone());
+                BackendDispatch::Postgres(pg)
+            } else if dsn.starts_with("sqlite://") || dsn == "sqlite::memory:" {
+                #[cfg(feature = "sqlite")]
+                {
+                    // URL parsing follows the SQLAlchemy / Python sqlite3
+                    // convention the CIRISAgent ecosystem already uses:
+                    //   `sqlite:///abs/path.db`  → file at `/abs/path.db`
+                    //   `sqlite:///relative.db`  → file at `relative.db`
+                    //                              (strip leading `/`)
+                    //   `sqlite:///:memory:`     → in-memory
+                    //   `sqlite::memory:`        → in-memory (compact form)
+                    //
+                    // The `sqlite://` prefix is the URL scheme;
+                    // `sqlite:///` is scheme + empty authority + path.
+                    let in_memory = dsn == "sqlite::memory:"
+                        || dsn == "sqlite:///:memory:"
+                        || dsn == "sqlite://:memory:";
+                    let sq = py.detach(|| {
+                        runtime.block_on(async {
+                            let sq = if in_memory {
+                                SqliteBackend::open_in_memory().await.map_err(|e| {
+                                    PyRuntimeError::new_err(format!("sqlite open: {e}"))
+                                })?
+                            } else {
+                                // Strip the `sqlite:///` (3-slash) or
+                                // `sqlite://` (2-slash) prefix to recover
+                                // the on-disk path. rusqlite::open takes a
+                                // path verbatim.
+                                let path = dsn
+                                    .strip_prefix("sqlite:///")
+                                    .or_else(|| dsn.strip_prefix("sqlite://"))
+                                    .unwrap_or(dsn);
+                                SqliteBackend::open(path).await.map_err(|e| {
+                                    PyRuntimeError::new_err(format!("sqlite open: {e}"))
+                                })?
+                            };
+                            sq.run_migrations()
+                                .await
+                                .map_err(|e| PyRuntimeError::new_err(format!("migrations: {e}")))?;
+                            Ok::<_, PyErr>(Arc::new(sq))
+                        })
+                    })?;
+                    pg_backend_for_sweep = None;
+                    BackendDispatch::Sqlite(sq)
+                }
+                #[cfg(not(feature = "sqlite"))]
+                {
+                    return Err(PyValueError::new_err(format!(
+                        "dsn `{dsn}` uses sqlite:// scheme but the `sqlite` feature \
+                     was not compiled in for this ciris_persist build"
+                    )));
+                }
+            } else {
+                return Err(PyValueError::new_err(format!(
+                    "unrecognized dsn scheme: {dsn:?} \
+                 (expected `postgresql://…`, `postgres://…`, `sqlite:///…`, or `sqlite::memory:`)"
+                )));
+            };
 
         // ciris-keyring: hardware-backed signer where available,
         // SoftwareSigner fallback otherwise. get_platform_signer
@@ -277,9 +525,18 @@ impl PyEngine {
         // per-write spawn failed transiently). Spawned as a background
         // task on the runtime so Engine::new returns immediately;
         // sweep result is logged at tracing::info when complete.
+        //
+        // v1.0.0-scaffold (CIRISPersist#193): the sweep primitive is
+        // Postgres-only today (operates on cirisgraph_keys /
+        // federation_attestations / federation_revocations PG tables).
+        // On the SQLite arm `pg_backend_for_sweep` is `None` and the
+        // sweep is silently skipped — same observable shape as
+        // `pqc_sweep_on_init=false`.
         if pqc_sweep_on_init {
-            if let Some(pqc_signer) = steward_signer.as_ref().and_then(|s| s.pqc_signer_arc()) {
-                let backend_for_sweep = backend.clone();
+            if let (Some(pqc_signer), Some(backend_for_sweep)) = (
+                steward_signer.as_ref().and_then(|s| s.pqc_signer_arc()),
+                pg_backend_for_sweep.as_ref().cloned(),
+            ) {
                 runtime.spawn(async move {
                     let summary = run_pqc_sweep_inner(&backend_for_sweep, &*pqc_signer, 1000).await;
                     tracing::info!(
@@ -728,7 +985,7 @@ impl PyEngine {
         added_by: Option<&str>,
     ) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let key_id = signature_key_id.to_owned();
             let pub_b64 = public_key_b64.to_owned();
@@ -783,7 +1040,7 @@ impl PyEngine {
     ) -> PyResult<Bound<'py, PyDict>> {
         catch_panic(|| {
             let bytes = body.as_bytes().to_vec();
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let scrubber = self.scrubber.clone();
             let signer = self.signer.clone();
             let signer_key_id = self.signer_key_id.clone();
@@ -884,7 +1141,7 @@ impl PyEngine {
     /// to fill them in. `algorithm` MUST be `"hybrid"`.
     fn put_public_key(&self, py: Python<'_>, signed_key_record_json: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let record: crate::federation::SignedKeyRecord =
                 serde_json::from_str(signed_key_record_json).map_err(|e| {
@@ -964,7 +1221,7 @@ impl PyEngine {
     /// Returns the JSON-encoded `KeyRecord` string, or `None`.
     fn lookup_public_key(&self, py: Python<'_>, key_id: &str) -> PyResult<Option<String>> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let key_id = key_id.to_owned();
             py.detach(|| {
@@ -990,7 +1247,7 @@ impl PyEngine {
     /// Returns a JSON array string of `KeyRecord` objects.
     fn lookup_keys_for_identity(&self, py: Python<'_>, identity_ref: &str) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let identity_ref = identity_ref.to_owned();
             py.detach(|| {
@@ -1011,7 +1268,7 @@ impl PyEngine {
     /// Federation directory: write an attestation.
     fn put_attestation(&self, py: Python<'_>, signed_attestation_json: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let att: crate::federation::SignedAttestation =
                 serde_json::from_str(signed_attestation_json).map_err(|e| {
@@ -1081,7 +1338,7 @@ impl PyEngine {
     /// Federation directory: list attestations targeting `attested_key_id`.
     fn list_attestations_for(&self, py: Python<'_>, attested_key_id: &str) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let attested_key_id = attested_key_id.to_owned();
             py.detach(|| {
@@ -1102,7 +1359,7 @@ impl PyEngine {
     /// Federation directory: list attestations issued by `attesting_key_id`.
     fn list_attestations_by(&self, py: Python<'_>, attesting_key_id: &str) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let attesting_key_id = attesting_key_id.to_owned();
             py.detach(|| {
@@ -1123,7 +1380,7 @@ impl PyEngine {
     /// Federation directory: write a revocation.
     fn put_revocation(&self, py: Python<'_>, signed_revocation_json: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let rev: crate::federation::SignedRevocation =
                 serde_json::from_str(signed_revocation_json).map_err(|e| {
@@ -1193,7 +1450,7 @@ impl PyEngine {
     /// Federation directory: list revocations targeting `revoked_key_id`.
     fn revocations_for(&self, py: Python<'_>, revoked_key_id: &str) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let revoked_key_id = revoked_key_id.to_owned();
             py.detach(|| {
@@ -1223,7 +1480,7 @@ impl PyEngine {
         scrub_signature_pqc: &str,
     ) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let key_id = key_id.to_owned();
             let mldsa_pk = pubkey_ml_dsa_65_base64.to_owned();
@@ -1249,7 +1506,7 @@ impl PyEngine {
         scrub_signature_pqc: &str,
     ) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let attestation_id = attestation_id.to_owned();
             let pqc_sig = scrub_signature_pqc.to_owned();
@@ -1274,7 +1531,7 @@ impl PyEngine {
         scrub_signature_pqc: &str,
     ) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let revocation_id = revocation_id.to_owned();
             let pqc_sig = scrub_signature_pqc.to_owned();
@@ -1352,7 +1609,7 @@ impl PyEngine {
                  steward_pqc_key_path to the Engine constructor)",
                     )
                 })?;
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
 
             let summary = py.detach(move || {
@@ -1432,7 +1689,7 @@ impl PyEngine {
         include_federation_key: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let agent_id_hash = agent_id_hash.to_owned();
             let signature_key_id = signature_key_id.to_owned();
@@ -1502,7 +1759,7 @@ impl PyEngine {
         agent_id_hash: Option<&str>,
     ) -> PyResult<pyo3::Bound<'py, pyo3::types::PyList>> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let agent_filter = agent_id_hash.map(str::to_owned);
 
@@ -1700,7 +1957,7 @@ impl PyEngine {
             use crate::verify::{verify_trace_via_directory, PythonJsonDumpsCanonicalizer};
             let trace: CompleteTrace = serde_json::from_str(complete_trace_json)
                 .map_err(|e| PyValueError::new_err(format!("CompleteTrace JSON decode: {e}")))?;
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let key_dir = TraceKeyDirectory { backend, runtime };
             verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &key_dir).map_err(
@@ -1767,7 +2024,7 @@ impl PyEngine {
             let key_id_owned = signature_key_id.to_owned();
             let ed25519_owned = ed25519_sig_b64.to_owned();
             let pqc_owned = ml_dsa_65_sig_b64.map(str::to_owned);
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
 
             let outcome = py
@@ -2021,7 +2278,7 @@ impl PyEngine {
                     PyValueError::new_err(format!("initial_next_attempt_after_rfc3339 parse: {e}"))
                 })?;
 
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let sender = sender_key_id.to_owned();
             let dest = destination_key_id.to_owned();
@@ -2064,7 +2321,7 @@ impl PyEngine {
         claimed_by: &str,
     ) -> PyResult<pyo3::Bound<'py, pyo3::types::PyList>> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let claimed_by_owned = claimed_by.to_owned();
             let rows = py
@@ -2095,7 +2352,7 @@ impl PyEngine {
         transport: &str,
     ) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let qid = queue_id.to_owned();
             let transport = transport.to_owned();
@@ -2125,7 +2382,7 @@ impl PyEngine {
                 next_attempt_after_rfc3339.parse().map_err(|e| {
                     PyValueError::new_err(format!("next_attempt_after_rfc3339 parse: {e}"))
                 })?;
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let qid = queue_id.to_owned();
             let ec = error_class.to_owned();
@@ -2161,7 +2418,7 @@ impl PyEngine {
     /// landed before the ACK could arrive).
     fn mark_replay_resolved(&self, py: Python<'_>, queue_id: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let qid = queue_id.to_owned();
             py.detach(move || {
@@ -2190,7 +2447,7 @@ impl PyEngine {
             }
             let mut hash = [0u8; 32];
             hash.copy_from_slice(in_reply_to_sha256);
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let row_opt = py
                 .detach(move || {
@@ -2216,7 +2473,7 @@ impl PyEngine {
         ack_envelope_bytes: &[u8],
     ) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let qid = queue_id.to_owned();
             let ack = ack_envelope_bytes.to_vec();
@@ -2234,7 +2491,7 @@ impl PyEngine {
     /// touched (retried or abandoned).
     fn sweep_ack_timeouts(&self, py: Python<'_>) -> PyResult<i64> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             py.detach(move || {
                 runtime.block_on(async move {
@@ -2249,7 +2506,7 @@ impl PyEngine {
     /// v0.4.0 — Sweep TTL-expired rows.
     fn sweep_ttl_expired(&self, py: Python<'_>) -> PyResult<i64> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             py.detach(move || {
                 runtime.block_on(async move {
@@ -2265,7 +2522,7 @@ impl PyEngine {
     /// rows whose claimed_until elapsed).
     fn sweep_expired_claims(&self, py: Python<'_>) -> PyResult<i64> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             py.detach(move || {
                 runtime.block_on(async move {
@@ -2285,7 +2542,7 @@ impl PyEngine {
         queue_id: &str,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let qid = queue_id.to_owned();
             let row_opt = py
@@ -2346,7 +2603,7 @@ impl PyEngine {
                 message_type: message_type.map(str::to_owned),
                 enqueued_after,
             };
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let rows = py
                 .detach(move || {
@@ -2363,7 +2620,7 @@ impl PyEngine {
     /// v0.4.0 — Operator-driven cancellation. Idempotent.
     fn cancel_outbound(&self, py: Python<'_>, queue_id: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let qid = queue_id.to_owned();
             py.detach(move || {
@@ -2380,7 +2637,7 @@ impl PyEngine {
     /// requeues an abandoned row.
     fn replay_abandoned(&self, py: Python<'_>, queue_id: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let qid = queue_id.to_owned();
             py.detach(move || {
@@ -2419,7 +2676,7 @@ impl PyEngine {
     /// row is inserted (idempotent on `detection_id`).
     fn put_detection_event(&self, py: Python<'_>, event_json: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let event: crate::derived::DetectionEvent = serde_json::from_str(event_json)
                 .map_err(|e| PyValueError::new_err(format!("DetectionEvent JSON decode: {e}")))?;
@@ -2485,7 +2742,7 @@ impl PyEngine {
     /// of `DetectionEvent` objects, ordered by `ts DESC`.
     fn get_detection_events(&self, py: Python<'_>, filter_json: Option<&str>) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let filter: crate::derived::EventFilter = match filter_json {
                 None => crate::derived::EventFilter::default(),
@@ -2530,7 +2787,7 @@ impl PyEngine {
     /// new row in a single transaction.
     fn put_calibration_bundle(&self, py: Python<'_>, bundle_json: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let bundle: crate::derived::CalibrationBundle = serde_json::from_str(bundle_json)
                 .map_err(|e| {
@@ -2586,7 +2843,7 @@ impl PyEngine {
     /// Returns JSON-encoded `CalibrationBundle` or `None`.
     fn get_current_calibration_bundle(&self, py: Python<'_>) -> PyResult<Option<String>> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             py.detach(move || {
                 runtime.block_on(async move {
@@ -2614,7 +2871,7 @@ impl PyEngine {
         version: i32,
     ) -> PyResult<Option<String>> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             py.detach(move || {
                 runtime.block_on(async move {
@@ -2662,7 +2919,7 @@ impl PyEngine {
         limit: i64,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
                 .map_err(|e| PyValueError::new_err(format!("TraceFilter JSON decode: {e}")))?;
@@ -2691,7 +2948,7 @@ impl PyEngine {
     /// `TraceSummary` or `None`.
     fn get_trace_summary(&self, py: Python<'_>, trace_id: &str) -> PyResult<Option<String>> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let trace_id = trace_id.to_owned();
             py.detach(move || {
@@ -2718,7 +2975,7 @@ impl PyEngine {
     /// or `None`. Drives `/repository/traces/{trace_id}`.
     fn get_trace_detail(&self, py: Python<'_>, trace_id: &str) -> PyResult<Option<String>> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let trace_id = trace_id.to_owned();
             py.detach(move || {
@@ -2756,7 +3013,7 @@ impl PyEngine {
         thought_id: &str,
     ) -> PyResult<Option<String>> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let trace_id = trace_id.to_owned();
             let thought_id = thought_id.to_owned();
@@ -2792,7 +3049,7 @@ impl PyEngine {
         thought_id: &str,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let trace_id = trace_id.to_owned();
             let thought_id = thought_id.to_owned();
@@ -2830,7 +3087,7 @@ impl PyEngine {
         limit: i64,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let filter: crate::read::TaskFilter = serde_json::from_str(filter_json)
                 .map_err(|e| PyValueError::new_err(format!("TaskFilter JSON decode: {e}")))?;
@@ -2868,7 +3125,7 @@ impl PyEngine {
         limit: i64,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let filter: crate::read::LlmCallFilter = serde_json::from_str(filter_json)
                 .map_err(|e| PyValueError::new_err(format!("LlmCallFilter JSON decode: {e}")))?;
@@ -2897,7 +3154,7 @@ impl PyEngine {
     /// totals. Returns JSON-encoded `LlmCostAggregate`.
     fn aggregate_llm_costs(&self, py: Python<'_>, filter_json: &str) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let filter: crate::read::LlmCallFilter = serde_json::from_str(filter_json)
                 .map_err(|e| PyValueError::new_err(format!("LlmCallFilter JSON decode: {e}")))?;
@@ -2924,7 +3181,7 @@ impl PyEngine {
     /// `CorpusShape`.
     fn corpus_shape(&self, py: Python<'_>, filter_json: &str) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let filter: crate::read::CorpusShapeFilter = serde_json::from_str(filter_json)
                 .map_err(|e| {
@@ -2954,7 +3211,7 @@ impl PyEngine {
         until_iso8601: &str,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let since = chrono::DateTime::parse_from_rfc3339(since_iso8601)
                 .map_err(|e| PyValueError::new_err(format!("since RFC3339: {e}")))?
@@ -2989,7 +3246,7 @@ impl PyEngine {
         limit: i64,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let filter: crate::read::FederationKeyFilter = serde_json::from_str(filter_json)
                 .map_err(|e| {
@@ -3026,7 +3283,7 @@ impl PyEngine {
         limit: i64,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let filter: crate::read::AttestationFilter = serde_json::from_str(filter_json)
                 .map_err(|e| {
@@ -3063,7 +3320,7 @@ impl PyEngine {
         limit: i64,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let filter: crate::read::RevocationFilter = serde_json::from_str(filter_json)
                 .map_err(|e| PyValueError::new_err(format!("RevocationFilter JSON decode: {e}")))?;
@@ -3103,7 +3360,7 @@ impl PyEngine {
         metric: &str,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let domain = deployment_domain.to_owned();
             let window: crate::read::TimeWindow = serde_json::from_str(window_json)
@@ -3135,7 +3392,7 @@ impl PyEngine {
         comparison_json: &str,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let aid = agent_id_hash.to_owned();
             let baseline: crate::read::TimeWindow = serde_json::from_str(baseline_json)
@@ -3166,7 +3423,7 @@ impl PyEngine {
         window_json: &str,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let aid = agent_id_hash.to_owned();
             let window: crate::read::TimeWindow = serde_json::from_str(window_json)
@@ -3194,7 +3451,7 @@ impl PyEngine {
         window_json: &str,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let domain = deployment_domain.to_owned();
             let window: crate::read::TimeWindow = serde_json::from_str(window_json)
@@ -3228,7 +3485,7 @@ impl PyEngine {
         baseline_window_json: Option<&str>,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let aid = agent_id_hash.to_owned();
             let window: crate::read::TimeWindow = serde_json::from_str(window_json)
@@ -3266,7 +3523,7 @@ impl PyEngine {
         baseline_window_json: Option<&str>,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let aids: Vec<String> = serde_json::from_str(agent_id_hashes_json)
                 .map_err(|e| PyValueError::new_err(format!("agent_id_hashes decode: {e}")))?;
@@ -3296,7 +3553,7 @@ impl PyEngine {
     /// Granular: count distinct trace_id matching filter.
     fn count_traces(&self, py: Python<'_>, filter_json: &str) -> PyResult<i64> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
                 .map_err(|e| PyValueError::new_err(format!("TraceFilter decode: {e}")))?;
@@ -3312,7 +3569,7 @@ impl PyEngine {
     /// Granular: count traces where conscience overrode the action.
     fn count_overrides(&self, py: Python<'_>, filter_json: &str) -> PyResult<i64> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
                 .map_err(|e| PyValueError::new_err(format!("TraceFilter decode: {e}")))?;
@@ -3331,7 +3588,7 @@ impl PyEngine {
     /// Granular: count agent_name changes (identity changes).
     fn count_identity_changes(&self, py: Python<'_>, filter_json: &str) -> PyResult<i64> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
                 .map_err(|e| PyValueError::new_err(format!("TraceFilter decode: {e}")))?;
@@ -3351,7 +3608,7 @@ impl PyEngine {
     /// Returns JSON-encoded `AuditChainAggregate`.
     fn aggregate_audit_chain(&self, py: Python<'_>, filter_json: &str) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
                 .map_err(|e| PyValueError::new_err(format!("TraceFilter decode: {e}")))?;
@@ -3388,7 +3645,7 @@ impl PyEngine {
         accessor: &str,
     ) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let key = key.to_owned();
             let value = value.to_owned();
@@ -3415,7 +3672,7 @@ impl PyEngine {
         accessor: &str,
     ) -> PyResult<Option<String>> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let key = key.to_owned();
             let accessor = accessor.to_owned();
@@ -3443,7 +3700,7 @@ impl PyEngine {
         decrypt: bool,
     ) -> PyResult<Option<String>> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let uuid = uuid.to_owned();
             let purpose = purpose.to_owned();
@@ -3476,7 +3733,7 @@ impl PyEngine {
         filter_json: &str,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let filter: crate::secrets::SecretsListFilter = serde_json::from_str(filter_json)
                 .map_err(|e| {
@@ -3501,7 +3758,7 @@ impl PyEngine {
     #[cfg(feature = "secrets")]
     fn secrets_forget_secret(&self, py: Python<'_>, uuid: &str, accessor: &str) -> PyResult<bool> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let uuid = uuid.to_owned();
             let accessor = accessor.to_owned();
@@ -3528,7 +3785,7 @@ impl PyEngine {
         accessor: &str,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let text = text.to_owned();
             let smi = source_message_id.to_owned();
@@ -3562,7 +3819,7 @@ impl PyEngine {
         ctx_json: &str,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let action_type = action_type.to_owned();
             let action_params: serde_json::Value = serde_json::from_str(action_params_json)
@@ -3588,7 +3845,7 @@ impl PyEngine {
     #[cfg(feature = "secrets")]
     fn secrets_encrypt(&self, py: Python<'_>, plaintext: &str) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let pt = plaintext.to_owned();
             py.detach(move || {
@@ -3604,7 +3861,7 @@ impl PyEngine {
     #[cfg(feature = "secrets")]
     fn secrets_decrypt(&self, py: Python<'_>, ciphertext: &str) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let ct = ciphertext.to_owned();
             py.detach(move || {
@@ -3621,7 +3878,7 @@ impl PyEngine {
     #[cfg(feature = "secrets")]
     fn secrets_get_filter_config(&self, py: Python<'_>) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             py.detach(move || {
                 runtime.block_on(async move {
@@ -3647,7 +3904,7 @@ impl PyEngine {
         accessor: &str,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let req: crate::secrets::FilterUpdateRequest = serde_json::from_str(updates_json)
                 .map_err(|e| PyValueError::new_err(format!("FilterUpdateRequest decode: {e}")))?;
@@ -3672,7 +3929,7 @@ impl PyEngine {
     #[cfg(feature = "secrets")]
     fn secrets_get_service_stats(&self, py: Python<'_>) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             py.detach(move || {
                 runtime.block_on(async move {
@@ -3693,7 +3950,7 @@ impl PyEngine {
     #[cfg(feature = "secrets")]
     fn secrets_is_healthy(&self, py: Python<'_>) -> PyResult<bool> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             py.detach(move || {
                 runtime.block_on(async move {
@@ -3714,7 +3971,7 @@ impl PyEngine {
         limit: usize,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let uuid = secret_uuid.map(str::to_owned);
             py.detach(move || {
@@ -3742,7 +3999,7 @@ impl PyEngine {
         accessor: &str,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let key_ref: crate::secrets::MasterKeyRef =
                 serde_json::from_str(new_master_key_ref_json)
@@ -3773,7 +4030,7 @@ impl PyEngine {
         accessor: &str,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let new_master: Option<Vec<u8>> = match new_master_b64 {
                 None => None,
@@ -3804,7 +4061,7 @@ impl PyEngine {
     #[cfg(feature = "secrets")]
     fn secrets_test_encryption(&self, py: Python<'_>) -> PyResult<bool> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             py.detach(move || {
                 runtime.block_on(async move {
@@ -3821,7 +4078,7 @@ impl PyEngine {
     #[cfg(feature = "secrets")]
     fn secrets_migrate_to_hardware_key(&self, py: Python<'_>, accessor: &str) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let accessor = accessor.to_owned();
             py.detach(move || {
@@ -3849,7 +4106,7 @@ impl PyEngine {
     #[cfg(feature = "cirisnode")]
     fn cirisnode_put_contribution(&self, py: Python<'_>, envelope_json: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let env: crate::cirisnode::ContributionEnvelope = serde_json::from_str(envelope_json)
                 .map_err(|e| {
@@ -3871,7 +4128,7 @@ impl PyEngine {
     #[cfg(feature = "cirisnode")]
     fn cirisnode_cast_vote(&self, py: Python<'_>, envelope_json: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let env: crate::cirisnode::VoteEnvelope = serde_json::from_str(envelope_json)
                 .map_err(|e| PyValueError::new_err(format!("VoteEnvelope decode: {e}")))?;
@@ -3888,7 +4145,7 @@ impl PyEngine {
     #[cfg(feature = "cirisnode")]
     fn cirisnode_update_credits_ledger(&self, py: Python<'_>, update_json: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let update: crate::cirisnode::CreditsUpdate = serde_json::from_str(update_json)
                 .map_err(|e| PyValueError::new_err(format!("CreditsUpdate decode: {e}")))?;
@@ -3908,7 +4165,7 @@ impl PyEngine {
     #[cfg(feature = "cirisnode")]
     fn cirisnode_update_expertise_ledger(&self, py: Python<'_>, update_json: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let update: crate::cirisnode::ExpertiseUpdate = serde_json::from_str(update_json)
                 .map_err(|e| PyValueError::new_err(format!("ExpertiseUpdate decode: {e}")))?;
@@ -3928,7 +4185,7 @@ impl PyEngine {
     #[cfg(feature = "cirisnode")]
     fn cirisnode_put_moderation_event(&self, py: Python<'_>, event_json: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let event: crate::cirisnode::ModerationEvent = serde_json::from_str(event_json)
                 .map_err(|e| PyValueError::new_err(format!("ModerationEvent decode: {e}")))?;
@@ -3948,7 +4205,7 @@ impl PyEngine {
     #[cfg(feature = "cirisnode")]
     fn cirisnode_put_slashing_attestation(&self, py: Python<'_>, att_json: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let att: crate::cirisnode::SlashingAttestation = serde_json::from_str(att_json)
                 .map_err(|e| PyValueError::new_err(format!("SlashingAttestation decode: {e}")))?;
@@ -3972,7 +4229,7 @@ impl PyEngine {
         req_json: &str,
     ) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let req: crate::cirisnode::ReconsiderationRequest = serde_json::from_str(req_json)
                 .map_err(|e| {
@@ -3998,7 +4255,7 @@ impl PyEngine {
         att_json: &str,
     ) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let att: crate::cirisnode::ReconsiderationAttestation = serde_json::from_str(att_json)
                 .map_err(|e| {
@@ -4025,7 +4282,7 @@ impl PyEngine {
     #[cfg(feature = "cirisnode")]
     fn cirisnode_put_promotion_attestation(&self, py: Python<'_>, att_json: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let att: crate::cirisnode::PromotionAttestation = serde_json::from_str(att_json)
                 .map_err(|e| PyValueError::new_err(format!("PromotionAttestation decode: {e}")))?;
@@ -4051,7 +4308,7 @@ impl PyEngine {
         language: &str,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let domain = domain.to_owned();
             let language = language.to_owned();
@@ -4083,7 +4340,7 @@ impl PyEngine {
         subject: &str,
     ) -> PyResult<Option<String>> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let contributor_id = contributor_id.to_owned();
             let domain = domain.to_owned();
@@ -4118,7 +4375,7 @@ impl PyEngine {
         limit: i64,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let filter: crate::cirisnode::ContributionsFilter = serde_json::from_str(filter_json)
                 .map_err(|e| {
@@ -4157,7 +4414,7 @@ impl PyEngine {
         limit: i64,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let filter: crate::cirisnode::VotesFilter = serde_json::from_str(filter_json)
                 .map_err(|e| PyValueError::new_err(format!("VotesFilter decode: {e}")))?;
@@ -4193,7 +4450,7 @@ impl PyEngine {
         subject: &str,
     ) -> PyResult<Option<String>> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let contributor_id = contributor_id.to_owned();
             let domain = domain.to_owned();
@@ -4227,7 +4484,7 @@ impl PyEngine {
         language: &str,
     ) -> PyResult<Option<String>> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let contributor_id = contributor_id.to_owned();
             let domain = domain.to_owned();
@@ -4267,7 +4524,7 @@ impl PyEngine {
         expected_version: i32,
     ) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let node: crate::graph::GraphNode = serde_json::from_str(node_json)
                 .map_err(|e| PyValueError::new_err(format!("GraphNode decode: {e}")))?;
@@ -4287,7 +4544,7 @@ impl PyEngine {
     #[cfg(feature = "cirisgraph")]
     fn cirisgraph_upsert_edge(&self, py: Python<'_>, edge_json: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let edge: crate::graph::GraphEdge = serde_json::from_str(edge_json)
                 .map_err(|e| PyValueError::new_err(format!("GraphEdge decode: {e}")))?;
@@ -4314,7 +4571,7 @@ impl PyEngine {
         hard: bool,
     ) -> PyResult<bool> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let node_id = node_id.to_owned();
             let scope = crate::graph::GraphScope::from_sql_str(scope)
@@ -4341,7 +4598,7 @@ impl PyEngine {
         scope: &str,
     ) -> PyResult<Option<String>> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let node_id = node_id.to_owned();
             let scope = crate::graph::GraphScope::from_sql_str(scope)
@@ -4378,7 +4635,7 @@ impl PyEngine {
         relationship_filter_json: Option<&str>,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let node_id = node_id.to_owned();
             let scope = crate::graph::GraphScope::from_sql_str(scope)
@@ -4417,7 +4674,7 @@ impl PyEngine {
         config_json: &str,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let start_node_id = start_node_id.to_owned();
             let scope = crate::graph::GraphScope::from_sql_str(scope)
@@ -4449,7 +4706,7 @@ impl PyEngine {
         limit: i64,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let filter: crate::graph::NodeFilter = serde_json::from_str(filter_json)
                 .map_err(|e| PyValueError::new_err(format!("NodeFilter decode: {e}")))?;
@@ -4485,7 +4742,7 @@ impl PyEngine {
     #[cfg(feature = "cirisaudit")]
     fn audit_record_entry(&self, py: Python<'_>, entry_json: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let entry: crate::audit::AuditEntry = serde_json::from_str(entry_json)
                 .map_err(|e| PyValueError::new_err(format!("AuditEntry decode: {e}")))?;
@@ -4509,7 +4766,7 @@ impl PyEngine {
         limit: i64,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let filter: crate::audit::AuditFilter = serde_json::from_str(filter_json)
                 .map_err(|e| PyValueError::new_err(format!("AuditFilter decode: {e}")))?;
@@ -4546,7 +4803,7 @@ impl PyEngine {
         to_sequence: Option<i64>,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let tenant_id = tenant_id.to_owned();
             py.detach(move || {
@@ -4572,7 +4829,7 @@ impl PyEngine {
     #[cfg(feature = "telemetry")]
     fn telemetry_record_metric(&self, py: Python<'_>, obs_json: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let obs: crate::telemetry::MetricObservation = serde_json::from_str(obs_json)
                 .map_err(|e| PyValueError::new_err(format!("MetricObservation decode: {e}")))?;
@@ -4592,7 +4849,7 @@ impl PyEngine {
     #[cfg(feature = "telemetry")]
     fn telemetry_record_metrics_batch(&self, py: Python<'_>, obs_json: &str) -> PyResult<u64> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let obs: Vec<crate::telemetry::MetricObservation> = serde_json::from_str(obs_json)
                 .map_err(|e| {
@@ -4620,7 +4877,7 @@ impl PyEngine {
         limit: i64,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let filter: crate::telemetry::MetricFilter = serde_json::from_str(filter_json)
                 .map_err(|e| PyValueError::new_err(format!("MetricFilter decode: {e}")))?;
@@ -4651,7 +4908,7 @@ impl PyEngine {
     #[cfg(feature = "telemetry")]
     fn telemetry_consolidate_period(&self, py: Python<'_>, req_json: &str) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let req: crate::telemetry::ConsolidationRequest = serde_json::from_str(req_json)
                 .map_err(|e| PyValueError::new_err(format!("ConsolidationRequest decode: {e}")))?;
@@ -4680,7 +4937,7 @@ impl PyEngine {
     #[cfg(feature = "cirisincident")]
     fn incident_record(&self, py: Python<'_>, incident_json: &str) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let inc: crate::incident::Incident = serde_json::from_str(incident_json)
                 .map_err(|e| PyValueError::new_err(format!("Incident decode: {e}")))?;
@@ -4701,7 +4958,7 @@ impl PyEngine {
     #[cfg(feature = "cirisincident")]
     fn incident_transition(&self, py: Python<'_>, transition_json: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let t: crate::incident::IncidentTransition = serde_json::from_str(transition_json)
                 .map_err(|e| PyValueError::new_err(format!("IncidentTransition decode: {e}")))?;
@@ -4727,7 +4984,7 @@ impl PyEngine {
         limit: i64,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let filter: crate::incident::IncidentFilter = serde_json::from_str(filter_json)
                 .map_err(|e| PyValueError::new_err(format!("IncidentFilter decode: {e}")))?;
@@ -4758,7 +5015,7 @@ impl PyEngine {
     #[cfg(feature = "cirisincident")]
     fn incident_correlate(&self, py: Python<'_>, tenant_id: &str, key: &str) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend.clone();
+            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let tenant_id = tenant_id.to_owned();
             let key = key.to_owned();
@@ -5038,6 +5295,10 @@ impl crate::verify::PublicKeyDirectory for TraceKeyDirectory {
         &self,
         key_id: &str,
     ) -> Result<Option<ed25519_dalek::VerifyingKey>, Box<dyn std::error::Error + Send + Sync>> {
+        // TraceKeyDirectory holds an Arc<PostgresBackend> directly (not
+        // a BackendDispatch) because it's constructed inline by the
+        // verify_trace caller, which already unwrapped the dispatch
+        // arm. No scaffold-helper indirection needed here.
         let backend = self.backend.clone();
         let key_id = key_id.to_owned();
         // verify_trace_via_directory's PublicKeyDirectory trait is
@@ -5923,6 +6184,18 @@ fn ciris_persist(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // v0.5.3 (CIRISPersist#27) — register LensQueryError so the
     // catch_panic wrapper has a typed exception class to raise.
     m.add("LensQueryError", py.get_type::<LensQueryError>())?;
+    // v1.0.0-scaffold (CIRISPersist#194) — typed retry-policy
+    // exception hierarchy. The follow-up porting agent threads
+    // `translate_error_kind` through each `Error::kind()`-aware
+    // map_err site; for now the classes are registered + importable
+    // (`from ciris_persist import PersistError, NotFound, Conflict,
+    // Transient, Permanent`) so the lens HTTP layer can pre-wire
+    // its retry / status-code dispatch.
+    m.add("PersistError", py.get_type::<PersistError>())?;
+    m.add("NotFound", py.get_type::<NotFound>())?;
+    m.add("Conflict", py.get_type::<Conflict>())?;
+    m.add("Transient", py.get_type::<Transient>())?;
+    m.add("Permanent", py.get_type::<Permanent>())?;
     // v0.5.4 (CIRISPersist#29) — feature-gated panic injector for the
     // Python regression suite. Off in release wheels.
     #[cfg(feature = "test-panic")]
