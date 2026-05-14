@@ -5,6 +5,79 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.9.2] — 2026-05-14
+
+**Multi-target build registration via `ciris-build-sign register`
+(closes CIRISPersist#42).** Persist's CI now produces and registers
+**four per-target BuildManifests** in the CanonicalBuild v2 shape
+(CIRISVerify v2.0.3+), unblocking `verify_tree(project=
+"ciris-persist", target=…)` for every deployment class — including
+iOS + Android consumers that rebuild persist's Rust from source
+and verify the Python wrapper tree.
+
+### What landed in CI
+
+- **`ciris-build-sign` tarball bumped** v1.8.0 → v2.0.5. Brings the
+  `register` subcommand + CanonicalBuild v2 multi-target shape.
+- **Four manifests signed per release** (was one):
+  - `python-source-tree` — file-tree hash over `python/ciris_persist/`
+    (`.py` + `.pyi` only; excludes `__pycache__`, `.pyc`, `.pyo`,
+    `.so`, `.dylib`, `.dll`). Covers what iOS / Android agents
+    walk when they verify persist's installed Python wrappers.
+  - `x86_64-unknown-linux-gnu` — `binary_hash = sha256(wheel.whl)`
+    for the Linux x86_64 wheel.
+  - `aarch64-unknown-linux-gnu` — same shape, Linux aarch64 wheel.
+  - `aarch64-apple-darwin` — same shape, macOS arm64 wheel.
+- **`ciris-build-sign register`** replaces the custom curl POST to
+  `/v1/verify/binary-manifest`. Writes the `builds` parent row
+  signed over all per-target manifest hashes, plus per-target
+  `binary_manifests` (binary mode) and `function_manifests`
+  (source-tree mode) rows to `/v1/builds`.
+- **Round-trip verify** updated to `GET /v1/builds/<v>?project=
+  ciris-persist` (parent row) **plus** per-target
+  `&target=<name>` GETs for every signed target. Fails the build
+  if ANY target's round-trip fails.
+
+### Why iOS + Android needed this
+
+`pip install ciris-persist` doesn't work on iOS/Android (no Python
+wheels for those platforms). Agents on those platforms embed the
+persist Python wrappers via PyOxidizer/Buildozer-style packaging
+and rebuild persist's Rust from source. Without a registered
+`python-source-tree` manifest, `verify_tree(project="ciris-persist",
+root=<embedded-persist-dir>, ...)` returns `registry_error` /
+`valid=false`. v0.9.2 closes that gap.
+
+### Library / wheel surface unchanged
+
+No code changes. The Rust trait surfaces, FFI shapes, wire
+formats, and the published wheel contents are byte-for-byte
+identical to v0.9.1. Only the CI registration shape changed.
+Existing v0.9.1 consumers can continue using the old
+`/v1/verify/binary-manifest` cached row; new consumers (or any
+post-v0.9.2 deployment) get the multi-target CanonicalBuild v2
+path automatically.
+
+### Tests
+
+- 349/349 lib pass against live `ciris-qa-postgres` + in-memory
+  SQLite (unchanged from v0.9.1).
+- `python3 -c "import yaml; yaml.safe_load(...)"` on the rewritten
+  workflow passes.
+- The register / round-trip flow only validates end-to-end against
+  the live CIRISRegistry in tag CI; local pre-push can't exercise
+  it. The tag CI is the integration gate.
+
+### References
+
+- CIRISPersist#42 — register persist builds in multi-project verify
+  expansion (closes here).
+- CIRISVerify#8 — CanonicalBuild v2 with per-target rows (v2.0.3).
+- CIRISVerify v2.0.5 — `ciris-build-sign register` subcommand + the
+  iOS hardware-marker self-heal + Mach-O `__TEXT` hash parity (the
+  three fixes v0.9.1 picked up at the Rust-library level; v0.9.2
+  now uses the matching `register` CLI).
+
 ## [0.9.1] — 2026-05-14
 
 **Verify pin bump v2.0.2 → v2.0.5.** Updates the Rust-side
