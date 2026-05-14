@@ -5,6 +5,52 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.9.1] — 2026-05-14
+
+**Verify pin bump v2.0.2 → v2.0.5.** Updates the Rust-side
+`ciris-keyring` + `ciris-verify-core` + `ciris-crypto` git pins
+(all from the CIRISVerify monorepo) AND the Python-side
+`ciris-verify` PyPI floor. Aligns persist with what CIRISAgent
+v2.9.0 expects.
+
+### What's in v2.0.5 (vs v2.0.2)
+
+- **v2.0.3** — CanonicalBuild v2 with `target` field (closes
+  CIRISVerify#8).
+- **v2.0.4** — Self-heal orphaned hardware markers on iOS
+  reinstall. iOS-specific; relevant to CIRISAgent v2.9.0 on iOS
+  device deployments.
+- **v2.0.5** — Single-source-of-truth `__TEXT` hash for Mach-O
+  sign/runtime parity (closes CIRISVerify#19). Fixes
+  sign-verifies-but-runtime-rejects edge case on macOS + iOS.
+
+### Why this matters for v2.9.0
+
+The agent's iOS-device deployment path benefits from v2.0.4's
+hardware-marker self-heal directly — without it, an agent app
+reinstall on iOS could leave the hardware-keyring marker file
+stale and refuse to boot until manual cleanup. v2.0.5's Mach-O
+hash fix matters for the build-manifest verify path that lens-core
+inherits transitively.
+
+### What changed at the persist layer
+
+- `Cargo.toml`: 3 git-pin lines bumped (`ciris-keyring`,
+  `ciris-verify-core`, `ciris-crypto`) from `tag = "v2.0.2"` to
+  `tag = "v2.0.5"`.
+- `pyproject.toml`: `ciris-verify>=1.8.6,<2` → `ciris-verify>=2.0.5,<3`.
+  Upper bound moved to `<3` per the semver-major convention.
+- No persist-side code changes. Trait surfaces, FFI shapes, and
+  wire formats are unchanged.
+
+### Tests
+
+- 349/349 lib pass against live `ciris-qa-postgres` + in-memory
+  SQLite.
+- Clippy `-D warnings` clean across the full feature matrix.
+- Cargo.lock updated; git-deps re-locked at v2.0.5
+  (`dcc8b4ed`).
+
 ## [0.9.0] — 2026-05-13
 
 **CIRISAgent 2.9.0 adoption cut — 6 of 22 services absorbed with

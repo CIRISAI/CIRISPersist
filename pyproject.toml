@@ -26,16 +26,17 @@ classifiers = [
 # whole verify+persist stack — no separate `pip install ciris-verify`
 # step needed for the build-manifest signing CLIs.
 #
-# Pin to >=1.8.6 because the v1.8.6 wheel is the first that ships
-# the CLI console_scripts on all 5 platforms (linux x86_64/aarch64,
-# macos x86_64/arm64, windows x86_64). Earlier 1.8.x had the source
-# but not the binary entry points on PyPI.
+# v0.9.1 — bumped to v2.0.5 floor to match the Rust-side git pin
+# (Cargo.toml). v2.0.4 brought the iOS-reinstall hardware-marker
+# self-heal (CIRISVerify#?, relevant to CIRISAgent 2.9.0 on iOS);
+# v2.0.5 brought the Mach-O `__TEXT` hash single-source-of-truth
+# (CIRISVerify#19) fixing sign/runtime parity on macOS + iOS.
+# Both fixes are inherited transitively by every persist consumer.
 #
-# Pin to <2 because we expect ciris-verify to follow semver-major
-# on breaking changes; v0.2.x persist consumes v1.x verify. Bump
-# to >=2 when v0.3.x persist coordinates with v2.x verify.
+# Pin to <3 to follow semver-major. Bump to >=3 when v0.10.x
+# persist coordinates with v3.x verify.
 dependencies = [
-    "ciris-verify>=1.8.6,<2",
+    "ciris-verify>=2.0.5,<3",
 ]
 dynamic = ["version"]
 
