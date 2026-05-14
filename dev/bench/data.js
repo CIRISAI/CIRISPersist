@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778713387539,
+  "lastUpdate": 1778717401527,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -12689,6 +12689,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23768855,
             "range": "± 966248",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "79e94852b0ca717b9c5c9ccc945c02a2dad80d27",
+          "message": "fix(pyproject): ship full v0.6.1+ feature set in the wheel (closes #41)\n\nThe v0.8.4–v0.8.7 SQLite parity work + the v0.7.x / v0.8.x\nsubstrate cuts shipped at the rlib level, but\n`[tool.maturin] features = [\"pyo3\"]` in pyproject.toml only\ncompiled `pyo3` + transitively `postgres` into the published wheel.\nResult: `pip install ciris-persist==0.9.0` would have shipped\npostgres-only with NONE of the v0.6.1+ modules — every agent\nconsumer would have had to source-rebuild with `--features\n\"sqlite cirisgraph cirisaudit telemetry cirisincident ...\"` to\nreach the actual v0.9.0 substrate.\n\nFix: bump `[tool.maturin] features` to enable the full\nagent-adoption feature set:\n\n  pyo3 + sqlite + cirisgraph + cirisaudit + telemetry +\n  cirisincident + secrets + cirisnode + extract + classify + scrub\n\nBackend selection happens at `Engine` construction time per DSN\nscheme — Postgres deployments get every module on Postgres;\nSQLite deployments get the 4 polyglot modules natively (graph,\naudit, telemetry, incident) and clean NotImplemented errors on\nsecrets + cirisnode trait calls until #39 + #40 close their\nSQLite parity.\n\nCost: rusqlite's bundled libsqlite3 + pipeline ML deps add\n~3-5 MB to the wheel vs the v0.8.3 postgres-only shape. Acceptable\ngiven the deployment-ergonomics win (one `pip install`, every\nbackend + every module, zero source-build).\n\nCloses CIRISPersist#41.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-13T19:02:41-05:00",
+          "tree_id": "2727927f5339fb10b9fda191139cabddf314b3a6",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/79e94852b0ca717b9c5c9ccc945c02a2dad80d27"
+        },
+        "date": 1778717400879,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 109034,
+            "range": "± 315",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 261416,
+            "range": "± 926",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 561681,
+            "range": "± 2242",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1996655,
+            "range": "± 31650",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 351,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1457,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8174,
+            "range": "± 21",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23242,
+            "range": "± 203",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26480,
+            "range": "± 70",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91064,
+            "range": "± 115",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 365,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3081,
+            "range": "± 17",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 10184,
+            "range": "± 20",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42262,
+            "range": "± 127",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 663,
+            "range": "± 27",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2247009,
+            "range": "± 38903",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7022528,
+            "range": "± 30019",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25874293,
+            "range": "± 80159",
             "unit": "ns/iter"
           }
         ]
