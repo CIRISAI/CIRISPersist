@@ -34,8 +34,6 @@
 -- Consumers should always filter by `node_type = 'tsdb_summary'`
 -- before trusting this column.
 
-BEGIN;
-
 ALTER TABLE cirisgraph.nodes
     ADD COLUMN IF NOT EXISTS consolidation_level TEXT NOT NULL DEFAULT 'basic'
         CHECK (consolidation_level IN ('basic', 'daily', 'weekly', 'monthly'));
@@ -45,16 +43,26 @@ ALTER TABLE cirisgraph.nodes
 -- expression index so the rollup queries — which filter by both
 -- node_type='tsdb_summary' AND consolidation_level=$tier AND the
 -- JSON-extracted metric_name — can hit a single index.
+--
+-- Note: period_start stays as TEXT (RFC 3339 / ISO 8601) in the
+-- index. The TIMESTAMPTZ cast (`(...)::timestamptz`) is STABLE
+-- (depends on session timezone), not IMMUTABLE — PG rejects STABLE
+-- functions in index expressions (SQLSTATE 42P17). Canonical RFC
+-- 3339 strings sort lexicographically the same way TIMESTAMPTZ does
+-- when the offset is normalized (Z or +HH:MM), which is how persist
+-- always emits them (via `fmt_datetime`).
+--
+-- No explicit BEGIN/COMMIT — refinery wraps each migration in its
+-- own transaction. Nested BEGIN/COMMIT interacts poorly with the
+-- expression-index parsing path in tokio-postgres.
 CREATE INDEX IF NOT EXISTS tsdb_summary_level_metric_period
     ON cirisgraph.nodes (
         node_type,
         consolidation_level,
         (attributes->>'metric_name'),
-        ((attributes->>'period_start')::timestamptz) DESC
+        (attributes->>'period_start') DESC
     )
     WHERE node_type = 'tsdb_summary';
 
 COMMENT ON COLUMN cirisgraph.nodes.consolidation_level IS
     'v1.0.0 (CIRISAgent#756 Q7) — TSDB rollup tier for node_type=tsdb_summary rows: basic (6h, raw obs), daily (basic rollup), weekly (daily rollup), monthly (weekly rollup). DEFAULT basic; CHECK-gated for typo defense.';
-
-COMMIT;
