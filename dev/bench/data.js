@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778717401527,
+  "lastUpdate": 1778718603821,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -12821,6 +12821,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25874293,
             "range": "± 80159",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "a98096193a0df6da33b898aa55120076f2eb89b9",
+          "message": "0.9.1 — verify pin bump v2.0.2 → v2.0.5 (iOS hardware-marker self-heal + Mach-O hash parity)\n\nRust-side git pins for ciris-keyring + ciris-verify-core +\nciris-crypto bumped from CIRISVerify v2.0.2 → v2.0.5 (all from the\nCIRISVerify monorepo). Python-side ciris-verify floor bumped to\n>=2.0.5,<3.\n\nBrings 3 fixes inherited transitively by every persist consumer:\n\n- v2.0.3 (CIRISVerify#8): CanonicalBuild v2 with `target` field.\n- v2.0.4: Self-heal orphaned hardware markers on iOS reinstall —\n  fixes a class of \"app reinstall leaves stale hardware-keyring\n  marker, agent refuses to boot\" failures on iOS device deployments.\n  Directly relevant to CIRISAgent v2.9.0 on iOS.\n- v2.0.5 (CIRISVerify#19): Single-source-of-truth __TEXT hash for\n  Mach-O sign/runtime parity. Closes the sign-verifies-but-runtime-\n  rejects edge case on macOS + iOS that affected build-manifest\n  verify paths.\n\nNo persist-side code changes — trait surfaces, FFI shapes, and\nwire formats unchanged. 349/349 lib pass against live ciris-qa-\npostgres + in-memory SQLite; clippy -D warnings clean across the\nfull feature matrix.\n\nCargo.lock re-locked at v2.0.5 (commit dcc8b4ed).\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-13T19:21:21-05:00",
+          "tree_id": "c526ea14771aab2869a95ff390c210d50433f4ec",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/a98096193a0df6da33b898aa55120076f2eb89b9"
+        },
+        "date": 1778718603206,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 102006,
+            "range": "± 812",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 242800,
+            "range": "± 2750",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 525781,
+            "range": "± 1405",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1852147,
+            "range": "± 23712",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 347,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1404,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7286,
+            "range": "± 102",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21159,
+            "range": "± 46",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24188,
+            "range": "± 126",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83567,
+            "range": "± 202",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 367,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3030,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9409,
+            "range": "± 34",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41286,
+            "range": "± 208",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 636,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2481459,
+            "range": "± 112790",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6810346,
+            "range": "± 129954",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23787156,
+            "range": "± 1430161",
             "unit": "ns/iter"
           }
         ]
