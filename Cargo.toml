@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "0.9.3"
+version = "0.9.4"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -112,7 +112,7 @@ secrets-server = ["secrets", "server"]
 # Distinct track from v0.6.x (lens/agent/bridge substrate). CIRISNodeCore
 # v0.1.0 pins ^0.7.0; deployments that don't need the federation-
 # consensus surface skip the migration + the feature.
-cirisnode      = ["postgres"]
+cirisnode      = []
 
 # v0.8.0 (CIRISPersist#34) — graph services absorption track. Powers
 # the agent's MemoryService + ConfigService migration off

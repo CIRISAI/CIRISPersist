@@ -5,6 +5,77 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [0.9.4] — 2026-05-14
+
+**NodeCoreService SQLite parity (closes CIRISPersist#40)** — the
+final SQLite parity piece for the v0.6.1+ substrate. Every persist
+module that ships a typed-write surface (cirisgraph, cirisaudit,
+telemetry, cirisincident, secrets, cirisnode) now runs on both
+backends.
+
+### What landed
+
+- **`cirisnode` feature decoupled from `postgres`.** Cargo.toml is
+  now `cirisnode = []`; pair with either backend (or both). Trait,
+  wire types, and dialect-agnostic signature-verify (`verify.rs`)
+  are backend-agnostic.
+- **`migrations/sqlite/lens/V011__cirisnode_consensus.sql`** —
+  7-table federation-consensus schema (contributions, votes,
+  credits_ledger, expertise_ledger, moderation_events,
+  slashing_attestations, reconsideration_requests,
+  reconsideration_attestations). Same audit envelope shape as the
+  Postgres V011 (signature / signing_key_id / signature_verified /
+  original_content_hash / scrub_signature_classical /
+  scrub_signature_pqc / scrub_key_id / scrub_timestamp /
+  pqc_completed_at / persist_row_hash). Dialect translations:
+  UUID→TEXT 36-char, JSONB→TEXT canonical JSON, TIMESTAMPTZ→RFC
+  3339, BYTEA→BLOB, DOUBLE PRECISION→REAL, BOOLEAN→INTEGER 0/1,
+  flat-prefixed `cirisnode_*` table names (no schema namespace).
+- **`migrations/sqlite/lens/V012__cirisnode_promotion_attestations.sql`**
+  — canonical-promotion attestation table (#32). `target_ids
+  UUID[]` translates to TEXT JSON-array; reverse-lookup via
+  `EXISTS (SELECT 1 FROM json_each(target_ids) WHERE value = ?)`
+  on the read path instead of the Postgres GIN index.
+- **`src/cirisnode/sqlite.rs`** — `SqliteNodeCoreBackend` impl of
+  all 14 `NodeCoreService` methods (8 typed-writes + 5 reads +
+  `put_promotion_attestation`). Per-call `tokio::task::
+  spawn_blocking` around the shared `Arc<Mutex<Connection>>`
+  handle; `BEGIN IMMEDIATE` (database-level RESERVED lock) replaces
+  Postgres `SELECT … FOR UPDATE` for `put_promotion_attestation`'s
+  multi-statement transaction (INSERT attestation + UPDATE N target
+  rows + verify total_affected matches target_ids.len() + rollback
+  on mismatch).
+- **Cursor pagination**: expanded OR form `WHERE submitted_at < ?N
+  OR (submitted_at = ?N AND contribution_id < ?M) ORDER BY DESC
+  LIMIT ?+1` instead of row-value tuple comparison, for broad
+  SQLite-version compatibility.
+
+### Signature-verify invariant unchanged
+
+The hybrid Ed25519 + ML-DSA-65 verify path lives in `src/cirisnode/
+verify.rs` and is shared by both backends — same as v0.7.x. The
+SQLite impl calls `super::verify::verify_envelope_signed(...)`
+byte-for-byte identically to the Postgres impl. No duplication, no
+divergence.
+
+### Tests
+
+`cirisnode::sqlite::tests::cirisnode_sqlite_round_trip_full_lifecycle`
+exercises all 14 trait methods + the promotion-attestation
+transactional path (including a rollback-on-mismatch sub-test).
+13/13 cirisnode tests pass with `--features "cirisnode sqlite"`;
+no regression with `--features "cirisnode postgres"` or both.
+
+### Series-completion note
+
+After v0.9.4 lands, every CIRISAgent service in the migration
+roadmap's persist-bound set (Memory / Config / Audit / Telemetry /
+TSDB / IncidentMgmt / Secrets / SecretsToolService) has full
+Postgres + SQLite parity. Sovereign-mode, Pi, iOS, server — all
+platforms supported. cirisnode itself isn't an agent-adoption
+dependency (it's CIRISNodeCore-track for federation-consensus
+rows), but its inclusion completes the v0.6.1+ matrix.
+
 ## [0.9.3] — 2026-05-13
 
 **SecretsService SQLite parity (closes CIRISPersist#39).** The
