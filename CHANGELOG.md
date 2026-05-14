@@ -5,6 +5,147 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.0.0] — 2026-05-14
+
+**Substrate-completion + CIRISAgent v2.9.0 adoption cut.** The "1.0"
+means: every CIRISAgent service the migration roadmap names as
+persist-bound (11 of 22) is reachable from the wheel, on every
+deployment platform (server Postgres + sovereign-mode / Pi / iOS
+SQLite). Agent team signed off (CIRISAgent#755 + #756); persist
+absorbs 9 services already (v0.9.4 Rust parity + this release's
+PyO3 SQLite wraps) and unblocks the remaining 2 (transit-touch
+Secrets + AdaptiveFilter classification via the pipeline orchestrator).
+
+### What v1.0.0 ships
+
+**PyO3 SQLite via URL-sniff (CIRISAgent#755 Option A)**
+
+- Single `Engine` Python class. Constructor sniffs the connection
+  URL: `postgresql://` / `postgres://` → Postgres backend;
+  `sqlite:///path` / `sqlite::memory:` / `sqlite:///:memory:` →
+  SQLite backend. Unknown scheme → `ValueError`.
+- Internal `BackendDispatch { Postgres, Sqlite }` enum; every
+  substrate method matches on it. Python-side API is identical
+  across backends — agent code is backend-blind beyond construction.
+- 51 substrate-service methods backend-dispatched: 18 secrets, 15
+  cirisnode, 7 cirisgraph, 4 telemetry, 4 incident, 3 audit. All
+  call into the SQLite sub-backends shipped v0.8.4-v0.9.4
+  (`SqliteSecretsBackend`, `SqliteNodeCoreBackend`, etc.) which share
+  one `Arc<Mutex<Connection>>` handle for zero-cost dispatch.
+- 60 non-substrate methods stay Postgres-only (verify, attestation,
+  federation_keys CRUD, revocations, cold-path PQC sweep, outbound
+  queue, ingest). Agent team explicitly deferred verify/attestation
+  pyo3-SQLite wraps to v1.0.1.
+
+**Typed Python exception hierarchy (CIRISAgent#755 sign-off)**
+
+- `PersistError(Exception)` base + 4 subclasses: `NotFound`,
+  `Conflict`, `Transient` (retryable — backend timeouts / pool
+  exhaustion), `Permanent` (don't-retry — validation, crypto, internal
+  bugs, hardware unavailable, not authorized).
+- Substrate `kind()` tokens (`secrets_not_found`, `audit_conflict`,
+  `telemetry_backend`, etc.) auto-translate to the right class via
+  `translate_error_kind()` on every backend-dispatched method.
+- Agent's `from ciris_persist import NotFound, Conflict, Transient,
+  Permanent` and `try: ... except NotFound: ...` patterns work directly.
+
+**Pipeline orchestrator (CIRISPersist#33 parts 1-2)**
+
+- `Pipeline` struct + `PipelineBuilder` + `Stage` / `ErasedStage`
+  traits (v0.7.5).
+- Four concrete stages (commit 5d92cc1, sub-agent's pipeline port):
+  - `ClassifyStage` — per-component classify matchers → outer-vec
+    of `Vec<ContentClassMatch>` (matcher catalog ships post-1.0.0).
+  - `ScrubStage` — `scrub::scrub_trace` redacts payload in-place;
+    `fields_modified` summed; `pii_scrubbed` flipped.
+  - `EncryptAndStoreStage<S>` — SecretsService transit-touch stub
+    (cleartext-capture deferred — `ContentClassMatch` doesn't yet
+    carry pre-scrub spans).
+  - `ExtractStage` — populates `state.features` from the first
+    CompleteTrace (v0.7.5).
+- Two direction-aware factories (CIRISAgent#756 concern #1):
+  - `default_inbound_pipeline(secrets, actor_id)` — Classify → Scrub
+    → EncryptAndStore → Extract. For network → agent ingest path.
+  - `default_outbound_pipeline()` — Classify + Scrub only (no
+    encrypt_and_store: outbound never stores secrets; no extract:
+    outbound isn't a corpus row). For agent SPEAK → network path.
+
+**Atomic-claim primitive (CIRISAgent#756 concern #2)**
+
+- `ClaimResult<R> { Stored(R), AlreadyClaimed(R) }` shared type;
+  re-exported via prelude.
+- `SecretsService::try_claim_secret(plaintext, ...)` — HMAC-SHA256
+  under active master key as the dedup hash. Race-safe via PG
+  `INSERT … ON CONFLICT DO NOTHING RETURNING` / SQLite `INSERT OR
+  IGNORE` + read-back-by-content-hmac. Master-key rotation is the
+  dedup boundary (rotation → same plaintext re-claims).
+- `AuditService::try_claim_event(content_hash, event, accessor)` —
+  caller-computed sha256 over canonical envelope bytes. Same
+  race-safe pattern; returns `AuditEventRef { entry_id, tenant_id,
+  sequence_number }`.
+- V017 migration (both dialects) adds the `content_hmac BLOB UNIQUE`
+  / `content_hash BYTEA UNIQUE` columns (nullable, NULLS-DISTINCT
+  UNIQUE on PG; partial unique index on SQLite).
+
+**Audit / telemetry shape locked-in from agent team verdicts**
+
+- **Q2 (action_type vocabulary)** — V018 migration adds `NOT VALID`
+  CHECK constraint on PG `cirislens.audit_log.action_type` with the
+  21-value vocabulary sourced from CIRISAgent's `AuditEventType`
+  enum (10 handler / 5 system / 6 wallet variants). Convention-only
+  on SQLite (`ALTER TABLE ADD CONSTRAINT CHECK` isn't supported).
+  Additive-only evolution committed in lockstep with agent.
+  New `AuditEventType` enum in `src/audit/types.rs` for typed callers.
+- **Q4 (graph-node side absorption)** — new
+  `AuditService::query_by_correlation_id(tenant, corr_id, filter)`.
+  Lets agent collapse the dual-write (hash-chain row + graph node
+  with correlation_id) to single-source. PG impl uses `payload @>
+  jsonb_build_object('correlation_id', $2)`; SQLite uses
+  `json_extract(payload, '$.correlation_id') = ?`.
+- **Q7 (4-tier consolidation)** — `ConsolidationLevel` enum (Basic
+  / Daily / Weekly / Monthly) on `TelemetryService::consolidate_
+  period(start, end, level)`. V019 migration adds `consolidation_
+  level TEXT NOT NULL DEFAULT 'basic'` column to `cirisgraph.nodes`
+  (tier-scoped TSDB summaries). Basic tier aggregates raw
+  observations; Daily/Weekly/Monthly aggregate prior-tier summaries.
+  Load-bearing for 4GB RAM target on Pi / sovereign deployments.
+
+**Documentation**
+
+- `docs/TELEMETRY_TAG_CONVENTIONS.md` — codifies CIRISAgent's
+  canonical telemetry tag keys (handler, action, path_type,
+  source_module, thought_id, service, model, api_base, metric_type,
+  service_name) as substrate vocabulary. Drops redundant
+  `tags["source"]` / `tags["timestamp"]`.
+
+### What's deferred to v1.0.1+ (NOT 2.9.0-blocking)
+
+- PyO3 SQLite wraps for verify / attestation / federation_keys /
+  steward signing. Agent already invokes these via persist prelude
+  (not pyo3) so 2.9.0 isn't blocked.
+- Pipeline pyo3 wraps (`engine.pipeline().run(envelope)` from
+  Python). Agent's 2.9.0 cutover plan (cirisgraph → audit/telemetry/
+  incident → secrets) doesn't reach pipeline orchestration.
+- Async-native pyo3 methods. Agent team explicitly OK'd
+  `asyncio.to_thread()` bridging if persist stays sync.
+- POST /api/v1/pipeline/ingest HTTP route + `FederatedSecretsClient`
+  (#33 parts 3-4) — Edge wire transport; not substrate.
+
+### Series-completion narrative
+
+| Bucket | Count | Status |
+|---|---|---|
+| Persist-bound, already absorbed (v0.9.4 Rust parity + v1.0.0 PyO3 SQLite) | 9 / 22 | ✓ |
+| Persist-bound, unblocked by #33 pipeline orchestrator (lands v1.0.0) | 2 / 22 | ✓ |
+| Stays at agent permanently (governance + lifecycle + LLM + host metrics) | 11 / 22 | by design |
+
+After 1.0.0, every CIRISAgent service the migration roadmap names as
+persist-bound is reachable from the wheel on every deployment
+platform. Subsequent persist work (v1.x) is verify/attestation pyo3
+parity, pipeline pyo3 wraps, Edge wire-transport (#33 parts 3-4),
+and the matcher catalog ship that fills in ClassifyStage's currently-
+stubbed output.
+
 ## [0.9.4] — 2026-05-14
 
 **NodeCoreService SQLite parity (closes CIRISPersist#40)** — the
