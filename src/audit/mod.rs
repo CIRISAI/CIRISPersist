@@ -47,7 +47,8 @@ pub mod verify;
 
 pub use service::AuditService;
 pub use types::{
-    AuditEntry, AuditEventRef, AuditFilter, AuditListPage, ChainVerification, ChainVerifyOutcome,
+    AuditEntry, AuditEventRef, AuditEventType, AuditFilter, AuditListPage, ChainVerification,
+    ChainVerifyOutcome, CorrelationQuery, CORRELATION_QUERY_MAX_LIMIT,
 };
 
 /// audit-layer errors.

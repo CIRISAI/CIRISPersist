@@ -24,7 +24,7 @@ use tokio::sync::Mutex;
 use super::service::AuditService;
 use super::types::{
     AuditCursor, AuditEntry, AuditEventRef, AuditFilter, AuditListPage, ChainBreakReason,
-    ChainVerification, ChainVerifyOutcome,
+    ChainVerification, ChainVerifyOutcome, CorrelationQuery, CORRELATION_QUERY_MAX_LIMIT,
 };
 use super::verify::{compute_entry_hash, verify_entry_signature};
 use super::{Error, GENESIS_PREV_HASH};
@@ -728,6 +728,65 @@ impl AuditService for SqliteAuditBackend {
         .await
         .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
     }
+
+    async fn query_by_correlation_id(
+        &self,
+        tenant_id: &str,
+        correlation_id: &str,
+        filter: CorrelationQuery,
+    ) -> Result<Vec<AuditEntry>, Error> {
+        if tenant_id.is_empty() {
+            return Err(Error::InvalidArgument(
+                "tenant_id is required (AV-51 — no cross-tenant reads)".into(),
+            ));
+        }
+        if correlation_id.is_empty() {
+            // See PG impl note — empty correlation_id is a defined
+            // no-op (returns empty Vec).
+            return Ok(Vec::new());
+        }
+        let limit = filter.limit.clamp(1, CORRELATION_QUERY_MAX_LIMIT) as i64;
+        let tenant_id = tenant_id.to_owned();
+        let correlation_id = correlation_id.to_owned();
+        let start = filter.time_window_start.map(fmt_datetime);
+        let end = filter.time_window_end.map(fmt_datetime);
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<AuditEntry>, Error> {
+            let guard = conn.blocking_lock();
+            // json_extract returns NULL when the key is absent and a
+            // TEXT value when present (payload is stored as TEXT JSON
+            // — see V014 SQLite). The equality compare against a
+            // non-empty TEXT ? handles missing-key rows correctly
+            // (NULL = '...' is NULL, filtered out).
+            let mut stmt = guard
+                .prepare(
+                    "SELECT entry_id, sequence_number, tenant_id, actor_id, \
+                            action_type, subject_kind, subject_id, payload, \
+                            prev_hash, entry_hash, recorded_at, signature \
+                     FROM cirislens_audit_log \
+                     WHERE tenant_id = ?1 \
+                       AND json_extract(payload, '$.correlation_id') = ?2 \
+                       AND (?3 IS NULL OR recorded_at >= ?3) \
+                       AND (?4 IS NULL OR recorded_at <= ?4) \
+                     ORDER BY recorded_at DESC, sequence_number DESC \
+                     LIMIT ?5",
+                )
+                .map_err(|e| map_sqlite_error(e, "query_by_correlation_id prepare"))?;
+            let rows_iter = stmt
+                .query_map(
+                    params![tenant_id, correlation_id, start, end, limit],
+                    |row| Ok(decode_entry_row(row)),
+                )
+                .map_err(|e| map_sqlite_error(e, "query_by_correlation_id query"))?;
+            let mut items = Vec::new();
+            for r in rows_iter {
+                items.push(r.map_err(|e| map_sqlite_error(e, "query_by_correlation_id row"))??);
+            }
+            Ok(items)
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+    }
 }
 
 #[cfg(test)]
@@ -995,5 +1054,105 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page.items.len(), 1, "exactly one audit row expected");
+    }
+
+    /// Build + sign an entry that carries a `correlation_id` in its
+    /// payload, used by the v1.0.0 query_by_correlation_id tests
+    /// (CIRISAgent#756 Q4 — graph-node side collapse into persist).
+    fn build_with_correlation(
+        key: &SigningKey,
+        tenant_id: &str,
+        sequence_number: i64,
+        prev_hash: Vec<u8>,
+        correlation_id: &str,
+    ) -> AuditEntry {
+        let mut entry = AuditEntry {
+            entry_id: Uuid::new_v4().to_string(),
+            sequence_number,
+            tenant_id: tenant_id.to_owned(),
+            actor_id: pubkey_b64(key),
+            action_type: "task_signed".into(),
+            subject_kind: "task".into(),
+            subject_id: format!("subj-{sequence_number}"),
+            payload: serde_json::json!({"correlation_id": correlation_id}),
+            prev_hash,
+            entry_hash: vec![],
+            recorded_at: truncate_to_micros(chrono::Utc::now()),
+            signature: String::new(),
+        };
+        let hash = compute_entry_hash(&entry).unwrap();
+        entry.entry_hash = hash.to_vec();
+        let canonical = crate::audit::verify::canonical_bytes_for_entry(&entry).unwrap();
+        let sig = key.sign(&canonical);
+        entry.signature = B64.encode(sig.to_bytes());
+        entry
+    }
+
+    /// v1.0.0 (CIRISAgent#756 Q4): `query_by_correlation_id` returns
+    /// only entries whose payload carries the matching correlation_id,
+    /// newest-first, tenant-scoped.
+    #[tokio::test]
+    async fn query_by_correlation_id() {
+        let (_b, audit) = fresh_backend().await;
+        let key = SigningKey::from_bytes(&[0xD4; 32]);
+        let tenant = format!("audit-corr-{}", Uuid::new_v4().simple());
+
+        // 3 entries on the same chain: corr-A, corr-A, corr-B.
+        let e1 = build_with_correlation(&key, &tenant, 1, GENESIS_PREV_HASH.to_vec(), "corr-A");
+        audit.record_entry(e1.clone()).await.unwrap();
+        // Force monotonic recorded_at ordering for the newest-first
+        // assertion (in-memory SQLite + microsecond truncation can
+        // collapse Utc::now() across rapid calls).
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let e2 = build_with_correlation(&key, &tenant, 2, e1.entry_hash.clone(), "corr-B");
+        audit.record_entry(e2.clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let e3 = build_with_correlation(&key, &tenant, 3, e2.entry_hash.clone(), "corr-A");
+        audit.record_entry(e3.clone()).await.unwrap();
+
+        // Query corr-A → 2 entries, newest-first (e3 then e1).
+        let hits = audit
+            .query_by_correlation_id(&tenant, "corr-A", CorrelationQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2, "expected 2 corr-A entries");
+        assert_eq!(hits[0].entry_id, e3.entry_id, "newest-first ordering");
+        assert_eq!(hits[1].entry_id, e1.entry_id);
+        for h in &hits {
+            assert_eq!(
+                h.payload.get("correlation_id").and_then(|v| v.as_str()),
+                Some("corr-A")
+            );
+        }
+
+        // Query corr-B → 1 entry.
+        let hits_b = audit
+            .query_by_correlation_id(&tenant, "corr-B", CorrelationQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(hits_b.len(), 1);
+        assert_eq!(hits_b[0].entry_id, e2.entry_id);
+
+        // Empty correlation_id → empty Vec (defined no-op).
+        let empty = audit
+            .query_by_correlation_id(&tenant, "", CorrelationQuery::default())
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
+
+        // Cross-tenant mismatch → empty Vec (AV-51).
+        let other_tenant = format!("other-tenant-{}", Uuid::new_v4().simple());
+        let cross = audit
+            .query_by_correlation_id(&other_tenant, "corr-A", CorrelationQuery::default())
+            .await
+            .unwrap();
+        assert!(cross.is_empty());
+
+        // Empty tenant_id rejects.
+        let no_tenant = audit
+            .query_by_correlation_id("", "corr-A", CorrelationQuery::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(no_tenant, Error::InvalidArgument(_)));
     }
 }

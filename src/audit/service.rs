@@ -20,6 +20,7 @@ use std::future::Future;
 
 use super::types::{
     AuditCursor, AuditEntry, AuditEventRef, AuditFilter, AuditListPage, ChainVerification,
+    CorrelationQuery,
 };
 use super::Error;
 use crate::ClaimResult;
@@ -107,5 +108,37 @@ pub trait AuditService: Send + Sync {
     ) -> impl Future<Output = Result<ClaimResult<AuditEventRef>, Error>> + Send {
         let _ = (content_hash, entry, accessor);
         async { Err(Error::NotImplemented("try_claim_event")) }
+    }
+
+    /// Read audit entries whose payload JSONB carries the given
+    /// `correlation_id`. Newest-first. Used by callers that need the
+    /// "what audit events relate to this correlation_id" trace —
+    /// previously served by the agent's graph-node side which is now
+    /// collapsed into persist (CIRISAgent#756 Q4, v1.0.0).
+    ///
+    /// Filter: `tenant_id` is required (AV-51 per-tenant isolation
+    /// invariant); `time_window_start` + `time_window_end` are
+    /// optional inclusive bounds; `limit` caps the result set
+    /// (default 100; clamped to `CORRELATION_QUERY_MAX_LIMIT` = 1000).
+    ///
+    /// Returns newest-first by `recorded_at` then `sequence_number`.
+    /// Empty `correlation_id` returns an empty Vec. Cross-tenant
+    /// `tenant_id` mismatches return an empty Vec (AV-51).
+    ///
+    /// # Default impl
+    ///
+    /// Returns [`Error::NotImplemented`] — backends opt in
+    /// explicitly. The PG impl uses `payload @> jsonb_build_object(
+    /// 'correlation_id', $2::text)` (index-friendly containment);
+    /// the SQLite impl uses `json_extract(payload,
+    /// '$.correlation_id') = ?`.
+    fn query_by_correlation_id(
+        &self,
+        tenant_id: &str,
+        correlation_id: &str,
+        filter: CorrelationQuery,
+    ) -> impl Future<Output = Result<Vec<AuditEntry>, Error>> + Send {
+        let _ = (tenant_id, correlation_id, filter);
+        async { Err(Error::NotImplemented("query_by_correlation_id")) }
     }
 }

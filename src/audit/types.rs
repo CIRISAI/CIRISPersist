@@ -143,6 +143,34 @@ pub struct ChainVerification {
     pub outcome: ChainVerifyOutcome,
 }
 
+/// Filter for [`super::AuditService::query_by_correlation_id`] (v1.0.0;
+/// CIRISAgent#756 Q4). Bounded time window + result cap. The default
+/// `limit` is 100; implementations cap at 1000.
+#[derive(Debug, Clone)]
+pub struct CorrelationQuery {
+    /// Optional inclusive lower bound on `recorded_at`.
+    pub time_window_start: Option<DateTime<Utc>>,
+    /// Optional inclusive upper bound on `recorded_at`.
+    pub time_window_end: Option<DateTime<Utc>>,
+    /// Result-set cap. Default 100; clamped to [1, 1000] by the impl.
+    pub limit: usize,
+}
+
+impl Default for CorrelationQuery {
+    fn default() -> Self {
+        Self {
+            time_window_start: None,
+            time_window_end: None,
+            limit: 100,
+        }
+    }
+}
+
+/// Maximum `limit` honored by [`super::AuditService::query_by_correlation_id`].
+/// Values above this cap are clamped, not rejected — caller-controlled
+/// page sizes are clamped to bound backend cost.
+pub const CORRELATION_QUERY_MAX_LIMIT: usize = 1000;
+
 /// Stable reference to an audit log row (v1.0.0; CIRISAgent#756 #2).
 ///
 /// Returned by [`super::AuditService::try_claim_event`] inside a
@@ -151,6 +179,131 @@ pub struct ChainVerification {
 /// natural key (UNIQUE on V014), `entry_id` is the global UUID.
 /// Callers attach downstream work to whichever of the three handles
 /// matches their addressing scheme.
+/// Canonical audit event type vocabulary (CIRISAgent#756 Q2).
+///
+/// 21 values across handler / system / wallet event classes. Sourced
+/// from CIRISAgent's `AuditEventType` enum (`ciris_engine/schemas/
+/// audit/core.py`); persist mirrors the wire-shape exactly so the
+/// agent's cutover can pass `action_type` strings through unchanged.
+///
+/// # Evolution
+///
+/// Additive-only per the agent team's commit on CIRISAgent#756.
+/// New values added by appending to this enum + (for Postgres
+/// deployments) `ALTER TABLE ... ADD CONSTRAINT` in a minor release;
+/// the agent commits to bumping vocab in lockstep.
+///
+/// # Why typed when the trait surface keeps `String`
+///
+/// `AuditEntry.action_type` is `String` to keep the substrate
+/// compatible with other consumers (CIRISLensCore / CIRISEdge
+/// writing their own audit envelopes with different vocab). This
+/// enum is a CONVENIENCE for callers that want compile-time
+/// vocab enforcement — call `.as_str()` to get the wire-shaped
+/// string for INSERT. Postgres deployments get additional DB-level
+/// enforcement via migration V018 (NOT VALID, so legacy rows skip);
+/// SQLite enforcement is convention-only for v1.0.0 (the table
+/// rebuild required for `ALTER TABLE ADD CHECK` is deferred — see
+/// the migration directory).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditEventType {
+    // Handler actions (10)
+    HandlerActionSpeak,
+    HandlerActionMemorize,
+    HandlerActionRecall,
+    HandlerActionForget,
+    HandlerActionTool,
+    HandlerActionDefer,
+    HandlerActionReject,
+    HandlerActionPonder,
+    HandlerActionObserve,
+    HandlerActionTaskComplete,
+
+    // System events (5)
+    SystemEvent,
+    SecurityEvent,
+    ConfigChange,
+    ServiceLifecycle,
+    ErrorEvent,
+
+    // Wallet events (6)
+    WalletFundsReceived,
+    WalletFundsSent,
+    WalletTransferFailed,
+    WalletSwapCompleted,
+    WalletSwapFailed,
+    WalletSecurityEvent,
+}
+
+impl AuditEventType {
+    /// Wire-shaped string. Matches CIRISAgent's `AuditEventType` enum
+    /// values + the Postgres V018 CHECK vocabulary.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HandlerActionSpeak => "handler_action_speak",
+            Self::HandlerActionMemorize => "handler_action_memorize",
+            Self::HandlerActionRecall => "handler_action_recall",
+            Self::HandlerActionForget => "handler_action_forget",
+            Self::HandlerActionTool => "handler_action_tool",
+            Self::HandlerActionDefer => "handler_action_defer",
+            Self::HandlerActionReject => "handler_action_reject",
+            Self::HandlerActionPonder => "handler_action_ponder",
+            Self::HandlerActionObserve => "handler_action_observe",
+            Self::HandlerActionTaskComplete => "handler_action_task_complete",
+            Self::SystemEvent => "system_event",
+            Self::SecurityEvent => "security_event",
+            Self::ConfigChange => "config_change",
+            Self::ServiceLifecycle => "service_lifecycle",
+            Self::ErrorEvent => "error_event",
+            Self::WalletFundsReceived => "wallet_funds_received",
+            Self::WalletFundsSent => "wallet_funds_sent",
+            Self::WalletTransferFailed => "wallet_transfer_failed",
+            Self::WalletSwapCompleted => "wallet_swap_completed",
+            Self::WalletSwapFailed => "wallet_swap_failed",
+            Self::WalletSecurityEvent => "wallet_security_event",
+        }
+    }
+
+    /// Parse from the wire-shaped string. Returns `None` for any
+    /// value outside the canonical vocabulary. Use at the persist
+    /// API boundary when typed enforcement matters; the trait
+    /// surface keeps `String` for compatibility with non-agent
+    /// consumers.
+    pub fn from_wire_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "handler_action_speak" => Self::HandlerActionSpeak,
+            "handler_action_memorize" => Self::HandlerActionMemorize,
+            "handler_action_recall" => Self::HandlerActionRecall,
+            "handler_action_forget" => Self::HandlerActionForget,
+            "handler_action_tool" => Self::HandlerActionTool,
+            "handler_action_defer" => Self::HandlerActionDefer,
+            "handler_action_reject" => Self::HandlerActionReject,
+            "handler_action_ponder" => Self::HandlerActionPonder,
+            "handler_action_observe" => Self::HandlerActionObserve,
+            "handler_action_task_complete" => Self::HandlerActionTaskComplete,
+            "system_event" => Self::SystemEvent,
+            "security_event" => Self::SecurityEvent,
+            "config_change" => Self::ConfigChange,
+            "service_lifecycle" => Self::ServiceLifecycle,
+            "error_event" => Self::ErrorEvent,
+            "wallet_funds_received" => Self::WalletFundsReceived,
+            "wallet_funds_sent" => Self::WalletFundsSent,
+            "wallet_transfer_failed" => Self::WalletTransferFailed,
+            "wallet_swap_completed" => Self::WalletSwapCompleted,
+            "wallet_swap_failed" => Self::WalletSwapFailed,
+            "wallet_security_event" => Self::WalletSecurityEvent,
+            _ => return None,
+        })
+    }
+}
+
+impl std::fmt::Display for AuditEventType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditEventRef {
     /// `cirislens.audit_log.entry_id` (UUID v4, 36-char hyphenated).

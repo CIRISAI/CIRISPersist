@@ -10,7 +10,7 @@
 use super::service::AuditService;
 use super::types::{
     AuditCursor, AuditEntry, AuditEventRef, AuditFilter, AuditListPage, ChainBreakReason,
-    ChainVerification, ChainVerifyOutcome,
+    ChainVerification, ChainVerifyOutcome, CorrelationQuery, CORRELATION_QUERY_MAX_LIMIT,
 };
 use super::verify::{compute_entry_hash, verify_entry_signature};
 use super::{Error, GENESIS_PREV_HASH};
@@ -723,6 +723,68 @@ impl AuditService for PostgresBackend {
             .map_err(|e| Error::Backend(format!("commit: {e}")))?;
         Ok(result)
     }
+
+    async fn query_by_correlation_id(
+        &self,
+        tenant_id: &str,
+        correlation_id: &str,
+        filter: CorrelationQuery,
+    ) -> Result<Vec<AuditEntry>, Error> {
+        if tenant_id.is_empty() {
+            return Err(Error::InvalidArgument(
+                "tenant_id is required (AV-51 — no cross-tenant reads)".into(),
+            ));
+        }
+        if correlation_id.is_empty() {
+            // Empty correlation_id is a defined no-op: returning rows
+            // would either be all-rows-with-the-key (high cost) or
+            // rows-where-the-key-is-empty-string (caller bug bait).
+            // Empty Vec is the unambiguous answer.
+            return Ok(Vec::new());
+        }
+        let limit = filter.limit.clamp(1, CORRELATION_QUERY_MAX_LIMIT) as i64;
+
+        // payload @> jsonb_build_object('correlation_id', $2::text)
+        // is the index-friendly containment query — a GIN index on
+        // (payload jsonb_path_ops) would accelerate it. None exists
+        // on V014 yet; if this query lands on the hot path, add one
+        // in a follow-up migration.
+        let needle = serde_json::json!({"correlation_id": correlation_id});
+
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let rows = client
+            .query(
+                "SELECT entry_id, sequence_number, tenant_id, actor_id, \
+                        action_type, subject_kind, subject_id, payload, \
+                        prev_hash, entry_hash, recorded_at, signature \
+                 FROM cirislens.audit_log \
+                 WHERE tenant_id = $1 \
+                   AND payload @> $2::jsonb \
+                   AND ($3::timestamptz IS NULL OR recorded_at >= $3) \
+                   AND ($4::timestamptz IS NULL OR recorded_at <= $4) \
+                 ORDER BY recorded_at DESC, sequence_number DESC \
+                 LIMIT $5",
+                &[
+                    &tenant_id,
+                    &needle,
+                    &filter.time_window_start,
+                    &filter.time_window_end,
+                    &limit,
+                ],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "query_by_correlation_id"))?;
+
+        let mut items: Vec<AuditEntry> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            items.push(decode_entry_row(row)?);
+        }
+        Ok(items)
+    }
 }
 
 #[cfg(test)]
@@ -917,5 +979,102 @@ mod tests {
             }
             other => panic!("expected Break on tampered entry, got {other:?}"),
         }
+    }
+
+    /// Build + sign an entry whose payload carries a `correlation_id`.
+    /// v1.0.0 (CIRISAgent#756 Q4).
+    fn build_with_correlation(
+        key: &SigningKey,
+        tenant_id: &str,
+        sequence_number: i64,
+        prev_hash: Vec<u8>,
+        correlation_id: &str,
+    ) -> AuditEntry {
+        let mut entry = AuditEntry {
+            entry_id: Uuid::new_v4().to_string(),
+            sequence_number,
+            tenant_id: tenant_id.to_owned(),
+            actor_id: pubkey_b64(key),
+            action_type: "task_signed".into(),
+            subject_kind: "task".into(),
+            subject_id: format!("subj-{sequence_number}"),
+            payload: serde_json::json!({"correlation_id": correlation_id}),
+            prev_hash,
+            entry_hash: vec![],
+            recorded_at: super::super::verify::truncate_to_micros(Utc::now()),
+            signature: String::new(),
+        };
+        let hash = compute_entry_hash(&entry).unwrap();
+        entry.entry_hash = hash.to_vec();
+        let canonical = super::super::verify::canonical_bytes_for_entry(&entry).unwrap();
+        let sig = key.sign(&canonical);
+        entry.signature = B64.encode(sig.to_bytes());
+        entry
+    }
+
+    /// v1.0.0 (CIRISAgent#756 Q4) — `query_by_correlation_id` returns
+    /// only entries whose payload JSONB contains the matching
+    /// `correlation_id`, newest-first, tenant-scoped (AV-51).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn query_by_correlation_id_round_trip() {
+        use crate::audit::CorrelationQuery;
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let key = SigningKey::from_bytes(&[0xD4; 32]);
+        let tenant = format!("audit-corr-{}", Uuid::new_v4().simple());
+
+        // 3 entries on the same chain: corr-A, corr-B, corr-A.
+        let e1 = build_with_correlation(&key, &tenant, 1, GENESIS_PREV_HASH.to_vec(), "corr-A");
+        backend.record_entry(e1.clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let e2 = build_with_correlation(&key, &tenant, 2, e1.entry_hash.clone(), "corr-B");
+        backend.record_entry(e2.clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let e3 = build_with_correlation(&key, &tenant, 3, e2.entry_hash.clone(), "corr-A");
+        backend.record_entry(e3.clone()).await.unwrap();
+
+        // Query corr-A → 2 entries, newest-first (e3 then e1).
+        let hits = backend
+            .query_by_correlation_id(&tenant, "corr-A", CorrelationQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2, "expected 2 corr-A entries");
+        assert_eq!(hits[0].entry_id, e3.entry_id, "newest-first ordering");
+        assert_eq!(hits[1].entry_id, e1.entry_id);
+        for h in &hits {
+            assert_eq!(
+                h.payload.get("correlation_id").and_then(|v| v.as_str()),
+                Some("corr-A")
+            );
+        }
+
+        // Empty correlation_id → empty Vec (defined no-op).
+        let empty = backend
+            .query_by_correlation_id(&tenant, "", CorrelationQuery::default())
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
+
+        // Cross-tenant mismatch → empty Vec (AV-51).
+        let other = format!("other-tenant-{}", Uuid::new_v4().simple());
+        let cross = backend
+            .query_by_correlation_id(&other, "corr-A", CorrelationQuery::default())
+            .await
+            .unwrap();
+        assert!(cross.is_empty());
+
+        // Empty tenant_id rejects.
+        let no_tenant = backend
+            .query_by_correlation_id("", "corr-A", CorrelationQuery::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(no_tenant, Error::InvalidArgument(_)));
     }
 }
