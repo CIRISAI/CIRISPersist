@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778776819514,
+  "lastUpdate": 1778779724103,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -13217,6 +13217,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23638462,
             "range": "± 167589",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "87355aff2f33f25423cb17ec258bae391717c3d4",
+          "message": "0.9.4 — cirisnode SQLite parity (closes #40)\n\nFinal SQLite parity piece for the v0.6.1+ substrate. Decouple\n`cirisnode` feature from `postgres`; pair with either backend.\n\n- migrations/sqlite/lens/V011 — 7-table federation-consensus\n  schema (contributions, votes, credits/expertise ledgers,\n  moderation, slashing, reconsideration request + attestation)\n  with the same audit envelope shape as Postgres V011.\n- migrations/sqlite/lens/V012 — promotion attestation table\n  (#32); target_ids UUID[] → TEXT JSON-array; reverse-lookup uses\n  json_each() instead of the Postgres GIN.\n- src/cirisnode/sqlite.rs — SqliteNodeCoreBackend impl of all 14\n  NodeCoreService methods (8 typed-writes + 5 reads +\n  put_promotion_attestation). Per-call spawn_blocking on the\n  shared Arc<Mutex<Connection>> handle; BEGIN IMMEDIATE replaces\n  SELECT … FOR UPDATE for put_promotion_attestation's transactional\n  INSERT-attestation + UPDATE-N-targets + verify-total-affected\n  + rollback-on-mismatch path.\n\nSignature-verify invariant unchanged: src/cirisnode/verify.rs is\nshared by both backends. No duplication; no divergence.\n\nTests: cirisnode::sqlite::tests::cirisnode_sqlite_round_trip_full_\nlifecycle exercises all 14 methods + the promotion-attestation\ntransactional path with a rollback sub-test. 13/13 cirisnode tests\npass with --features \"cirisnode sqlite\"; no regression with\n\"cirisnode postgres\" or both.\n\nSeries completion: every CIRISAgent service in the persist-bound\nset (Memory/Config/Audit/Telemetry/TSDB/IncidentMgmt/Secrets/\nSecretsToolService) now has full Postgres + SQLite parity. Server,\nsovereign-mode, Pi, iOS — all platforms supported.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-14T12:20:18-05:00",
+          "tree_id": "6698d0737d4151450584647100b37db83d9231a1",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/87355aff2f33f25423cb17ec258bae391717c3d4"
+        },
+        "date": 1778779722832,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 102140,
+            "range": "± 859",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 242954,
+            "range": "± 1086",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 526243,
+            "range": "± 6033",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1853055,
+            "range": "± 8700",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 342,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1477,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7587,
+            "range": "± 758",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21332,
+            "range": "± 82",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24350,
+            "range": "± 66",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83729,
+            "range": "± 162",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 363,
+            "range": "± 22",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3167,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9471,
+            "range": "± 33",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41719,
+            "range": "± 172",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2270150,
+            "range": "± 61471",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6670094,
+            "range": "± 162490",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23966246,
+            "range": "± 227082",
             "unit": "ns/iter"
           }
         ]
