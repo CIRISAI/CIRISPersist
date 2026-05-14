@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778779724103,
+  "lastUpdate": 1778802287278,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -13349,6 +13349,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23966246,
             "range": "± 227082",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "d8b467b05c989d49952fa2383ddb0e6dc65d275a",
+          "message": "fix(V019): drop nested BEGIN/COMMIT + TIMESTAMPTZ cast in index expr\n\nPre-push hook caught two issues in V019 as written:\n\n1. `((attributes->>'period_start')::timestamptz)` in the expression\n   index — TIMESTAMPTZ cast from text is STABLE (depends on session\n   timezone), not IMMUTABLE. PG rejects STABLE functions in index\n   expressions (SQLSTATE 42P17). Canonical RFC 3339 strings sort\n   lexicographically the same way TIMESTAMPTZ does when the offset\n   is normalized (Z or +HH:MM) — which is how persist always emits\n   them via `fmt_datetime`. Dropping the cast keeps the index TEXT-\n   typed and immutable.\n\n2. Explicit `BEGIN; ... COMMIT;` wrap — refinery wraps each migration\n   in its own transaction; the nested wrap interacts poorly with\n   tokio-postgres's expression-index parsing path (the second\n   statement parses in a context where the prior ALTER's column-add\n   hasn't \"committed\" within refinery's outer tx, so the expression\n   index sees a partially-resolved column reference and the\n   IMMUTABLE check fires). Letting refinery's own tx handle atomicity\n   sidesteps the issue.\n\nVerified: fresh-DB migration sweep clean; 38/38 read_section tests\npass with --features \"postgres,pyo3,server\".\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-14T18:36:29-05:00",
+          "tree_id": "7a495b604fdcb2f075991373b5ce6298656aa915",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/d8b467b05c989d49952fa2383ddb0e6dc65d275a"
+        },
+        "date": 1778802286111,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 95647,
+            "range": "± 185",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 237628,
+            "range": "± 1083",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 520246,
+            "range": "± 7184",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1941787,
+            "range": "± 20509",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 309,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1226,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7259,
+            "range": "± 76",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 20579,
+            "range": "± 395",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 23973,
+            "range": "± 78",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 88443,
+            "range": "± 172",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 317,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3329,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9908,
+            "range": "± 31",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 44204,
+            "range": "± 95",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 538,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2110026,
+            "range": "± 60922",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6513073,
+            "range": "± 114226",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23592600,
+            "range": "± 440088",
             "unit": "ns/iter"
           }
         ]
