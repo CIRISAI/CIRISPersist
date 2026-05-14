@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778722208934,
+  "lastUpdate": 1778776819514,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -13085,6 +13085,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23515983,
             "range": "± 306526",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "12283341960852233bf0ec3c6fe22db9841b9cd2",
+          "message": "0.9.3 — SecretsService SQLite parity (closes #39)\n\nDecouple `secrets` feature from `postgres`: enable secrets alongside\neither backend (or both). Crypto facade + key cache + trait are\nbackend-agnostic; only the storage adapter changes.\n\n- migrations/sqlite/lens/V010 — 5-table schema with BYTEA→BLOB,\n  JSONB→TEXT JSON, TEXT[]→TEXT JSON-array, UUID→TEXT 36-char,\n  TIMESTAMPTZ→RFC 3339, BIGSERIAL→INTEGER AUTOINCREMENT.\n- src/secrets/key_cache.rs — process-static software master-key\n  cache extracted from postgres.rs so both backends share it.\n- src/secrets/sqlite.rs — SqliteSecretsBackend impl of all 18\n  SecretsService methods. Per-call spawn_blocking around the shared\n  Arc<Mutex<Connection>> handle; BEGIN IMMEDIATE replaces SELECT …\n  FOR UPDATE for reencrypt_all rotation; every method writes its\n  access-log row before returning (audit invariant matches Postgres\n  1:1). process_incoming_text / decapsulate_secrets_in_parameters\n  stub to Internal (deferred to v0.6.2 pipeline); migrate_to_\n  hardware_key returns HardwareKeyUnavailable (waits on\n  ciris-keyring/symmetric-derivation upstream) — same shape as the\n  v0.6.1-α5 Postgres stubs.\n\nCrypto invariant (FSD §7.5a) unchanged: src/secrets/crypto.rs\nremains the sole ciris-crypto import site; persist takes zero direct\nprimitive deps. The SQLite impl routes through that facade byte-\nfor-byte identically to Postgres.\n\nTests: secrets::sqlite::tests::secrets_sqlite_round_trip_full_\nlifecycle exercises 13 phases against an in-memory SQLite. 18/18\nsecrets tests pass with --features \"secrets sqlite\"; no regression\nwith --features \"secrets postgres\" or both.\n\nNOT tagged: CIRISRegistry#13 (HTTP 500 on /v1/builds POST for\nciris-persist) still blocks the v0.9.2 publish workflow; v0.9.3\nlands on main now so downstream consumers can read source. Tag +\nPyPI publish follow once registry unblocks.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-13T20:50:38-05:00",
+          "tree_id": "5cfe7cf08f21f9978e9c069b1c7eea4ef0dd6034",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/12283341960852233bf0ec3c6fe22db9841b9cd2"
+        },
+        "date": 1778776819043,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101517,
+            "range": "± 785",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 241881,
+            "range": "± 738",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 523448,
+            "range": "± 1747",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1848994,
+            "range": "± 12657",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 340,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1500,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7843,
+            "range": "± 102",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21096,
+            "range": "± 41",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24140,
+            "range": "± 56",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83466,
+            "range": "± 585",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 370,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3106,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9552,
+            "range": "± 31",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41731,
+            "range": "± 169",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 631,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2212569,
+            "range": "± 42377",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6544620,
+            "range": "± 93195",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23638462,
+            "range": "± 167589",
             "unit": "ns/iter"
           }
         ]
