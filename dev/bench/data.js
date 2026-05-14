@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778802287278,
+  "lastUpdate": 1778802776393,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -13481,6 +13481,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23592600,
             "range": "± 440088",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "6179fa678d25e350ad3b991e4f9960ad6c5eb8be",
+          "message": "1.0.1 — first publishable wheel of the 1.x series\n\nv1.0.0 tag CI hit two issues that gated wheel publish:\n- V019 nested BEGIN/COMMIT + ::timestamptz cast (SQLSTATE 42P17)\n- av26 hardcoded migration-count assertion (16 → 19)\n\nBoth fixed in d8b467b + 6310577. This bump promotes those onto the\n1.x tag track. No surface or behavioral changes from v1.0.0; same\nsubstrate-completion cut.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-14T18:45:28-05:00",
+          "tree_id": "9d606dc7ff26cba66db6a90753555613cf3a2f98",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/6179fa678d25e350ad3b991e4f9960ad6c5eb8be"
+        },
+        "date": 1778802775909,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 113997,
+            "range": "± 1318",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 264345,
+            "range": "± 874",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 562577,
+            "range": "± 7830",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1985441,
+            "range": "± 10084",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 329,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1363,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 6623,
+            "range": "± 62",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23177,
+            "range": "± 51",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26418,
+            "range": "± 186",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91066,
+            "range": "± 180",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 370,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3102,
+            "range": "± 37",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9816,
+            "range": "± 146",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42634,
+            "range": "± 727",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2254313,
+            "range": "± 78865",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7013425,
+            "range": "± 165504",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25837847,
+            "range": "± 240996",
             "unit": "ns/iter"
           }
         ]
