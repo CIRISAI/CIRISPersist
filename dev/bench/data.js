@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778718603821,
+  "lastUpdate": 1778722208934,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -12953,6 +12953,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23787156,
             "range": "± 1430161",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "940f000b92ea6561af279187181ca1c8a4ce7412",
+          "message": "0.9.2 — multi-target build registration via ciris-build-sign register (closes #42)\n\nPersist's CI now signs FOUR per-target BuildManifests + registers\nthem as a single CanonicalBuild v2 row (CIRISVerify v2.0.3+),\nunblocking verify_tree(project=\"ciris-persist\", target=...) for\nevery deployment class — including iOS + Android consumers that\nrebuild persist's Rust from source and verify the Python wrapper\ntree.\n\nCI changes:\n\n- ciris-build-sign tarball: v1.8.0 → v2.0.5. Brings the `register`\n  subcommand + CanonicalBuild v2 multi-target shape.\n\n- Four manifests signed per release (was one):\n  * python-source-tree: file-tree hash of python/ciris_persist/\n    (.py + .pyi only). Covers what iOS / Android agents walk\n    when they verify persist's installed Python wrappers.\n  * x86_64-unknown-linux-gnu: binary_hash = sha256(linux x86_64 wheel)\n  * aarch64-unknown-linux-gnu: binary_hash = sha256(linux aarch64 wheel)\n  * aarch64-apple-darwin: binary_hash = sha256(macOS arm64 wheel)\n\n- ciris-build-sign register replaces the custom curl POST to\n  /v1/verify/binary-manifest. Writes the `builds` parent row signed\n  over all per-target manifest hashes + per-target binary_manifests\n  (binary mode) + function_manifests (source-tree mode) rows to\n  /v1/builds.\n\n- Round-trip verify updated to GET /v1/builds/<v>?project=ciris-persist\n  for the parent row + per-target ?target=<name> GETs for every\n  signed target. Fails the build if any target's round-trip fails.\n\nWhy iOS + Android needed this:\n\npip install ciris-persist doesn't work on iOS/Android (no wheels).\nAgents on those platforms embed the persist Python wrappers via\nPyOxidizer/Buildozer and rebuild persist's Rust from source. Without\na registered python-source-tree manifest, verify_tree returns\nregistry_error / valid=false. v0.9.2 closes that gap.\n\nLibrary / wheel surface unchanged. No code changes; trait surfaces,\nFFI shapes, wire formats, and the published wheel contents are\nbyte-for-byte identical to v0.9.1. Only the CI registration shape\nchanged.\n\nTests: 349/349 lib pass against live ciris-qa-postgres + in-memory\nSQLite. YAML parse check on the rewritten workflow passes. The\nregister / round-trip flow only validates end-to-end against the\nlive CIRISRegistry in tag CI; the tag CI run is the integration\ngate.\n\nCloses CIRISPersist#42.\nReferences CIRISVerify#8 (CanonicalBuild v2, v2.0.3) + v2.0.5\nrelease for the register subcommand.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-13T20:21:49-05:00",
+          "tree_id": "ecd6ab9f94a7e3c023d7f9ece2b24adb0b0677c5",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/940f000b92ea6561af279187181ca1c8a4ce7412"
+        },
+        "date": 1778722207676,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 95632,
+            "range": "± 600",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 237842,
+            "range": "± 400",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 520476,
+            "range": "± 4028",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1946724,
+            "range": "± 29244",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 304,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1216,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 6844,
+            "range": "± 42",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 20554,
+            "range": "± 293",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 23946,
+            "range": "± 59",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 88386,
+            "range": "± 324",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 327,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3259,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 10181,
+            "range": "± 86",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 45783,
+            "range": "± 253",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 606,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2056564,
+            "range": "± 62950",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6321440,
+            "range": "± 125834",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23515983,
+            "range": "± 306526",
             "unit": "ns/iter"
           }
         ]
