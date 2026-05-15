@@ -88,6 +88,24 @@ pub enum IngestError {
     /// §3.4 #7 contract is "every row signed."
     #[error("sign: {0}")]
     Sign(String),
+
+    /// v1.1.0 (CIRISPersist#33 part 3) — `PipelineEnvelope` failed one
+    /// of the FSD §4.3 wire-shape / consistency invariants. Lens →
+    /// HTTP 422. Each invariant carries a stable kind token so
+    /// downstream consumers can distinguish "edge dropped the scrub
+    /// stage" from "edge shipped orphan encrypted secrets" without
+    /// string-parsing the detail blob.
+    #[error("pipeline invariant {kind}: {detail}")]
+    PipelineInvariant {
+        /// Stable token identifying WHICH invariant fired. See
+        /// [`IngestError::kind`] for the full enumeration. Mirrors
+        /// the rest of persist's error-token convention
+        /// (THREAT_MODEL.md AV-15).
+        kind: &'static str,
+        /// Human-readable detail (closed-set / operator-configurable;
+        /// never raw user-payload bytes).
+        detail: String,
+    },
 }
 
 impl IngestError {
@@ -102,6 +120,7 @@ impl IngestError {
             IngestError::Scrub(e) => e.kind(),
             IngestError::Store(e) => e.kind(),
             IngestError::Sign(_) => "sign_keyring",
+            IngestError::PipelineInvariant { kind, .. } => kind,
         }
     }
 
@@ -126,6 +145,7 @@ impl IngestError {
     pub fn detail(&self) -> Option<String> {
         match self {
             IngestError::Schema(e) => e.detail(),
+            IngestError::PipelineInvariant { detail, .. } => Some(detail.clone()),
             IngestError::Verify(_)
             | IngestError::Scrub(_)
             | IngestError::Store(_)

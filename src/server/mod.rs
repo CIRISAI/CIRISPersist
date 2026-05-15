@@ -30,16 +30,59 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
+use crate::federation::FederationDirectory;
 use crate::journal::Journal;
 use crate::queue::{IngestHandle, QueueError};
+use crate::store::Backend;
+
+pub mod pipeline;
 
 /// Server state shared across handlers.
-#[derive(Clone)]
-pub struct AppState {
+///
+/// # Type parameter `F`
+///
+/// v1.1.0 (CIRISPersist#33 part 3) introduced the `F: FederationDirectory`
+/// type parameter so the `POST /api/v1/pipeline/ingest` route can call
+/// `verify_hybrid_via_directory` against whichever concrete backend the
+/// deployment composed (memory / postgres / sqlite). The
+/// `FederationDirectory` trait uses Rust 1.75+ `async fn in trait`
+/// (`impl Future + Send` return-position syntax) which is NOT
+/// object-safe, so we can't hide it behind `Arc<dyn _>`. Composing the
+/// server pins a concrete backend, mirroring the `BackendDispatch`
+/// shape on [`crate::Engine`].
+///
+/// Callers that don't need the new route can use any `F` —
+/// `MemoryBackend` for tests is the conventional choice.
+pub struct AppState<F>
+where
+    F: FederationDirectory + Backend + 'static,
+{
     /// Producer-side handle into the bounded ingest queue.
     pub handle: IngestHandle,
     /// Shared local journal for outage tolerance (FSD §3.4 #2).
     pub journal: Arc<Journal>,
+    /// v1.1.0 (CIRISPersist#33 part 3) — federation directory used by
+    /// the pipeline ingest route to look up the edge's hybrid pubkey
+    /// pair for signature verification. Same directory the legacy
+    /// trace-verify path consults (`Backend::lookup_public_key`)
+    /// inside the persister — mission constraint MISSION.md §3
+    /// anti-pattern #3: one path for key lookup.
+    pub directory: Arc<F>,
+}
+
+// Manual `Clone` impl — derive would require `F: Clone`, but we only
+// need `Arc<F>` to clone and `IngestHandle` is already `Clone`.
+impl<F> Clone for AppState<F>
+where
+    F: FederationDirectory + Backend + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            handle: self.handle.clone(),
+            journal: self.journal.clone(),
+            directory: self.directory.clone(),
+        }
+    }
 }
 
 /// Maximum body size for `POST /api/v1/accord/events`.
@@ -54,10 +97,22 @@ pub const MAX_INGEST_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 /// Build the axum router with the Phase-1 endpoints. Caller is
 /// responsible for binding the listener and serving.
-pub fn router(state: AppState) -> Router {
+///
+/// v1.1.0 (CIRISPersist#33 part 3) — generic over `F: FederationDirectory`
+/// so the `POST /api/v1/pipeline/ingest` route can verify the edge
+/// signature against whichever concrete backend the deployment composed
+/// (memory / postgres / sqlite). See [`AppState`] for the rationale.
+pub fn router<F>(state: AppState<F>) -> Router
+where
+    F: FederationDirectory + Backend + 'static,
+{
     Router::new()
-        .route("/api/v1/accord/events", post(post_events))
-        .route("/health", get(get_health))
+        .route("/api/v1/accord/events", post(post_events::<F>))
+        .route(
+            "/api/v1/pipeline/ingest",
+            post(pipeline::post_pipeline_ingest::<F>),
+        )
+        .route("/health", get(get_health::<F>))
         .layer(DefaultBodyLimit::max(MAX_INGEST_BODY_BYTES))
         .with_state(state)
 }
@@ -92,7 +147,10 @@ pub struct HealthOwned {
     pub schema_versions_supported: Vec<String>,
 }
 
-async fn get_health(State(state): State<AppState>) -> impl IntoResponse {
+async fn get_health<F>(State(state): State<AppState<F>>) -> impl IntoResponse
+where
+    F: FederationDirectory + Backend + 'static,
+{
     let pending = state.journal.pending_count().unwrap_or(0);
     Json(Health {
         status: "ok",
@@ -108,7 +166,10 @@ async fn get_health(State(state): State<AppState>) -> impl IntoResponse {
 /// channel; the persister task is the single consumer that does
 /// schema/verify/scrub/decompose/store. Mission constraint: 429 on
 /// full queue, never silent drop.
-async fn post_events(State(state): State<AppState>, body: axum::body::Bytes) -> Response {
+async fn post_events<F>(State(state): State<AppState<F>>, body: axum::body::Bytes) -> Response
+where
+    F: FederationDirectory + Backend + 'static,
+{
     // We *could* parse + verify here on the request thread before
     // queuing, to fail-fast on malformed bodies. Phase 1 keeps the
     // handler thin: queue first, persister handles the typed
@@ -209,7 +270,14 @@ mod tests {
         // Detach the persister handle from the test's lifetime;
         // graceful-shutdown coverage lives in queue::tests.
         std::mem::forget(persister);
-        (router(AppState { handle, journal }), backend)
+        (
+            router(AppState {
+                handle,
+                journal,
+                directory: backend.clone(),
+            }),
+            backend,
+        )
     }
 
     /// Mission category §4 "Backpressure": the agent's POST flow

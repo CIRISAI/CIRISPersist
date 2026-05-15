@@ -1098,12 +1098,16 @@ impl PyEngine {
                     );
                     match e {
                         // Schema / verify / scrub → ValueError (caller-fault; 4xx).
-                        IngestError::Schema(_) | IngestError::Verify(_) | IngestError::Scrub(_) => {
-                            Err(match detail {
-                                Some(d) => PyValueError::new_err((kind, d)),
-                                None => PyValueError::new_err(kind),
-                            })
-                        }
+                        // v1.1.0 (CIRISPersist#33 part 3) — PipelineInvariant
+                        // is also caller-fault (FSD §4.3 shape violation
+                        // signalled by the edge); maps to lens-side HTTP 422.
+                        IngestError::Schema(_)
+                        | IngestError::Verify(_)
+                        | IngestError::Scrub(_)
+                        | IngestError::PipelineInvariant { .. } => Err(match detail {
+                            Some(d) => PyValueError::new_err((kind, d)),
+                            None => PyValueError::new_err(kind),
+                        }),
                         // Store / Sign → RuntimeError (server-fault; 5xx).
                         // AV-25: signing failure is operator-side
                         // (keyring locked, hardware unavailable, etc.) —

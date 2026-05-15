@@ -51,6 +51,26 @@ struct Job {
     /// (mission constraint MISSION.md §2 — `verify/`: round-trip
     /// preserves the agent's testimony byte-for-byte).
     bytes: Vec<u8>,
+    /// v1.1.0 (CIRISPersist#33 part 3) — optional pipeline sidecar
+    /// attached by the edge-side `POST /api/v1/pipeline/ingest`
+    /// route. The sidecar carries pre-computed classify / extract /
+    /// encrypt-and-store outputs from a federation-internal edge so
+    /// the persister can skip re-running those stages (they were
+    /// signed-for by the edge under the FSD §4.3 invariants).
+    ///
+    /// `None` for the legacy `POST /api/v1/accord/events` path; the
+    /// persister runs its own in-process pipeline in that case. The
+    /// route handler is responsible for verifying the edge signature
+    /// and every FSD §4.3 invariant BEFORE submitting a sidecar-
+    /// bearing job; the persister TRUSTS the sidecar.
+    ///
+    /// Persister-side consumption of the sidecar (writing
+    /// classifications / features / encrypted_secrets rows in the
+    /// same transaction as the BatchEnvelope decompose) is a
+    /// follow-up — for now the sidecar is plumbed through and logged
+    /// at debug level. See `src/server/pipeline.rs` doc comment.
+    #[cfg(feature = "server")]
+    sidecar: Option<crate::pipeline::types::PipelineSidecar>,
 }
 
 /// Producer handle returned by [`spawn_persister`].
@@ -67,7 +87,41 @@ impl IngestHandle {
     /// Try to submit a batch. Non-blocking. On `QueueError::Full`,
     /// caller responds 429 with Retry-After.
     pub fn try_submit(&self, bytes: Vec<u8>) -> Result<(), QueueError> {
-        match self.tx.try_send(Job { bytes }) {
+        let job = Job {
+            bytes,
+            #[cfg(feature = "server")]
+            sidecar: None,
+        };
+        match self.tx.try_send(job) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Err(QueueError::Full),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(QueueError::Closed),
+        }
+    }
+
+    /// v1.1.0 (CIRISPersist#33 part 3) — submit a batch with an
+    /// attached [`crate::pipeline::types::PipelineSidecar`].
+    ///
+    /// Used by the `POST /api/v1/pipeline/ingest` route after the
+    /// route handler has verified the edge signature + every FSD §4.3
+    /// invariant. The sidecar carries pre-computed classify / extract
+    /// / encrypt-and-store outputs from the edge; the persister
+    /// trusts the sidecar and skips re-running those stages.
+    ///
+    /// Backpressure shape is identical to [`Self::try_submit`]:
+    /// non-blocking, `QueueError::Full` on saturation, `Closed` after
+    /// shutdown.
+    #[cfg(feature = "server")]
+    pub fn try_submit_with_sidecar(
+        &self,
+        bytes: Vec<u8>,
+        sidecar: crate::pipeline::types::PipelineSidecar,
+    ) -> Result<(), QueueError> {
+        let job = Job {
+            bytes,
+            sidecar: Some(sidecar),
+        };
+        match self.tx.try_send(job) {
             Ok(()) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Err(QueueError::Full),
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(QueueError::Closed),
@@ -81,7 +135,12 @@ impl IngestHandle {
         bytes: Vec<u8>,
         timeout: Duration,
     ) -> Result<(), QueueError> {
-        match tokio::time::timeout(timeout, self.tx.send(Job { bytes })).await {
+        let job = Job {
+            bytes,
+            #[cfg(feature = "server")]
+            sidecar: None,
+        };
+        match tokio::time::timeout(timeout, self.tx.send(job)).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) => Err(QueueError::Closed),
             Err(_) => Err(QueueError::Full),
@@ -233,6 +292,23 @@ where
 
         // Main loop.
         while let Some(job) = rx.recv().await {
+            // v1.1.0 (CIRISPersist#33 part 3) — log presence of a
+            // pipeline sidecar. Persister-side consumption (writing
+            // pre-computed classifications / features / encrypted
+            // secrets in the same transaction as the BatchEnvelope
+            // decompose) lands in a follow-up. For now the route
+            // handler has verified the edge signature + invariants;
+            // the inner BatchEnvelope flows through the same
+            // `receive_and_persist` path as the legacy
+            // `/api/v1/accord/events` route. See
+            // `src/server/pipeline.rs` doc comment.
+            #[cfg(feature = "server")]
+            if job.sidecar.is_some() {
+                tracing::debug!(
+                    "pipeline sidecar present on queue job; persister-side \
+                     sidecar consumption is a v1.1.x follow-up"
+                );
+            }
             let pipeline = IngestPipeline {
                 backend: &*backend,
                 canonicalizer: &*canonicalizer,
