@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778858604799,
+  "lastUpdate": 1778875951372,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -14471,6 +14471,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23573173,
             "range": "± 149016",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "8cfaa17cfa87e9b9d800f62671b3188b9aab1016",
+          "message": "1.3.0 — FederationDirectory trust extension + V020 (closes #46 + #47)\n\nM2 unified cut absorbing NodeCore's `src/trust.rs` (CIRISAI/\nCIRISNodeCore@be82bd9) into persist's substrate. NodeCore can now\nreplace its local placeholder trait with\n`pub use ciris_persist::federation::FederationDirectory` (or the\nconvenience path `pub use ciris_persist::cirisnode::\nFederationDirectory`).\n\nSchema (V020 both dialects):\n- federation_keys + 7 columns: consent_role (CIRISAgent#760 OQ-1\n  flat enum), trust_type, trust_relationship, trust_domains[],\n  trusted_at, trusted_by, expires_at, roles[]\n- PG CHECK constraints: trusted_by != key_id (self-trust prevention),\n  Registry-relationship requires non-empty trust_domains\n- SQLite enforcement at API layer (V018 deferral pattern continued\n  — ALTER TABLE ADD CONSTRAINT CHECK unsupported)\n- new cirislens.edge_detection_events table for LensCore's\n  UnconsentedExternalProbe detector signals\n- audit_log action_type CHECK extended with 'trust_granted' +\n  'trust_revoked' (PG) — vocabulary additions in\n  AuditEventType enum\n\nFederationDirectory trait extension (4 new methods on existing\ntrait, NOT a sibling — same trait that owns federation_keys row\nCRUD today):\n- grant_trust(grant) — UPSERT + audit chain transition\n- revoke_trust(key, revoked_by) — soft-delete + audit + idempotent\n- lookup_trust(key) — raw row, no transitive resolution\n- list_trusted_keys(filter) — server-side filtering + default-excludes\n  expired rows\n\n5 supporting types (mirror NodeCore's `src/trust.rs` field-for-field):\nTrustType, TrustRelationship, TrustGrant, TrustRow, TrustFilter.\nTrustEdge stays in NodeCore (their resolver output, not our\nstorage concern).\n\nConvenience re-export: `crate::cirisnode::{FederationDirectory,\nTrustGrant, TrustRow, TrustFilter, TrustType, TrustRelationship}`\nso NodeCore can pin the sibling-pattern path that matches\nNodeCoreService's import shape.\n\nPyO3 wraps on PyEngine: federation_grant_trust /\nfederation_revoke_trust / federation_lookup_trust /\nfederation_list_trusted_keys. Backend-dispatched (Path A pattern).\n\nRole-tag enforcement (closes #46):\n- KeyRecord.roles field added with #[serde(default)] for compat\n- pipeline ingest route requires cirislens_pipeline_writer OR\n  cirislens_secrets_writer (kind: pipeline_invariant_role_tag)\n- secrets routes enforce 3-tier per #33 part 4a docs (kind:\n  secrets_role_tag)\n\nTests (+11; 8 SQLite + 3 PG-gated): all 5 M1-validated shapes\ncovered. 296/296 lib tests pass with full feature combo. PG\ntrust impl verified locally on fresh ciris-qa-postgres.\n\nZERO deviation from NodeCore's contract at commit be82bd9.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-15T15:05:07-05:00",
+          "tree_id": "e50d8b2660e86966e75e1462a37974be4c60b3ea",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/8cfaa17cfa87e9b9d800f62671b3188b9aab1016"
+        },
+        "date": 1778875950820,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 109076,
+            "range": "± 583",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 260000,
+            "range": "± 2818",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 560818,
+            "range": "± 1817",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1993775,
+            "range": "± 4371",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 331,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1455,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 6555,
+            "range": "± 68",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23144,
+            "range": "± 59",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26373,
+            "range": "± 406",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91062,
+            "range": "± 1299",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 369,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3117,
+            "range": "± 38",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9605,
+            "range": "± 64",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42323,
+            "range": "± 174",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 632,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2258183,
+            "range": "± 75416",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6996611,
+            "range": "± 156081",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25962487,
+            "range": "± 1227911",
             "unit": "ns/iter"
           }
         ]
