@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778802776393,
+  "lastUpdate": 1778807888771,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -13613,6 +13613,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25837847,
             "range": "± 240996",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "1669aafc5054664d39adcb28e6892e230a3c61e4",
+          "message": "1.0.2 — narrow python smoke test to exception-hierarchy export check\n\nv1.0.1 tag CI failed at tests/python/test_sqlite_engine.py because the\nEngine constructor signature is `(dsn, signing_key_id, scrubber=None,\nsteward_key_id=None, steward_key_path=None)` — not `(dsn)` as the\nhopeful smoke tests assumed. Full Engine construction needs a keyring\n+ signing-key fixture; that's not warranted for an end-to-end Python\nsmoke test when the Rust-side substrate tests already exercise the\nin-memory SQLite path end-to-end.\n\nNarrowed test_sqlite_engine.py to the one check the wheel surface\ngenuinely needs at the Python level: the typed exception hierarchy\n(PersistError / NotFound / Conflict / Transient / Permanent) is\nexported, all four subclasses extend the base, and the base extends\nPython's `Exception` (not BaseException — uvicorn-style `except\nException:` must catch them).\n\nNo substrate or surface change. v1.0.0 + v1.0.1 tags remain on their\ncommits; v1.0.2 is the first wheel that actually reaches PyPI.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-14T20:09:28-05:00",
+          "tree_id": "85e211ecb40d2c49953b1da5af17fc8e67d4543f",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/1669aafc5054664d39adcb28e6892e230a3c61e4"
+        },
+        "date": 1778807887617,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 109874,
+            "range": "± 444",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 250933,
+            "range": "± 4312",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 532186,
+            "range": "± 1449",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1863040,
+            "range": "± 31907",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 345,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1503,
+            "range": "± 41",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8239,
+            "range": "± 32",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21273,
+            "range": "± 117",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24326,
+            "range": "± 56",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83655,
+            "range": "± 163",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 394,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3285,
+            "range": "± 58",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9981,
+            "range": "± 45",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42831,
+            "range": "± 792",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2262792,
+            "range": "± 64566",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6631225,
+            "range": "± 101301",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23806592,
+            "range": "± 595874",
             "unit": "ns/iter"
           }
         ]
