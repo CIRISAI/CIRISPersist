@@ -5,6 +5,149 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.1.0] — 2026-05-14
+
+**Edge wire-transport substrate complete + Pipeline polymorphic.** v1.0.x
+shipped the agent-adoption substrate; v1.1.0 ships the federation
+wire-transport substrate. The combined surface unblocks CIRISEdge
+v0.2.0 (polymorphic `pipeline.run(envelope)` regardless of message
+type) + CIRISLensCore#7 (`init_edge_runtime` PyO3 fn) + sovereign-mode
+Reticulum agents (Engine + substrate constructors without PyEngine).
+
+### Path A: polymorphic Pipeline (closes CIRISPersist#33 parts 1-2)
+
+`Pipeline` + `Stage` are now generic over a new `WireEnvelope` trait.
+`BatchEnvelope` impls it (one body per component); new
+`InlineTextEnvelope` impls it (single body) for SPEAK / LLM-prompt /
+WBD / DSAR flows.
+
+- `src/pipeline/wire_envelope.rs` — `WireEnvelope` trait
+  (`canonical_bytes`, `text_bodies`, `mutate_body`, `body_count`,
+  `scrub_level`) + `MatchAddress` enum (`BatchComponent { index,
+  json_path } | InlineText { json_path }`) replacing v1.0.x's flat
+  `component_index: usize` + `json_path` pair on `ContentClassMatch`.
+- `src/pipeline/inline_text.rs` — new `InlineTextEnvelope` for inline
+  text flows.
+- `ClassifyStage`, `ScrubStage`, `EncryptAndStoreStage<S, E>` are now
+  `Stage<E: WireEnvelope>` generic.
+- `ExtractStage` stays `Stage<BatchEnvelope>` — `Features` projection
+  is structurally trace-coupled per FSD §5.1.
+- Three factories: `default_inbound_pipeline<S>` (full 4-stage on
+  BatchEnvelope), `default_outbound_pipeline<E>()` (Classify + Scrub
+  generic over E), `default_speak_pipeline<S>` (Classify + Scrub +
+  EncryptAndStore on InlineTextEnvelope — agent responses CAN
+  contain secrets to encrypt-and-store before they leave).
+
+Wire-format note: the matcher catalog was stubbed in v1.0.x; no
+production `classifications` JSONB blobs carry real matches. The
+v1.1.0 `MatchAddress` shape is the canonical shape; no migration
+needed.
+
+### Substrate constructors decoupled from Engine (closes #43)
+
+Three public APIs for sovereign-mode Reticulum + lens-core in-process
+consumers who need substrate primitives without the full PyEngine:
+
+- `Engine::with_signer(Arc<StewardSigner>, dsn)` /
+  `Engine::with_signer_arcs(SigningKey, key_id, Option<Arc<dyn
+  PqcSigner>>, pqc_key_id, dsn)` — new Rust-side `Engine` struct
+  composing `BackendDispatch { Postgres | Sqlite }` + `Arc<
+  StewardSigner>`. URL-sniff constructor mirrors PyEngine. Accessors:
+  `federation_directory()`, `edge_outbound_queue()`, `signer()`.
+- `FederationDirectorySqlite::open(db_path) -> Arc<SqliteBackend>` —
+  standalone constructor; no Engine required.
+- `EdgeOutboundQueueSqlite::open(db_path) -> Arc<SqliteBackend>` —
+  same shape.
+
+PyEngine untouched — purely additive Rust-side surface.
+
+Trait-shape adaptation: `FederationDirectory` / `OutboundQueue` /
+`Backend` use RPITIT and aren't object-safe, so the wrappers return
+concrete `Arc<SqliteBackend>` (which implements all three traits).
+CIRISEdge's blanket impl in `src/outbound.rs:102` handles
+type-erasure on their side.
+
+### Error::Json(_)::detail() surfaces serde_json msg (closes #44)
+
+`schema::Error::Json(_)::detail()` now returns `Some(e.to_string())`
+instead of `None`. CIRISLens#13 operator diagnostics: bridge sees
+`PERSIST_DELEGATE_REJECT_DETAIL: 'missing field \`component_type\` at
+line 1 column 247'` instead of `None`. AV-15 safe: serde_json's
+`Display` carries field names from the Rust struct + structural
+positions, not attacker-controlled content.
+
+### POST /api/v1/pipeline/ingest route (closes #33 part 3)
+
+Edge wire-transport ingest. Accepts a `PipelineEnvelope`, verifies the
+edge_signature + inner agent signature, validates FSD §4.3
+invariants, enqueues the inner BatchEnvelope with the sidecar
+attached.
+
+Six invariant kind tokens: `pipeline_invariant_schema_version`,
+`_edge_signature`, `_inner_signature`, `_pii_scrubbed`,
+`_classifications_count`, `_orphan_secret`. Queue API extended with
+`try_submit_with_sidecar(bytes, sidecar)`.
+
+Two v1.1.x follow-ups documented:
+1. Role-tag check on `edge_key_id` (KeyRecord needs a role-list
+   field; V020+ migration).
+2. Persister sidecar consumption — today the sidecar is plumbed
+   through + logged at debug level but the persister still re-runs
+   scrub + extract on the inner envelope. Edge-signed sidecar
+   consumption is the next step.
+
+### secrets-server axum routes + FederatedSecretsClient (closes #33 part 4)
+
+15 HTTP routes mirroring the 18-method `SecretsService` trait (3
+methods stay in-process only: `process_incoming_text`,
+`decapsulate_secrets_in_parameters`, `test_encryption`).
+
+- `src/server/secrets.rs` — 13 handlers serving 15 routes (`/secrets/
+  {uuid}` does GET + DELETE; `/secrets/filter_config` does GET +
+  PUT). Hybrid sign-verify on inbound bodies. Three-tier role-tag
+  design (`cirislens_secrets_reader` / `_writer` / `_admin`) baked
+  into docs; enforcement deferred to v1.1.x with KeyRecord schema
+  addition.
+- `src/secrets/wire.rs` — 16 typed request/response structs +
+  `SecretsErrorResponse` with stable kind() tokens. Stable across
+  v1.x.
+- `src/secrets/client.rs` — `FederatedSecretsClient` impls
+  `SecretsService`. New `secrets-client` Cargo feature. reqwest
+  rustls-tls (federation transport posture). Mock-HTTP-free tests
+  using `std::net::TcpListener` + spawn_blocking.
+
+Notable handler-shape divergences from the trait (documented per
+handler):
+- `GET /secrets/{uuid}` is UUID-keyed for federation addressability;
+  delegates to `recall_secret(uuid, "http retrieve", accessor,
+  decrypt=true)`.
+- `POST /secrets/decrypt` carries ciphertext as base64 in JSON body
+  (not raw binary) so the entire request fits one canonical
+  sign-bundle.
+- `POST /secrets/reencrypt_all` takes raw new-master-key bytes
+  (base64); bytes-into-software-key-cache loading deferred.
+- `GET /secrets/access_logs` filters client-side post-fetch (trait
+  doesn't expose accessor/since/until filters); push-down deferred.
+- `try_claim_secret` 200 + outcome-field for both `Stored` and
+  `AlreadyClaimed` (no 409 — both outcomes carry in body).
+
+### What's deferred to v1.2.0
+
+- Role-tag enforcement on KeyRecord (needs V020+ schema addition).
+- Persister sidecar consumption (today sidecar plumbed + logged but
+  not consumed).
+- Pipeline pyo3 wraps for `engine.pipeline().run()` from Python.
+- Async-native pyo3 methods.
+- Reencrypt-all bytes loading into the software-key cache.
+- Access-logs filter push-down to persister query.
+
+### Test count
+
+v1.0.3 → v1.1.0: 339 → 270+ tests per feature combo. Full lib
+suite with `secrets-server secrets-client postgres sqlite cirisgraph
+cirisaudit cirisnode telemetry cirisincident classify scrub extract`:
+all green.
+
 ## [1.0.3] — 2026-05-14
 
 **v1.0.2 with Python wrapper re-export fixup.** v1.0.2 tag CI failed
