@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "1.1.1"
+version = "1.1.2"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -201,7 +201,7 @@ tls = ["dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-native-certs"]
 # deps on AES-GCM/PBKDF2/HKDF/HMAC primitive crates ever — the
 # `src/secrets/crypto.rs` facade lands as a single import-site change.
 ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.0.5", version = "2", features = ["pqc-ml-dsa"] }
-ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.0.5", version = "2" }
+ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.1.5", version = "2" }
 # v0.3.6 (CIRISPersist#14) — direct ciris-crypto dep for HybridVerifier
 # in `Engine.verify_hybrid`. Same git source / tag as ciris-keyring +
 # ciris-verify-core so versions are workspace-coherent. Features

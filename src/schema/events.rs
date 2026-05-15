@@ -88,6 +88,33 @@ pub enum ReasoningEventType {
     /// dead-code suppress until that lands.
     #[allow(dead_code)]
     RoundComplete,
+    /// v1.1.2 (CIRISPersist#45) — forward-compat fallback for any
+    /// wire value not matching the closed set above. Same shape as
+    /// `ComponentType::Unknown` (this file, line 43), which has
+    /// shipped since v0.1.x.
+    ///
+    /// # Why
+    ///
+    /// CIRISLens#13 — 28-43% reject rate on /accord/events for ~48h
+    /// when three agents emitted `parent_event_type="UNKNOWN_PARENT"`
+    /// (an internal fallback value, NOT a TRACE_WIRE_FORMAT §4
+    /// variant). The closed enum rejected via `Error::Json(_)` →
+    /// `schema_malformed_json` → agents retried deterministically →
+    /// federation traffic loss in the steady state.
+    ///
+    /// `parent_event_type` / `event_type` informs trace_llm_calls row
+    /// linkage + detection cohort joins. Neither gates a security-
+    /// critical write path (verify happens upstream of decompose;
+    /// signing-key-id is separate). Degrading to `Unknown` on agent-
+    /// side enum drift preserves trace ingest at the cost of one
+    /// column losing discriminant value — strictly better than 422'ing
+    /// the whole batch.
+    ///
+    /// AV-15 safe: `#[serde(other)]` carries no payload (no
+    /// attacker-controlled bytes echoed), and the variant serializes
+    /// back as `"UNKNOWN"` regardless of the rejected input.
+    #[serde(other)]
+    Unknown,
 }
 
 impl ReasoningEventType {
@@ -106,6 +133,11 @@ impl ReasoningEventType {
             Self::ActionResult => "ACTION_RESULT",
             Self::LlmCall => "LLM_CALL",
             Self::RoundComplete => "ROUND_COMPLETE",
+            // v1.1.2 (CIRISPersist#45): wire shape for the forward-
+            // compat catchall. Serde produces this when an unrecognized
+            // variant is parsed; row→struct conversions emit it here so
+            // round-trips stay consistent.
+            Self::Unknown => "UNKNOWN",
         }
     }
 
@@ -126,6 +158,11 @@ impl ReasoningEventType {
             "ACTION_RESULT" => Some(Self::ActionResult),
             "LLM_CALL" => Some(Self::LlmCall),
             "ROUND_COMPLETE" => Some(Self::RoundComplete),
+            // v1.1.2 (CIRISPersist#45): the serde-side
+            // #[serde(other)] catchall surfaces as "UNKNOWN" on
+            // round-trip; the row→struct path mirrors it so
+            // consumers see a stable token.
+            "UNKNOWN" => Some(Self::Unknown),
             _ => None,
         }
     }
@@ -317,6 +354,34 @@ mod tests {
             let back: ReasoningEventType = serde_json::from_str(&json).unwrap();
             assert_eq!(back, et, "round-trips");
         }
+    }
+
+    /// v1.1.2 (CIRISPersist#45): any wire value not in the closed set
+    /// must deserialize to `Unknown` rather than rejecting via
+    /// `Error::Json(_)`. CIRISLens#13 ~48h prod outage: agents emitted
+    /// `"UNKNOWN_PARENT"` on parent_event_type → schema_malformed_json
+    /// → infinite agent retries → federation traffic loss.
+    #[test]
+    fn reasoning_event_type_unknown_variant_absorbs_drift() {
+        for wire in [
+            r#""UNKNOWN_PARENT""#,
+            r#""SOME_FUTURE_VALUE""#,
+            r#""hot_garbage""#,
+            r#""""#,
+        ] {
+            let parsed: ReasoningEventType = serde_json::from_str(wire)
+                .unwrap_or_else(|e| panic!("v1.1.2 — should absorb {wire}: {e}"));
+            assert_eq!(parsed, ReasoningEventType::Unknown);
+        }
+        // The catchall serializes back as "UNKNOWN" (AV-15: no
+        // echo of attacker-controlled input).
+        let json = serde_json::to_string(&ReasoningEventType::Unknown).unwrap();
+        assert_eq!(json, r#""UNKNOWN""#);
+        // Row→struct conversions via from_wire_str also accept it.
+        assert_eq!(
+            ReasoningEventType::from_wire_str("UNKNOWN"),
+            Some(ReasoningEventType::Unknown)
+        );
     }
 
     #[test]

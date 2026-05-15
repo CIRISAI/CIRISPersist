@@ -37,7 +37,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # v1.1.2 (CIRISVerify v2.1.1 hardening pattern):
+      # `continue-on-error: true` on cache restore. A cache miss /
+      # corruption shouldn't fail the whole job — compile from scratch
+      # is slower but correct. Same on every Swatinem/rust-cache site
+      # in this workflow.
       - uses: Swatinem/rust-cache@v2
+        continue-on-error: true
       - name: cargo test (postgres + server + pyo3)
         env:
           CIRIS_PERSIST_TEST_PG_URL: postgres://ciris:ciris@localhost:5432/ciris_persist_test
@@ -55,12 +61,26 @@ jobs:
         with:
           python-version: "3.11"
       - name: install maturin + pytest
-        run: pip install maturin pytest
+        # v1.1.2 (CIRISVerify v2.1.1 hardening): retry pip install
+        # against PyPI transient blips. 3 attempts with backoff.
+        run: |
+          for attempt in 1 2 3; do
+            if pip install maturin pytest; then break; fi
+            echo "::warning::pip install attempt $attempt failed; retrying in $((attempt * 5))s"
+            sleep $((attempt * 5))
+            [ "$attempt" = "3" ] && { echo "::error::pip install failed 3x"; exit 1; }
+          done
       - name: maturin develop (test-panic feature)
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install maturin pytest
+          # Same retry pattern inside the venv.
+          for attempt in 1 2 3; do
+            if pip install maturin pytest; then break; fi
+            echo "::warning::pip install (venv) attempt $attempt failed; retrying in $((attempt * 5))s"
+            sleep $((attempt * 5))
+            [ "$attempt" = "3" ] && { echo "::error::pip install failed 3x"; exit 1; }
+          done
           maturin develop --features test-panic,pyo3 --release
       - name: pytest tests/python/
         run: |
@@ -93,9 +113,11 @@ jobs:
       # `~/.cargo/bin/`. Disabling bin caching keeps the dtolnay-
       # installed cargo intact. Build cache (registry + target) is
       # unaffected. (v0.7.0/v0.7.1 main CI + v0.7.2 tag CI flakes.)
+      # v1.1.2: + continue-on-error per CIRISVerify v2.1.1 hardening.
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
+        continue-on-error: true
       - name: which cargo (diagnostic)
         run: |
           which cargo
@@ -113,9 +135,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      # v1.1.2: continue-on-error per CIRISVerify v2.1.1 hardening.
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
+        continue-on-error: true
       - name: which cargo (diagnostic)
         run: |
           which cargo
@@ -134,7 +158,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      # v1.1.2: continue-on-error per CIRISVerify v2.1.1 hardening.
       - uses: Swatinem/rust-cache@v2
+        continue-on-error: true
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
       - name: cargo clippy
@@ -191,7 +217,16 @@ jobs:
         with:
           python-version: "3.11"
       - name: install maturin
-        run: pip install maturin
+        # v1.1.2 (CIRISVerify v2.1.1 hardening): retry pip install
+        # against PyPI transient blips.
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            if pip install maturin; then break; fi
+            echo "::warning::pip install attempt $attempt failed; retrying in $((attempt * 5))s"
+            sleep $((attempt * 5))
+            [ "$attempt" = "3" ] && { echo "::error::pip install failed 3x"; exit 1; }
+          done
       - name: maturin build
         run: maturin build --release --strip
       - name: confirm wheel shape
@@ -341,10 +376,12 @@ jobs:
           VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "ciris-persist version: $VERSION"
-      - name: install ciris-build-sign v2.0.5 (prebuilt from CIRISVerify release)
-        # v0.9.2 — bumped from v1.8.0 to v2.0.5 to match the Rust
-        # git-pin floor (Cargo.toml ciris-keyring / ciris-verify-core
-        # / ciris-crypto all at tag = "v2.0.5"). v2.0.5 includes:
+      - name: install ciris-build-sign v2.1.5 (prebuilt from CIRISVerify release)
+        # v1.1.2 — bumped from v2.0.5 to v2.1.5. The v2.1.x series is
+        # the CI-hardening arc (continue-on-error on cache, retry on
+        # network installs, macOS x86_64 shadow defang via cache-bin:
+        # false + bash shell on guards). v2.1.5 also includes everything
+        # the v2.0.x line shipped:
         # - CanonicalBuild v2 with per-target rows (v2.0.3)
         # - iOS hardware-marker self-heal (v2.0.4)
         # - Mach-O __TEXT hash sign/runtime parity (v2.0.5)
@@ -358,9 +395,22 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cd "$RUNNER_TEMP"
-          gh release download v2.0.5 --repo CIRISAI/CIRISVerify \
-            --pattern 'ciris-verify-v2.0.5-build-tool-linux-x86_64.tar.gz'
-          tar -xzf ciris-verify-v2.0.5-build-tool-linux-x86_64.tar.gz
+          # v1.1.2 (CIRISVerify v2.1.1 CI hardening pattern): retry the
+          # `gh release download` to absorb GitHub API transient 5xx /
+          # network blip. Three attempts with backoff, then fail loud.
+          for attempt in 1 2 3; do
+            if gh release download v2.1.5 --repo CIRISAI/CIRISVerify \
+                --pattern 'ciris-verify-v2.1.5-build-tool-linux-x86_64.tar.gz'; then
+              break
+            fi
+            echo "::warning::gh release download attempt $attempt failed; retrying in $((attempt * 5))s"
+            sleep $((attempt * 5))
+            if [ "$attempt" = "3" ]; then
+              echo "::error::gh release download failed 3 times — investigate"
+              exit 1
+            fi
+          done
+          tar -xzf ciris-verify-v2.1.5-build-tool-linux-x86_64.tar.gz
           # Tarball layout: build-tool/{ciris-build-sign,ciris-build-verify}
           sudo install -m755 build-tool/ciris-build-sign /usr/local/bin/ciris-build-sign
           sudo install -m755 build-tool/ciris-build-verify /usr/local/bin/ciris-build-verify
@@ -524,7 +574,7 @@ jobs:
         # v0.9.2 (CIRISPersist#42) — replaces the prior custom
         # curl POST to /v1/verify/binary-manifest with the
         # `ciris-build-sign register` subcommand from CIRISVerify
-        # v2.0.5. The subcommand:
+        # v2.1.5. The subcommand:
         # - Reads each per-target manifest produced above.
         # - Signs a CanonicalBuild v2 `builds` parent row over all
         #   the per-target manifest hashes.
@@ -590,7 +640,7 @@ jobs:
             --build-id "${{ github.sha }}" \
             --source-repo "https://github.com/CIRISAI/CIRISPersist" \
             --source-commit "${{ github.sha }}" \
-            --notes "CIRIS federation persist substrate; CanonicalBuild v2 multi-target via ciris-build-sign v2.0.5 (CIRISPersist#42). Targets: python-source-tree + per-wheel binary manifests." \
+            --notes "CIRIS federation persist substrate; CanonicalBuild v2 multi-target via ciris-build-sign v2.1.5 (CIRISPersist#42). Targets: python-source-tree + per-wheel binary manifests." \
             --ed25519-seed "$ED_KEY_PATH" \
             --mldsa-secret "$MLDSA_KEY_PATH" \
             --key-id ciris-persist-build-v1 \

@@ -36,7 +36,7 @@ classifiers = [
 # Pin to <3 to follow semver-major. Bump to >=3 when v0.10.x
 # persist coordinates with v3.x verify.
 dependencies = [
-    "ciris-verify>=2.0.5,<3",
+    "ciris-verify>=2.1.5,<3",
 ]
 dynamic = ["version"]
 

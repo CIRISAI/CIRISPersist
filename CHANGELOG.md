@@ -5,6 +5,66 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.1.2] — 2026-05-15
+
+**Hardening cut: ReasoningEventType forward-compat + verify 2.1.5 +
+CI hardening playbook.**
+
+### `ReasoningEventType::Unknown` (closes #45)
+
+`#[serde(other)] Unknown` variant on `ReasoningEventType`. Closes the
+second half of CIRISLens#13 — the 48h prod outage where agents
+emitted `parent_event_type="UNKNOWN_PARENT"` (an internal fallback,
+not a TRACE_WIRE_FORMAT §4 variant) and persist rejected via
+`Error::Json(_)` → `schema_malformed_json` → infinite agent retries.
+
+- `src/schema/events.rs` — add `#[serde(other)] Unknown` variant.
+  `as_str()` returns `"UNKNOWN"`; `from_wire_str("UNKNOWN")` returns
+  Some(Unknown). Mirrors the `ComponentType::Unknown` shape that
+  shipped in v0.1.x.
+- `src/store/decompose.rs` — exhaustive match arm: `Unknown` maps to
+  `ComponentType::Unknown` so the row→struct path stays defined.
+- Regression test asserts `serde_json::from_str("UNKNOWN_PARENT")`,
+  `"SOME_FUTURE_VALUE"`, etc. all parse to `Unknown` instead of
+  erroring. AV-15 safe: catchall echoes no attacker-controlled
+  bytes; serializes back as the constant `"UNKNOWN"`.
+
+v1.1.1's `Error::Json::detail()` fix (#44) surfaced the failures;
+v1.1.2's `serde(other)` prevents them entirely. Pair complete.
+
+### CIRISVerify pin bump 2.0.5 → 2.1.5
+
+- `Cargo.toml` — `ciris-verify-core` git tag bumped to `v2.1.5`.
+  The 2.1.x series is CIRISVerify's CI hardening arc; library
+  surface unchanged from 2.0.5.
+- `pyproject.toml` — `ciris-verify>=2.1.5,<3`.
+- `.github/workflows/ci.yml` — `ciris-build-sign` tarball download
+  bumped to `v2.1.5` (matches Rust git-pin floor).
+
+### CI hardening playbook (from CIRISVerify v2.1.x arc)
+
+- **`gh release download` retry** on the `ciris-build-sign` tarball
+  fetch (3 attempts with backoff). Absorbs GitHub API transient 5xx
+  / network blips.
+- **`pip install` retry** on the three pip-install sites (maturin +
+  pytest + venv-scoped). Same 3-attempt-with-backoff shape against
+  PyPI blips.
+- **`continue-on-error: true`** on every `Swatinem/rust-cache@v2`
+  use site (4 sites: linux test, macos test, ios build, lint).
+  Cache miss / corruption shouldn't fail the whole job — recompile
+  from scratch is slower but correct.
+- **Existing**: `cache-bin: false` on macOS already in place from
+  v0.7.2 (the macOS x86_64 shim shadow fix). v2.1.4-style active
+  heal not needed because we never hit the shadow on persist's
+  macos-14 runners.
+
+No `shell: bash` overrides needed — persist's matrix is Linux + macOS
++ iOS cross-compile only, no Windows runners (the v2.1.5 pwsh fix
+target).
+
+No surface change. v1.1.2 is a hardening cut on top of v1.1.1's
+substrate.
+
 ## [1.1.1] — 2026-05-15
 
 **v1.1.0 with no-features compile fix.** v1.1.0 tag CI failed at

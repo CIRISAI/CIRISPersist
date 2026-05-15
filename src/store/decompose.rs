@@ -326,6 +326,10 @@ mod tests {
                 ReasoningEventType::ActionResult => ComponentType::Action,
                 ReasoningEventType::LlmCall => ComponentType::LlmCall,
                 ReasoningEventType::RoundComplete => ComponentType::Unknown,
+                // v1.1.2 (CIRISPersist#45): forward-compat catchall;
+                // map to the existing ComponentType::Unknown so
+                // ingest doesn't reject on agent-side enum drift.
+                ReasoningEventType::Unknown => ComponentType::Unknown,
             },
             event_type,
             timestamp: ts("2026-04-30T00:16:00Z"),
