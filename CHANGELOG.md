@@ -5,6 +5,74 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.2.0] — 2026-05-15
+
+**Maintenance ops absorbed + DatabaseMaintenance reclassification (closes #48).**
+Agent's `DatabaseMaintenanceService` splits like `AuthenticationService` +
+`AdaptiveFilterService` did before it: **operations** (VACUUM, archive expired,
+prune audit chain, consolidate periods, rotate master keys) move to persist;
+**scheduling** (when/how often) stays at agent's `TaskSchedulerService`. The
+agent-side service disappears as a separate concern; it collapses into
+TaskScheduler invoking `engine.maintain()`.
+
+### New surface
+
+- **`MaintenanceService` trait** in `src/maintenance/service.rs` with 4
+  methods: `vacuum_substrate`, `archive_expired(ArchiveWindow)`,
+  `prune_audit_chain(tenant, before)`, `maintain()` umbrella.
+- **`Engine::maintenance()` accessor** + new `EngineMaintenance { Postgres |
+  Sqlite }` enum (trait isn't object-safe — same dispatch shape as the
+  existing `BackendDispatch`).
+- **PyEngine methods**: `maintenance_vacuum()`, `maintenance_archive_expired(
+  window=None)`, `maintenance_prune_audit_chain(tenant, before)`,
+  `maintain()`. JSON-encoded report returns. `maintenance_backend` →
+  `Transient` exception class.
+
+### Substrate retention defaults
+
+| Module | Column | Default | Notes |
+|---|---|---|---|
+| telemetry raw observations | `expires_at` | substrate-defined per row (V015 TTL) | producer sets; archive deletes physically |
+| secrets access_log | `created_at` | 30 days | |
+| incidents (closed) | `last_seen_at` | 90 days | V016 has no `updated_at`; `last_seen_at` is the resolution timestamp |
+| federation_keys (expired) | `valid_until` | 180 days | persists revocations live in `federation_revocations`; `valid_until` is the operational expiry analog. Per-module key: `federation_keys_expired` |
+
+### Postgres VACUUM behavior
+
+VACUUM cannot run inside a transaction. The impl uses
+`client.batch_execute("VACUUM ANALYZE")` on a deadpool-checked-out
+transaction-free client. Documented in `src/maintenance/postgres.rs`.
+
+### SQLite datetime gotcha
+
+Rows in V010/V015/V016 mix RFC 3339 (`T` separator, microsecond
+precision) and SQLite-default (`YYYY-MM-DD HH:MM:SS` space separator).
+Direct string `<` comparison is lexicographically wrong across the two
+shapes (space < `T`). All comparisons use `julianday(col) < julianday(
+'now', ?)` to parse both formats and produce a numeric scalar.
+
+### `prune_audit_chain` stub
+
+Returns `PruneReport { entries_removed: 0, new_anchor_id: None }` on
+both backends. Real semantics depend on **CIRISAgent#760** Counter-RII
+review-window guidance — how long the chain must stay re-derivable
+for steward review determines the pruning policy. Implementation
+deferred to the v1.2.x → v1.3.x range once #760 resolves.
+
+### Tests
+
++9 tests: 5 SQLite in-memory + 4 PG (gated on `CIRIS_PERSIST_TEST_PG_URL`)
++ 1 stable-kind()-tokens unit. Lib suite: 301/301 passing locally.
+
+### Post-fold service count (locked)
+
+| Bucket | Count |
+|---|---|
+| Persist substrate (direct + prelude + this) | **10 of 22** |
+| LensCore-owned (Audit, persist hosts substrate) | 1 of 22 |
+| Edge-owned (transit-touch) | 2 of 22 |
+| Stays at agent | 10 of 22 (DatabaseMaintenance folded into TaskScheduler) |
+
 ## [1.1.2] — 2026-05-15
 
 **Hardening cut: ReasoningEventType forward-compat + verify 2.1.5 +
