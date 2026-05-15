@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778857819018,
+  "lastUpdate": 1778858604799,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -14339,6 +14339,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25649951,
             "range": "± 1893140",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "2bbe29d5a784a154e1c4d3347e8caa7de5fb2c11",
+          "message": "1.2.1 — fix PG maintenance bind types (jsonb + make_interval secs)\n\nv1.2.0 tag CI hit two PG-side bind-type failures:\n\n1. Test fixture bound &\"{}\" to a jsonb column. Even with $5::jsonb\n   SQL cast, tokio-postgres rejects str→jsonb (param-type negotiation\n   runs before SQL casts). Fix: bind via serde_json::json!({}).\n2. Impl used make_interval(secs => $1) with an i64 bind. PG's `secs`\n   is double precision, not bigint; i64 raises\n   `WrongType { postgres: Float8, rust: \"i64\" }`. Fix: fixed_seconds\n   returns f64 across the 4 call sites (telemetry-custom, secrets,\n   incidents, federation).\n\nBoth surfaced only on the live PG test path; local SQLite + no-DB\nintegration paths didn't trip them. Verified on fresh\nciris-qa-postgres container: 4/4 maintenance::postgres tests pass.\n\nNo surface change. v1.2.1 is the first 1.2.x wheel to publish.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-15T10:14:59-05:00",
+          "tree_id": "739f94194b7bb0ec356391f3e79c1e1ef2ed44d7",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/2bbe29d5a784a154e1c4d3347e8caa7de5fb2c11"
+        },
+        "date": 1778858604254,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101371,
+            "range": "± 455",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 243083,
+            "range": "± 780",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 525074,
+            "range": "± 1989",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1855416,
+            "range": "± 29761",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 340,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1418,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7576,
+            "range": "± 62",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21140,
+            "range": "± 268",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24190,
+            "range": "± 32",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83528,
+            "range": "± 172",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 370,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3058,
+            "range": "± 24",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9379,
+            "range": "± 48",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41566,
+            "range": "± 311",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 621,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2344216,
+            "range": "± 96516",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6617115,
+            "range": "± 113493",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23573173,
+            "range": "± 149016",
             "unit": "ns/iter"
           }
         ]
