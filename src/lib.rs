@@ -51,6 +51,8 @@ pub mod graph;
 pub mod incident;
 pub mod ingest;
 pub mod journal;
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub mod maintenance;
 pub mod manifest;
 pub mod outbound;
 pub mod pipeline;

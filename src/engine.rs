@@ -204,6 +204,47 @@ impl Engine {
             BackendDispatch::Sqlite(_) => None,
         }
     }
+
+    /// v1.2.0 (CIRISPersist#48) — borrow a per-backend
+    /// [`MaintenanceService`](crate::maintenance::MaintenanceService)
+    /// handle wrapping the Engine's underlying backend Arc.
+    ///
+    /// Returns an [`EngineMaintenance`] enum that mirrors the
+    /// [`BackendDispatch`] variants. Consumers `match` on the
+    /// returned variant to call the trait methods (the trait isn't
+    /// object-safe — RPITIT precludes `&dyn MaintenanceService`).
+    ///
+    /// Cheap: each variant clones the inner backend `Arc` once.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub fn maintenance(&self) -> EngineMaintenance {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => EngineMaintenance::Postgres(
+                crate::maintenance::postgres::PostgresMaintenanceBackend::new(b.clone()),
+            ),
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => EngineMaintenance::Sqlite(
+                crate::maintenance::sqlite::SqliteMaintenanceBackend::new(b.conn_handle()),
+            ),
+        }
+    }
+}
+
+/// v1.2.0 (CIRISPersist#48) — per-backend
+/// [`MaintenanceService`](crate::maintenance::MaintenanceService)
+/// handle returned by [`Engine::maintenance`].
+///
+/// The trait uses RPITIT and isn't object-safe; this enum lets
+/// callers dispatch over the concrete backend without rebuilding
+/// the [`BackendDispatch`] match each time.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub enum EngineMaintenance {
+    /// Postgres-backed maintenance handle.
+    #[cfg(feature = "postgres")]
+    Postgres(crate::maintenance::postgres::PostgresMaintenanceBackend),
+    /// SQLite-backed maintenance handle.
+    #[cfg(feature = "sqlite")]
+    Sqlite(crate::maintenance::sqlite::SqliteMaintenanceBackend),
 }
 
 /// Build the backend dispatch for an `Engine` from a DSN string.

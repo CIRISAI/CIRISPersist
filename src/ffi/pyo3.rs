@@ -154,13 +154,19 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
 
         // Transient family — backend connection / timeout / pool
         // exhaustion; caller MAY retry with backoff.
-        "secrets_backend" | "audit_backend" | "cirisnode_backend" | "incident_backend"
-        | "cirisgraph_backend" | "telemetry_backend" => Transient::new_err(msg),
+        "secrets_backend"
+        | "audit_backend"
+        | "cirisnode_backend"
+        | "incident_backend"
+        | "cirisgraph_backend"
+        | "telemetry_backend"
+        | "maintenance_backend" => Transient::new_err(msg),
 
         // Default — Permanent. Covers invalid arguments, signature
         // failures, crypto errors, rotation conflicts, "not authorized,"
-        // hardware unavailable, not-implemented, and any unknown
-        // future kind. Conservative: when in doubt, don't retry.
+        // hardware unavailable, not-implemented, maintenance
+        // invalid-argument / internal, and any unknown future kind.
+        // Conservative: when in doubt, don't retry.
         _ => Permanent::new_err(msg),
     }
 }
@@ -5864,6 +5870,207 @@ impl PyEngine {
                             .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
                         serde_json::to_string(&refs).map_err(|e| {
                             PyRuntimeError::new_err(format!("Vec<IncidentRef> encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    // ── v1.2.0 (CIRISPersist#48) maintenance cluster ─────────────
+    //
+    // Absorbs the operations side of CIRISAgent's
+    // DatabaseMaintenanceService. Reports cross the FFI as JSON
+    // strings so the agent-side shim can decode them
+    // field-for-field via `pydantic.model_validate_json`. Errors
+    // thread through `translate_error_kind` (maintenance_backend
+    // → Transient, maintenance_invalid_argument → Permanent,
+    // maintenance_internal → Permanent).
+
+    /// v1.2.0 (CIRISPersist#48) — Run a substrate-wide VACUUM
+    /// (PG: `VACUUM ANALYZE` via dedicated non-transactional client;
+    /// SQLite: `VACUUM; ANALYZE;` via spawn_blocking). Returns a
+    /// JSON-encoded `VacuumReport`.
+    fn maintenance_vacuum(&self, py: Python<'_>) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let svc =
+                        crate::maintenance::postgres::PostgresMaintenanceBackend::new(pg.clone());
+                    runtime.block_on(async move {
+                        use crate::maintenance::MaintenanceService;
+                        let report = svc
+                            .vacuum_substrate()
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&report).map_err(|e| {
+                            PyRuntimeError::new_err(format!("VacuumReport encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let svc =
+                        crate::maintenance::sqlite::SqliteMaintenanceBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::maintenance::MaintenanceService;
+                        let report = svc
+                            .vacuum_substrate()
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&report).map_err(|e| {
+                            PyRuntimeError::new_err(format!("VacuumReport encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.2.0 (CIRISPersist#48) — Archive expired rows across
+    /// substrate modules (telemetry, secrets access_log, closed
+    /// incidents, expired federation_keys). `window_seconds=None`
+    /// uses the substrate-default cutoff per module; passing an
+    /// integer overrides with `ArchiveWindow::Custom { seconds }`.
+    /// Returns a JSON-encoded `ArchiveReport`.
+    #[pyo3(signature = (window_seconds=None))]
+    fn maintenance_archive_expired(
+        &self,
+        py: Python<'_>,
+        window_seconds: Option<u64>,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let window = match window_seconds {
+                None => crate::maintenance::ArchiveWindow::SubstrateDefault,
+                Some(seconds) => crate::maintenance::ArchiveWindow::Custom { seconds },
+            };
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let svc =
+                        crate::maintenance::postgres::PostgresMaintenanceBackend::new(pg.clone());
+                    runtime.block_on(async move {
+                        use crate::maintenance::MaintenanceService;
+                        let report = svc
+                            .archive_expired(window)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&report).map_err(|e| {
+                            PyRuntimeError::new_err(format!("ArchiveReport encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let svc =
+                        crate::maintenance::sqlite::SqliteMaintenanceBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::maintenance::MaintenanceService;
+                        let report = svc
+                            .archive_expired(window)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&report).map_err(|e| {
+                            PyRuntimeError::new_err(format!("ArchiveReport encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.2.0 (CIRISPersist#48) — Prune audit-chain entries for
+    /// `tenant` strictly older than `before` (RFC 3339). Returns a
+    /// JSON-encoded `PruneReport`. **Stub in v1.2.0** — always
+    /// returns `entries_removed: 0, new_anchor_id: None`. Real
+    /// semantics depend on CIRISAgent#760 Counter-RII review-window
+    /// guidance.
+    fn maintenance_prune_audit_chain(
+        &self,
+        py: Python<'_>,
+        tenant: &str,
+        before: &str,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let tenant = tenant.to_owned();
+            let before_dt = chrono::DateTime::parse_from_rfc3339(before)
+                .map_err(|e| {
+                    PyValueError::new_err(format!(
+                        "maintenance_prune_audit_chain: `before` must be RFC 3339: {e}"
+                    ))
+                })?
+                .with_timezone(&chrono::Utc);
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let svc =
+                        crate::maintenance::postgres::PostgresMaintenanceBackend::new(pg.clone());
+                    runtime.block_on(async move {
+                        use crate::maintenance::MaintenanceService;
+                        let report = svc
+                            .prune_audit_chain(&tenant, before_dt)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&report).map_err(|e| {
+                            PyRuntimeError::new_err(format!("PruneReport encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let svc =
+                        crate::maintenance::sqlite::SqliteMaintenanceBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::maintenance::MaintenanceService;
+                        let report = svc
+                            .prune_audit_chain(&tenant, before_dt)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&report).map_err(|e| {
+                            PyRuntimeError::new_err(format!("PruneReport encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.2.0 (CIRISPersist#48) — Run the maintenance umbrella:
+    /// vacuum → archive_expired(SubstrateDefault). Returns a
+    /// JSON-encoded `MaintenanceReport`. Prune is intentionally not
+    /// part of the umbrella — callers run it on a tenant-scoped
+    /// schedule separately.
+    fn maintain(&self, py: Python<'_>) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let svc =
+                        crate::maintenance::postgres::PostgresMaintenanceBackend::new(pg.clone());
+                    runtime.block_on(async move {
+                        use crate::maintenance::MaintenanceService;
+                        let report = svc
+                            .maintain()
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&report).map_err(|e| {
+                            PyRuntimeError::new_err(format!("MaintenanceReport encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let svc =
+                        crate::maintenance::sqlite::SqliteMaintenanceBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::maintenance::MaintenanceService;
+                        let report = svc
+                            .maintain()
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&report).map_err(|e| {
+                            PyRuntimeError::new_err(format!("MaintenanceReport encode: {e}"))
                         })
                     })
                 }

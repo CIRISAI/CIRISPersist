@@ -118,3 +118,14 @@ pub use crate::engine::{BackendDispatch, Engine, EngineError};
 pub use crate::federation::FederationDirectorySqlite;
 #[cfg(feature = "sqlite")]
 pub use crate::outbound::EdgeOutboundQueueSqlite;
+
+// v1.2.0 (CIRISPersist#48) — maintenance trait surface + typed
+// reports. Operation-side of the agent's
+// `DatabaseMaintenanceService`; absorbs vacuum / archive_expired /
+// prune-audit-chain orchestration. Trait + types live at
+// `ciris_persist::maintenance`; the umbrella is reachable through
+// the [`Engine`] dispatcher's per-backend accessor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub use crate::maintenance::{
+    ArchiveReport, ArchiveWindow, MaintenanceReport, MaintenanceService, PruneReport, VacuumReport,
+};
