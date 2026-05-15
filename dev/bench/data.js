@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778808526276,
+  "lastUpdate": 1778814186487,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -13877,6 +13877,72 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23728507,
             "range": "± 236667",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "cdf033a58bae0035dddb702beca9d09c16e6244b",
+          "message": "1.1.0 — Path A polymorphic pipeline + Edge wire-transport substrate\n\nThe v1.x cuts thus far:\n- v1.0.x — agent-adoption substrate (PyO3 SQLite, typed exceptions,\n  11/22 services unblocked via in-process callers).\n- v1.1.0 — Edge wire-transport substrate (polymorphic pipeline +\n  substrate constructors decoupled from Engine + HTTP routes +\n  FederatedSecretsClient + serde_json diagnostic surfacing).\n\nBundle:\n- #33 parts 1-2: Path A polymorphic Pipeline<E: WireEnvelope>.\n  ClassifyStage / ScrubStage / EncryptAndStoreStage<S, E> generic;\n  ExtractStage stays Stage<BatchEnvelope> (Features structurally\n  trace-coupled). MatchAddress enum replaces v1.0.x's flat\n  component_index. Three factories: default_inbound_pipeline (full\n  4-stage BatchEnvelope), default_outbound_pipeline<E> (generic\n  Classify + Scrub), default_speak_pipeline (Classify + Scrub +\n  EncryptAndStore on InlineTextEnvelope).\n- #33 part 3: POST /api/v1/pipeline/ingest route. PipelineEnvelope\n  verify (schema_version allowlist + edge_signature via\n  verify_hybrid_via_directory + inner agent signature) + FSD §4.3\n  invariants. Queue API extended with try_submit_with_sidecar.\n- #33 part 4a: 15 secrets-server axum routes mirroring SecretsService.\n  16-type wire shape in src/secrets/wire.rs. Three-tier role-tag\n  design (enforcement deferred to v1.1.x with KeyRecord schema add).\n- #33 part 4b: FederatedSecretsClient over reqwest (rustls-tls). New\n  secrets-client feature. impls SecretsService for transparent\n  in-process ↔ federated swap.\n- #43: substrate constructors decoupled from Engine. New Rust-side\n  Engine struct + FederationDirectorySqlite::open + EdgeOutboundQueue\n  Sqlite::open. PyEngine untouched.\n- #44: Error::Json(_)::detail() surfaces serde_json msg — CIRISLens#13\n  operator diagnostics.\n\nSix commits aggregate: 1f74d29 (json detail), b2bbdae (substrate\nctors), 4e42fbd (Path A refactor), 3db08a7 (pipeline ingest route),\ndd029bf (secrets-server routes), 6fc8654 (FederatedSecretsClient).\n\nv1.1.x follow-ups documented in CHANGELOG: role-tag enforcement,\npersister sidecar consumption, pipeline pyo3 wraps, async-native\npyo3, reencrypt-all bytes loading, access-logs filter push-down.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-14T21:58:20-05:00",
+          "tree_id": "7a28393108504c2d23686f0847ee7ec43f90d7e8",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/cdf033a58bae0035dddb702beca9d09c16e6244b"
+        },
+        "date": 1778814154124,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 103868,
+            "range": "± 440",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 244766,
+            "range": "± 767",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 525944,
+            "range": "± 3877",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1853076,
+            "range": "± 50958",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2370821,
+            "range": "± 114601",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6716571,
+            "range": "± 123944",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23878470,
+            "range": "± 318358",
             "unit": "ns/iter"
           }
         ]
