@@ -27,6 +27,13 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+// v1.1.0 (CIRISPersist#33): `MatchAddress` moved to the always-on
+// `pipeline::wire_envelope` module so the `WireEnvelope` trait can
+// reference it without requiring the `classify` feature. Re-exported
+// here so existing `classify::MatchAddress` import paths continue to
+// resolve.
+pub use crate::pipeline::wire_envelope::MatchAddress;
+
 /// **D1** — What the matched span IS. The taxonomic noun.
 ///
 /// 36 built-in variants across 4 groups + one `Custom(String)` escape
@@ -261,12 +268,19 @@ pub struct ContentClassMatch {
     /// Stable matcher id (e.g. `"regex:email_v1"`, `"ner:xlm-r:PER"`).
     /// Used for differential testing + learning attribution.
     pub matcher_id: String,
-    /// Which component within the BatchEnvelope this match came from.
-    pub component_index: usize,
-    /// JSON-pointer-like path to the matched field within the
-    /// component payload. `None` for whole-component matches (e.g.
-    /// `Action::Drop`).
-    pub json_path: Option<String>,
+    /// v1.1.0 (CIRISPersist#33): match address. Replaces the v1.0.x
+    /// `component_index: usize` + `json_path: Option<String>` field
+    /// pair so inline-text-envelope matches (SPEAK / LLM-prompt /
+    /// WBD / DSAR) can address themselves without faking a component
+    /// index. See [`MatchAddress`] for the variant shape.
+    ///
+    /// Migration safety: the v1.0.x matcher catalog was stubbed
+    /// (per the v1.0.0 CHANGELOG: "ClassifyStage populates empty
+    /// per-component classification vecs"), so production
+    /// `classifications` JSONB blobs are empty or absent — no
+    /// wire-format data-migration is needed. The new shape IS the
+    /// v1.1.0 wire shape.
+    pub address: MatchAddress,
     /// Byte-offset span `(start, end)` within the matched string.
     /// `None` for non-textual matches.
     pub span: Option<(usize, usize)>,
@@ -334,8 +348,10 @@ mod tests {
             sensitivity: Sensitivity::Medium,
             action: Action::ScrubReplace,
             matcher_id: "regex:email_v1".into(),
-            component_index: 0,
-            json_path: Some("$.task_description".into()),
+            address: MatchAddress::BatchComponent {
+                index: 0,
+                json_path: Some("$.task_description".into()),
+            },
             span: Some((10, 32)),
             confidence: 1.0,
             learning: None,
@@ -348,7 +364,45 @@ mod tests {
         assert_eq!(back.sensitivity, m.sensitivity);
         assert_eq!(back.action, m.action);
         assert_eq!(back.matcher_id, m.matcher_id);
-        assert_eq!(back.json_path, m.json_path);
+        assert_eq!(back.address, m.address);
         assert_eq!(back.span, m.span);
+    }
+
+    /// v1.1.0 (CIRISPersist#33): MatchAddress wire format. Adjacently-
+    /// tagged, snake_case kind, json_path elided when None.
+    #[test]
+    fn match_address_serde_batch_component_no_path() {
+        let a = MatchAddress::BatchComponent {
+            index: 2,
+            json_path: None,
+        };
+        let s = serde_json::to_string(&a).unwrap();
+        assert_eq!(s, r#"{"kind":"batch_component","index":2}"#);
+        let back: MatchAddress = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, a);
+    }
+
+    #[test]
+    fn match_address_serde_batch_component_with_path() {
+        let a = MatchAddress::BatchComponent {
+            index: 0,
+            json_path: Some("$.task_description".into()),
+        };
+        let s = serde_json::to_string(&a).unwrap();
+        assert_eq!(
+            s,
+            r#"{"kind":"batch_component","index":0,"json_path":"$.task_description"}"#
+        );
+        let back: MatchAddress = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, a);
+    }
+
+    #[test]
+    fn match_address_serde_inline_text() {
+        let a = MatchAddress::InlineText { json_path: None };
+        let s = serde_json::to_string(&a).unwrap();
+        assert_eq!(s, r#"{"kind":"inline_text"}"#);
+        let back: MatchAddress = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, a);
     }
 }

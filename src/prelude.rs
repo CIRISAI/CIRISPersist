@@ -99,6 +99,11 @@ pub use crate::federation::{
 // federation peers calling either path need the typed outcome enum.
 pub use crate::ClaimResult;
 
+// v1.1.0 (CIRISPersist#33) — generic pipeline substrate trait +
+// inline-text envelope + match address. Consumers wiring outbound
+// SPEAK / LLM-prompt / WBD / DSAR pipelines compose against these.
+pub use crate::pipeline::{InlineTextEnvelope, MatchAddress, WireEnvelope};
+
 // v1.1.0 (CIRISPersist#43) — Rust-side substrate composition handle
 // + SQLite-only direct constructors for sovereign-mode Reticulum
 // agents and in-process lens-core consumers.

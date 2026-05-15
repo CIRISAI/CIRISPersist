@@ -8556,8 +8556,10 @@ mod tests {
                 sensitivity: crate::pipeline::classify::Sensitivity::Medium,
                 action: crate::pipeline::classify::Action::ScrubReplace,
                 matcher_id: "regex:email_v1".into(),
-                component_index: 0,
-                json_path: Some("$.task_description".into()),
+                address: crate::pipeline::classify::MatchAddress::BatchComponent {
+                    index: 0,
+                    json_path: Some("$.task_description".into()),
+                },
                 span: Some((0, 16)),
                 confidence: 1.0,
                 learning: None,
