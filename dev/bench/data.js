@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778814186487,
+  "lastUpdate": 1778815194499,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -13943,6 +13943,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23878470,
             "range": "± 318358",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "0cdde185cb248bb5ca222d49d551459c2612d4f0",
+          "message": "1.1.1 — feature-gate Backend import in engine.rs\n\nv1.1.0 tag CI failed at `cargo test --test wire_format_fixtures` (the\nno-features integration target). engine.rs imported\n`crate::store::Backend` unconditionally, but the trait is only\nreachable + used when postgres or sqlite is on. Under no-features\nthe import was unused → `-D warnings` rejected the lib build.\n\nFix: gate `use crate::store::Backend` on `any(feature = \"postgres\",\nfeature = \"sqlite\")`. StoreError import stays unconditional (used by\nEngineError regardless of backend feature).\n\nNo surface change. v1.1.0 is the substantive cut; v1.1.1 is the first\n1.1.x wheel that reaches PyPI.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-14T22:11:59-05:00",
+          "tree_id": "bf6035261d0bea3dfdb99b2f48c2f06e370630f2",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/0cdde185cb248bb5ca222d49d551459c2612d4f0"
+        },
+        "date": 1778815193875,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101388,
+            "range": "± 1508",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 241859,
+            "range": "± 2083",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 522627,
+            "range": "± 2117",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1843070,
+            "range": "± 17447",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 347,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1454,
+            "range": "± 19",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7574,
+            "range": "± 110",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21116,
+            "range": "± 66",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24156,
+            "range": "± 69",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83486,
+            "range": "± 172",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 390,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3127,
+            "range": "± 343",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9578,
+            "range": "± 54",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42092,
+            "range": "± 161",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 1452,
+            "range": "± 18",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2294051,
+            "range": "± 96665",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6631093,
+            "range": "± 168213",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23759271,
+            "range": "± 611617",
             "unit": "ns/iter"
           }
         ]
