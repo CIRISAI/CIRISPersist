@@ -99,6 +99,12 @@ pub use crate::federation::{
 // federation peers calling either path need the typed outcome enum.
 pub use crate::ClaimResult;
 
+// v1.1.0 (CIRISPersist#33 part 4b) — federated HTTP client for the
+// secrets API. Mirrors the SecretsService trait surface so consumer
+// code can swap in-process ↔ federated transparently.
+#[cfg(feature = "secrets-client")]
+pub use crate::secrets::FederatedSecretsClient;
+
 // v1.1.0 (CIRISPersist#33) — generic pipeline substrate trait +
 // inline-text envelope + match address. Consumers wiring outbound
 // SPEAK / LLM-prompt / WBD / DSAR pipelines compose against these.

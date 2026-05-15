@@ -63,11 +63,17 @@ pub mod sqlite;
 #[cfg(feature = "secrets")]
 pub mod types;
 
-#[cfg(feature = "secrets-server")]
+#[cfg(any(feature = "secrets-server", feature = "secrets-client"))]
 pub mod wire;
+
+#[cfg(feature = "secrets-client")]
+pub mod client;
 
 #[cfg(feature = "secrets")]
 pub use service::SecretsService;
+
+#[cfg(feature = "secrets-client")]
+pub use client::FederatedSecretsClient;
 
 #[cfg(feature = "secrets")]
 pub use types::{
