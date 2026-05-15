@@ -44,8 +44,12 @@
 //! disjoint batches. Expired claims (worker crashed mid-flight)
 //! revert via `sweep_expired_claims`.
 
+#[cfg(feature = "sqlite")]
+pub mod sqlite_open;
 pub mod types;
 
+#[cfg(feature = "sqlite")]
+pub use sqlite_open::EdgeOutboundQueueSqlite;
 pub use types::{
     AbandonedReason, OutboundFailureOutcome, OutboundFilter, OutboundRow, OutboundStatus, QueueId,
 };

@@ -98,3 +98,12 @@ pub use crate::federation::{
 // by SecretsService::try_claim_secret + AuditService::try_claim_event;
 // federation peers calling either path need the typed outcome enum.
 pub use crate::ClaimResult;
+
+// v1.1.0 (CIRISPersist#43) — Rust-side substrate composition handle
+// + SQLite-only direct constructors for sovereign-mode Reticulum
+// agents and in-process lens-core consumers.
+pub use crate::engine::{BackendDispatch, Engine, EngineError};
+#[cfg(feature = "sqlite")]
+pub use crate::federation::FederationDirectorySqlite;
+#[cfg(feature = "sqlite")]
+pub use crate::outbound::EdgeOutboundQueueSqlite;

@@ -42,6 +42,7 @@ pub mod audit;
 #[cfg(feature = "cirisnode")]
 pub mod cirisnode;
 pub mod derived;
+pub mod engine;
 pub mod federation;
 pub mod ffi;
 #[cfg(feature = "cirisgraph")]
@@ -68,8 +69,13 @@ pub mod store;
 pub mod telemetry;
 pub mod verify;
 
+pub use engine::{BackendDispatch, Engine, EngineError};
+#[cfg(feature = "sqlite")]
+pub use federation::FederationDirectorySqlite;
 pub use ingest::{BatchSummary, IngestError, IngestPipeline};
 pub use journal::{Journal, JournalError};
+#[cfg(feature = "sqlite")]
+pub use outbound::EdgeOutboundQueueSqlite;
 pub use queue::{
     shutdown_signal, spawn_persister, IngestHandle, PersisterHandle, QueueError,
     DEFAULT_QUEUE_DEPTH,

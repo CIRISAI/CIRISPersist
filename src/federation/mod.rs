@@ -34,8 +34,12 @@
 
 use std::future::Future;
 
+#[cfg(feature = "sqlite")]
+pub mod sqlite_open;
 pub mod types;
 
+#[cfg(feature = "sqlite")]
+pub use sqlite_open::FederationDirectorySqlite;
 pub use types::{
     Attestation, HybridPendingRow, KeyRecord, Revocation, SignedAttestation, SignedKeyRecord,
     SignedRevocation,
