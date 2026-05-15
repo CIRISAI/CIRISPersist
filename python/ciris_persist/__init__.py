@@ -26,15 +26,25 @@ Engine rejects schema-altering scrubber output.
 """
 
 from .ciris_persist import (
+    Conflict,
     Engine,
     LensQueryError,
+    NotFound,
+    Permanent,
+    PersistError,
     SUPPORTED_SCHEMA_VERSIONS,
+    Transient,
     __version__,
 )
 
 __all__ = [
+    "Conflict",
     "Engine",
     "LensQueryError",
+    "NotFound",
+    "Permanent",
+    "PersistError",
     "SUPPORTED_SCHEMA_VERSIONS",
+    "Transient",
     "__version__",
 ]

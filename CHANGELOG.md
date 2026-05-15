@@ -5,6 +5,25 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.0.3] — 2026-05-14
+
+**v1.0.2 with Python wrapper re-export fixup.** v1.0.2 tag CI failed
+the typed-exception-hierarchy smoke because the inner Rust pyo3 module
+registers `PersistError` / `NotFound` / `Conflict` / `Transient` /
+`Permanent`, but the Python wrapper at `python/ciris_persist/
+__init__.py` only re-exported `Engine` + `LensQueryError` from the
+inner module. Agent code doing `from ciris_persist import NotFound`
+saw `ImportError`.
+
+- `python/ciris_persist/__init__.py` — adds the four typed exception
+  classes + base `PersistError` to both the import statement and
+  `__all__`. Now `from ciris_persist import NotFound, Conflict,
+  Transient, Permanent, PersistError` works as documented.
+
+No substrate change. v1.0.0–v1.0.2 tags remain on their commits;
+v1.0.3 is the first wheel that actually publishes to PyPI with the
+agent-facing exception classes reachable.
+
 ## [1.0.2] — 2026-05-14
 
 **v1.0.1 with Python smoke test fixup.** v1.0.1 tag CI failed because
