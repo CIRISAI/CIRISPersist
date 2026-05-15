@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778815194499,
+  "lastUpdate": 1778816597659,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -14075,6 +14075,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23759271,
             "range": "± 611617",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "6f8b5f054807e0cdb3ec1e1961e3cbe16194a621",
+          "message": "1.1.2 — ReasoningEventType Unknown (#45) + verify 2.1.5 + CI hardening\n\nThree bundled hardening items:\n\n1. ReasoningEventType::Unknown (#45) — closes CIRISLens#13 second\n   half.\n\n   Add #[serde(other)] Unknown variant to ReasoningEventType. Same\n   shape as ComponentType::Unknown (shipped v0.1.x). When an agent\n   emits a wire value not in the closed §4 set (real prod: 3 agents\n   emitting parent_event_type=\"UNKNOWN_PARENT\" for 48h, 28-43%\n   reject rate on /accord/events), persist now absorbs into Unknown\n   instead of failing Error::Json(_) → schema_malformed_json →\n   infinite agent retries. AV-15 safe: catchall echoes no\n   attacker-controlled bytes; serializes back as constant \"UNKNOWN\".\n\n   Pair: v1.1.1 #44 fix surfaced WHICH field failed (Error::Json::\n   detail() returns serde_json msg); v1.1.2 #45 prevents the\n   rejection entirely on enum drift. Lens#13 root cause closed.\n\n2. CIRISVerify 2.0.5 → 2.1.5 pin bump.\n\n   - Cargo.toml ciris-verify-core git tag → v2.1.5\n   - pyproject.toml ciris-verify>=2.1.5,<3\n   - CI ciris-build-sign tarball → v2.1.5 prebuild\n\n   The 2.1.x series is CIRISVerify's CI hardening arc; library\n   surface unchanged from 2.0.5.\n\n3. CI hardening playbook from CIRISVerify v2.1.x.\n\n   - gh release download retry on ciris-build-sign tarball fetch\n     (3 attempts, backoff). Absorbs GitHub API transient 5xx.\n   - pip install retry on the 3 pip-install sites (maturin +\n     pytest + venv-scoped). Same shape against PyPI blips.\n   - continue-on-error: true on every Swatinem/rust-cache@v2 site\n     (4 sites). Cache miss/corruption shouldn't fail the whole\n     job — recompile slower but correct.\n\n   Not folded in (don't apply to persist's matrix):\n   - v2.1.5's `shell: bash` on guard — persist has no Windows\n     runners. Matrix is Linux + macOS-14 (arm) + iOS cross-compile.\n   - v2.1.4-style active heal on dtolnay shim — persist never hit\n     the macOS x86_64 shadow because we already had cache-bin:\n     false from v0.7.2.\n\nNo library surface change. Hardening cut on top of v1.1.1.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-14T22:34:21-05:00",
+          "tree_id": "709c37cad623715942ce226d7835ea7eabb9e196",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/6f8b5f054807e0cdb3ec1e1961e3cbe16194a621"
+        },
+        "date": 1778816596701,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101568,
+            "range": "± 3979",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 242534,
+            "range": "± 3666",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 524205,
+            "range": "± 3265",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1851569,
+            "range": "± 15338",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 341,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1434,
+            "range": "± 21",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7566,
+            "range": "± 318",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21108,
+            "range": "± 704",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24147,
+            "range": "± 219",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83464,
+            "range": "± 563",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 375,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3050,
+            "range": "± 21",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9347,
+            "range": "± 92",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41826,
+            "range": "± 475",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 621,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2293460,
+            "range": "± 141009",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6667077,
+            "range": "± 154859",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 24032781,
+            "range": "± 291505",
             "unit": "ns/iter"
           }
         ]
