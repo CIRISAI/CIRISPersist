@@ -66,7 +66,13 @@ use crate::signing::StewardSigner;
 use crate::store::PostgresBackend;
 #[cfg(feature = "sqlite")]
 use crate::store::SqliteBackend;
-use crate::store::{Backend, Error as StoreError};
+// `Backend` is only reachable via the postgres / sqlite trait impls;
+// gate the import so a no-backend build (e.g.
+// `cargo test --test wire_format_fixtures`) doesn't see it as
+// unused under the CI's `-D warnings`.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+use crate::store::Backend;
+use crate::store::Error as StoreError;
 
 /// v1.1.0 (CIRISPersist#43) — public dispatch enum over the
 /// substrate's storage backends.

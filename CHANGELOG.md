@@ -5,6 +5,23 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.1.1] — 2026-05-15
+
+**v1.1.0 with no-features compile fix.** v1.1.0 tag CI failed at
+`cargo test --test wire_format_fixtures` (no-features integration test
+target). `src/engine.rs:69` imported `crate::store::Backend`
+unconditionally, but the trait is only reachable + used when one of
+the `postgres` / `sqlite` features is on. Under no-features, the
+import was unused → `-D warnings` rejected the build.
+
+- `src/engine.rs` — feature-gate the `Backend` import on
+  `any(feature = "postgres", feature = "sqlite")`. `StoreError` import
+  stays unconditional (used by `EngineError` variant regardless of
+  backend).
+
+No surface change. v1.1.0 is the substantive cut; v1.1.1 is the first
+wheel of the 1.1.x series that publishes to PyPI.
+
 ## [1.1.0] — 2026-05-14
 
 **Edge wire-transport substrate complete + Pipeline polymorphic.** v1.0.x
