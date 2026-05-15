@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778807888771,
+  "lastUpdate": 1778808526276,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -13745,6 +13745,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23806592,
             "range": "± 595874",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "bbf1778d79bdbaeaf06a6e09d12d90d24c5459dd",
+          "message": "1.0.3 — re-export typed exception classes in Python wrapper\n\nv1.0.2 tag CI failed test_typed_exception_hierarchy_exported because\nthe inner Rust pyo3 module registers `PersistError` / `NotFound` /\n`Conflict` / `Transient` / `Permanent` but the Python wrapper at\n`python/ciris_persist/__init__.py` only re-exports `Engine` +\n`LensQueryError` from the inner module. Agent code doing\n`from ciris_persist import NotFound` saw ImportError.\n\nBug-for-bug: same shape oversight that bit v0.6.1 secrets surface\nduring the early pyo3 lift. Adding the typed exception names to both\nthe `from .ciris_persist import (...)` line and `__all__`.\n\nNo substrate change. v1.0.3 is the first wheel that publishes to PyPI\nwith the agent-facing exception classes actually reachable.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-14T20:21:18-05:00",
+          "tree_id": "b8852dee40880be35902fe3af77b763276971b4a",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/bbf1778d79bdbaeaf06a6e09d12d90d24c5459dd"
+        },
+        "date": 1778808525792,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101401,
+            "range": "± 196",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 241442,
+            "range": "± 2123",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 523287,
+            "range": "± 3485",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1845956,
+            "range": "± 20187",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 352,
+            "range": "± 18",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1474,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7339,
+            "range": "± 102",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21152,
+            "range": "± 353",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24200,
+            "range": "± 178",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83547,
+            "range": "± 203",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 359,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3195,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9323,
+            "range": "± 21",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41690,
+            "range": "± 101",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 784,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2311799,
+            "range": "± 150880",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6662467,
+            "range": "± 201108",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23728507,
+            "range": "± 236667",
             "unit": "ns/iter"
           }
         ]
