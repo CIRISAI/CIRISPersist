@@ -36,6 +36,8 @@ use crate::queue::{IngestHandle, QueueError};
 use crate::store::Backend;
 
 pub mod pipeline;
+#[cfg(feature = "secrets-server")]
+pub mod secrets;
 
 /// Server state shared across handlers.
 ///
@@ -102,6 +104,25 @@ pub const MAX_INGEST_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// so the `POST /api/v1/pipeline/ingest` route can verify the edge
 /// signature against whichever concrete backend the deployment composed
 /// (memory / postgres / sqlite). See [`AppState`] for the rationale.
+///
+/// # Secrets routes composition
+///
+/// When the `secrets-server` feature is on, the federated secrets
+/// CRUD surface lives in [`secrets::router`]. The
+/// [`SecretsService`](crate::secrets::SecretsService) trait uses
+/// RPITIT (`impl Future + Send` return-position syntax) and is
+/// therefore NOT object-safe; we can't fold a
+/// `secrets_service: Arc<dyn SecretsService>` into [`AppState`].
+/// Callers compose the two routers explicitly:
+///
+/// ```ignore
+/// let app = ciris_persist::server::router(app_state)
+///     .merge(ciris_persist::server::secrets::router(secrets_state));
+/// ```
+///
+/// This mirrors the v1.1.0 part-3 pipeline-ingest pattern: each
+/// route family parameterizes over the concrete backend it needs,
+/// and the deployment composes them at boot.
 pub fn router<F>(state: AppState<F>) -> Router
 where
     F: FederationDirectory + Backend + 'static,

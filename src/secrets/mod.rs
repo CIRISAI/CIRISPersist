@@ -63,6 +63,9 @@ pub mod sqlite;
 #[cfg(feature = "secrets")]
 pub mod types;
 
+#[cfg(feature = "secrets-server")]
+pub mod wire;
+
 #[cfg(feature = "secrets")]
 pub use service::SecretsService;
 
