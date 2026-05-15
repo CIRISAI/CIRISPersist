@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778816597659,
+  "lastUpdate": 1778857819018,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -14207,6 +14207,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 24032781,
             "range": "± 291505",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "e559fa5a8bb5c4904b0c093013bc5cde05b21ec4",
+          "message": "1.2.0 — MaintenanceService absorption + DatabaseMaintenance reclass\n\nCloses CIRISPersist#48. DatabaseMaintenance splits like Auth +\nAdaptiveFilter did: operations → persist, scheduling → agent's\nTaskSchedulerService. The agent-side DatabaseMaintenance service\ndisappears as a separate concern; collapses into TaskScheduler\ninvoking engine.maintain().\n\nPost-fold 22-service count (locked): 10 → persist substrate (incl.\nthis), 1 → LensCore (Audit), 2 → Edge (transit-touch), 10 → agent.\n\nSurface:\n- MaintenanceService trait (vacuum_substrate / archive_expired /\n  prune_audit_chain / maintain umbrella).\n- Engine::maintenance() accessor + EngineMaintenance enum (trait\n  isn't object-safe — RPITIT).\n- 4 PyEngine methods returning JSON reports.\n- 4 substrate modules with retention defaults: telemetry (V015\n  expires_at), secrets access_log (30d), incidents-closed (90d\n  on last_seen_at), federation_keys-expired (180d on valid_until).\n\nImplementation gotchas documented:\n- VACUUM can't run in tx → batch_execute on deadpool client.\n- SQLite datetime cross-format compare via julianday() (RFC 3339\n  and YYYY-MM-DD HH:MM:SS sort lexico-wrong against each other).\n- prune_audit_chain stubbed pending CIRISAgent#760 Counter-RII\n  review-window guidance.\n\nTests: +9 (5 SQLite + 4 PG + 1 unit). Lib: 301/301 passing.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-15T10:02:25-05:00",
+          "tree_id": "f19572c72c4777a43c224ff675e32636afc7ca9b",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/e559fa5a8bb5c4904b0c093013bc5cde05b21ec4"
+        },
+        "date": 1778857818558,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 108782,
+            "range": "± 1109",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 260519,
+            "range": "± 4433",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 561882,
+            "range": "± 8821",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1998699,
+            "range": "± 12806",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 313,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1427,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 6562,
+            "range": "± 44",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23172,
+            "range": "± 60",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26439,
+            "range": "± 63",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91089,
+            "range": "± 2305",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 370,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3030,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9655,
+            "range": "± 146",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42339,
+            "range": "± 796",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 637,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2249113,
+            "range": "± 202148",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6975323,
+            "range": "± 640224",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25649951,
+            "range": "± 1893140",
             "unit": "ns/iter"
           }
         ]
