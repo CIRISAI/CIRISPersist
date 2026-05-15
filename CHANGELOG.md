@@ -5,6 +5,26 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.2.1] — 2026-05-15
+
+**v1.2.0 PG integration test fix.** v1.2.0 tag CI hit two PG-side
+failures in the new maintenance test fixtures + impl:
+
+1. **Test fixture**: bound `&"{}"` to a `jsonb` column. Even with
+   `$5::jsonb` SQL cast, tokio-postgres rejects `&str → jsonb` because
+   param-type negotiation runs before SQL casts. Fixed by binding via
+   `serde_json::json!({})`.
+2. **Impl**: `make_interval(secs => $1)` with an `i64` bind. PG's
+   `secs` parameter is `double precision`, not `bigint`; binding i64
+   raises `WrongType { postgres: Float8, rust: "i64" }`. Fixed by
+   changing `fixed_seconds` return type i64 → f64 across all four
+   call sites (telemetry-custom, secrets, incidents, federation).
+
+Both surfaced only on the CIRISVerify v2.1.x CI matrix (the live PG
+test path) — local SQLite + no-DB integration paths didn't trip them.
+
+No surface change. v1.2.1 is the first 1.2.x wheel that reaches PyPI.
+
 ## [1.2.0] — 2026-05-15
 
 **Maintenance ops absorbed + DatabaseMaintenance reclassification (closes #48).**

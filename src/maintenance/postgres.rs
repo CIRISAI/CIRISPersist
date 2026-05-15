@@ -56,10 +56,15 @@ fn map_pg_error(e: tokio_postgres::Error, op: &str) -> Error {
     Error::Backend(format!("{op}: {detail}"))
 }
 
-fn fixed_seconds(window: ArchiveWindow, default_days: i64) -> i64 {
+/// Compute the cutoff seconds for an archive window.
+///
+/// PG `make_interval(secs => …)` expects `double precision`, not
+/// bigint — binding i64 raises `WrongType { postgres: Float8,
+/// rust: "i64" }`. Returning f64 lines up the bind types.
+fn fixed_seconds(window: ArchiveWindow, default_days: f64) -> f64 {
     match window {
-        ArchiveWindow::SubstrateDefault => default_days * 86_400,
-        ArchiveWindow::Custom { seconds } => seconds as i64,
+        ArchiveWindow::SubstrateDefault => default_days * 86_400.0,
+        ArchiveWindow::Custom { seconds } => seconds as f64,
     }
 }
 
@@ -116,7 +121,7 @@ impl MaintenanceService for PostgresMaintenanceBackend {
                 .await
                 .map_err(|e| map_pg_error(e, "DELETE telemetry"))?,
             ArchiveWindow::Custom { seconds } => {
-                let secs = seconds as i64;
+                let secs = seconds as f64;
                 client
                     .execute(
                         "DELETE FROM cirisgraph.telemetry_metrics \
@@ -131,7 +136,7 @@ impl MaintenanceService for PostgresMaintenanceBackend {
         total += telemetry_n as usize;
 
         // ── secrets access_log: 30-day default ───────────────────
-        let secrets_secs = fixed_seconds(window, 30);
+        let secrets_secs = fixed_seconds(window, 30.0);
         let secrets_n = client
             .execute(
                 "DELETE FROM cirislens_secrets.access_log \
@@ -149,7 +154,7 @@ impl MaintenanceService for PostgresMaintenanceBackend {
         // is the closest analog — it tracks when the incident was
         // most recently observed; for closed incidents that's
         // effectively the resolution timestamp.
-        let incidents_secs = fixed_seconds(window, 90);
+        let incidents_secs = fixed_seconds(window, 90.0);
         let incidents_n = client
             .execute(
                 "DELETE FROM cirislens.incident_records \
@@ -170,7 +175,7 @@ impl MaintenanceService for PostgresMaintenanceBackend {
         // analog operational signal is `valid_until` (key expiry).
         // Keys whose validity ended more than the cutoff ago are
         // safe to archive.
-        let federation_secs = fixed_seconds(window, 180);
+        let federation_secs = fixed_seconds(window, 180.0);
         let federation_n = client
             .execute(
                 "DELETE FROM cirislens.federation_keys \
@@ -274,9 +279,18 @@ mod tests {
                     "INSERT INTO cirisgraph.telemetry_metrics (\
                         metric_id, metric_name, tenant_id, value, labels, \
                         observed_at, expires_at\
-                     ) VALUES ($1::uuid, $2, $3, $4, $5::jsonb, NOW() - INTERVAL '2 hours', \
+                     ) VALUES ($1::uuid, $2, $3, $4, $5, NOW() - INTERVAL '2 hours', \
                         NOW() - INTERVAL '1 hour')",
-                    &[&Uuid::new_v4(), &"mnt.test.metric", &tenant, &1.0f64, &"{}"],
+                    // labels is JSONB — bind via serde_json::Value, not &str.
+                    // tokio-postgres can't auto-cast str→jsonb even with $5::jsonb
+                    // (the param-type negotiation runs before the SQL cast).
+                    &[
+                        &Uuid::new_v4(),
+                        &"mnt.test.metric",
+                        &tenant,
+                        &1.0f64,
+                        &serde_json::json!({}),
+                    ],
                 )
                 .await
                 .unwrap();
