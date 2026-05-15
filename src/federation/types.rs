@@ -192,6 +192,16 @@ pub struct KeyRecord {
     /// compare; they don't reproduce the canonicalizer. Closes the
     /// shortest-round-trip drift class of cache-divergence bugs.
     pub persist_row_hash: String,
+    /// v1.3.0 (CIRISPersist#46) — Per-row role tags. Determines what
+    /// the key is authorized to do at the persist API boundary:
+    /// `cirislens_pipeline_writer` gates `POST /api/v1/pipeline/ingest`;
+    /// `cirislens_secrets_reader` / `_writer` / `_admin` gate the
+    /// secrets routes. Empty default — pre-V020 rows + new rows that
+    /// didn't declare roles deserialize to `vec![]`. The `#[serde(default)]`
+    /// keeps the wire shape backward-compatible with v1.2.x writers
+    /// that don't know about the field yet.
+    #[serde(default)]
+    pub roles: Vec<String>,
 }
 
 impl KeyRecord {
@@ -356,6 +366,147 @@ pub struct SignedRevocation {
     pub revocation: Revocation,
 }
 
+// ─── Trust hierarchy (v1.3.0, CIRISPersist#46 + #47) ───────────────
+//
+// Persist absorbs NodeCore's `crate::trust` module surface at the
+// M2 cut. See FSD TRUST_HIERARCHY.md §4.1 and the NodeCore
+// `src/trust.rs` source (commit be82bd9) for the architectural
+// rationale. Shapes mirror NodeCore exactly so NodeCore can
+// replace its local placeholder trait definition with
+// `pub use ciris_persist::federation::FederationDirectory` once
+// this release ships.
+
+/// Trust type axis. Mirrors CIRISAgent ConsentService taxonomy;
+/// tracks CIRISAgent#760 §RC consent_role lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustType {
+    /// Default. Most peer-to-peer agent-to-agent observations.
+    Temporary,
+    /// Bilateral approval (CIRISAgent#760 / LensCore ConsentService scope).
+    Partnered,
+    /// Anonymous trust grant.
+    Anonymous,
+}
+
+impl TrustType {
+    /// Wire-shaped string. Matches the federation_keys.trust_type
+    /// CHECK constraint vocabulary.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Temporary => "temporary",
+            Self::Partnered => "partnered",
+            Self::Anonymous => "anonymous",
+        }
+    }
+
+    /// Parse from the wire-shaped string. Returns `None` on
+    /// vocabulary mismatch.
+    pub fn from_wire_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "temporary" => Self::Temporary,
+            "partnered" => Self::Partnered,
+            "anonymous" => Self::Anonymous,
+            _ => return None,
+        })
+    }
+}
+
+/// Trust relationship axis. New axis introduced by FSD
+/// TRUST_HIERARCHY.md.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustRelationship {
+    /// Peer trust — `K_B` can act directly with the grantor.
+    Direct,
+    /// Vouching delegation — `K_B` can vouch for other keys within
+    /// `trust_domains` only.
+    Registry,
+}
+
+impl TrustRelationship {
+    /// Wire-shaped string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Registry => "registry",
+        }
+    }
+
+    /// Parse from the wire-shaped string.
+    pub fn from_wire_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "direct" => Self::Direct,
+            "registry" => Self::Registry,
+            _ => return None,
+        })
+    }
+}
+
+/// A trust grant — what the grantor declared. The persist write
+/// path materializes this into a row on `federation_keys` (UPSERT
+/// on `key_id`, preserving the pubkey + signature envelope from the
+/// prior `put_public_key`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustGrant {
+    /// Subject of the grant — the trusted key.
+    pub key: String,
+    /// Type axis.
+    pub trust_type: TrustType,
+    /// Relationship axis.
+    pub trust_relationship: TrustRelationship,
+    /// Domain scope. Required when `trust_relationship = Registry`;
+    /// `None` for `Direct` grants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_domains: Option<Vec<String>>,
+    /// Grantor key. Must differ from `key` per the
+    /// `trusted_by != key` integrity rule (no self-trust).
+    pub trusted_by: String,
+    /// `None` = open-ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// A row from the directory — the grant + its `trusted_at`
+/// timestamp. Returned by
+/// [`super::FederationDirectory::lookup_trust`] and
+/// [`super::FederationDirectory::list_trusted_keys`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrustRow {
+    /// Subject of the grant.
+    pub key: String,
+    /// Type axis.
+    pub trust_type: TrustType,
+    /// Relationship axis.
+    pub trust_relationship: TrustRelationship,
+    /// Domain scope (`Some` when relationship = Registry).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_domains: Option<Vec<String>>,
+    /// Grantor key.
+    pub trusted_by: String,
+    /// When the grant was created.
+    pub trusted_at: DateTime<Utc>,
+    /// `None` = open-ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// Filter for [`super::FederationDirectory::list_trusted_keys`].
+/// All fields AND-composed; every field optional.
+#[derive(Debug, Clone, Default)]
+pub struct TrustFilter {
+    /// Narrow by type axis.
+    pub trust_type: Option<TrustType>,
+    /// Narrow by relationship axis.
+    pub trust_relationship: Option<TrustRelationship>,
+    /// Narrow to registries vouching for `domain`. Only meaningful
+    /// with `trust_relationship = Some(Registry)`.
+    pub domain: Option<String>,
+    /// If `false` (default), expired rows are filtered server-side
+    /// via `WHERE expires_at IS NULL OR expires_at > NOW()`.
+    pub include_expired: bool,
+}
+
 /// Compute the canonical-bytes hash for a row used for
 /// `persist_row_hash`. Persist calls this server-side on every write
 /// path so consumers don't have to.
@@ -420,6 +571,7 @@ mod tests {
                     .into(),
             ),
             persist_row_hash: String::new(),
+            roles: Vec::new(),
         }
     }
 

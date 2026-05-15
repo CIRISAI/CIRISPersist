@@ -1016,14 +1016,22 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // Idempotent on (key_id, persist_row_hash). DO NOTHING when
         // (key_id, persist_row_hash) match exactly; raise Conflict
         // when key_id matches but content differs.
+        //
+        // v1.3.0 (CIRISPersist#46): write the roles list to the TEXT[]
+        // column. Empty Vec maps to NULL via Option<&Vec<String>>.
+        let roles_param: Option<&Vec<String>> = if row.roles.is_empty() {
+            None
+        } else {
+            Some(&row.roles)
+        };
         let result = client
             .execute(
                 "INSERT INTO cirislens.federation_keys (\
                     key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
                     identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) \
                  ON CONFLICT (key_id) DO NOTHING",
                 &[
                     &row.key_id,
@@ -1042,6 +1050,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.scrub_timestamp,
                     &row.pqc_completed_at,
                     &row.persist_row_hash,
+                    &roles_param,
                 ],
             )
             .await
@@ -1084,7 +1093,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
                     identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles \
                  FROM cirislens.federation_keys WHERE key_id = $1",
                 &[&key_id],
             )
@@ -1108,7 +1117,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
                     identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles \
                  FROM cirislens.federation_keys WHERE identity_ref = $1",
                 &[&identity_ref],
             )
@@ -1609,6 +1618,224 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             })
             .collect()
     }
+
+    // ── Trust grants (v1.3.0, CIRISPersist#46 + #47) ───────────────
+
+    async fn grant_trust(
+        &self,
+        grant: crate::federation::TrustGrant,
+    ) -> Result<(), crate::federation::Error> {
+        crate::store::memory::validate_trust_grant(&grant)?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let trust_type_str = grant.trust_type.as_str();
+        let trust_relationship_str = grant.trust_relationship.as_str();
+        // PG TEXT[] binds from `&Vec<String>` via postgres-types' built-in.
+        let domains_owned: Vec<String> = grant.trust_domains.clone().unwrap_or_default();
+        let domains_param: Option<&Vec<String>> = if grant.trust_domains.is_some() {
+            Some(&domains_owned)
+        } else {
+            None
+        };
+        // UPSERT — overwrite trust columns, preserve everything else
+        // (pubkey, signature envelope, etc.). `trusted_at = NOW()` on
+        // the UPDATE branch so a re-grant refreshes the timestamp.
+        // `expires_at` re-set on UPDATE so a re-grant clears any prior
+        // soft-delete.
+        let n = client
+            .execute(
+                "UPDATE cirislens.federation_keys \
+                 SET trust_type = $2, \
+                     trust_relationship = $3, \
+                     trust_domains = $4, \
+                     trusted_by = $5, \
+                     trusted_at = NOW(), \
+                     expires_at = $6 \
+                 WHERE key_id = $1",
+                &[
+                    &grant.key,
+                    &trust_type_str,
+                    &trust_relationship_str,
+                    &domains_param,
+                    &grant.trusted_by,
+                    &grant.expires_at,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                let msg = e.to_string();
+                // V020 CHECK constraints (no self-trust /
+                // registry-requires-domains) surface as `check_violation`
+                // here — translate to InvalidArgument for parity with
+                // the API-layer guards in `validate_trust_grant`.
+                if msg.contains("federation_keys_no_self_trust")
+                    || msg.contains("federation_keys_registry_requires_domains")
+                    || msg.contains("violates check constraint")
+                {
+                    crate::federation::Error::InvalidArgument(format!(
+                        "trust column CHECK violated: {msg}"
+                    ))
+                } else {
+                    crate::federation::Error::Backend(format!("grant_trust UPDATE: {msg}"))
+                }
+            })?;
+        if n == 0 {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "federation_keys row {} does not exist — call put_public_key first",
+                grant.key
+            )));
+        }
+        Ok(())
+    }
+
+    async fn revoke_trust(
+        &self,
+        key: &str,
+        revoked_by: &str,
+    ) -> Result<(), crate::federation::Error> {
+        if key.is_empty() {
+            return Err(crate::federation::Error::InvalidArgument(
+                "key must be non-empty".into(),
+            ));
+        }
+        if revoked_by.is_empty() {
+            return Err(crate::federation::Error::InvalidArgument(
+                "revoked_by must be non-empty".into(),
+            ));
+        }
+        // Idempotent: only set expires_at if the row isn't already
+        // expired. UPDATE returning zero rows is fine (idempotent
+        // no-op); only backend errors propagate.
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .execute(
+                "UPDATE cirislens.federation_keys \
+                 SET expires_at = NOW() \
+                 WHERE key_id = $1 \
+                   AND trusted_by IS NOT NULL \
+                   AND (expires_at IS NULL OR expires_at > NOW())",
+                &[&key],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("revoke_trust: {e}")))?;
+        // `revoked_by` is logged in the audit chain by the caller —
+        // not stored on the row directly (the row keeps the original
+        // `trusted_by` for forensic continuity).
+        let _ = revoked_by;
+        Ok(())
+    }
+
+    async fn lookup_trust(
+        &self,
+        key: &str,
+    ) -> Result<Option<crate::federation::TrustRow>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let row_opt = client
+            .query_opt(
+                "SELECT key_id, trust_type, trust_relationship, trust_domains, \
+                        trusted_by, trusted_at, expires_at \
+                 FROM cirislens.federation_keys \
+                 WHERE key_id = $1 AND trusted_by IS NOT NULL",
+                &[&key],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("lookup_trust: {e}")))?;
+        row_opt.map(pg_row_to_trust_row).transpose()
+    }
+
+    async fn list_trusted_keys(
+        &self,
+        filter: crate::federation::TrustFilter,
+    ) -> Result<Vec<crate::federation::TrustRow>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // Build the parametric WHERE clause. Owned-string holders
+        // keep references alive for the tokio_postgres ToSql binding.
+        let mut where_parts: Vec<String> = vec!["trusted_by IS NOT NULL".to_owned()];
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        if !filter.include_expired {
+            where_parts.push("(expires_at IS NULL OR expires_at > NOW())".to_owned());
+        }
+        if let Some(t) = filter.trust_type {
+            params.push(Box::new(t.as_str().to_owned()));
+            where_parts.push(format!("trust_type = ${}", params.len()));
+        }
+        if let Some(rel) = filter.trust_relationship {
+            params.push(Box::new(rel.as_str().to_owned()));
+            where_parts.push(format!("trust_relationship = ${}", params.len()));
+        }
+        if let Some(domain) = filter.domain {
+            params.push(Box::new(domain));
+            where_parts.push(format!("${} = ANY(trust_domains)", params.len()));
+        }
+        let where_sql = where_parts.join(" AND ");
+        let sql = format!(
+            "SELECT key_id, trust_type, trust_relationship, trust_domains, \
+                    trusted_by, trusted_at, expires_at \
+             FROM cirislens.federation_keys \
+             WHERE {where_sql} \
+             ORDER BY trusted_at DESC, key_id DESC"
+        );
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let rows = client
+            .query(&sql, &params_ref[..])
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("list_trusted_keys: {e}")))?;
+        rows.into_iter().map(pg_row_to_trust_row).collect()
+    }
+}
+
+/// Convert a postgres row from the trust columns of
+/// `cirislens.federation_keys` into a [`crate::federation::TrustRow`].
+/// SELECT clause MUST include exactly the 7 trust columns in any
+/// order (we read by name).
+fn pg_row_to_trust_row(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::TrustRow, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    let trust_type_str: String = row.safe_get_with("trust_type", mk_err)?;
+    let trust_relationship_str: String = row.safe_get_with("trust_relationship", mk_err)?;
+    let trust_type =
+        crate::federation::TrustType::from_wire_str(&trust_type_str).ok_or_else(|| {
+            crate::federation::Error::Backend(format!("unknown trust_type: {trust_type_str}"))
+        })?;
+    let trust_relationship = crate::federation::TrustRelationship::from_wire_str(
+        &trust_relationship_str,
+    )
+    .ok_or_else(|| {
+        crate::federation::Error::Backend(format!(
+            "unknown trust_relationship: {trust_relationship_str}"
+        ))
+    })?;
+    // `trusted_by` is NOT NULL on a trust row by construction (the
+    // caller filters on `trusted_by IS NOT NULL`), but Postgres
+    // schema still has it nullable; treat absent as Backend error.
+    let trusted_by: Option<String> = row.safe_get_with("trusted_by", mk_err)?;
+    let trusted_by = trusted_by.ok_or_else(|| {
+        crate::federation::Error::Backend(
+            "pg_row_to_trust_row: trusted_by IS NULL — filter contract violated".into(),
+        )
+    })?;
+    Ok(crate::federation::TrustRow {
+        key: row.safe_get_with("key_id", mk_err)?,
+        trust_type,
+        trust_relationship,
+        trust_domains: row.safe_get_with("trust_domains", mk_err)?,
+        trusted_by,
+        trusted_at: row.safe_get_with("trusted_at", mk_err)?,
+        expires_at: row.safe_get_with("expires_at", mk_err)?,
+    })
 }
 
 // ─── OutboundQueue impl (v0.4.0, CIRISPersist#16) ──────────────────
@@ -2302,6 +2529,17 @@ fn pg_row_to_key_record(
 ) -> Result<crate::federation::KeyRecord, crate::federation::Error> {
     let mk_err = crate::federation::Error::Backend;
     let original_content_hash: Vec<u8> = row.safe_get_with("original_content_hash", mk_err)?;
+    // v1.3.0 (CIRISPersist#46): `roles` column is TEXT[] on PG; NULL
+    // / absent column maps to empty Vec. `safe_get_with` returns
+    // Option<Vec<String>> via the schema column type — when the SELECT
+    // didn't include `roles`, the column lookup errors, which we
+    // swallow into an empty list. SELECT statements that need the
+    // roles MUST include the column explicitly.
+    let roles: Vec<String> = row
+        .try_get::<_, Option<Vec<String>>>("roles")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     Ok(crate::federation::KeyRecord {
         key_id: row.safe_get_with("key_id", mk_err)?,
         pubkey_ed25519_base64: row.safe_get_with("pubkey_ed25519_base64", mk_err)?,
@@ -2319,6 +2557,7 @@ fn pg_row_to_key_record(
         scrub_timestamp: row.safe_get_with("scrub_timestamp", mk_err)?,
         pqc_completed_at: row.safe_get_with("pqc_completed_at", mk_err)?,
         persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
+        roles,
     })
 }
 
@@ -7509,6 +7748,7 @@ mod tests {
                 None
             },
             persist_row_hash: String::new(),
+            roles: Vec::new(),
         }
     }
 
@@ -8730,5 +8970,215 @@ mod tests {
 
         let c = backend.read_classifications(&tid, &thid).await.unwrap();
         assert!(c.is_empty(), "pre-pipeline row → empty Vec");
+    }
+
+    // ─── Trust hierarchy tests (v1.3.0, CIRISPersist#46+#47) ───────
+    //
+    // PG-side counterparts to the SQLite trust tests. Validates the
+    // V020 column additions + CHECK constraints + UPSERT semantics
+    // against a real Postgres deployment. Gated on
+    // CIRIS_PERSIST_TEST_PG_URL like the rest of this test module.
+
+    async fn trust_steward(backend: &PostgresBackend) -> String {
+        let kid = format!("trust-steward-{}", uuid_like());
+        use crate::federation::FederationDirectory;
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: fix_section_i_key(&kid, "registry", chrono::Utc::now(), false),
+            })
+            .await
+            .unwrap();
+        kid
+    }
+
+    /// Trust shape 1+2+3: round-trip + self-trust reject + Registry-
+    /// without-domains reject (run as one composed test because pg
+    /// runs are serialized and each does its own connect+migrate).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn trust_pg_grant_lookup_and_validation() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+
+        let steward = trust_steward(&backend).await;
+        let key_id = format!("trust-k-{}", uuid_like());
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: fix_section_i_key(&key_id, "primitive", chrono::Utc::now(), false),
+            })
+            .await
+            .unwrap();
+
+        // Shape 1: round-trip.
+        let grant = crate::federation::TrustGrant {
+            key: key_id.clone(),
+            trust_type: crate::federation::TrustType::Partnered,
+            trust_relationship: crate::federation::TrustRelationship::Direct,
+            trust_domains: None,
+            trusted_by: steward.clone(),
+            expires_at: None,
+        };
+        backend.grant_trust(grant).await.unwrap();
+        let row = backend.lookup_trust(&key_id).await.unwrap().unwrap();
+        assert_eq!(row.key, key_id);
+        assert_eq!(row.trust_type, crate::federation::TrustType::Partnered);
+        assert_eq!(
+            row.trust_relationship,
+            crate::federation::TrustRelationship::Direct
+        );
+        assert_eq!(row.trusted_by, steward);
+
+        // Shape 2: self-trust is rejected at the API surface.
+        let bad_self = crate::federation::TrustGrant {
+            key: key_id.clone(),
+            trust_type: crate::federation::TrustType::Temporary,
+            trust_relationship: crate::federation::TrustRelationship::Direct,
+            trust_domains: None,
+            trusted_by: key_id.clone(),
+            expires_at: None,
+        };
+        let err = backend.grant_trust(bad_self).await.unwrap_err();
+        assert!(matches!(err, crate::federation::Error::InvalidArgument(_)));
+
+        // Shape 3: Registry without domains is rejected at the API
+        // surface (also at the V020 PG CHECK constraint).
+        let bad_registry = crate::federation::TrustGrant {
+            key: key_id.clone(),
+            trust_type: crate::federation::TrustType::Temporary,
+            trust_relationship: crate::federation::TrustRelationship::Registry,
+            trust_domains: None,
+            trusted_by: steward.clone(),
+            expires_at: None,
+        };
+        let err = backend.grant_trust(bad_registry).await.unwrap_err();
+        assert!(matches!(err, crate::federation::Error::InvalidArgument(_)));
+    }
+
+    /// Trust shape 4+6: revoke idempotent + include_expired filter.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn trust_pg_revoke_idempotent_and_filter_expired() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+
+        let steward = trust_steward(&backend).await;
+        let key_id = format!("trust-revoke-{}", uuid_like());
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: fix_section_i_key(&key_id, "primitive", chrono::Utc::now(), false),
+            })
+            .await
+            .unwrap();
+        let grant = crate::federation::TrustGrant {
+            key: key_id.clone(),
+            trust_type: crate::federation::TrustType::Temporary,
+            trust_relationship: crate::federation::TrustRelationship::Direct,
+            trust_domains: None,
+            trusted_by: steward.clone(),
+            expires_at: None,
+        };
+        backend.grant_trust(grant).await.unwrap();
+        backend.revoke_trust(&key_id, &steward).await.unwrap();
+        // Second revoke MUST succeed (idempotent).
+        backend.revoke_trust(&key_id, &steward).await.unwrap();
+        let row = backend.lookup_trust(&key_id).await.unwrap().unwrap();
+        assert!(row.expires_at.is_some());
+
+        // include_expired=false → row excluded; include_expired=true → included.
+        let active = backend
+            .list_trusted_keys(crate::federation::TrustFilter::default())
+            .await
+            .unwrap();
+        assert!(active.iter().all(|r| r.key != key_id));
+        let all = backend
+            .list_trusted_keys(crate::federation::TrustFilter {
+                include_expired: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(all.iter().any(|r| r.key == key_id));
+    }
+
+    /// Trust shape 5: relationship + domain filter scoped to Registry.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn trust_pg_list_filter_relationship_and_domain() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+
+        let steward = trust_steward(&backend).await;
+        let domain = format!("alpha-{}", uuid_like());
+        let k_direct = format!("trust-d-{}", uuid_like());
+        let k_registry = format!("trust-r-{}", uuid_like());
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: fix_section_i_key(&k_direct, "primitive", chrono::Utc::now(), false),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: fix_section_i_key(&k_registry, "primitive", chrono::Utc::now(), false),
+            })
+            .await
+            .unwrap();
+        backend
+            .grant_trust(crate::federation::TrustGrant {
+                key: k_direct.clone(),
+                trust_type: crate::federation::TrustType::Temporary,
+                trust_relationship: crate::federation::TrustRelationship::Direct,
+                trust_domains: None,
+                trusted_by: steward.clone(),
+                expires_at: None,
+            })
+            .await
+            .unwrap();
+        backend
+            .grant_trust(crate::federation::TrustGrant {
+                key: k_registry.clone(),
+                trust_type: crate::federation::TrustType::Temporary,
+                trust_relationship: crate::federation::TrustRelationship::Registry,
+                trust_domains: Some(vec![domain.clone()]),
+                trusted_by: steward.clone(),
+                expires_at: None,
+            })
+            .await
+            .unwrap();
+
+        let registry_only = backend
+            .list_trusted_keys(crate::federation::TrustFilter {
+                trust_relationship: Some(crate::federation::TrustRelationship::Registry),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(registry_only.iter().any(|r| r.key == k_registry));
+        assert!(registry_only.iter().all(|r| r.key != k_direct));
+
+        let in_domain = backend
+            .list_trusted_keys(crate::federation::TrustFilter {
+                trust_relationship: Some(crate::federation::TrustRelationship::Registry),
+                domain: Some(domain.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(in_domain.iter().any(|r| r.key == k_registry));
     }
 }

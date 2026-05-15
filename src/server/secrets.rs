@@ -84,6 +84,99 @@ pub const HEADER_ED25519: &str = "x-ciris-signature-ed25519";
 /// during the hybrid-pending rollout window (HybridPolicy::Ed25519Fallback).
 pub const HEADER_ML_DSA_65: &str = "x-ciris-signature-ml-dsa-65";
 
+// ── v1.3.0 (CIRISPersist#46) — Role-tag tiers ──────────────────────
+
+/// Read-only secrets routes (`get_list` / `get_retrieve` /
+/// `get_filter_config` / `get_stats` / `get_health` /
+/// `get_access_logs`) require this role tag (or any higher tier).
+pub const ROLE_SECRETS_READER: &str = "cirislens_secrets_reader";
+/// Mutating secrets routes (`post_store` / `post_try_claim` /
+/// `post_encrypt` / `post_decrypt` / `post_recall` /
+/// `post_reencrypt_all` / `delete_forget` / `put_filter_config`)
+/// require this role tag (or any higher tier).
+pub const ROLE_SECRETS_WRITER: &str = "cirislens_secrets_writer";
+/// Master-key rotation (`post_rotate_master_key`) requires this
+/// role tag.
+pub const ROLE_SECRETS_ADMIN: &str = "cirislens_secrets_admin";
+
+/// Stable error kind token for role-tag rejection (403).
+pub const KIND_ROLE_TAG: &str = "secrets_role_tag";
+
+/// Tier required by a route — used by [`require_role`] to gate
+/// access. Higher tiers implicitly satisfy lower tiers
+/// (admin > writer > reader).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretsTier {
+    Reader,
+    Writer,
+    Admin,
+}
+
+impl SecretsTier {
+    fn allowed_roles(self) -> &'static [&'static str] {
+        match self {
+            Self::Reader => &[ROLE_SECRETS_READER, ROLE_SECRETS_WRITER, ROLE_SECRETS_ADMIN],
+            Self::Writer => &[ROLE_SECRETS_WRITER, ROLE_SECRETS_ADMIN],
+            Self::Admin => &[ROLE_SECRETS_ADMIN],
+        }
+    }
+}
+
+/// Look up the caller's KeyRecord and require at least one role tag
+/// matching `tier`. Returns 403 on missing tag, 503 on backend
+/// lookup failure, 401 on missing/malformed key_id header.
+async fn require_role<F>(
+    directory: &F,
+    headers: &HeaderMap,
+    tier: SecretsTier,
+) -> Result<(), Response>
+where
+    F: FederationDirectory,
+{
+    let key_id = headers
+        .get(HEADER_KEY_ID)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::UNAUTHORIZED,
+                "secrets_signature_missing",
+                format!("missing {} header", HEADER_KEY_ID),
+            )
+        })?;
+    let record = directory.lookup_public_key(key_id).await.map_err(|e| {
+        tracing::error!(error = %e, key_id, "role-tag lookup failed");
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "secrets_directory_unavailable",
+            format!("{e}"),
+        )
+    })?;
+    let record = record.ok_or_else(|| {
+        error_response(
+            StatusCode::FORBIDDEN,
+            KIND_ROLE_TAG,
+            format!("unknown key_id {key_id}"),
+        )
+    })?;
+    let allowed = tier.allowed_roles();
+    let has_role = record.roles.iter().any(|r| allowed.contains(&r.as_str()));
+    if !has_role {
+        tracing::warn!(
+            key_id, roles = ?record.roles, tier = ?tier,
+            "secrets route rejected: role-tag missing"
+        );
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            KIND_ROLE_TAG,
+            format!(
+                "key {} missing required role for {:?} tier (allowed: {:?})",
+                key_id, tier, allowed
+            ),
+        ));
+    }
+    Ok(())
+}
+
 // ── State ──────────────────────────────────────────────────────────
 
 /// Shared state for the secrets sub-router.
@@ -204,6 +297,28 @@ fn extract_signatures(headers: &HeaderMap) -> Result<SignedRequest, Response> {
     })
 }
 
+/// Verify the request signature against the federation directory,
+/// then enforce the role-tag tier for this route. On failure, returns
+/// a 401 (signature) or 403 (role) response.
+///
+/// v1.3.0 (CIRISPersist#46): `tier` gates which `federation_keys.roles`
+/// values are accepted (admin > writer > reader). Pre-V020 rows have
+/// empty `roles` → reject. Routes that need reader-tier access pass
+/// [`SecretsTier::Reader`]; mutating routes pass [`SecretsTier::Writer`];
+/// master-key rotation passes [`SecretsTier::Admin`].
+async fn verify_and_authorize<F>(
+    directory: &F,
+    headers: &HeaderMap,
+    body: &[u8],
+    tier: SecretsTier,
+) -> Result<(), Response>
+where
+    F: FederationDirectory,
+{
+    verify_request(directory, headers, body).await?;
+    require_role(directory, headers, tier).await
+}
+
 /// Verify the request signature against the federation directory.
 /// On failure, returns a 401 response ready to surface to the caller.
 async fn verify_request<F>(directory: &F, headers: &HeaderMap, body: &[u8]) -> Result<(), Response>
@@ -300,7 +415,9 @@ where
     S: SecretsService + 'static,
     F: FederationDirectory + Backend + 'static,
 {
-    if let Err(r) = verify_request(&*state.directory, &headers, &body).await {
+    if let Err(r) =
+        verify_and_authorize(&*state.directory, &headers, &body, SecretsTier::Writer).await
+    {
         return r;
     }
     let req: StoreSecretRequest = match parse_body(&body) {
@@ -335,7 +452,9 @@ where
     S: SecretsService + 'static,
     F: FederationDirectory + Backend + 'static,
 {
-    if let Err(r) = verify_request(&*state.directory, &headers, &body).await {
+    if let Err(r) =
+        verify_and_authorize(&*state.directory, &headers, &body, SecretsTier::Writer).await
+    {
         return r;
     }
     let req: TryClaimSecretRequest = match parse_body(&body) {
@@ -393,7 +512,9 @@ where
     // GET routes verify on the empty body (matches the
     // edge-signature convention for the pipeline route at the
     // wire-canonicalization layer).
-    if let Err(r) = verify_request(&*state.directory, &headers, &[]).await {
+    if let Err(r) =
+        verify_and_authorize(&*state.directory, &headers, &[], SecretsTier::Reader).await
+    {
         return r;
     }
     match state
@@ -437,7 +558,9 @@ where
     S: SecretsService + 'static,
     F: FederationDirectory + Backend + 'static,
 {
-    if let Err(r) = verify_request(&*state.directory, &headers, &body).await {
+    if let Err(r) =
+        verify_and_authorize(&*state.directory, &headers, &body, SecretsTier::Writer).await
+    {
         return r;
     }
     let req: RecallSecretRequest = match parse_body(&body) {
@@ -469,7 +592,9 @@ where
     S: SecretsService + 'static,
     F: FederationDirectory + Backend + 'static,
 {
-    if let Err(r) = verify_request(&*state.directory, &headers, &[]).await {
+    if let Err(r) =
+        verify_and_authorize(&*state.directory, &headers, &[], SecretsTier::Reader).await
+    {
         return r;
     }
     let (limit, filter) = q.into_filter();
@@ -490,7 +615,9 @@ where
     S: SecretsService + 'static,
     F: FederationDirectory + Backend + 'static,
 {
-    if let Err(r) = verify_request(&*state.directory, &headers, &[]).await {
+    if let Err(r) =
+        verify_and_authorize(&*state.directory, &headers, &[], SecretsTier::Writer).await
+    {
         return r;
     }
     match state.service.forget_secret(&uuid, q.accessor).await {
@@ -509,7 +636,9 @@ where
     S: SecretsService + 'static,
     F: FederationDirectory + Backend + 'static,
 {
-    if let Err(r) = verify_request(&*state.directory, &headers, &body).await {
+    if let Err(r) =
+        verify_and_authorize(&*state.directory, &headers, &body, SecretsTier::Writer).await
+    {
         return r;
     }
     let req: EncryptRequest = match parse_body(&body) {
@@ -538,7 +667,9 @@ where
     S: SecretsService + 'static,
     F: FederationDirectory + Backend + 'static,
 {
-    if let Err(r) = verify_request(&*state.directory, &headers, &body).await {
+    if let Err(r) =
+        verify_and_authorize(&*state.directory, &headers, &body, SecretsTier::Writer).await
+    {
         return r;
     }
     let req: DecryptRequest = match parse_body(&body) {
@@ -560,7 +691,9 @@ where
     S: SecretsService + 'static,
     F: FederationDirectory + Backend + 'static,
 {
-    if let Err(r) = verify_request(&*state.directory, &headers, &[]).await {
+    if let Err(r) =
+        verify_and_authorize(&*state.directory, &headers, &[], SecretsTier::Reader).await
+    {
         return r;
     }
     match state.service.get_filter_config().await {
@@ -585,7 +718,9 @@ where
     S: SecretsService + 'static,
     F: FederationDirectory + Backend + 'static,
 {
-    if let Err(r) = verify_request(&*state.directory, &headers, &body).await {
+    if let Err(r) =
+        verify_and_authorize(&*state.directory, &headers, &body, SecretsTier::Writer).await
+    {
         return r;
     }
     let req: FilterConfigUpdateRequest = match parse_body(&body) {
@@ -612,7 +747,9 @@ where
     S: SecretsService + 'static,
     F: FederationDirectory + Backend + 'static,
 {
-    if let Err(r) = verify_request(&*state.directory, &headers, &[]).await {
+    if let Err(r) =
+        verify_and_authorize(&*state.directory, &headers, &[], SecretsTier::Reader).await
+    {
         return r;
     }
     match state.service.get_service_stats().await {
@@ -649,7 +786,9 @@ where
     S: SecretsService + 'static,
     F: FederationDirectory + Backend + 'static,
 {
-    if let Err(r) = verify_request(&*state.directory, &headers, &[]).await {
+    if let Err(r) =
+        verify_and_authorize(&*state.directory, &headers, &[], SecretsTier::Reader).await
+    {
         return r;
     }
     let secret_uuid = q.secret_uuid.as_deref();
@@ -684,7 +823,9 @@ where
     S: SecretsService + 'static,
     F: FederationDirectory + Backend + 'static,
 {
-    if let Err(r) = verify_request(&*state.directory, &headers, &body).await {
+    if let Err(r) =
+        verify_and_authorize(&*state.directory, &headers, &body, SecretsTier::Writer).await
+    {
         return r;
     }
     let req: ReencryptAllRequest = match parse_body(&body) {
@@ -732,7 +873,9 @@ where
     S: SecretsService + 'static,
     F: FederationDirectory + Backend + 'static,
 {
-    if let Err(r) = verify_request(&*state.directory, &headers, &body).await {
+    if let Err(r) =
+        verify_and_authorize(&*state.directory, &headers, &body, SecretsTier::Admin).await
+    {
         return r;
     }
     let req: RotateMasterKeyRequest = match parse_body(&body) {
@@ -809,6 +952,14 @@ mod tests {
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
+            // v1.3.0 (CIRISPersist#46): grant the test steward all
+            // three secrets role tiers so existing tests continue to
+            // pass against routes now gated by `verify_and_authorize`.
+            roles: vec![
+                ROLE_SECRETS_READER.to_owned(),
+                ROLE_SECRETS_WRITER.to_owned(),
+                ROLE_SECRETS_ADMIN.to_owned(),
+            ],
         };
         FederationDirectory::put_public_key(&*backend, SignedKeyRecord { record: key })
             .await

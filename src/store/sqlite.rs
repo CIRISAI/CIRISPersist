@@ -722,6 +722,17 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             )));
         }
 
+        // v1.3.0 (CIRISPersist#46): serialize the roles list to a
+        // JSON-array TEXT for the column. Empty Vec → NULL so the
+        // column matches the pre-V020 "no roles declared" semantics.
+        let roles_text: Option<String> =
+            if row.roles.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&row.roles).map_err(|e| {
+                    crate::federation::Error::Backend(format!("roles serialize: {e}"))
+                })?)
+            };
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
             let conn = conn.blocking_lock();
@@ -730,8 +741,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
                     identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 rusqlite::params![
                     row.key_id,
                     row.pubkey_ed25519_base64,
@@ -749,6 +760,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.scrub_timestamp.to_rfc3339(),
                     row.pqc_completed_at.map(|t| t.to_rfc3339()),
                     row.persist_row_hash,
+                    roles_text,
                 ],
             )?;
             Ok(())
@@ -772,7 +784,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
                         identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles \
                      FROM federation_keys WHERE key_id = ?1",
                     [&key_id],
                     sqlite_row_to_key_record,
@@ -798,7 +810,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
                         identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles \
                      FROM federation_keys WHERE identity_ref = ?1",
                 )?;
                 let rows = stmt.query_map([&identity_ref], sqlite_row_to_key_record)?;
@@ -1338,6 +1350,253 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             })
             .collect()
     }
+
+    // ── Trust grants (v1.3.0, CIRISPersist#46 + #47) ───────────────
+
+    async fn grant_trust(
+        &self,
+        grant: crate::federation::TrustGrant,
+    ) -> Result<(), crate::federation::Error> {
+        crate::store::memory::validate_trust_grant(&grant)?;
+        // Serialize the trust_domains list to a JSON-array string for
+        // the TEXT column (SQLite has no array type).
+        let trust_domains_text: Option<String> = match &grant.trust_domains {
+            Some(d) => Some(serde_json::to_string(d).map_err(|e| {
+                crate::federation::Error::Backend(format!("trust_domains serialize: {e}"))
+            })?),
+            None => None,
+        };
+        let trust_type_str = grant.trust_type.as_str().to_owned();
+        let trust_relationship_str = grant.trust_relationship.as_str().to_owned();
+        let key = grant.key.clone();
+        let trusted_by = grant.trusted_by.clone();
+        let expires_at_text = grant.expires_at.map(|t| t.to_rfc3339());
+        let now_text = chrono::Utc::now().to_rfc3339();
+
+        let conn = self.conn.clone();
+        let n = tokio::task::spawn_blocking(move || -> Result<usize, rusqlite::Error> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE federation_keys \
+                 SET trust_type = ?2, \
+                     trust_relationship = ?3, \
+                     trust_domains = ?4, \
+                     trusted_by = ?5, \
+                     trusted_at = ?6, \
+                     expires_at = ?7 \
+                 WHERE key_id = ?1",
+                rusqlite::params![
+                    key,
+                    trust_type_str,
+                    trust_relationship_str,
+                    trust_domains_text,
+                    trusted_by,
+                    now_text,
+                    expires_at_text,
+                ],
+            )
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| crate::federation::Error::Backend(format!("grant_trust UPDATE: {e}")))?;
+        if n == 0 {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "federation_keys row {} does not exist — call put_public_key first",
+                grant.key
+            )));
+        }
+        Ok(())
+    }
+
+    async fn revoke_trust(
+        &self,
+        key: &str,
+        revoked_by: &str,
+    ) -> Result<(), crate::federation::Error> {
+        if key.is_empty() {
+            return Err(crate::federation::Error::InvalidArgument(
+                "key must be non-empty".into(),
+            ));
+        }
+        if revoked_by.is_empty() {
+            return Err(crate::federation::Error::InvalidArgument(
+                "revoked_by must be non-empty".into(),
+            ));
+        }
+        // RFC 3339 comparisons via julianday() so the SQLite-native
+        // CURRENT_TIMESTAMP shape ("YYYY-MM-DD HH:MM:SS") and the
+        // chrono RFC-3339 ("YYYY-MM-DDTHH:MM:SS.fff+00:00") shape
+        // both compare correctly.
+        let key_owned = key.to_owned();
+        let now_text = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<usize, rusqlite::Error> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE federation_keys \
+                 SET expires_at = ?2 \
+                 WHERE key_id = ?1 \
+                   AND trusted_by IS NOT NULL \
+                   AND (expires_at IS NULL OR julianday(expires_at) > julianday(?2))",
+                rusqlite::params![key_owned, now_text],
+            )
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| crate::federation::Error::Backend(format!("revoke_trust: {e}")))?;
+        let _ = revoked_by;
+        Ok(())
+    }
+
+    async fn lookup_trust(
+        &self,
+        key: &str,
+    ) -> Result<Option<crate::federation::TrustRow>, crate::federation::Error> {
+        let key_owned = key.to_owned();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(
+            move || -> Result<Option<crate::federation::TrustRow>, rusqlite::Error> {
+                let conn = conn.blocking_lock();
+                conn.query_row(
+                    "SELECT key_id, trust_type, trust_relationship, trust_domains, \
+                            trusted_by, trusted_at, expires_at \
+                     FROM federation_keys \
+                     WHERE key_id = ?1 AND trusted_by IS NOT NULL",
+                    [&key_owned],
+                    sqlite_row_to_trust_row,
+                )
+                .optional()
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| crate::federation::Error::Backend(format!("lookup_trust: {e}")))
+    }
+
+    async fn list_trusted_keys(
+        &self,
+        filter: crate::federation::TrustFilter,
+    ) -> Result<Vec<crate::federation::TrustRow>, crate::federation::Error> {
+        // Build the parametric WHERE clause. We materialize all rows
+        // and apply the domain filter in-memory because SQLite has
+        // no native ARRAY/JSON-membership operator on the bound side;
+        // `json_each` works but composes awkwardly with the rest of
+        // the filter. For the row counts persist sees on the SQLite
+        // arm (sovereign-mode agents, single-tenant) this is fine.
+        let now_text = chrono::Utc::now().to_rfc3339();
+        let mut where_parts: Vec<String> = vec!["trusted_by IS NOT NULL".to_owned()];
+        let mut params: Vec<String> = Vec::new();
+        if !filter.include_expired {
+            params.push(now_text);
+            where_parts.push(format!(
+                "(expires_at IS NULL OR julianday(expires_at) > julianday(?{}))",
+                params.len()
+            ));
+        }
+        if let Some(t) = filter.trust_type {
+            params.push(t.as_str().to_owned());
+            where_parts.push(format!("trust_type = ?{}", params.len()));
+        }
+        if let Some(rel) = filter.trust_relationship {
+            params.push(rel.as_str().to_owned());
+            where_parts.push(format!("trust_relationship = ?{}", params.len()));
+        }
+        let where_sql = where_parts.join(" AND ");
+        let sql = format!(
+            "SELECT key_id, trust_type, trust_relationship, trust_domains, \
+                    trusted_by, trusted_at, expires_at \
+             FROM federation_keys \
+             WHERE {where_sql} \
+             ORDER BY trusted_at DESC, key_id DESC"
+        );
+        let domain_filter = filter.domain;
+        let conn = self.conn.clone();
+        let rows = tokio::task::spawn_blocking(
+            move || -> Result<Vec<crate::federation::TrustRow>, rusqlite::Error> {
+                let conn = conn.blocking_lock();
+                let mut stmt = conn.prepare(&sql)?;
+                let params_dyn: Vec<&dyn rusqlite::ToSql> =
+                    params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+                let rows = stmt
+                    .query_map(params_dyn.as_slice(), sqlite_row_to_trust_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| crate::federation::Error::Backend(format!("list_trusted_keys: {e}")))?;
+        let filtered: Vec<crate::federation::TrustRow> = match domain_filter {
+            Some(domain) => rows
+                .into_iter()
+                .filter(|r| {
+                    r.trust_domains
+                        .as_ref()
+                        .map(|d| d.iter().any(|x| x == &domain))
+                        .unwrap_or(false)
+                })
+                .collect(),
+            None => rows,
+        };
+        Ok(filtered)
+    }
+}
+
+/// Convert a SQLite row from the trust columns of `federation_keys`
+/// into a [`crate::federation::TrustRow`]. SELECT clause MUST include
+/// exactly the 7 trust columns (read by name).
+fn sqlite_row_to_trust_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::TrustRow> {
+    let trust_type_str: String = row.get("trust_type")?;
+    let trust_relationship_str: String = row.get("trust_relationship")?;
+    let trust_type =
+        crate::federation::TrustType::from_wire_str(&trust_type_str).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unknown trust_type: {trust_type_str}"),
+                )),
+            )
+        })?;
+    let trust_relationship = crate::federation::TrustRelationship::from_wire_str(
+        &trust_relationship_str,
+    )
+    .ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown trust_relationship: {trust_relationship_str}"),
+            )),
+        )
+    })?;
+    let trust_domains_text: Option<String> = row.get("trust_domains")?;
+    let trust_domains: Option<Vec<String>> = match trust_domains_text.as_deref() {
+        Some("") | None => None,
+        Some(s) => Some(serde_json::from_str(s).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            )
+        })?),
+    };
+    let trusted_by: String = row.get("trusted_by")?;
+    let trusted_at_text: String = row.get("trusted_at")?;
+    let expires_at_text: Option<String> = row.get("expires_at")?;
+    Ok(crate::federation::TrustRow {
+        key: row.get("key_id")?,
+        trust_type,
+        trust_relationship,
+        trust_domains,
+        trusted_by,
+        trusted_at: parse_rfc3339(&trusted_at_text),
+        expires_at: expires_at_text.as_deref().map(parse_rfc3339),
+    })
 }
 
 // ─── OutboundQueue impl (v0.4.0, CIRISPersist#16) ──────────────────
@@ -2194,6 +2453,14 @@ fn sqlite_row_to_key_record(
     let valid_until: Option<String> = row.get("valid_until")?;
     let scrub_timestamp: String = row.get("scrub_timestamp")?;
     let pqc_completed_at: Option<String> = row.get("pqc_completed_at")?;
+    // v1.3.0 (CIRISPersist#46): `roles` is stored as a JSON-array
+    // TEXT column. NULL or absent → empty Vec.
+    let roles_text: Option<String> = row.get("roles").ok();
+    let roles: Vec<String> = roles_text
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
     Ok(crate::federation::KeyRecord {
         key_id: row.get("key_id")?,
         pubkey_ed25519_base64: row.get("pubkey_ed25519_base64")?,
@@ -2211,6 +2478,7 @@ fn sqlite_row_to_key_record(
         scrub_timestamp: parse_rfc3339(&scrub_timestamp),
         pqc_completed_at: pqc_completed_at.as_deref().map(parse_rfc3339),
         persist_row_hash: row.get("persist_row_hash")?,
+        roles,
     })
 }
 
@@ -2856,6 +3124,7 @@ mod tests {
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
+            roles: Vec::new(),
         }
     }
 
@@ -3079,5 +3348,292 @@ mod tests {
         assert_eq!(revs.len(), 1);
         assert_eq!(revs[0].revocation_id, "rev-1");
         assert_eq!(revs[0].persist_row_hash.len(), 64);
+    }
+
+    // ─── Trust hierarchy tests (v1.3.0, CIRISPersist#46+#47) ───────
+    //
+    // Shapes 1–7 cover the seven invariants in the M2 cut spec; shape 8
+    // smokes the edge_detection_events table V020 ships alongside.
+
+    use crate::federation::{TrustFilter, TrustGrant, TrustRelationship, TrustType};
+
+    async fn trust_test_backend() -> SqliteBackend {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        // Bootstrap a registry steward so the FK contract on
+        // federation_keys is satisfied.
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("registry-steward", "registry", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        backend
+    }
+
+    fn trust_grant_for(key: &str) -> TrustGrant {
+        TrustGrant {
+            key: key.to_owned(),
+            trust_type: TrustType::Temporary,
+            trust_relationship: TrustRelationship::Direct,
+            trust_domains: None,
+            trusted_by: "registry-steward".to_owned(),
+            expires_at: None,
+        }
+    }
+
+    /// Shape 1 (M1): grant_trust → lookup_trust round-trip.
+    #[tokio::test]
+    async fn trust_grant_then_lookup_round_trip() {
+        let backend = trust_test_backend().await;
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-a", "primitive-a", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        backend.grant_trust(trust_grant_for("k-a")).await.unwrap();
+        let got = backend.lookup_trust("k-a").await.unwrap();
+        let row = got.expect("trust row present");
+        assert_eq!(row.key, "k-a");
+        assert_eq!(row.trust_type, TrustType::Temporary);
+        assert_eq!(row.trust_relationship, TrustRelationship::Direct);
+        assert_eq!(row.trusted_by, "registry-steward");
+        assert!(row.expires_at.is_none());
+    }
+
+    /// Shape 2 (M1): self-trust → InvalidArgument.
+    #[tokio::test]
+    async fn trust_grant_rejects_self_trust() {
+        let backend = trust_test_backend().await;
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-self", "primitive-self", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        let mut grant = trust_grant_for("k-self");
+        grant.trusted_by = "k-self".to_owned();
+        let err = backend.grant_trust(grant).await.unwrap_err();
+        assert!(matches!(err, crate::federation::Error::InvalidArgument(_)));
+    }
+
+    /// Shape 3 (M1): Registry without domains → InvalidArgument.
+    /// SQLite enforces at the API surface via `validate_trust_grant`;
+    /// PG also enforces via the V020 CHECK constraint.
+    #[tokio::test]
+    async fn trust_grant_rejects_registry_without_domains() {
+        let backend = trust_test_backend().await;
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-reg", "primitive-reg", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        let mut grant = trust_grant_for("k-reg");
+        grant.trust_relationship = TrustRelationship::Registry;
+        grant.trust_domains = None;
+        let err = backend.grant_trust(grant).await.unwrap_err();
+        assert!(matches!(err, crate::federation::Error::InvalidArgument(_)));
+    }
+
+    /// Shape 4 (M1): revoke_trust is idempotent — second revoke is a
+    /// no-op.
+    #[tokio::test]
+    async fn trust_revoke_is_idempotent() {
+        let backend = trust_test_backend().await;
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-rev", "primitive-rev", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        backend.grant_trust(trust_grant_for("k-rev")).await.unwrap();
+        backend
+            .revoke_trust("k-rev", "registry-steward")
+            .await
+            .unwrap();
+        // Second call must succeed without error.
+        backend
+            .revoke_trust("k-rev", "registry-steward")
+            .await
+            .unwrap();
+        let row = backend.lookup_trust("k-rev").await.unwrap().unwrap();
+        // expires_at populated by revoke; the second revoke didn't
+        // change the row.
+        assert!(row.expires_at.is_some());
+    }
+
+    /// Shape 5 (M1): list_trusted_keys filter narrows by relationship.
+    #[tokio::test]
+    async fn trust_list_filter_by_relationship() {
+        let backend = trust_test_backend().await;
+        // Two Direct + one Registry; filter Registry returns 1.
+        for (kid, rel, domains) in [
+            ("k-d1", TrustRelationship::Direct, None),
+            ("k-d2", TrustRelationship::Direct, None),
+            (
+                "k-r1",
+                TrustRelationship::Registry,
+                Some(vec!["alpha".into()]),
+            ),
+        ] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(kid, kid, "registry-steward"),
+                })
+                .await
+                .unwrap();
+            let mut grant = trust_grant_for(kid);
+            grant.trust_relationship = rel;
+            grant.trust_domains = domains;
+            backend.grant_trust(grant).await.unwrap();
+        }
+        let registry_only = backend
+            .list_trusted_keys(TrustFilter {
+                trust_relationship: Some(TrustRelationship::Registry),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(registry_only.len(), 1);
+        assert_eq!(registry_only[0].key, "k-r1");
+    }
+
+    /// Shape 6 (M1): include_expired filter.
+    #[tokio::test]
+    async fn trust_list_include_expired() {
+        let backend = trust_test_backend().await;
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-exp", "primitive-exp", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        let mut grant = trust_grant_for("k-exp");
+        grant.expires_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        backend.grant_trust(grant).await.unwrap();
+
+        // include_expired=false → excludes.
+        let active = backend
+            .list_trusted_keys(TrustFilter::default())
+            .await
+            .unwrap();
+        assert!(active.iter().all(|r| r.key != "k-exp"));
+
+        // include_expired=true → includes.
+        let all = backend
+            .list_trusted_keys(TrustFilter {
+                include_expired: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(all.iter().any(|r| r.key == "k-exp"));
+    }
+
+    /// Shape 7 (M1): audit chain integration — a trust grant + a
+    /// caller-composed `trust_granted` audit entry round-trip. Per
+    /// the trait doc, persist's `grant_trust` does NOT auto-sign the
+    /// audit entry (the audit chain is self-signed by the caller's
+    /// Ed25519 key per AV-49). The vocabulary is the integration
+    /// point: V020 extends the V018 CHECK to accept `trust_granted` +
+    /// `trust_revoked`. This test exercises the vocabulary by parsing
+    /// the wire string through `AuditEventType::from_wire_str`.
+    #[cfg(feature = "cirisaudit")]
+    #[tokio::test]
+    async fn trust_grant_vocab_round_trips_via_audit_event_type() {
+        use crate::audit::AuditEventType;
+        assert_eq!(AuditEventType::TrustGranted.as_str(), "trust_granted");
+        assert_eq!(AuditEventType::TrustRevoked.as_str(), "trust_revoked");
+        assert_eq!(
+            AuditEventType::from_wire_str("trust_granted"),
+            Some(AuditEventType::TrustGranted)
+        );
+        assert_eq!(
+            AuditEventType::from_wire_str("trust_revoked"),
+            Some(AuditEventType::TrustRevoked)
+        );
+    }
+
+    /// Shape 8: edge_detection_events table is usable (smoke test —
+    /// no service trait wraps it yet, just confirms the V020 table
+    /// schema works for INSERT + SELECT).
+    #[tokio::test]
+    async fn edge_detection_events_insert_and_select() {
+        let backend = trust_test_backend().await;
+        // FK-target key
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-suspect", "primitive-suspect", "registry-steward"),
+            })
+            .await
+            .unwrap();
+
+        let conn = backend.conn.clone();
+        let detection_id = uuid::Uuid::new_v4().to_string();
+        let did = detection_id.clone();
+        tokio::task::spawn_blocking(move || -> rusqlite::Result<()> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO edge_detection_events (\
+                    detection_id, tenant_id, detector_kind, subject_key_id, \
+                    observed_at, evidence, severity, \
+                    signature, signing_key_id, signature_verified, persist_row_hash\
+                 ) VALUES (?1, ?2, 'unconsented_external_probe', ?3, ?4, ?5, 'warn', \
+                          'sig', 'registry-steward', 1, 'hash')",
+                rusqlite::params![
+                    did,
+                    "tnt-test",
+                    "k-suspect",
+                    "2026-05-15T00:00:00+00:00",
+                    "{\"probed\":\"x\"}",
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        let conn = backend.conn.clone();
+        let did = detection_id.clone();
+        let row_exists = tokio::task::spawn_blocking(move || -> rusqlite::Result<bool> {
+            let conn = conn.blocking_lock();
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM edge_detection_events WHERE detection_id = ?1",
+                [&did],
+                |r| r.get(0),
+            )?;
+            Ok(n == 1)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(row_exists);
+    }
+
+    /// v1.3.0 (CIRISPersist#46): roles round-trip via put_public_key
+    /// → lookup_public_key. Confirms the wire-shape + storage path
+    /// for the per-row role tag column.
+    #[tokio::test]
+    async fn roles_round_trip_via_put_lookup() {
+        let backend = trust_test_backend().await;
+        let mut key = fed_key("k-roles", "primitive-roles", "registry-steward");
+        key.roles = vec![
+            "cirislens_pipeline_writer".to_owned(),
+            "cirislens_secrets_reader".to_owned(),
+        ];
+        backend
+            .put_public_key(SignedKeyRecord { record: key })
+            .await
+            .unwrap();
+        let got = FederationDirectory::lookup_public_key(&backend, "k-roles")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.roles.len(), 2);
+        assert!(got.roles.contains(&"cirislens_pipeline_writer".to_owned()));
+        assert!(got.roles.contains(&"cirislens_secrets_reader".to_owned()));
     }
 }

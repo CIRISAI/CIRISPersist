@@ -5,6 +5,135 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.3.0] — 2026-05-15
+
+**M2 cut: trust hierarchy absorption + role-tag enforcement
+(closes #46 + #47).** Persist absorbs `CIRISNodeCore`'s `crate::trust`
+module surface — the 5 shapes (`TrustType`, `TrustRelationship`,
+`TrustGrant`, `TrustRow`, `TrustFilter`) and the 4 trait methods
+(`grant_trust`, `revoke_trust`, `lookup_trust`, `list_trusted_keys`)
+land on the existing `FederationDirectory` trait. NodeCore's local
+placeholder trait in `src/trust.rs` becomes
+`pub use ciris_persist::federation::FederationDirectory` (or the
+convenience alias under `ciris_persist::cirisnode::`). Per-row role
+tags on `federation_keys` ship in the same migration to enforce
+pipeline + secrets writer/reader/admin tiers (CIRISPersist#46 — the
+deliverable that v1.1.0 deferred). #45 already shipped in 1.1.2 and
+is unchanged.
+
+### V020 migration — single cut for both dialects
+
+- **`federation_keys` trust hierarchy columns**: `consent_role`
+  (CIRISAgent#760 §RC, flat enum), `trust_type`, `trust_relationship`,
+  `trust_domains`, `trusted_at`, `trusted_by`, `expires_at`. PG ships
+  CHECK constraints (`federation_keys_no_self_trust`,
+  `federation_keys_registry_requires_domains`) NOT VALID so legacy
+  rows skip validation; SQLite enforces both at the API surface
+  (`FederationDirectory::grant_trust` /
+  `crate::store::memory::validate_trust_grant`) since `ALTER TABLE
+  ADD CHECK` isn't supported.
+- **`federation_keys.roles` TEXT[] (PG) / TEXT JSON-array (SQLite)**
+  for the CIRISPersist#46 role-tag deliverable. `KeyRecord` gains a
+  `roles: Vec<String>` field with `#[serde(default)]` so v1.2.x wire
+  shapes deserialize unchanged.
+- **`edge_detection_events` table** for LensCore's
+  `UnconsentedExternalProbe` / `ExcessiveRecursion` /
+  `ConsentGateLeak` detector signals. FK to `federation_keys(key_id)`
+  + standard CIRISPersist audit envelope.
+- **`audit_log` CHECK vocabulary extension** adds `trust_granted` +
+  `trust_revoked` to the V018 vocabulary (CIRISAgent#756 Q4 verdict
+  — state transitions live in the audit chain). Folded into V020 on
+  the PG side; SQLite stays convention-only per the V018 deferral
+  note.
+
+### New trait surface
+
+- `FederationDirectory::grant_trust(grant)` — UPSERT semantics on
+  `federation_keys.key_id`, preserves pubkey + signature envelope
+  from prior `put_public_key`. Self-trust + Registry-without-domains
+  rejected at the API boundary with `Error::InvalidArgument`.
+- `FederationDirectory::revoke_trust(key, revoked_by)` — sets
+  `expires_at = NOW()`. Idempotent.
+- `FederationDirectory::lookup_trust(key)` — raw row, no transitive
+  resolution. NodeCore composes `resolve_trust` on top.
+- `FederationDirectory::list_trusted_keys(filter)` — relationship +
+  domain + type AND-filtered; expired rows excluded unless
+  `include_expired=true`.
+- `KeyRecord.roles: Vec<String>` (additive field, serde-default).
+- `AuditEventType::TrustGranted` / `TrustRevoked` (new variants).
+
+### Role-tag enforcement (CIRISPersist#46)
+
+- **Pipeline ingest** (`POST /api/v1/pipeline/ingest`): after edge
+  signature verifies, fetches the edge's `KeyRecord` and requires
+  `cirislens_pipeline_writer` OR `cirislens_secrets_writer` in the
+  roles list. Rejects with 403 + kind `pipeline_invariant_role_tag`.
+- **Secrets routes** (`src/server/secrets.rs`): per-route reader /
+  writer / admin tier enforcement via `verify_and_authorize`. Read
+  routes (list / retrieve / filter_config / stats / access_logs)
+  accept `cirislens_secrets_reader` and higher; mutating routes
+  (store / try_claim / recall / encrypt / decrypt / put_filter_config
+  / reencrypt_all / forget) require `cirislens_secrets_writer` or
+  higher; `rotate_master_key` requires `cirislens_secrets_admin`.
+  Rejects with 403 + kind `secrets_role_tag`.
+
+### PyO3 surface
+
+Four new `Engine` methods on the backend-dispatch surface:
+`federation_grant_trust(grant_json)`,
+`federation_revoke_trust(key, revoked_by)`,
+`federation_lookup_trust(key) → Option[str]`,
+`federation_list_trusted_keys(filter_json) → str`. JSON in/out for
+complex types; primitive types as `&str` args. Errors flow through
+the existing `federation_err_to_py` shape (kind tokens
+`federation_invalid_argument` → `Permanent`, etc.).
+
+### Convenience re-export
+
+`ciris_persist::cirisnode` module gains a `pub use crate::federation`
+re-export bundle (`FederationDirectory`, `TrustGrant`, `TrustRow`,
+`TrustFilter`, `TrustType`, `TrustRelationship`) so NodeCore can
+import via either the canonical `ciris_persist::federation::*` path
+or the sibling-pattern `ciris_persist::cirisnode::*` path that
+matches its existing `NodeCoreService` import shape.
+
+### Audit chain integration
+
+`grant_trust` and `revoke_trust` do NOT auto-write audit chain
+entries — the chain is self-signed (AV-49) and requires the caller's
+Ed25519 key, which persist doesn't hold. Callers compose the pair:
+write the trust row via this trait, then write an `AuditEntry` with
+`action_type='trust_granted'` (or `trust_revoked`) via
+`AuditService::record_entry` / `try_claim_event`. The V020 CHECK
+extension + `AuditEventType` enum variants are the vocabulary
+contract; the actual sign-and-write stays at the caller.
+
+### Tests added
+
+8 new tests on the SQLite arm + 3 on the Postgres arm covering the
+seven M1-validated shapes (round-trip, self-trust reject,
+Registry-without-domains reject, revoke idempotent, relationship
+filter, include_expired filter, audit vocab round-trip) plus the
+edge_detection_events smoke test and a roles-column round-trip
+smoke test. `tests/qa_harness.rs` schema_history expectation bumped
+19 → 20 to match V020.
+
+### Migrations
+
+- `migrations/postgres/lens/V020__federation_keys_trust_hierarchy.sql`
+- `migrations/sqlite/lens/V020__federation_keys_trust_hierarchy.sql`
+
+### Constraints honored
+
+- `FederationDirectory` existing trait methods UNCHANGED. Trust
+  methods are additive.
+- `KeyRecord` wire shape preserved — the new `roles` field has
+  `#[serde(default)]` so v1.2.x writers/readers stay compatible.
+- No new dependencies. Trust types compose from chrono + serde +
+  the existing federation error tree.
+- NodeCore's `src/trust.rs` contract mirrored exactly. Zero
+  deviation from the trait + 5 supporting type shapes.
+
 ## [1.2.1] — 2026-05-15
 
 **v1.2.0 PG integration test fix.** v1.2.0 tag CI hit two PG-side

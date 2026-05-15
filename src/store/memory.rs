@@ -51,6 +51,13 @@ struct State {
     /// v0.2.0 — Federation directory `federation_keys` rows,
     /// keyed by `key_id`.
     federation_keys: HashMap<String, crate::federation::KeyRecord>,
+    /// v1.3.0 (CIRISPersist#46 + #47) — Federation trust hierarchy
+    /// rows, parallel to `federation_keys`. Same key (`key_id`)
+    /// because V020 adds the trust columns to the same Postgres
+    /// table; on the memory backend we keep them separately so the
+    /// "row exists in directory but has no trust grant" case
+    /// stays unambiguous.
+    federation_trust: HashMap<String, crate::federation::TrustRow>,
     /// v0.2.0 — Federation `federation_attestations` rows,
     /// append-only.
     federation_attestations: Vec<crate::federation::Attestation>,
@@ -75,6 +82,7 @@ impl Default for MemoryBackend {
                 federation_keys: HashMap::new(),
                 federation_attestations: Vec::new(),
                 federation_revocations: Vec::new(),
+                federation_trust: HashMap::new(),
                 outbound_queue: HashMap::new(),
             }),
         }
@@ -122,12 +130,27 @@ impl MemoryBackend {
             scrub_timestamp: now,
             pqc_completed_at: None,
             persist_row_hash: String::new(),
+            roles: Vec::new(),
         };
         state.federation_keys.insert(key_id.to_owned(), rec);
         // Keep the legacy map populated too — some tests still
         // reference it via `state.keys`. Single source of truth at
         // verify is federation_keys; this is just bookkeeping.
         state.keys.insert(key_id.to_owned(), key);
+    }
+
+    /// v1.3.0 (CIRISPersist#46) — test helper to grant a key the
+    /// supplied role tags. Mutates the existing `federation_keys`
+    /// row's `roles` column; called after [`add_public_key`] by tests
+    /// that exercise the role-tag enforcement on pipeline / secrets
+    /// routes. Panics if the key isn't already present.
+    pub fn set_roles(&self, key_id: &str, roles: Vec<String>) {
+        let mut state = self.state.lock().expect("memory backend lock");
+        let rec = state
+            .federation_keys
+            .get_mut(key_id)
+            .expect("set_roles: key_id must exist via add_public_key first");
+        rec.roles = roles;
     }
 
     /// Snapshot of inserted event rows. For tests.
@@ -640,6 +663,169 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             })
             .collect())
     }
+
+    // ── Trust grants (v1.3.0, CIRISPersist#46 + #47) ───────────────
+
+    async fn grant_trust(
+        &self,
+        grant: crate::federation::TrustGrant,
+    ) -> Result<(), crate::federation::Error> {
+        validate_trust_grant(&grant)?;
+        let mut state = self.state.lock().expect("memory backend lock");
+        // V020 adds the trust columns to the existing federation_keys
+        // table. On the memory backend we mirror that contract by
+        // requiring `grant.key` to already exist as a federation_keys
+        // row (matches the PG "UPSERT preserves pubkey + envelope"
+        // shape — there's nothing to preserve if the row doesn't
+        // exist yet).
+        if !state.federation_keys.contains_key(&grant.key) {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "federation_keys row {} does not exist — call put_public_key first",
+                grant.key
+            )));
+        }
+        let row = crate::federation::TrustRow {
+            key: grant.key.clone(),
+            trust_type: grant.trust_type,
+            trust_relationship: grant.trust_relationship,
+            trust_domains: grant.trust_domains,
+            trusted_by: grant.trusted_by,
+            trusted_at: chrono::Utc::now(),
+            expires_at: grant.expires_at,
+        };
+        state.federation_trust.insert(grant.key, row);
+        Ok(())
+    }
+
+    async fn revoke_trust(
+        &self,
+        key: &str,
+        revoked_by: &str,
+    ) -> Result<(), crate::federation::Error> {
+        if key.is_empty() {
+            return Err(crate::federation::Error::InvalidArgument(
+                "key must be non-empty".into(),
+            ));
+        }
+        if revoked_by.is_empty() {
+            return Err(crate::federation::Error::InvalidArgument(
+                "revoked_by must be non-empty".into(),
+            ));
+        }
+        let mut state = self.state.lock().expect("memory backend lock");
+        if let Some(row) = state.federation_trust.get_mut(key) {
+            // Idempotent: only update if not already expired.
+            let now = chrono::Utc::now();
+            match row.expires_at {
+                Some(t) if t <= now => {} // already expired — no-op
+                _ => row.expires_at = Some(now),
+            }
+        }
+        Ok(())
+    }
+
+    async fn lookup_trust(
+        &self,
+        key: &str,
+    ) -> Result<Option<crate::federation::TrustRow>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(state.federation_trust.get(key).cloned())
+    }
+
+    async fn list_trusted_keys(
+        &self,
+        filter: crate::federation::TrustFilter,
+    ) -> Result<Vec<crate::federation::TrustRow>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let now = chrono::Utc::now();
+        let rows: Vec<crate::federation::TrustRow> = state
+            .federation_trust
+            .values()
+            .filter(|r| {
+                if !filter.include_expired {
+                    if let Some(t) = r.expires_at {
+                        if t <= now {
+                            return false;
+                        }
+                    }
+                }
+                if let Some(t) = filter.trust_type {
+                    if r.trust_type != t {
+                        return false;
+                    }
+                }
+                if let Some(rel) = filter.trust_relationship {
+                    if r.trust_relationship != rel {
+                        return false;
+                    }
+                }
+                if let Some(domain) = &filter.domain {
+                    let in_domain = r
+                        .trust_domains
+                        .as_ref()
+                        .map(|d| d.iter().any(|x| x == domain))
+                        .unwrap_or(false);
+                    if !in_domain {
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect();
+        Ok(rows)
+    }
+}
+
+/// Shared validation for `TrustGrant`. Same rules as the PG CHECK
+/// constraints (`federation_keys_no_self_trust` +
+/// `federation_keys_registry_requires_domains`) — surfaced as typed
+/// `Error::InvalidArgument` instead of an opaque backend SQL error.
+/// Used by every FederationDirectory impl so SQLite (which can't
+/// add CHECK via ALTER TABLE) gets the same enforcement.
+pub(crate) fn validate_trust_grant(
+    grant: &crate::federation::TrustGrant,
+) -> Result<(), crate::federation::Error> {
+    if grant.key.is_empty() {
+        return Err(crate::federation::Error::InvalidArgument(
+            "grant.key must be non-empty".into(),
+        ));
+    }
+    if grant.trusted_by.is_empty() {
+        return Err(crate::federation::Error::InvalidArgument(
+            "grant.trusted_by must be non-empty".into(),
+        ));
+    }
+    if grant.trusted_by == grant.key {
+        return Err(crate::federation::Error::InvalidArgument(format!(
+            "grant.trusted_by must differ from grant.key (no self-trust); got {}",
+            grant.key
+        )));
+    }
+    match grant.trust_relationship {
+        crate::federation::TrustRelationship::Registry => {
+            let n = grant.trust_domains.as_ref().map(|d| d.len()).unwrap_or(0);
+            if n == 0 {
+                return Err(crate::federation::Error::InvalidArgument(
+                    "Registry-relationship grants require a non-empty trust_domains list".into(),
+                ));
+            }
+        }
+        crate::federation::TrustRelationship::Direct => {
+            // Direct grants: trust_domains MUST be None per NodeCore's
+            // shape contract. The PG schema doesn't reject Some(vec)
+            // on Direct rows directly, but the resolver ignores
+            // domains there — surface as InvalidArgument at the API
+            // boundary so callers get a clean error instead of silent
+            // misuse of the field.
+            if grant.trust_domains.is_some() {
+                return Err(crate::federation::Error::InvalidArgument(
+                    "Direct-relationship grants must have trust_domains=None".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 // ─── OutboundQueue impl (v0.4.0, CIRISPersist#16) ──────────────────
@@ -1631,6 +1817,7 @@ mod tests {
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
+            roles: Vec::new(),
         }
     }
 

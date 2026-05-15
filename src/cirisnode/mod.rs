@@ -64,6 +64,17 @@ pub mod types;
 pub mod verify;
 
 pub use service::NodeCoreService;
+// v1.3.0 (CIRISPersist#47): convenience re-export of the
+// FederationDirectory trait so NodeCore consumers can use either
+// `ciris_persist::federation::FederationDirectory` (canonical) or
+// `ciris_persist::cirisnode::FederationDirectory` (sibling-pattern
+// matches the v0.7.0 NodeCoreService import path). This unblocks
+// NodeCore's `pub use ciris_persist::cirisnode::{FederationDirectory,
+// TrustGrant, TrustRow, TrustFilter}` replacement of its local
+// placeholder trait definition in `src/trust.rs`.
+pub use crate::federation::{
+    FederationDirectory, TrustFilter, TrustGrant, TrustRelationship, TrustRow, TrustType,
+};
 pub use types::{
     Cell, ContributionEnvelope, ContributionListPage, ContributionType, ContributionsFilter,
     CreditsLedgerEntry, CreditsUpdate, DiversityProof, ExpertiseLedgerEntry, ExpertiseUpdate,

@@ -1557,6 +1557,144 @@ impl PyEngine {
         })
     }
 
+    // ── v1.3.0 (CIRISPersist#46 + #47) — Trust hierarchy wraps ─────
+    //
+    // Wire shape mirrors the existing FederationDirectory PyO3
+    // surface: JSON strings in/out for complex types (TrustGrant,
+    // TrustRow, TrustFilter); primitive types as direct &str args.
+    // Lens calls json.dumps before passing in, json.loads on receiving
+    // back. Errors go through `federation_err_to_py` for the same
+    // stable-kind discipline as the rest of the federation methods.
+
+    /// Federation directory: grant trust to a key.
+    ///
+    /// `trust_grant_json` is a JSON string of `TrustGrant`:
+    /// `{"key": ..., "trust_type": "temporary"|"partnered"|"anonymous",
+    ///   "trust_relationship": "direct"|"registry",
+    ///   "trust_domains": [...]|null,
+    ///   "trusted_by": ..., "expires_at": "...."|null}`.
+    /// Raises `ValueError` on self-trust (trusted_by == key),
+    /// missing-domains-on-Registry, or unknown key_id.
+    fn federation_grant_trust(&self, py: Python<'_>, trust_grant_json: &str) -> PyResult<()> {
+        catch_panic(|| {
+            let backend = self.backend_postgres_unwrap().clone();
+            let runtime = self.runtime.clone();
+            let grant: crate::federation::TrustGrant = serde_json::from_str(trust_grant_json)
+                .map_err(|e| PyValueError::new_err(format!("TrustGrant JSON decode: {e}")))?;
+            py.detach(|| {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    backend
+                        .grant_trust(grant)
+                        .await
+                        .map_err(federation_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// Federation directory: revoke trust for a key. Idempotent —
+    /// revoking an already-expired key is a no-op.
+    fn federation_revoke_trust(&self, py: Python<'_>, key: &str, revoked_by: &str) -> PyResult<()> {
+        catch_panic(|| {
+            let backend = self.backend_postgres_unwrap().clone();
+            let runtime = self.runtime.clone();
+            let key = key.to_owned();
+            let revoked_by = revoked_by.to_owned();
+            py.detach(|| {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    backend
+                        .revoke_trust(&key, &revoked_by)
+                        .await
+                        .map_err(federation_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// Federation directory: look up the trust row for a key.
+    /// Returns a JSON-encoded `TrustRow` string, or `None` if no
+    /// trust grant exists.
+    fn federation_lookup_trust(&self, py: Python<'_>, key: &str) -> PyResult<Option<String>> {
+        catch_panic(|| {
+            let backend = self.backend_postgres_unwrap().clone();
+            let runtime = self.runtime.clone();
+            let key = key.to_owned();
+            py.detach(|| {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    let opt = backend
+                        .lookup_trust(&key)
+                        .await
+                        .map_err(federation_err_to_py)?;
+                    match opt {
+                        None => Ok(None),
+                        Some(row) => Ok(Some(serde_json::to_string(&row).map_err(|e| {
+                            PyRuntimeError::new_err(format!("TrustRow JSON encode: {e}"))
+                        })?)),
+                    }
+                })
+            })
+        })
+    }
+
+    /// Federation directory: list trusted keys matching a filter.
+    /// Returns a JSON-array string of `TrustRow` objects.
+    ///
+    /// `trust_filter_json` shape:
+    /// `{"trust_type": "..."|null, "trust_relationship": "..."|null,
+    ///   "domain": "..."|null, "include_expired": bool}`.
+    /// All fields optional; `include_expired` defaults to false.
+    fn federation_list_trusted_keys(
+        &self,
+        py: Python<'_>,
+        trust_filter_json: &str,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let backend = self.backend_postgres_unwrap().clone();
+            let runtime = self.runtime.clone();
+            // TrustFilter doesn't derive Serialize/Deserialize (the
+            // shape mirrors NodeCore's local type, which is bare); we
+            // parse a wire dict manually into the native type.
+            let wire: TrustFilterWire = serde_json::from_str(trust_filter_json)
+                .map_err(|e| PyValueError::new_err(format!("TrustFilter JSON decode: {e}")))?;
+            let trust_type = match wire.trust_type.as_deref() {
+                None => None,
+                Some(s) => Some(
+                    crate::federation::TrustType::from_wire_str(s)
+                        .ok_or_else(|| PyValueError::new_err(format!("unknown trust_type: {s}")))?,
+                ),
+            };
+            let trust_relationship = match wire.trust_relationship.as_deref() {
+                None => None,
+                Some(s) => Some(
+                    crate::federation::TrustRelationship::from_wire_str(s).ok_or_else(|| {
+                        PyValueError::new_err(format!("unknown trust_relationship: {s}"))
+                    })?,
+                ),
+            };
+            let filter = crate::federation::TrustFilter {
+                trust_type,
+                trust_relationship,
+                domain: wire.domain,
+                include_expired: wire.include_expired,
+            };
+            py.detach(|| {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    let rows = backend
+                        .list_trusted_keys(filter)
+                        .await
+                        .map_err(federation_err_to_py)?;
+                    serde_json::to_string(&rows).map_err(|e| {
+                        PyRuntimeError::new_err(format!("Vec<TrustRow> JSON encode: {e}"))
+                    })
+                })
+            })
+        })
+    }
+
     /// v0.3.2 (CIRISPersist#11) — Walk hybrid-pending federation rows
     /// across `federation_keys` / `federation_attestations` /
     /// `federation_revocations` and drive cold-path PQC fill-in for
@@ -6348,6 +6486,22 @@ fn parse_hybrid_policy(
             "unknown policy {other:?} (expected strict / ed25519_fallback / soft_freshness)"
         ))),
     }
+}
+
+/// v1.3.0 (CIRISPersist#46 + #47) — Wire shape for the `TrustFilter`
+/// JSON dict that `federation_list_trusted_keys` accepts from Python.
+/// All fields optional; `include_expired` defaults to false via
+/// `#[serde(default)]`.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct TrustFilterWire {
+    #[serde(default)]
+    trust_type: Option<String>,
+    #[serde(default)]
+    trust_relationship: Option<String>,
+    #[serde(default)]
+    domain: Option<String>,
+    #[serde(default)]
+    include_expired: bool,
 }
 
 /// v0.4.0 — Adapter implementing `PublicKeyDirectory` against the

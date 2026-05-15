@@ -234,6 +234,15 @@ pub enum AuditEventType {
     WalletSwapCompleted,
     WalletSwapFailed,
     WalletSecurityEvent,
+
+    // Trust hierarchy state transitions (2 — v1.3.0, CIRISPersist#47)
+    /// `FederationDirectory::grant_trust` write — subject_kind="key",
+    /// subject_id=the granted `key`. Payload carries the full
+    /// `TrustGrant` fields.
+    TrustGranted,
+    /// `FederationDirectory::revoke_trust` write — subject_kind="key",
+    /// subject_id=the revoked `key`. Payload carries `revoked_by`.
+    TrustRevoked,
 }
 
 impl AuditEventType {
@@ -262,6 +271,8 @@ impl AuditEventType {
             Self::WalletSwapCompleted => "wallet_swap_completed",
             Self::WalletSwapFailed => "wallet_swap_failed",
             Self::WalletSecurityEvent => "wallet_security_event",
+            Self::TrustGranted => "trust_granted",
+            Self::TrustRevoked => "trust_revoked",
         }
     }
 
@@ -293,6 +304,8 @@ impl AuditEventType {
             "wallet_swap_completed" => Self::WalletSwapCompleted,
             "wallet_swap_failed" => Self::WalletSwapFailed,
             "wallet_security_event" => Self::WalletSecurityEvent,
+            "trust_granted" => Self::TrustGranted,
+            "trust_revoked" => Self::TrustRevoked,
             _ => return None,
         })
     }

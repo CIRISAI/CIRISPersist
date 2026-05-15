@@ -91,6 +91,15 @@ pub const KIND_CLASSIFICATIONS_COUNT: &str = "pipeline_invariant_classifications
 /// An `encrypted_secret.secret_uuid` doesn't appear as
 /// `{SECRET:uuid:description}` anywhere in the scrubbed envelope.
 pub const KIND_ORPHAN_SECRET: &str = "pipeline_invariant_orphan_secret";
+/// v1.3.0 (CIRISPersist#46) — Edge key doesn't carry a writer role
+/// tag in `federation_keys.roles`. Reject with 403.
+pub const KIND_ROLE_TAG: &str = "pipeline_invariant_role_tag";
+
+/// Role tag required for the pipeline ingest writer (v1.3.0 #46).
+const ROLE_PIPELINE_WRITER: &str = "cirislens_pipeline_writer";
+/// Alternate role tag accepted for the pipeline ingest writer
+/// (overlaps the secrets writer privilege tier).
+const ROLE_SECRETS_WRITER: &str = "cirislens_secrets_writer";
 
 // ── Route handler ────────────────────────────────────────────────────
 
@@ -151,6 +160,62 @@ where
             "pipeline ingest rejected: edge signature failed verify"
         );
         return invariant_response(KIND_EDGE_SIGNATURE, format!("{e}"));
+    }
+
+    // 2b. Role-tag enforcement (v1.3.0, CIRISPersist#46). After the
+    //     edge signature verifies, fetch the edge's KeyRecord and
+    //     require a writer role tag — `cirislens_pipeline_writer`
+    //     OR `cirislens_secrets_writer` (the secrets-writer tier
+    //     overlaps because secrets-writers send pipeline traffic
+    //     too). Reject with 403 if no writer role is present.
+    let edge_record = match FederationDirectory::lookup_public_key(
+        &*state.directory,
+        &envelope.edge_key_id,
+    )
+    .await
+    {
+        Ok(Some(rec)) => rec,
+        Ok(None) => {
+            return invariant_response(
+                KIND_EDGE_SIGNATURE,
+                format!("edge key not in directory: {}", envelope.edge_key_id),
+            );
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "edge key lookup failed during role-tag check");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    kind: "store_lookup_failed",
+                    detail: format!("{e}"),
+                    retry_after_seconds: Some(5),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let has_writer_role = edge_record
+        .roles
+        .iter()
+        .any(|r| r == ROLE_PIPELINE_WRITER || r == ROLE_SECRETS_WRITER);
+    if !has_writer_role {
+        tracing::warn!(
+            edge_key_id = %envelope.edge_key_id,
+            roles = ?edge_record.roles,
+            "pipeline ingest rejected: edge key has no writer role tag"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                kind: KIND_ROLE_TAG,
+                detail: format!(
+                    "edge key {} missing required role ({} or {})",
+                    envelope.edge_key_id, ROLE_PIPELINE_WRITER, ROLE_SECRETS_WRITER
+                ),
+                retry_after_seconds: None,
+            }),
+        )
+            .into_response();
     }
 
     // 3. Inner agent signature verify (FSD §4.3 invariant 3 — defense-
@@ -442,6 +507,11 @@ mod tests {
         // directory so verify can resolve them.
         let edge_sk = SigningKey::from_bytes(&EDGE_SEED);
         backend.add_public_key(EDGE_KEY_ID, edge_sk.verifying_key());
+        // v1.3.0 (CIRISPersist#46): edge keys need a writer role to
+        // pass the role-tag invariant gate. Pipeline tests grant
+        // `cirislens_pipeline_writer`; the alternate
+        // `cirislens_secrets_writer` would also pass.
+        backend.set_roles(EDGE_KEY_ID, vec!["cirislens_pipeline_writer".to_owned()]);
         let agent_sk = SigningKey::from_bytes(&AGENT_SEED);
         backend.add_public_key(AGENT_KEY_ID, agent_sk.verifying_key());
 

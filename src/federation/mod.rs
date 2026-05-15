@@ -42,7 +42,7 @@ pub mod types;
 pub use sqlite_open::FederationDirectorySqlite;
 pub use types::{
     Attestation, HybridPendingRow, KeyRecord, Revocation, SignedAttestation, SignedKeyRecord,
-    SignedRevocation,
+    SignedRevocation, TrustFilter, TrustGrant, TrustRelationship, TrustRow, TrustType,
 };
 
 /// Federation directory trait — the registry/lens/agent's read+write
@@ -215,6 +215,97 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         limit: i64,
     ) -> impl Future<Output = Result<Vec<HybridPendingRow>, Error>> + Send;
+
+    // ── Trust grants (v1.3.0, CIRISPersist#46 + #47) ───────────────
+    //
+    // Persist absorbs NodeCore's `crate::trust` module surface at
+    // the M2 cut. Raw CRUD over the trust-hierarchy columns on
+    // `federation_keys` (added by V020); NodeCore composes the
+    // transitive-resolution policy on top via `resolve_trust`.
+    //
+    // Default impls return `Error::Backend` with a stable
+    // "trust_methods_not_implemented" marker so backends that
+    // haven't been ported yet (memory/test shims) compile cleanly.
+    // The real backends (postgres, sqlite) override every method.
+    //
+    // # Audit chain coupling
+    //
+    // CIRISAgent#756 Q4 verdict: state transitions for the trust
+    // hierarchy live in the audit chain (`cirislens.audit_log`),
+    // not in a separate revocation_history table. The
+    // `AuditEventType::TrustGranted` / `TrustRevoked` vocabulary +
+    // V020 CHECK extension carry the wire-shape; persist callers
+    // compose the pair (write the trust row via this trait, then
+    // write the audit entry via `AuditService::record_entry` /
+    // `try_claim_event` with a caller-signed `AuditEntry`). Persist
+    // does not auto-sign because the audit chain's self-signed
+    // identity model (AV-49) requires the caller's Ed25519 key.
+
+    /// Insert or update a trust row on `federation_keys`.
+    /// Implementations:
+    ///   1. Validate `grant.trusted_by != grant.key` (no self-trust);
+    ///      reject with [`Error::InvalidArgument`].
+    ///   2. Validate `Registry`-relationship grants carry a non-empty
+    ///      `trust_domains`; reject with [`Error::InvalidArgument`].
+    ///   3. UPSERT on `key_id` — preserves the pubkey + signature
+    ///      envelope written by the prior `put_public_key`, overwrites
+    ///      the trust columns. `trusted_at` is set to `NOW()`.
+    fn grant_trust(&self, grant: TrustGrant) -> impl Future<Output = Result<(), Error>> + Send {
+        let _ = grant;
+        async {
+            Err(Error::Backend(
+                "grant_trust not implemented for this backend".into(),
+            ))
+        }
+    }
+
+    /// Soft-delete a trust row by setting `expires_at = NOW()`.
+    /// Idempotent — revoking an already-expired row is a no-op.
+    fn revoke_trust(
+        &self,
+        key: &str,
+        revoked_by: &str,
+    ) -> impl Future<Output = Result<(), Error>> + Send {
+        let _ = (key, revoked_by);
+        async {
+            Err(Error::Backend(
+                "revoke_trust not implemented for this backend".into(),
+            ))
+        }
+    }
+
+    /// Point lookup — the raw trust row, no transitive resolution.
+    /// `None` if no trust row exists for `key` (i.e., the row
+    /// exists in `federation_keys` but `trusted_by` is NULL — a
+    /// pre-V020 row, or a key registered without a trust grant).
+    fn lookup_trust(
+        &self,
+        key: &str,
+    ) -> impl Future<Output = Result<Option<TrustRow>, Error>> + Send {
+        let _ = key;
+        async {
+            Err(Error::Backend(
+                "lookup_trust not implemented for this backend".into(),
+            ))
+        }
+    }
+
+    /// All currently-trusted keys matching `filter`. Server-side
+    /// filtering for relationship + domain; expired rows excluded
+    /// unless `filter.include_expired = true`. Pre-V020 rows
+    /// (`trusted_by IS NULL`) are excluded — the surface returns
+    /// only rows with an explicit trust grant.
+    fn list_trusted_keys(
+        &self,
+        filter: TrustFilter,
+    ) -> impl Future<Output = Result<Vec<TrustRow>, Error>> + Send {
+        let _ = filter;
+        async {
+            Err(Error::Backend(
+                "list_trusted_keys not implemented for this backend".into(),
+            ))
+        }
+    }
 }
 
 /// Federation directory errors. Distinct from
