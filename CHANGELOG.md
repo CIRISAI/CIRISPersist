@@ -5,6 +5,29 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.0.2] — 2026-05-14
+
+**v1.0.1 with Python smoke test fixup.** v1.0.1 tag CI failed because
+the `test_sqlite_engine.py` Python smoke tests I wrote assumed an
+Engine constructor signature with only `(dsn)`, but the real signature
+is `Engine(dsn, signing_key_id, scrubber=None, steward_key_id=None,
+steward_key_path=None)`. Full Engine construction needs a keyring +
+signing-key fixture; the Rust-side substrate tests
+(`secrets::sqlite::tests::*`, `cirisnode::sqlite::tests::*`, etc.)
+already exercise the in-memory SQLite path end-to-end at the substrate
+level, so the Python smoke test scope is narrowed to just the
+agent-facing exception-hierarchy export check.
+
+- `tests/python/test_sqlite_engine.py` — keep the
+  `test_typed_exception_hierarchy_exported` check (verifies
+  `PersistError` / `NotFound` / `Conflict` / `Transient` / `Permanent`
+  are exported + form a clean inheritance chain extending Python's
+  `Exception`). Drop the three Engine-construction tests.
+
+No surface or behavioral changes from v1.0.0 / v1.0.1. The v1.0.0 +
+v1.0.1 tags remain on their commits as a record of the cut; v1.0.2 is
+the first wheel that actually publishes to PyPI.
+
 ## [1.0.1] — 2026-05-14
 
 **v1.0.0 with CI test fixup.** v1.0.0 tag CI hit two issues that
