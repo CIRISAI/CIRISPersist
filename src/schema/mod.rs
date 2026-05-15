@@ -157,7 +157,15 @@ impl Error {
     /// the `tracing` log path.
     pub fn detail(&self) -> Option<String> {
         match self {
-            Error::Json(_) => None,
+            // v1.1.0 (CIRISPersist#44 + CIRISLens#13): surface
+            // serde_json's structural Display message — field name from
+            // the Rust struct, line/column position, expected type.
+            // AV-15: operator-actionable, not attacker-content-bearing
+            // (the strings come from the Rust struct definitions and
+            // structural offsets, not raw payload). Bridge investigators
+            // get "missing field `component_type` at line 1 column 247"
+            // instead of None.
+            Error::Json(e) => Some(e.to_string()),
             Error::UnsupportedSchemaVersion { got, .. } => Some(got.clone()),
             Error::UnknownTraceLevel(s) => Some(s.clone()),
             Error::MissingField(name) => Some((*name).to_string()),
@@ -218,4 +226,47 @@ pub(crate) fn check_data_depth(
         walk(v, 1)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v1.1.0 (CIRISPersist#44): Error::Json(_)::detail() returns the
+    /// serde_json Display message, not None. Operator-actionable.
+    #[test]
+    fn json_error_detail_surfaces_serde_json_message() {
+        let raw = br#"{"trace_schema_version":"2.7.9"}"#;
+        let err: serde_json::Error = serde_json::from_slice::<i32>(raw).unwrap_err();
+        let kind_token = Error::Json(err).kind();
+        assert_eq!(kind_token, "schema_malformed_json");
+
+        let err2: serde_json::Error = serde_json::from_slice::<i32>(raw).unwrap_err();
+        let detail = Error::Json(err2).detail();
+        let s = detail.expect("v1.1.0 — Json::detail must be Some");
+        assert!(
+            !s.is_empty(),
+            "v1.1.0 — Json::detail must carry the serde_json message"
+        );
+    }
+
+    /// v1.1.0 (CIRISPersist#44): missing-field deserialize surfaces
+    /// the field name in detail() via serde_json's Display impl.
+    #[test]
+    fn json_error_detail_carries_missing_field_name() {
+        #[derive(Debug, serde::Deserialize)]
+        #[allow(dead_code)]
+        struct Required {
+            component_type: String,
+            data: serde_json::Value,
+        }
+
+        let raw = br#"{"data":{"a":1}}"#;
+        let err = serde_json::from_slice::<Required>(raw).unwrap_err();
+        let detail = Error::Json(err).detail().expect("Json::detail is Some");
+        assert!(
+            detail.contains("component_type"),
+            "Json::detail should name the missing field; got: {detail}"
+        );
+    }
 }
