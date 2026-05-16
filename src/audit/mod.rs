@@ -37,6 +37,7 @@
 //!   PyO3 wraps, integration tests covering the chain-break / replay
 //!   / cross-tenant rejection paths.
 
+pub mod merkle_leaf;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod service;

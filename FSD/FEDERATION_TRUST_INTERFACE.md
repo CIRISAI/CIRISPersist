@@ -527,9 +527,21 @@ Persist's audit chain (per-tenant linear hash chain in `cirisaudit_events`) is a
 - Internal node = SHA-256(`0x01` || left || right)
 - Odd-leaf promotion (standard RFC 6962)
 
-**Signed Tree Heads:**
+**Signed Tree Heads — every-append cadence (Sigstore Rekor pattern):**
 
-The engine signs an STH per tenant on a fixed cadence (default: every N entries OR every K minutes, whichever first; cadence configurable). STH is signed with the engine's local hybrid key (Ed25519 + ML-DSA-65). STH freshness is the verifier's responsibility — they enforce a window matching the engine's signing cadence + grace.
+The engine signs an STH **on every audit-chain append** — one STH per leaf per tenant. Each `AuditService::record_entry` call atomically: (1) records the entry under the existing chain integrity rules; (2) appends a leaf to the tenant's `TransparencyLog<AuditLeaf>`; (3) signs an STH over the new `(tenant_id, tree_size, root_hash, now)` with the engine's local hybrid key (Ed25519 + ML-DSA-65); (4) returns the STH alongside the entry receipt.
+
+Rationale — every-append is the right cadence for CIRIS's governance-paced volume (handfuls of events/tenant/min, not transactional):
+
+- Verifier always has a fresh STH paired with each emit receipt — no separate "fetch current STH" round-trip
+- No staleness reasoning required for active tenants
+- Witness-compatibility forward — heartbeat option becomes additive when witness protocol lands
+- Storage cost is bounded (~200 bytes/STH × emit volume; ~2 MB/tenant/year at 10K leaves)
+- Hybrid signing cost (~1 ms/leaf) amortizes over event signing already in the path
+
+STH freshness is the verifier's responsibility — the substrate signs every STH; consumers decide their own window (strict consumers may require seconds; historical replay tooling accepts any STH that covers the leaf). The CIRIS Accord doesn't pin freshness — it's policy.
+
+**Heartbeat STHs** (signed STH at fixed cadence even when idle) — deferred to the witness-cosigning era. The substrate ships every-append in v1.5.0; heartbeat is additive.
 
 ```rust
 // From ciris_verify_core::transparency

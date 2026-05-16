@@ -36,7 +36,30 @@ use std::future::Future;
 
 #[cfg(feature = "sqlite")]
 pub mod sqlite_open;
+pub mod trust_grant;
 pub mod types;
+
+/// Base64-string serde codec for `Vec<u8>` byte fields. Mirrors the
+/// private module of the same name in `crate::audit::types` — kept
+/// in lockstep so federation + audit wire shapes serialize byte
+/// fields identically (base64 standard alphabet). Visibility is
+/// `pub(crate)` so the federation submodules use it via
+/// `#[serde(with = "crate::federation::serde_bytes_b64")]` without
+/// re-exporting the codec on the public surface.
+pub(crate) mod serde_bytes_b64 {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        B64.encode(bytes).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(d)?;
+        B64.decode(s).map_err(serde::de::Error::custom)
+    }
+}
 
 #[cfg(feature = "sqlite")]
 pub use sqlite_open::FederationDirectorySqlite;
