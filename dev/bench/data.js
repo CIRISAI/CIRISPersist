@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778949216520,
+  "lastUpdate": 1778950895093,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -14867,6 +14867,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23709793,
             "range": "± 189919",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "b4a837778397778dba372c6d23a190549dc759f2",
+          "message": "1.3.2 — bulk_import flag + typed AttributesTooLarge (closes #50)\n\nFollow-up to v1.3.1 #49 surfaced by CIRISAgent datum-cutover: 1 of\n989 legacy graph_nodes rows is a 1.67 MiB conversation_summary that\nthe AV-45 1 MiB cap rejects. Cap is load-bearing for steady-state,\nbut bulk migration needs an escape hatch.\n\n- `GraphService::upsert_node` + `upsert_edge` take new\n  `bulk_import: bool` parameter. `true` skips the AV-45 cap.\n  Default `false` preserves existing semantics for hot path.\n- New `Error::AttributesTooLarge { bytes, cap }` variant with stable\n  `kind = \"cirisgraph_attributes_too_large\"`. Replaces the opaque\n  `InvalidArgument(\"attributes too large: …\")` string callers had\n  to grep for. PyO3 surfaces via the typed-exception `Permanent`\n  class.\n- PyO3 `cirisgraph_upsert_node` / `cirisgraph_upsert_edge` now take\n  `bulk_import` kwarg (default `False`).\n\nPer-type caps (ask #2 from #50) deferred — bigger config surface;\nbulk_import flag covers the migration case.\n\nBackward compat: trait signature changes are breaking for direct\nRust consumers composing the trait. PyO3 callers on v1.3.1 keep\nworking — `bulk_import` defaults to `False` matching prior behavior.\nCallers grepping for \"attributes too large\" in InvalidArgument\nstrings need to switch to `Error::AttributesTooLarge { .. }` or\n`err.kind() == \"cirisgraph_attributes_too_large\"`.\n\nTests: +1 SQLite (bulk_import skips cap; default rejects with typed\nvariant). Existing AV-45 assertions updated to match the new\ntyped variant in both backends. 4/4 graph::sqlite::tests pass;\nPG round-trip green against fresh ciris-qa-postgres.\n\nCIRISAgent's tools/ops/migrate_to_persist.py can now drop the\noversize-row workaround and pass `bulk_import=True` for migration.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-16T11:53:54-05:00",
+          "tree_id": "77e3b00d2ddafd2e07017f0c51fc17fdb72bcd47",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/b4a837778397778dba372c6d23a190549dc759f2"
+        },
+        "date": 1778950894495,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 105901,
+            "range": "± 828",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 245743,
+            "range": "± 1932",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 526170,
+            "range": "± 4798",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1848735,
+            "range": "± 8290",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 342,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1525,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7590,
+            "range": "± 202",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21181,
+            "range": "± 70",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24249,
+            "range": "± 584",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83575,
+            "range": "± 586",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 389,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3106,
+            "range": "± 51",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9595,
+            "range": "± 30",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41798,
+            "range": "± 763",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 621,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2271348,
+            "range": "± 61679",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6602942,
+            "range": "± 225814",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23641162,
+            "range": "± 100286",
             "unit": "ns/iter"
           }
         ]
