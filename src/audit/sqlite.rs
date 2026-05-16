@@ -1158,6 +1158,348 @@ impl AuditService for SqliteAuditBackend {
                 .map_err(|e| Error::Backend(format!("decode grant_id: {e}"))),
         }
     }
+
+    // ── v1.5.0 Phase F+G — projection reads + Merkle proofs ─────────
+
+    async fn get_trust_grant(
+        &self,
+        grant_id: uuid::Uuid,
+    ) -> Result<Option<crate::federation::trust_grant::TrustGrantRow>, Error> {
+        let conn = self.conn_handle();
+        let grant_id_str = grant_id.to_string();
+        let jh: tokio::task::JoinHandle<
+            Result<Option<crate::federation::trust_grant::TrustGrantRow>, Error>,
+        > = tokio::task::spawn_blocking(move || {
+            let guard = conn.blocking_lock();
+            let mut stmt = guard
+                .prepare(
+                    "SELECT grant_id, grantee_key, granter_key, purpose, scope, \
+                            granted_at, expires_at, revoked_at, revoked_by, \
+                            chain_event_id, chain_event_hash, tenant_id \
+                     FROM federation_trust_grants \
+                     WHERE grant_id = ?1",
+                )
+                .map_err(|e| Error::Backend(format!("prepare get_trust_grant: {e}")))?;
+            let row_opt = stmt
+                .query_row(
+                    rusqlite::params![grant_id_str],
+                    decode_trust_grant_row_sqlite,
+                )
+                .optional()
+                .map_err(|e| Error::Backend(format!("query get_trust_grant: {e}")))?;
+            match row_opt {
+                None => Ok(None),
+                Some(r) => Ok(Some(r?)),
+            }
+        });
+        jh.await
+            .map_err(|e| Error::Backend(format!("get_trust_grant join: {e}")))?
+    }
+
+    async fn lookup_trust_grant(
+        &self,
+        grantee_key: &str,
+        purpose: crate::federation::trust_grant::TrustPurpose,
+        scope: &str,
+        include_revoked: bool,
+        include_expired: bool,
+    ) -> Result<Vec<crate::federation::trust_grant::TrustGrantRow>, Error> {
+        let conn = self.conn_handle();
+        let grantee = grantee_key.to_owned();
+        let purpose_str = purpose.as_str().to_owned();
+        let scope = scope.to_owned();
+        // Lexical comparison against an UTC-Z RFC3339 string is monotonic
+        // — see fmt_datetime + parse_datetime locked above.
+        let now_str = fmt_datetime(chrono::Utc::now());
+        let jh: tokio::task::JoinHandle<
+            Result<Vec<crate::federation::trust_grant::TrustGrantRow>, Error>,
+        > = tokio::task::spawn_blocking(move || {
+            let mut sql = String::from(
+                "SELECT grant_id, grantee_key, granter_key, purpose, scope, \
+                        granted_at, expires_at, revoked_at, revoked_by, \
+                        chain_event_id, chain_event_hash, tenant_id \
+                 FROM federation_trust_grants \
+                 WHERE grantee_key = ?1 AND purpose = ?2 \
+                   AND (scope = ?3 OR scope = '*')",
+            );
+            if !include_revoked {
+                sql.push_str(" AND revoked_at IS NULL");
+            }
+            if !include_expired {
+                sql.push_str(" AND (expires_at IS NULL OR expires_at > ?4)");
+            }
+            sql.push_str(" ORDER BY granted_at DESC, grant_id");
+
+            let guard = conn.blocking_lock();
+            let mut stmt = guard
+                .prepare(&sql)
+                .map_err(|e| Error::Backend(format!("prepare lookup_trust_grant: {e}")))?;
+            let mut out = Vec::new();
+            if include_expired {
+                let rows = stmt
+                    .query_map(
+                        rusqlite::params![grantee, purpose_str, scope],
+                        decode_trust_grant_row_sqlite,
+                    )
+                    .map_err(|e| Error::Backend(format!("query lookup_trust_grant: {e}")))?;
+                for r in rows {
+                    out.push(
+                        r.map_err(|e| Error::Backend(format!("row lookup_trust_grant: {e}")))??,
+                    );
+                }
+            } else {
+                let rows = stmt
+                    .query_map(
+                        rusqlite::params![grantee, purpose_str, scope, now_str],
+                        decode_trust_grant_row_sqlite,
+                    )
+                    .map_err(|e| Error::Backend(format!("query lookup_trust_grant: {e}")))?;
+                for r in rows {
+                    out.push(
+                        r.map_err(|e| Error::Backend(format!("row lookup_trust_grant: {e}")))??,
+                    );
+                }
+            }
+            Ok(out)
+        });
+        jh.await
+            .map_err(|e| Error::Backend(format!("lookup_trust_grant join: {e}")))?
+    }
+
+    async fn list_trust_grants(
+        &self,
+        filter: crate::federation::trust_grant::TrustGrantFilter,
+    ) -> Result<Vec<crate::federation::trust_grant::TrustGrantRow>, Error> {
+        let conn = self.conn_handle();
+        let now_str = fmt_datetime(chrono::Utc::now());
+        let jh: tokio::task::JoinHandle<
+            Result<Vec<crate::federation::trust_grant::TrustGrantRow>, Error>,
+        > = tokio::task::spawn_blocking(move || {
+            let mut sql = String::from(
+                "SELECT grant_id, grantee_key, granter_key, purpose, scope, \
+                        granted_at, expires_at, revoked_at, revoked_by, \
+                        chain_event_id, chain_event_hash, tenant_id \
+                 FROM federation_trust_grants",
+            );
+            let mut where_clauses: Vec<String> = Vec::new();
+            let mut params: Vec<SqlValue> = Vec::new();
+            if let Some(g) = filter.grantee_key.as_ref() {
+                where_clauses.push(format!("grantee_key = ?{}", params.len() + 1));
+                params.push(SqlValue::Text(g.clone()));
+            }
+            if let Some(g) = filter.granter_key.as_ref() {
+                where_clauses.push(format!("granter_key = ?{}", params.len() + 1));
+                params.push(SqlValue::Text(g.clone()));
+            }
+            if let Some(p) = filter.purpose {
+                where_clauses.push(format!("purpose = ?{}", params.len() + 1));
+                params.push(SqlValue::Text(p.as_str().to_owned()));
+            }
+            if let Some(prefix) = filter.scope_prefix.as_ref() {
+                where_clauses.push(format!("scope LIKE ?{}", params.len() + 1));
+                params.push(SqlValue::Text(format!("{prefix}%")));
+            }
+            if !filter.include_revoked {
+                where_clauses.push("revoked_at IS NULL".to_owned());
+            }
+            if !filter.include_expired {
+                where_clauses.push(format!(
+                    "(expires_at IS NULL OR expires_at > ?{})",
+                    params.len() + 1
+                ));
+                params.push(SqlValue::Text(now_str.clone()));
+            }
+            if !where_clauses.is_empty() {
+                sql.push_str(" WHERE ");
+                sql.push_str(&where_clauses.join(" AND "));
+            }
+            sql.push_str(" ORDER BY granted_at DESC, grant_id");
+
+            let guard = conn.blocking_lock();
+            let mut stmt = guard
+                .prepare(&sql)
+                .map_err(|e| Error::Backend(format!("prepare list_trust_grants: {e}")))?;
+            let rows = stmt
+                .query_map(params_from_iter(params), decode_trust_grant_row_sqlite)
+                .map_err(|e| Error::Backend(format!("query list_trust_grants: {e}")))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(|e| Error::Backend(format!("row list_trust_grants: {e}")))??);
+            }
+            Ok(out)
+        });
+        jh.await
+            .map_err(|e| Error::Backend(format!("list_trust_grants join: {e}")))?
+    }
+
+    async fn leaf_canonical_bytes_for_chain_event(
+        &self,
+        tenant_id: &str,
+        chain_event_id: i64,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        if tenant_id.is_empty() {
+            return Err(Error::InvalidArgument("tenant_id must be non-empty".into()));
+        }
+        let conn = self.conn_handle();
+        let tenant = tenant_id.to_owned();
+        let jh: tokio::task::JoinHandle<Result<Option<Vec<u8>>, rusqlite::Error>> =
+            tokio::task::spawn_blocking(move || {
+                let guard = conn.blocking_lock();
+                guard
+                    .query_row(
+                        "SELECT canonical_bytes FROM merkle_leaves \
+                         WHERE tenant_id = ?1 AND chain_event_id = ?2",
+                        rusqlite::params![tenant, chain_event_id],
+                        |row| row.get::<_, Vec<u8>>(0),
+                    )
+                    .optional()
+            });
+        jh.await
+            .map_err(|e| Error::Backend(format!("leaf_canonical_bytes join: {e}")))?
+            .map_err(|e| Error::Backend(format!("leaf_canonical_bytes: {e}")))
+    }
+
+    async fn inclusion_proof_for_chain_event(
+        &self,
+        tenant_id: &str,
+        chain_event_id: i64,
+    ) -> Result<ciris_verify_core::transparency::MerkleProof, Error> {
+        use super::merkle_leaf::AuditLeaf;
+        use super::merkle_store::SqliteMerkleStore;
+        use ciris_verify_core::transparency::{TransparencyLog, TransparencyStore};
+
+        if tenant_id.is_empty() {
+            return Err(Error::InvalidArgument("tenant_id must be non-empty".into()));
+        }
+        // Resolve chain_event_id → leaf_index.
+        let conn = self.conn_handle();
+        let tenant = tenant_id.to_owned();
+        let tenant_for_lookup = tenant.clone();
+        let leaf_idx_opt: tokio::task::JoinHandle<Result<Option<i64>, rusqlite::Error>> =
+            tokio::task::spawn_blocking(move || {
+                let guard = conn.blocking_lock();
+                guard
+                    .query_row(
+                        "SELECT leaf_index FROM merkle_leaves \
+                         WHERE tenant_id = ?1 AND chain_event_id = ?2",
+                        rusqlite::params![tenant_for_lookup, chain_event_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()
+            });
+        let leaf_idx_i: i64 = leaf_idx_opt
+            .await
+            .map_err(|e| Error::Backend(format!("leaf_index lookup join: {e}")))?
+            .map_err(|e| Error::Backend(format!("leaf_index lookup: {e}")))?
+            .ok_or_else(|| {
+                Error::NotFound(format!(
+                    "no merkle_leaves row for tenant={tenant} chain_event_id={chain_event_id}"
+                ))
+            })?;
+        let leaf_index =
+            u64::try_from(leaf_idx_i).map_err(|_| Error::Backend("leaf_index negative".into()))?;
+
+        let conn = self.conn_handle();
+        let handle = tokio::runtime::Handle::current();
+        let store: Arc<dyn TransparencyStore<AuditLeaf>> =
+            Arc::new(SqliteMerkleStore::new(conn, handle, tenant.clone()));
+        let log_id = super::merkle_store::log_id_for_tenant(&tenant);
+        let jh: tokio::task::JoinHandle<
+            Result<
+                ciris_verify_core::transparency::MerkleProof,
+                ciris_verify_core::transparency::TransparencyError,
+            >,
+        > = tokio::task::spawn_blocking(move || {
+            let log = TransparencyLog::<AuditLeaf>::for_log(log_id, store);
+            log.inclusion_proof(leaf_index)
+        });
+        jh.await
+            .map_err(|e| Error::Merkle(format!("inclusion_proof join: {e}")))?
+            .map_err(|e| Error::Merkle(format!("inclusion_proof: {e}")))
+    }
+
+    async fn consistency_proof(
+        &self,
+        tenant_id: &str,
+        old_size: u64,
+        new_size: u64,
+    ) -> Result<ciris_verify_core::transparency::ConsistencyProof, Error> {
+        use super::merkle_leaf::AuditLeaf;
+        use super::merkle_store::SqliteMerkleStore;
+        use ciris_verify_core::transparency::{TransparencyLog, TransparencyStore};
+
+        if tenant_id.is_empty() {
+            return Err(Error::InvalidArgument("tenant_id must be non-empty".into()));
+        }
+        let conn = self.conn_handle();
+        let handle = tokio::runtime::Handle::current();
+        let tenant_owned = tenant_id.to_owned();
+        let store: Arc<dyn TransparencyStore<AuditLeaf>> =
+            Arc::new(SqliteMerkleStore::new(conn, handle, tenant_owned.clone()));
+        let log_id = super::merkle_store::log_id_for_tenant(&tenant_owned);
+        let jh: tokio::task::JoinHandle<
+            Result<
+                ciris_verify_core::transparency::ConsistencyProof,
+                ciris_verify_core::transparency::TransparencyError,
+            >,
+        > = tokio::task::spawn_blocking(move || {
+            let log = TransparencyLog::<AuditLeaf>::for_log(log_id, store);
+            log.consistency_proof(old_size, new_size)
+        });
+        jh.await
+            .map_err(|e| Error::Merkle(format!("consistency_proof join: {e}")))?
+            .map_err(|e| Error::Merkle(format!("consistency_proof: {e}")))
+    }
+}
+
+/// Decode one `federation_trust_grants` row into a [`TrustGrantRow`].
+/// Used by `get_trust_grant`, `lookup_trust_grant`, `list_trust_grants`.
+///
+/// Wraps the outer `Result<T, Error>` inside the rusqlite row callback's
+/// `Result<T, rusqlite::Error>` — the rusqlite callback can only fail
+/// with rusqlite errors, but parse failures (TrustPurpose, UUID,
+/// timestamp) are domain-level. We return `Ok(Err(Error))` so the
+/// outer call site can `?` the inner error.
+fn decode_trust_grant_row_sqlite(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<Result<crate::federation::trust_grant::TrustGrantRow, Error>> {
+    use crate::federation::trust_grant::{TrustGrantRow, TrustPurpose};
+    let grant_id_str: String = row.get("grant_id")?;
+    let grantee_key: String = row.get("grantee_key")?;
+    let granter_key: String = row.get("granter_key")?;
+    let purpose_str: String = row.get("purpose")?;
+    let scope: String = row.get("scope")?;
+    let granted_at_str: String = row.get("granted_at")?;
+    let expires_at_str: Option<String> = row.get("expires_at")?;
+    let revoked_at_str: Option<String> = row.get("revoked_at")?;
+    let revoked_by: Option<String> = row.get("revoked_by")?;
+    let chain_event_id: i64 = row.get("chain_event_id")?;
+    let chain_event_hash: Vec<u8> = row.get("chain_event_hash")?;
+    let tenant_id: String = row.get("tenant_id")?;
+
+    Ok((|| {
+        let grant_id = uuid::Uuid::parse_str(&grant_id_str)
+            .map_err(|e| Error::Backend(format!("decode grant_id: {e}")))?;
+        let purpose = TrustPurpose::parse_str(&purpose_str)
+            .ok_or_else(|| Error::Backend(format!("unknown purpose: {purpose_str}")))?;
+        let granted_at = parse_datetime(&granted_at_str)?;
+        let expires_at = expires_at_str.as_deref().map(parse_datetime).transpose()?;
+        let revoked_at = revoked_at_str.as_deref().map(parse_datetime).transpose()?;
+        Ok(TrustGrantRow {
+            grant_id,
+            grantee_key,
+            granter_key,
+            purpose,
+            scope,
+            granted_at,
+            expires_at,
+            revoked_at,
+            revoked_by,
+            chain_event_id,
+            chain_event_hash,
+            tenant_id,
+        })
+    })())
 }
 
 #[cfg(test)]

@@ -270,7 +270,7 @@ where
         .lookup_grant_id_by_chain_event(chain_event_id)
         .await
         .map_err(EmitError::Audit)?
-        .ok_or_else(|| EmitError::PostEmitProjectionMissing { chain_event_id })?;
+        .ok_or(EmitError::PostEmitProjectionMissing { chain_event_id })?;
 
     Ok(TrustGrantReceipt {
         grant_id,

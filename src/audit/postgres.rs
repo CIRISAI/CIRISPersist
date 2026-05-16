@@ -1127,6 +1127,323 @@ impl AuditService for PostgresBackend {
             }
         }
     }
+
+    // ── v1.5.0 Phase F+G — projection reads + Merkle proofs ─────────
+
+    async fn get_trust_grant(
+        &self,
+        grant_id: uuid::Uuid,
+    ) -> Result<Option<crate::federation::trust_grant::TrustGrantRow>, Error> {
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let row_opt = client
+            .query_opt(
+                "SELECT grant_id, grantee_key, granter_key, purpose, scope, \
+                        granted_at, expires_at, revoked_at, revoked_by, \
+                        chain_event_id, chain_event_hash, tenant_id \
+                 FROM cirislens.federation_trust_grants \
+                 WHERE grant_id = $1",
+                &[&grant_id],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("get_trust_grant: {e}")))?;
+        match row_opt {
+            None => Ok(None),
+            Some(r) => Ok(Some(decode_trust_grant_row_pg(&r)?)),
+        }
+    }
+
+    async fn lookup_trust_grant(
+        &self,
+        grantee_key: &str,
+        purpose: crate::federation::trust_grant::TrustPurpose,
+        scope: &str,
+        include_revoked: bool,
+        include_expired: bool,
+    ) -> Result<Vec<crate::federation::trust_grant::TrustGrantRow>, Error> {
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        // Per FSD §3.3, wildcard scopes are valid and MUST be surfaced
+        // alongside exact-match rows — the caller (NodeCore's
+        // resolve_trust) decides whether a wildcard satisfies the
+        // query.
+        let mut sql = String::from(
+            "SELECT grant_id, grantee_key, granter_key, purpose, scope, \
+                    granted_at, expires_at, revoked_at, revoked_by, \
+                    chain_event_id, chain_event_hash, tenant_id \
+             FROM cirislens.federation_trust_grants \
+             WHERE grantee_key = $1 AND purpose = $2 \
+               AND (scope = $3 OR scope = '*')",
+        );
+        if !include_revoked {
+            sql.push_str(" AND revoked_at IS NULL");
+        }
+        if !include_expired {
+            sql.push_str(" AND (expires_at IS NULL OR expires_at > NOW())");
+        }
+        sql.push_str(" ORDER BY granted_at DESC, grant_id");
+        let purpose_str = purpose.as_str();
+        let rows = client
+            .query(&sql, &[&grantee_key, &purpose_str, &scope])
+            .await
+            .map_err(|e| Error::Backend(format!("lookup_trust_grant: {e}")))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            out.push(decode_trust_grant_row_pg(r)?);
+        }
+        Ok(out)
+    }
+
+    async fn list_trust_grants(
+        &self,
+        filter: crate::federation::trust_grant::TrustGrantFilter,
+    ) -> Result<Vec<crate::federation::trust_grant::TrustGrantRow>, Error> {
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        // Build the WHERE clause dynamically. params lifetimes here
+        // are tricky — pre-stage each binding as a typed local so we
+        // can push trait-object references into one Vec.
+        let purpose_str_opt = filter.purpose.map(|p| p.as_str().to_owned());
+        let scope_like = filter.scope_prefix.as_ref().map(|p| format!("{p}%"));
+
+        let mut where_clauses: Vec<String> = Vec::new();
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
+        let mut idx = 1usize;
+        if let Some(g) = filter.grantee_key.as_ref() {
+            where_clauses.push(format!("grantee_key = ${idx}"));
+            params.push(g);
+            idx += 1;
+        }
+        if let Some(g) = filter.granter_key.as_ref() {
+            where_clauses.push(format!("granter_key = ${idx}"));
+            params.push(g);
+            idx += 1;
+        }
+        if let Some(p) = purpose_str_opt.as_ref() {
+            where_clauses.push(format!("purpose = ${idx}"));
+            params.push(p);
+            idx += 1;
+        }
+        if let Some(s) = scope_like.as_ref() {
+            where_clauses.push(format!("scope LIKE ${idx}"));
+            params.push(s);
+            idx += 1;
+        }
+        if !filter.include_revoked {
+            where_clauses.push("revoked_at IS NULL".to_owned());
+        }
+        if !filter.include_expired {
+            where_clauses.push("(expires_at IS NULL OR expires_at > NOW())".to_owned());
+        }
+        let _ = idx; // silence unused-assignment lint once params building finishes
+        let mut sql = String::from(
+            "SELECT grant_id, grantee_key, granter_key, purpose, scope, \
+                    granted_at, expires_at, revoked_at, revoked_by, \
+                    chain_event_id, chain_event_hash, tenant_id \
+             FROM cirislens.federation_trust_grants",
+        );
+        if !where_clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&where_clauses.join(" AND "));
+        }
+        sql.push_str(" ORDER BY granted_at DESC, grant_id");
+        let rows = client
+            .query(&sql, &params)
+            .await
+            .map_err(|e| Error::Backend(format!("list_trust_grants: {e}")))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            out.push(decode_trust_grant_row_pg(r)?);
+        }
+        Ok(out)
+    }
+
+    async fn leaf_canonical_bytes_for_chain_event(
+        &self,
+        tenant_id: &str,
+        chain_event_id: i64,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        if tenant_id.is_empty() {
+            return Err(Error::InvalidArgument("tenant_id must be non-empty".into()));
+        }
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let row_opt = client
+            .query_opt(
+                "SELECT canonical_bytes FROM cirislens.merkle_leaves \
+                 WHERE tenant_id = $1 AND chain_event_id = $2",
+                &[&tenant_id, &chain_event_id],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("leaf_canonical_bytes: {e}")))?;
+        match row_opt {
+            None => Ok(None),
+            Some(r) => {
+                let raw: Vec<u8> = r
+                    .try_get("canonical_bytes")
+                    .map_err(|e| Error::Backend(format!("decode canonical_bytes: {e}")))?;
+                Ok(Some(raw))
+            }
+        }
+    }
+
+    async fn inclusion_proof_for_chain_event(
+        &self,
+        tenant_id: &str,
+        chain_event_id: i64,
+    ) -> Result<ciris_verify_core::transparency::MerkleProof, Error> {
+        if tenant_id.is_empty() {
+            return Err(Error::InvalidArgument("tenant_id must be non-empty".into()));
+        }
+        // Resolve chain_event_id → leaf_index first.
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let row_opt = client
+            .query_opt(
+                "SELECT leaf_index FROM cirislens.merkle_leaves \
+                 WHERE tenant_id = $1 AND chain_event_id = $2",
+                &[&tenant_id, &chain_event_id],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("inclusion_proof leaf_index lookup: {e}")))?;
+        let row = row_opt.ok_or_else(|| {
+            Error::NotFound(format!(
+                "no merkle_leaves row for tenant={tenant_id} chain_event_id={chain_event_id}"
+            ))
+        })?;
+        let leaf_idx_i: i64 = row
+            .try_get("leaf_index")
+            .map_err(|e| Error::Backend(format!("decode leaf_index: {e}")))?;
+        let leaf_index =
+            u64::try_from(leaf_idx_i).map_err(|_| Error::Backend("leaf_index negative".into()))?;
+        drop(client);
+
+        // Build a tenant-scoped store and delegate inclusion_proof on
+        // a blocking worker (the store is sync-trait + uses block_on
+        // internally). Same shape as `current_sth`.
+        let pool = self.pool().clone();
+        let handle = tokio::runtime::Handle::current();
+        let tenant_owned = tenant_id.to_owned();
+        let store: Arc<dyn TransparencyStore<AuditLeaf>> =
+            Arc::new(PgMerkleStore::from_pool(pool, handle, tenant_owned.clone()));
+        let log_id = log_id_for_tenant(&tenant_owned);
+        let jh: tokio::task::JoinHandle<
+            Result<
+                ciris_verify_core::transparency::MerkleProof,
+                ciris_verify_core::transparency::TransparencyError,
+            >,
+        > = tokio::task::spawn_blocking(move || {
+            let log = TransparencyLog::<AuditLeaf>::for_log(log_id, store);
+            log.inclusion_proof(leaf_index)
+        });
+        jh.await
+            .map_err(|e| Error::Merkle(format!("inclusion_proof join: {e}")))?
+            .map_err(|e| Error::Merkle(format!("inclusion_proof: {e}")))
+    }
+
+    async fn consistency_proof(
+        &self,
+        tenant_id: &str,
+        old_size: u64,
+        new_size: u64,
+    ) -> Result<ciris_verify_core::transparency::ConsistencyProof, Error> {
+        if tenant_id.is_empty() {
+            return Err(Error::InvalidArgument("tenant_id must be non-empty".into()));
+        }
+        let pool = self.pool().clone();
+        let handle = tokio::runtime::Handle::current();
+        let tenant_owned = tenant_id.to_owned();
+        let store: Arc<dyn TransparencyStore<AuditLeaf>> =
+            Arc::new(PgMerkleStore::from_pool(pool, handle, tenant_owned.clone()));
+        let log_id = log_id_for_tenant(&tenant_owned);
+        let jh: tokio::task::JoinHandle<
+            Result<
+                ciris_verify_core::transparency::ConsistencyProof,
+                ciris_verify_core::transparency::TransparencyError,
+            >,
+        > = tokio::task::spawn_blocking(move || {
+            let log = TransparencyLog::<AuditLeaf>::for_log(log_id, store);
+            log.consistency_proof(old_size, new_size)
+        });
+        jh.await
+            .map_err(|e| Error::Merkle(format!("consistency_proof join: {e}")))?
+            .map_err(|e| Error::Merkle(format!("consistency_proof: {e}")))
+    }
+}
+
+/// Decode one `federation_trust_grants` row into a [`TrustGrantRow`].
+/// Used by `get_trust_grant`, `lookup_trust_grant`, `list_trust_grants`.
+fn decode_trust_grant_row_pg(
+    row: &tokio_postgres::Row,
+) -> Result<crate::federation::trust_grant::TrustGrantRow, Error> {
+    use crate::federation::trust_grant::{TrustGrantRow, TrustPurpose};
+    let grant_id: uuid::Uuid = row
+        .try_get("grant_id")
+        .map_err(|e| Error::Backend(format!("decode grant_id: {e}")))?;
+    let grantee_key: String = row
+        .try_get("grantee_key")
+        .map_err(|e| Error::Backend(format!("decode grantee_key: {e}")))?;
+    let granter_key: String = row
+        .try_get("granter_key")
+        .map_err(|e| Error::Backend(format!("decode granter_key: {e}")))?;
+    let purpose_str: String = row
+        .try_get("purpose")
+        .map_err(|e| Error::Backend(format!("decode purpose: {e}")))?;
+    let purpose = TrustPurpose::parse_str(&purpose_str)
+        .ok_or_else(|| Error::Backend(format!("unknown purpose: {purpose_str}")))?;
+    let scope: String = row
+        .try_get("scope")
+        .map_err(|e| Error::Backend(format!("decode scope: {e}")))?;
+    let granted_at: chrono::DateTime<chrono::Utc> = row
+        .try_get("granted_at")
+        .map_err(|e| Error::Backend(format!("decode granted_at: {e}")))?;
+    let expires_at: Option<chrono::DateTime<chrono::Utc>> = row
+        .try_get("expires_at")
+        .map_err(|e| Error::Backend(format!("decode expires_at: {e}")))?;
+    let revoked_at: Option<chrono::DateTime<chrono::Utc>> = row
+        .try_get("revoked_at")
+        .map_err(|e| Error::Backend(format!("decode revoked_at: {e}")))?;
+    let revoked_by: Option<String> = row
+        .try_get("revoked_by")
+        .map_err(|e| Error::Backend(format!("decode revoked_by: {e}")))?;
+    let chain_event_id: i64 = row
+        .try_get("chain_event_id")
+        .map_err(|e| Error::Backend(format!("decode chain_event_id: {e}")))?;
+    let chain_event_hash: Vec<u8> = row
+        .try_get("chain_event_hash")
+        .map_err(|e| Error::Backend(format!("decode chain_event_hash: {e}")))?;
+    let tenant_id: String = row
+        .try_get("tenant_id")
+        .map_err(|e| Error::Backend(format!("decode tenant_id: {e}")))?;
+    Ok(TrustGrantRow {
+        grant_id,
+        grantee_key,
+        granter_key,
+        purpose,
+        scope,
+        granted_at,
+        expires_at,
+        revoked_at,
+        revoked_by,
+        chain_event_id,
+        chain_event_hash,
+        tenant_id,
+    })
 }
 
 #[cfg(test)]

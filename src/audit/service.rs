@@ -24,7 +24,7 @@ use super::types::{
 };
 use super::Error;
 use crate::ClaimResult;
-use ciris_verify_core::transparency::SignedTreeHead;
+use ciris_verify_core::transparency::{ConsistencyProof, MerkleProof, SignedTreeHead};
 
 /// Per-tenant chain head — the `(sequence_number, entry_hash)` of the
 /// tail row, suitable for composing the next [`AuditEntry`].
@@ -234,5 +234,147 @@ pub trait AuditService: Send + Sync {
     ) -> impl Future<Output = Result<Option<uuid::Uuid>, Error>> + Send {
         let _ = chain_event_id;
         async { Err(Error::NotImplemented("lookup_grant_id_by_chain_event")) }
+    }
+
+    // ── v1.5.0 Phase F+G — trust-grant read API + proof retrieval ───
+    //
+    // FSD §4.3 (read API) + §4.1 (inclusion / consistency proof
+    // signatures). Phase F is the projection-side queries; Phase G is
+    // the Merkle-side proof generation against the per-tenant store
+    // already shipped at Phase B.
+
+    /// v1.5.0 Phase F — point-lookup a trust grant by its canonical
+    /// PK (`federation_trust_grants.grant_id`). Returns `None` if no
+    /// such row exists. Used by Phase G's inclusion-proof API to
+    /// resolve a grant_id back to its `(tenant_id, chain_event_id)`
+    /// coordinates before generating the Merkle proof.
+    ///
+    /// # Default impl
+    ///
+    /// Returns [`Error::NotImplemented`].
+    fn get_trust_grant(
+        &self,
+        grant_id: uuid::Uuid,
+    ) -> impl Future<Output = Result<Option<crate::federation::trust_grant::TrustGrantRow>, Error>> + Send
+    {
+        let _ = grant_id;
+        async { Err(Error::NotImplemented("get_trust_grant")) }
+    }
+
+    /// v1.5.0 Phase F — live-grants lookup for `(grantee, purpose, scope)`.
+    /// Returns rows from **all** granters that match — caller filters by
+    /// granter (NodeCore's `resolve_trust` composes this) and decides
+    /// whether a wildcard scope satisfies the query. Per FSD §3.3
+    /// wildcards (`scope = '*'`) are also surfaced unconditionally:
+    /// the caller is the policy layer.
+    ///
+    /// `include_revoked` flips whether rows with `revoked_at IS NOT NULL`
+    /// are returned. `include_expired` flips whether rows with
+    /// `expires_at <= NOW()` are returned (which are NOT necessarily
+    /// `revoked_at`-populated until a re-issuance projects them).
+    ///
+    /// # Default impl
+    ///
+    /// Returns [`Error::NotImplemented`].
+    fn lookup_trust_grant(
+        &self,
+        grantee_key: &str,
+        purpose: crate::federation::trust_grant::TrustPurpose,
+        scope: &str,
+        include_revoked: bool,
+        include_expired: bool,
+    ) -> impl Future<Output = Result<Vec<crate::federation::trust_grant::TrustGrantRow>, Error>> + Send
+    {
+        let _ = (
+            grantee_key,
+            purpose,
+            scope,
+            include_revoked,
+            include_expired,
+        );
+        async { Err(Error::NotImplemented("lookup_trust_grant")) }
+    }
+
+    /// v1.5.0 Phase F — filter query over `federation_trust_grants`.
+    /// All non-`None` fields on the filter are AND-intersected.
+    /// `scope_prefix` matches via SQL `LIKE '<prefix>%'`. Revoked /
+    /// expired rows are excluded unless the matching `include_*` flag
+    /// on the filter is set.
+    ///
+    /// # Default impl
+    ///
+    /// Returns [`Error::NotImplemented`].
+    fn list_trust_grants(
+        &self,
+        filter: crate::federation::trust_grant::TrustGrantFilter,
+    ) -> impl Future<Output = Result<Vec<crate::federation::trust_grant::TrustGrantRow>, Error>> + Send
+    {
+        let _ = filter;
+        async { Err(Error::NotImplemented("list_trust_grants")) }
+    }
+
+    /// v1.5.0 Phase G — fetch the `canonical_bytes` column for the
+    /// merkle_leaves row keyed by `(tenant_id, chain_event_id)`. These
+    /// are the RFC 6962 §2.1 hashing-form bytes a verifier needs to
+    /// recompute `leaf_hash = sha256(0x00 || canonical_bytes)` and
+    /// walk the inclusion proof up to the STH's root_hash without
+    /// trusting the directory's projection.
+    ///
+    /// Returns `Ok(None)` if no merkle leaf was appended for the
+    /// chain event (Merkle hook disabled at emit time, or Phase I
+    /// backfill not yet run).
+    ///
+    /// # Default impl
+    ///
+    /// Returns [`Error::NotImplemented`].
+    fn leaf_canonical_bytes_for_chain_event(
+        &self,
+        tenant_id: &str,
+        chain_event_id: i64,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, Error>> + Send {
+        let _ = (tenant_id, chain_event_id);
+        async {
+            Err(Error::NotImplemented(
+                "leaf_canonical_bytes_for_chain_event",
+            ))
+        }
+    }
+
+    /// v1.5.0 Phase G — RFC 6962 inclusion proof for a chain event
+    /// against the **current** STH for its tenant. Wraps a per-tenant
+    /// `TransparencyStore<AuditLeaf>` in a `TransparencyLog` and
+    /// delegates to `inclusion_proof(leaf_index)`. Maps
+    /// `chain_event_id → leaf_index` via the merkle_leaves table.
+    ///
+    /// Returns [`Error::NotFound`] if no merkle leaf exists for the
+    /// chain event.
+    ///
+    /// # Default impl
+    ///
+    /// Returns [`Error::NotImplemented`].
+    fn inclusion_proof_for_chain_event(
+        &self,
+        tenant_id: &str,
+        chain_event_id: i64,
+    ) -> impl Future<Output = Result<MerkleProof, Error>> + Send {
+        let _ = (tenant_id, chain_event_id);
+        async { Err(Error::NotImplemented("inclusion_proof_for_chain_event")) }
+    }
+
+    /// v1.5.0 Phase G — RFC 6962 consistency proof between two tree
+    /// sizes for a tenant. Verifier confirms STH(old_size) →
+    /// STH(new_size) is a legal append (no retroactive rewrite).
+    ///
+    /// # Default impl
+    ///
+    /// Returns [`Error::NotImplemented`].
+    fn consistency_proof(
+        &self,
+        tenant_id: &str,
+        old_size: u64,
+        new_size: u64,
+    ) -> impl Future<Output = Result<ConsistencyProof, Error>> + Send {
+        let _ = (tenant_id, old_size, new_size);
+        async { Err(Error::NotImplemented("consistency_proof")) }
     }
 }
