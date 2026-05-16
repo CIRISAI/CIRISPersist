@@ -10,11 +10,12 @@ participant's local directory can emit grants; Registry is no longer
 the only authority.
 
 **Cross-coordinates with:**
+- **CIRISVerify** — [#23](https://github.com/CIRISAI/CIRISVerify/issues/23) — SOTA upgrade to `ciris-verify-core::transparency` (RFC 6962 + STH + ConsistencyProof + generic `TransparencyLeaf` + `TransparencyStore` abstraction + per-`log_id` scoping). v1.5.0 pins to whichever minor ships this; persist consumes the upgraded primitives as the canonical transparency-log substrate. **Verify is the wellspring; persist consumes; edge consumes** — no parallel Merkle implementations.
 - **CIRISNodeCore** — Accord §RC `subject_kind` extension for
-  `TrustGrant`; downstream rewire of `crate::trust::resolve_trust` to
+  `TrustGrant` (LANDED in [`871ebab`](https://github.com/CIRISAI/CIRISNodeCore/commit/871ebab)); downstream rewire of `crate::trust::resolve_trust` to
   read the new table.
 - **CIRISLensCore** — sign-emit path for grants issued by lens-tier
-  operators; `verify_hybrid_via_directory` becomes verify-and-check-grant.
+  operators; `verify_hybrid_via_directory` becomes verify-and-check-grant against STH+inclusion-proof.
 - **CIRISPortal** — UI surface for human-issued grants (later cut).
 - **CIRISPersist#47 / FSD `V020`** — V020 columns (`trust_type`,
   `trust_relationship`, `trust_domains`, `trusted_by`, `trusted_at`,
@@ -383,29 +384,81 @@ impl Engine {
         scope: &str,
     ) -> Result<TrustGrantReceipt, Error>;
 
-    /// Fetch a Trillian/CT-style inclusion proof for a grant.
-    /// Lets external consumers verify a grant without trusting the
-    /// directory's projection — they verify the audit chain's
-    /// signed root + the Merkle path to the grant's event.
+    /// Fetch an RFC 6962 inclusion proof for a grant against the
+    /// current Signed Tree Head. External verifiers check:
+    ///   1. STH signature (engine's hybrid Ed25519+ML-DSA-65)
+    ///   2. Inclusion proof: leaf hashes up the sibling path to the
+    ///      STH root, matching `root_hash`
+    /// Confirms the grant is in the tree without trusting the
+    /// directory's projection.
     pub async fn trust_grant_inclusion_proof(
         &self,
         grant_id: Uuid,
-    ) -> Result<InclusionProof, Error>;
+    ) -> Result<TrustGrantInclusionProof, Error>;
+
+    /// Fetch an RFC 6962 consistency proof between two tree sizes.
+    /// External verifiers check that STH(old_size) → STH(new_size)
+    /// is a legal append (no rewrite). Used for cross-period
+    /// re-verification.
+    pub async fn trust_grant_consistency_proof(
+        &self,
+        tenant_id: &str,
+        old_size: u64,
+        new_size: u64,
+    ) -> Result<ConsistencyProof, Error>;
+
+    /// Fetch the current Signed Tree Head for a tenant. STH freshness
+    /// is the verifier's responsibility (recommended policy: reject
+    /// STHs older than the engine's signing cadence + grace).
+    pub async fn current_sth(
+        &self,
+        tenant_id: &str,
+    ) -> Result<SignedTreeHead, Error>;
 }
 
 pub struct TrustGrantReceipt {
     pub grant_id: Uuid,
     pub chain_event_id: u64,
     pub chain_event_hash: Vec<u8>,
+    pub tenant_id: String,                  // log scope
+    pub tree_size_at_emit: u64,             // STH size when this grant was sealed
 }
 
-pub struct InclusionProof {
-    pub chain_event_id: u64,
-    pub chain_event_hash: Vec<u8>,
-    pub merkle_path: Vec<Vec<u8>>,     // sibling hashes from leaf to root
-    pub signed_root: Vec<u8>,          // current chain root (engine-signed)
-    pub root_signature: Vec<u8>,       // engine's hybrid signature over root
+/// Inclusion proof against an STH. Types reused from
+/// `ciris_verify_core::transparency` (the canonical SOTA primitive;
+/// per the CIRIS-wide architecture, all transparency-log primitives
+/// live in Verify — persist consumes, does not redefine).
+pub struct TrustGrantInclusionProof {
+    pub sth: SignedTreeHead,                // ciris_verify_core::transparency
+    pub merkle_proof: MerkleProof,          // ciris_verify_core::transparency
+    pub leaf_canonical_bytes: Vec<u8>,      // for verifier to re-hash
 }
+
+// SignedTreeHead, MerkleProof, ConsistencyProof: see
+// ciris_verify_core::transparency. Wire-shape repeated here for
+// reference only — the canonical types are imported.
+//
+// pub struct SignedTreeHead {
+//     pub log_id: String,                       // = tenant_id for persist
+//     pub tree_size: u64,
+//     pub root_hash: [u8; 32],
+//     pub timestamp: DateTime<Utc>,
+//     pub signature: HybridSignature,           // ciris_crypto
+//     pub witness_signatures: Vec<WitnessSignature>,  // reserved
+// }
+//
+// pub struct MerkleProof {
+//     pub entry_index: u64,
+//     pub leaf_hash: [u8; 32],
+//     pub siblings: Vec<(bool, [u8; 32])>,      // (is_right, hash)
+//     pub root: [u8; 32],
+// }
+//
+// pub struct ConsistencyProof {
+//     pub old_tree_size: u64,
+//     pub new_tree_size: u64,
+//     pub proof_hashes: Vec<[u8; 32]>,
+// }
 ```
 
 The signer is the engine's local signing key (post-#51 `local_sign`).
@@ -460,6 +513,68 @@ caller decides whether a wildcard grant satisfies the question.
 Transitive resolution stays out of persist — that's NodeCore's
 `resolve_trust` policy layer. Persist provides the rows; NodeCore
 applies the §RC transitive-vouching rules.
+
+### 4.4 Merkle transparency layer — per-tenant SOTA trees
+
+Persist's audit chain (per-tenant linear hash chain in `cirisaudit_events`) is augmented with a **per-tenant Merkle tree** for SOTA inclusion + consistency proofs. The transparency-log primitives live in `ciris_verify_core::transparency` per the CIRIS-wide architecture (Verify = wellspring; Persist = next stop); persist implements `AuditLeaf: TransparencyLeaf` and provides PG + SQLite `TransparencyStore` implementations.
+
+**Tree shape per RFC 6962 / Trillian:**
+
+- Binary Merkle tree over leaves, SHA-256
+- **Byte prefixes** (RFC 6962 §2.1): `0x00` for leaves, `0x01` for internal nodes. Migrates cleanly from Verify's legacy string prefixes at the audit-chain-bridge boundary (genesis-on-cutover policy already locked).
+- One tree per tenant (`log_id = tenant_id`) — matches persist's per-tenant chain isolation (no cross-tenant correlation possible at the Merkle layer either)
+- Leaf hash = SHA-256(`0x00` || canonical_bytes(audit_entry))
+- Internal node = SHA-256(`0x01` || left || right)
+- Odd-leaf promotion (standard RFC 6962)
+
+**Signed Tree Heads:**
+
+The engine signs an STH per tenant on a fixed cadence (default: every N entries OR every K minutes, whichever first; cadence configurable). STH is signed with the engine's local hybrid key (Ed25519 + ML-DSA-65). STH freshness is the verifier's responsibility — they enforce a window matching the engine's signing cadence + grace.
+
+```rust
+// From ciris_verify_core::transparency
+pub struct SignedTreeHead {
+    pub log_id: String,              // tenant_id
+    pub tree_size: u64,
+    pub root_hash: [u8; 32],
+    pub timestamp: DateTime<Utc>,
+    pub signature: HybridSignature,
+    pub witness_signatures: Vec<WitnessSignature>,  // reserved for protocol
+}
+```
+
+**Storage:**
+
+The Merkle layer is computed on top of `cirisaudit_events` via a parallel `merkle_nodes` table (separate from `federation_trust_grants` — the Merkle layer is universal, not trust-grant-specific). On each audit-chain insert, the corresponding tree updates; STH is signed at cadence and recorded in `merkle_sth_log`.
+
+V021 schema additions:
+- `merkle_leaves(tenant_id, leaf_index PRIMARY KEY, chain_event_id, leaf_hash)` — leaf-to-event mapping; chain_event_id is the FK into `cirisaudit_events`
+- `merkle_sth_log(tenant_id, tree_size PRIMARY KEY (tenant_id, tree_size), root_hash, timestamp, signature, witness_signatures)` — all signed STHs retained (small; one row per cadence interval)
+- `merkle_nodes(tenant_id, level, index_at_level, hash)` — materialized internal nodes for proof generation efficiency. Optional; can be regenerated from leaves on demand. Recommended for production.
+
+**Threat model coverage** (RFC 6962 + STH + ConsistencyProof + per-tenant scoping):
+
+| Threat | Mitigation |
+|---|---|
+| Log fork / split-view | STH + reserved witness cosigning (protocol future) |
+| Retroactive insertion | `ConsistencyProof` verifies STH(n) → STH(m) is an append |
+| Selective omission | `InclusionProof` against signed root: "prove K's grant is at index N under STH(size_m)" |
+| Stale STH acceptance | Verifier-side freshness policy on STH timestamp |
+| Cross-tenant correlation breach | Per-tenant trees (no global root) |
+| Cross-subsystem proof collision | RFC 6962 byte prefixes (persist + Verify share the prefix scheme; `log_id` distinguishes the universe) |
+| Quantum break on signing | Hybrid Ed25519 + ML-DSA-65 STH signing |
+| Quantum break on tree | SHA-256 is PQ-resistant |
+
+**External verifier flow** (the property that justifies the substrate):
+
+1. Verifier fetches `current_sth(tenant_id)` from the directory
+2. Verifies STH signature against the engine's published hybrid pubkey
+3. Checks STH timestamp is within freshness window
+4. Fetches `trust_grant_inclusion_proof(grant_id)` for the grant in question
+5. Verifies the inclusion proof against `sth.root_hash`
+6. (Optional, for cross-period verification) Fetches `trust_grant_consistency_proof(tenant_id, old_size, new_size)` and verifies append-only between two STHs
+
+At no point does the verifier trust the directory's projection — only signatures + hashes.
 
 ---
 
@@ -559,17 +674,19 @@ FSD — Portal owns the UI design.
 
 | # | Step | Repo | Dep |
 |---|---|---|---|
-| 1 | ~~Accord §RC additions: `trust_grant` `subject_kind` + new subject_kinds `test_result`, `improvement`, `gratitude_signal`~~ **LANDED** in NodeCore [`871ebab`](https://github.com/CIRISAI/CIRISNodeCore/commit/871ebab) with 15 new subject_kinds + MESSAGE_TAXONOMY FSD | CIRISNodeCore | ✅ done |
-| 2 | V021 migration (Postgres + SQLite) | CIRISPersist | (1) |
-| 3 | `TrustGrantPayload` + ingest hook (incl. witness_set activation) | CIRISPersist | (1) (2) |
-| 4 | `grant_trust` / `revoke_trust_grant` emit API + PyO3 wrappers | CIRISPersist | (3) |
-| 5 | `lookup_trust_grant` / `list_trust_grants` read API + PyO3 | CIRISPersist | (2) |
-| 6 | `trust_grant_inclusion_proof` (Trillian/CT-style verification) | CIRISPersist | (5) |
-| 7 | V021 backfill from V020 columns | CIRISPersist | (3) (4) |
-| 8 | `crate::trust::resolve_trust` rewire to grants table | CIRISNodeCore | (5) |
-| 9 | `verify_hybrid_and_check_grant` | CIRISLensCore | (5) |
-| 10 | "Manage Trust" UI | CIRISPortal | (4) |
-| 11 | V022 drop of V020 trust columns | CIRISPersist | one minor after (7) |
+| 1 | ~~Accord §RC additions: 15 new subject_kinds + MESSAGE_TAXONOMY FSD~~ **LANDED** in NodeCore [`871ebab`](https://github.com/CIRISAI/CIRISNodeCore/commit/871ebab) | CIRISNodeCore | ✅ done |
+| 2 | ciris-verify-core::transparency SOTA upgrade (RFC 6962 + STH + ConsistencyProof + generic leaf + storage abstraction + per-log_id) — **[CIRISVerify#23](https://github.com/CIRISAI/CIRISVerify/issues/23)** | CIRISVerify | 🔴 upstream gate for v1.5.0 |
+| 3 | V021 migration (Postgres + SQLite) — `federation_trust_grants` + `merkle_leaves` + `merkle_sth_log` + `merkle_nodes` | CIRISPersist | (2) |
+| 4 | `AuditLeaf: TransparencyLeaf` impl + `PgTransparencyStore` / `SqliteTransparencyStore` | CIRISPersist | (2) (3) |
+| 5 | `TrustGrantPayload` + chain-commit ingest hook (incl. witness_set activation + Merkle tree update + STH cadence trigger) | CIRISPersist | (1) (3) (4) |
+| 6 | `grant_trust` / `revoke_trust_grant` emit API + PyO3 wrappers | CIRISPersist | (5) |
+| 7 | `lookup_trust_grant` / `list_trust_grants` read API + PyO3 | CIRISPersist | (3) |
+| 8 | `trust_grant_inclusion_proof` / `trust_grant_consistency_proof` / `current_sth` proof APIs + PyO3 wrappers | CIRISPersist | (4) (5) |
+| 9 | V021 backfill from V020 columns (synthetic TrustGrant events signed by recovered `trusted_by`) | CIRISPersist | (5) (6) |
+| 10 | `crate::trust::resolve_trust` rewire to grants table | CIRISNodeCore | (7) |
+| 11 | `verify_hybrid_and_check_grant` + STH/inclusion-proof verification | CIRISLensCore | (7) (8) |
+| 12 | "Manage Trust" UI | CIRISPortal | (6) |
+| 13 | V022 drop of V020 trust columns | CIRISPersist | one minor after (9) |
 
 Steps 1-6 are the v1.5.0 cut. Steps 7-9 land in successive downstream
 minors. Step 10 is v1.6.0.
