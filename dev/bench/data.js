@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778950895093,
+  "lastUpdate": 1778951403172,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -14999,6 +14999,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23641162,
             "range": "± 100286",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "7191d62c06fd77b1fc703ab26f8d9ecc27d6e64d",
+          "message": "1.3.3 — cover AttributesTooLarge in cirisgraph_err_to_py match\n\nv1.3.2 tag build failed at the FFI wheel jobs: legacy\n`cirisgraph_err_to_py` bridge function had a non-exhaustive match\nagainst `graph::Error` and didn't cover the new AttributesTooLarge\nvariant from v1.3.2. Local dev feature-set compiled clean; CI's\nwheel combo surfaced the gap.\n\nAdded the new variant to the caller-fault arm alongside\nInvalidArgument / NotAuthorized / Conflict / NotFound. Maps to\nPyValueError matching the typed-exception kind v1.0.0's\ntranslate_error_kind already does.\n\nNo surface change. v1.3.3 is the first wheel of the bulk_import\nwork that publishes to PyPI.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-16T12:00:41-05:00",
+          "tree_id": "75a8e50dce09463d875aead62ff3bfb1d2f40e6b",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/7191d62c06fd77b1fc703ab26f8d9ecc27d6e64d"
+        },
+        "date": 1778951402068,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 108952,
+            "range": "± 1042",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 262388,
+            "range": "± 1436",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 562619,
+            "range": "± 10566",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1993508,
+            "range": "± 4558",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 322,
+            "range": "± 20",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1435,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 6607,
+            "range": "± 38",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23216,
+            "range": "± 305",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26485,
+            "range": "± 376",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91260,
+            "range": "± 733",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 368,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3122,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9793,
+            "range": "± 74",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41726,
+            "range": "± 84",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 632,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2245486,
+            "range": "± 100483",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7040701,
+            "range": "± 220348",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25724009,
+            "range": "± 1080670",
             "unit": "ns/iter"
           }
         ]
