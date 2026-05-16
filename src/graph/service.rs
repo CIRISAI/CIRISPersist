@@ -41,17 +41,27 @@ pub trait GraphService: Send + Sync {
     /// Verify-and-insert (or update) a graph node. AV-48 optimistic-
     /// concurrency gate: pass `expected_version = 0` for new rows
     /// or the current row's `version` for updates. AV-45: rejects
-    /// when serialized attributes exceed the configured size cap.
+    /// when serialized attributes exceed the configured size cap —
+    /// unless `bulk_import = true` (v1.3.2, CIRISPersist#50), which
+    /// skips the cap for one-time historical migration. Use sparingly
+    /// — the cap is a load-bearing safety check on the hot path.
     fn upsert_node(
         &self,
         node: GraphNode,
         expected_version: i32,
+        bulk_import: bool,
     ) -> impl Future<Output = Result<(), Error>> + Send;
 
     /// Insert a directed edge. Idempotent on `edge_id` PK; collision
     /// surfaces as `Error::Conflict` (caller decides whether to
-    /// treat as no-op).
-    fn upsert_edge(&self, edge: GraphEdge) -> impl Future<Output = Result<(), Error>> + Send;
+    /// treat as no-op). `bulk_import` mirrors `upsert_node` semantics
+    /// for symmetry — edges have no attributes-size cap today, so
+    /// the flag is a no-op currently but reserved.
+    fn upsert_edge(
+        &self,
+        edge: GraphEdge,
+        bulk_import: bool,
+    ) -> impl Future<Output = Result<(), Error>> + Send;
 
     /// Soft- or hard-delete a node. Hard delete also removes any
     /// edges that name the node as source or target (cascading

@@ -5,6 +5,62 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.3.2] — 2026-05-16
+
+**`bulk_import` mode + typed `AttributesTooLarge` (closes #50).**
+Follow-up to v1.3.1 #49 surfaced by CIRISAgent's datum-cutover migration:
+1 of 989 legacy `graph_nodes` rows was a 1.67 MiB `conversation_summary`
+that the AV-45 1 MiB attributes cap rejected. The cap is a load-bearing
+safety check for steady-state writes, but bulk historical migration
+needs an escape hatch.
+
+### Surface changes
+
+- **New `bulk_import: bool` parameter** on `GraphService::upsert_node`
+  and `GraphService::upsert_edge`. `true` skips the AV-45 cap. Default
+  `false` preserves existing semantics for hot-path writes.
+- **New `Error::AttributesTooLarge { bytes, cap }` variant** with
+  stable `kind = "cirisgraph_attributes_too_large"`. Replaces the
+  opaque `Error::InvalidArgument("attributes too large: …")` string
+  callers had to grep for. PyO3 surfaces this via the typed-exception
+  hierarchy (`Permanent` class for migration-side handling).
+- **PyO3 `cirisgraph_upsert_node` / `cirisgraph_upsert_edge`** now
+  take an optional `bulk_import` kwarg (default `False`).
+
+### What's NOT in this cut
+
+- **Per-node-type caps** (ask #2 from #50): bigger config surface
+  (per-type registry + env override per type). Deferred. The
+  `bulk_import` flag covers the migration case; if steady-state
+  conversation_summary writes are also legitimately oversize, file a
+  follow-up.
+
+### Backward compatibility
+
+The trait signature change is breaking for direct Rust consumers
+holding `dyn GraphService` (which doesn't compile anyway — RPITIT
+isn't object-safe) or composing the trait in tests. PyO3 callers
+on v1.3.1 keep working — `bulk_import` defaults to `False` matching
+prior behavior.
+
+Callers grepping for `"attributes too large"` in `InvalidArgument`
+strings need to update to match on the new typed `AttributesTooLarge`
+variant OR check `err.kind() == "cirisgraph_attributes_too_large"`.
+The string form is gone.
+
+### Tests
+
+Three new SQLite tests:
+- `upsert_node_bulk_import_skips_attribute_cap` — 1.5 MiB blob: rejected
+  with typed `AttributesTooLarge` when `bulk_import=false`; lands when
+  `bulk_import=true`.
+- Existing `cirisgraph_sqlite_round_trip_full_lifecycle` + PG analog
+  updated to assert the new typed variant.
+
+CIRISAgent's `tools/ops/migrate_to_persist.py` can drop the
+oversize-row workaround now and pass `bulk_import=True` for migration
+writes.
+
 ## [1.3.1] — 2026-05-16
 
 **CIRISAgent 2.9.0 cutover support cut.** Two upstream asks from

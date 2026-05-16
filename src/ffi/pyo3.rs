@@ -5214,12 +5214,19 @@ impl PyEngine {
     /// v0.8.0 — Upsert a graph node with AV-48 optimistic-concurrency
     /// gate. Pass `expected_version = 0` for new rows; current
     /// version for updates.
+    ///
+    /// v1.3.2 (CIRISPersist#50): `bulk_import` (default False) skips
+    /// the AV-45 attributes-size cap for one-time historical
+    /// migration. Use sparingly — the cap is a hot-path safety check
+    /// for steady-state writes.
     #[cfg(feature = "cirisgraph")]
+    #[pyo3(signature = (node_json, expected_version, bulk_import = false))]
     fn cirisgraph_upsert_node(
         &self,
         py: Python<'_>,
         node_json: &str,
         expected_version: i32,
+        bulk_import: bool,
     ) -> PyResult<()> {
         catch_panic(|| {
             let runtime = self.runtime.clone();
@@ -5231,7 +5238,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::graph::GraphService;
                         backend
-                            .upsert_node(node, expected_version)
+                            .upsert_node(node, expected_version, bulk_import)
                             .await
                             .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
                     })
@@ -5242,7 +5249,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::graph::GraphService;
                         backend
-                            .upsert_node(node, expected_version)
+                            .upsert_node(node, expected_version, bulk_import)
                             .await
                             .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
                     })
@@ -5252,8 +5259,18 @@ impl PyEngine {
     }
 
     /// v0.8.0 — Insert a directed edge. Idempotent on edge_id.
+    ///
+    /// v1.3.2 (CIRISPersist#50): `bulk_import` is reserved for
+    /// symmetry with `cirisgraph_upsert_node`; edges have no
+    /// attributes-size cap today so the flag is a no-op currently.
     #[cfg(feature = "cirisgraph")]
-    fn cirisgraph_upsert_edge(&self, py: Python<'_>, edge_json: &str) -> PyResult<()> {
+    #[pyo3(signature = (edge_json, bulk_import = false))]
+    fn cirisgraph_upsert_edge(
+        &self,
+        py: Python<'_>,
+        edge_json: &str,
+        bulk_import: bool,
+    ) -> PyResult<()> {
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let edge: crate::graph::GraphEdge = serde_json::from_str(edge_json)
@@ -5264,7 +5281,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::graph::GraphService;
                         backend
-                            .upsert_edge(edge)
+                            .upsert_edge(edge, bulk_import)
                             .await
                             .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
                     })
@@ -5275,7 +5292,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::graph::GraphService;
                         backend
-                            .upsert_edge(edge)
+                            .upsert_edge(edge, bulk_import)
                             .await
                             .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
                     })

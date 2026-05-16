@@ -61,10 +61,25 @@ pub use types::{
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// Caller passed invalid arguments — unknown scope, depth
-    /// exceeds [`MAX_KHOP_DEPTH`], attributes too large
-    /// (AV-45), missing required fields, etc.
+    /// exceeds [`MAX_KHOP_DEPTH`], missing required fields, etc.
+    /// AV-45 attribute-size violations are surfaced via the more
+    /// specific [`Error::AttributesTooLarge`] variant.
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+
+    /// v1.3.2 (CIRISPersist#50): caller supplied attributes whose
+    /// serialized JSON exceeds the AV-45 cap. Typed so callers can
+    /// branch on it without string-matching the InvalidArgument
+    /// detail. Migration paths can either retry with
+    /// `bulk_import=true` or partition the row.
+    #[error("attributes too large: {bytes} bytes exceeds cap of {cap}")]
+    AttributesTooLarge {
+        /// Serialized attribute size in bytes.
+        bytes: usize,
+        /// Configured cap (DEFAULT_MAX_ATTRIBUTES_BYTES unless
+        /// overridden by CIRIS_PERSIST_GRAPH_MAX_ATTRIBUTES_BYTES).
+        cap: usize,
+    },
 
     /// Authorization layer rejected — caller's scope claim does
     /// not entitle access to the requested row's scope.
@@ -105,6 +120,7 @@ impl Error {
     pub fn kind(&self) -> &'static str {
         match self {
             Error::InvalidArgument(_) => "cirisgraph_invalid_argument",
+            Error::AttributesTooLarge { .. } => "cirisgraph_attributes_too_large",
             Error::NotAuthorized(_) => "cirisgraph_not_authorized",
             Error::Conflict(_) => "cirisgraph_conflict",
             Error::NotFound(_) => "cirisgraph_not_found",

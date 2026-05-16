@@ -72,17 +72,17 @@ fn max_attributes_bytes() -> usize {
 }
 
 /// AV-45: cap attributes size + return canonical JSON text for the
-/// SQLite TEXT column.
-fn encode_attributes(attrs: &serde_json::Value) -> Result<String, Error> {
+/// SQLite TEXT column. `bulk_import = true` (v1.3.2, CIRISPersist#50)
+/// skips the cap for migration use cases.
+fn encode_attributes(attrs: &serde_json::Value, bulk_import: bool) -> Result<String, Error> {
     let s = serde_json::to_string(attrs)
         .map_err(|e| Error::Internal(format!("attributes serialize: {e}")))?;
     let cap = max_attributes_bytes();
-    if s.len() > cap {
-        return Err(Error::InvalidArgument(format!(
-            "attributes too large: {} bytes exceeds cap of {}",
-            s.len(),
-            cap
-        )));
+    if !bulk_import && s.len() > cap {
+        return Err(Error::AttributesTooLarge {
+            bytes: s.len(),
+            cap,
+        });
     }
     Ok(s)
 }
@@ -193,7 +193,12 @@ fn decode_edge_row(row: &rusqlite::Row<'_>) -> Result<GraphEdge, Error> {
 }
 
 impl GraphService for SqliteGraphBackend {
-    async fn upsert_node(&self, node: GraphNode, expected_version: i32) -> Result<(), Error> {
+    async fn upsert_node(
+        &self,
+        node: GraphNode,
+        expected_version: i32,
+        bulk_import: bool,
+    ) -> Result<(), Error> {
         if expected_version < 0 {
             return Err(Error::InvalidArgument(
                 "expected_version must be >= 0".into(),
@@ -202,7 +207,7 @@ impl GraphService for SqliteGraphBackend {
         if node.version < 1 {
             return Err(Error::InvalidArgument("node.version must be >= 1".into()));
         }
-        let attrs = encode_attributes(&node.attributes)?;
+        let attrs = encode_attributes(&node.attributes, bulk_import)?;
         let scope_str = node.scope.as_sql_str().to_owned();
         let sig_verified_int: i64 = if node.signature_verified { 1 } else { 0 };
         // v1.3.1 (CIRISPersist#49): honor caller-supplied timestamps
@@ -290,8 +295,8 @@ impl GraphService for SqliteGraphBackend {
         .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
     }
 
-    async fn upsert_edge(&self, edge: GraphEdge) -> Result<(), Error> {
-        let attrs = encode_attributes(&edge.attributes)?;
+    async fn upsert_edge(&self, edge: GraphEdge, bulk_import: bool) -> Result<(), Error> {
+        let attrs = encode_attributes(&edge.attributes, bulk_import)?;
         let scope_str = edge.scope.as_sql_str().to_owned();
         // v1.3.1 (CIRISPersist#49): honor caller-supplied
         // `edge.created_at` for bulk historical imports.
@@ -761,7 +766,7 @@ mod tests {
         // 1. Insert 3 nodes.
         for nid in [&n_a, &n_b, &n_c] {
             graph
-                .upsert_node(fixture_node(nid, GraphScope::Local, "test"), 0)
+                .upsert_node(fixture_node(nid, GraphScope::Local, "test"), 0, false)
                 .await
                 .unwrap();
         }
@@ -777,7 +782,7 @@ mod tests {
 
         // 3. AV-48: version conflict.
         let conflict = graph
-            .upsert_node(fixture_node(&n_a, GraphScope::Local, "test"), 0)
+            .upsert_node(fixture_node(&n_a, GraphScope::Local, "test"), 0, false)
             .await
             .unwrap_err();
         assert!(matches!(conflict, Error::Conflict(_)));
@@ -785,7 +790,7 @@ mod tests {
         // 4. Update with correct version succeeds.
         let mut updated = got.clone();
         updated.attributes = serde_json::json!({"updated": true});
-        graph.upsert_node(updated, 1).await.unwrap();
+        graph.upsert_node(updated, 1, false).await.unwrap();
         let post = graph
             .get_node(&n_a, GraphScope::Local)
             .await
@@ -796,20 +801,26 @@ mod tests {
         // 5. AV-45: oversized attributes reject.
         let mut huge = fixture_node("test:huge", GraphScope::Local, "test");
         huge.attributes = serde_json::json!({"payload": "x".repeat(2 * 1024 * 1024)});
-        let too_big = graph.upsert_node(huge, 0).await.unwrap_err();
-        assert!(matches!(too_big, Error::InvalidArgument(_)));
+        let too_big = graph.upsert_node(huge, 0, false).await.unwrap_err();
+        // v1.3.2 (CIRISPersist#50): AV-45 now surfaces as the typed
+        // `AttributesTooLarge { bytes, cap }` variant rather than the
+        // opaque `InvalidArgument` string the pre-v1.3.2 impl used.
+        assert!(matches!(too_big, Error::AttributesTooLarge { .. }));
 
         // 6. Edges: a -OWNS-> b -OWNS-> c -SUMMARIZES-> a (cycle).
         graph
-            .upsert_edge(fixture_edge(&n_a, &n_b, GraphScope::Local, "OWNS"))
+            .upsert_edge(fixture_edge(&n_a, &n_b, GraphScope::Local, "OWNS"), false)
             .await
             .unwrap();
         graph
-            .upsert_edge(fixture_edge(&n_b, &n_c, GraphScope::Local, "OWNS"))
+            .upsert_edge(fixture_edge(&n_b, &n_c, GraphScope::Local, "OWNS"), false)
             .await
             .unwrap();
         graph
-            .upsert_edge(fixture_edge(&n_c, &n_a, GraphScope::Local, "SUMMARIZES"))
+            .upsert_edge(
+                fixture_edge(&n_c, &n_a, GraphScope::Local, "SUMMARIZES"),
+                false,
+            )
             .await
             .unwrap();
 
@@ -933,7 +944,7 @@ mod tests {
             signing_key_id: None,
             signature_verified: false,
         };
-        graph.upsert_node(node, 0).await.unwrap();
+        graph.upsert_node(node, 0, false).await.unwrap();
         let got = graph
             .get_node("probe-49", GraphScope::Local)
             .await
@@ -959,7 +970,7 @@ mod tests {
         // enforce FK at the SQL layer; still seed for hygiene).
         for nid in ["src-49", "dst-49"] {
             graph
-                .upsert_node(fixture_node(nid, GraphScope::Local, "test"), 0)
+                .upsert_node(fixture_node(nid, GraphScope::Local, "test"), 0, false)
                 .await
                 .unwrap();
         }
@@ -977,7 +988,7 @@ mod tests {
             attributes: serde_json::json!({}),
             created_at: historical,
         };
-        graph.upsert_edge(edge).await.unwrap();
+        graph.upsert_edge(edge, false).await.unwrap();
         let edges = graph
             .get_edges_for_node("src-49", GraphScope::Local, EdgeDirection::Outgoing, None)
             .await
@@ -987,5 +998,50 @@ mod tests {
             stored.created_at, historical,
             "v1.3.1 (#49): edge created_at must round-trip verbatim"
         );
+    }
+
+    /// v1.3.2 (CIRISPersist#50): `bulk_import=true` skips the AV-45
+    /// attributes-size cap for one-time historical migration. The
+    /// row should land successfully even when serialized attrs
+    /// exceed `DEFAULT_MAX_ATTRIBUTES_BYTES`. Mirrors the
+    /// `conversation_summary` 1.67 MiB case from datum's cutover.
+    #[tokio::test]
+    async fn upsert_node_bulk_import_skips_attribute_cap() {
+        let (_b, graph) = fresh_backend().await;
+        // Build a node whose serialized attributes exceed the 1 MiB
+        // default cap. Use a 1.5 MiB string blob to mimic a long-form
+        // conversation_summary payload.
+        let blob = "x".repeat(1_500_000);
+        let huge = GraphNode {
+            node_id: "huge-50".into(),
+            scope: GraphScope::Local,
+            node_type: "conversation_summary".into(),
+            attributes: serde_json::json!({"text": blob}),
+            version: 1,
+            updated_by: "migrate".into(),
+            updated_at: chrono::Utc::now(),
+            created_at: chrono::Utc::now(),
+            signature: None,
+            signing_key_id: None,
+            signature_verified: false,
+        };
+        // Default (bulk_import=false) rejects with the typed
+        // AttributesTooLarge error.
+        let rejected = graph.upsert_node(huge.clone(), 0, false).await.unwrap_err();
+        match rejected {
+            Error::AttributesTooLarge { bytes, cap } => {
+                assert!(bytes > cap, "bytes {bytes} should exceed cap {cap}");
+                assert_eq!(cap, DEFAULT_MAX_ATTRIBUTES_BYTES);
+            }
+            other => panic!("expected AttributesTooLarge, got {other:?}"),
+        }
+        // bulk_import=true lands the row.
+        graph.upsert_node(huge, 0, true).await.unwrap();
+        let got = graph
+            .get_node("huge-50", GraphScope::Local)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.node_type, "conversation_summary");
     }
 }

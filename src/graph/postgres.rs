@@ -49,17 +49,20 @@ fn max_attributes_bytes() -> usize {
 
 /// AV-45: serialize the attributes to JSON bytes once, return them
 /// plus the parsed [`serde_json::Value`] for the DB binding. Refuses
-/// payloads above the configured size cap.
-fn encode_attributes(attrs: &serde_json::Value) -> Result<serde_json::Value, Error> {
+/// payloads above the configured size cap unless `bulk_import` is
+/// true (v1.3.2, CIRISPersist#50 — migration-only escape hatch).
+fn encode_attributes(
+    attrs: &serde_json::Value,
+    bulk_import: bool,
+) -> Result<serde_json::Value, Error> {
     let serialized = serde_json::to_vec(attrs)
         .map_err(|e| Error::Internal(format!("attributes serialize: {e}")))?;
     let cap = max_attributes_bytes();
-    if serialized.len() > cap {
-        return Err(Error::InvalidArgument(format!(
-            "attributes too large: {} bytes exceeds cap of {}",
-            serialized.len(),
-            cap
-        )));
+    if !bulk_import && serialized.len() > cap {
+        return Err(Error::AttributesTooLarge {
+            bytes: serialized.len(),
+            cap,
+        });
     }
     Ok(attrs.clone())
 }
@@ -152,7 +155,12 @@ fn decode_edge_row(row: &tokio_postgres::Row) -> Result<GraphEdge, Error> {
 // ─── GraphService impl ──────────────────────────────────────────────
 
 impl GraphService for PostgresBackend {
-    async fn upsert_node(&self, node: GraphNode, expected_version: i32) -> Result<(), Error> {
+    async fn upsert_node(
+        &self,
+        node: GraphNode,
+        expected_version: i32,
+        bulk_import: bool,
+    ) -> Result<(), Error> {
         if expected_version < 0 {
             return Err(Error::InvalidArgument(
                 "expected_version must be >= 0".into(),
@@ -161,7 +169,7 @@ impl GraphService for PostgresBackend {
         if node.version < 1 {
             return Err(Error::InvalidArgument("node.version must be >= 1".into()));
         }
-        let attrs = encode_attributes(&node.attributes)?;
+        let attrs = encode_attributes(&node.attributes, bulk_import)?;
         let client = self
             .pool()
             .get()
@@ -235,12 +243,12 @@ impl GraphService for PostgresBackend {
         Ok(())
     }
 
-    async fn upsert_edge(&self, edge: GraphEdge) -> Result<(), Error> {
+    async fn upsert_edge(&self, edge: GraphEdge, bulk_import: bool) -> Result<(), Error> {
         let edge_uuid: uuid::Uuid = edge
             .edge_id
             .parse()
             .map_err(|e| Error::InvalidArgument(format!("edge_id parse: {e}")))?;
-        let attrs = encode_attributes(&edge.attributes)?;
+        let attrs = encode_attributes(&edge.attributes, bulk_import)?;
         let client = self
             .pool()
             .get()
@@ -659,7 +667,7 @@ mod tests {
         // 1. Insert 3 nodes (expected_version=0 for new rows).
         for nid in [&n_a, &n_b, &n_c] {
             backend
-                .upsert_node(fixture_node(nid, GraphScope::Local, "test"), 0)
+                .upsert_node(fixture_node(nid, GraphScope::Local, "test"), 0, false)
                 .await
                 .unwrap();
         }
@@ -676,7 +684,7 @@ mod tests {
 
         // 3. AV-48: version conflict on stale update.
         let conflict = backend
-            .upsert_node(fixture_node(&n_a, GraphScope::Local, "test"), 0)
+            .upsert_node(fixture_node(&n_a, GraphScope::Local, "test"), 0, false)
             .await
             .unwrap_err();
         assert!(
@@ -687,7 +695,7 @@ mod tests {
         // 4. Update with correct expected_version succeeds.
         let mut updated = got.clone();
         updated.attributes = serde_json::json!({"updated": true});
-        backend.upsert_node(updated, 1).await.unwrap();
+        backend.upsert_node(updated, 1, false).await.unwrap();
         let post = backend
             .get_node(&n_a, GraphScope::Local)
             .await
@@ -699,23 +707,28 @@ mod tests {
         let mut huge = fixture_node(&format!("test:huge-{suffix}"), GraphScope::Local, "test");
         let big_string = "x".repeat(2 * 1024 * 1024); // 2 MiB > 1 MiB default cap
         huge.attributes = serde_json::json!({"payload": big_string});
-        let too_big = backend.upsert_node(huge, 0).await.unwrap_err();
+        let too_big = backend.upsert_node(huge, 0, false).await.unwrap_err();
         assert!(
-            matches!(too_big, Error::InvalidArgument(_)),
+            // v1.3.2 (CIRISPersist#50): AV-45 now surfaces as the
+            // typed `AttributesTooLarge { bytes, cap }` variant.
+            matches!(too_big, Error::AttributesTooLarge { .. }),
             "expected InvalidArgument on oversized attributes, got {too_big:?}"
         );
 
         // 6. Edges: a -OWNS-> b -OWNS-> c -SUMMARIZES-> a (cycle).
         backend
-            .upsert_edge(fixture_edge(&n_a, &n_b, GraphScope::Local, "OWNS"))
+            .upsert_edge(fixture_edge(&n_a, &n_b, GraphScope::Local, "OWNS"), false)
             .await
             .unwrap();
         backend
-            .upsert_edge(fixture_edge(&n_b, &n_c, GraphScope::Local, "OWNS"))
+            .upsert_edge(fixture_edge(&n_b, &n_c, GraphScope::Local, "OWNS"), false)
             .await
             .unwrap();
         backend
-            .upsert_edge(fixture_edge(&n_c, &n_a, GraphScope::Local, "SUMMARIZES"))
+            .upsert_edge(
+                fixture_edge(&n_c, &n_a, GraphScope::Local, "SUMMARIZES"),
+                false,
+            )
             .await
             .unwrap();
 
