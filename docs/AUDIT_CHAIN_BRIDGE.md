@@ -192,7 +192,7 @@ engine = Engine("sqlite:///agent.db", "agent-steward-v1")
 #   - valid_from / valid_until: RFC 3339 timestamps
 #   - registration_envelope: signed self-attestation per V004 shape
 
-engine.federation_put_public_key(signed_record_json)
+engine.put_public_key(signed_record_json)
 ```
 
 **Idempotency**: `put_public_key` is idempotent on `key_id` collision
@@ -210,7 +210,7 @@ looked up via `lookup_public_key(key_id)` at verify time.
 engine = Engine(connection_string, agent_signing_key_id)
 
 # Step 2: Register agent's steward key (idempotent; safe on every boot)
-engine.federation_put_public_key(agent_signed_key_record_json)
+engine.put_public_key(agent_signed_key_record_json)
 
 # Step 3: Bridge audit chain (if cutting over from a legacy chain)
 #         OR start fresh genesis (if first deployment)
@@ -256,7 +256,7 @@ licenses), it's the registry's signing key_id.
 
 | Step | Persist call | Module |
 |---|---|---|
-| Register key | `engine.federation_put_public_key(record)` | federation |
+| Register key | `engine.put_public_key(record)` | federation |
 | Bridge audit chain | `engine.audit_try_claim_event(hash, entry, accessor)` | audit |
 | Normal audit write | `engine.audit_record_entry(entry)` | audit |
 | Verify chain | `engine.audit_verify_chain(tenant_id, from, to)` | audit |

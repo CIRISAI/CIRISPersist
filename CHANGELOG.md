@@ -5,6 +5,75 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.4.0] — 2026-05-16
+
+**Interim cut before v1.5.0 substrate work — SQLite federation parity + clean-break API rename + audit-bridge doc fix.**
+
+This release closes the two open Lane C blockers downstream of v1.3.x
+(CIRISPersist#52 SQLite federation panic, CIRISPersist#51 steward
+naming leakage) and lands a small doc correction. v1.5.0 (the
+purpose-scoped trust-grants-as-signed-events substrate per
+`FSD/FEDERATION_TRUST_INTERFACE.md`) builds on this surface.
+
+### Surface changes (breaking — see migration notes)
+
+- **Engine PyO3 method rename (clean break, old names removed):**
+  - `steward_sign` → `local_sign`
+  - `steward_pqc_sign` → `local_pqc_sign`
+  - `steward_key_id` → `local_key_id`
+  - `steward_pqc_key_id` → `local_pqc_key_id`
+  - `steward_public_key_b64` → `local_public_key_b64`
+  - `steward_pqc_public_key_b64` → `local_pqc_public_key_b64`
+- **Engine constructor kwarg rename (clean break, old kwargs removed):**
+  - `steward_key_id` → `local_key_id`
+  - `steward_key_path` → `local_key_path`
+  - `steward_pqc_key_id` → `local_pqc_key_id`
+  - `steward_pqc_key_path` → `local_pqc_key_path`
+
+**Why:** "Steward" was a federation directory role tag (the registry
+bootstrap anchor). The Engine's signing methods refer to *this
+process's local signing key*, which is role-orthogonal — every CIRIS
+agent (whether `client`, `proxy`, or `server` role) has a local
+signer. The old names leaked the role concept into a process-local API
+that doesn't need it. Clean break, no deprecation aliases — callers
+update import names in lockstep.
+
+**Migration:** sed-replace `steward_` → `local_` on Engine method
+calls and constructor kwargs. Internal types (`StewardSigner` struct,
+`steward_signer` field) are unchanged; renaming those is deferred to
+2.0.0.
+
+### SQLite parity for federation surface (closes #52)
+
+The 9 federation-related PyO3 methods that previously panicked on
+SQLite backends are now fully dispatched:
+
+| Method | Backend trait used |
+|---|---|
+| `register_public_key` | Raw SQL (dialect-aware: `cirislens.accord_public_keys` on PG, unqualified on SQLite) |
+| `put_public_key` | `FederationDirectory::put_public_key` |
+| `lookup_public_key` | `FederationDirectory::lookup_public_key` |
+| `lookup_keys_for_identity` | `FederationDirectory::lookup_keys_for_identity` |
+| `federation_grant_trust` | `FederationDirectory::grant_trust` |
+| `federation_revoke_trust` | `FederationDirectory::revoke_trust` |
+| `federation_lookup_trust` | `FederationDirectory::lookup_trust` |
+| `federation_list_trusted_keys` | `FederationDirectory::list_trusted_keys` |
+| `list_federation_keys` | `ReadEngine::list_federation_keys` |
+
+Each site now does `match &self.backend { Postgres(pg) => ..., Sqlite(sq) => ... }` dispatch (mirroring the v1.0.0 substrate-method port). All trait impls existed on `SqliteBackend` already; the gap was purely in the PyO3 wrapper's `backend_postgres_unwrap()` panic helper. Trait disambiguation (`Backend::lookup_public_key` vs `FederationDirectory::lookup_public_key`) handled via fully-qualified syntax.
+
+**Impact on CIRISAgent 2.9.0:** unblocks Lane C (federation/auth absorption — CIRISAgent#765) in its entirety. SQLite-first deployments can now register agent pubkeys, look up federation peers, and use the trust hierarchy without panic-then-skip.
+
+**Out of scope for this cut:** 65 remaining `backend_postgres_unwrap` call sites in non-federation surfaces (attestation, revocation, scrub, maintenance, etc.) — those land in subsequent SQLite parity sweeps.
+
+### Doc fixes
+
+- `docs/AUDIT_CHAIN_BRIDGE.md` — `engine.federation_put_public_key` → `engine.put_public_key` (the method has always been `put_public_key`; the doc string was wrong).
+
+### Tests
+
+`cargo test --features "postgres sqlite" --lib` — 274 passed, 0 failed. SQLite-only and Postgres-only feature combos both clean.
+
 ## [1.3.3] — 2026-05-16
 
 **v1.3.2 CI fixup.** v1.3.2 tag build failed in the wheel jobs at

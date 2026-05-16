@@ -192,23 +192,22 @@ pub struct PyEngine {
     scrubber: Arc<dyn Scrubber>,
     signer: Arc<dyn HardwareSigner>,
     signer_key_id: String,
-    /// v0.4.2 (CIRISPersist#17) — Federation steward signer. One
+    /// v0.4.2 (CIRISPersist#17) — Local-process signing identity. One
     /// struct now holds the Ed25519 + optional ML-DSA-65 identities
-    /// that the pre-v0.4.2 PyEngine carried as four separate fields
-    /// (`steward_signing_key`, `steward_key_id`, `steward_pqc_signer`,
-    /// `steward_pqc_key_id`). The PyO3 surface methods
-    /// (`steward_sign`, `steward_pqc_sign`, accessors) are now thin
-    /// wrappers over [`crate::signing::StewardSigner`] —
-    /// CIRISPersist#7 single-source-of-truth pattern repeated for
-    /// signing.
+    /// that the pre-v0.4.2 PyEngine carried as four separate fields.
+    /// The PyO3 surface methods (`local_sign`, `local_pqc_sign`,
+    /// accessors) are now thin wrappers over
+    /// [`crate::signing::StewardSigner`] (internal type name retained
+    /// pending the 2.0.0 type-rename cut) — CIRISPersist#7
+    /// single-source-of-truth pattern repeated for signing.
     ///
-    /// `None` when the federation steward role isn't configured for
-    /// this Engine instance — the `steward_*` methods return
-    /// ValueError in that case.
+    /// `None` when no local signing identity is configured for this
+    /// Engine instance — the `local_*` methods return ValueError in
+    /// that case.
     ///
     /// Lens process never sees the seed bytes after construction;
-    /// signing happens via `steward_sign(message)` /
-    /// `steward_pqc_sign(message)` returning raw signature bytes,
+    /// signing happens via `local_sign(message)` /
+    /// `local_pqc_sign(message)` returning raw signature bytes,
     /// matching the FFI-boundary discipline of `Engine.sign()`.
     ///
     /// Held as `Arc` so the auto-fire tokio task in `put_public_key`
@@ -270,26 +269,33 @@ impl PyEngine {
     /// also the deployment's Reticulum destination address (when
     /// Phase 2.3 lands) and the registry-published public key.
     ///
-    /// **v0.2.2** — optional `steward_key_id` + `steward_key_path`
+    /// **v0.2.2** — optional `local_key_id` + `local_key_path` (renamed
+    /// from `steward_key_id` / `steward_key_path` in v1.4.0; the old
+    /// kwargs are fully removed — this is a clean breaking change)
     /// configure a SECOND identity for federation-directory signing
-    /// (`engine.steward_sign()`, `engine.steward_public_key_b64()`).
+    /// (`engine.local_sign()`, `engine.local_public_key_b64()`).
     /// This identity is Ed25519 (matching the federation_keys schema),
     /// distinct from `signing_key_id` (which is the scrub-envelope
-    /// identity, typically P-256 via ciris-keyring). The lens-steward
+    /// identity, typically P-256 via ciris-keyring). The local-process
     /// keypair is generated externally (e.g., by CIRIS bridge); the
-    /// 32-byte raw Ed25519 seed is stored in `steward_key_path`. The
-    /// lens process never touches the seed bytes after construction —
-    /// signing happens via `steward_sign(message)`.
+    /// 32-byte raw Ed25519 seed is stored in `local_key_path`. The
+    /// host process never touches the seed bytes after construction —
+    /// signing happens via `local_sign(message)`.
+    ///
+    /// "Local" here means the per-process signing identity, which is
+    /// role-orthogonal — every CIRIS agent (`client`, `proxy`, or
+    /// `server` role) has a local signer; the role label lives in the
+    /// FederationDirectory, not on the Engine.
     ///
     /// Raises `RuntimeError` if Postgres is unreachable, migrations
     /// fail, or the keyring is inaccessible. Raises `ValueError` if
-    /// only one of `steward_key_id`/`steward_key_path` is provided
-    /// (must be both-or-neither), or if the steward seed file is
+    /// only one of `local_key_id`/`local_key_path` is provided
+    /// (must be both-or-neither), or if the local seed file is
     /// missing/wrong-size.
     #[new]
     #[pyo3(signature = (dsn, signing_key_id, scrubber=None,
-                        steward_key_id=None, steward_key_path=None,
-                        steward_pqc_key_id=None, steward_pqc_key_path=None,
+                        local_key_id=None, local_key_path=None,
+                        local_pqc_key_id=None, local_pqc_key_path=None,
                         pqc_sweep_on_init=true))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -297,10 +303,10 @@ impl PyEngine {
         dsn: &str,
         signing_key_id: &str,
         scrubber: Option<Py<PyAny>>,
-        steward_key_id: Option<String>,
-        steward_key_path: Option<String>,
-        steward_pqc_key_id: Option<String>,
-        steward_pqc_key_path: Option<String>,
+        local_key_id: Option<String>,
+        local_key_path: Option<String>,
+        local_pqc_key_id: Option<String>,
+        local_pqc_key_path: Option<String>,
         pqc_sweep_on_init: bool,
     ) -> PyResult<Self> {
         // Build a multi-thread runtime once per Engine instance.
@@ -494,14 +500,14 @@ impl PyEngine {
         // Rust callers (CIRISLensCore, CIRISEdge) hit the same
         // construction path.
         let steward_signer: Option<Arc<crate::signing::StewardSigner>> =
-            match (steward_key_id, steward_key_path) {
+            match (local_key_id, local_key_path) {
                 (None, None) => {
                     // Pair PQC config check before silently dropping a
                     // PQC-only config — surface as the same typed error
                     // the loaded path would.
-                    if steward_pqc_key_id.is_some() || steward_pqc_key_path.is_some() {
+                    if local_pqc_key_id.is_some() || local_pqc_key_path.is_some() {
                         return Err(PyValueError::new_err(
-                            "steward_pqc_key_* requires steward_key_id + steward_key_path",
+                            "local_pqc_key_* requires local_key_id + local_key_path",
                         ));
                     }
                     None
@@ -510,8 +516,8 @@ impl PyEngine {
                     let cfg = crate::signing::StewardSignerConfig {
                         key_id,
                         key_path: std::path::PathBuf::from(key_path),
-                        pqc_key_id: steward_pqc_key_id,
-                        pqc_key_path: steward_pqc_key_path.map(std::path::PathBuf::from),
+                        pqc_key_id: local_pqc_key_id,
+                        pqc_key_path: local_pqc_key_path.map(std::path::PathBuf::from),
                     };
                     let signer = crate::signing::StewardSigner::from_config(&cfg)
                         .map_err(steward_signer_err_to_py)?;
@@ -519,14 +525,14 @@ impl PyEngine {
                 }
                 _ => {
                     return Err(PyValueError::new_err(
-                        "steward_key_id and steward_key_path must both be provided \
+                        "local_key_id and local_key_path must both be provided \
                          or both omitted",
                     ));
                 }
             };
 
-        // v0.3.2 (CIRISPersist#11) — Auto-sweep on init when PQC
-        // steward is configured. Drains hybrid-pending rows authored
+        // v0.3.2 (CIRISPersist#11) — Auto-sweep on init when a local
+        // PQC key is configured. Drains hybrid-pending rows authored
         // before the per-write cold-path was wired (or rows where the
         // per-write spawn failed transiently). Spawned as a background
         // task on the runtime so Engine::new returns immediately;
@@ -703,37 +709,54 @@ impl PyEngine {
         })
     }
 
-    /// v0.2.2 — Return the steward Ed25519 public key (base64) for
-    /// publishing to consumers (registry pinning, lens-steward
-    /// fingerprint, federation_keys.pubkey_ed25519_base64). Distinct
-    /// from `public_key_b64()` (which returns the scrub-envelope
-    /// identity's pubkey).
+    /// v1.4.0 (CIRISPersist#51) — Return the local-process Ed25519
+    /// public key (base64) for publishing to consumers (registry
+    /// pinning, federation_keys.pubkey_ed25519_base64). Distinct from
+    /// `public_key_b64()` (which returns the scrub-envelope identity's
+    /// pubkey).
+    ///
+    /// "Local" here means the per-process signing identity — the key
+    /// the local Engine holds in `local_key_path`, independent of any
+    /// federation-directory role tag. Every CIRIS agent (`client`,
+    /// `proxy`, or `server`) has a local signer; the role label is
+    /// what the FederationDirectory says, not what the Engine carries.
+    ///
+    /// **Renamed from `steward_public_key_b64` in v1.4.0** to remove
+    /// the role-tag conceptual leak. The old name is fully removed —
+    /// callers must update to `local_public_key_b64`.
     ///
     /// Raises `ValueError` if the Engine wasn't constructed with
-    /// `steward_key_id` + `steward_key_path` (the federation steward
-    /// role isn't configured).
-    fn steward_public_key_b64(&self, _py: Python<'_>) -> PyResult<String> {
+    /// `local_key_id` + `local_key_path` (no local signing identity
+    /// configured).
+    fn local_public_key_b64(&self, _py: Python<'_>) -> PyResult<String> {
         catch_panic(|| {
             // v0.4.2 — thin wrapper over StewardSigner::public_key_b64.
+            // Internal struct keeps the `StewardSigner` name for now
+            // (deferred to 2.0.0 cleanup); the public surface is local_*.
             self.steward_signer
                 .as_ref()
                 .map(|s| s.public_key_b64())
                 .ok_or_else(|| {
                     PyValueError::new_err(
-                        "no steward key configured (pass steward_key_id + steward_key_path \
+                        "no local signing key configured (pass local_key_id + local_key_path \
                      to the Engine constructor)",
                     )
                 })
         })
     }
 
-    /// v0.2.2 — Return the configured `steward_key_id` (the lens-
-    /// steward identifier — used as `key_id` in the lens-steward
-    /// federation_keys row, and as `scrub_key_id` for federation
-    /// rows the lens publishes).
+    /// v1.4.0 (CIRISPersist#51) — Return the configured `local_key_id`
+    /// — the stable identifier for this Engine's local Ed25519 signing
+    /// identity. Used as `key_id` in the per-process federation_keys
+    /// row, and as `scrub_key_id` for federation rows the process
+    /// publishes.
     ///
-    /// Raises `ValueError` if no steward identity is configured.
-    fn steward_key_id(&self, _py: Python<'_>) -> PyResult<String> {
+    /// **Renamed from `steward_key_id` in v1.4.0** to remove the
+    /// role-tag conceptual leak. The old name is fully removed —
+    /// callers must update to `local_key_id`.
+    ///
+    /// Raises `ValueError` if no local signing identity is configured.
+    fn local_key_id(&self, _py: Python<'_>) -> PyResult<String> {
         catch_panic(|| {
             // v0.4.2 — thin wrapper over StewardSigner::key_id.
             self.steward_signer
@@ -741,28 +764,32 @@ impl PyEngine {
                 .map(|s| s.key_id().to_owned())
                 .ok_or_else(|| {
                     PyValueError::new_err(
-                        "no steward key configured (pass steward_key_id + steward_key_path \
+                        "no local signing key configured (pass local_key_id + local_key_path \
                      to the Engine constructor)",
                     )
                 })
         })
     }
 
-    /// v0.2.2 — Sign arbitrary bytes with the steward Ed25519 signing
-    /// key. Returns the 64-byte raw signature.
+    /// v1.4.0 (CIRISPersist#51) — Sign arbitrary bytes with the local
+    /// Ed25519 signing key. Returns the 64-byte raw signature.
     ///
     /// Same FFI-boundary discipline as `Engine.sign()`: bytes in,
-    /// bytes out, no key material crossing the boundary. The lens
+    /// bytes out, no key material crossing the boundary. The host
     /// process never sees the seed.
     ///
     /// **Hot-path Ed25519 only.** The cold-path ML-DSA-65 sign
-    /// happens elsewhere — lens runs ML-DSA-65 sign over
+    /// happens elsewhere — the caller runs ML-DSA-65 sign over
     /// `(canonical || classical_sig)` via its own pipeline and
     /// fills in via `attach_key_pqc_signature()` per the writer
     /// contract (`docs/FEDERATION_DIRECTORY.md` §"Trust contract").
     ///
-    /// Raises `ValueError` if no steward key is configured.
-    fn steward_sign<'py>(
+    /// **Renamed from `steward_sign` in v1.4.0** to remove the
+    /// role-tag conceptual leak. The old name is fully removed —
+    /// callers must update to `local_sign`.
+    ///
+    /// Raises `ValueError` if no local signing key is configured.
+    fn local_sign<'py>(
         &self,
         py: Python<'py>,
         message: &Bound<'py, PyBytes>,
@@ -773,7 +800,7 @@ impl PyEngine {
             // PyO3 callers hit identical bytes-in / bytes-out logic.
             let signer = self.steward_signer.as_ref().ok_or_else(|| {
                 PyValueError::new_err(
-                    "no steward key configured (pass steward_key_id + steward_key_path \
+                    "no local signing key configured (pass local_key_id + local_key_path \
                  to the Engine constructor)",
                 )
             })?;
@@ -784,24 +811,29 @@ impl PyEngine {
         })
     }
 
-    /// v0.3.1 — Return the steward ML-DSA-65 public key (base64) for
-    /// publishing to consumers (federation_keys.pubkey_ml_dsa_65_base64,
-    /// peer pinning, fingerprint registries). Distinct from
-    /// `steward_public_key_b64()` (the Ed25519 steward identity).
+    /// v1.4.0 (CIRISPersist#51) — Return the local-process ML-DSA-65
+    /// public key (base64) for publishing to consumers
+    /// (federation_keys.pubkey_ml_dsa_65_base64, peer pinning,
+    /// fingerprint registries). Distinct from `local_public_key_b64()`
+    /// (the Ed25519 identity).
     ///
     /// 1952-byte raw ML-DSA-65 public key per FIPS 204 final, base64
     /// standard alphabet → ~2604 chars.
     ///
+    /// **Renamed from `steward_pqc_public_key_b64` in v1.4.0** to
+    /// remove the role-tag conceptual leak. The old name is fully
+    /// removed — callers must update to `local_pqc_public_key_b64`.
+    ///
     /// Raises `ValueError` if the Engine wasn't constructed with both
-    /// `steward_pqc_key_id` + `steward_pqc_key_path` (the cold-path
-    /// PQC role isn't configured).
-    fn steward_pqc_public_key_b64(&self, py: Python<'_>) -> PyResult<String> {
+    /// `local_pqc_key_id` + `local_pqc_key_path` (the cold-path PQC
+    /// identity isn't configured).
+    fn local_pqc_public_key_b64(&self, py: Python<'_>) -> PyResult<String> {
         catch_panic(|| {
             // v0.4.2 — thin wrapper over StewardSigner::pqc_public_key_b64.
             let signer = self.steward_signer.clone().ok_or_else(|| {
                 PyValueError::new_err(
-                    "no PQC steward key configured (pass steward_pqc_key_id + \
-                 steward_pqc_key_path to the Engine constructor)",
+                    "no local PQC key configured (pass local_pqc_key_id + \
+                 local_pqc_key_path to the Engine constructor)",
                 )
             })?;
             let runtime = self.runtime.clone();
@@ -809,18 +841,22 @@ impl PyEngine {
                 py.detach(|| runtime.block_on(async move { signer.pqc_public_key_b64().await }));
             result.map_err(steward_signer_err_to_py)?.ok_or_else(|| {
                 PyValueError::new_err(
-                    "no PQC steward key configured (pass steward_pqc_key_id + \
-                     steward_pqc_key_path to the Engine constructor)",
+                    "no local PQC key configured (pass local_pqc_key_id + \
+                     local_pqc_key_path to the Engine constructor)",
                 )
             })
         })
     }
 
-    /// v0.3.1 — Return the configured `steward_pqc_key_id`. Distinct
-    /// from `steward_key_id` (the Ed25519 identity); deployments will
-    /// typically pin them equal but the alias spaces don't have to
-    /// match.
-    fn steward_pqc_key_id(&self, _py: Python<'_>) -> PyResult<String> {
+    /// v1.4.0 (CIRISPersist#51) — Return the configured
+    /// `local_pqc_key_id`. Distinct from `local_key_id` (the Ed25519
+    /// identity); deployments will typically pin them equal but the
+    /// alias spaces don't have to match.
+    ///
+    /// **Renamed from `steward_pqc_key_id` in v1.4.0** to remove the
+    /// role-tag conceptual leak. The old name is fully removed —
+    /// callers must update to `local_pqc_key_id`.
+    fn local_pqc_key_id(&self, _py: Python<'_>) -> PyResult<String> {
         catch_panic(|| {
             // v0.4.2 — thin wrapper over StewardSigner::pqc_key_id.
             self.steward_signer
@@ -828,18 +864,18 @@ impl PyEngine {
                 .and_then(|s| s.pqc_key_id().map(str::to_owned))
                 .ok_or_else(|| {
                     PyValueError::new_err(
-                        "no PQC steward key configured (pass steward_pqc_key_id + \
-                     steward_pqc_key_path to the Engine constructor)",
+                        "no local PQC key configured (pass local_pqc_key_id + \
+                     local_pqc_key_path to the Engine constructor)",
                     )
                 })
         })
     }
 
-    /// v0.3.1 — Sign arbitrary bytes with the steward ML-DSA-65
-    /// signing key. Returns the 3309-byte raw signature (FIPS 204
-    /// final).
+    /// v1.4.0 (CIRISPersist#51) — Sign arbitrary bytes with the local
+    /// ML-DSA-65 signing key. Returns the 3309-byte raw signature
+    /// (FIPS 204 final).
     ///
-    /// Same FFI-boundary discipline as `steward_sign()`: bytes in,
+    /// Same FFI-boundary discipline as `local_sign()`: bytes in,
     /// bytes out, no key material crossing the boundary. Persist
     /// owns the cold-path PQC sign automatically after federation
     /// writes (CIRISPersist#10) — this method is the explicit-call
@@ -852,8 +888,12 @@ impl PyEngine {
     /// `HybridSignature` shape (`ciris-crypto/src/types.rs:156`).
     /// Callers concatenate the two byte sequences before calling.
     ///
-    /// Raises `ValueError` if no PQC steward key is configured.
-    fn steward_pqc_sign<'py>(
+    /// **Renamed from `steward_pqc_sign` in v1.4.0** to remove the
+    /// role-tag conceptual leak. The old name is fully removed —
+    /// callers must update to `local_pqc_sign`.
+    ///
+    /// Raises `ValueError` if no local PQC key is configured.
+    fn local_pqc_sign<'py>(
         &self,
         py: Python<'py>,
         message: &Bound<'py, PyBytes>,
@@ -862,8 +902,8 @@ impl PyEngine {
             // v0.4.2 — thin wrapper over StewardSigner::sign_ml_dsa_65.
             let signer = self.steward_signer.clone().ok_or_else(|| {
                 PyValueError::new_err(
-                    "no PQC steward key configured (pass steward_pqc_key_id + \
-                 steward_pqc_key_path to the Engine constructor)",
+                    "no local PQC key configured (pass local_pqc_key_id + \
+                 local_pqc_key_path to the Engine constructor)",
                 )
             })?;
             let runtime = self.runtime.clone();
@@ -991,7 +1031,6 @@ impl PyEngine {
         added_by: Option<&str>,
     ) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let key_id = signature_key_id.to_owned();
             let pub_b64 = public_key_b64.to_owned();
@@ -1009,26 +1048,68 @@ impl PyEngine {
                 })?),
             };
 
-            py.detach(|| {
-                runtime.block_on(async move {
-                    let client = backend
-                        .pool()
-                        .get()
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        let client = backend
+                            .pool()
+                            .get()
+                            .await
+                            .map_err(|e| PyRuntimeError::new_err(format!("pool: {e}")))?;
+                        client
+                            .execute(
+                                "INSERT INTO cirislens.accord_public_keys \
+                             (key_id, public_key_base64, algorithm, description, \
+                              expires_at, added_by) \
+                             VALUES ($1, $2, $3, $4, $5, $6) \
+                             ON CONFLICT (key_id) DO NOTHING",
+                                &[&key_id, &pub_b64, &algo, &desc, &expires_dt, &added],
+                            )
+                            .await
+                            .map_err(|e| PyRuntimeError::new_err(format!("register: {e}")))?;
+                        Ok::<_, PyErr>(())
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    // SQLite shape (migrations/sqlite/lens/V001
+                    // accord_public_keys): unqualified table name (no
+                    // `cirislens.` schema prefix), `?N` placeholders,
+                    // TEXT-encoded ISO-8601 for `expires_at` matching
+                    // the rest of the SQLite TEXT-as-TIMESTAMPTZ
+                    // convention. Idempotent on `key_id` PRIMARY KEY
+                    // via `ON CONFLICT DO NOTHING` (same shape as PG).
+                    let conn = sq.conn_handle();
+                    let expires_text: Option<String> = expires_dt.map(|t| t.to_rfc3339());
+                    runtime.block_on(async move {
+                        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
+                            let conn = conn.blocking_lock();
+                            conn.execute(
+                                    "INSERT INTO accord_public_keys \
+                                     (key_id, public_key_base64, algorithm, description, \
+                                      expires_at, added_by) \
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                                     ON CONFLICT (key_id) DO NOTHING",
+                                    rusqlite::params![
+                                        key_id,
+                                        pub_b64,
+                                        algo,
+                                        desc,
+                                        expires_text,
+                                        added,
+                                    ],
+                                )?;
+                            Ok(())
+                        })
                         .await
-                        .map_err(|e| PyRuntimeError::new_err(format!("pool: {e}")))?;
-                    client
-                        .execute(
-                            "INSERT INTO cirislens.accord_public_keys \
-                         (key_id, public_key_base64, algorithm, description, \
-                          expires_at, added_by) \
-                         VALUES ($1, $2, $3, $4, $5, $6) \
-                         ON CONFLICT (key_id) DO NOTHING",
-                            &[&key_id, &pub_b64, &algo, &desc, &expires_dt, &added],
-                        )
-                        .await
+                        .map_err(|e| {
+                            PyRuntimeError::new_err(format!("register spawn_blocking join: {e}"))
+                        })?
                         .map_err(|e| PyRuntimeError::new_err(format!("register: {e}")))?;
-                    Ok::<_, PyErr>(())
-                })
+                        Ok::<_, PyErr>(())
+                    })
+                }
             })
         })
     }
@@ -1151,7 +1232,6 @@ impl PyEngine {
     /// to fill them in. `algorithm` MUST be `"hybrid"`.
     fn put_public_key(&self, py: Python<'_>, signed_key_record_json: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let record: crate::federation::SignedKeyRecord =
                 serde_json::from_str(signed_key_record_json).map_err(|e| {
@@ -1160,9 +1240,10 @@ impl PyEngine {
 
             // v0.3.1 — cold-path PQC fill-in (CIRISPersist#10). Capture
             // the inputs the auto-fire task needs BEFORE backend consumes
-            // the record. Cold-path skips when no PQC steward configured;
-            // row stays hybrid-pending and consumers can fill via the
-            // attach_*_pqc_signature escape hatch on their own schedule.
+            // the record. Cold-path skips when no local PQC key is
+            // configured; row stays hybrid-pending and consumers can fill
+            // via the attach_*_pqc_signature escape hatch on their own
+            // schedule.
             let cold_path_inputs = self
                 .steward_signer
                 .as_ref()
@@ -1176,53 +1257,111 @@ impl PyEngine {
                     )
                 });
 
-            py.detach(|| {
-                runtime.block_on(async move {
-                    use crate::federation::FederationDirectory;
-                    backend
-                        .put_public_key(record)
-                        .await
-                        .map_err(federation_err_to_py)?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        backend
+                            .put_public_key(record)
+                            .await
+                            .map_err(federation_err_to_py)?;
 
-                    // Cold-path fire-and-forget. We're already inside
-                    // tokio::Runtime::block_on, so tokio::spawn here
-                    // schedules the task without waiting. The synchronous
-                    // Python call returns as soon as the put commits;
-                    // PQC catches up within seconds.
-                    if let Some((signer, key_id, envelope, classical_sig_b64)) = cold_path_inputs {
-                        let backend = backend.clone();
-                        tokio::spawn(async move {
-                            match cold_path_pqc_sign(&*signer, &envelope, &classical_sig_b64).await
-                            {
-                                Ok((pubkey_b64, pqc_sig_b64)) => {
-                                    if let Err(e) = backend
-                                        .attach_key_pqc_signature(
-                                            &key_id,
-                                            &pubkey_b64,
-                                            &pqc_sig_b64,
-                                        )
-                                        .await
-                                    {
+                        // Cold-path fire-and-forget. We're already inside
+                        // tokio::Runtime::block_on, so tokio::spawn here
+                        // schedules the task without waiting. The synchronous
+                        // Python call returns as soon as the put commits;
+                        // PQC catches up within seconds.
+                        if let Some((signer, key_id, envelope, classical_sig_b64)) =
+                            cold_path_inputs
+                        {
+                            let backend = backend.clone();
+                            tokio::spawn(async move {
+                                match cold_path_pqc_sign(&*signer, &envelope, &classical_sig_b64)
+                                    .await
+                                {
+                                    Ok((pubkey_b64, pqc_sig_b64)) => {
+                                        if let Err(e) = backend
+                                            .attach_key_pqc_signature(
+                                                &key_id,
+                                                &pubkey_b64,
+                                                &pqc_sig_b64,
+                                            )
+                                            .await
+                                        {
+                                            tracing::warn!(
+                                                key_id = key_id.as_str(),
+                                                error = %e,
+                                                "cold-path PQC attach_key_pqc_signature failed; \
+                                                 row stays hybrid-pending"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
                                         tracing::warn!(
                                             key_id = key_id.as_str(),
                                             error = %e,
-                                            "cold-path PQC attach_key_pqc_signature failed; \
-                                             row stays hybrid-pending"
+                                            "cold-path PQC sign failed; row stays hybrid-pending"
                                         );
                                     }
                                 }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        key_id = key_id.as_str(),
-                                        error = %e,
-                                        "cold-path PQC sign failed; row stays hybrid-pending"
-                                    );
+                            });
+                        }
+                        Ok(())
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        backend
+                            .put_public_key(record)
+                            .await
+                            .map_err(federation_err_to_py)?;
+
+                        // Cold-path fire-and-forget; same shape as the
+                        // Postgres arm — tokio::spawn inside the tokio
+                        // runtime returns immediately, PQC attach
+                        // catches up out-of-band.
+                        if let Some((signer, key_id, envelope, classical_sig_b64)) =
+                            cold_path_inputs
+                        {
+                            let backend = backend.clone();
+                            tokio::spawn(async move {
+                                match cold_path_pqc_sign(&*signer, &envelope, &classical_sig_b64)
+                                    .await
+                                {
+                                    Ok((pubkey_b64, pqc_sig_b64)) => {
+                                        if let Err(e) = backend
+                                            .attach_key_pqc_signature(
+                                                &key_id,
+                                                &pubkey_b64,
+                                                &pqc_sig_b64,
+                                            )
+                                            .await
+                                        {
+                                            tracing::warn!(
+                                                key_id = key_id.as_str(),
+                                                error = %e,
+                                                "cold-path PQC attach_key_pqc_signature failed; \
+                                                 row stays hybrid-pending"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            key_id = key_id.as_str(),
+                                            error = %e,
+                                            "cold-path PQC sign failed; row stays hybrid-pending"
+                                        );
+                                    }
                                 }
-                            }
-                        });
-                    }
-                    Ok(())
-                })
+                            });
+                        }
+                        Ok(())
+                    })
+                }
             })
         })
     }
@@ -1231,24 +1370,44 @@ impl PyEngine {
     /// Returns the JSON-encoded `KeyRecord` string, or `None`.
     fn lookup_public_key(&self, py: Python<'_>, key_id: &str) -> PyResult<Option<String>> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let key_id = key_id.to_owned();
-            py.detach(|| {
-                runtime.block_on(async move {
-                    let opt =
-                    <PostgresBackend as crate::federation::FederationDirectory>::lookup_public_key(
-                        &backend, &key_id,
-                    )
-                    .await
-                    .map_err(federation_err_to_py)?;
-                    match opt {
-                        None => Ok(None),
-                        Some(rec) => Ok(Some(serde_json::to_string(&rec).map_err(|e| {
-                            PyRuntimeError::new_err(format!("KeyRecord JSON encode: {e}"))
-                        })?)),
-                    }
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        let opt = <PostgresBackend as FederationDirectory>::lookup_public_key(
+                            &backend, &key_id,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)?;
+                        match opt {
+                            None => Ok(None),
+                            Some(rec) => Ok(Some(serde_json::to_string(&rec).map_err(|e| {
+                                PyRuntimeError::new_err(format!("KeyRecord JSON encode: {e}"))
+                            })?)),
+                        }
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        let opt = <SqliteBackend as FederationDirectory>::lookup_public_key(
+                            &backend, &key_id,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)?;
+                        match opt {
+                            None => Ok(None),
+                            Some(rec) => Ok(Some(serde_json::to_string(&rec).map_err(|e| {
+                                PyRuntimeError::new_err(format!("KeyRecord JSON encode: {e}"))
+                            })?)),
+                        }
+                    })
+                }
             })
         })
     }
@@ -1257,20 +1416,36 @@ impl PyEngine {
     /// Returns a JSON array string of `KeyRecord` objects.
     fn lookup_keys_for_identity(&self, py: Python<'_>, identity_ref: &str) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let identity_ref = identity_ref.to_owned();
-            py.detach(|| {
-                runtime.block_on(async move {
-                    use crate::federation::FederationDirectory;
-                    let rows = backend
-                        .lookup_keys_for_identity(&identity_ref)
-                        .await
-                        .map_err(federation_err_to_py)?;
-                    serde_json::to_string(&rows).map_err(|e| {
-                        PyRuntimeError::new_err(format!("Vec<KeyRecord> JSON encode: {e}"))
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        let rows = backend
+                            .lookup_keys_for_identity(&identity_ref)
+                            .await
+                            .map_err(federation_err_to_py)?;
+                        serde_json::to_string(&rows).map_err(|e| {
+                            PyRuntimeError::new_err(format!("Vec<KeyRecord> JSON encode: {e}"))
+                        })
                     })
-                })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        let rows = backend
+                            .lookup_keys_for_identity(&identity_ref)
+                            .await
+                            .map_err(federation_err_to_py)?;
+                        serde_json::to_string(&rows).map_err(|e| {
+                            PyRuntimeError::new_err(format!("Vec<KeyRecord> JSON encode: {e}"))
+                        })
+                    })
+                }
             })
         })
     }
@@ -1577,18 +1752,31 @@ impl PyEngine {
     /// missing-domains-on-Registry, or unknown key_id.
     fn federation_grant_trust(&self, py: Python<'_>, trust_grant_json: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let grant: crate::federation::TrustGrant = serde_json::from_str(trust_grant_json)
                 .map_err(|e| PyValueError::new_err(format!("TrustGrant JSON decode: {e}")))?;
-            py.detach(|| {
-                runtime.block_on(async move {
-                    use crate::federation::FederationDirectory;
-                    backend
-                        .grant_trust(grant)
-                        .await
-                        .map_err(federation_err_to_py)
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        backend
+                            .grant_trust(grant)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        backend
+                            .grant_trust(grant)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
             })
         })
     }
@@ -1597,18 +1785,31 @@ impl PyEngine {
     /// revoking an already-expired key is a no-op.
     fn federation_revoke_trust(&self, py: Python<'_>, key: &str, revoked_by: &str) -> PyResult<()> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let key = key.to_owned();
             let revoked_by = revoked_by.to_owned();
-            py.detach(|| {
-                runtime.block_on(async move {
-                    use crate::federation::FederationDirectory;
-                    backend
-                        .revoke_trust(&key, &revoked_by)
-                        .await
-                        .map_err(federation_err_to_py)
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        backend
+                            .revoke_trust(&key, &revoked_by)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        backend
+                            .revoke_trust(&key, &revoked_by)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
             })
         })
     }
@@ -1618,23 +1819,42 @@ impl PyEngine {
     /// trust grant exists.
     fn federation_lookup_trust(&self, py: Python<'_>, key: &str) -> PyResult<Option<String>> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let key = key.to_owned();
-            py.detach(|| {
-                runtime.block_on(async move {
-                    use crate::federation::FederationDirectory;
-                    let opt = backend
-                        .lookup_trust(&key)
-                        .await
-                        .map_err(federation_err_to_py)?;
-                    match opt {
-                        None => Ok(None),
-                        Some(row) => Ok(Some(serde_json::to_string(&row).map_err(|e| {
-                            PyRuntimeError::new_err(format!("TrustRow JSON encode: {e}"))
-                        })?)),
-                    }
-                })
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        let opt = backend
+                            .lookup_trust(&key)
+                            .await
+                            .map_err(federation_err_to_py)?;
+                        match opt {
+                            None => Ok(None),
+                            Some(row) => Ok(Some(serde_json::to_string(&row).map_err(|e| {
+                                PyRuntimeError::new_err(format!("TrustRow JSON encode: {e}"))
+                            })?)),
+                        }
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        let opt = backend
+                            .lookup_trust(&key)
+                            .await
+                            .map_err(federation_err_to_py)?;
+                        match opt {
+                            None => Ok(None),
+                            Some(row) => Ok(Some(serde_json::to_string(&row).map_err(|e| {
+                                PyRuntimeError::new_err(format!("TrustRow JSON encode: {e}"))
+                            })?)),
+                        }
+                    })
+                }
             })
         })
     }
@@ -1652,7 +1872,6 @@ impl PyEngine {
         trust_filter_json: &str,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             // TrustFilter doesn't derive Serialize/Deserialize (the
             // shape mirrors NodeCore's local type, which is bare); we
@@ -1680,17 +1899,34 @@ impl PyEngine {
                 domain: wire.domain,
                 include_expired: wire.include_expired,
             };
-            py.detach(|| {
-                runtime.block_on(async move {
-                    use crate::federation::FederationDirectory;
-                    let rows = backend
-                        .list_trusted_keys(filter)
-                        .await
-                        .map_err(federation_err_to_py)?;
-                    serde_json::to_string(&rows).map_err(|e| {
-                        PyRuntimeError::new_err(format!("Vec<TrustRow> JSON encode: {e}"))
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        let rows = backend
+                            .list_trusted_keys(filter)
+                            .await
+                            .map_err(federation_err_to_py)?;
+                        serde_json::to_string(&rows).map_err(|e| {
+                            PyRuntimeError::new_err(format!("Vec<TrustRow> JSON encode: {e}"))
+                        })
                     })
-                })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        let rows = backend
+                            .list_trusted_keys(filter)
+                            .await
+                            .map_err(federation_err_to_py)?;
+                        serde_json::to_string(&rows).map_err(|e| {
+                            PyRuntimeError::new_err(format!("Vec<TrustRow> JSON encode: {e}"))
+                        })
+                    })
+                }
             })
         })
     }
@@ -1703,7 +1939,7 @@ impl PyEngine {
     /// already in the table without per-write spawn coverage:
     ///
     /// - Rows authored before v0.3.1 wired the per-write cold-path
-    /// - Rows authored before the PQC steward was configured on the
+    /// - Rows authored before the local PQC key was configured on the
     ///   writer
     /// - Rows where the per-write `tokio::spawn` cold-path failed
     ///   transiently (sign error, attach network blip, process restart
@@ -1742,8 +1978,8 @@ impl PyEngine {
     /// Re-invoke until `scanned == 0` to drain larger backlogs
     /// incrementally.
     ///
-    /// Raises `ValueError` if no PQC steward is configured (same shape
-    /// as `steward_pqc_sign`).
+    /// Raises `ValueError` if no local PQC key is configured (same
+    /// shape as `local_pqc_sign`).
     #[pyo3(signature = (batch_size=1000))]
     fn run_pqc_sweep<'py>(&self, py: Python<'py>, batch_size: i64) -> PyResult<Bound<'py, PyDict>> {
         catch_panic(|| {
@@ -1753,8 +1989,8 @@ impl PyEngine {
                 .and_then(|s| s.pqc_signer_arc())
                 .ok_or_else(|| {
                     PyValueError::new_err(
-                        "PQC steward not configured (pass steward_pqc_key_id and \
-                 steward_pqc_key_path to the Engine constructor)",
+                        "no local PQC key configured (pass local_pqc_key_id and \
+                 local_pqc_key_path to the Engine constructor)",
                     )
                 })?;
             let backend = self.backend_postgres_unwrap().clone();
@@ -3394,7 +3630,6 @@ impl PyEngine {
         limit: i64,
     ) -> PyResult<String> {
         catch_panic(|| {
-            let backend = self.backend_postgres_unwrap().clone();
             let runtime = self.runtime.clone();
             let filter: crate::read::FederationKeyFilter = serde_json::from_str(filter_json)
                 .map_err(|e| {
@@ -3406,17 +3641,34 @@ impl PyEngine {
                     PyValueError::new_err(format!("FederationKeyCursor JSON decode: {e}"))
                 })?),
             };
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::read::ReadEngine;
-                    let page = backend
-                        .list_federation_keys(filter, cursor, limit)
-                        .await
-                        .map_err(read_err_to_py)?;
-                    serde_json::to_string(&page).map_err(|e| {
-                        PyRuntimeError::new_err(format!("FederationKeyListPage encode: {e}"))
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::read::ReadEngine;
+                        let page = backend
+                            .list_federation_keys(filter, cursor, limit)
+                            .await
+                            .map_err(read_err_to_py)?;
+                        serde_json::to_string(&page).map_err(|e| {
+                            PyRuntimeError::new_err(format!("FederationKeyListPage encode: {e}"))
+                        })
                     })
-                })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::read::ReadEngine;
+                        let page = backend
+                            .list_federation_keys(filter, cursor, limit)
+                            .await
+                            .map_err(read_err_to_py)?;
+                        serde_json::to_string(&page).map_err(|e| {
+                            PyRuntimeError::new_err(format!("FederationKeyListPage encode: {e}"))
+                        })
+                    })
+                }
             })
         })
     }
@@ -6642,7 +6894,7 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
 /// v0.3.1 — Cold-path PQC sign helper for the auto-fire flow after
 /// federation writes (CIRISPersist#10). Computes the bound-signature
 /// input (canonical_envelope_bytes || classical_sig_bytes), invokes
-/// the steward's ML-DSA-65 signer, and returns base64-encoded
+/// the local ML-DSA-65 signer, and returns base64-encoded
 /// (pubkey, signature) ready for `attach_*_pqc_signature`.
 ///
 /// Per the writer contract in `migrations/postgres/lens/V004__federation_directory.sql`:

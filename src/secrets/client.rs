@@ -99,7 +99,7 @@ impl std::fmt::Debug for FederatedSecretsClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FederatedSecretsClient")
             .field("base_url", &self.base_url.as_str())
-            .field("steward_key_id", &self.signer.key_id())
+            .field("local_key_id", &self.signer.key_id())
             .finish()
     }
 }
@@ -634,7 +634,7 @@ mod tests {
         let signer = make_signer();
         let url = Url::parse("https://persist.example.com").unwrap();
         let client = FederatedSecretsClient::new(url, signer).expect("construct");
-        // Debug shape exposes base_url + steward_key_id; no secrets.
+        // Debug shape exposes base_url + local_key_id; no secrets.
         let dbg = format!("{client:?}");
         assert!(dbg.contains("persist.example.com"));
         assert!(dbg.contains("test-steward"));
