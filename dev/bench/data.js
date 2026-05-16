@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778961502378,
+  "lastUpdate": 1778963253035,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -15395,6 +15395,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23581679,
             "range": "± 127900",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "73b8a124b396fd20b3c720de4b596592396f049e",
+          "message": "1.4.0 — SQLite federation parity (#52) + steward→local rename (#51) + audit-bridge doc fix\n\nInterim cut before v1.5.0 substrate work. Closes the two Lane C\nblockers downstream of v1.3.x and clears the API-name and doc decks\nso v1.5.0's trust-grants-as-signed-events substrate (per\nFSD/FEDERATION_TRUST_INTERFACE.md) builds on a stable surface.\n\nBreaking changes (clean break, no aliases):\n- Engine.steward_sign → Engine.local_sign (+ pqc_sign + key_id +\n  pqc_key_id + public_key_b64 + pqc_public_key_b64)\n- Engine constructor: steward_key_id/steward_key_path (+ pqc_*) →\n  local_key_id/local_key_path (+ pqc_*)\n\nWhy rename: \"steward\" was a federation directory role tag (registry\nbootstrap anchor). The Engine's signing methods refer to *this\nprocess's local signing key*, which is role-orthogonal — every CIRIS\nagent (whether client, proxy, or server role) has a local signer.\nThe old names leaked the role concept into a process-local API that\ndoesn't need it. Internal types (StewardSigner struct, steward_signer\nfield) unchanged; deferred to 2.0.0.\n\nSQLite federation parity (closes #52):\n- 9 PyO3 methods ported from backend_postgres_unwrap panic pattern to\n  proper match-dispatch: register_public_key, put_public_key,\n  lookup_public_key, lookup_keys_for_identity, federation_grant_trust,\n  federation_revoke_trust, federation_lookup_trust,\n  federation_list_trusted_keys, list_federation_keys.\n- All FederationDirectory trait impls existed on SqliteBackend (V020\n  schema is there); gap was purely in the PyO3 wrapper.\n- Unblocks CIRISAgent#765 (Lane C federation/auth absorption) — SQLite\n  deployments can now register agent pubkeys + use the trust hierarchy.\n- 65 remaining non-federation backend_postgres_unwrap call sites\n  remain — separate sweep, not in this cut.\n\nDoc fix:\n- docs/AUDIT_CHAIN_BRIDGE.md: engine.federation_put_public_key →\n  engine.put_public_key (method has always been put_public_key).\n\nTests: cargo test --features \"postgres sqlite\" --lib — 274 passed,\n0 failed. SQLite-only and Postgres-only feature combos both clean.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-16T15:19:40-05:00",
+          "tree_id": "6345ce7576d318f5a55b9ee1d7942ddd71731951",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/73b8a124b396fd20b3c720de4b596592396f049e"
+        },
+        "date": 1778963252604,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 111048,
+            "range": "± 356",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 251679,
+            "range": "± 686",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 534276,
+            "range": "± 2730",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1863995,
+            "range": "± 25637",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 340,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1449,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7369,
+            "range": "± 104",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21501,
+            "range": "± 34",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24546,
+            "range": "± 73",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83913,
+            "range": "± 508",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 371,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3049,
+            "range": "± 23",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9324,
+            "range": "± 54",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42130,
+            "range": "± 249",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 636,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2309984,
+            "range": "± 131615",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6726684,
+            "range": "± 177335",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 24267740,
+            "range": "± 361651",
             "unit": "ns/iter"
           }
         ]
