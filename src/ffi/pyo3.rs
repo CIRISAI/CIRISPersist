@@ -6313,6 +6313,7 @@ fn cirisgraph_err_to_py(e: crate::graph::Error) -> PyErr {
     tracing::warn!(error = %e, kind = kind, "cirisgraph error");
     match e {
         crate::graph::Error::InvalidArgument(_)
+        | crate::graph::Error::AttributesTooLarge { .. }
         | crate::graph::Error::NotAuthorized(_)
         | crate::graph::Error::Conflict(_)
         | crate::graph::Error::NotFound(_) => PyValueError::new_err(kind),

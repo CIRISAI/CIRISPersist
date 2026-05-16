@@ -5,6 +5,26 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.3.3] — 2026-05-16
+
+**v1.3.2 CI fixup.** v1.3.2 tag build failed in the wheel jobs at
+the FFI layer — `cirisgraph_err_to_py` legacy bridge function (used
+by pre-v1.0.0 `translate_error_kind` consumers; still present for
+back-compat) had a non-exhaustive `match e { … }` against
+`graph::Error` and didn't cover the new `AttributesTooLarge` variant
+added in v1.3.2. Local feature-set used during dev (`pyo3 sqlite
+cirisgraph`) compiled clean; CI's wheel feature combo surfaced the
+match.
+
+Fix: add `crate::graph::Error::AttributesTooLarge { .. }` to the
+caller-fault arm alongside `InvalidArgument` / `NotAuthorized` /
+`Conflict` / `NotFound`. Maps to `PyValueError` (caller-fault),
+matching the typed-exception kind already in v1.0.0's
+`translate_error_kind` path.
+
+No surface change. v1.3.3 is the first 1.3.x wheel of v1.3.2's
+bulk_import work that publishes to PyPI.
+
 ## [1.3.2] — 2026-05-16
 
 **`bulk_import` mode + typed `AttributesTooLarge` (closes #50).**
