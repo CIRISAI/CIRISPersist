@@ -1028,6 +1028,105 @@ impl AuditService for PostgresBackend {
         }
         Ok(items)
     }
+
+    async fn next_chain_position(
+        &self,
+        tenant_id: &str,
+    ) -> Result<super::service::ChainPosition, Error> {
+        if tenant_id.is_empty() {
+            return Err(Error::InvalidArgument("tenant_id must be non-empty".into()));
+        }
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let row_opt = client
+            .query_opt(
+                "SELECT sequence_number, entry_hash \
+                 FROM cirislens.audit_log \
+                 WHERE tenant_id = $1 \
+                 ORDER BY sequence_number DESC \
+                 LIMIT 1",
+                &[&tenant_id],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "next_chain_position tail probe"))?;
+        if let Some(row) = row_opt {
+            let prev_seq: i64 = row
+                .try_get("sequence_number")
+                .map_err(|e| Error::Backend(format!("decode prev seq: {e}")))?;
+            let prev_hash_bytes: Vec<u8> = row
+                .try_get("entry_hash")
+                .map_err(|e| Error::Backend(format!("decode prev hash: {e}")))?;
+            let prev_hash: [u8; 32] = prev_hash_bytes.as_slice().try_into().map_err(|_| {
+                Error::Backend(format!(
+                    "entry_hash column expected 32 bytes, got {}",
+                    prev_hash_bytes.len()
+                ))
+            })?;
+            Ok(super::service::ChainPosition {
+                next_sequence_number: prev_seq + 1,
+                prev_hash,
+            })
+        } else {
+            Ok(super::service::ChainPosition {
+                next_sequence_number: 1,
+                prev_hash: GENESIS_PREV_HASH,
+            })
+        }
+    }
+
+    async fn current_sth(&self, tenant_id: &str) -> Result<Option<SignedTreeHead>, Error> {
+        if tenant_id.is_empty() {
+            return Err(Error::InvalidArgument("tenant_id must be non-empty".into()));
+        }
+        // Build a tenant-scoped PG merkle store on the fly + call its
+        // sync `latest_sth()` via spawn_blocking (the store uses
+        // `runtime.block_on` internally — calling it directly on a
+        // tokio worker would panic).
+        let pool = self.pool().clone();
+        let handle = tokio::runtime::Handle::current();
+        let tenant_owned = tenant_id.to_owned();
+        let store: Arc<dyn TransparencyStore<AuditLeaf>> =
+            Arc::new(PgMerkleStore::from_pool(pool, handle, tenant_owned));
+        let jh: tokio::task::JoinHandle<
+            Result<Option<SignedTreeHead>, ciris_verify_core::transparency::TransparencyError>,
+        > = tokio::task::spawn_blocking(move || store.latest_sth());
+        let res = jh
+            .await
+            .map_err(|e| Error::Merkle(format!("current_sth join: {e}")))?
+            .map_err(|e| Error::Merkle(format!("latest_sth: {e}")))?;
+        Ok(res)
+    }
+
+    async fn lookup_grant_id_by_chain_event(
+        &self,
+        chain_event_id: i64,
+    ) -> Result<Option<uuid::Uuid>, Error> {
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let row = client
+            .query_opt(
+                "SELECT grant_id FROM cirislens.federation_trust_grants \
+                 WHERE chain_event_id = $1",
+                &[&chain_event_id],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("lookup_grant_id: {e}")))?;
+        match row {
+            None => Ok(None),
+            Some(r) => {
+                let grant_id: uuid::Uuid = r
+                    .try_get("grant_id")
+                    .map_err(|e| Error::Backend(format!("decode grant_id: {e}")))?;
+                Ok(Some(grant_id))
+            }
+        }
+    }
 }
 
 #[cfg(test)]

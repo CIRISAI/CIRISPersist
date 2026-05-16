@@ -24,6 +24,29 @@ use super::types::{
 };
 use super::Error;
 use crate::ClaimResult;
+use ciris_verify_core::transparency::SignedTreeHead;
+
+/// Per-tenant chain head — the `(sequence_number, entry_hash)` of the
+/// tail row, suitable for composing the next [`AuditEntry`].
+///
+/// Returned by [`AuditService::next_chain_position`] so emit-side
+/// callers (v1.5.0 Phase E `federation::emit::grant_trust`) can build
+/// and sign the next entry without re-implementing the tenant-tail
+/// probe each backend already performs in `record_entry` under
+/// `SELECT … FOR UPDATE` / `BEGIN IMMEDIATE`. This helper is best-
+/// effort: by the time the caller commits its newly-signed entry the
+/// tail may have advanced. The backend's transactional gate inside
+/// `record_entry` is the source of truth — a stale read here surfaces
+/// as `Error::ChainIntegrity` on the insert and the caller retries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainPosition {
+    /// Next sequence number to assign (`1` for a brand-new tenant
+    /// chain, `tail.sequence_number + 1` otherwise).
+    pub next_sequence_number: i64,
+    /// `prev_hash` value the new entry must carry (zeros for a
+    /// brand-new tenant chain, `tail.entry_hash` otherwise).
+    pub prev_hash: [u8; 32],
+}
 
 /// Hash-chained audit trail surface (v0.8.1). 3 methods: write
 /// (with full chain-integrity + signature gate), list (cursor-paged,
@@ -140,5 +163,76 @@ pub trait AuditService: Send + Sync {
     ) -> impl Future<Output = Result<Vec<AuditEntry>, Error>> + Send {
         let _ = (tenant_id, correlation_id, filter);
         async { Err(Error::NotImplemented("query_by_correlation_id")) }
+    }
+
+    /// v1.5.0 Phase E — return the per-tenant chain head as a
+    /// [`ChainPosition`] (`next_sequence_number` + `prev_hash`) suitable
+    /// for building the next [`AuditEntry`]. New-tenant cases return
+    /// `(1, GENESIS_PREV_HASH)`; existing-tenant cases return
+    /// `(tail.sequence_number + 1, tail.entry_hash)`.
+    ///
+    /// This is a **read-only convenience probe**. The
+    /// [`AuditService::record_entry`] gate is still the source of
+    /// truth — a stale read here surfaces as `Error::ChainIntegrity`
+    /// on the subsequent insert (the backend re-reads the tail under
+    /// `SELECT … FOR UPDATE` / `BEGIN IMMEDIATE`). Callers SHOULD
+    /// retry once on `ChainIntegrity` under contention.
+    ///
+    /// # Default impl
+    ///
+    /// Returns [`Error::NotImplemented`] — backends opt in by
+    /// overriding. Both PG + SQLite ship overrides at v1.5.0 Phase E.
+    fn next_chain_position(
+        &self,
+        tenant_id: &str,
+    ) -> impl Future<Output = Result<ChainPosition, Error>> + Send {
+        let _ = tenant_id;
+        async { Err(Error::NotImplemented("next_chain_position")) }
+    }
+
+    /// v1.5.0 Phase E — return the most-recent
+    /// [`ciris_verify_core::transparency::SignedTreeHead`] for the
+    /// tenant's Merkle log, or `None` if no STH has been signed yet
+    /// (Merkle hook disabled, or chain empty).
+    ///
+    /// Backends implement by constructing a per-tenant
+    /// `TransparencyStore<AuditLeaf>` (PgMerkleStore / SqliteMerkleStore)
+    /// and calling its `latest_sth()`. Phase E's `grant_trust` uses
+    /// this to surface the post-emit STH on the receipt without
+    /// changing the [`AuditService::record_entry`] return type.
+    /// Phase G's "current STH" read API will hit this same surface.
+    ///
+    /// # Default impl
+    ///
+    /// Returns [`Error::NotImplemented`].
+    fn current_sth(
+        &self,
+        tenant_id: &str,
+    ) -> impl Future<Output = Result<Option<SignedTreeHead>, Error>> + Send {
+        let _ = tenant_id;
+        async { Err(Error::NotImplemented("current_sth")) }
+    }
+
+    /// Look up the canonical `grant_id` (federation_trust_grants PK)
+    /// for the projection row materialized by a specific chain event.
+    /// Used by Phase E's `grant_trust` to surface the canonical
+    /// projection PK on the receipt (rather than a fresh UUID that
+    /// wouldn't match a subsequent read-path lookup, especially on
+    /// re-issuance where the UPSERT keeps the original `grant_id`
+    /// stable).
+    ///
+    /// Returns `Ok(None)` if no projection row exists for the chain
+    /// event (caller wasn't a `trust_grant` subject_kind, or the
+    /// projection failed and Phase I backfill hasn't caught up).
+    ///
+    /// # Default impl
+    ///
+    /// Returns [`Error::NotImplemented`].
+    fn lookup_grant_id_by_chain_event(
+        &self,
+        chain_event_id: i64,
+    ) -> impl Future<Output = Result<Option<uuid::Uuid>, Error>> + Send {
+        let _ = chain_event_id;
+        async { Err(Error::NotImplemented("lookup_grant_id_by_chain_event")) }
     }
 }

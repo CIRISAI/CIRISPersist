@@ -34,6 +34,8 @@
 
 use std::future::Future;
 
+#[cfg(feature = "cirisaudit")]
+pub mod emit;
 #[cfg(feature = "sqlite")]
 pub mod sqlite_open;
 pub mod trust_grant;

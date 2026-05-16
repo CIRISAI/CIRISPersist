@@ -1056,6 +1056,108 @@ impl AuditService for SqliteAuditBackend {
         .await
         .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
     }
+
+    async fn next_chain_position(
+        &self,
+        tenant_id: &str,
+    ) -> Result<super::service::ChainPosition, Error> {
+        if tenant_id.is_empty() {
+            return Err(Error::InvalidArgument("tenant_id must be non-empty".into()));
+        }
+        let tenant_owned = tenant_id.to_owned();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<super::service::ChainPosition, Error> {
+            let guard = conn.blocking_lock();
+            let row_opt: Option<(i64, Vec<u8>)> = guard
+                .query_row(
+                    "SELECT sequence_number, entry_hash FROM cirislens_audit_log \
+                     WHERE tenant_id = ?1 \
+                     ORDER BY sequence_number DESC LIMIT 1",
+                    params![tenant_owned],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|e| map_sqlite_error(e, "next_chain_position tail probe"))?;
+            if let Some((prev_seq, prev_hash_vec)) = row_opt {
+                let prev_hash: [u8; 32] = prev_hash_vec.as_slice().try_into().map_err(|_| {
+                    Error::Backend(format!(
+                        "entry_hash column expected 32 bytes, got {}",
+                        prev_hash_vec.len()
+                    ))
+                })?;
+                Ok(super::service::ChainPosition {
+                    next_sequence_number: prev_seq + 1,
+                    prev_hash,
+                })
+            } else {
+                Ok(super::service::ChainPosition {
+                    next_sequence_number: 1,
+                    prev_hash: GENESIS_PREV_HASH,
+                })
+            }
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+    }
+
+    async fn current_sth(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<ciris_verify_core::transparency::SignedTreeHead>, Error> {
+        use super::merkle_leaf::AuditLeaf;
+        use super::merkle_store::SqliteMerkleStore;
+        use ciris_verify_core::transparency::{SignedTreeHead, TransparencyStore};
+
+        if tenant_id.is_empty() {
+            return Err(Error::InvalidArgument("tenant_id must be non-empty".into()));
+        }
+        let conn = self.conn_handle();
+        let handle = tokio::runtime::Handle::current();
+        let tenant_owned = tenant_id.to_owned();
+        let store: Arc<dyn TransparencyStore<AuditLeaf>> =
+            Arc::new(SqliteMerkleStore::new(conn, handle, tenant_owned));
+        let jh: tokio::task::JoinHandle<
+            Result<Option<SignedTreeHead>, ciris_verify_core::transparency::TransparencyError>,
+        > = tokio::task::spawn_blocking(move || store.latest_sth());
+        let res = jh
+            .await
+            .map_err(|e| Error::Merkle(format!("current_sth join: {e}")))?
+            .map_err(|e| Error::Merkle(format!("latest_sth: {e}")))?;
+        Ok(res)
+    }
+
+    async fn lookup_grant_id_by_chain_event(
+        &self,
+        chain_event_id: i64,
+    ) -> Result<Option<uuid::Uuid>, Error> {
+        let conn = self.conn_handle();
+        let jh: tokio::task::JoinHandle<Result<Option<String>, rusqlite::Error>> =
+            tokio::task::spawn_blocking(move || {
+                let guard = conn.blocking_lock();
+                guard
+                    .query_row(
+                        "SELECT grant_id FROM federation_trust_grants \
+                         WHERE chain_event_id = ?1",
+                        rusqlite::params![chain_event_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map(Some)
+                    .or_else(|e| match e {
+                        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                        other => Err(other),
+                    })
+            });
+        let opt_str = jh
+            .await
+            .map_err(|e| Error::Backend(format!("lookup_grant_id join: {e}")))?
+            .map_err(|e| Error::Backend(format!("lookup_grant_id: {e}")))?;
+        match opt_str {
+            None => Ok(None),
+            Some(s) => uuid::Uuid::parse_str(&s)
+                .map(Some)
+                .map_err(|e| Error::Backend(format!("decode grant_id: {e}"))),
+        }
+    }
 }
 
 #[cfg(test)]

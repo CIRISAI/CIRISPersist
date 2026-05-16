@@ -48,7 +48,7 @@ pub mod sqlite;
 pub mod types;
 pub mod verify;
 
-pub use service::AuditService;
+pub use service::{AuditService, ChainPosition};
 pub use types::{
     AuditEntry, AuditEventRef, AuditEventType, AuditFilter, AuditListPage, ChainVerification,
     ChainVerifyOutcome, CorrelationQuery, CORRELATION_QUERY_MAX_LIMIT,
