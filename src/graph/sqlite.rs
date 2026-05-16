@@ -205,7 +205,15 @@ impl GraphService for SqliteGraphBackend {
         let attrs = encode_attributes(&node.attributes)?;
         let scope_str = node.scope.as_sql_str().to_owned();
         let sig_verified_int: i64 = if node.signature_verified { 1 } else { 0 };
-        let updated_at = fmt_datetime(chrono::Utc::now());
+        // v1.3.1 (CIRISPersist#49): honor caller-supplied timestamps
+        // verbatim. The pre-v1.3.1 behavior stamped `chrono::Utc::now()`
+        // on every write, which destroyed temporal ordering on bulk
+        // historical imports (CIRISAgent 2.9.0 cutover migrating
+        // legacy graph_nodes rows). `node.updated_at` and
+        // `node.created_at` are both required fields per the wire
+        // schema; pass them through to the row.
+        let updated_at = fmt_datetime(node.updated_at);
+        let created_at = fmt_datetime(node.created_at);
         let conn = self.conn.clone();
         let node_id = node.node_id;
         let node_type = node.node_type;
@@ -220,9 +228,9 @@ impl GraphService for SqliteGraphBackend {
                 .execute(
                     "INSERT INTO cirisgraph_nodes (\
                         node_id, scope, node_type, attributes, version, \
-                        updated_by, updated_at, signature, signing_key_id, \
+                        updated_by, updated_at, created_at, signature, signing_key_id, \
                         signature_verified, persist_row_hash\
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
                      ON CONFLICT (node_id, scope) DO UPDATE SET \
                         node_type = excluded.node_type, \
                         attributes = excluded.attributes, \
@@ -233,7 +241,7 @@ impl GraphService for SqliteGraphBackend {
                         signing_key_id = excluded.signing_key_id, \
                         signature_verified = excluded.signature_verified, \
                         persist_row_hash = excluded.persist_row_hash \
-                     WHERE cirisgraph_nodes.version = ?12",
+                     WHERE cirisgraph_nodes.version = ?13",
                     params![
                         node_id,
                         scope_str,
@@ -242,6 +250,7 @@ impl GraphService for SqliteGraphBackend {
                         version,
                         updated_by,
                         updated_at,
+                        created_at,
                         signature,
                         signing_key_id,
                         sig_verified_int,
@@ -284,6 +293,9 @@ impl GraphService for SqliteGraphBackend {
     async fn upsert_edge(&self, edge: GraphEdge) -> Result<(), Error> {
         let attrs = encode_attributes(&edge.attributes)?;
         let scope_str = edge.scope.as_sql_str().to_owned();
+        // v1.3.1 (CIRISPersist#49): honor caller-supplied
+        // `edge.created_at` for bulk historical imports.
+        let created_at = fmt_datetime(edge.created_at);
         let conn = self.conn.clone();
         let edge_id = edge.edge_id;
         let source = edge.source_node_id;
@@ -296,8 +308,8 @@ impl GraphService for SqliteGraphBackend {
                 .execute(
                     "INSERT INTO cirisgraph_edges (\
                         edge_id, source_node_id, target_node_id, scope, \
-                        relationship, weight, attributes\
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                        relationship, weight, attributes, created_at\
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
                      ON CONFLICT (edge_id) DO NOTHING",
                     params![
                         edge_id,
@@ -306,7 +318,8 @@ impl GraphService for SqliteGraphBackend {
                         scope_str,
                         relationship,
                         weight,
-                        attrs
+                        attrs,
+                        created_at,
                     ],
                 )
                 .map_err(|e| map_sqlite_error(e, "upsert_edge"))?;
@@ -894,5 +907,85 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// v1.3.1 (CIRISPersist#49): supplied `updated_at` / `created_at`
+    /// on `upsert_node` must round-trip verbatim. Regression test for
+    /// the bulk-historical-import case (CIRISAgent 2.9.0 cutover) —
+    /// pre-v1.3.1 the impl stamped wall-clock now, destroying
+    /// temporal ordering on migrated rows.
+    #[tokio::test]
+    async fn upsert_node_preserves_supplied_timestamps() {
+        let (_b, graph) = fresh_backend().await;
+        let historical = chrono::DateTime::parse_from_rfc3339("2022-01-15T10:30:00.000000+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let node = GraphNode {
+            node_id: "probe-49".into(),
+            scope: GraphScope::Local,
+            node_type: "config".into(),
+            attributes: serde_json::json!({}),
+            version: 1,
+            updated_by: "test".into(),
+            updated_at: historical,
+            created_at: historical,
+            signature: None,
+            signing_key_id: None,
+            signature_verified: false,
+        };
+        graph.upsert_node(node, 0).await.unwrap();
+        let got = graph
+            .get_node("probe-49", GraphScope::Local)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            got.created_at, historical,
+            "v1.3.1 (#49): created_at must round-trip verbatim"
+        );
+        assert_eq!(
+            got.updated_at, historical,
+            "v1.3.1 (#49): updated_at must round-trip verbatim"
+        );
+    }
+
+    /// v1.3.1 (CIRISPersist#49): same regression for upsert_edge —
+    /// edge.created_at must round-trip rather than getting stamped
+    /// now().
+    #[tokio::test]
+    async fn upsert_edge_preserves_supplied_created_at() {
+        let (_b, graph) = fresh_backend().await;
+        // Seed nodes (edges reference them by id but the impl doesn't
+        // enforce FK at the SQL layer; still seed for hygiene).
+        for nid in ["src-49", "dst-49"] {
+            graph
+                .upsert_node(fixture_node(nid, GraphScope::Local, "test"), 0)
+                .await
+                .unwrap();
+        }
+        let historical = chrono::DateTime::parse_from_rfc3339("2021-08-04T12:00:00.000000+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let edge_id = Uuid::new_v4().to_string();
+        let edge = GraphEdge {
+            edge_id: edge_id.clone(),
+            source_node_id: "src-49".into(),
+            target_node_id: "dst-49".into(),
+            scope: GraphScope::Local,
+            relationship: "related".into(),
+            weight: None,
+            attributes: serde_json::json!({}),
+            created_at: historical,
+        };
+        graph.upsert_edge(edge).await.unwrap();
+        let edges = graph
+            .get_edges_for_node("src-49", GraphScope::Local, EdgeDirection::Outgoing, None)
+            .await
+            .unwrap();
+        let stored = edges.iter().find(|e| e.edge_id == edge_id).unwrap();
+        assert_eq!(
+            stored.created_at, historical,
+            "v1.3.1 (#49): edge created_at must round-trip verbatim"
+        );
     }
 }

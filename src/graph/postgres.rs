@@ -172,23 +172,30 @@ impl GraphService for PostgresBackend {
         // when no row exists yet (expected_version = 0) OR the
         // current row's version matches expected_version. Mismatch
         // returns affected=0; we map that to Error::Conflict.
+        //
+        // v1.3.1 (CIRISPersist#49): honor caller-supplied timestamps
+        // verbatim. The pre-v1.3.1 SQL used `NOW()` for both INSERT
+        // and ON CONFLICT updated_at, which destroyed temporal
+        // ordering on bulk historical imports (CIRISAgent 2.9.0
+        // cutover migrating legacy graph_nodes rows). `node.updated_at`
+        // and `node.created_at` are now passed through.
         let sql = "\
             INSERT INTO cirisgraph.nodes (\
                 node_id, scope, node_type, attributes, version, \
-                updated_by, updated_at, signature, signing_key_id, \
+                updated_by, updated_at, created_at, signature, signing_key_id, \
                 signature_verified, persist_row_hash\
-            ) VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, $10) \
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
             ON CONFLICT (node_id, scope) DO UPDATE SET \
                 node_type = EXCLUDED.node_type, \
                 attributes = EXCLUDED.attributes, \
                 version = cirisgraph.nodes.version + 1, \
                 updated_by = EXCLUDED.updated_by, \
-                updated_at = NOW(), \
+                updated_at = EXCLUDED.updated_at, \
                 signature = EXCLUDED.signature, \
                 signing_key_id = EXCLUDED.signing_key_id, \
                 signature_verified = EXCLUDED.signature_verified, \
                 persist_row_hash = EXCLUDED.persist_row_hash \
-            WHERE cirisgraph.nodes.version = $11";
+            WHERE cirisgraph.nodes.version = $13";
 
         // For new rows (expected_version=0) the WHERE clause on the
         // ON CONFLICT branch evaluates against the existing row's
@@ -208,6 +215,8 @@ impl GraphService for PostgresBackend {
                     &attrs,
                     &node.version,
                     &node.updated_by,
+                    &node.updated_at,
+                    &node.created_at,
                     &node.signature,
                     &node.signing_key_id,
                     &signature_verified,
@@ -237,12 +246,16 @@ impl GraphService for PostgresBackend {
             .get()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        // v1.3.1 (CIRISPersist#49): honor caller-supplied
+        // `edge.created_at` for bulk historical imports. ON CONFLICT
+        // DO NOTHING — edges are insert-only; existing rows keep
+        // their original created_at.
         client
             .execute(
                 "INSERT INTO cirisgraph.edges (\
                     edge_id, source_node_id, target_node_id, scope, \
-                    relationship, weight, attributes\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                    relationship, weight, attributes, created_at\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
                  ON CONFLICT (edge_id) DO NOTHING",
                 &[
                     &edge_uuid,
@@ -252,6 +265,7 @@ impl GraphService for PostgresBackend {
                     &edge.relationship,
                     &edge.weight,
                     &attrs,
+                    &edge.created_at,
                 ],
             )
             .await
