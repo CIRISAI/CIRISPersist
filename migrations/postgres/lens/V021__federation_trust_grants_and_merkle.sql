@@ -72,6 +72,18 @@ CREATE INDEX idx_ftg_chain ON cirislens.federation_trust_grants (chain_event_id)
 CREATE INDEX idx_ftg_tenant ON cirislens.federation_trust_grants (tenant_id);
 
 -- ─── merkle_leaves ─────────────────────────────────────────────────
+--
+-- `canonical_bytes` is the RFC 6962 §2.1 hashing-form bytes (i.e. the
+-- output of `AuditLeaf::canonical_bytes()` — the bytes that get fed
+-- into `sha256(0x00 || canonical_bytes)` to produce `leaf_hash`).
+-- `leaf_serialized` is the full serde-JSON serialization of the
+-- AuditLeaf wrapper (including `chain_event_id` + the full
+-- `AuditEntry`) so `TransparencyStore::get(index)` can round-trip the
+-- leaf without joining back to `cirislens.audit_log`. Two columns is
+-- cheap (audit entries are small) and keeps the Phase B store
+-- self-contained per FSD §4.4 (the audit log is source-of-truth, but
+-- the merkle layer round-trips its own leaves without depending on the
+-- foreign-key target).
 
 CREATE TABLE cirislens.merkle_leaves (
     tenant_id          TEXT NOT NULL,
@@ -79,6 +91,7 @@ CREATE TABLE cirislens.merkle_leaves (
     chain_event_id     BIGINT NOT NULL,
     leaf_hash          BYTEA NOT NULL,
     canonical_bytes    BYTEA NOT NULL,
+    leaf_serialized    BYTEA NOT NULL,
     appended_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (tenant_id, leaf_index),
     UNIQUE (tenant_id, chain_event_id),
@@ -88,6 +101,14 @@ CREATE TABLE cirislens.merkle_leaves (
 CREATE INDEX idx_merkle_leaves_chain ON cirislens.merkle_leaves (chain_event_id);
 
 -- ─── merkle_sth_log ────────────────────────────────────────────────
+--
+-- `signature_blob` carries the serde-JSON serialization of
+-- `ciris_crypto::HybridSignature` (crypto_kind + tagged classical +
+-- tagged PQC + mode). The tagged structure carries algorithm + public
+-- key info that bare `signature_classical` + `signature_pqc` BYTEA
+-- columns would lose. Storage is JSON-as-BYTEA (vs JSONB) so SQLite
+-- parity stays straightforward — both dialects round-trip identical
+-- bytes via `serde_json::to_vec` / `serde_json::from_slice`.
 
 CREATE TABLE cirislens.merkle_sth_log (
     tenant_id              TEXT NOT NULL,
@@ -95,8 +116,7 @@ CREATE TABLE cirislens.merkle_sth_log (
     root_hash              BYTEA NOT NULL,
     signed_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     signer_key_id          TEXT NOT NULL,
-    signature_classical    BYTEA NOT NULL,
-    signature_pqc          BYTEA,
+    signature_blob         BYTEA NOT NULL,
     witness_signatures     JSONB NOT NULL DEFAULT '[]'::jsonb,
     PRIMARY KEY (tenant_id, tree_size),
     CHECK (octet_length(root_hash) = 32)

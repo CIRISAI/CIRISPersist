@@ -56,6 +56,12 @@ CREATE INDEX idx_ftg_chain ON federation_trust_grants (chain_event_id);
 CREATE INDEX idx_ftg_tenant ON federation_trust_grants (tenant_id);
 
 -- ─── merkle_leaves ─────────────────────────────────────────────────
+--
+-- `canonical_bytes` = RFC 6962 §2.1 leaf-hash input (the bytes that
+-- get fed into `sha256(0x00 || canonical_bytes)`). `leaf_serialized`
+-- = full serde-JSON of the AuditLeaf for round-trip `get()` without
+-- joining `cirislens_audit_log`. See Postgres V021 header for the
+-- two-column rationale.
 
 CREATE TABLE merkle_leaves (
     tenant_id          TEXT NOT NULL,
@@ -63,6 +69,7 @@ CREATE TABLE merkle_leaves (
     chain_event_id     INTEGER NOT NULL,
     leaf_hash          BLOB NOT NULL,
     canonical_bytes    BLOB NOT NULL,
+    leaf_serialized    BLOB NOT NULL,
     appended_at        TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (tenant_id, leaf_index),
     UNIQUE (tenant_id, chain_event_id),
@@ -72,6 +79,10 @@ CREATE TABLE merkle_leaves (
 CREATE INDEX idx_merkle_leaves_chain ON merkle_leaves (chain_event_id);
 
 -- ─── merkle_sth_log ────────────────────────────────────────────────
+--
+-- `signature_blob` carries the serde-JSON serialization of
+-- `ciris_crypto::HybridSignature` — see Postgres V021 header for why
+-- this is one column instead of separate classical/pqc BYTEA pair.
 
 CREATE TABLE merkle_sth_log (
     tenant_id              TEXT NOT NULL,
@@ -79,8 +90,7 @@ CREATE TABLE merkle_sth_log (
     root_hash              BLOB NOT NULL,
     signed_at              TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     signer_key_id          TEXT NOT NULL,
-    signature_classical    BLOB NOT NULL,
-    signature_pqc          BLOB,
+    signature_blob         BLOB NOT NULL,
     witness_signatures     TEXT NOT NULL DEFAULT '[]',  -- JSON-array string
     PRIMARY KEY (tenant_id, tree_size),
     CHECK (length(root_hash) = 32)

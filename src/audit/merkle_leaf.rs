@@ -16,18 +16,55 @@ use super::verify::canonical_bytes_for_entry;
 
 /// A Merkle-tree leaf for one audit chain entry.
 ///
-/// Holds the audit entry verbatim; `canonical_bytes` returns the same
-/// canonical-byte representation the linear chain hashes for
-/// `entry_hash` (with `entry_hash` and `signature` zeroed to avoid
-/// self-referential cycles, per `verify::compute_entry_hash`).
+/// Holds the audit entry verbatim plus the `chain_event_id` —
+/// the BIGINT primary key of the corresponding row in
+/// `cirislens.audit_log` (the per-tenant monotonic sequence number
+/// reused as the chain-event id, per FSD §4.4 +
+/// V021__federation_trust_grants_and_merkle.sql). The
+/// `chain_event_id` is **not** part of the Merkle leaf's
+/// canonical-bytes hash — it's a side-channel projection field the
+/// `TransparencyStore` impl needs to populate the
+/// `merkle_leaves.chain_event_id` column (FK projection back to the
+/// audit chain). Two semantically-identical AuditLeaves with
+/// different `chain_event_id` values produce byte-equal
+/// canonical_bytes (and therefore byte-equal leaf hashes); the audit
+/// chain is the source of truth.
+///
+/// `canonical_bytes` returns the same canonical-byte representation
+/// the linear chain hashes for `entry_hash` (with `entry_hash` and
+/// `signature` zeroed to avoid self-referential cycles, per
+/// `verify::compute_entry_hash`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditLeaf {
     pub entry: AuditEntry,
+    /// BIGINT PK of the matching `cirislens.audit_log` row. Captured
+    /// at append time so `merkle_leaves.chain_event_id` projects back
+    /// to the audit chain without an extra round-trip. Excluded from
+    /// `canonical_bytes()` — the Merkle leaf hashes only the audit
+    /// entry's canonical form so cross-substrate verifiers don't need
+    /// the chain-event-id schema to recompute leaf hashes.
+    pub chain_event_id: i64,
 }
 
 impl AuditLeaf {
+    /// Construct a leaf with a `chain_event_id` of `0` (a sentinel
+    /// only valid in test/scratch contexts where the audit-chain FK
+    /// is irrelevant). Phase D ingest call sites use
+    /// [`AuditLeaf::with_chain_event_id`] instead.
     pub fn new(entry: AuditEntry) -> Self {
-        Self { entry }
+        Self {
+            entry,
+            chain_event_id: 0,
+        }
+    }
+
+    /// Construct a leaf bound to its audit-chain row. Phase D
+    /// ingest-path constructor.
+    pub fn with_chain_event_id(entry: AuditEntry, chain_event_id: i64) -> Self {
+        Self {
+            entry,
+            chain_event_id,
+        }
     }
 }
 

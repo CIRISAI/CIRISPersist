@@ -38,6 +38,8 @@
 //!   / cross-tenant rejection paths.
 
 pub mod merkle_leaf;
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub mod merkle_store;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod service;
