@@ -36,14 +36,132 @@ use crate::ClaimResult;
 /// ride the same WAL + PRAGMA settings as the trace-ingest path.
 pub struct SqliteAuditBackend {
     conn: Arc<Mutex<Connection>>,
+    /// Optional steward signer for the v1.5.0 Merkle transparency
+    /// hook. Mirror of `PostgresBackend.merkle_signer`. When
+    /// configured, every committed audit entry is appended to the
+    /// tenant's `TransparencyLog<AuditLeaf>` and an STH is signed +
+    /// stored. When `None`, the Merkle hook is a no-op. Wired by the
+    /// Engine layer at construction (Phase G/H).
+    merkle_signer: std::sync::RwLock<Option<Arc<crate::signing::StewardSigner>>>,
 }
 
 impl SqliteAuditBackend {
     /// Construct from a shared connection handle (typically
-    /// `SqliteBackend::conn_handle()`).
+    /// `SqliteBackend::conn_handle()`). Merkle hook starts disabled
+    /// — call [`Self::set_merkle_signer`] to opt in.
     pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            merkle_signer: std::sync::RwLock::new(None),
+        }
     }
+
+    /// Install the Merkle-hook signer for v1.5.0 audit-service
+    /// transparency. Engine layer wires this in at construction with
+    /// `Arc::clone(&self.steward_signer)`. Passing `None` disables
+    /// the hook (no-op path). Idempotent.
+    pub fn set_merkle_signer(&self, signer: Option<Arc<crate::signing::StewardSigner>>) {
+        let mut guard = self
+            .merkle_signer
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        *guard = signer;
+    }
+
+    /// Snapshot the currently-installed Merkle signer (Phase C
+    /// ingest path uses this to gate the hook).
+    pub fn merkle_signer(&self) -> Option<Arc<crate::signing::StewardSigner>> {
+        let guard = self.merkle_signer.read().unwrap_or_else(|p| p.into_inner());
+        guard.clone()
+    }
+
+    /// Shared connection handle — exposed so the Phase C Merkle hook
+    /// can build a tenant-scoped [`crate::audit::merkle_store::SqliteMerkleStore`]
+    /// from `&self`.
+    pub(crate) fn conn_handle(&self) -> Arc<Mutex<Connection>> {
+        self.conn.clone()
+    }
+}
+
+/// v1.5.0 Phase C — Merkle transparency hook for the SQLite audit
+/// path. Parity with the PG `merkle_hook_pg` in `audit::postgres`:
+/// chain commit FIRST, Merkle hook SECOND (option (b) from the
+/// Phase C plan). See `merkle_hook_pg` rustdoc for the full
+/// atomicity rationale.
+async fn merkle_hook_sqlite(
+    backend: &SqliteAuditBackend,
+    entry: &super::types::AuditEntry,
+    chain_event_id: i64,
+) -> Result<(), Error> {
+    use super::merkle_leaf::AuditLeaf;
+    use super::merkle_store::{log_id_for_tenant, SqliteMerkleStore};
+    use ciris_verify_core::transparency::{SignedTreeHead, TransparencyLog, TransparencyStore};
+    use std::sync::Arc as StdArc;
+
+    let Some(signer) = backend.merkle_signer() else {
+        // No signer → no-op. CIRIS-RED / unconfigured-deployment shape.
+        return Ok(());
+    };
+
+    let conn = backend.conn_handle();
+    let handle = tokio::runtime::Handle::current();
+    let tenant_id = entry.tenant_id.clone();
+    let leaf = AuditLeaf::with_chain_event_id(entry.clone(), chain_event_id);
+    let log_id = log_id_for_tenant(&tenant_id);
+
+    let store: StdArc<dyn TransparencyStore<AuditLeaf>> =
+        StdArc::new(SqliteMerkleStore::new(conn, handle, tenant_id));
+    let log = TransparencyLog::<AuditLeaf>::for_log(log_id.clone(), store.clone());
+
+    // 1. Append + compute tree_size + merkle_root in a blocking
+    //    thread (sync TransparencyStore trait calls `runtime.block_on`
+    //    inside the SqliteMerkleStore — would panic on a tokio worker).
+    let log_for_block = log;
+    let leaf_for_block = leaf;
+    let head_jh = tokio::task::spawn_blocking(
+        move || -> Result<(u64, [u8; 32]), ciris_verify_core::transparency::TransparencyError> {
+            let _idx = log_for_block.append(leaf_for_block)?;
+            let ts = log_for_block.tree_size()?;
+            let root = log_for_block.merkle_root()?;
+            Ok((ts, root))
+        },
+    );
+    let (tree_size, root_hash) = head_jh
+        .await
+        .map_err(|e| Error::Merkle(format!("append join: {e}")))?
+        .map_err(|e| Error::Merkle(format!("append: {e}")))?;
+
+    // 2. Sign STH via StewardSigner::sign_hybrid (async).
+    let timestamp = chrono::Utc::now();
+    let signing_bytes = SignedTreeHead::signing_bytes(&log_id, tree_size, &root_hash, timestamp);
+    let signature = signer
+        .sign_hybrid(&signing_bytes)
+        .await
+        .map_err(|e| Error::Merkle(format!("sign_hybrid: {e}")))?;
+
+    let sth = SignedTreeHead {
+        log_id,
+        tree_size,
+        root_hash,
+        timestamp,
+        signature,
+        witness_signatures: Vec::new(),
+    };
+
+    // 3. Persist the STH (sync trait → spawn_blocking).
+    let store_for_store = store;
+    let sth_for_store = sth;
+    let store_jh = tokio::task::spawn_blocking(
+        move || -> Result<(), ciris_verify_core::transparency::TransparencyError> {
+            store_for_store.store_sth(&sth_for_store)
+        },
+    );
+    store_jh
+        .await
+        .map_err(|e| Error::Merkle(format!("store_sth join: {e}")))?
+        .map_err(|e| Error::Merkle(format!("store_sth: {e}")))?;
+
+    Ok(())
 }
 
 fn map_sqlite_error(e: rusqlite::Error, op: &str) -> Error {
@@ -154,7 +272,13 @@ impl AuditService for SqliteAuditBackend {
             .map_err(|e| Error::Internal(format!("payload serialize: {e}")))?;
         let recorded_at = fmt_datetime(entry.recorded_at);
         let conn = self.conn.clone();
+        // Phase C: clone the entry up-front so the Merkle hook below
+        // can use it after the chain-commit closure consumes its
+        // copy. The clone is cheap (small AuditEntry; payload is
+        // JSON Value).
+        let entry_for_chain = entry.clone();
         tokio::task::spawn_blocking(move || -> Result<(), Error> {
+            let entry = entry_for_chain;
             let mut guard = conn.blocking_lock();
             // BEGIN IMMEDIATE acquires the database-level RESERVED
             // lock — coarser than Postgres FOR UPDATE but combined
@@ -237,7 +361,17 @@ impl AuditService for SqliteAuditBackend {
             Ok(())
         })
         .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))??;
+
+        // v1.5.0 Phase C — Merkle transparency hook (SQLite parity).
+        // Runs only when a steward signer is installed; otherwise this
+        // is a no-op and chain semantics are unchanged. Same option
+        // (b) atomicity stance as PG: chain is source of truth, Merkle
+        // is projection (see `merkle_hook_sqlite` rustdoc + the PG
+        // sibling helper).
+        merkle_hook_sqlite(self, &entry, entry.sequence_number).await?;
+
+        Ok(())
     }
 
     async fn list_entries(
@@ -555,7 +689,11 @@ impl AuditService for SqliteAuditBackend {
         let recorded_at = fmt_datetime(entry.recorded_at);
         let content_hash_vec = content_hash.to_vec();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<ClaimResult<AuditEventRef>, Error> {
+        // Phase C: clone the entry so the Merkle hook below can use it
+        // after the chain-commit closure consumes its copy.
+        let entry_for_chain = entry.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<ClaimResult<AuditEventRef>, Error> {
+            let entry = entry_for_chain;
             let mut guard = conn.blocking_lock();
             let tx = guard
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -726,7 +864,17 @@ impl AuditService for SqliteAuditBackend {
             Ok(result)
         })
         .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))??;
+
+        // v1.5.0 Phase C — Merkle hook on the newly-stored path only
+        // (same gating rule as the PG impl). On `AlreadyClaimed` the
+        // existing row's Merkle leaf already landed at the original
+        // call; re-appending here would double-count.
+        if let ClaimResult::Stored(_) = &result {
+            merkle_hook_sqlite(self, &entry, entry.sequence_number).await?;
+        }
+
+        Ok(result)
     }
 
     async fn query_by_correlation_id(
@@ -1154,5 +1302,222 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(no_tenant, Error::InvalidArgument(_)));
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // v1.5.0 Phase C — Merkle transparency hook tests (SQLite)
+    // ────────────────────────────────────────────────────────────────
+
+    /// Build a StewardSigner with PQC configured via in-memory seeds.
+    /// Phase C's Merkle hook needs `sign_hybrid` (Ed25519 + ML-DSA-65),
+    /// which requires a PQC signer; bare Ed25519-only signers trip the
+    /// `PqcNotConfigured` path.
+    fn merkle_test_signer(seed_byte: u8) -> std::sync::Arc<crate::signing::StewardSigner> {
+        use ciris_keyring::MlDsa65SoftwareSigner;
+        let signing_key = SigningKey::from_bytes(&[seed_byte; 32]);
+        let pqc =
+            MlDsa65SoftwareSigner::from_seed_bytes(&[seed_byte ^ 0x55; 32], "test-merkle-pqc")
+                .expect("seed bytes");
+        let pqc_arc: std::sync::Arc<dyn ciris_keyring::PqcSigner> = std::sync::Arc::new(pqc);
+        std::sync::Arc::new(crate::signing::StewardSigner::from_parts(
+            signing_key,
+            "test-merkle-steward".to_string(),
+            Some(pqc_arc),
+            Some("test-merkle-pqc".to_string()),
+        ))
+    }
+
+    async fn count_merkle_rows(audit: &SqliteAuditBackend, tenant: &str) -> (i64, i64) {
+        let conn = audit.conn_handle();
+        let tenant = tenant.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let leaves: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM merkle_leaves WHERE tenant_id = ?1",
+                    rusqlite::params![tenant],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let sth: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM merkle_sth_log WHERE tenant_id = ?1",
+                    rusqlite::params![tenant],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (leaves, sth)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// v1.5.0 Phase C — when no signer is installed (default),
+    /// `record_entry` is unchanged from v1.4.x: no rows land in
+    /// merkle_leaves or merkle_sth_log. This is the CIRIS-RED /
+    /// unconfigured-deployment / test path.
+    #[tokio::test]
+    async fn merkle_hook_disabled_when_signer_absent() {
+        let (_b, audit) = fresh_backend().await;
+        let key = SigningKey::from_bytes(&[0xC0; 32]);
+        let tenant = format!("audit-merk-off-{}", Uuid::new_v4().simple());
+
+        let e1 = build_and_sign(&key, &tenant, 1, GENESIS_PREV_HASH.to_vec(), "task_signed");
+        audit.record_entry(e1.clone()).await.unwrap();
+        let e2 = build_and_sign(&key, &tenant, 2, e1.entry_hash.clone(), "task_signed");
+        audit.record_entry(e2.clone()).await.unwrap();
+
+        let (leaves, sth) = count_merkle_rows(&audit, &tenant).await;
+        assert_eq!(leaves, 0, "no signer → no merkle leaves");
+        assert_eq!(sth, 0, "no signer → no STH rows");
+    }
+
+    /// v1.5.0 Phase C — when a signer is installed, every committed
+    /// audit entry appends a leaf + signs + stores an STH. tree_size
+    /// grows monotonically; one STH per leaf (every-append cadence
+    /// per FSD §4.4).
+    #[tokio::test]
+    async fn merkle_hook_enabled_appends_and_signs() {
+        let (_b, audit) = fresh_backend().await;
+        audit.set_merkle_signer(Some(merkle_test_signer(0xD1)));
+        let key = SigningKey::from_bytes(&[0xD1; 32]);
+        let tenant = format!("audit-merk-on-{}", Uuid::new_v4().simple());
+
+        let e1 = build_and_sign(&key, &tenant, 1, GENESIS_PREV_HASH.to_vec(), "task_signed");
+        audit.record_entry(e1.clone()).await.unwrap();
+        let (l1, s1) = count_merkle_rows(&audit, &tenant).await;
+        assert_eq!(l1, 1);
+        assert_eq!(s1, 1);
+
+        let e2 = build_and_sign(&key, &tenant, 2, e1.entry_hash.clone(), "task_signed");
+        audit.record_entry(e2.clone()).await.unwrap();
+        let (l2, s2) = count_merkle_rows(&audit, &tenant).await;
+        assert_eq!(l2, 2);
+        assert_eq!(s2, 2);
+
+        let e3 = build_and_sign(&key, &tenant, 3, e2.entry_hash.clone(), "task_signed");
+        audit.record_entry(e3.clone()).await.unwrap();
+        let (l3, s3) = count_merkle_rows(&audit, &tenant).await;
+        assert_eq!(l3, 3);
+        assert_eq!(s3, 3);
+
+        // tree_size monotonicity — every-append cadence means tree_size
+        // grows by 1 per record_entry call.
+        let conn = audit.conn_handle();
+        let tenant_owned = tenant.clone();
+        let sizes: Vec<i64> = tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare("SELECT tree_size FROM merkle_sth_log WHERE tenant_id = ?1 ORDER BY tree_size ASC")
+                .unwrap();
+            let rows = stmt
+                .query_map(rusqlite::params![tenant_owned], |row| row.get::<_, i64>(0))
+                .unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        })
+        .await
+        .unwrap();
+        assert_eq!(sizes, vec![1, 2, 3]);
+    }
+
+    /// v1.5.0 Phase C — multi-tenant isolation: append under tenant-A
+    /// must not change tenant-B's tree_size. Same SQLite connection
+    /// hosts both chains.
+    #[tokio::test]
+    async fn merkle_hook_multi_tenant_isolated() {
+        let (_b, audit) = fresh_backend().await;
+        audit.set_merkle_signer(Some(merkle_test_signer(0xE2)));
+
+        let key_a = SigningKey::from_bytes(&[0xEA; 32]);
+        let key_b = SigningKey::from_bytes(&[0xEB; 32]);
+        let tenant_a = format!("audit-merk-iso-A-{}", Uuid::new_v4().simple());
+        let tenant_b = format!("audit-merk-iso-B-{}", Uuid::new_v4().simple());
+
+        // Two leaves under tenant_a.
+        let a1 = build_and_sign(
+            &key_a,
+            &tenant_a,
+            1,
+            GENESIS_PREV_HASH.to_vec(),
+            "task_signed",
+        );
+        audit.record_entry(a1.clone()).await.unwrap();
+        let a2 = build_and_sign(&key_a, &tenant_a, 2, a1.entry_hash.clone(), "task_signed");
+        audit.record_entry(a2.clone()).await.unwrap();
+        // One leaf under tenant_b.
+        let b1 = build_and_sign(
+            &key_b,
+            &tenant_b,
+            1,
+            GENESIS_PREV_HASH.to_vec(),
+            "task_signed",
+        );
+        audit.record_entry(b1.clone()).await.unwrap();
+
+        let (la, sa) = count_merkle_rows(&audit, &tenant_a).await;
+        let (lb, sb) = count_merkle_rows(&audit, &tenant_b).await;
+        assert_eq!((la, sa), (2, 2), "tenant_a: 2 leaves, 2 STH rows");
+        assert_eq!((lb, sb), (1, 1), "tenant_b: 1 leaf, 1 STH row");
+    }
+
+    /// v1.5.0 Phase C — installing a signer mid-chain doesn't
+    /// retroactively backfill (Phase I's job). New entries appended
+    /// after enablement land in the Merkle tables; pre-enable entries
+    /// stay in the audit chain only.
+    #[tokio::test]
+    async fn merkle_hook_install_mid_chain_only_affects_subsequent() {
+        let (_b, audit) = fresh_backend().await;
+        let key = SigningKey::from_bytes(&[0xF3; 32]);
+        let tenant = format!("audit-merk-mid-{}", Uuid::new_v4().simple());
+
+        // 2 entries with signer OFF.
+        let e1 = build_and_sign(&key, &tenant, 1, GENESIS_PREV_HASH.to_vec(), "task_signed");
+        audit.record_entry(e1.clone()).await.unwrap();
+        let e2 = build_and_sign(&key, &tenant, 2, e1.entry_hash.clone(), "task_signed");
+        audit.record_entry(e2.clone()).await.unwrap();
+        let (l_before, _) = count_merkle_rows(&audit, &tenant).await;
+        assert_eq!(l_before, 0);
+
+        // Turn signer ON.
+        audit.set_merkle_signer(Some(merkle_test_signer(0xF3)));
+
+        // 2 more entries — only these should land in merkle_leaves.
+        let e3 = build_and_sign(&key, &tenant, 3, e2.entry_hash.clone(), "task_signed");
+        audit.record_entry(e3.clone()).await.unwrap();
+        let e4 = build_and_sign(&key, &tenant, 4, e3.entry_hash.clone(), "task_signed");
+        audit.record_entry(e4.clone()).await.unwrap();
+        let (l_after, s_after) = count_merkle_rows(&audit, &tenant).await;
+        assert_eq!(l_after, 2, "only post-enable entries appear as leaves");
+        assert_eq!(s_after, 2);
+
+        // Chain integrity unchanged (AV-50): all 4 entries verify.
+        let verif = audit.verify_chain(&tenant, 1, None).await.unwrap();
+        assert_eq!(verif.entries_walked, 4);
+        assert_eq!(verif.outcome, ChainVerifyOutcome::Ok);
+    }
+
+    /// v1.5.0 Phase C — chain integrity (AV-49) preserved when the
+    /// Merkle hook is enabled: replay still rejected by the chain
+    /// commit phase, never reaches the Merkle step.
+    #[tokio::test]
+    async fn merkle_hook_does_not_weaken_chain_integrity() {
+        let (_b, audit) = fresh_backend().await;
+        audit.set_merkle_signer(Some(merkle_test_signer(0xA9)));
+        let key = SigningKey::from_bytes(&[0xA9; 32]);
+        let tenant = format!("audit-merk-int-{}", Uuid::new_v4().simple());
+
+        let e1 = build_and_sign(&key, &tenant, 1, GENESIS_PREV_HASH.to_vec(), "task_signed");
+        audit.record_entry(e1.clone()).await.unwrap();
+        // Replay → ChainIntegrity (sequence gap) OR Conflict. Either
+        // way the chain rejects it BEFORE the Merkle hook runs, so
+        // there's no double-append.
+        let replay_err = audit.record_entry(e1.clone()).await.unwrap_err();
+        assert!(matches!(
+            replay_err,
+            Error::ChainIntegrity(_) | Error::Conflict(_)
+        ));
+        let (l, s) = count_merkle_rows(&audit, &tenant).await;
+        assert_eq!(l, 1, "exactly one leaf — replay was chain-rejected");
+        assert_eq!(s, 1);
     }
 }

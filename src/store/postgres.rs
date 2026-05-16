@@ -68,6 +68,18 @@ pub struct PostgresBackend {
     /// the lock auto-releases when the connection drops — including
     /// the panic-mid-migration case.
     dsn: String,
+    /// Optional steward signer for the v1.5.0 Merkle transparency
+    /// hook (`AuditService::record_entry` ingest path). When
+    /// configured, every committed audit entry is appended to the
+    /// tenant's `TransparencyLog<AuditLeaf>` and an STH is signed +
+    /// stored. When `None`, the Merkle hook is a no-op — preserves
+    /// behavior for deployments without a steward identity loaded
+    /// (CIRIS-RED hot-path peers, tests, etc.).
+    ///
+    /// Wired by the Engine layer at construction (Phase G/H); Phase
+    /// C only adds the field + setter.
+    #[cfg(feature = "cirisaudit")]
+    merkle_signer: std::sync::RwLock<Option<std::sync::Arc<crate::signing::StewardSigner>>>,
 }
 
 impl PostgresBackend {
@@ -137,6 +149,8 @@ impl PostgresBackend {
         Ok(Self {
             pool,
             dsn: dsn.to_owned(),
+            #[cfg(feature = "cirisaudit")]
+            merkle_signer: std::sync::RwLock::new(None),
         })
     }
 
@@ -152,7 +166,38 @@ impl PostgresBackend {
         Self {
             pool,
             dsn: dsn.into(),
+            #[cfg(feature = "cirisaudit")]
+            merkle_signer: std::sync::RwLock::new(None),
         }
+    }
+
+    /// Install the Merkle-hook signer for v1.5.0 audit-service
+    /// transparency. Engine layer wires this in at construction with
+    /// `Arc::clone(&self.steward_signer)`. Passing `None` disables
+    /// the hook (no-op path). Idempotent — calling twice replaces
+    /// the prior signer.
+    ///
+    /// # Phase C scope
+    ///
+    /// Only the field + setter are added in Phase C; Engine-layer
+    /// wiring lands in Phase G/H.
+    #[cfg(feature = "cirisaudit")]
+    pub fn set_merkle_signer(&self, signer: Option<std::sync::Arc<crate::signing::StewardSigner>>) {
+        // RwLock write — set-once at startup, but rwlock keeps the
+        // surface flexible for live reconfigures (e.g. key rotation).
+        let mut guard = self
+            .merkle_signer
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        *guard = signer;
+    }
+
+    /// Snapshot the currently-installed Merkle signer (Phase C
+    /// ingest path uses this to gate the hook).
+    #[cfg(feature = "cirisaudit")]
+    pub fn merkle_signer(&self) -> Option<std::sync::Arc<crate::signing::StewardSigner>> {
+        let guard = self.merkle_signer.read().unwrap_or_else(|p| p.into_inner());
+        guard.clone()
     }
 
     /// Borrow the underlying pool. Phase 2's `peer-replicate` channel

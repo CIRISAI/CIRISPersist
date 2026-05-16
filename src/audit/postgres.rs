@@ -17,6 +17,114 @@ use super::{Error, GENESIS_PREV_HASH};
 use crate::store::postgres::PostgresBackend;
 use crate::ClaimResult;
 
+use ciris_verify_core::transparency::{SignedTreeHead, TransparencyLog, TransparencyStore};
+use std::sync::Arc;
+
+use super::merkle_leaf::AuditLeaf;
+use super::merkle_store::{log_id_for_tenant, PgMerkleStore};
+
+/// v1.5.0 Phase C — Merkle transparency hook for the audit-service
+/// ingest path. Called after the chain commit lands; **gated on the
+/// backend's `merkle_signer` being configured** (no signer → no-op).
+///
+/// # Atomicity
+///
+/// Chain commit happens **first** in a dedicated transaction (the
+/// existing AV-49 path; unchanged). The Merkle hook runs **after**
+/// commit on a fresh connection.
+///
+/// This is option (b) from the Phase C plan: the audit chain is the
+/// source of truth; the Merkle tables are a projection. A failure
+/// inside this helper is surfaced as `Error::Merkle(_)` but the
+/// chain row already stands committed and visible. Phase I's
+/// backfill (V021 backfill task) recomputes any missed leaves +
+/// re-issues STHs from the chain.
+///
+/// Option (a) (single transaction spanning chain + Merkle) is not
+/// feasible at Phase C: `PgMerkleStore` opens its own pool
+/// connection per call, and re-entering the pool while the chain tx
+/// holds one connection would deadlock under pool size = 1. A real
+/// single-tx implementation requires injecting the existing
+/// transaction into the merkle store — out of scope for Phase C.
+async fn merkle_hook_pg(
+    backend: &PostgresBackend,
+    entry: &AuditEntry,
+    chain_event_id: i64,
+) -> Result<(), Error> {
+    let Some(signer) = backend.merkle_signer() else {
+        // Signer not configured — no-op. Preserves the pre-Phase-C
+        // behavior for CIRIS-RED deployments + tests without a
+        // steward identity loaded.
+        return Ok(());
+    };
+
+    // Bridge from the async caller into the sync TransparencyStore
+    // trait. The TransparencyLog operations (append / merkle_root /
+    // store_sth) all call PgMerkleStore methods which in turn call
+    // `runtime.block_on(pool.get())`. Doing that on the current
+    // tokio worker would panic; spawn_blocking moves the work to
+    // a blocking thread.
+    let handle = tokio::runtime::Handle::current();
+    let pool = backend.pool().clone();
+    let tenant_id = entry.tenant_id.clone();
+    let leaf = AuditLeaf::with_chain_event_id(entry.clone(), chain_event_id);
+    let log_id = log_id_for_tenant(&tenant_id);
+
+    let store: Arc<dyn TransparencyStore<AuditLeaf>> =
+        Arc::new(PgMerkleStore::from_pool(pool, handle, tenant_id.clone()));
+    let log = TransparencyLog::<AuditLeaf>::for_log(log_id.clone(), store.clone());
+
+    // 1. Append the leaf + compute tree_size + merkle_root on a
+    //    blocking thread (the TransparencyStore trait is sync; its
+    //    PgMerkleStore impl uses `runtime.block_on(pool.get())`,
+    //    which would panic on a tokio worker — spawn_blocking moves
+    //    the work to a blocking thread).
+    let log_for_block = log;
+    let leaf_for_block = leaf;
+    let head_jh: tokio::task::JoinHandle<
+        Result<(u64, [u8; 32]), ciris_verify_core::transparency::TransparencyError>,
+    > = tokio::task::spawn_blocking(move || {
+        let _idx = log_for_block.append(leaf_for_block)?;
+        let ts = log_for_block.tree_size()?;
+        let root = log_for_block.merkle_root()?;
+        Ok((ts, root))
+    });
+    let (tree_size, root_hash) = head_jh
+        .await
+        .map_err(|e| Error::Merkle(format!("append join: {e}")))?
+        .map_err(|e| Error::Merkle(format!("append: {e}")))?;
+
+    // 2. Sign the STH via StewardSigner::sign_hybrid (async).
+    let timestamp = chrono::Utc::now();
+    let signing_bytes = SignedTreeHead::signing_bytes(&log_id, tree_size, &root_hash, timestamp);
+    let signature = signer
+        .sign_hybrid(&signing_bytes)
+        .await
+        .map_err(|e| Error::Merkle(format!("sign_hybrid: {e}")))?;
+
+    let sth = SignedTreeHead {
+        log_id,
+        tree_size,
+        root_hash,
+        timestamp,
+        signature,
+        witness_signatures: Vec::new(),
+    };
+
+    // 3. Persist the STH (sync trait again → spawn_blocking).
+    let store_for_store = store;
+    let sth_for_store = sth;
+    let store_jh: tokio::task::JoinHandle<
+        Result<(), ciris_verify_core::transparency::TransparencyError>,
+    > = tokio::task::spawn_blocking(move || store_for_store.store_sth(&sth_for_store));
+    store_jh
+        .await
+        .map_err(|e| Error::Merkle(format!("store_sth join: {e}")))?
+        .map_err(|e| Error::Merkle(format!("store_sth: {e}")))?;
+
+    Ok(())
+}
+
 fn map_pg_error(e: tokio_postgres::Error, op: &str) -> Error {
     use tokio_postgres::error::SqlState;
     let code = e.as_db_error().map(|d| d.code().clone());
@@ -212,6 +320,14 @@ impl AuditService for PostgresBackend {
         tx.commit()
             .await
             .map_err(|e| Error::Backend(format!("commit: {e}")))?;
+
+        // v1.5.0 Phase C — Merkle transparency hook. Runs only when a
+        // steward signer was installed via `set_merkle_signer`;
+        // otherwise this is a no-op and the audit chain semantics are
+        // unchanged. `sequence_number` is reused as the
+        // `chain_event_id` per FSD §4.4.
+        merkle_hook_pg(self, &entry, entry.sequence_number).await?;
+
         Ok(())
     }
 
@@ -721,6 +837,16 @@ impl AuditService for PostgresBackend {
         tx.commit()
             .await
             .map_err(|e| Error::Backend(format!("commit: {e}")))?;
+
+        // v1.5.0 Phase C — Merkle hook on the newly-stored path only.
+        // `AlreadyClaimed` returns a reference to a row inserted by a
+        // prior call whose Merkle hook already ran (or didn't, if the
+        // prior call lacked a signer). Re-running here would
+        // double-append.
+        if let ClaimResult::Stored(_) = &result {
+            merkle_hook_pg(self, &entry, entry.sequence_number).await?;
+        }
+
         Ok(result)
     }
 
@@ -1076,5 +1202,222 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(no_tenant, Error::InvalidArgument(_)));
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // v1.5.0 Phase C — Merkle transparency hook tests (Postgres)
+    // ────────────────────────────────────────────────────────────────
+
+    fn merkle_test_signer(seed_byte: u8) -> std::sync::Arc<crate::signing::StewardSigner> {
+        use ciris_keyring::MlDsa65SoftwareSigner;
+        let signing_key = SigningKey::from_bytes(&[seed_byte; 32]);
+        let pqc =
+            MlDsa65SoftwareSigner::from_seed_bytes(&[seed_byte ^ 0x55; 32], "test-merkle-pqc")
+                .expect("seed bytes");
+        let pqc_arc: std::sync::Arc<dyn ciris_keyring::PqcSigner> = std::sync::Arc::new(pqc);
+        std::sync::Arc::new(crate::signing::StewardSigner::from_parts(
+            signing_key,
+            "test-merkle-steward".to_string(),
+            Some(pqc_arc),
+            Some("test-merkle-pqc".to_string()),
+        ))
+    }
+
+    async fn pg_count_merkle_rows(backend: &PostgresBackend, tenant: &str) -> (i64, i64) {
+        let client = backend.pool().get().await.unwrap();
+        let leaves: i64 = client
+            .query_one(
+                "SELECT COUNT(*)::BIGINT FROM cirislens.merkle_leaves WHERE tenant_id = $1",
+                &[&tenant],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let sth: i64 = client
+            .query_one(
+                "SELECT COUNT(*)::BIGINT FROM cirislens.merkle_sth_log WHERE tenant_id = $1",
+                &[&tenant],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        (leaves, sth)
+    }
+
+    async fn pg_cleanup_tenant_merkle(backend: &PostgresBackend, tenant: &str) {
+        let client = backend.pool().get().await.unwrap();
+        client
+            .execute(
+                "DELETE FROM cirislens.merkle_sth_log WHERE tenant_id = $1",
+                &[&tenant],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "DELETE FROM cirislens.merkle_leaves WHERE tenant_id = $1",
+                &[&tenant],
+            )
+            .await
+            .unwrap();
+    }
+
+    /// v1.5.0 Phase C — signer-absent path is a no-op (PG parity).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_merkle_hook_disabled_when_signer_absent() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let key = SigningKey::from_bytes(&[0xB0; 32]);
+        let tenant = format!("pg-merk-off-{}", Uuid::new_v4().simple());
+        pg_cleanup_tenant_merkle(&backend, &tenant).await;
+
+        let e1 = build_and_sign(&key, &tenant, 1, GENESIS_PREV_HASH.to_vec(), "system_event");
+        backend.record_entry(e1.clone()).await.unwrap();
+        let e2 = build_and_sign(&key, &tenant, 2, e1.entry_hash.clone(), "system_event");
+        backend.record_entry(e2.clone()).await.unwrap();
+
+        let (leaves, sth) = pg_count_merkle_rows(&backend, &tenant).await;
+        assert_eq!(leaves, 0);
+        assert_eq!(sth, 0);
+
+        pg_cleanup_tenant_merkle(&backend, &tenant).await;
+    }
+
+    /// v1.5.0 Phase C — signer-present path appends every entry, signs,
+    /// stores STH (PG parity).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_merkle_hook_enabled_appends_and_signs() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend.set_merkle_signer(Some(merkle_test_signer(0xC1)));
+
+        let key = SigningKey::from_bytes(&[0xC1; 32]);
+        let tenant = format!("pg-merk-on-{}", Uuid::new_v4().simple());
+        pg_cleanup_tenant_merkle(&backend, &tenant).await;
+
+        let e1 = build_and_sign(&key, &tenant, 1, GENESIS_PREV_HASH.to_vec(), "system_event");
+        backend.record_entry(e1.clone()).await.unwrap();
+        let (l1, s1) = pg_count_merkle_rows(&backend, &tenant).await;
+        assert_eq!((l1, s1), (1, 1));
+
+        let e2 = build_and_sign(&key, &tenant, 2, e1.entry_hash.clone(), "system_event");
+        backend.record_entry(e2.clone()).await.unwrap();
+        let e3 = build_and_sign(&key, &tenant, 3, e2.entry_hash.clone(), "system_event");
+        backend.record_entry(e3.clone()).await.unwrap();
+        let (l3, s3) = pg_count_merkle_rows(&backend, &tenant).await;
+        assert_eq!((l3, s3), (3, 3));
+
+        // tree_size monotonicity in STH log.
+        let client = backend.pool().get().await.unwrap();
+        let rows = client
+            .query(
+                "SELECT tree_size FROM cirislens.merkle_sth_log \
+                 WHERE tenant_id = $1 ORDER BY tree_size ASC",
+                &[&tenant],
+            )
+            .await
+            .unwrap();
+        let sizes: Vec<i64> = rows.iter().map(|r| r.get(0)).collect();
+        assert_eq!(sizes, vec![1, 2, 3]);
+
+        // Reset signer + cleanup.
+        backend.set_merkle_signer(None);
+        pg_cleanup_tenant_merkle(&backend, &tenant).await;
+    }
+
+    /// v1.5.0 Phase C — multi-tenant isolation (PG parity).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_merkle_hook_multi_tenant_isolated() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend.set_merkle_signer(Some(merkle_test_signer(0xD2)));
+
+        let key_a = SigningKey::from_bytes(&[0xDA; 32]);
+        let key_b = SigningKey::from_bytes(&[0xDB; 32]);
+        let tenant_a = format!("pg-merk-iso-A-{}", Uuid::new_v4().simple());
+        let tenant_b = format!("pg-merk-iso-B-{}", Uuid::new_v4().simple());
+        pg_cleanup_tenant_merkle(&backend, &tenant_a).await;
+        pg_cleanup_tenant_merkle(&backend, &tenant_b).await;
+
+        let a1 = build_and_sign(
+            &key_a,
+            &tenant_a,
+            1,
+            GENESIS_PREV_HASH.to_vec(),
+            "system_event",
+        );
+        backend.record_entry(a1.clone()).await.unwrap();
+        let a2 = build_and_sign(&key_a, &tenant_a, 2, a1.entry_hash.clone(), "system_event");
+        backend.record_entry(a2.clone()).await.unwrap();
+        let b1 = build_and_sign(
+            &key_b,
+            &tenant_b,
+            1,
+            GENESIS_PREV_HASH.to_vec(),
+            "system_event",
+        );
+        backend.record_entry(b1.clone()).await.unwrap();
+
+        let (la, sa) = pg_count_merkle_rows(&backend, &tenant_a).await;
+        let (lb, sb) = pg_count_merkle_rows(&backend, &tenant_b).await;
+        assert_eq!((la, sa), (2, 2));
+        assert_eq!((lb, sb), (1, 1));
+
+        backend.set_merkle_signer(None);
+        pg_cleanup_tenant_merkle(&backend, &tenant_a).await;
+        pg_cleanup_tenant_merkle(&backend, &tenant_b).await;
+    }
+
+    /// v1.5.0 Phase C — chain integrity (AV-49) preserved alongside
+    /// the Merkle hook (PG parity).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_merkle_hook_does_not_weaken_chain_integrity() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend.set_merkle_signer(Some(merkle_test_signer(0xE3)));
+
+        let key = SigningKey::from_bytes(&[0xE3; 32]);
+        let tenant = format!("pg-merk-int-{}", Uuid::new_v4().simple());
+        pg_cleanup_tenant_merkle(&backend, &tenant).await;
+
+        let e1 = build_and_sign(&key, &tenant, 1, GENESIS_PREV_HASH.to_vec(), "system_event");
+        backend.record_entry(e1.clone()).await.unwrap();
+        // Replay → rejected by chain commit, NOT by merkle hook.
+        let replay_err = backend.record_entry(e1.clone()).await.unwrap_err();
+        assert!(matches!(
+            replay_err,
+            Error::ChainIntegrity(_) | Error::Conflict(_)
+        ));
+        let (l, s) = pg_count_merkle_rows(&backend, &tenant).await;
+        assert_eq!(l, 1, "exactly one leaf — replay was chain-rejected");
+        assert_eq!(s, 1);
+
+        backend.set_merkle_signer(None);
+        pg_cleanup_tenant_merkle(&backend, &tenant).await;
     }
 }

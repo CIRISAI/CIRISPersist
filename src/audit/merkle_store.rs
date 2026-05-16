@@ -134,6 +134,7 @@ mod pg_impl {
     };
     use crate::store::postgres::PostgresBackend;
     use ciris_verify_core::transparency::TransparencyLeaf;
+    use deadpool_postgres::Pool;
     use std::sync::Arc;
 
     /// PG-backed `TransparencyStore<AuditLeaf>`.
@@ -141,14 +142,26 @@ mod pg_impl {
     /// One instance per tenant. All SQL filters by the captured
     /// `tenant_id`; cross-tenant operations are not possible through
     /// this surface.
+    ///
+    /// # Phase C refactor
+    ///
+    /// `PgMerkleStore` now holds a deadpool `Pool` directly (not
+    /// `Arc<PostgresBackend>`). This lets the audit-service ingest
+    /// hook (Phase C) build a tenant-scoped store from `&self`
+    /// (clone the pool) without needing an `Arc<Self>` of the
+    /// backend. The backward-compatible [`Self::new`] constructor
+    /// (which takes `Arc<PostgresBackend>`) is retained so Phase B
+    /// tests don't need to change shape.
     pub struct PgMerkleStore {
-        backend: Arc<PostgresBackend>,
+        pool: Pool,
         runtime: Handle,
         tenant_id: String,
     }
 
     impl PgMerkleStore {
-        /// Construct a tenant-scoped Postgres Merkle store.
+        /// Construct a tenant-scoped Postgres Merkle store from a
+        /// backend Arc. Backward-compatible Phase B shape — clones the
+        /// backend's pool internally.
         ///
         /// `runtime` is the tokio runtime handle the sync trait
         /// methods bridge to via `block_on`. Pass
@@ -160,7 +173,19 @@ mod pg_impl {
             tenant_id: impl Into<String>,
         ) -> Self {
             Self {
-                backend,
+                pool: backend.pool().clone(),
+                runtime,
+                tenant_id: tenant_id.into(),
+            }
+        }
+
+        /// Construct a tenant-scoped Postgres Merkle store from the
+        /// pool directly (Phase C ingest path). Used by
+        /// `AuditService::record_entry` on `PostgresBackend` so the
+        /// store can be built from `&self` without an `Arc<Self>`.
+        pub fn from_pool(pool: Pool, runtime: Handle, tenant_id: impl Into<String>) -> Self {
+            Self {
+                pool,
                 runtime,
                 tenant_id: tenant_id.into(),
             }
@@ -185,11 +210,10 @@ mod pg_impl {
                 serde_json::to_vec(&entry).map_err(|e| pg_storage_err("leaf serialize", e))?;
             let chain_event_id = entry.chain_event_id;
             let tenant = self.tenant_id.clone();
-            let backend = self.backend.clone();
+            let pool = self.pool.clone();
 
             self.runtime.block_on(async move {
-                let mut client = backend
-                    .pool()
+                let mut client = pool
                     .get()
                     .await
                     .map_err(|e| pg_storage_err("pool get", e))?;
@@ -241,12 +265,11 @@ mod pg_impl {
 
         fn get(&self, index: u64) -> Result<Option<AuditLeaf>, TransparencyError> {
             let tenant = self.tenant_id.clone();
-            let backend = self.backend.clone();
+            let pool = self.pool.clone();
             let leaf_idx = i64::try_from(index)
                 .map_err(|_| TransparencyError::Storage("index exceeds i64 range".into()))?;
             self.runtime.block_on(async move {
-                let client = backend
-                    .pool()
+                let client = pool
                     .get()
                     .await
                     .map_err(|e| pg_storage_err("pool get", e))?;
@@ -273,12 +296,11 @@ mod pg_impl {
 
         fn leaf_hash(&self, index: u64) -> Result<Option<[u8; 32]>, TransparencyError> {
             let tenant = self.tenant_id.clone();
-            let backend = self.backend.clone();
+            let pool = self.pool.clone();
             let leaf_idx = i64::try_from(index)
                 .map_err(|_| TransparencyError::Storage("index exceeds i64 range".into()))?;
             self.runtime.block_on(async move {
-                let client = backend
-                    .pool()
+                let client = pool
                     .get()
                     .await
                     .map_err(|e| pg_storage_err("pool get", e))?;
@@ -303,10 +325,9 @@ mod pg_impl {
 
         fn tree_size(&self) -> Result<u64, TransparencyError> {
             let tenant = self.tenant_id.clone();
-            let backend = self.backend.clone();
+            let pool = self.pool.clone();
             self.runtime.block_on(async move {
-                let client = backend
-                    .pool()
+                let client = pool
                     .get()
                     .await
                     .map_err(|e| pg_storage_err("pool get", e))?;
@@ -328,10 +349,9 @@ mod pg_impl {
 
         fn latest_sth(&self) -> Result<Option<SignedTreeHead>, TransparencyError> {
             let tenant = self.tenant_id.clone();
-            let backend = self.backend.clone();
+            let pool = self.pool.clone();
             self.runtime.block_on(async move {
-                let client = backend
-                    .pool()
+                let client = pool
                     .get()
                     .await
                     .map_err(|e| pg_storage_err("pool get", e))?;
@@ -381,7 +401,7 @@ mod pg_impl {
 
         fn store_sth(&self, sth: &SignedTreeHead) -> Result<(), TransparencyError> {
             let tenant = self.tenant_id.clone();
-            let backend = self.backend.clone();
+            let pool = self.pool.clone();
             let tree_size = i64::try_from(sth.tree_size)
                 .map_err(|_| TransparencyError::Storage("tree_size exceeds i64 range".into()))?;
             let root_hash = sth.root_hash.to_vec();
@@ -390,8 +410,7 @@ mod pg_impl {
             let witnesses_str = serialize_witness_signatures(&sth.witness_signatures)?;
             let signer_key_id = hex::encode(&sth.signature.classical.public_key);
             self.runtime.block_on(async move {
-                let client = backend
-                    .pool()
+                let client = pool
                     .get()
                     .await
                     .map_err(|e| pg_storage_err("pool get", e))?;
@@ -422,10 +441,9 @@ mod pg_impl {
 
         fn all_leaf_hashes(&self) -> Result<Vec<[u8; 32]>, TransparencyError> {
             let tenant = self.tenant_id.clone();
-            let backend = self.backend.clone();
+            let pool = self.pool.clone();
             self.runtime.block_on(async move {
-                let client = backend
-                    .pool()
+                let client = pool
                     .get()
                     .await
                     .map_err(|e| pg_storage_err("pool get", e))?;

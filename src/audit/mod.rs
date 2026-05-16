@@ -96,6 +96,16 @@ pub enum Error {
     /// Internal serialization / type-conversion bug.
     #[error("internal: {0}")]
     Internal(String),
+
+    /// Merkle transparency-layer error (v1.5.0 Phase C). Surfaces a
+    /// failure from the per-tenant `TransparencyStore<AuditLeaf>`
+    /// append / STH sign / STH store path. The audit chain commit
+    /// itself is intact (chain commit precedes Merkle hook); callers
+    /// observing this variant should NOT re-issue the audit entry —
+    /// the chain row already landed. Phase I's backfill recomputes
+    /// any missing Merkle projection rows.
+    #[error("merkle: {0}")]
+    Merkle(String),
 }
 
 impl Error {
@@ -110,6 +120,7 @@ impl Error {
             Error::Backend(_) => "audit_backend",
             Error::NotImplemented(_) => "audit_not_implemented",
             Error::Internal(_) => "audit_internal",
+            Error::Merkle(_) => "audit_merkle",
         }
     }
 }
@@ -139,6 +150,7 @@ mod tests {
         assert_eq!(Error::Backend("x".into()).kind(), "audit_backend");
         assert_eq!(Error::NotImplemented("x").kind(), "audit_not_implemented");
         assert_eq!(Error::Internal("x".into()).kind(), "audit_internal");
+        assert_eq!(Error::Merkle("x".into()).kind(), "audit_merkle");
     }
 
     #[test]
