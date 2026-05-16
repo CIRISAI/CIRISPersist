@@ -199,18 +199,27 @@ nothing in this FSD reinvents that machinery.
 ```rust
 pub struct TrustGrantPayload {
     pub grantee_key: String,        // base64 hybrid pubkey
-    pub purpose: TrustPurpose,      // Technical | Deferral | Contribution
+    pub purpose: TrustPurpose,      // Technical | Deferral | Contribution | Service
     pub scope: String,              // purpose-specific (see §3.3)
     pub expires_at: Option<DateTime<Utc>>,
     pub rationale: String,          // free-form, why this grant
 }
 
 pub enum TrustPurpose {
-    Technical,
-    Deferral,
-    Contribution,
+    Technical,    // manifest / build / artifact attestation
+    Deferral,     // domain-scoped resolver routing
+    Contribution, // authorship + voting on chain events
+    Service,      // access to advertised peer services (LLM/embedding/tool RPC)
 }
 ```
+
+The `Service` variant gates per-pubkey-addressable peer service
+offerings (LLM, embedding, tool) advertised via NodeCore's
+`service_announcement` / `service_deprecation` / `service_usage_summary`
+Contributions per MESSAGE_TAXONOMY §5/§6.1. Per-invocation RPC rides
+edge transport (out of scope here per MESSAGE_TAXONOMY §8); the chain
+records announcement + aggregated usage summaries, and the trust grant
+gates whether a caller is authorized to invoke the service at all.
 
 The granter is `author_id` (envelope-level). The author's
 `HybridSignature` covers the canonical envelope per NodeCore SCHEMA
@@ -230,6 +239,7 @@ RBAC/ABAC/ReBAC context.
 | Technical | `manifest:<id>` \| `channel:<name>` \| `artifact:<hash>` | `manifest:*` etc. | Matches CIRISRegistry's manifest IDs |
 | Deferral | `<domain>` (free-form lowercase identifier) | `*` | Identical to V020 `trust_domains` entries |
 | Contribution | `<contribution_type>` \| `<contribution_type>:<subject_kind>` \| `vote:<contribution_type>:<subject_kind>` | `*` | See enumeration below |
+| Service | `service:<kind>` \| `service:<kind>:<resource>` | `*` (high-stakes — witness-set-gated per §3.5) | Authorizes invocation of advertised peer services; resource axis distinguishes specific offerings within a kind |
 
 **Contribution scopes** must align with the NodeCore SCHEMA §3.1
 `contribution_type` enum and §3.2 `subject_kind` taxonomy. The grants
@@ -265,9 +275,29 @@ typically grant both; gating them separately is the seam that lets
 policy distinguish proposers from ratifiers.
 
 The three new `subject_kind`s (`test_result`, `improvement`,
-`gratitude_signal`) are listed here as needed but require NodeCore
-SCHEMA §3.2 additions before they can flow on the wire. They're
-called out in §8 as upstream blockers.
+`gratitude_signal`) were proposed as upstream blockers in an earlier
+draft; **NodeCore §RC landed those plus 12 additional subject_kinds**
+in [`871ebab`](https://github.com/CIRISAI/CIRISNodeCore/commit/871ebab)
+via the MESSAGE_TAXONOMY FSD. All 15 are now wire-ready.
+
+**Service scopes** are canonical strings under `Service` purpose:
+
+| Scope string | Authorizes |
+|---|---|
+| `service:llm` | All LLM service offerings |
+| `service:llm:<model_id>` | Specific LLM (e.g. `service:llm:claude-opus-4-7`) |
+| `service:embedding` | All embedding services |
+| `service:embedding:<model_id>` | Specific embedding model |
+| `service:tool:<tool_name>` | Specific tool RPC |
+| `*` | Wildcard — all services (witness-set-gated per §3.5) |
+
+The `<kind>` axis is open-ended at the schema layer (callers and
+service providers agree on canonical kinds per MESSAGE_TAXONOMY §6.1);
+the `<resource>` axis distinguishes offerings within a kind. The trust
+grant gates whether the grantee may invoke; per-invocation RPC
+authorization rides edge transport (CIRISEdge `ServiceRequest` /
+`ServiceResponse` `MessageType` — separate issue, non-blocking for
+v1.5.0).
 
 Wildcard semantics: a grant with `scope='*'` matches all scopes within
 its purpose. Wildcards are a strict trust elevation; consumers should
@@ -529,7 +559,7 @@ FSD — Portal owns the UI design.
 
 | # | Step | Repo | Dep |
 |---|---|---|---|
-| 1 | Accord §RC additions: `trust_grant` `subject_kind` + new subject_kinds `test_result`, `improvement`, `gratitude_signal` | CIRISNodeCore | (none — first move) |
+| 1 | ~~Accord §RC additions: `trust_grant` `subject_kind` + new subject_kinds `test_result`, `improvement`, `gratitude_signal`~~ **LANDED** in NodeCore [`871ebab`](https://github.com/CIRISAI/CIRISNodeCore/commit/871ebab) with 15 new subject_kinds + MESSAGE_TAXONOMY FSD | CIRISNodeCore | ✅ done |
 | 2 | V021 migration (Postgres + SQLite) | CIRISPersist | (1) |
 | 3 | `TrustGrantPayload` + ingest hook (incl. witness_set activation) | CIRISPersist | (1) (2) |
 | 4 | `grant_trust` / `revoke_trust_grant` emit API + PyO3 wrappers | CIRISPersist | (3) |
