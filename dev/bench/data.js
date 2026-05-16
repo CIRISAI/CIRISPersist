@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778875951372,
+  "lastUpdate": 1778949083266,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -14603,6 +14603,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25962487,
             "range": "± 1227911",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "c639a37cce1247c938a7477939b5f4a37d25ce6e",
+          "message": "1.3.1 — audit-chain bridge docs + #49 timestamp preservation\n\nCIRISAgent 2.9.0 cutover support cut. Two upstream asks from\nCIRISAgent#763 Lane A bundled into one release:\n\n1. docs/AUDIT_CHAIN_BRIDGE.md (NEW) — operational documentation for\n   the audit-chain bridge mechanism + Lane C identity registration:\n   - Bridge-entry mechanism: rooting a new cirisaudit chain on top\n     of an existing chain. Canonical-bytes rule, prev_hash derivation\n     from legacy chain terminal state, ChainBreakReason::Genesis\n     PrevHashNotZero as a bridge signal.\n   - tenant_id semantics (opaque, caller-defined, stable; don't\n     change mid-chain).\n   - signing_key_id registration flow (one-time federation_put_\n     public_key at boot; idempotent).\n   - 2.9.0 first-boot flow pseudo-code.\n   - Trust hierarchy registration (Lane C C3) call shapes.\n   Unblocks CIRISAgent#763 A0b + Lane C wiring.\n\n2. #49 timestamp preservation on cirisgraph_upsert_{node,edge}:\n   - PG INSERT VALUES binds node.updated_at / node.created_at as\n     parameters instead of NOW(). ON CONFLICT UPDATE uses EXCLUDED.\n     updated_at.\n   - SQLite same: fmt_datetime(node.updated_at) /\n     fmt_datetime(node.created_at) passed through; excluded.updated_at\n     on conflict.\n   - Same fix on upsert_edge (both backends) adds edge.created_at\n     to the INSERT.\n   - Two regression tests in src/graph/sqlite.rs covering the\n     #49-body repro for bulk-historical-import.\n   Closes CIRISPersist#49. Unblocks CIRISAgent#763 A0a — agent can\n   now use the typed engine.cirisgraph_upsert_node() API instead of\n   bypassing to direct sqlite3 INSERT.\n\nNo upstream API breakage; purely additive (docs file) + bug fix\n(timestamp behavior corrects required-but-ignored). PyO3 GIL perf\nbaseline (low-priority ask) deferred — Memory Benchmark integration\ntests during Lane A will surface anything hot enough to bench.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-16T11:23:19-05:00",
+          "tree_id": "3da9fffef375a99bab0376624afa1ed21c42ec76",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/c639a37cce1247c938a7477939b5f4a37d25ce6e"
+        },
+        "date": 1778949082215,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 108918,
+            "range": "± 1098",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 259855,
+            "range": "± 1280",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 559807,
+            "range": "± 1714",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1985419,
+            "range": "± 4465",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 323,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1402,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7939,
+            "range": "± 34",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23162,
+            "range": "± 130",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26426,
+            "range": "± 179",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91030,
+            "range": "± 182",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 357,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3204,
+            "range": "± 19",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9508,
+            "range": "± 27",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41750,
+            "range": "± 288",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 663,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2283915,
+            "range": "± 32977",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7013642,
+            "range": "± 49037",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25747033,
+            "range": "± 297473",
             "unit": "ns/iter"
           }
         ]
