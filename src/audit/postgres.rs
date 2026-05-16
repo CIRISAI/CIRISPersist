@@ -125,6 +125,108 @@ async fn merkle_hook_pg(
     Ok(())
 }
 
+/// v1.5.0 Phase D — TrustGrant projection hook for the audit-service
+/// ingest path. Called after the Merkle hook completes; **gated on
+/// `entry.subject_kind == "trust_grant"`** so non-grant entries skip
+/// the helper entirely.
+///
+/// Materializes / refreshes a row in `cirislens.federation_trust_grants`
+/// keyed by `(grantee_key, granter_key, purpose, scope)` per FSD §3.6.
+/// Re-issuance is a UPSERT on the unique key (refresh chain pointers,
+/// `granted_at` from `entry.recorded_at`, and clear revocation columns).
+/// Revocation per FSD §3.4 is a re-issuance with `expires_at <= NOW()`;
+/// the UPSERT detects that and sets `revoked_at` + `revoked_by`.
+///
+/// # Atomicity
+///
+/// Out-of-transaction, matching `merkle_hook_pg`. The audit chain +
+/// Merkle leaf are the source of truth (already committed by the time
+/// this runs); a projection failure surfaces as `Error::TrustGrant(_)`
+/// but the chain row stands. Phase I's V021 backfill walks the chain
+/// to re-project any orphaned trust_grant entries.
+///
+/// # Self-grant rejection
+///
+/// `granter_key == grantee_key` is rejected here (matches the V021
+/// CHECK constraint AND FSD §3.6 integrity rule). The audit entry
+/// itself is already on-chain by the time we get here; this is a
+/// projection-side belt-and-suspenders that also surfaces the issue
+/// earlier than the CHECK violation would.
+async fn project_trust_grant_pg(
+    backend: &PostgresBackend,
+    entry: &AuditEntry,
+    chain_event_id: i64,
+) -> Result<(), Error> {
+    use crate::federation::trust_grant::TrustGrantPayload;
+
+    let payload: TrustGrantPayload = serde_json::from_value(entry.payload.clone())
+        .map_err(|e| Error::TrustGrant(format!("payload deserialize: {e}")))?;
+
+    // Granter is envelope-level `actor_id` (FSD §3.1 — granter is
+    // author_id; not duplicated in the payload).
+    let granter_key = entry.actor_id.as_str();
+    let grantee_key = payload.grantee_key.as_str();
+
+    if granter_key == grantee_key {
+        return Err(Error::TrustGrant(
+            "self-grant rejected (granter == grantee)".into(),
+        ));
+    }
+
+    let purpose_str = payload.purpose.as_str();
+    let chain_event_hash = entry.entry_hash.clone();
+    let granted_at = entry.recorded_at;
+    let expires_at = payload.expires_at;
+
+    let client = backend
+        .pool()
+        .get()
+        .await
+        .map_err(|e| Error::TrustGrant(format!("pool: {e}")))?;
+    client
+        .execute(
+            "INSERT INTO cirislens.federation_trust_grants (\
+                grantee_key, granter_key, purpose, scope, \
+                granted_at, expires_at, chain_event_id, chain_event_hash, tenant_id\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             ON CONFLICT (grantee_key, granter_key, purpose, scope) DO UPDATE SET \
+                granted_at = EXCLUDED.granted_at, \
+                expires_at = EXCLUDED.expires_at, \
+                chain_event_id = EXCLUDED.chain_event_id, \
+                chain_event_hash = EXCLUDED.chain_event_hash, \
+                tenant_id = EXCLUDED.tenant_id, \
+                revoked_at = CASE \
+                    WHEN EXCLUDED.expires_at IS NOT NULL \
+                     AND EXCLUDED.expires_at <= NOW() \
+                    THEN NOW() ELSE NULL END, \
+                revoked_by = CASE \
+                    WHEN EXCLUDED.expires_at IS NOT NULL \
+                     AND EXCLUDED.expires_at <= NOW() \
+                    THEN EXCLUDED.granter_key ELSE NULL END",
+            &[
+                &grantee_key,
+                &granter_key,
+                &purpose_str,
+                &payload.scope,
+                &granted_at,
+                &expires_at,
+                &chain_event_id,
+                &chain_event_hash,
+                &entry.tenant_id,
+            ],
+        )
+        .await
+        .map_err(|e| {
+            // CHECK violation (granter == grantee at the DB level) or
+            // FK violation (grantee_key/granter_key missing from
+            // federation_keys). Both are caller-data integrity issues
+            // for the chain; surface as TrustGrant.
+            Error::TrustGrant(format!("UPSERT federation_trust_grants: {e}"))
+        })?;
+
+    Ok(())
+}
+
 fn map_pg_error(e: tokio_postgres::Error, op: &str) -> Error {
     use tokio_postgres::error::SqlState;
     let code = e.as_db_error().map(|d| d.code().clone());
@@ -327,6 +429,12 @@ impl AuditService for PostgresBackend {
         // unchanged. `sequence_number` is reused as the
         // `chain_event_id` per FSD §4.4.
         merkle_hook_pg(self, &entry, entry.sequence_number).await?;
+
+        // v1.5.0 Phase D — TrustGrant projection hook. Gated on
+        // subject_kind; non-grant entries skip without DB work.
+        if entry.subject_kind == crate::federation::trust_grant::TRUST_GRANT_SUBJECT_KIND {
+            project_trust_grant_pg(self, &entry, entry.sequence_number).await?;
+        }
 
         Ok(())
     }
@@ -843,8 +951,17 @@ impl AuditService for PostgresBackend {
         // prior call whose Merkle hook already ran (or didn't, if the
         // prior call lacked a signer). Re-running here would
         // double-append.
+        //
+        // v1.5.0 Phase D — TrustGrant projection same as Merkle:
+        // only on the newly-stored path. AlreadyClaimed means the
+        // projection already ran (or was a no-op if the prior call
+        // happened on a SIDB at a time when this branch did not
+        // exist; the V021 backfill will catch any orphans).
         if let ClaimResult::Stored(_) = &result {
             merkle_hook_pg(self, &entry, entry.sequence_number).await?;
+            if entry.subject_kind == crate::federation::trust_grant::TRUST_GRANT_SUBJECT_KIND {
+                project_trust_grant_pg(self, &entry, entry.sequence_number).await?;
+            }
         }
 
         Ok(result)
@@ -1419,5 +1536,532 @@ mod tests {
 
         backend.set_merkle_signer(None);
         pg_cleanup_tenant_merkle(&backend, &tenant).await;
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // v1.5.0 Phase D — TrustGrant projection tests (Postgres)
+    // ────────────────────────────────────────────────────────────────
+
+    /// Seed `cirislens.federation_keys` so FK targets exist for the
+    /// projection's INSERT. Idempotent — uses ON CONFLICT DO NOTHING.
+    async fn pg_seed_federation_key(backend: &PostgresBackend, key_id: &str) {
+        let client = backend.pool().get().await.unwrap();
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_keys (\
+                    key_id, pubkey_ed25519_base64, algorithm, identity_type, \
+                    identity_ref, valid_from, registration_envelope, \
+                    original_content_hash, scrub_signature_classical, \
+                    scrub_key_id, scrub_timestamp, persist_row_hash\
+                 ) VALUES ($1, 'AAAA', 'hybrid', 'agent', $1, NOW(), \
+                          '{}'::jsonb, decode('00', 'hex'), '', $1, NOW(), '0') \
+                 ON CONFLICT (key_id) DO NOTHING",
+                &[&key_id],
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn pg_cleanup_trust_grants(backend: &PostgresBackend, tenant: &str) {
+        let client = backend.pool().get().await.unwrap();
+        client
+            .execute(
+                "DELETE FROM cirislens.federation_trust_grants WHERE tenant_id = $1",
+                &[&tenant],
+            )
+            .await
+            .unwrap();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_trust_grant_entry_pg(
+        granter_key: &SigningKey,
+        tenant_id: &str,
+        sequence_number: i64,
+        prev_hash: Vec<u8>,
+        grantee_key_b64: &str,
+        purpose: crate::federation::trust_grant::TrustPurpose,
+        scope: &str,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> AuditEntry {
+        let payload = serde_json::json!({
+            "grantee_key": grantee_key_b64,
+            "purpose": purpose.as_str(),
+            "scope": scope,
+            "expires_at": expires_at.map(|t| t.to_rfc3339()),
+            "rationale": "phase-D-pg-test",
+        });
+        let mut entry = AuditEntry {
+            entry_id: Uuid::new_v4().to_string(),
+            sequence_number,
+            tenant_id: tenant_id.to_owned(),
+            actor_id: pubkey_b64(granter_key),
+            action_type: "trust_granted".into(),
+            subject_kind: crate::federation::trust_grant::TRUST_GRANT_SUBJECT_KIND.into(),
+            subject_id: grantee_key_b64.to_owned(),
+            payload,
+            prev_hash,
+            entry_hash: vec![],
+            recorded_at: super::super::verify::truncate_to_micros(Utc::now()),
+            signature: String::new(),
+        };
+        let hash = compute_entry_hash(&entry).unwrap();
+        entry.entry_hash = hash.to_vec();
+        let canonical = super::super::verify::canonical_bytes_for_entry(&entry).unwrap();
+        let sig = granter_key.sign(&canonical);
+        entry.signature = B64.encode(sig.to_bytes());
+        entry
+    }
+
+    async fn pg_count_grants(backend: &PostgresBackend, tenant: &str) -> i64 {
+        let client = backend.pool().get().await.unwrap();
+        client
+            .query_one(
+                "SELECT COUNT(*)::BIGINT FROM cirislens.federation_trust_grants WHERE tenant_id = $1",
+                &[&tenant],
+            )
+            .await
+            .unwrap()
+            .get(0)
+    }
+
+    /// v1.5.0 Phase D — Non-trust-grant entries don't touch the
+    /// projection (PG parity).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_project_skips_non_trust_grant_subject_kinds() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let key = SigningKey::from_bytes(&[0x70; 32]);
+        let tenant = format!("pg-pd-skip-{}", Uuid::new_v4().simple());
+        pg_cleanup_trust_grants(&backend, &tenant).await;
+
+        // Use action_types from V020's audit_log CHECK whitelist.
+        let e1 = build_and_sign(&key, &tenant, 1, GENESIS_PREV_HASH.to_vec(), "system_event");
+        backend.record_entry(e1.clone()).await.unwrap();
+        let e2 = build_and_sign(&key, &tenant, 2, e1.entry_hash.clone(), "config_change");
+        backend.record_entry(e2.clone()).await.unwrap();
+
+        assert_eq!(pg_count_grants(&backend, &tenant).await, 0);
+        pg_cleanup_trust_grants(&backend, &tenant).await;
+    }
+
+    /// v1.5.0 Phase D — New grant materializes one row with expected
+    /// values (PG parity).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_project_new_grant_materializes_row() {
+        use crate::federation::trust_grant::TrustPurpose;
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let granter_signing = SigningKey::from_bytes(&[0x71; 32]);
+        let granter_b64 = pubkey_b64(&granter_signing);
+        let grantee_b64 = pubkey_b64(&SigningKey::from_bytes(&[0x72; 32]));
+        let tenant = format!("pg-pd-new-{}", Uuid::new_v4().simple());
+        pg_cleanup_trust_grants(&backend, &tenant).await;
+        pg_seed_federation_key(&backend, &granter_b64).await;
+        pg_seed_federation_key(&backend, &grantee_b64).await;
+
+        let entry = build_trust_grant_entry_pg(
+            &granter_signing,
+            &tenant,
+            1,
+            GENESIS_PREV_HASH.to_vec(),
+            &grantee_b64,
+            TrustPurpose::Contribution,
+            "proposal:registry_vouch",
+            None,
+        );
+        backend.record_entry(entry.clone()).await.unwrap();
+
+        let client = backend.pool().get().await.unwrap();
+        let row = client
+            .query_one(
+                "SELECT grantee_key, granter_key, purpose, scope, \
+                        chain_event_id, tenant_id, \
+                        revoked_at, revoked_by, expires_at \
+                 FROM cirislens.federation_trust_grants \
+                 WHERE grantee_key = $1 AND granter_key = $2 \
+                   AND purpose = $3 AND scope = $4",
+                &[
+                    &grantee_b64,
+                    &granter_b64,
+                    &"contribution",
+                    &"proposal:registry_vouch",
+                ],
+            )
+            .await
+            .unwrap();
+        let chain_event_id: i64 = row.get("chain_event_id");
+        let tenant_id: String = row.get("tenant_id");
+        let revoked_at: Option<chrono::DateTime<chrono::Utc>> = row.get("revoked_at");
+        let revoked_by: Option<String> = row.get("revoked_by");
+        let expires_at: Option<chrono::DateTime<chrono::Utc>> = row.get("expires_at");
+        assert_eq!(chain_event_id, 1);
+        assert_eq!(tenant_id, tenant);
+        assert!(revoked_at.is_none());
+        assert!(revoked_by.is_none());
+        assert!(expires_at.is_none());
+        assert_eq!(pg_count_grants(&backend, &tenant).await, 1);
+
+        pg_cleanup_trust_grants(&backend, &tenant).await;
+    }
+
+    /// v1.5.0 Phase D — Re-issuance UPSERTs (row count stays 1; chain
+    /// pointers refresh).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_project_re_issuance_updates_existing_row() {
+        use crate::federation::trust_grant::TrustPurpose;
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let granter_signing = SigningKey::from_bytes(&[0x73; 32]);
+        let granter_b64 = pubkey_b64(&granter_signing);
+        let grantee_b64 = pubkey_b64(&SigningKey::from_bytes(&[0x74; 32]));
+        let tenant = format!("pg-pd-reissue-{}", Uuid::new_v4().simple());
+        pg_cleanup_trust_grants(&backend, &tenant).await;
+        pg_seed_federation_key(&backend, &granter_b64).await;
+        pg_seed_federation_key(&backend, &grantee_b64).await;
+
+        let e1 = build_trust_grant_entry_pg(
+            &granter_signing,
+            &tenant,
+            1,
+            GENESIS_PREV_HASH.to_vec(),
+            &grantee_b64,
+            TrustPurpose::Technical,
+            "manifest:stable",
+            None,
+        );
+        backend.record_entry(e1.clone()).await.unwrap();
+
+        let client = backend.pool().get().await.unwrap();
+        let original_grant_id: uuid::Uuid = client
+            .query_one(
+                "SELECT grant_id FROM cirislens.federation_trust_grants \
+                 WHERE grantee_key = $1 AND granter_key = $2 \
+                   AND purpose = 'technical' AND scope = 'manifest:stable'",
+                &[&grantee_b64, &granter_b64],
+            )
+            .await
+            .unwrap()
+            .get("grant_id");
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let far_future = chrono::Utc::now() + chrono::Duration::hours(48);
+        let e2 = build_trust_grant_entry_pg(
+            &granter_signing,
+            &tenant,
+            2,
+            e1.entry_hash.clone(),
+            &grantee_b64,
+            TrustPurpose::Technical,
+            "manifest:stable",
+            Some(far_future),
+        );
+        backend.record_entry(e2.clone()).await.unwrap();
+
+        let row = client
+            .query_one(
+                "SELECT grant_id, chain_event_id, expires_at, revoked_at, revoked_by \
+                 FROM cirislens.federation_trust_grants \
+                 WHERE grantee_key = $1 AND granter_key = $2 \
+                   AND purpose = 'technical' AND scope = 'manifest:stable'",
+                &[&grantee_b64, &granter_b64],
+            )
+            .await
+            .unwrap();
+        let new_grant_id: uuid::Uuid = row.get("grant_id");
+        let chain_event_id: i64 = row.get("chain_event_id");
+        let expires_at: Option<chrono::DateTime<chrono::Utc>> = row.get("expires_at");
+        let revoked_at: Option<chrono::DateTime<chrono::Utc>> = row.get("revoked_at");
+        let revoked_by: Option<String> = row.get("revoked_by");
+        assert_eq!(
+            new_grant_id, original_grant_id,
+            "grant_id stable across re-issuance"
+        );
+        assert_eq!(chain_event_id, 2, "chain_event_id refreshed");
+        assert!(expires_at.is_some(), "expires_at populated");
+        assert!(revoked_at.is_none(), "future expiry is not revocation");
+        assert!(revoked_by.is_none());
+        assert_eq!(pg_count_grants(&backend, &tenant).await, 1);
+
+        pg_cleanup_trust_grants(&backend, &tenant).await;
+    }
+
+    /// v1.5.0 Phase D — Revocation (expires_at <= NOW()) sets
+    /// revoked_at + revoked_by (PG parity).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_project_revocation_sets_revoked_at() {
+        use crate::federation::trust_grant::TrustPurpose;
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let granter_signing = SigningKey::from_bytes(&[0x75; 32]);
+        let granter_b64 = pubkey_b64(&granter_signing);
+        let grantee_b64 = pubkey_b64(&SigningKey::from_bytes(&[0x76; 32]));
+        let tenant = format!("pg-pd-revoke-{}", Uuid::new_v4().simple());
+        pg_cleanup_trust_grants(&backend, &tenant).await;
+        pg_seed_federation_key(&backend, &granter_b64).await;
+        pg_seed_federation_key(&backend, &grantee_b64).await;
+
+        let e1 = build_trust_grant_entry_pg(
+            &granter_signing,
+            &tenant,
+            1,
+            GENESIS_PREV_HASH.to_vec(),
+            &grantee_b64,
+            TrustPurpose::Deferral,
+            "medical_deferral",
+            None,
+        );
+        backend.record_entry(e1.clone()).await.unwrap();
+
+        let past = chrono::Utc::now() - chrono::Duration::seconds(60);
+        let e2 = build_trust_grant_entry_pg(
+            &granter_signing,
+            &tenant,
+            2,
+            e1.entry_hash.clone(),
+            &grantee_b64,
+            TrustPurpose::Deferral,
+            "medical_deferral",
+            Some(past),
+        );
+        backend.record_entry(e2.clone()).await.unwrap();
+
+        let client = backend.pool().get().await.unwrap();
+        let row = client
+            .query_one(
+                "SELECT revoked_at, revoked_by \
+                 FROM cirislens.federation_trust_grants \
+                 WHERE grantee_key = $1 AND granter_key = $2 \
+                   AND purpose = 'deferral' AND scope = 'medical_deferral'",
+                &[&grantee_b64, &granter_b64],
+            )
+            .await
+            .unwrap();
+        let revoked_at: Option<chrono::DateTime<chrono::Utc>> = row.get("revoked_at");
+        let revoked_by: Option<String> = row.get("revoked_by");
+        assert!(revoked_at.is_some(), "revocation sets revoked_at");
+        assert_eq!(
+            revoked_by.as_deref(),
+            Some(granter_b64.as_str()),
+            "revoked_by = granter"
+        );
+        assert_eq!(pg_count_grants(&backend, &tenant).await, 1);
+
+        pg_cleanup_trust_grants(&backend, &tenant).await;
+    }
+
+    /// v1.5.0 Phase D — Cross-tenant collapse via UNIQUE constraint
+    /// (PG parity with SQLite `project_cross_tenant_collapses…`).
+    /// FSD §3.6: UNIQUE is `(grantee_key, granter_key, purpose, scope)`
+    /// — no tenant_id qualifier — so a same-tuple emit under tenant-B
+    /// UPDATES the tenant-A row.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_project_cross_tenant_collapses_per_unique_constraint() {
+        use crate::federation::trust_grant::TrustPurpose;
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let granter_signing = SigningKey::from_bytes(&[0x79; 32]);
+        let granter_b64 = pubkey_b64(&granter_signing);
+        let grantee_b64 = pubkey_b64(&SigningKey::from_bytes(&[0x7A; 32]));
+        let tenant_a = format!("pg-pd-mt-A-{}", Uuid::new_v4().simple());
+        let tenant_b = format!("pg-pd-mt-B-{}", Uuid::new_v4().simple());
+        pg_cleanup_trust_grants(&backend, &tenant_a).await;
+        pg_cleanup_trust_grants(&backend, &tenant_b).await;
+        pg_seed_federation_key(&backend, &granter_b64).await;
+        pg_seed_federation_key(&backend, &grantee_b64).await;
+
+        let a1 = build_trust_grant_entry_pg(
+            &granter_signing,
+            &tenant_a,
+            1,
+            GENESIS_PREV_HASH.to_vec(),
+            &grantee_b64,
+            TrustPurpose::Contribution,
+            "proposal:registry_vouch",
+            None,
+        );
+        backend.record_entry(a1.clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let b1 = build_trust_grant_entry_pg(
+            &granter_signing,
+            &tenant_b,
+            1,
+            GENESIS_PREV_HASH.to_vec(),
+            &grantee_b64,
+            TrustPurpose::Contribution,
+            "proposal:registry_vouch",
+            None,
+        );
+        backend.record_entry(b1.clone()).await.unwrap();
+
+        let client = backend.pool().get().await.unwrap();
+        // One row total — UPSERT collapses both emits.
+        let total: i64 = client
+            .query_one(
+                "SELECT COUNT(*)::BIGINT FROM cirislens.federation_trust_grants \
+                 WHERE grantee_key = $1 AND granter_key = $2 \
+                   AND purpose = 'contribution' AND scope = 'proposal:registry_vouch'",
+                &[&grantee_b64, &granter_b64],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(total, 1, "cross-tenant emits collapse via UPSERT");
+        let row_tenant: String = client
+            .query_one(
+                "SELECT tenant_id FROM cirislens.federation_trust_grants \
+                 WHERE grantee_key = $1 AND granter_key = $2 \
+                   AND purpose = 'contribution' AND scope = 'proposal:registry_vouch'",
+                &[&grantee_b64, &granter_b64],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(row_tenant, tenant_b, "latest emit wins on tenant_id");
+
+        pg_cleanup_trust_grants(&backend, &tenant_a).await;
+        pg_cleanup_trust_grants(&backend, &tenant_b).await;
+    }
+
+    /// v1.5.0 Phase D — Self-grant rejected with Error::TrustGrant
+    /// (PG parity).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_project_self_grant_rejected() {
+        use crate::federation::trust_grant::TrustPurpose;
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let granter_signing = SigningKey::from_bytes(&[0x77; 32]);
+        let granter_b64 = pubkey_b64(&granter_signing);
+        let tenant = format!("pg-pd-self-{}", Uuid::new_v4().simple());
+        pg_cleanup_trust_grants(&backend, &tenant).await;
+        pg_seed_federation_key(&backend, &granter_b64).await;
+
+        let entry = build_trust_grant_entry_pg(
+            &granter_signing,
+            &tenant,
+            1,
+            GENESIS_PREV_HASH.to_vec(),
+            &granter_b64, // grantee == granter
+            TrustPurpose::Service,
+            "service:llm",
+            None,
+        );
+        let err = backend.record_entry(entry).await.unwrap_err();
+        assert!(
+            matches!(err, Error::TrustGrant(_)),
+            "expected Error::TrustGrant, got {err:?}"
+        );
+        assert_eq!(
+            pg_count_grants(&backend, &tenant).await,
+            0,
+            "no projection row materialized"
+        );
+        pg_cleanup_trust_grants(&backend, &tenant).await;
+    }
+
+    /// v1.5.0 Phase D — Malformed payload surfaces Error::TrustGrant
+    /// while the chain row already stands (PG parity).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_project_malformed_payload_surfaces_error() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let granter_signing = SigningKey::from_bytes(&[0x78; 32]);
+        let tenant = format!("pg-pd-malformed-{}", Uuid::new_v4().simple());
+        pg_cleanup_trust_grants(&backend, &tenant).await;
+
+        let mut entry = AuditEntry {
+            entry_id: Uuid::new_v4().to_string(),
+            sequence_number: 1,
+            tenant_id: tenant.clone(),
+            actor_id: pubkey_b64(&granter_signing),
+            action_type: "trust_granted".into(),
+            subject_kind: crate::federation::trust_grant::TRUST_GRANT_SUBJECT_KIND.into(),
+            subject_id: "irrelevant".into(),
+            payload: serde_json::json!({"junk": "value"}),
+            prev_hash: GENESIS_PREV_HASH.to_vec(),
+            entry_hash: vec![],
+            recorded_at: super::super::verify::truncate_to_micros(Utc::now()),
+            signature: String::new(),
+        };
+        let hash = compute_entry_hash(&entry).unwrap();
+        entry.entry_hash = hash.to_vec();
+        let canonical = super::super::verify::canonical_bytes_for_entry(&entry).unwrap();
+        let sig = granter_signing.sign(&canonical);
+        entry.signature = B64.encode(sig.to_bytes());
+
+        let err = backend.record_entry(entry).await.unwrap_err();
+        assert!(
+            matches!(err, Error::TrustGrant(_)),
+            "expected Error::TrustGrant, got {err:?}"
+        );
+
+        // Chain row stands (option-(b)).
+        let page = backend
+            .list_entries(
+                AuditFilter {
+                    tenant_id: tenant.clone(),
+                    action_type: None,
+                    actor_id: None,
+                    subject_kind: None,
+                    subject_id: None,
+                    recorded_after: None,
+                    recorded_before: None,
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        pg_cleanup_trust_grants(&backend, &tenant).await;
     }
 }

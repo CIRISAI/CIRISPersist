@@ -106,6 +106,17 @@ pub enum Error {
     /// any missing Merkle projection rows.
     #[error("merkle: {0}")]
     Merkle(String),
+
+    /// TrustGrant projection-layer error (v1.5.0 Phase D). Surfaces
+    /// a failure from the `subject_kind="trust_grant"` materialization
+    /// hook that UPSERTs into `federation_trust_grants`. Same atomicity
+    /// stance as `Merkle`: chain commit lands FIRST, projection runs
+    /// AFTER. A failure here means the audit row + Merkle leaf are
+    /// already on-chain (source of truth) but the projection row is
+    /// missing or stale; Phase I's V021 backfill recomputes it from
+    /// the chain. Callers should NOT re-issue the audit entry.
+    #[error("trust_grant: {0}")]
+    TrustGrant(String),
 }
 
 impl Error {
@@ -121,6 +132,7 @@ impl Error {
             Error::NotImplemented(_) => "audit_not_implemented",
             Error::Internal(_) => "audit_internal",
             Error::Merkle(_) => "audit_merkle",
+            Error::TrustGrant(_) => "audit_trust_grant",
         }
     }
 }
@@ -151,6 +163,7 @@ mod tests {
         assert_eq!(Error::NotImplemented("x").kind(), "audit_not_implemented");
         assert_eq!(Error::Internal("x".into()).kind(), "audit_internal");
         assert_eq!(Error::Merkle("x".into()).kind(), "audit_merkle");
+        assert_eq!(Error::TrustGrant("x".into()).kind(), "audit_trust_grant");
     }
 
     #[test]

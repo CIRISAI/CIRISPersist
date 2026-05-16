@@ -6548,7 +6548,8 @@ fn audit_err_to_py(e: crate::audit::Error) -> PyErr {
         crate::audit::Error::Backend(_)
         | crate::audit::Error::NotImplemented(_)
         | crate::audit::Error::Internal(_)
-        | crate::audit::Error::Merkle(_) => PyRuntimeError::new_err(kind),
+        | crate::audit::Error::Merkle(_)
+        | crate::audit::Error::TrustGrant(_) => PyRuntimeError::new_err(kind),
     }
 }
 

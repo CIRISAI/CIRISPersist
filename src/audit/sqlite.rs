@@ -164,6 +164,113 @@ async fn merkle_hook_sqlite(
     Ok(())
 }
 
+/// v1.5.0 Phase D — TrustGrant projection hook (SQLite parity with
+/// `project_trust_grant_pg`). UPSERTs `federation_trust_grants` keyed
+/// by `(grantee_key, granter_key, purpose, scope)` per FSD §3.6. On
+/// SQLite the table is bare (no `cirislens.` schema prefix). Same
+/// out-of-transaction stance as the Merkle hook (option (b) from
+/// Phase C).
+async fn project_trust_grant_sqlite(
+    backend: &SqliteAuditBackend,
+    entry: &AuditEntry,
+    chain_event_id: i64,
+) -> Result<(), Error> {
+    use crate::federation::trust_grant::TrustGrantPayload;
+    use rusqlite::params;
+    use uuid::Uuid;
+
+    let payload: TrustGrantPayload = serde_json::from_value(entry.payload.clone())
+        .map_err(|e| Error::TrustGrant(format!("payload deserialize: {e}")))?;
+
+    let granter_key = entry.actor_id.clone();
+    let grantee_key = payload.grantee_key.clone();
+
+    if granter_key == grantee_key {
+        return Err(Error::TrustGrant(
+            "self-grant rejected (granter == grantee)".into(),
+        ));
+    }
+
+    let purpose_str = payload.purpose.as_str().to_string();
+    let scope = payload.scope.clone();
+    let chain_event_hash = entry.entry_hash.clone();
+    let granted_at = fmt_datetime(entry.recorded_at);
+    let expires_at_str = payload.expires_at.map(fmt_datetime);
+    let tenant_id = entry.tenant_id.clone();
+    // SQLite has no gen_random_uuid(); the V021 SQLite schema marks
+    // grant_id as TEXT PRIMARY KEY with caller-generated UUID. On
+    // re-issuance we don't actually need the new uuid (UPSERT keeps
+    // the existing row's grant_id), but we still need a value to
+    // attempt the INSERT half of `INSERT … ON CONFLICT DO UPDATE`.
+    let new_grant_id = Uuid::new_v4().to_string();
+
+    let conn = backend.conn_handle();
+    tokio::task::spawn_blocking(move || -> Result<(), Error> {
+        let guard = conn.blocking_lock();
+        // Emulate the Postgres revocation rule:
+        //   revoked_at = CASE WHEN expires_at <= NOW() THEN NOW()
+        //                ELSE NULL END
+        //   revoked_by = CASE WHEN expires_at <= NOW() THEN granter
+        //                ELSE NULL END
+        // SQLite's strftime returns the format we use for the column
+        // (RFC 3339-ish TEXT). `expires_at` is text; lexical
+        // comparison works because all timestamps are normalized to
+        // UTC `Z`-suffixed RFC 3339 (see `fmt_datetime`).
+        // We compute the projected revoked_at / revoked_by values in
+        // Rust to keep the SQL portable. `now` is captured once so
+        // CHECK (`revoked_at IS NULL OR revoked_by IS NOT NULL`) is
+        // satisfied transactionally.
+        let now_str = fmt_datetime(chrono::Utc::now());
+        let is_revocation = expires_at_str
+            .as_deref()
+            .map(|e| e <= now_str.as_str())
+            .unwrap_or(false);
+        let (revoked_at_param, revoked_by_param): (Option<String>, Option<String>) =
+            if is_revocation {
+                (Some(now_str.clone()), Some(granter_key.clone()))
+            } else {
+                (None, None)
+            };
+
+        guard
+            .execute(
+                "INSERT INTO federation_trust_grants (\
+                    grant_id, grantee_key, granter_key, purpose, scope, \
+                    granted_at, expires_at, revoked_at, revoked_by, \
+                    chain_event_id, chain_event_hash, tenant_id\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+                 ON CONFLICT (grantee_key, granter_key, purpose, scope) DO UPDATE SET \
+                    granted_at = excluded.granted_at, \
+                    expires_at = excluded.expires_at, \
+                    chain_event_id = excluded.chain_event_id, \
+                    chain_event_hash = excluded.chain_event_hash, \
+                    tenant_id = excluded.tenant_id, \
+                    revoked_at = excluded.revoked_at, \
+                    revoked_by = excluded.revoked_by",
+                params![
+                    new_grant_id,
+                    grantee_key,
+                    granter_key,
+                    purpose_str,
+                    scope,
+                    granted_at,
+                    expires_at_str,
+                    revoked_at_param,
+                    revoked_by_param,
+                    chain_event_id,
+                    chain_event_hash,
+                    tenant_id,
+                ],
+            )
+            .map_err(|e| Error::TrustGrant(format!("UPSERT federation_trust_grants: {e}")))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| Error::TrustGrant(format!("spawn_blocking join: {e}")))??;
+
+    Ok(())
+}
+
 fn map_sqlite_error(e: rusqlite::Error, op: &str) -> Error {
     use rusqlite::ErrorCode;
     if let rusqlite::Error::SqliteFailure(err, _) = &e {
@@ -370,6 +477,12 @@ impl AuditService for SqliteAuditBackend {
         // is projection (see `merkle_hook_sqlite` rustdoc + the PG
         // sibling helper).
         merkle_hook_sqlite(self, &entry, entry.sequence_number).await?;
+
+        // v1.5.0 Phase D — TrustGrant projection (SQLite parity with
+        // `project_trust_grant_pg`). Gated on subject_kind.
+        if entry.subject_kind == crate::federation::trust_grant::TRUST_GRANT_SUBJECT_KIND {
+            project_trust_grant_sqlite(self, &entry, entry.sequence_number).await?;
+        }
 
         Ok(())
     }
@@ -870,8 +983,16 @@ impl AuditService for SqliteAuditBackend {
         // (same gating rule as the PG impl). On `AlreadyClaimed` the
         // existing row's Merkle leaf already landed at the original
         // call; re-appending here would double-count.
+        //
+        // v1.5.0 Phase D — TrustGrant projection same gating: only
+        // on the newly-stored path. AlreadyClaimed → the prior call
+        // already ran the projection (or, if Phase D wasn't deployed
+        // at that prior time, Phase I's backfill will fill it in).
         if let ClaimResult::Stored(_) = &result {
             merkle_hook_sqlite(self, &entry, entry.sequence_number).await?;
+            if entry.subject_kind == crate::federation::trust_grant::TRUST_GRANT_SUBJECT_KIND {
+                project_trust_grant_sqlite(self, &entry, entry.sequence_number).await?;
+            }
         }
 
         Ok(result)
@@ -1519,5 +1640,553 @@ mod tests {
         let (l, s) = count_merkle_rows(&audit, &tenant).await;
         assert_eq!(l, 1, "exactly one leaf — replay was chain-rejected");
         assert_eq!(s, 1);
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // v1.5.0 Phase D — TrustGrant projection tests (SQLite)
+    // ────────────────────────────────────────────────────────────────
+
+    /// Seed a row in `federation_keys` for the given `key_id` so the
+    /// FK constraints on `federation_trust_grants` (grantee / granter
+    /// / revoked_by all reference `federation_keys(key_id)`) are
+    /// satisfied. The pubkey + envelope columns get throwaway values;
+    /// only the FK shape matters for Phase D's projection tests.
+    async fn seed_federation_key(audit: &SqliteAuditBackend, key_id: &str) {
+        let conn = audit.conn_handle();
+        let key_id = key_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT OR IGNORE INTO federation_keys (\
+                    key_id, pubkey_ed25519_base64, algorithm, \
+                    identity_type, identity_ref, valid_from, \
+                    registration_envelope, original_content_hash, \
+                    scrub_signature_classical, scrub_key_id, \
+                    scrub_timestamp, persist_row_hash\
+                 ) VALUES (?1, 'AAAA', 'hybrid', 'agent', ?1, \
+                          '2026-01-01T00:00:00Z', '{}', \
+                          x'00', '', ?1, '2026-01-01T00:00:00Z', '0')",
+                rusqlite::params![key_id],
+            )
+            .unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Build + sign a trust_grant audit entry. Mirrors `build_and_sign`
+    /// but parameterizes the payload + sets `subject_kind="trust_grant"`.
+    #[allow(clippy::too_many_arguments)]
+    fn build_trust_grant_entry(
+        granter_key: &SigningKey,
+        tenant_id: &str,
+        sequence_number: i64,
+        prev_hash: Vec<u8>,
+        grantee_key_b64: &str,
+        purpose: crate::federation::trust_grant::TrustPurpose,
+        scope: &str,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> AuditEntry {
+        let payload = serde_json::json!({
+            "grantee_key": grantee_key_b64,
+            "purpose": purpose.as_str(),
+            "scope": scope,
+            "expires_at": expires_at.map(|t| t.to_rfc3339()),
+            "rationale": "phase-D-test",
+        });
+        let mut entry = AuditEntry {
+            entry_id: Uuid::new_v4().to_string(),
+            sequence_number,
+            tenant_id: tenant_id.to_owned(),
+            actor_id: pubkey_b64(granter_key),
+            action_type: "trust_granted".into(),
+            subject_kind: crate::federation::trust_grant::TRUST_GRANT_SUBJECT_KIND.into(),
+            subject_id: grantee_key_b64.to_owned(),
+            payload,
+            prev_hash,
+            entry_hash: vec![],
+            recorded_at: truncate_to_micros(chrono::Utc::now()),
+            signature: String::new(),
+        };
+        let hash = compute_entry_hash(&entry).unwrap();
+        entry.entry_hash = hash.to_vec();
+        let canonical = crate::audit::verify::canonical_bytes_for_entry(&entry).unwrap();
+        let sig = granter_key.sign(&canonical);
+        entry.signature = B64.encode(sig.to_bytes());
+        entry
+    }
+
+    #[derive(Debug, Clone)]
+    struct ProjectedGrantRow {
+        grant_id: String,
+        grantee_key: String,
+        granter_key: String,
+        purpose: String,
+        scope: String,
+        granted_at: String,
+        expires_at: Option<String>,
+        revoked_at: Option<String>,
+        revoked_by: Option<String>,
+        chain_event_id: i64,
+        tenant_id: String,
+    }
+
+    async fn fetch_grant(
+        audit: &SqliteAuditBackend,
+        grantee: &str,
+        granter: &str,
+        purpose: &str,
+        scope: &str,
+    ) -> Option<ProjectedGrantRow> {
+        let conn = audit.conn_handle();
+        let grantee = grantee.to_owned();
+        let granter = granter.to_owned();
+        let purpose = purpose.to_owned();
+        let scope = scope.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.query_row(
+                "SELECT grant_id, grantee_key, granter_key, purpose, scope, \
+                        granted_at, expires_at, revoked_at, revoked_by, \
+                        chain_event_id, tenant_id \
+                 FROM federation_trust_grants \
+                 WHERE grantee_key = ?1 AND granter_key = ?2 \
+                   AND purpose = ?3 AND scope = ?4",
+                rusqlite::params![grantee, granter, purpose, scope],
+                |row| {
+                    Ok(ProjectedGrantRow {
+                        grant_id: row.get(0)?,
+                        grantee_key: row.get(1)?,
+                        granter_key: row.get(2)?,
+                        purpose: row.get(3)?,
+                        scope: row.get(4)?,
+                        granted_at: row.get(5)?,
+                        expires_at: row.get(6)?,
+                        revoked_at: row.get(7)?,
+                        revoked_by: row.get(8)?,
+                        chain_event_id: row.get(9)?,
+                        tenant_id: row.get(10)?,
+                    })
+                },
+            )
+            .optional()
+            .unwrap()
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn count_grants(audit: &SqliteAuditBackend, tenant: &str) -> i64 {
+        let conn = audit.conn_handle();
+        let tenant = tenant.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.query_row(
+                "SELECT COUNT(*) FROM federation_trust_grants WHERE tenant_id = ?1",
+                rusqlite::params![tenant],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        })
+        .await
+        .unwrap()
+    }
+
+    /// v1.5.0 Phase D — Non-trust-grant entries do NOT touch
+    /// federation_trust_grants. The projection is gated on
+    /// `subject_kind == "trust_grant"`; an entry with
+    /// `subject_kind="task"` (the default for `build_and_sign`)
+    /// must leave the projection empty.
+    #[tokio::test]
+    async fn project_skips_non_trust_grant_subject_kinds() {
+        let (_b, audit) = fresh_backend().await;
+        let key = SigningKey::from_bytes(&[0x10; 32]);
+        let tenant = format!("audit-pd-skip-{}", Uuid::new_v4().simple());
+
+        let e1 = build_and_sign(&key, &tenant, 1, GENESIS_PREV_HASH.to_vec(), "task_signed");
+        audit.record_entry(e1.clone()).await.unwrap();
+        let e2 = build_and_sign(&key, &tenant, 2, e1.entry_hash.clone(), "config_changed");
+        audit.record_entry(e2.clone()).await.unwrap();
+
+        assert_eq!(count_grants(&audit, &tenant).await, 0);
+    }
+
+    /// v1.5.0 Phase D — A trust_grant entry materializes one row in
+    /// federation_trust_grants with the expected values.
+    #[tokio::test]
+    async fn project_new_grant_materializes_row() {
+        use crate::federation::trust_grant::TrustPurpose;
+        let (_b, audit) = fresh_backend().await;
+
+        let granter_signing = SigningKey::from_bytes(&[0x11; 32]);
+        let granter_b64 = pubkey_b64(&granter_signing);
+        let grantee_b64 = pubkey_b64(&SigningKey::from_bytes(&[0x12; 32]));
+        let tenant = format!("audit-pd-new-{}", Uuid::new_v4().simple());
+
+        seed_federation_key(&audit, &granter_b64).await;
+        seed_federation_key(&audit, &grantee_b64).await;
+
+        let entry = build_trust_grant_entry(
+            &granter_signing,
+            &tenant,
+            1,
+            GENESIS_PREV_HASH.to_vec(),
+            &grantee_b64,
+            TrustPurpose::Contribution,
+            "proposal:registry_vouch",
+            None,
+        );
+        audit.record_entry(entry.clone()).await.unwrap();
+
+        let row = fetch_grant(
+            &audit,
+            &grantee_b64,
+            &granter_b64,
+            "contribution",
+            "proposal:registry_vouch",
+        )
+        .await
+        .expect("grant row materialized");
+        assert_eq!(row.grantee_key, grantee_b64);
+        assert_eq!(row.granter_key, granter_b64);
+        assert_eq!(row.purpose, "contribution");
+        assert_eq!(row.scope, "proposal:registry_vouch");
+        assert_eq!(row.chain_event_id, 1);
+        assert_eq!(row.tenant_id, tenant);
+        assert!(row.revoked_at.is_none());
+        assert!(row.revoked_by.is_none());
+        assert!(row.expires_at.is_none());
+        // granted_at follows entry.recorded_at (modulo micro
+        // truncation). The exact string match isn't useful; sanity-
+        // check that the column is populated.
+        assert!(!row.granted_at.is_empty());
+
+        assert_eq!(count_grants(&audit, &tenant).await, 1);
+    }
+
+    /// v1.5.0 Phase D — Re-issuance of the same (grantee, granter,
+    /// purpose, scope) tuple updates the existing row in place. Row
+    /// count stays 1; chain_event_id refreshes to the latest entry's
+    /// sequence_number.
+    #[tokio::test]
+    async fn project_re_issuance_updates_existing_row() {
+        use crate::federation::trust_grant::TrustPurpose;
+        let (_b, audit) = fresh_backend().await;
+
+        let granter_signing = SigningKey::from_bytes(&[0x21; 32]);
+        let granter_b64 = pubkey_b64(&granter_signing);
+        let grantee_b64 = pubkey_b64(&SigningKey::from_bytes(&[0x22; 32]));
+        let tenant = format!("audit-pd-reissue-{}", Uuid::new_v4().simple());
+
+        seed_federation_key(&audit, &granter_b64).await;
+        seed_federation_key(&audit, &grantee_b64).await;
+
+        // Future expiry (well past now).
+        let far_future = chrono::Utc::now() + chrono::Duration::hours(48);
+
+        let e1 = build_trust_grant_entry(
+            &granter_signing,
+            &tenant,
+            1,
+            GENESIS_PREV_HASH.to_vec(),
+            &grantee_b64,
+            TrustPurpose::Technical,
+            "manifest:stable",
+            None,
+        );
+        audit.record_entry(e1.clone()).await.unwrap();
+
+        // Re-issue with an explicit future expiry — row updates in
+        // place. Capture grant_id BEFORE the re-issuance.
+        let original = fetch_grant(
+            &audit,
+            &grantee_b64,
+            &granter_b64,
+            "technical",
+            "manifest:stable",
+        )
+        .await
+        .expect("first grant row");
+        let original_grant_id = original.grant_id.clone();
+
+        // Force a recorded_at delta so the granted_at column changes.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let e2 = build_trust_grant_entry(
+            &granter_signing,
+            &tenant,
+            2,
+            e1.entry_hash.clone(),
+            &grantee_b64,
+            TrustPurpose::Technical,
+            "manifest:stable",
+            Some(far_future),
+        );
+        audit.record_entry(e2.clone()).await.unwrap();
+
+        assert_eq!(
+            count_grants(&audit, &tenant).await,
+            1,
+            "re-issuance does not insert a new row"
+        );
+        let row = fetch_grant(
+            &audit,
+            &grantee_b64,
+            &granter_b64,
+            "technical",
+            "manifest:stable",
+        )
+        .await
+        .expect("row still present");
+        assert_eq!(
+            row.grant_id, original_grant_id,
+            "grant_id is stable across re-issuance (UPSERT keeps PK)"
+        );
+        assert_eq!(row.chain_event_id, 2, "chain_event_id refreshed");
+        assert!(
+            row.expires_at.is_some(),
+            "expires_at populated by re-issuance"
+        );
+        assert!(row.revoked_at.is_none(), "future expiry → not revocation");
+        assert!(row.revoked_by.is_none());
+    }
+
+    /// v1.5.0 Phase D — Revocation per FSD §3.4 is a re-issuance with
+    /// `expires_at <= NOW()`. The projection detects this and sets
+    /// `revoked_at` + `revoked_by`.
+    #[tokio::test]
+    async fn project_revocation_sets_revoked_at() {
+        use crate::federation::trust_grant::TrustPurpose;
+        let (_b, audit) = fresh_backend().await;
+
+        let granter_signing = SigningKey::from_bytes(&[0x31; 32]);
+        let granter_b64 = pubkey_b64(&granter_signing);
+        let grantee_b64 = pubkey_b64(&SigningKey::from_bytes(&[0x32; 32]));
+        let tenant = format!("audit-pd-revoke-{}", Uuid::new_v4().simple());
+
+        seed_federation_key(&audit, &granter_b64).await;
+        seed_federation_key(&audit, &grantee_b64).await;
+
+        // Initial grant: no expiry.
+        let e1 = build_trust_grant_entry(
+            &granter_signing,
+            &tenant,
+            1,
+            GENESIS_PREV_HASH.to_vec(),
+            &grantee_b64,
+            TrustPurpose::Deferral,
+            "medical_deferral",
+            None,
+        );
+        audit.record_entry(e1.clone()).await.unwrap();
+
+        // Revocation: re-issuance with expires_at = past timestamp.
+        let past = chrono::Utc::now() - chrono::Duration::seconds(60);
+        let e2 = build_trust_grant_entry(
+            &granter_signing,
+            &tenant,
+            2,
+            e1.entry_hash.clone(),
+            &grantee_b64,
+            TrustPurpose::Deferral,
+            "medical_deferral",
+            Some(past),
+        );
+        audit.record_entry(e2.clone()).await.unwrap();
+
+        let row = fetch_grant(
+            &audit,
+            &grantee_b64,
+            &granter_b64,
+            "deferral",
+            "medical_deferral",
+        )
+        .await
+        .expect("grant row");
+        assert!(row.revoked_at.is_some(), "revocation populates revoked_at");
+        assert_eq!(
+            row.revoked_by.as_deref(),
+            Some(granter_b64.as_str()),
+            "revoked_by = granter (author-only per §3.4)"
+        );
+        assert_eq!(count_grants(&audit, &tenant).await, 1);
+    }
+
+    /// v1.5.0 Phase D — Self-grant (granter == grantee) is rejected
+    /// with Error::TrustGrant. Mirrors the V021 CHECK constraint AND
+    /// FSD §3.6 integrity rule.
+    #[tokio::test]
+    async fn project_self_grant_rejected() {
+        use crate::federation::trust_grant::TrustPurpose;
+        let (_b, audit) = fresh_backend().await;
+
+        let granter_signing = SigningKey::from_bytes(&[0x41; 32]);
+        let granter_b64 = pubkey_b64(&granter_signing);
+        let tenant = format!("audit-pd-self-{}", Uuid::new_v4().simple());
+
+        seed_federation_key(&audit, &granter_b64).await;
+
+        let entry = build_trust_grant_entry(
+            &granter_signing,
+            &tenant,
+            1,
+            GENESIS_PREV_HASH.to_vec(),
+            &granter_b64, // grantee = granter
+            TrustPurpose::Service,
+            "service:llm",
+            None,
+        );
+        let err = audit.record_entry(entry).await.unwrap_err();
+        assert!(
+            matches!(err, Error::TrustGrant(_)),
+            "expected Error::TrustGrant, got {err:?}"
+        );
+        assert_eq!(
+            count_grants(&audit, &tenant).await,
+            0,
+            "no projection row materialized on self-grant"
+        );
+    }
+
+    /// v1.5.0 Phase D — Multi-tenant isolation. The UNIQUE constraint
+    /// on `(grantee_key, granter_key, purpose, scope)` intentionally
+    /// omits `tenant_id` per FSD §3.6 — the grant identity is the
+    /// relationship + purpose + scope, not the audit log location.
+    /// So a same-tuple grant under tenant-B UPDATES the tenant-A row
+    /// (treating gossip cross-emission as re-issuance), keeping a
+    /// single canonical projection per relationship globally.
+    ///
+    /// This test verifies that semantic: two tenants emitting the
+    /// same logical grant resolve to one row whose `tenant_id`
+    /// reflects the latest emit.
+    #[tokio::test]
+    async fn project_cross_tenant_collapses_per_unique_constraint() {
+        use crate::federation::trust_grant::TrustPurpose;
+        let (_b, audit) = fresh_backend().await;
+
+        let granter_signing = SigningKey::from_bytes(&[0x51; 32]);
+        let granter_b64 = pubkey_b64(&granter_signing);
+        let grantee_b64 = pubkey_b64(&SigningKey::from_bytes(&[0x52; 32]));
+        let tenant_a = format!("audit-pd-mt-A-{}", Uuid::new_v4().simple());
+        let tenant_b = format!("audit-pd-mt-B-{}", Uuid::new_v4().simple());
+
+        seed_federation_key(&audit, &granter_b64).await;
+        seed_federation_key(&audit, &grantee_b64).await;
+
+        let a1 = build_trust_grant_entry(
+            &granter_signing,
+            &tenant_a,
+            1,
+            GENESIS_PREV_HASH.to_vec(),
+            &grantee_b64,
+            TrustPurpose::Contribution,
+            "proposal:registry_vouch",
+            None,
+        );
+        audit.record_entry(a1.clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let b1 = build_trust_grant_entry(
+            &granter_signing,
+            &tenant_b,
+            1,
+            GENESIS_PREV_HASH.to_vec(),
+            &grantee_b64,
+            TrustPurpose::Contribution,
+            "proposal:registry_vouch",
+            None,
+        );
+        audit.record_entry(b1.clone()).await.unwrap();
+
+        let row = fetch_grant(
+            &audit,
+            &grantee_b64,
+            &granter_b64,
+            "contribution",
+            "proposal:registry_vouch",
+        )
+        .await
+        .expect("grant row");
+        // Tenant B emit landed last → row.tenant_id == tenant_b.
+        assert_eq!(row.tenant_id, tenant_b);
+        // The grants table should hold one row TOTAL across both
+        // tenants (UNIQUE constraint per FSD §3.6).
+        let total: i64 = {
+            let conn = audit.conn_handle();
+            tokio::task::spawn_blocking(move || {
+                let conn = conn.blocking_lock();
+                conn.query_row("SELECT COUNT(*) FROM federation_trust_grants", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap()
+            })
+            .await
+            .unwrap()
+        };
+        assert_eq!(
+            total, 1,
+            "cross-tenant same-tuple emits collapse via UPSERT"
+        );
+    }
+
+    /// v1.5.0 Phase D — A malformed trust_grant payload (subject_kind
+    /// is "trust_grant" but the payload doesn't parse as a
+    /// TrustGrantPayload) surfaces as Error::TrustGrant. The chain
+    /// row already landed at this point — that's the documented
+    /// option-(b) atomicity stance (Phase I will reconcile).
+    #[tokio::test]
+    async fn project_malformed_payload_surfaces_error() {
+        let (_b, audit) = fresh_backend().await;
+        let granter_signing = SigningKey::from_bytes(&[0x61; 32]);
+        let tenant = format!("audit-pd-malformed-{}", Uuid::new_v4().simple());
+
+        let mut entry = AuditEntry {
+            entry_id: Uuid::new_v4().to_string(),
+            sequence_number: 1,
+            tenant_id: tenant.clone(),
+            actor_id: pubkey_b64(&granter_signing),
+            action_type: "trust_granted".into(),
+            subject_kind: crate::federation::trust_grant::TRUST_GRANT_SUBJECT_KIND.into(),
+            subject_id: "irrelevant".into(),
+            // Missing required fields — won't deserialize.
+            payload: serde_json::json!({"junk": "value"}),
+            prev_hash: GENESIS_PREV_HASH.to_vec(),
+            entry_hash: vec![],
+            recorded_at: truncate_to_micros(chrono::Utc::now()),
+            signature: String::new(),
+        };
+        let hash = compute_entry_hash(&entry).unwrap();
+        entry.entry_hash = hash.to_vec();
+        let canonical = crate::audit::verify::canonical_bytes_for_entry(&entry).unwrap();
+        let sig = granter_signing.sign(&canonical);
+        entry.signature = B64.encode(sig.to_bytes());
+
+        let err = audit.record_entry(entry).await.unwrap_err();
+        assert!(
+            matches!(err, Error::TrustGrant(_)),
+            "expected Error::TrustGrant, got {err:?}"
+        );
+
+        // The chain entry DID land (option-(b)): list_entries finds it.
+        let page = audit
+            .list_entries(
+                AuditFilter {
+                    tenant_id: tenant.clone(),
+                    action_type: None,
+                    actor_id: None,
+                    subject_kind: None,
+                    subject_id: None,
+                    recorded_after: None,
+                    recorded_before: None,
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.items.len(),
+            1,
+            "chain row stands even when projection fails (FSD §4.2)"
+        );
     }
 }

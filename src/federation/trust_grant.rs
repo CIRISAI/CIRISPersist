@@ -59,6 +59,12 @@ impl TrustPurpose {
     }
 }
 
+/// The `subject_kind` value persist's audit ingest hook keys on to
+/// materialize a `federation_trust_grants` row. NodeCore SCHEMA §3.2
+/// 871ebab vocabulary; persist's V021 CHECK constraint on
+/// `audit_log.subject_kind` is the wire contract. v1.5.0 Phase D.
+pub const TRUST_GRANT_SUBJECT_KIND: &str = "trust_grant";
+
 /// Trust grant payload — the `subject_kind="trust_grant"` Contribution
 /// payload per NodeCore SCHEMA §3.2 / §4.x and CIRISPersist FSD §3.2.
 ///
