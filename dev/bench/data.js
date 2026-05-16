@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778963253035,
+  "lastUpdate": 1778967542603,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -15527,6 +15527,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 24267740,
             "range": "± 361651",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "6d22b13acfaa134c3473b07a594383c925b67e0e",
+          "message": "docs(FSD): rev §4 with SOTA Merkle transparency anchored on CIRISVerify\n\nReconciles the FSD's §4.1 InclusionProof with what the substrate\nactually supports. The previous version overpromised Trillian/CT-style\nproofs against infrastructure that didn't exist; investigation\nsurfaced that CIRISVerify already has a Merkle transparency log at\nciris-verify-core::transparency for license attestation.\n\nArchitectural call: Verify is the wellspring for transparency\nprimitives; persist consumes; edge consumes. No parallel Merkle\nimplementations. The SOTA primitives are baked into Verify at the\nfoundation, and every downstream consumer pulls them in.\n\nCIRISVerify#23 filed requesting the six-piece SOTA upgrade:\n- RFC 6962 byte prefixes (0x00 leaf, 0x01 node) replacing string prefixes\n- Generic TransparencyLeaf trait (license/audit/edge plug-ins)\n- SignedTreeHead with HybridSignature + reserved witness_signatures\n- ConsistencyProof per RFC 6962 §2.1.2\n- TransparencyStore trait (in-memory/file for Verify, PG/SQLite for Persist)\n- Per-log_id / per-tenant scoping (maps to persist's per-tenant chains)\n\nMigration is clean at the audit-chain-bridge boundary\n(genesis-on-cutover policy already locked) — no mixed-prefix\nverification needed.\n\nFSD changes:\n- §1.1: cross-coordinates with CIRISVerify#23 added (the new upstream gate)\n- §4.1: TrustGrantInclusionProof shape now references SignedTreeHead +\n  MerkleProof + leaf_canonical_bytes from ciris_verify_core. Adds\n  trust_grant_consistency_proof + current_sth APIs.\n- §4.4 NEW: per-tenant Merkle transparency layer — RFC 6962 tree\n  shape, STH signing cadence, merkle_leaves/merkle_sth_log/merkle_nodes\n  schema additions, threat-model coverage table, external verifier flow.\n- §8: implementation order reworked — Verify SOTA upgrade is now\n  step 2 (upstream gate); persist substrate work steps 3-9 depend\n  on it. Downstream steps 10-13 unchanged in shape.\n\nThreat-model justification: STH defends against split-view,\nConsistencyProof defends against retroactive insertion, per-tenant\nscoping preserves the existing audit-chain isolation invariant,\nhybrid signing extends quantum resistance to the signing axis (the\nSHA-256 tree is already PQ-resistant).\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-16T16:30:19-05:00",
+          "tree_id": "47b0045d3e0734ac2ed4252f6ad2e9db787aa81d",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/6d22b13acfaa134c3473b07a594383c925b67e0e"
+        },
+        "date": 1778967541525,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 90111,
+            "range": "± 500",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 206859,
+            "range": "± 377",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 439126,
+            "range": "± 1303",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1544411,
+            "range": "± 13404",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 253,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1063,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 5010,
+            "range": "± 53",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 17939,
+            "range": "± 146",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 20461,
+            "range": "± 158",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 70589,
+            "range": "± 170",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 277,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 2411,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 7512,
+            "range": "± 32",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 32470,
+            "range": "± 114",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 521,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2195058,
+            "range": "± 8532543",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 5892429,
+            "range": "± 618076",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 20484272,
+            "range": "± 20734843",
             "unit": "ns/iter"
           }
         ]
