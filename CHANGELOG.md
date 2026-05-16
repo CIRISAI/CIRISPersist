@@ -5,6 +5,55 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.3.1] — 2026-05-16
+
+**CIRISAgent 2.9.0 cutover support cut.** Two upstream asks from
+[CIRISAgent#763](https://github.com/CIRISAI/CIRISAgent/issues/763)
+Lane A bundled into one release: documentation for the audit-chain
+bridge mechanism + Lane C federation identity registration, plus the
+[#49](https://github.com/CIRISAI/CIRISPersist/issues/49) timestamp
+preservation fix on `cirisgraph_upsert_node` / `cirisgraph_upsert_edge`.
+
+### `docs/AUDIT_CHAIN_BRIDGE.md` (NEW)
+
+Operational documentation covering bridge-entry mechanism for rooting
+a new `cirisaudit` chain on top of an existing chain, `tenant_id`
+semantics (opaque, caller-defined, stable; don't change mid-chain),
+`signing_key_id` registration flow (one-time `federation_put_public_key`
+at boot; idempotent), 2.9.0 first-boot flow pseudo-code, trust
+hierarchy registration call shapes for Lane C C3.
+
+Unblocks **CIRISAgent#763 A0b** (audit chain re-root) and **Lane C**
+(federation verify + steward signing wiring).
+
+### `#49` timestamp preservation
+
+`cirisgraph_upsert_node` and `cirisgraph_upsert_edge` previously
+stamped `chrono::Utc::now()` / SQL `NOW()` on every write, ignoring
+the caller-supplied `updated_at` / `created_at` fields on `GraphNode`
+and `GraphEdge`. Required-but-ignored.
+
+Fix:
+- `src/graph/postgres.rs::upsert_node` — INSERT VALUES now binds
+  `node.updated_at` and `node.created_at`; ON CONFLICT UPDATE uses
+  `EXCLUDED.updated_at`.
+- `src/graph/sqlite.rs::upsert_node` — same: `fmt_datetime(node.
+  updated_at)` and `fmt_datetime(node.created_at)` passed through.
+- Same fix on `upsert_edge` (both backends).
+
+Two regression tests in `src/graph/sqlite.rs::tests` reproducing the
+#49 body's historical-import scenario.
+
+Closes **CIRISPersist#49**. Unblocks **CIRISAgent#763 A0a** — the
+agent can use the typed `engine.cirisgraph_upsert_node()` API for
+bulk migration instead of bypassing to direct sqlite3 INSERT.
+
+### What's NOT in this cut
+
+- **PyO3 GIL boundary perf baseline** (low-priority ask) — deferred.
+  CIRISAgent Memory Benchmark scenario during Lane A integration
+  tests will surface any hot-path regression empirically.
+
 ## [1.3.0] — 2026-05-15
 
 **M2 cut: trust hierarchy absorption + role-tag enforcement
