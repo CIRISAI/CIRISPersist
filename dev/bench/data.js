@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778959905846,
+  "lastUpdate": 1778961502378,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -15263,6 +15263,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23604733,
             "range": "± 465769",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "aae4b57f035eb816fc1693abcdc359824c8607c7",
+          "message": "docs(FSD): fold TrustPurpose::Service per NodeCore 871ebab MESSAGE_TAXONOMY\n\nNodeCore§RC at 871ebab landed FSD/MESSAGE_TAXONOMY.md plus 15 new\nsubject_kinds (vs the original 4 in #3) — Searle/FIPA × counterparty ×\ntrust-gate taxonomy. The Persist-side coordination ask is minimal:\nextend TrustPurpose with Service variant + scope grammar.\n\nChanges:\n- §3.2 payload: TrustPurpose adds Service variant\n- §3.3 scope table: Service row with service:<kind> | service:<kind>:<resource>\n- §3.3 service scope examples: llm, embedding, tool kinds\n- §8 implementation order: NodeCore §RC step marked LANDED\n\nNon-breaking. No new columns, no new tables, no V021 footprint change.\nPer-invocation RPC remains edge-transport (out of scope here per\nMESSAGE_TAXONOMY §8); chain carries service_announcement /\nservice_deprecation / service_usage_summary via existing §3.2 route.\n\nCross-references:\n- NodeCore commit: https://github.com/CIRISAI/CIRISNodeCore/commit/871ebab\n- Persist v1.5.0 tracking: #53\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-16T14:50:35-05:00",
+          "tree_id": "cf6cb01a1a51f8eb15f492c51ebc690083eda1f2",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/aae4b57f035eb816fc1693abcdc359824c8607c7"
+        },
+        "date": 1778961501777,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101869,
+            "range": "± 598",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 242173,
+            "range": "± 2394",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 523912,
+            "range": "± 1625",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1848104,
+            "range": "± 8120",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 339,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1420,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7536,
+            "range": "± 50",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 22063,
+            "range": "± 35",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 25560,
+            "range": "± 595",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 84523,
+            "range": "± 1496",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 374,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 2995,
+            "range": "± 16",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9491,
+            "range": "± 87",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41628,
+            "range": "± 165",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2235989,
+            "range": "± 47038",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6609631,
+            "range": "± 94594",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23581679,
+            "range": "± 127900",
             "unit": "ns/iter"
           }
         ]
