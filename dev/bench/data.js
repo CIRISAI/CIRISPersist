@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778949083266,
+  "lastUpdate": 1778949216520,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -14735,6 +14735,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25747033,
             "range": "± 297473",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "2b510df927d3a1e34133f23f763756ba5d02be90",
+          "message": "chore(changelog): add v1.3.1 entry dropped by linter race in c639a37\n\nTag v1.3.1 already points at c639a37 (the code + docs commit).\nCHANGELOG had a linter-modify race during that commit and the v1.3.1\nsection didn't land. Patching forward here so the CHANGELOG matches\nthe tagged release.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-16T11:24:45-05:00",
+          "tree_id": "504abd37e98285b2f81a2fdba2591af4dfac3ba0",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/2b510df927d3a1e34133f23f763756ba5d02be90"
+        },
+        "date": 1778949215466,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101825,
+            "range": "± 735",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 241950,
+            "range": "± 768",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 521919,
+            "range": "± 8115",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1847828,
+            "range": "± 9604",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 351,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1443,
+            "range": "± 40",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7320,
+            "range": "± 105",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21184,
+            "range": "± 52",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24236,
+            "range": "± 260",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83625,
+            "range": "± 2225",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 359,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3220,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9477,
+            "range": "± 36",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41616,
+            "range": "± 218",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 621,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2260667,
+            "range": "± 134674",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6656102,
+            "range": "± 200883",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23709793,
+            "range": "± 189919",
             "unit": "ns/iter"
           }
         ]
