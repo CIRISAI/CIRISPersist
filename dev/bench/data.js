@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778951403172,
+  "lastUpdate": 1778959905846,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -15131,6 +15131,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25724009,
             "range": "± 1080670",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "ef8905d33f131b809fe7f6369f199914c604cef2",
+          "message": "docs(FSD): federation trust interface — purpose-scoped grants as signed events\n\nDrafts the v1.5.0 substrate FSD for trust grants as signed Contribution\nevents. Replaces the v1.3.0 trust-column shape on federation_keys with\na purpose-scoped grant table backed by audit-chain events.\n\nKey shape:\n- Identity = Ed25519+ML-DSA-65 hybrid pubkey (unchanged); roles\n  collapse to client/proxy/server (post-3.0 \"everything is an agent\").\n- Three purposes: Technical (manifests) / Deferral (domains) /\n  Contribution (evolution — including votes on any contribution).\n- Steward = topology-recovered (first grant signer), not a tag.\n- Grants are §3.2 subject_kind=\"trust_grant\" Contributions; ride the\n  existing HybridSignature + witness_set primitives (no crypto surface\n  added, CIRISVerify untouched).\n- Multi-signer in scope via existing witness_set (Accord consensus).\n- Trillian/CT-style inclusion proofs surfaced from the audit chain.\n- DID/VC layer explicitly rejected with 2026 SOTA citation.\n\nUpstream gates: NodeCore §RC additions — trust_grant + three new\nsubject_kinds (test_result, improvement, gratitude_signal). Filed\nseparately. Downstream rewires: NodeCore resolve_trust, LensCore\nverify_hybrid_and_check_grant, Portal Manage-Trust UI.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-16T14:24:25-05:00",
+          "tree_id": "fe79177f8b3b3de5472477cccb146ab334c0c0a5",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/ef8905d33f131b809fe7f6369f199914c604cef2"
+        },
+        "date": 1778959905101,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 106558,
+            "range": "± 925",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 245974,
+            "range": "± 1708",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 527169,
+            "range": "± 4435",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1849386,
+            "range": "± 21286",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 341,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1448,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7542,
+            "range": "± 52",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21156,
+            "range": "± 115",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24201,
+            "range": "± 64",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83542,
+            "range": "± 173",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 370,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3029,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9398,
+            "range": "± 94",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42218,
+            "range": "± 163",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2237634,
+            "range": "± 41527",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6585064,
+            "range": "± 167204",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23604733,
+            "range": "± 465769",
             "unit": "ns/iter"
           }
         ]
