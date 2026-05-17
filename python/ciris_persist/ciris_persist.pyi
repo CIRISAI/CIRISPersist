@@ -46,10 +46,48 @@ class Engine:
         public_key_b64: str,
         agent_id_hash: str | None = None,
     ) -> None:
-        """Register the agent's Ed25519 verifying key.
+        """Register a raw Ed25519 verifying key in the **lens audit-chain
+        directory** (`accord_public_keys`).
+
+        Used by lens-tier verifiers to look up the signing key for an
+        audit-chain entry. Distinct from `register_federation_key` /
+        `put_public_key`, which write to the **federation directory**
+        (`federation_keys` with full signed envelope + V020 trust
+        columns + V021 trust grants).
 
         Idempotent on the same key/value; rejects rotation (registering
         a different key for an existing key id raises).
+        """
+
+    def register_federation_key(
+        self,
+        identity_type: str,
+        identity_ref: str,
+        valid_until: str | None = None,
+        registration_envelope_json: str | None = None,
+        roles: list[str] | None = None,
+    ) -> str:
+        """v1.5.3 — One-call helper that registers THIS engine's local
+        pubkey in the **federation directory** (`federation_keys`).
+
+        Composes the existing canonicalize + sign + put_public_key
+        primitives so callers don't re-implement persist's canonical-bytes
+        rule in Python. Returns the registered `key_id` (equals
+        `engine.local_key_id()`).
+
+        Internally:
+        1. Canonicalizes `registration_envelope_json` (defaults to `{}`)
+           via persist's `PythonJsonDumpsCanonicalizer`.
+        2. Signs canonical bytes with the engine's local Ed25519 key.
+        3. Builds a self-signed `SignedKeyRecord` (scrub_key_id =
+           local_key_id).
+        4. Calls `put_public_key` — backend dispatch + cold-path
+           ML-DSA-65 PQC attach handled automatically.
+
+        Raises:
+            ValueError: no local signing identity, malformed valid_until,
+                or unparseable registration_envelope_json.
+            RuntimeError: backend / IO error.
         """
 
     def receive_and_persist(self, body: bytes) -> BatchSummary:

@@ -1384,6 +1384,146 @@ impl PyEngine {
         })
     }
 
+    /// v1.5.3 — One-call helper that registers THIS engine's local
+    /// pubkey as a `federation_keys` row of the specified
+    /// `identity_type`. Composes the existing primitives
+    /// (`canonicalize_envelope` + `local_sign` + `put_public_key`) so
+    /// callers don't have to re-implement persist's canonical-bytes
+    /// rule in their own language.
+    ///
+    /// What it does:
+    /// 1. Builds a `KeyRecord` with this engine's local Ed25519 pubkey
+    ///    + `key_id`, the supplied `identity_type` / `identity_ref` /
+    ///    `valid_until`, and `algorithm = "hybrid"`.
+    /// 2. Canonicalizes the supplied `registration_envelope` JSON via
+    ///    `PythonJsonDumpsCanonicalizer` (same rule the existing
+    ///    `canonicalize_envelope` PyO3 method uses).
+    /// 3. Signs those canonical bytes with the local Ed25519 key →
+    ///    `scrub_signature_classical`.
+    /// 4. `original_content_hash = hex(SHA-256(canonical_bytes))`.
+    /// 5. `scrub_key_id = key_id` (self-signed bootstrap row).
+    /// 6. ML-DSA-65 half left as `None` — the existing cold-path PQC
+    ///    fill in `put_public_key` will attach the PQC signature
+    ///    asynchronously if the engine was constructed with PQC keys.
+    /// 7. Calls `put_public_key` with the assembled `SignedKeyRecord`.
+    ///
+    /// Returns the registered `key_id` (which equals
+    /// `engine.local_key_id()`).
+    ///
+    /// Idempotent on `(key_id)` PRIMARY KEY of `federation_keys` — the
+    /// underlying `put_public_key` writer rejects on key_id conflict
+    /// with differing content, no-ops on identical re-registration.
+    ///
+    /// Raises:
+    /// - `ValueError` if no local signing identity is configured.
+    /// - `ValueError` if `valid_until` is malformed ISO-8601.
+    /// - `ValueError` if `registration_envelope_json` doesn't parse.
+    /// - `RuntimeError` for backend errors (pool, conflict, etc.).
+    #[pyo3(signature = (identity_type, identity_ref, valid_until = None,
+                        registration_envelope_json = None, roles = None))]
+    fn register_federation_key(
+        &self,
+        py: Python<'_>,
+        identity_type: &str,
+        identity_ref: &str,
+        valid_until: Option<&str>,
+        registration_envelope_json: Option<&str>,
+        roles: Option<Vec<String>>,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            use sha2::{Digest, Sha256};
+
+            let signer = self.local_signer.clone().ok_or_else(|| {
+                PyValueError::new_err(
+                    "no local signing key configured (pass local_key_id + local_key_path \
+                     to the Engine constructor)",
+                )
+            })?;
+
+            // Parse valid_until.
+            let valid_until_dt: Option<chrono::DateTime<chrono::Utc>> = match valid_until {
+                None => None,
+                Some(s) => Some(s.parse().map_err(|e| {
+                    PyValueError::new_err(format!("valid_until must be ISO-8601 (got {s:?}): {e}"))
+                })?),
+            };
+
+            // Parse registration_envelope (default to {}).
+            let envelope: serde_json::Value = match registration_envelope_json {
+                None => serde_json::json!({}),
+                Some(s) => serde_json::from_str(s).map_err(|e| {
+                    PyValueError::new_err(format!("registration_envelope JSON decode: {e}"))
+                })?,
+            };
+
+            // Canonicalize envelope — same shape as canonicalize_envelope
+            // PyO3 surface, which the documented manual workflow uses.
+            let canonical_bytes = <PythonJsonDumpsCanonicalizer as crate::verify::canonical::Canonicalizer>::canonicalize_value(
+                &PythonJsonDumpsCanonicalizer,
+                &envelope,
+            )
+            .map_err(|e| PyRuntimeError::new_err(format!("canonicalize: {e}")))?;
+
+            // SHA-256 hex of the canonical bytes.
+            let mut hasher = Sha256::new();
+            hasher.update(&canonical_bytes);
+            let original_content_hash = format!("{:x}", hasher.finalize());
+
+            // Classical Ed25519 sig over canonical_bytes — base64.
+            let classical_sig_bytes = signer
+                .sign_ed25519(&canonical_bytes)
+                .map_err(|e| PyRuntimeError::new_err(format!("local_sign: {e}")))?;
+            let classical_sig_b64 = B64.encode(classical_sig_bytes);
+
+            // Build KeyRecord. PQC half + persist_row_hash + pqc_completed_at
+            // left to the existing put_public_key cold-path + server-compute.
+            let key_id = signer.key_id().to_owned();
+            let pubkey_ed25519_b64 = signer.public_key_b64();
+            // Truncate to microsecond precision — Postgres TIMESTAMPTZ is
+            // microsecond-precision, so the post-storage round-trip would
+            // otherwise differ from the pre-storage canonical bytes. Mirrors
+            // crate::audit::verify::truncate_to_micros (inlined to avoid a
+            // cirisaudit-feature dependency on this path).
+            let now = {
+                use chrono::Timelike as _;
+                let dt = chrono::Utc::now();
+                let micros = dt.nanosecond() / 1000;
+                dt.with_nanosecond(micros * 1000).unwrap_or(dt)
+            };
+
+            let record = crate::federation::KeyRecord {
+                key_id: key_id.clone(),
+                pubkey_ed25519_base64: pubkey_ed25519_b64,
+                pubkey_ml_dsa_65_base64: None,
+                algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+                identity_type: identity_type.to_owned(),
+                identity_ref: identity_ref.to_owned(),
+                valid_from: now,
+                valid_until: valid_until_dt,
+                registration_envelope: envelope,
+                original_content_hash,
+                scrub_signature_classical: classical_sig_b64,
+                scrub_signature_pqc: None,
+                scrub_key_id: key_id.clone(),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                roles: roles.unwrap_or_default(),
+            };
+            let signed = crate::federation::SignedKeyRecord { record };
+            let signed_json = serde_json::to_string(&signed).map_err(|e| {
+                PyRuntimeError::new_err(format!("SignedKeyRecord JSON encode: {e}"))
+            })?;
+
+            // Delegate to put_public_key — handles backend dispatch +
+            // cold-path PQC fill automatically.
+            self.put_public_key(py, &signed_json)?;
+            Ok(key_id)
+        })
+    }
+
     /// Federation directory: lookup a public key by `key_id`.
     /// Returns the JSON-encoded `KeyRecord` string, or `None`.
     fn lookup_public_key(&self, py: Python<'_>, key_id: &str) -> PyResult<Option<String>> {

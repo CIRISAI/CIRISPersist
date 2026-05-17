@@ -5,6 +5,66 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.5.3] — 2026-05-17
+
+**`register_federation_key` — one-call ergonomic helper that unblocks CIRISAgent Lane C federation directory registration.**
+
+The federation-directory write path (`put_public_key`) requires a fully
+assembled `SignedKeyRecord` — caller computes canonical bytes of the
+registration envelope, signs Ed25519, attaches `scrub_signature_classical`,
+builds the wrapper, then submits. CIRISAgent and other Python consumers
+shouldn't re-implement persist's canonical-bytes rule in their own
+language — that's exactly the "do persist's job upstream" anti-pattern
+the substrate is designed to avoid.
+
+New PyO3 method on `Engine`:
+
+```python
+key_id = engine.register_federation_key(
+    identity_type="agent",
+    identity_ref="agent-x-prod",
+    valid_until="2027-12-31T00:00:00Z",     # optional
+    registration_envelope_json='{"role":"agent","tenant":"t1"}',  # optional
+    roles=["cirislens_pipeline_writer"],     # optional V020 role tags
+)
+# → returns the engine's local_key_id (which is what got registered).
+# → row lands in federation_keys with full hybrid envelope.
+# → cold-path ML-DSA-65 PQC sign fires automatically if Engine was
+#   constructed with local_pqc_key_id + local_pqc_key_path.
+```
+
+Composes existing primitives — no semantic novelty:
+
+1. Canonicalizes `registration_envelope_json` via `PythonJsonDumpsCanonicalizer`
+   (same rule the documented manual workflow uses through
+   `engine.canonicalize_envelope`)
+2. Signs canonical bytes with `LocalSigner::sign_ed25519`
+3. Computes `original_content_hash = hex(SHA-256(canonical_bytes))`
+4. Builds a self-signed `KeyRecord` (`scrub_key_id = key_id`) with
+   `algorithm = "hybrid"`, `pubkey_ml_dsa_65_base64 = None`,
+   `scrub_signature_pqc = None`, `pqc_completed_at = None` (cold path
+   fills)
+5. Wraps in `SignedKeyRecord` + delegates to `put_public_key` — backend
+   dispatch + cold-path PQC attach handled automatically
+
+Idempotent on `key_id` PRIMARY KEY of `federation_keys` — same shape as
+the underlying `put_public_key` contract.
+
+Distinguishes the **federation directory** write path from
+`register_public_key`, which writes to the **lens audit-chain pubkey
+directory** (`accord_public_keys`) — two different tables, two different
+purposes. Updated docstrings on both methods to make the distinction
+explicit (closes the docs/clarity follow-up from CIRISPersist#54).
+
+**Unblocks:** CIRISAgent 2.9.0 Lane C — federation_keys self-registration
+without requiring the agent team to implement canonical-bytes in Python.
+A0b (audit bridge entry) cascades behind this as separate agent-side
+wiring; A3 cascades behind A0b.
+
+Tests: 368 lib pass (unchanged; helper composes existing tested
+primitives). The new path will smoke-test through downstream integration
+once the wheel publishes.
+
 ## [1.5.2] — 2026-05-17
 
 **Pin bump — ciris-keyring / ciris-verify-core / ciris-crypto v2.3.0 → v2.4.0.**
