@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778967542603,
+  "lastUpdate": 1778977892268,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -15659,6 +15659,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 20484272,
             "range": "± 20734843",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "0a22c21d864171c1e0fdbaca7833d8f491457ae5",
+          "message": "1.5.0 — federation trust substrate (signed events + Merkle transparency)\n\nThe substantive substrate cut spec'd in FSD/FEDERATION_TRUST_INTERFACE.md.\nTrust grants become signed Contribution events that ride the audit\nchain; every audit entry on every backend also appends a leaf to a\nper-tenant Merkle tree and gets a freshly-signed STH (RFC 6962 +\nSigstore Rekor every-append cadence). External verifiers confirm any\ngrant via inclusion proof + STH signature without trusting the\ndirectory's projection. Anchored on CIRISVerify v2.3.0's SOTA\ntransparency upgrade.\n\nHighlights:\n- 4 new TrustPurpose variants (Technical/Deferral/Contribution/Service)\n- V021 schema: federation_trust_grants + merkle_leaves + merkle_sth_log\n- Every audit entry → Merkle leaf + signed STH (universal transparency)\n- 9 new Engine PyO3 methods (emit/read/proof/backfill)\n- 9 new AuditService trait methods (PG + SQLite override; default NotImpl)\n- Internal StewardSigner → LocalSigner rename (finishes v1.4.0 #51 work)\n- V020 → V021 one-shot backfill (idempotent, scope-limited to local granter)\n\nThreat model coverage (FSD §4.4):\n- Log fork / split-view: STH + reserved witness cosigning\n- Retroactive insertion: ConsistencyProof per RFC 6962 §2.1.2\n- Selective omission: InclusionProof against signed root\n- Stale STH: verifier-side freshness policy\n- Cross-tenant correlation: per-tenant trees (no global root)\n- Cross-subsystem proof collision: RFC 6962 byte prefixes\n- Quantum break on signing: hybrid Ed25519 + ML-DSA-65 STH\n- Quantum break on tree: SHA-256 PQ-resistant\n\nAtomicity: chain commit first (AV-49 integrity); Merkle hook second\n(signer-gated); projection third (subject_kind-gated). Downstream\nfailures surface as typed errors (Error::Merkle, Error::TrustGrant)\nbut chain row stands — audit chain is source of truth, Merkle and\nprojection are projections. Phase I backfill reconciles orphans.\n\nImplementation phases (already on main):\n- A bf075c2: V021 + types\n- B 35f3953: TransparencyStore<AuditLeaf> adapters\n- C 93841cc: Universal Merkle hook\n- D cb93e00: TrustGrant projection\n- E 7a2fbb1: grant_trust / revoke_trust_grant emit\n- F+G 20b5071: read + proof APIs\n- H f41f191: PyO3 + StewardSigner→LocalSigner rename\n- I fc50769: V020 backfill\n\nTests: 368 passed (was 274 at v1.3.3); 2 pre-existing PG audit failures\n(V020 action_type CHECK) unchanged.\n\nUpstream:\n- CIRISVerify v2.3.0 (#23) — ciris-verify-core::transparency SOTA upgrade\n- CIRISNodeCore 871ebab — MESSAGE_TAXONOMY + 15 new subject_kinds\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-16T19:22:34-05:00",
+          "tree_id": "23bc361d92c4fe777e2806ec05033afbf81f3da0",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/0a22c21d864171c1e0fdbaca7833d8f491457ae5"
+        },
+        "date": 1778977891635,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 102762,
+            "range": "± 713",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 244016,
+            "range": "± 2967",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 526370,
+            "range": "± 2670",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1861986,
+            "range": "± 31080",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 359,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1501,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7295,
+            "range": "± 140",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21110,
+            "range": "± 68",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24162,
+            "range": "± 159",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83498,
+            "range": "± 441",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 372,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3175,
+            "range": "± 20",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9432,
+            "range": "± 120",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41328,
+            "range": "± 191",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2284823,
+            "range": "± 64100",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6632688,
+            "range": "± 60882",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23772143,
+            "range": "± 484136",
             "unit": "ns/iter"
           }
         ]
