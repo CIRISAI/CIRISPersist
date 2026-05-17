@@ -5,6 +5,85 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.5.4] — 2026-05-17
+
+**Audit-chain canonical-bytes helpers + bridge-entry permit (unblocks Lane A0b).**
+
+Same pattern as v1.5.3's `register_federation_key` — agent shouldn't
+reimplement persist's canonical-bytes rule in Python. Two PyO3 helpers
+expose the canonicalization without forcing callers to choose between
+a callback API (awkward over PyO3) and reimplementing the strip rule
+in caller-language.
+
+### New PyO3 methods
+
+`engine.audit_canonicalize_for_hash(entry_json) -> bytes`
+- Caller builds AuditEntry with `entry_hash=""` and `signature=""`.
+- Method zeroes both fields (matching `compute_entry_hash`) and
+  canonicalizes via `PythonJsonDumpsCanonicalizer`.
+- Caller `sha256`'s the returned bytes to compute `entry_hash`.
+
+`engine.audit_canonicalize_for_signing(entry_json) -> bytes`
+- Caller has filled `entry_hash` and left `signature=""`.
+- Method zeroes `signature` (matches `canonical_bytes_for_entry`)
+  and canonicalizes. `entry_hash` stays in the signed body —
+  binds signature to chain position so subsequent-entry rewrites
+  invalidate this signature too.
+- Caller signs with their own signer (CIRISVerify TPM, local Ed25519,
+  KMS, whatever) and fills `signature`.
+
+Both helpers parse the input JSON through the `AuditEntry` struct
+before canonicalizing — guarantees byte-equality with persist's
+internal computation. Raw-JSON canonicalization diverges on chrono
+datetime + `Vec<u8>` field serialization; the struct-parse step
+normalizes those.
+
+### Bridge-entry permit (audit chain integrity)
+
+`AuditService::record_entry` previously rejected non-zero `prev_hash`
+on `sequence_number=1` with `Permanent: first entry must have
+prev_hash = GENESIS_PREV_HASH (32 zero bytes)` — contradicting
+`docs/AUDIT_CHAIN_BRIDGE.md §1` which explicitly supports bridge
+entries (the verifier already signals them via
+`ChainBreakReason::GenesisPrevHashNotZero` as informational, not a
+break). Write-path now permits + logs the case for observability.
+
+Impact: A0b (audit chain bridge entry on 2.9.0 first boot) can now
+land. CIRISAgent's bridge from its pre-2.9.0 audit log into persist's
+`cirisaudit` chain works as documented.
+
+### Doc updates
+
+`docs/AUDIT_CHAIN_BRIDGE.md` §1 expanded with the explicit caller
+workflow (4-step Python recipe using the new helpers) and reference
+to `crate::audit::verify::compute_entry_hash` as the canonical
+implementation (rather than the prior `src/audit/postgres.rs`
+reference which assumed downstream readers had source-tree access).
+
+### Tests
+
+`cargo test --features "postgres sqlite cirisaudit" --lib` — 368 pass
+(unchanged; helpers compose existing tested primitives + bridge
+permit only changes the rejection path that was always-erroring on a
+documented-supported case).
+
+Live smoke-tested with the agent's documented A0b flow against a
+fresh SQLite DB:
+- helpers produce canonical bytes that match persist's internal
+  computation (no more `entry_hash mismatch` rejection)
+- bridge entry with non-zero `prev_hash` on seq=1 lands successfully
+- signature round-trips through the Ed25519 sign + persist verify path
+
+### Unblocks
+
+- **CIRISAgent A0b** (audit chain bridge entry on 2.9.0 first boot) —
+  agent assembles bridge entry → `audit_canonicalize_for_hash` →
+  sha256 → fill `entry_hash` → `audit_canonicalize_for_signing` →
+  sign externally → fill `signature` → `audit_record_entry`. Done.
+- **CIRISAgent A3** (GraphAudit cutover) — cascades behind A0b.
+- Every other `audit_record_entry` caller — same pattern, no more
+  canonical-bytes reimplementation in caller-language.
+
 ## [1.5.3] — 2026-05-17
 
 **`register_federation_key` — one-call ergonomic helper that unblocks CIRISAgent Lane C federation directory registration.**

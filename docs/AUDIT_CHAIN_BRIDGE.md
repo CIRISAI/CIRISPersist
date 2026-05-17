@@ -45,8 +45,8 @@ Every audit entry's `entry_hash` covers the canonical JSON of the
 entry **minus the `signature` and `entry_hash` fields**. The
 `signature` then covers the canonical bytes **including** the
 resolved `entry_hash`. Same shape as the `cirisnode` envelopes
-(`src/cirisnode/verify.rs`) — see `compute_entry_hash` in
-`src/audit/postgres.rs` for the reference implementation.
+(`src/cirisnode/verify.rs`); the reference implementation is
+`compute_entry_hash` in `src/audit/verify.rs`.
 
 In short:
 
@@ -56,6 +56,55 @@ entry_hash = sha256(canonical_bytes_for_hash)
 canonical_bytes_for_sign = canonical_json(entry minus signature, WITH entry_hash filled in)
 signature = Ed25519(signing_key, canonical_bytes_for_sign)
 ```
+
+**Canonicalizer:** `PythonJsonDumpsCanonicalizer` — sorted keys, no
+whitespace, `ensure_ascii=True`. The exact byte sequence is defined
+by persist; **don't reimplement the rule in caller-language**.
+
+### Caller workflow (v1.5.4+)
+
+Persist exposes the two canonicalization phases as PyO3 methods so
+callers can plug their own signer (TPM-backed via CIRISVerify, KMS,
+HSM, etc.) without reimplementing the canonical-bytes rule:
+
+```python
+# Step 1: build the entry with entry_hash="" and signature=""
+entry = {
+    "entry_id": str(uuid.uuid4()),
+    "sequence_number": 1,
+    "tenant_id": "...",
+    "actor_id": "<base64 Ed25519 pubkey>",
+    "action_type": "chain_bridge",
+    "subject_kind": "audit_chain",
+    "subject_id": "...",
+    "payload": {...},
+    "prev_hash": "<base64 32 bytes>",
+    "entry_hash": "",
+    "recorded_at": "...",
+    "signature": "",
+}
+
+# Step 2: get canonical bytes for the hash phase, compute entry_hash
+ch = engine.audit_canonicalize_for_hash(json.dumps(entry))
+entry["entry_hash"] = base64.b64encode(hashlib.sha256(ch).digest()).decode()
+
+# Step 3: get canonical bytes for the signing phase, sign externally
+cs = engine.audit_canonicalize_for_signing(json.dumps(entry))
+sig_bytes = your_signer.sign_ed25519(cs)   # CIRISVerify TPM signer, etc.
+entry["signature"] = base64.b64encode(sig_bytes).decode()
+
+# Step 4: submit — persist re-derives entry_hash + verifies signature
+engine.audit_record_entry(json.dumps(entry))
+```
+
+Stripping rule (locked, audited):
+- `audit_canonicalize_for_hash` strips **both** `entry_hash` AND
+  `signature` from the top-level JSON object, then canonicalizes.
+- `audit_canonicalize_for_signing` strips **only** `signature` —
+  `entry_hash` participates in the signed body (binds the signature
+  to the chain position).
+
+Persist owns the rule; callers stay in their language.
 
 ### Bridge entry shape
 

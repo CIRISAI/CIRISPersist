@@ -430,11 +430,14 @@ impl AuditService for SqliteAuditBackend {
                         entry.tenant_id, entry.sequence_number
                     )));
                 }
+                // v1.5.4 — bridge entry permitted per
+                // docs/AUDIT_CHAIN_BRIDGE.md §1 (see PG comment).
                 if entry.prev_hash.as_slice() != GENESIS_PREV_HASH.as_slice() {
-                    return Err(Error::ChainIntegrity(
-                        "first entry must have prev_hash = GENESIS_PREV_HASH (32 zero bytes)"
-                            .into(),
-                    ));
+                    tracing::info!(
+                        tenant_id = %entry.tenant_id,
+                        prev_hash_hex = %hex::encode(&entry.prev_hash),
+                        "audit chain bridge entry — non-zero prev_hash on sequence_number=1"
+                    );
                 }
             }
 
@@ -879,11 +882,14 @@ impl AuditService for SqliteAuditBackend {
                         entry.tenant_id, entry.sequence_number
                     )));
                 }
+                // v1.5.4 — bridge entry permitted per
+                // docs/AUDIT_CHAIN_BRIDGE.md §1 (see PG comment).
                 if entry.prev_hash.as_slice() != GENESIS_PREV_HASH.as_slice() {
-                    return Err(Error::ChainIntegrity(
-                        "first entry must have prev_hash = GENESIS_PREV_HASH (32 zero bytes)"
-                            .into(),
-                    ));
+                    tracing::info!(
+                        tenant_id = %entry.tenant_id,
+                        prev_hash_hex = %hex::encode(&entry.prev_hash),
+                        "audit chain bridge entry — non-zero prev_hash on sequence_number=1"
+                    );
                 }
             }
 

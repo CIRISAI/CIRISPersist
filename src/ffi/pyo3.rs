@@ -6883,6 +6883,88 @@ impl PyEngine {
     // FFI boundary; catch_panic discipline; audit::Error → PyErr via
     // audit_err_to_py with stable kind() tokens.
 
+    /// v1.5.4 — Return the exact canonical bytes whose SHA-256 equals
+    /// the audit entry's `entry_hash`. Caller-side workflow:
+    ///
+    /// 1. Build the AuditEntry JSON with `entry_hash = ""` and
+    ///    `signature = ""`.
+    /// 2. `ch = engine.audit_canonicalize_for_hash(json.dumps(entry))`
+    /// 3. `entry["entry_hash"] = base64(sha256(ch).digest())`
+    ///
+    /// Rule (mirrors `crate::audit::verify::compute_entry_hash`): both
+    /// the top-level `entry_hash` AND `signature` fields are stripped
+    /// before canonicalization via `PythonJsonDumpsCanonicalizer`
+    /// (sorted keys, no whitespace, ensure_ascii=True). The hash is
+    /// over canonical bytes that don't include itself.
+    ///
+    /// Use this rather than reimplementing the rule in caller-language
+    /// — persist owns the canonicalizer; any future tightening lands
+    /// here without forcing a coordinated downstream change.
+    ///
+    /// Companion of [`audit_canonicalize_for_signing`].
+    #[cfg(feature = "cirisaudit")]
+    fn audit_canonicalize_for_hash<'py>(
+        &self,
+        py: Python<'py>,
+        entry_json: &str,
+    ) -> PyResult<Py<PyBytes>> {
+        catch_panic(|| {
+            // Parse the caller's JSON through the AuditEntry struct so the
+            // canonical bytes match what crate::audit::verify::compute_entry_hash
+            // produces internally byte-for-byte. Going through the struct
+            // normalizes chrono datetime + Vec<u8> serialization; raw-JSON
+            // canonicalization would diverge on those fields and produce a
+            // hash that persist's verify path rejects.
+            let mut entry: crate::audit::AuditEntry = serde_json::from_str(entry_json)
+                .map_err(|e| PyValueError::new_err(format!("AuditEntry JSON decode: {e}")))?;
+            entry.entry_hash = Vec::new();
+            entry.signature = String::new();
+            let bytes = crate::audit::verify::canonical_bytes_for_entry(&entry)
+                .map_err(|e| PyRuntimeError::new_err(format!("canonicalize: {e}")))?;
+            Ok(PyBytes::new(py, &bytes).unbind())
+        })
+    }
+
+    /// v1.5.4 — Return the exact canonical bytes the audit-entry
+    /// `signature` covers. Caller-side workflow:
+    ///
+    /// 1. Build AuditEntry with `entry_hash` already filled (per
+    ///    [`audit_canonicalize_for_hash`]) and `signature = ""`.
+    /// 2. `cs = engine.audit_canonicalize_for_signing(json.dumps(entry))`
+    /// 3. `sig_bytes = ciris_verify.sign_ed25519(cs)`  # or engine.local_sign(cs)
+    /// 4. `entry["signature"] = base64(sig_bytes)`
+    /// 5. `engine.audit_record_entry(json.dumps(entry))`
+    ///
+    /// Rule: only the top-level `signature` field is stripped before
+    /// canonicalization. `entry_hash` participates in the signed body
+    /// — that binds the signature to the chain position so a chain-
+    /// rewrite that flipped `prev_hash` of subsequent entries would
+    /// invalidate this entry's signature too. Same persist-wide
+    /// canonicalizer rule as [`canonicalize_envelope_for_signing`],
+    /// applied to audit-entry JSON.
+    ///
+    /// Companion of [`audit_canonicalize_for_hash`].
+    #[cfg(feature = "cirisaudit")]
+    fn audit_canonicalize_for_signing<'py>(
+        &self,
+        py: Python<'py>,
+        entry_json: &str,
+    ) -> PyResult<Py<PyBytes>> {
+        catch_panic(|| {
+            // Same parse-through-struct discipline as audit_canonicalize_for_hash
+            // — guarantees byte-equal canonical bytes with what persist's
+            // signature verify path computes internally. entry_hash stays in
+            // the canonical body; signature is zeroed before
+            // canonical_bytes_for_entry's strip-then-canonicalize.
+            let mut entry: crate::audit::AuditEntry = serde_json::from_str(entry_json)
+                .map_err(|e| PyValueError::new_err(format!("AuditEntry JSON decode: {e}")))?;
+            entry.signature = String::new();
+            let bytes = crate::audit::verify::canonical_bytes_for_entry(&entry)
+                .map_err(|e| PyRuntimeError::new_err(format!("canonicalize: {e}")))?;
+            Ok(PyBytes::new(py, &bytes).unbind())
+        })
+    }
+
     /// v0.8.1 — Verify-and-insert one audit entry. Persist enforces
     /// hash-chain integrity (AV-49) + sequence monotonicity + signature.
     #[cfg(feature = "cirisaudit")]

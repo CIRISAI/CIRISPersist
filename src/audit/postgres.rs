@@ -384,10 +384,18 @@ impl AuditService for PostgresBackend {
                     entry.tenant_id, entry.sequence_number
                 )));
             }
+            // v1.5.4 — non-zero prev_hash on sequence_number=1 is a
+            // bridge entry per docs/AUDIT_CHAIN_BRIDGE.md §1. The
+            // verifier (`AuditService::verify_chain`) surfaces it as
+            // `ChainBreakReason::GenesisPrevHashNotZero` so downstream
+            // consumers can distinguish clean genesis from bridged-
+            // from-legacy chain. Write path permits + logs.
             if entry.prev_hash.as_slice() != GENESIS_PREV_HASH.as_slice() {
-                return Err(Error::ChainIntegrity(
-                    "first entry must have prev_hash = GENESIS_PREV_HASH (32 zero bytes)".into(),
-                ));
+                tracing::info!(
+                    tenant_id = %entry.tenant_id,
+                    prev_hash_hex = %hex::encode(&entry.prev_hash),
+                    "audit chain bridge entry — non-zero prev_hash on sequence_number=1"
+                );
             }
         }
 
@@ -859,10 +867,18 @@ impl AuditService for PostgresBackend {
                     entry.tenant_id, entry.sequence_number
                 )));
             }
+            // v1.5.4 — non-zero prev_hash on sequence_number=1 is a
+            // bridge entry per docs/AUDIT_CHAIN_BRIDGE.md §1. The
+            // verifier (`AuditService::verify_chain`) surfaces it as
+            // `ChainBreakReason::GenesisPrevHashNotZero` so downstream
+            // consumers can distinguish clean genesis from bridged-
+            // from-legacy chain. Write path permits + logs.
             if entry.prev_hash.as_slice() != GENESIS_PREV_HASH.as_slice() {
-                return Err(Error::ChainIntegrity(
-                    "first entry must have prev_hash = GENESIS_PREV_HASH (32 zero bytes)".into(),
-                ));
+                tracing::info!(
+                    tenant_id = %entry.tenant_id,
+                    prev_hash_hex = %hex::encode(&entry.prev_hash),
+                    "audit chain bridge entry — non-zero prev_hash on sequence_number=1"
+                );
             }
         }
 

@@ -59,6 +59,36 @@ class Engine:
         a different key for an existing key id raises).
         """
 
+    def audit_canonicalize_for_hash(self, entry_json: str) -> bytes:
+        """v1.5.4 — Return the exact canonical bytes whose SHA-256 equals
+        the audit entry's `entry_hash`.
+
+        Workflow:
+        1. Build AuditEntry JSON with `entry_hash = ""` and `signature = ""`.
+        2. `ch = engine.audit_canonicalize_for_hash(json.dumps(entry))`
+        3. `entry["entry_hash"] = base64(sha256(ch).digest())`
+
+        Rule mirrors `crate::audit::verify::compute_entry_hash`: both
+        `entry_hash` and `signature` are zeroed pre-canonicalization;
+        canonicalization is PythonJsonDumpsCanonicalizer (sorted keys,
+        no whitespace, ensure_ascii=True). Companion of
+        `audit_canonicalize_for_signing`.
+        """
+
+    def audit_canonicalize_for_signing(self, entry_json: str) -> bytes:
+        """v1.5.4 — Return the exact canonical bytes the audit entry's
+        Ed25519 `signature` covers.
+
+        Workflow:
+        4. `cs = engine.audit_canonicalize_for_signing(json.dumps(entry))`
+        5. `entry["signature"] = base64(your_signer.sign_ed25519(cs))`
+        6. `engine.audit_record_entry(json.dumps(entry))`
+
+        Rule: only `signature` is stripped — `entry_hash` participates
+        in the signed body so a chain rewrite that flips a subsequent
+        entry's `prev_hash` invalidates this entry's signature too.
+        """
+
     def register_federation_key(
         self,
         identity_type: str,
