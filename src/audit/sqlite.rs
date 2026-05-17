@@ -1450,6 +1450,94 @@ impl AuditService for SqliteAuditBackend {
             .map_err(|e| Error::Merkle(format!("consistency_proof join: {e}")))?
             .map_err(|e| Error::Merkle(format!("consistency_proof: {e}")))
     }
+
+    // ── v1.5.0 Phase I — V020 → V021 backfill source ────────────────
+
+    async fn read_v020_trust_rows_for_local(
+        &self,
+        local_pubkey: &str,
+    ) -> Result<Vec<crate::federation::trust_grant::V020TrustRow>, Error> {
+        use crate::federation::trust_grant::V020TrustRow;
+
+        if local_pubkey.is_empty() {
+            return Err(Error::InvalidArgument(
+                "local_pubkey must be non-empty".into(),
+            ));
+        }
+        let conn = self.conn_handle();
+        let local_pubkey = local_pubkey.to_owned();
+        let jh: tokio::task::JoinHandle<Result<Vec<V020TrustRow>, Error>> =
+            tokio::task::spawn_blocking(move || {
+                let guard = conn.blocking_lock();
+                let mut stmt = guard
+                    .prepare(
+                        "SELECT key_id, pubkey_ed25519_base64, trust_type, \
+                                trust_relationship, trust_domains, \
+                                trusted_at, expires_at \
+                         FROM federation_keys \
+                         WHERE trusted_by = ?1 \
+                           AND trust_relationship IS NOT NULL \
+                         ORDER BY trusted_at ASC, key_id ASC",
+                    )
+                    .map_err(|e| Error::Backend(format!("prepare v020 rows: {e}")))?;
+                let rows = stmt
+                    .query_map(
+                        rusqlite::params![local_pubkey],
+                        decode_v020_trust_row_sqlite,
+                    )
+                    .map_err(|e| Error::Backend(format!("query v020 rows: {e}")))?;
+                let mut out: Vec<V020TrustRow> = Vec::new();
+                for r in rows {
+                    let inner = r.map_err(|e| Error::Backend(format!("row v020 rows: {e}")))??;
+                    out.push(inner);
+                }
+                Ok(out)
+            });
+        jh.await
+            .map_err(|e| Error::Backend(format!("v020 rows join: {e}")))?
+    }
+}
+
+/// Decode one V020-shape row from `federation_keys` into a
+/// [`V020TrustRow`]. Used by [`SqliteAuditBackend::read_v020_trust_rows_for_local`].
+///
+/// `trust_domains` is stored as a JSON-array string per V020 SQLite
+/// dialect notes; `Some("")` and `None` both map to `None`. Empty
+/// arrays map to `Some(vec![])` (legal per the SQLite schema, though
+/// the API-layer `grant_trust` guard rejects Registry+empty).
+fn decode_v020_trust_row_sqlite(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<Result<crate::federation::trust_grant::V020TrustRow, Error>> {
+    use crate::federation::trust_grant::V020TrustRow;
+
+    let key_id: String = row.get("key_id")?;
+    let grantee_pubkey: String = row.get("pubkey_ed25519_base64")?;
+    let trust_type: String = row.get("trust_type")?;
+    let trust_relationship: String = row.get("trust_relationship")?;
+    let trust_domains_text: Option<String> = row.get("trust_domains")?;
+    let trusted_at_text: String = row.get("trusted_at")?;
+    let expires_at_text: Option<String> = row.get("expires_at")?;
+
+    Ok((|| {
+        let trust_domains: Option<Vec<String>> = match trust_domains_text.as_deref() {
+            None | Some("") => None,
+            Some(s) => Some(
+                serde_json::from_str::<Vec<String>>(s)
+                    .map_err(|e| Error::Backend(format!("trust_domains decode: {e}")))?,
+            ),
+        };
+        let trusted_at = parse_datetime(&trusted_at_text)?;
+        let expires_at = expires_at_text.as_deref().map(parse_datetime).transpose()?;
+        Ok(V020TrustRow {
+            key_id,
+            grantee_pubkey,
+            trust_type,
+            trust_relationship,
+            trust_domains,
+            trusted_at,
+            expires_at,
+        })
+    })())
 }
 
 /// Decode one `federation_trust_grants` row into a [`TrustGrantRow`].

@@ -1384,6 +1384,73 @@ impl AuditService for PostgresBackend {
             .map_err(|e| Error::Merkle(format!("consistency_proof join: {e}")))?
             .map_err(|e| Error::Merkle(format!("consistency_proof: {e}")))
     }
+
+    // ── v1.5.0 Phase I — V020 → V021 backfill source ────────────────
+
+    async fn read_v020_trust_rows_for_local(
+        &self,
+        local_pubkey: &str,
+    ) -> Result<Vec<crate::federation::trust_grant::V020TrustRow>, Error> {
+        use crate::federation::trust_grant::V020TrustRow;
+
+        if local_pubkey.is_empty() {
+            return Err(Error::InvalidArgument(
+                "local_pubkey must be non-empty".into(),
+            ));
+        }
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let rows = client
+            .query(
+                "SELECT key_id, pubkey_ed25519_base64, trust_type, \
+                        trust_relationship, trust_domains, trusted_at, \
+                        expires_at \
+                 FROM cirislens.federation_keys \
+                 WHERE trusted_by = $1 \
+                   AND trust_relationship IS NOT NULL \
+                 ORDER BY trusted_at ASC, key_id ASC",
+                &[&local_pubkey],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("read_v020_trust_rows: {e}")))?;
+        let mut out: Vec<V020TrustRow> = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let key_id: String = r
+                .try_get("key_id")
+                .map_err(|e| Error::Backend(format!("decode key_id: {e}")))?;
+            let grantee_pubkey: String = r
+                .try_get("pubkey_ed25519_base64")
+                .map_err(|e| Error::Backend(format!("decode pubkey_ed25519_base64: {e}")))?;
+            let trust_type: String = r
+                .try_get("trust_type")
+                .map_err(|e| Error::Backend(format!("decode trust_type: {e}")))?;
+            let trust_relationship: String = r
+                .try_get("trust_relationship")
+                .map_err(|e| Error::Backend(format!("decode trust_relationship: {e}")))?;
+            let trust_domains: Option<Vec<String>> = r
+                .try_get("trust_domains")
+                .map_err(|e| Error::Backend(format!("decode trust_domains: {e}")))?;
+            let trusted_at: chrono::DateTime<chrono::Utc> = r
+                .try_get("trusted_at")
+                .map_err(|e| Error::Backend(format!("decode trusted_at: {e}")))?;
+            let expires_at: Option<chrono::DateTime<chrono::Utc>> = r
+                .try_get("expires_at")
+                .map_err(|e| Error::Backend(format!("decode expires_at: {e}")))?;
+            out.push(V020TrustRow {
+                key_id,
+                grantee_pubkey,
+                trust_type,
+                trust_relationship,
+                trust_domains,
+                trusted_at,
+                expires_at,
+            });
+        }
+        Ok(out)
+    }
 }
 
 /// Decode one `federation_trust_grants` row into a [`TrustGrantRow`].

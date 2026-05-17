@@ -6497,6 +6497,69 @@ impl PyEngine {
         })
     }
 
+    /// v1.5.0 Phase I (FSD §6.2) — One-shot V020 → V021 backfill for
+    /// the supplied tenant. Walks `federation_keys` for rows where
+    /// `trusted_by` equals this Engine's local signer pubkey, expands
+    /// each row to one (`direct`) or N (`registry`) `TrustGrant`
+    /// emissions, and records them via
+    /// [`crate::federation::emit::grant_trust`] — which fires the
+    /// Phase C Merkle hook + Phase D projection inline.
+    ///
+    /// Returns a JSON-serialized
+    /// [`crate::federation::backfill::BackfillReport`] string with
+    /// `{ rows_scanned, events_emitted, already_present }`.
+    ///
+    /// Idempotent: re-running checks the V021 projection for each
+    /// `(grantee, granter, purpose, scope)` quad and skips emissions
+    /// whose projection rows already exist.
+    ///
+    /// Requires `local_key_id` / `local_key_path` on the Engine (the
+    /// re-emitted grants are signed against this identity, per FSD
+    /// §6.2's "signed by the recovered `trusted_by` key" rule). Raises
+    /// `ValueError` if no signer is configured.
+    #[cfg(feature = "cirisaudit")]
+    fn backfill_v020_trust_rows(&self, py: Python<'_>, tenant_id: &str) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let tenant_id = tenant_id.to_owned();
+            let signer = self.local_signer.clone().ok_or_else(|| {
+                PyValueError::new_err(
+                    "no local signing key configured (pass local_key_id + local_key_path \
+                     to the Engine constructor)",
+                )
+            })?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        let report = crate::federation::backfill::backfill_v020_trust_rows(
+                            &*backend, &signer, &tenant_id,
+                        )
+                        .await
+                        .map_err(backfill_err_to_py)?;
+                        backfill_report_to_json(&report)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(_) => {
+                    let audit = self
+                        .sqlite_audit
+                        .as_ref()
+                        .expect("v1.5.0 Phase H: sqlite_audit must be Some when backend is Sqlite")
+                        .clone();
+                    runtime.block_on(async move {
+                        let report = crate::federation::backfill::backfill_v020_trust_rows(
+                            &*audit, &signer, &tenant_id,
+                        )
+                        .await
+                        .map_err(backfill_err_to_py)?;
+                        backfill_report_to_json(&report)
+                    })
+                }
+            })
+        })
+    }
+
     // ── v0.8.2: telemetry PyO3 surface (CIRISPersist#36) ─────────────
     //
     // 4 methods wrapping TelemetryService.
@@ -7143,6 +7206,39 @@ fn federation_read_err_to_py(e: crate::federation::read::ReadError) -> PyErr {
         ReadError::Audit(inner) => audit_err_to_py(inner),
         ReadError::NotFound(_) => PyKeyError::new_err(format!("{e}")),
     }
+}
+
+/// v1.5.0 Phase I — Bridge [`crate::federation::backfill::BackfillError`]
+/// → `PyErr` at the FFI boundary. Emit-side failures route through
+/// [`emit_err_to_py`]; audit-side failures through [`audit_err_to_py`];
+/// caller-fault validation → `PyValueError`.
+#[cfg(feature = "cirisaudit")]
+fn backfill_err_to_py(e: crate::federation::backfill::BackfillError) -> PyErr {
+    use crate::federation::backfill::BackfillError;
+    tracing::warn!(error = %e, "federation backfill error");
+    match e {
+        BackfillError::Emit(inner) => emit_err_to_py(inner),
+        BackfillError::Audit(inner) => audit_err_to_py(inner),
+        BackfillError::InvalidArgument(_) => PyValueError::new_err(format!("{e}")),
+    }
+}
+
+/// v1.5.0 Phase I — Encode a
+/// [`crate::federation::backfill::BackfillReport`] as a JSON string
+/// for the PyO3 caller. Wraps the encode failure in `PyRuntimeError`
+/// (5xx) — JSON encoding of three `u64`s shouldn't fail, but the
+/// surface follows the same shape as the other Phase H encoders.
+#[cfg(feature = "cirisaudit")]
+fn backfill_report_to_json(
+    report: &crate::federation::backfill::BackfillReport,
+) -> PyResult<String> {
+    let v = serde_json::json!({
+        "rows_scanned": report.rows_scanned,
+        "events_emitted": report.events_emitted,
+        "already_present": report.already_present,
+    });
+    serde_json::to_string(&v)
+        .map_err(|e| PyRuntimeError::new_err(format!("BackfillReport encode: {e}")))
 }
 
 /// v1.5.0 Phase H — Wire-shape adapter for

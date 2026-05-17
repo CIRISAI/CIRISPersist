@@ -128,6 +128,37 @@ pub struct TrustGrantReceipt {
     pub sth: ciris_verify_core::transparency::SignedTreeHead,
 }
 
+/// One V020-shape trust row read from `federation_keys`. Materialized
+/// from rows where `trust_relationship IS NOT NULL` (i.e., rows with
+/// an explicit V020 grant). Used by v1.5.0 Phase I backfill
+/// (FSD §6.2) to enumerate the rows that need re-emission as V021
+/// `TrustGrant` Contribution events.
+///
+/// Field semantics mirror the V020 schema (CIRISPersist#46/#47):
+///
+/// - `key_id` — the `federation_keys.key_id` row identifier; this is
+///   the *grantee's* row in the directory.
+/// - `grantee_pubkey` — the `pubkey_ed25519_base64` value of that
+///   same row. This is what becomes the V021 `grantee_key` (the V021
+///   wire shape keys grants on pubkey-base64, not key_id; FSD §3.1).
+/// - `trust_type` / `trust_relationship` / `trust_domains` — V020
+///   trust shape; `trust_domains` is `None` for `direct` grants and
+///   `Some(non_empty)` for `registry` grants per V020's
+///   `registry_requires_domains` CHECK.
+/// - `trusted_at` / `expires_at` — V020 timestamps; `expires_at`
+///   maps directly to V021's `expires_at` (the V021 projection
+///   handles `expires_at <= NOW()` → `revoked_at` itself).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V020TrustRow {
+    pub key_id: String,
+    pub grantee_pubkey: String,
+    pub trust_type: String,
+    pub trust_relationship: String,
+    pub trust_domains: Option<Vec<String>>,
+    pub trusted_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -35,6 +35,8 @@
 use std::future::Future;
 
 #[cfg(feature = "cirisaudit")]
+pub mod backfill;
+#[cfg(feature = "cirisaudit")]
 pub mod emit;
 #[cfg(feature = "cirisaudit")]
 pub mod read;

@@ -377,4 +377,30 @@ pub trait AuditService: Send + Sync {
         let _ = (tenant_id, old_size, new_size);
         async { Err(Error::NotImplemented("consistency_proof")) }
     }
+
+    /// v1.5.0 Phase I (FSD §6.2) — enumerate V020 trust rows where
+    /// `trusted_by` matches `local_pubkey`. Used by
+    /// [`crate::federation::backfill::backfill_v020_trust_rows`] to
+    /// drive the one-shot migration from the V020 trust columns on
+    /// `federation_keys` to V021's signed-event substrate.
+    ///
+    /// Returned rows satisfy `trust_relationship IS NOT NULL` (i.e.,
+    /// they have an explicit V020 grant — rows with NULL trust
+    /// columns are pre-V020 and not backfillable). Rows where
+    /// `trusted_by` is some *other* agent's `key_id` are excluded
+    /// per the FSD §6.2 scope constraint: only the granter can
+    /// re-emit on the chain (FSD §3.1, signer == author_id).
+    ///
+    /// # Default impl
+    ///
+    /// Returns [`Error::NotImplemented`]. PG + SQLite both ship
+    /// concrete overrides at v1.5.0 Phase I.
+    fn read_v020_trust_rows_for_local(
+        &self,
+        local_pubkey: &str,
+    ) -> impl Future<Output = Result<Vec<crate::federation::trust_grant::V020TrustRow>, Error>> + Send
+    {
+        let _ = local_pubkey;
+        async { Err(Error::NotImplemented("read_v020_trust_rows_for_local")) }
+    }
 }
