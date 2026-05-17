@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778986810383,
+  "lastUpdate": 1778989276634,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -16187,6 +16187,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 20489737,
             "range": "± 23491895",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "93b6433b925d3039138ef4f0fa306b8906061753",
+          "message": "1.5.4 — audit canonical-bytes helpers + bridge-entry permit (unblocks Lane A0b)\n\nSame pattern as v1.5.3's register_federation_key — agent shouldn't\nreimplement persist's canonical-bytes rule in Python. Two PyO3 helpers\nexpose the audit-chain canonicalization without forcing callers to\nchoose between a callback API (awkward over PyO3) and reimplementing\nthe strip rule in caller-language.\n\nTwo new PyO3 methods on Engine:\n\n  engine.audit_canonicalize_for_hash(entry_json) -> bytes\n    Caller builds AuditEntry with entry_hash=\"\" + signature=\"\";\n    method zeroes both, canonicalizes via PythonJsonDumpsCanonicalizer;\n    caller sha256's returned bytes to compute entry_hash.\n\n  engine.audit_canonicalize_for_signing(entry_json) -> bytes\n    Caller has filled entry_hash, left signature=\"\";\n    method zeroes signature (entry_hash stays — binds sig to chain\n    position), canonicalizes; caller signs externally with whatever\n    signer they prefer (CIRISVerify TPM, local Ed25519, KMS, ...).\n\nBoth parse JSON through AuditEntry struct before canonicalizing —\nguarantees byte-equality with crate::audit::verify::compute_entry_hash.\nRaw-JSON canonicalization diverges on chrono datetime + Vec<u8>\nserialization; struct-parse normalizes those.\n\nBridge-entry permit:\nAuditService::record_entry previously rejected non-zero prev_hash on\nsequence_number=1 — contradicting docs/AUDIT_CHAIN_BRIDGE.md §1 which\ndocuments bridge entries as supported (verifier already signals via\nChainBreakReason::GenesisPrevHashNotZero as informational, not a\nbreak). Write-path now permits + logs for observability. 4 enforcement\nsites relaxed: 2 on PG (record_entry + try_claim_event), 2 on SQLite\n(same paths).\n\nDoc updates (docs/AUDIT_CHAIN_BRIDGE.md §1):\n- Canonical-bytes rule reference updated to point at\n  src/audit/verify.rs::compute_entry_hash (was src/audit/postgres.rs)\n- New \"Caller workflow (v1.5.4+)\" section with explicit 4-step Python\n  recipe using the helpers\n- Stripping rule locked + audited inline\n\nTests: 368 lib pass (unchanged — helpers compose existing tested\nprimitives; bridge permit only changes a rejection path that was\nalways-erroring on a documented-supported case).\n\nLive smoke-tested: helpers produce canonical bytes that match\npersist's internal computation; bridge entry with non-zero prev_hash\non seq=1 lands successfully; signature round-trips through sign +\nverify.\n\nUnblocks CIRISAgent A0b (audit chain bridge entry) + A3 (GraphAudit\ncutover, cascades behind A0b).\n\nCloses CIRISPersist#55.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-16T22:33:17-05:00",
+          "tree_id": "09d118f1db74e653f22c0df4be8b8ec7665c9bf3",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/93b6433b925d3039138ef4f0fa306b8906061753"
+        },
+        "date": 1778989276081,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 122018,
+            "range": "± 357",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 273306,
+            "range": "± 12168",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 575217,
+            "range": "± 3449",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 2008684,
+            "range": "± 5636",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 320,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1407,
+            "range": "± 18",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 6612,
+            "range": "± 33",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23149,
+            "range": "± 210",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26382,
+            "range": "± 33",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91018,
+            "range": "± 331",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 358,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3098,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9581,
+            "range": "± 19",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41572,
+            "range": "± 446",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 631,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2270295,
+            "range": "± 136046",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7059311,
+            "range": "± 126881",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25739152,
+            "range": "± 127568",
             "unit": "ns/iter"
           }
         ]
