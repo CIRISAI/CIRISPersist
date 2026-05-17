@@ -5,6 +5,96 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.5.1] — 2026-05-17
+
+**SQLite parity sweep — 100% no-panic across the PyO3 surface.**
+
+Completes the v1.0.0-scaffold port that v1.4.0 (#52) started for 9
+federation methods. Every remaining `backend_postgres_unwrap()` call
+site in `src/ffi/pyo3.rs` — 55 of them across attestation, revocation,
+PQC-fill, outbound queue, detection events, calibration bundles, lens
+reads, ratchet, scrub stats, scoring aggregates, audit chain, and trace
+verification — now dispatches cleanly to `match &self.backend { Postgres
+=> ..., Sqlite => ... }`. The helper itself is deleted.
+
+This is the parity bar CIRISAgent's SQLite-first deployments need
+before adopting v1.5.x. No more process panics on non-federation Engine
+calls.
+
+### What ported
+
+53 methods to `SqliteBackend` trait dispatch (impls already existed in
+`src/store/sqlite.rs`):
+- Attestation / revocation surface: `put_attestation`, `list_attestations_for`,
+  `list_attestations_by`, `put_revocation`, `revocations_for`, all three
+  `attach_*_pqc_signature` variants, `list_attestations`, `list_revocations`,
+  `run_pqc_sweep`
+- Outbound queue: `enqueue_outbound`, `claim_pending_outbound`,
+  `mark_transport_delivered`, `mark_transport_failed`, `mark_replay_resolved`,
+  `match_ack_to_outbound`, `mark_ack_received`, `sweep_ack_timeouts`,
+  `sweep_ttl_expired`, `sweep_expired_claims`, `outbound_status`,
+  `list_outbound`, `cancel_outbound`, `replay_abandoned`
+- Detection + calibration: `put_detection_event`, `get_detection_events`,
+  `put_calibration_bundle`, `get_current_calibration_bundle`,
+  `get_calibration_bundle_by_version`
+- Lens reads + ratchet: `list_trace_summaries`, `get_trace_summary`,
+  `get_trace_detail`, `list_tasks`, `list_llm_calls`, `aggregate_llm_costs`,
+  `corpus_shape`, `aggregate_scrub_stats`, `cross_agent_divergence`,
+  `temporal_drift`, `hash_chain_gaps`, `conscience_override_rates`,
+  `aggregate_scoring_factors`, `aggregate_scoring_factors_batch`,
+  `count_traces`, `count_overrides`, `count_identity_changes`,
+  `aggregate_audit_chain`
+- Trace verification + ingest: `receive_and_persist`,
+  `delete_traces_for_agent`, `fetch_trace_events_page`, `verify_trace`,
+  `verify_hybrid_via_directory`
+
+These lens-read + ratchet methods were originally flagged as PG-only per
+v0.5.0 FSD, but `SqliteBackend` already returns `Error::NotImplemented`
+inside each trait impl — so dispatch through the trait surfaces the
+right typed error via `read_err_to_py`. SQLite callers get a clean
+4xx/5xx instead of a panic.
+
+2 methods truly PG-only (inherent methods on PostgresBackend, no trait):
+- `get_features` (extract pipeline read) — SQLite arm returns
+  `PyRuntimeError("get_features: pipeline-read primitives are
+  Postgres-only (v0.6.0 FSD); SQLite backends should query their PG
+  counterpart for observability or wait for the sovereign-mode v0.6.x
+  track")`
+- `get_classifications` (classify pipeline read) — same shape
+
+### Structural support
+
+Two helpers refactored to take generic `Backend + Send + Sync + 'static`
+trait bounds so a single primitive powers both arms:
+
+- `run_pqc_sweep_inner` + its `sweep_keys` / `sweep_attestations` /
+  `sweep_revocations` helpers (`src/ffi/pyo3.rs:~7990-8100`) — generic
+  over `FederationDirectory`
+- `TraceKeyDirectory` (`src/ffi/pyo3.rs:~8420`) — generic over
+  `crate::store::Backend`; `verify_trace` constructs it per-arm
+
+### What's gone
+
+- `backend_postgres_unwrap()` helper itself (definition + doc comments)
+- The `#[allow(dead_code)]` on `BackendDispatch::Sqlite` (every arm now read)
+- The v1.0.0-scaffold module-header comment is rewritten to record the
+  v1.5.1 completion
+
+### Tests
+
+`cargo test --features "postgres sqlite cirisaudit" --lib` — **368 pass**
+(unchanged vs v1.5.0; the parity sweep is pure dispatch port, no
+behavior change). Diff: `src/ffi/pyo3.rs` +1665 / −761 (one file).
+
+### Impact
+
+CIRISAgent's SQLite-first deployments can call any Engine PyO3 method
+without process crashes. Where SQLite genuinely doesn't have an impl
+(lens reads / ratchet / extract / classify pipeline), the caller gets a
+typed Python error they can catch and handle. The substrate-level
+"trust grant + Merkle transparency" surface from v1.5.0 was already
+100% parity'd; this release closes the remaining surface.
+
 ## [1.5.0] — 2026-05-16
 
 **The federation trust substrate — trust grants as signed events with per-tenant Merkle transparency.**
