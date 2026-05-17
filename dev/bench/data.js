@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778977892268,
+  "lastUpdate": 1778979390816,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -15791,6 +15791,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23772143,
             "range": "± 484136",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "105dee2f7cc8849be4673e5f095388f5fe43ae4c",
+          "message": "1.5.1 — SQLite parity sweep (100% no-panic across PyO3 surface)\n\nCompletes the v1.0.0-scaffold port that v1.4.0 (#52) started for 9\nfederation methods. Every remaining backend_postgres_unwrap() call site\nin src/ffi/pyo3.rs — 55 of them across attestation, revocation,\nPQC-fill, outbound queue, detection events, calibration bundles, lens\nreads, ratchet, scrub stats, scoring aggregates, audit chain, and trace\nverification — now dispatches cleanly to match &self.backend { Postgres\n=> ..., Sqlite => ... }. The backend_postgres_unwrap helper itself is\ndeleted.\n\nThis is the parity bar CIRISAgent's SQLite-first deployments need before\nadopting v1.5.x. No more process panics on non-federation Engine calls.\n\n53 methods ported via SqliteBackend trait dispatch (impls already existed):\n- Attestation / revocation: put_attestation, list_attestations_{for,by},\n  put_revocation, revocations_for, attach_{key,attestation,revocation}_\n  pqc_signature, list_attestations, list_revocations, run_pqc_sweep\n- Outbound queue: enqueue_outbound, claim_pending_outbound,\n  mark_transport_{delivered,failed,replay_resolved},\n  match_ack_to_outbound, mark_ack_received, sweep_{ack_timeouts,\n  ttl_expired,expired_claims}, outbound_status, list_outbound,\n  cancel_outbound, replay_abandoned\n- Detection + calibration: put_detection_event, get_detection_events,\n  put_calibration_bundle, get_current_calibration_bundle,\n  get_calibration_bundle_by_version\n- Lens reads + ratchet (SqliteBackend impls return Error::NotImplemented\n  internally; dispatch surfaces clean typed errors): list_trace_summaries,\n  get_trace_{summary,detail}, list_tasks, list_llm_calls,\n  aggregate_llm_costs, corpus_shape, aggregate_scrub_stats,\n  cross_agent_divergence, temporal_drift, hash_chain_gaps,\n  conscience_override_rates, aggregate_scoring_factors{,_batch},\n  count_{traces,overrides,identity_changes}, aggregate_audit_chain\n- Trace ingest + verification: receive_and_persist,\n  delete_traces_for_agent, fetch_trace_events_page, verify_trace,\n  verify_hybrid_via_directory\n\n2 methods truly PG-only (inherent on PostgresBackend, no trait); SQLite\narm returns PyRuntimeError with stable message naming the FSD:\n- get_features (extract pipeline)\n- get_classifications (classify pipeline)\n\nStructural refactors to support dispatch:\n- run_pqc_sweep_inner + sweep_{keys,attestations,revocations} helpers\n  generic over FederationDirectory + Send + Sync + 'static\n- TraceKeyDirectory generic over crate::store::Backend + Send + Sync +\n  'static; verify_trace constructs per-arm\n\nDeleted:\n- backend_postgres_unwrap() helper (def + doc comments)\n- #[allow(dead_code)] on BackendDispatch::Sqlite (every arm now read)\n- v1.0.0-scaffold module-header comment rewritten to v1.5.1 completion\n\nTests: 368 lib pass (unchanged from v1.5.0 — pure dispatch port).\nDiff: src/ffi/pyo3.rs +1665 / −761 (one file).\n\nCIRISAgent SQLite-first deployments unblocked.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-16T19:48:24-05:00",
+          "tree_id": "1ba6951177185793c6a575346592f2b6ee91e308",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/105dee2f7cc8849be4673e5f095388f5fe43ae4c"
+        },
+        "date": 1778979389961,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 109209,
+            "range": "± 1069",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 259885,
+            "range": "± 891",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 561392,
+            "range": "± 8330",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1998729,
+            "range": "± 69651",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 324,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1462,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 6779,
+            "range": "± 37",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23112,
+            "range": "± 56",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26368,
+            "range": "± 188",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 90987,
+            "range": "± 217",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 383,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3153,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9564,
+            "range": "± 135",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42236,
+            "range": "± 165",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 632,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2277743,
+            "range": "± 101465",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7034895,
+            "range": "± 48076",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25930938,
+            "range": "± 354381",
             "unit": "ns/iter"
           }
         ]
