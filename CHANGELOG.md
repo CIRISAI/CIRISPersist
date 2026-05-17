@@ -5,6 +5,26 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.5.2] — 2026-05-17
+
+**Pin bump — ciris-keyring / ciris-verify-core / ciris-crypto v2.3.0 → v2.4.0.**
+
+Workspace coherence with CIRISVerify v2.4.0's vocabulary-fix rename
+(`load_steward_seed` → `load_local_seed`, `StewardSeedConfig` →
+`LocalSeedConfig`). No code changes here — persist doesn't import the
+renamed symbols (we use `Ed25519SoftwareSigner`, `MlDsa65SoftwareSigner`,
+`PqcSigner`, `HardwareSigner`, none with "steward" in the name).
+
+The Verify v2.4.0 vocabulary now matches what v1.4.0 (#51) +
+v1.5.0 (Phase H) baked into persist's internals:
+
+| Term | Meaning |
+|---|---|
+| **steward** | bootstrap-trusted root identity (Verify's `bootstrap_stewards.json` entries — the registry's anchor pubkeys that seed federation trust) |
+| **local** | a deployment's own per-process signing identity (persist's `LocalSigner`, edge's signer, agent's signer) |
+
+Tests: 368 lib pass (unchanged; pin-bump only).
+
 ## [1.5.1] — 2026-05-17
 
 **SQLite parity sweep — 100% no-panic across the PyO3 surface.**
