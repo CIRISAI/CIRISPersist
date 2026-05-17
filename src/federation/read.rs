@@ -214,7 +214,7 @@ mod sqlite_tests {
     use crate::audit::sqlite::SqliteAuditBackend;
     use crate::federation::emit::{grant_trust, revoke_trust_grant};
     use crate::federation::trust_grant::{TrustGrantFilter, TrustPurpose};
-    use crate::signing::StewardSigner;
+    use crate::signing::LocalSigner;
     use crate::store::sqlite::SqliteBackend;
     use crate::store::Backend;
     use base64::engine::general_purpose::STANDARD as B64;
@@ -225,13 +225,13 @@ mod sqlite_tests {
     use std::sync::Arc;
     use uuid::Uuid;
 
-    fn build_signer(seed_byte: u8) -> Arc<StewardSigner> {
+    fn build_signer(seed_byte: u8) -> Arc<LocalSigner> {
         let signing_key = SigningKey::from_bytes(&[seed_byte; 32]);
         let pqc =
             MlDsa65SoftwareSigner::from_seed_bytes(&[seed_byte ^ 0x55; 32], "phase-fg-test-pqc")
                 .expect("pqc seed");
         let pqc_arc: Arc<dyn ciris_keyring::PqcSigner> = Arc::new(pqc);
-        Arc::new(StewardSigner::from_parts(
+        Arc::new(LocalSigner::from_parts(
             signing_key,
             "phase-fg-test-steward".to_owned(),
             Some(pqc_arc),
@@ -239,7 +239,7 @@ mod sqlite_tests {
         ))
     }
 
-    async fn fresh_audit(seed_byte: u8) -> (SqliteBackend, SqliteAuditBackend, Arc<StewardSigner>) {
+    async fn fresh_audit(seed_byte: u8) -> (SqliteBackend, SqliteAuditBackend, Arc<LocalSigner>) {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         let audit = SqliteAuditBackend::new(backend.conn_handle());
@@ -708,7 +708,7 @@ mod postgres_tests {
     use crate::audit::merkle_store::hash_leaf;
     use crate::federation::emit::{grant_trust, revoke_trust_grant};
     use crate::federation::trust_grant::{TrustGrantFilter, TrustPurpose};
-    use crate::signing::StewardSigner;
+    use crate::signing::LocalSigner;
     use crate::store::postgres::PostgresBackend;
     use crate::store::Backend;
     use base64::engine::general_purpose::STANDARD as B64;
@@ -723,13 +723,13 @@ mod postgres_tests {
         std::env::var("CIRIS_PERSIST_TEST_PG_URL").ok()
     }
 
-    fn build_signer(seed_byte: u8) -> Arc<StewardSigner> {
+    fn build_signer(seed_byte: u8) -> Arc<LocalSigner> {
         let signing_key = SigningKey::from_bytes(&[seed_byte; 32]);
         let pqc =
             MlDsa65SoftwareSigner::from_seed_bytes(&[seed_byte ^ 0x55; 32], "phase-fg-pg-test-pqc")
                 .expect("pqc seed");
         let pqc_arc: Arc<dyn ciris_keyring::PqcSigner> = Arc::new(pqc);
-        Arc::new(StewardSigner::from_parts(
+        Arc::new(LocalSigner::from_parts(
             signing_key,
             "phase-fg-pg-test-steward".to_owned(),
             Some(pqc_arc),

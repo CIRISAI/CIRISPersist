@@ -26,10 +26,10 @@
 //!   boundary so callers see an `InvalidArgument` error *before*
 //!   signing + writing a chain row that the projection would refuse.
 //!
-//! - **Signer is non-optional.** An emit without a steward identity
+//! - **Signer is non-optional.** An emit without a local identity
 //!   can't produce a valid `AuditEntry.signature` (the chain rejects
 //!   entries with no signature), and the resulting receipt's STH
-//!   would be meaningless. Phase E therefore takes a `&StewardSigner`
+//!   would be meaningless. Phase E therefore takes a `&LocalSigner`
 //!   by reference; callers that don't have one constructed have no
 //!   business emitting trust grants.
 //!
@@ -53,7 +53,7 @@ use super::trust_grant::{
 use crate::audit::types::AuditEntry;
 use crate::audit::verify::{canonical_bytes_for_entry, compute_entry_hash, truncate_to_micros};
 use crate::audit::AuditService;
-use crate::signing::StewardSigner;
+use crate::signing::LocalSigner;
 
 /// Errors from [`grant_trust`] / [`revoke_trust_grant`].
 #[derive(Debug, thiserror::Error)]
@@ -64,7 +64,7 @@ pub enum EmitError {
     #[error("audit: {0}")]
     Audit(#[from] crate::audit::Error),
 
-    /// Steward signer raised an error (Ed25519 key missing, PQC
+    /// Local signer raised an error (Ed25519 key missing, PQC
     /// seed inconsistent, …).
     #[error("signing: {0}")]
     Signing(String),
@@ -76,7 +76,7 @@ pub enum EmitError {
     InvalidArgument(String),
 
     /// Phase E expected to find a [`SignedTreeHead`] for the tenant
-    /// after `record_entry` committed (because the steward signer is
+    /// after `record_entry` committed (because the local signer is
     /// configured and the Merkle hook should have signed the STH) but
     /// none was returned. Surfacing this as a typed error lets callers
     /// distinguish "Merkle hook silently disabled mid-flight" from
@@ -101,8 +101,8 @@ pub enum EmitError {
     },
 }
 
-impl From<crate::signing::StewardSignerError> for EmitError {
-    fn from(e: crate::signing::StewardSignerError) -> Self {
+impl From<crate::signing::LocalSignerError> for EmitError {
+    fn from(e: crate::signing::LocalSignerError) -> Self {
         EmitError::Signing(format!("{e}"))
     }
 }
@@ -160,7 +160,7 @@ impl From<crate::signing::StewardSignerError> for EmitError {
 #[allow(clippy::too_many_arguments)]
 pub async fn grant_trust<A>(
     audit_service: &A,
-    signer: &StewardSigner,
+    signer: &LocalSigner,
     tenant_id: &str,
     grantee_key: &str,
     purpose: TrustPurpose,
@@ -294,7 +294,7 @@ where
 /// `expires_at = Utc::now()` and a custom rationale.
 pub async fn revoke_trust_grant<A>(
     audit_service: &A,
-    signer: &StewardSigner,
+    signer: &LocalSigner,
     tenant_id: &str,
     grantee_key: &str,
     purpose: TrustPurpose,
@@ -325,7 +325,7 @@ mod sqlite_tests {
     use super::*;
     use crate::audit::sqlite::SqliteAuditBackend;
     use crate::audit::AuditFilter;
-    use crate::signing::StewardSigner;
+    use crate::signing::LocalSigner;
     use crate::store::sqlite::SqliteBackend;
     use crate::store::Backend;
     use ciris_keyring::MlDsa65SoftwareSigner;
@@ -334,16 +334,16 @@ mod sqlite_tests {
     use std::sync::Arc;
     use uuid::Uuid;
 
-    /// Build a StewardSigner with PQC configured. The Phase C Merkle
+    /// Build a LocalSigner with PQC configured. The Phase C Merkle
     /// hook requires `sign_hybrid` (Ed25519 + ML-DSA-65); without PQC
     /// the hook trips `PqcNotConfigured`.
-    fn build_signer(seed_byte: u8) -> Arc<StewardSigner> {
+    fn build_signer(seed_byte: u8) -> Arc<LocalSigner> {
         let signing_key = SigningKey::from_bytes(&[seed_byte; 32]);
         let pqc =
             MlDsa65SoftwareSigner::from_seed_bytes(&[seed_byte ^ 0x55; 32], "phase-e-test-pqc")
                 .expect("pqc seed");
         let pqc_arc: Arc<dyn ciris_keyring::PqcSigner> = Arc::new(pqc);
-        Arc::new(StewardSigner::from_parts(
+        Arc::new(LocalSigner::from_parts(
             signing_key,
             "phase-e-test-steward".to_owned(),
             Some(pqc_arc),
@@ -351,7 +351,7 @@ mod sqlite_tests {
         ))
     }
 
-    async fn fresh_audit(seed_byte: u8) -> (SqliteBackend, SqliteAuditBackend, Arc<StewardSigner>) {
+    async fn fresh_audit(seed_byte: u8) -> (SqliteBackend, SqliteAuditBackend, Arc<LocalSigner>) {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         let audit = SqliteAuditBackend::new(backend.conn_handle());
@@ -865,7 +865,7 @@ mod sqlite_tests {
 mod postgres_tests {
     use super::*;
     use crate::audit::AuditFilter;
-    use crate::signing::StewardSigner;
+    use crate::signing::LocalSigner;
     use crate::store::postgres::PostgresBackend;
     use crate::store::Backend;
     use ciris_keyring::MlDsa65SoftwareSigner;
@@ -877,13 +877,13 @@ mod postgres_tests {
         std::env::var("CIRIS_PERSIST_TEST_PG_URL").ok()
     }
 
-    fn build_signer(seed_byte: u8) -> Arc<StewardSigner> {
+    fn build_signer(seed_byte: u8) -> Arc<LocalSigner> {
         let signing_key = SigningKey::from_bytes(&[seed_byte; 32]);
         let pqc =
             MlDsa65SoftwareSigner::from_seed_bytes(&[seed_byte ^ 0x55; 32], "phase-e-pg-test-pqc")
                 .expect("pqc seed");
         let pqc_arc: Arc<dyn ciris_keyring::PqcSigner> = Arc::new(pqc);
-        Arc::new(StewardSigner::from_parts(
+        Arc::new(LocalSigner::from_parts(
             signing_key,
             "phase-e-pg-test-steward".to_owned(),
             Some(pqc_arc),

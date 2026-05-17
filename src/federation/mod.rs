@@ -212,7 +212,7 @@ pub trait FederationDirectory: Send + Sync {
     // These three methods feed that pipeline. Persist's PyO3
     // `Engine.run_pqc_sweep()` walks each batch and drives cold-path
     // PQC fill-in for rows authored before the writer was configured
-    // with a PQC steward (or where the per-write cold-path failed
+    // with a PQC local signer (or where the per-write cold-path failed
     // transiently). Idempotent at the consumer level —
     // `attach_*_pqc_signature` already guards against double-fill via
     // `WHERE pqc_completed_at IS NULL`.

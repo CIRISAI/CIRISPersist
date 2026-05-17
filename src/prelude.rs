@@ -65,11 +65,11 @@ pub use crate::derived::{
     EventFilter, ProjectionMetadata, Standardization,
 };
 
-// Steward signing surface (v0.4.2, CIRISPersist#17). Federation
-// peers signing as their deployment's steward identity construct
-// `StewardSigner` from filesystem seeds and call `sign_ed25519` /
+// Local signing surface (v0.4.2, CIRISPersist#17). Federation
+// peers signing as their deployment's local identity construct
+// `LocalSigner` from filesystem seeds and call `sign_ed25519` /
 // `sign_ml_dsa_65` / `sign_hybrid`.
-pub use crate::signing::{StewardSigner, StewardSignerConfig, StewardSignerError};
+pub use crate::signing::{LocalSigner, LocalSignerConfig, LocalSignerError};
 
 // Verify primitives. The full surface edge needs to compose a
 // verify pipeline against persist instead of rebuilding it.

@@ -17,13 +17,13 @@
 //!
 //! # Authentication
 //!
-//! Caller passes an [`Arc<StewardSigner>`] at construction; the
+//! Caller passes an [`Arc<LocalSigner>`] at construction; the
 //! client signs every request body via
-//! [`StewardSigner::sign_hybrid`] when PQC is configured, falling
-//! back to [`StewardSigner::sign_ed25519`] when not. Headers
+//! [`LocalSigner::sign_hybrid`] when PQC is configured, falling
+//! back to [`LocalSigner::sign_ed25519`] when not. Headers
 //! emitted:
 //!
-//! - `X-Ciris-Signing-Key-Id: <steward-key-id>`
+//! - `X-Ciris-Signing-Key-Id: <local-key-id>`
 //! - `X-Ciris-Signature-Ed25519: <base64>`
 //! - `X-Ciris-Signature-MlDsa-65: <base64>` (when PQC is configured)
 //!
@@ -73,16 +73,16 @@ use crate::secrets::wire::{
     TryClaimSecretRequest,
 };
 use crate::secrets::{SecretsError, SecretsService};
-use crate::signing::StewardSigner;
+use crate::signing::LocalSigner;
 use crate::ClaimResult;
 
-/// Header carrying the steward's `federation_keys.key_id`.
+/// Header carrying the local signer's `federation_keys.key_id`.
 const HEADER_KEY_ID: &str = "X-Ciris-Signing-Key-Id";
 /// Header carrying the Ed25519 signature (base64) over the request
 /// body bytes.
 const HEADER_ED25519: &str = "X-Ciris-Signature-Ed25519";
 /// Header carrying the ML-DSA-65 signature (base64). Optional —
-/// emitted only when the configured [`StewardSigner`] has PQC.
+/// emitted only when the configured [`LocalSigner`] has PQC.
 const HEADER_ML_DSA_65: &str = "X-Ciris-Signature-MlDsa-65";
 
 /// HTTP client mirroring the [`SecretsService`] trait surface.
@@ -92,7 +92,7 @@ const HEADER_ML_DSA_65: &str = "X-Ciris-Signature-MlDsa-65";
 pub struct FederatedSecretsClient {
     base_url: Url,
     client: HttpClient,
-    signer: Arc<StewardSigner>,
+    signer: Arc<LocalSigner>,
 }
 
 impl std::fmt::Debug for FederatedSecretsClient {
@@ -114,7 +114,7 @@ impl FederatedSecretsClient {
     /// Default reqwest settings: 30s connection timeout, 60s request
     /// timeout, gzip-on. Callers needing finer control construct via
     /// [`Self::from_parts`].
-    pub fn new(base_url: Url, signer: Arc<StewardSigner>) -> Result<Self, SecretsError> {
+    pub fn new(base_url: Url, signer: Arc<LocalSigner>) -> Result<Self, SecretsError> {
         let client = HttpClient::builder()
             .connect_timeout(Duration::from_secs(30))
             .timeout(Duration::from_secs(60))
@@ -132,7 +132,7 @@ impl FederatedSecretsClient {
     /// tests that wire a mock-transport client or production
     /// deployments needing custom TLS / proxy / connection-pool
     /// settings.
-    pub fn from_parts(base_url: Url, client: HttpClient, signer: Arc<StewardSigner>) -> Self {
+    pub fn from_parts(base_url: Url, client: HttpClient, signer: Arc<LocalSigner>) -> Self {
         Self {
             base_url,
             client,
@@ -140,7 +140,7 @@ impl FederatedSecretsClient {
         }
     }
 
-    /// Sign a request body with the configured steward signer and
+    /// Sign a request body with the configured local signer and
     /// emit the signature headers.
     ///
     /// When the signer has PQC configured, returns the hybrid
@@ -161,17 +161,17 @@ impl FederatedSecretsClient {
                     (HEADER_ML_DSA_65, ml_dsa_65_b64),
                 ])
             }
-            Err(crate::signing::StewardSignerError::PqcNotConfigured) => {
+            Err(crate::signing::LocalSignerError::PqcNotConfigured) => {
                 let sig = self
                     .signer
                     .sign_ed25519(body)
-                    .map_err(|e| SecretsError::Internal(format!("steward sign: {e}")))?;
+                    .map_err(|e| SecretsError::Internal(format!("local sign: {e}")))?;
                 Ok(vec![
                     (HEADER_KEY_ID, self.signer.key_id().to_owned()),
                     (HEADER_ED25519, BASE64.encode(sig)),
                 ])
             }
-            Err(e) => Err(SecretsError::Internal(format!("steward sign: {e}"))),
+            Err(e) => Err(SecretsError::Internal(format!("local sign: {e}"))),
         }
     }
 
@@ -604,7 +604,7 @@ async fn map_error_response(resp: reqwest::Response) -> SecretsError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::signing::{StewardSigner, StewardSignerConfig};
+    use crate::signing::{LocalSigner, LocalSignerConfig};
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -615,11 +615,11 @@ mod tests {
         f
     }
 
-    fn make_signer() -> Arc<StewardSigner> {
+    fn make_signer() -> Arc<LocalSigner> {
         let seed = [0x5Au8; 32];
         let f = write_seed(&seed);
         Arc::new(
-            StewardSigner::from_config(&StewardSignerConfig {
+            LocalSigner::from_config(&LocalSignerConfig {
                 key_id: "test-steward".into(),
                 key_path: f.path().to_path_buf(),
                 pqc_key_id: None,

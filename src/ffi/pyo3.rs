@@ -197,8 +197,7 @@ pub struct PyEngine {
     /// that the pre-v0.4.2 PyEngine carried as four separate fields.
     /// The PyO3 surface methods (`local_sign`, `local_pqc_sign`,
     /// accessors) are now thin wrappers over
-    /// [`crate::signing::StewardSigner`] (internal type name retained
-    /// pending the 2.0.0 type-rename cut) — CIRISPersist#7
+    /// [`crate::signing::LocalSigner`] — CIRISPersist#7
     /// single-source-of-truth pattern repeated for signing.
     ///
     /// `None` when no local signing identity is configured for this
@@ -213,7 +212,22 @@ pub struct PyEngine {
     /// Held as `Arc` so the auto-fire tokio task in `put_public_key`
     /// / `put_attestation` / `put_revocation` can clone and own its
     /// own reference for the duration of the cold-path sign.
-    steward_signer: Option<Arc<crate::signing::StewardSigner>>,
+    local_signer: Option<Arc<crate::signing::LocalSigner>>,
+    /// v1.5.0 Phase H — persisted [`SqliteAuditBackend`] wrapping the
+    /// same connection handle as the SQLite [`BackendDispatch::Sqlite`]
+    /// arm. Held on the Engine (instead of constructed fresh per call
+    /// like the v1.4.0 pattern in `audit_record_entry`) so the Merkle-
+    /// transparency signer installed at construction time persists for
+    /// the lifetime of the Engine. The Postgres arm doesn't need this
+    /// shim because the `PostgresBackend` itself impls `AuditService`
+    /// and is already held by `BackendDispatch::Postgres`.
+    ///
+    /// `None` when the backend is Postgres, or when the `sqlite`/
+    /// `cirisaudit` features are off. The Phase H trust-grant /
+    /// inclusion-proof methods unwrap this on the SQLite arm and
+    /// reuse the same backend for every call.
+    #[cfg(all(feature = "sqlite", feature = "cirisaudit"))]
+    sqlite_audit: Option<Arc<crate::audit::sqlite::SqliteAuditBackend>>,
 }
 
 impl PyEngine {
@@ -330,7 +344,7 @@ impl PyEngine {
         // primitive is Postgres-only today; on the SQLite arm we
         // simply skip the sweep (it's a Postgres-table migration
         // artifact that doesn't exist on the SQLite schema).
-        #[allow(unused_variables)] // borrowed only when steward_signer + sweep are wired
+        #[allow(unused_variables)] // borrowed only when local_signer + sweep are wired
         let pg_backend_for_sweep: Option<Arc<PostgresBackend>>;
         let backend: BackendDispatch =
             if dsn.starts_with("postgresql://") || dsn.starts_with("postgres://") {
@@ -491,15 +505,15 @@ impl PyEngine {
             }),
         };
 
-        // v0.4.2 (CIRISPersist#17) — Steward identity wiring is now
-        // [`crate::signing::StewardSigner::from_config`]. Same
+        // v0.4.2 (CIRISPersist#17) — Local identity wiring is now
+        // [`crate::signing::LocalSigner::from_config`]. Same
         // both-or-neither contract on the Ed25519 + PQC pairs;
         // identical seed-load semantics; identical tracing::info
         // observability shape. The Rust function is the
         // single-source-of-truth — both PyO3 callers (this) and
         // Rust callers (CIRISLensCore, CIRISEdge) hit the same
         // construction path.
-        let steward_signer: Option<Arc<crate::signing::StewardSigner>> =
+        let local_signer: Option<Arc<crate::signing::LocalSigner>> =
             match (local_key_id, local_key_path) {
                 (None, None) => {
                     // Pair PQC config check before silently dropping a
@@ -513,14 +527,14 @@ impl PyEngine {
                     None
                 }
                 (Some(key_id), Some(key_path)) => {
-                    let cfg = crate::signing::StewardSignerConfig {
+                    let cfg = crate::signing::LocalSignerConfig {
                         key_id,
                         key_path: std::path::PathBuf::from(key_path),
                         pqc_key_id: local_pqc_key_id,
                         pqc_key_path: local_pqc_key_path.map(std::path::PathBuf::from),
                     };
-                    let signer = crate::signing::StewardSigner::from_config(&cfg)
-                        .map_err(steward_signer_err_to_py)?;
+                    let signer = crate::signing::LocalSigner::from_config(&cfg)
+                        .map_err(local_signer_err_to_py)?;
                     Some(Arc::new(signer))
                 }
                 _ => {
@@ -546,7 +560,7 @@ impl PyEngine {
         // `pqc_sweep_on_init=false`.
         if pqc_sweep_on_init {
             if let (Some(pqc_signer), Some(backend_for_sweep)) = (
-                steward_signer.as_ref().and_then(|s| s.pqc_signer_arc()),
+                local_signer.as_ref().and_then(|s| s.pqc_signer_arc()),
                 pg_backend_for_sweep.as_ref().cloned(),
             ) {
                 runtime.spawn(async move {
@@ -564,13 +578,44 @@ impl PyEngine {
             }
         }
 
+        // v1.5.0 Phase H — wire Engine.local_signer → backend's
+        // Merkle-hook signer. The Phase C audit-service hook reads
+        // this on every committed entry; without it `record_entry`
+        // skips the Merkle append + STH publish as a no-op (matches
+        // CIRIS-RED / unconfigured-deployment shape). On the SQLite
+        // path, we also persist the SqliteAuditBackend on the Engine
+        // (instead of constructing fresh per call like v1.4.0's
+        // `audit_record_entry`), so the installed signer survives
+        // beyond one method call.
+        #[cfg(all(feature = "sqlite", feature = "cirisaudit"))]
+        let sqlite_audit: Option<Arc<crate::audit::sqlite::SqliteAuditBackend>> = match &backend {
+            BackendDispatch::Sqlite(sq) => {
+                let audit = Arc::new(crate::audit::sqlite::SqliteAuditBackend::new(
+                    sq.conn_handle(),
+                ));
+                if let Some(signer) = local_signer.as_ref() {
+                    audit.set_merkle_signer(Some(signer.clone()));
+                }
+                Some(audit)
+            }
+            BackendDispatch::Postgres(_) => None,
+        };
+        #[cfg(feature = "cirisaudit")]
+        if let BackendDispatch::Postgres(pg) = &backend {
+            if let Some(signer) = local_signer.as_ref() {
+                pg.set_merkle_signer(Some(signer.clone()));
+            }
+        }
+
         Ok(PyEngine {
             backend,
             runtime,
             scrubber,
             signer,
             signer_key_id: signing_key_id.to_owned(),
-            steward_signer,
+            local_signer,
+            #[cfg(all(feature = "sqlite", feature = "cirisaudit"))]
+            sqlite_audit,
         })
     }
 
@@ -730,10 +775,8 @@ impl PyEngine {
     /// configured).
     fn local_public_key_b64(&self, _py: Python<'_>) -> PyResult<String> {
         catch_panic(|| {
-            // v0.4.2 — thin wrapper over StewardSigner::public_key_b64.
-            // Internal struct keeps the `StewardSigner` name for now
-            // (deferred to 2.0.0 cleanup); the public surface is local_*.
-            self.steward_signer
+            // v0.4.2 — thin wrapper over LocalSigner::public_key_b64.
+            self.local_signer
                 .as_ref()
                 .map(|s| s.public_key_b64())
                 .ok_or_else(|| {
@@ -758,8 +801,8 @@ impl PyEngine {
     /// Raises `ValueError` if no local signing identity is configured.
     fn local_key_id(&self, _py: Python<'_>) -> PyResult<String> {
         catch_panic(|| {
-            // v0.4.2 — thin wrapper over StewardSigner::key_id.
-            self.steward_signer
+            // v0.4.2 — thin wrapper over LocalSigner::key_id.
+            self.local_signer
                 .as_ref()
                 .map(|s| s.key_id().to_owned())
                 .ok_or_else(|| {
@@ -795,10 +838,10 @@ impl PyEngine {
         message: &Bound<'py, PyBytes>,
     ) -> PyResult<Py<PyBytes>> {
         catch_panic(|| {
-            // v0.4.2 — thin wrapper over StewardSigner::sign_ed25519.
+            // v0.4.2 — thin wrapper over LocalSigner::sign_ed25519.
             // Single-source-of-truth: Rust callers (CIRISLensCore) and
             // PyO3 callers hit identical bytes-in / bytes-out logic.
-            let signer = self.steward_signer.as_ref().ok_or_else(|| {
+            let signer = self.local_signer.as_ref().ok_or_else(|| {
                 PyValueError::new_err(
                     "no local signing key configured (pass local_key_id + local_key_path \
                  to the Engine constructor)",
@@ -806,7 +849,7 @@ impl PyEngine {
             })?;
             let sig = signer
                 .sign_ed25519(message.as_bytes())
-                .map_err(steward_signer_err_to_py)?;
+                .map_err(local_signer_err_to_py)?;
             Ok(PyBytes::new(py, &sig).unbind())
         })
     }
@@ -829,8 +872,8 @@ impl PyEngine {
     /// identity isn't configured).
     fn local_pqc_public_key_b64(&self, py: Python<'_>) -> PyResult<String> {
         catch_panic(|| {
-            // v0.4.2 — thin wrapper over StewardSigner::pqc_public_key_b64.
-            let signer = self.steward_signer.clone().ok_or_else(|| {
+            // v0.4.2 — thin wrapper over LocalSigner::pqc_public_key_b64.
+            let signer = self.local_signer.clone().ok_or_else(|| {
                 PyValueError::new_err(
                     "no local PQC key configured (pass local_pqc_key_id + \
                  local_pqc_key_path to the Engine constructor)",
@@ -839,7 +882,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let result =
                 py.detach(|| runtime.block_on(async move { signer.pqc_public_key_b64().await }));
-            result.map_err(steward_signer_err_to_py)?.ok_or_else(|| {
+            result.map_err(local_signer_err_to_py)?.ok_or_else(|| {
                 PyValueError::new_err(
                     "no local PQC key configured (pass local_pqc_key_id + \
                      local_pqc_key_path to the Engine constructor)",
@@ -858,8 +901,8 @@ impl PyEngine {
     /// callers must update to `local_pqc_key_id`.
     fn local_pqc_key_id(&self, _py: Python<'_>) -> PyResult<String> {
         catch_panic(|| {
-            // v0.4.2 — thin wrapper over StewardSigner::pqc_key_id.
-            self.steward_signer
+            // v0.4.2 — thin wrapper over LocalSigner::pqc_key_id.
+            self.local_signer
                 .as_ref()
                 .and_then(|s| s.pqc_key_id().map(str::to_owned))
                 .ok_or_else(|| {
@@ -899,8 +942,8 @@ impl PyEngine {
         message: &Bound<'py, PyBytes>,
     ) -> PyResult<Py<PyBytes>> {
         catch_panic(|| {
-            // v0.4.2 — thin wrapper over StewardSigner::sign_ml_dsa_65.
-            let signer = self.steward_signer.clone().ok_or_else(|| {
+            // v0.4.2 — thin wrapper over LocalSigner::sign_ml_dsa_65.
+            let signer = self.local_signer.clone().ok_or_else(|| {
                 PyValueError::new_err(
                     "no local PQC key configured (pass local_pqc_key_id + \
                  local_pqc_key_path to the Engine constructor)",
@@ -910,7 +953,7 @@ impl PyEngine {
             let msg = message.as_bytes().to_vec();
             let sig_bytes = py
                 .detach(|| runtime.block_on(async move { signer.sign_ml_dsa_65(&msg).await }))
-                .map_err(steward_signer_err_to_py)?;
+                .map_err(local_signer_err_to_py)?;
             Ok(PyBytes::new(py, &sig_bytes).unbind())
         })
     }
@@ -1245,7 +1288,7 @@ impl PyEngine {
             // via the attach_*_pqc_signature escape hatch on their own
             // schedule.
             let cold_path_inputs = self
-                .steward_signer
+                .local_signer
                 .as_ref()
                 .and_then(|s| s.pqc_signer_arc())
                 .map(|signer| {
@@ -1462,7 +1505,7 @@ impl PyEngine {
 
             // v0.3.1 — cold-path PQC fill-in (CIRISPersist#10).
             let cold_path_inputs = self
-                .steward_signer
+                .local_signer
                 .as_ref()
                 .and_then(|s| s.pqc_signer_arc())
                 .map(|signer| {
@@ -1574,7 +1617,7 @@ impl PyEngine {
 
             // v0.3.1 — cold-path PQC fill-in (CIRISPersist#10).
             let cold_path_inputs = self
-                .steward_signer
+                .local_signer
                 .as_ref()
                 .and_then(|s| s.pqc_signer_arc())
                 .map(|signer| {
@@ -1984,7 +2027,7 @@ impl PyEngine {
     fn run_pqc_sweep<'py>(&self, py: Python<'py>, batch_size: i64) -> PyResult<Bound<'py, PyDict>> {
         catch_panic(|| {
             let signer = self
-                .steward_signer
+                .local_signer
                 .as_ref()
                 .and_then(|s| s.pqc_signer_arc())
                 .ok_or_else(|| {
@@ -5946,6 +5989,514 @@ impl PyEngine {
         })
     }
 
+    // ── v1.5.0 Phase H: trust-grant + Merkle transparency PyO3 surface ──
+    //
+    // 8 methods wrapping `federation::emit` (grant_trust /
+    // revoke_trust_grant) and `federation::read` (lookup_trust_grant /
+    // list_trust_grants / get_trust_grant / current_sth /
+    // trust_grant_inclusion_proof / trust_grant_consistency_proof).
+    //
+    // Return shapes are JSON strings (matching the v1.3.0
+    // `federation_*` and v0.8.1 `audit_*` patterns). The Python
+    // consumer parses the JSON themselves — no new pyclass wrappers
+    // for Phase H. New Python classes are reserved for the Phase J
+    // release cut if a typed surface is needed.
+    //
+    // Engine.local_signer → backend.merkle_signer is wired in
+    // `Engine::new` so these methods Just Work without per-call
+    // configuration.
+
+    /// v1.5.0 Phase H — Emit a signed `TrustGrant` audit-chain entry
+    /// (FSD §4.1). Returns a JSON-serialized
+    /// [`crate::federation::trust_grant::TrustGrantReceipt`] string
+    /// with `{ grant_id, chain_event_id, chain_event_hash, tenant_id,
+    /// tree_size_at_emit, sth }`.
+    ///
+    /// Requires `local_key_id` / `local_key_path` were configured on
+    /// the Engine (the trust grant is signed against the local
+    /// identity). Raises `ValueError` if no signer is configured,
+    /// `ValueError` for malformed `purpose` / `expires_at` /
+    /// self-grant, or `RuntimeError` for backend / signer issues.
+    #[cfg(feature = "cirisaudit")]
+    #[allow(clippy::too_many_arguments)]
+    fn grant_trust(
+        &self,
+        py: Python<'_>,
+        tenant_id: &str,
+        grantee_key: &str,
+        purpose: &str,
+        scope: &str,
+        expires_at: Option<&str>,
+        rationale: &str,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let tenant_id = tenant_id.to_owned();
+            let grantee_key = grantee_key.to_owned();
+            let scope = scope.to_owned();
+            let rationale = rationale.to_owned();
+            let purpose = crate::federation::trust_grant::TrustPurpose::parse_str(purpose)
+                .ok_or_else(|| {
+                    PyValueError::new_err(
+                        "unknown TrustPurpose (expected technical|deferral|contribution|service)",
+                    )
+                })?;
+            let expires_dt: Option<chrono::DateTime<chrono::Utc>> = match expires_at {
+                None => None,
+                Some(s) => Some(s.parse().map_err(|e| {
+                    PyValueError::new_err(format!("expires_at must be ISO-8601 (got {s:?}): {e}"))
+                })?),
+            };
+            let signer = self.local_signer.clone().ok_or_else(|| {
+                PyValueError::new_err(
+                    "no local signing key configured (pass local_key_id + local_key_path \
+                     to the Engine constructor)",
+                )
+            })?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        let receipt = crate::federation::emit::grant_trust(
+                            &*backend,
+                            &signer,
+                            &tenant_id,
+                            &grantee_key,
+                            purpose,
+                            &scope,
+                            expires_dt,
+                            &rationale,
+                        )
+                        .await
+                        .map_err(emit_err_to_py)?;
+                        serde_json::to_string(&receipt).map_err(|e| {
+                            PyRuntimeError::new_err(format!("TrustGrantReceipt encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(_) => {
+                    let audit = self
+                        .sqlite_audit
+                        .as_ref()
+                        .expect("v1.5.0 Phase H: sqlite_audit must be Some when backend is Sqlite")
+                        .clone();
+                    runtime.block_on(async move {
+                        let receipt = crate::federation::emit::grant_trust(
+                            &*audit,
+                            &signer,
+                            &tenant_id,
+                            &grantee_key,
+                            purpose,
+                            &scope,
+                            expires_dt,
+                            &rationale,
+                        )
+                        .await
+                        .map_err(emit_err_to_py)?;
+                        serde_json::to_string(&receipt).map_err(|e| {
+                            PyRuntimeError::new_err(format!("TrustGrantReceipt encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.0 Phase H — Revoke a trust grant per FSD §3.4 (re-issuance
+    /// with `expires_at = now()`, rationale = `"revocation"`). Returns
+    /// a JSON-serialized [`crate::federation::trust_grant::TrustGrantReceipt`]
+    /// for the revocation event.
+    #[cfg(feature = "cirisaudit")]
+    fn revoke_trust_grant(
+        &self,
+        py: Python<'_>,
+        tenant_id: &str,
+        grantee_key: &str,
+        purpose: &str,
+        scope: &str,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let tenant_id = tenant_id.to_owned();
+            let grantee_key = grantee_key.to_owned();
+            let scope = scope.to_owned();
+            let purpose = crate::federation::trust_grant::TrustPurpose::parse_str(purpose)
+                .ok_or_else(|| {
+                    PyValueError::new_err(
+                        "unknown TrustPurpose (expected technical|deferral|contribution|service)",
+                    )
+                })?;
+            let signer = self.local_signer.clone().ok_or_else(|| {
+                PyValueError::new_err(
+                    "no local signing key configured (pass local_key_id + local_key_path \
+                     to the Engine constructor)",
+                )
+            })?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        let receipt = crate::federation::emit::revoke_trust_grant(
+                            &*backend,
+                            &signer,
+                            &tenant_id,
+                            &grantee_key,
+                            purpose,
+                            &scope,
+                        )
+                        .await
+                        .map_err(emit_err_to_py)?;
+                        serde_json::to_string(&receipt).map_err(|e| {
+                            PyRuntimeError::new_err(format!("TrustGrantReceipt encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(_) => {
+                    let audit = self
+                        .sqlite_audit
+                        .as_ref()
+                        .expect("v1.5.0 Phase H: sqlite_audit must be Some when backend is Sqlite")
+                        .clone();
+                    runtime.block_on(async move {
+                        let receipt = crate::federation::emit::revoke_trust_grant(
+                            &*audit,
+                            &signer,
+                            &tenant_id,
+                            &grantee_key,
+                            purpose,
+                            &scope,
+                        )
+                        .await
+                        .map_err(emit_err_to_py)?;
+                        serde_json::to_string(&receipt).map_err(|e| {
+                            PyRuntimeError::new_err(format!("TrustGrantReceipt encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.0 Phase H — Look up live (non-revoked, non-expired) trust
+    /// grants for `(grantee_key, purpose, scope)`. Returns a JSON-array
+    /// string of [`crate::federation::trust_grant::TrustGrantRow`]
+    /// objects. Wildcard (`scope = '*'`) grants surface alongside
+    /// exact matches per FSD §3.3.
+    #[cfg(feature = "cirisaudit")]
+    fn lookup_trust_grant(
+        &self,
+        py: Python<'_>,
+        grantee_key: &str,
+        purpose: &str,
+        scope: &str,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let grantee_key = grantee_key.to_owned();
+            let scope = scope.to_owned();
+            let purpose = crate::federation::trust_grant::TrustPurpose::parse_str(purpose)
+                .ok_or_else(|| {
+                    PyValueError::new_err(
+                        "unknown TrustPurpose (expected technical|deferral|contribution|service)",
+                    )
+                })?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        let rows = crate::federation::read::lookup_trust_grant(
+                            &*backend,
+                            &grantee_key,
+                            purpose,
+                            &scope,
+                        )
+                        .await
+                        .map_err(federation_read_err_to_py)?;
+                        serde_json::to_string(&rows).map_err(|e| {
+                            PyRuntimeError::new_err(format!("Vec<TrustGrantRow> encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(_) => {
+                    let audit = self
+                        .sqlite_audit
+                        .as_ref()
+                        .expect("v1.5.0 Phase H: sqlite_audit must be Some when backend is Sqlite")
+                        .clone();
+                    runtime.block_on(async move {
+                        let rows = crate::federation::read::lookup_trust_grant(
+                            &*audit,
+                            &grantee_key,
+                            purpose,
+                            &scope,
+                        )
+                        .await
+                        .map_err(federation_read_err_to_py)?;
+                        serde_json::to_string(&rows).map_err(|e| {
+                            PyRuntimeError::new_err(format!("Vec<TrustGrantRow> encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.0 Phase H — Filter query over `federation_trust_grants`.
+    /// `filter_json` deserializes into
+    /// [`crate::federation::trust_grant::TrustGrantFilter`]; all
+    /// non-`None` fields AND-intersect. Returns a JSON-array string of
+    /// [`crate::federation::trust_grant::TrustGrantRow`] objects.
+    #[cfg(feature = "cirisaudit")]
+    fn list_trust_grants(&self, py: Python<'_>, filter_json: &str) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let filter: crate::federation::trust_grant::TrustGrantFilter =
+                serde_json::from_str(filter_json).map_err(|e| {
+                    PyValueError::new_err(format!("TrustGrantFilter JSON decode: {e}"))
+                })?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        let rows = crate::federation::read::list_trust_grants(&*backend, filter)
+                            .await
+                            .map_err(federation_read_err_to_py)?;
+                        serde_json::to_string(&rows).map_err(|e| {
+                            PyRuntimeError::new_err(format!("Vec<TrustGrantRow> encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(_) => {
+                    let audit = self
+                        .sqlite_audit
+                        .as_ref()
+                        .expect("v1.5.0 Phase H: sqlite_audit must be Some when backend is Sqlite")
+                        .clone();
+                    runtime.block_on(async move {
+                        let rows = crate::federation::read::list_trust_grants(&*audit, filter)
+                            .await
+                            .map_err(federation_read_err_to_py)?;
+                        serde_json::to_string(&rows).map_err(|e| {
+                            PyRuntimeError::new_err(format!("Vec<TrustGrantRow> encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.0 Phase H — Point lookup by canonical
+    /// `federation_trust_grants.grant_id`. Returns a JSON-serialized
+    /// [`crate::federation::trust_grant::TrustGrantRow`] or `None`
+    /// when no projection row exists for the grant id.
+    #[cfg(feature = "cirisaudit")]
+    fn get_trust_grant(&self, py: Python<'_>, grant_id: &str) -> PyResult<Option<String>> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let grant_uuid: uuid::Uuid = grant_id
+                .parse()
+                .map_err(|e| PyValueError::new_err(format!("grant_id must be UUID: {e}")))?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        let row = crate::federation::read::get_trust_grant(&*backend, grant_uuid)
+                            .await
+                            .map_err(federation_read_err_to_py)?;
+                        match row {
+                            None => Ok(None),
+                            Some(r) => Ok(Some(serde_json::to_string(&r).map_err(|e| {
+                                PyRuntimeError::new_err(format!("TrustGrantRow encode: {e}"))
+                            })?)),
+                        }
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(_) => {
+                    let audit = self
+                        .sqlite_audit
+                        .as_ref()
+                        .expect("v1.5.0 Phase H: sqlite_audit must be Some when backend is Sqlite")
+                        .clone();
+                    runtime.block_on(async move {
+                        let row = crate::federation::read::get_trust_grant(&*audit, grant_uuid)
+                            .await
+                            .map_err(federation_read_err_to_py)?;
+                        match row {
+                            None => Ok(None),
+                            Some(r) => Ok(Some(serde_json::to_string(&r).map_err(|e| {
+                                PyRuntimeError::new_err(format!("TrustGrantRow encode: {e}"))
+                            })?)),
+                        }
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.0 Phase H — Fetch the current
+    /// [`ciris_verify_core::transparency::SignedTreeHead`] for the
+    /// per-tenant Merkle log. Returns a JSON-serialized `SignedTreeHead`
+    /// or `None` if no STH has been published for `tenant_id` yet
+    /// (the audit chain may be empty or the Merkle hook may be
+    /// disabled).
+    #[cfg(feature = "cirisaudit")]
+    fn current_sth(&self, py: Python<'_>, tenant_id: &str) -> PyResult<Option<String>> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let tenant_id = tenant_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::audit::AuditService;
+                        let sth = backend
+                            .current_sth(&tenant_id)
+                            .await
+                            .map_err(audit_err_to_py)?;
+                        match sth {
+                            None => Ok(None),
+                            Some(s) => Ok(Some(serde_json::to_string(&s).map_err(|e| {
+                                PyRuntimeError::new_err(format!("SignedTreeHead encode: {e}"))
+                            })?)),
+                        }
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(_) => {
+                    let audit = self
+                        .sqlite_audit
+                        .as_ref()
+                        .expect("v1.5.0 Phase H: sqlite_audit must be Some when backend is Sqlite")
+                        .clone();
+                    runtime.block_on(async move {
+                        use crate::audit::AuditService;
+                        let sth = audit
+                            .current_sth(&tenant_id)
+                            .await
+                            .map_err(audit_err_to_py)?;
+                        match sth {
+                            None => Ok(None),
+                            Some(s) => Ok(Some(serde_json::to_string(&s).map_err(|e| {
+                                PyRuntimeError::new_err(format!("SignedTreeHead encode: {e}"))
+                            })?)),
+                        }
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.0 Phase H — Generate the full inclusion-proof bundle for
+    /// a trust grant. Returns a JSON-serialized
+    /// [`crate::federation::read::TrustGrantInclusionProof`] (sth +
+    /// merkle_proof + leaf_canonical_bytes). Raises `KeyError`
+    /// (`NotFound`-shape) if the grant_id has no projection row, the
+    /// tenant has no STH, or the merkle leaf is missing.
+    #[cfg(feature = "cirisaudit")]
+    fn trust_grant_inclusion_proof(&self, py: Python<'_>, grant_id: &str) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let grant_uuid: uuid::Uuid = grant_id
+                .parse()
+                .map_err(|e| PyValueError::new_err(format!("grant_id must be UUID: {e}")))?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        let bundle = crate::federation::read::trust_grant_inclusion_proof(
+                            &*backend, grant_uuid,
+                        )
+                        .await
+                        .map_err(federation_read_err_to_py)?;
+                        serde_json::to_string(&trust_grant_inclusion_proof_to_wire(&bundle))
+                            .map_err(|e| {
+                                PyRuntimeError::new_err(format!(
+                                    "TrustGrantInclusionProof encode: {e}"
+                                ))
+                            })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(_) => {
+                    let audit = self
+                        .sqlite_audit
+                        .as_ref()
+                        .expect("v1.5.0 Phase H: sqlite_audit must be Some when backend is Sqlite")
+                        .clone();
+                    runtime.block_on(async move {
+                        let bundle = crate::federation::read::trust_grant_inclusion_proof(
+                            &*audit, grant_uuid,
+                        )
+                        .await
+                        .map_err(federation_read_err_to_py)?;
+                        serde_json::to_string(&trust_grant_inclusion_proof_to_wire(&bundle))
+                            .map_err(|e| {
+                                PyRuntimeError::new_err(format!(
+                                    "TrustGrantInclusionProof encode: {e}"
+                                ))
+                            })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.0 Phase H — Generate an RFC 6962 §2.1.2 consistency proof
+    /// between two tree sizes for a tenant. Returns a JSON-serialized
+    /// [`ciris_verify_core::transparency::ConsistencyProof`]. Verifier
+    /// composes with the two STHs.
+    #[cfg(feature = "cirisaudit")]
+    fn trust_grant_consistency_proof(
+        &self,
+        py: Python<'_>,
+        tenant_id: &str,
+        old_size: u64,
+        new_size: u64,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let tenant_id = tenant_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        let proof = crate::federation::read::trust_grant_consistency_proof(
+                            &*backend, &tenant_id, old_size, new_size,
+                        )
+                        .await
+                        .map_err(federation_read_err_to_py)?;
+                        serde_json::to_string(&proof).map_err(|e| {
+                            PyRuntimeError::new_err(format!("ConsistencyProof encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(_) => {
+                    let audit = self
+                        .sqlite_audit
+                        .as_ref()
+                        .expect("v1.5.0 Phase H: sqlite_audit must be Some when backend is Sqlite")
+                        .clone();
+                    runtime.block_on(async move {
+                        let proof = crate::federation::read::trust_grant_consistency_proof(
+                            &*audit, &tenant_id, old_size, new_size,
+                        )
+                        .await
+                        .map_err(federation_read_err_to_py)?;
+                        serde_json::to_string(&proof).map_err(|e| {
+                            PyRuntimeError::new_err(format!("ConsistencyProof encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
     // ── v0.8.2: telemetry PyO3 surface (CIRISPersist#36) ─────────────
     //
     // 4 methods wrapping TelemetryService.
@@ -6534,8 +7085,10 @@ fn telemetry_err_to_py(e: crate::telemetry::Error) -> PyErr {
 /// Internal → RuntimeError (server-fault 5xx-shape).
 /// v1.0.0 — superseded for substrate-pyo3 dispatch by
 /// [`translate_error_kind`]; see the comment on `incident_err_to_py`.
+/// v1.5.0 Phase H — re-wired as the audit-error mapper for the new
+/// trust-grant / Merkle PyO3 methods (`current_sth`,
+/// `trust_grant_inclusion_proof`, …).
 #[cfg(feature = "cirisaudit")]
-#[allow(dead_code)]
 fn audit_err_to_py(e: crate::audit::Error) -> PyErr {
     let kind = e.kind();
     tracing::warn!(error = %e, kind = kind, "audit error");
@@ -6551,6 +7104,66 @@ fn audit_err_to_py(e: crate::audit::Error) -> PyErr {
         | crate::audit::Error::Merkle(_)
         | crate::audit::Error::TrustGrant(_) => PyRuntimeError::new_err(kind),
     }
+}
+
+/// v1.5.0 Phase H — Bridge [`crate::federation::emit::EmitError`] →
+/// `PyErr` at the FFI boundary. Audit-side failures route via
+/// [`audit_err_to_py`] (preserves the stable kind tokens); caller-
+/// fault validation → `PyValueError` (4xx); signer / post-emit
+/// missing-artifact errors → `PyRuntimeError` (5xx; config-fault).
+#[cfg(feature = "cirisaudit")]
+fn emit_err_to_py(e: crate::federation::emit::EmitError) -> PyErr {
+    use crate::federation::emit::EmitError;
+    tracing::warn!(error = %e, "federation emit error");
+    match e {
+        EmitError::Audit(inner) => audit_err_to_py(inner),
+        EmitError::InvalidArgument(_) => PyValueError::new_err(format!("{e}")),
+        EmitError::Signing(_) => PyRuntimeError::new_err(format!("{e}")),
+        EmitError::PostEmitSthMissing { .. } | EmitError::PostEmitProjectionMissing { .. } => {
+            PyRuntimeError::new_err(format!("{e}"))
+        }
+    }
+}
+
+/// v1.5.0 Phase H — Bridge [`crate::federation::read::ReadError`] →
+/// `PyErr`. Audit-side failures route through [`audit_err_to_py`];
+/// missing artifacts → `PyKeyError` (Python convention for "key not
+/// found" lookups, distinct from 4xx caller-fault validation
+/// failures).
+///
+/// Distinct from the lens-reads [`read_err_to_py`] (bridges
+/// `crate::read::Error`); kept under its own name to avoid the
+/// import-path collision.
+#[cfg(feature = "cirisaudit")]
+fn federation_read_err_to_py(e: crate::federation::read::ReadError) -> PyErr {
+    use crate::federation::read::ReadError;
+    use pyo3::exceptions::PyKeyError;
+    tracing::warn!(error = %e, "federation read error");
+    match e {
+        ReadError::Audit(inner) => audit_err_to_py(inner),
+        ReadError::NotFound(_) => PyKeyError::new_err(format!("{e}")),
+    }
+}
+
+/// v1.5.0 Phase H — Wire-shape adapter for
+/// [`crate::federation::read::TrustGrantInclusionProof`]. The
+/// substrate struct doesn't derive `Serialize` (its
+/// `leaf_canonical_bytes: Vec<u8>` would default to a JSON array of
+/// bytes, which isn't what verifiers want — they expect a base64
+/// string matching the rest of the federation wire codec). This
+/// helper builds the `serde_json::Value` payload Phase H ships
+/// through the PyO3 surface.
+#[cfg(feature = "cirisaudit")]
+fn trust_grant_inclusion_proof_to_wire(
+    bundle: &crate::federation::read::TrustGrantInclusionProof,
+) -> serde_json::Value {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    serde_json::json!({
+        "sth": bundle.sth,
+        "merkle_proof": bundle.merkle_proof,
+        "leaf_canonical_bytes": B64.encode(&bundle.leaf_canonical_bytes),
+    })
 }
 
 /// v0.8.0 — Bridge `graph::Error` → `PyErr` at the FFI boundary.
@@ -6624,22 +7237,22 @@ fn secrets_err_to_py(e: crate::secrets::SecretsError) -> PyErr {
     }
 }
 
-/// v0.4.2 — Bridge `signing::StewardSignerError` → `PyErr` at the
+/// v0.4.2 — Bridge `signing::LocalSignerError` → `PyErr` at the
 /// FFI boundary. Same discipline as `federation_err_to_py` and
 /// `outbound_err_to_py`: typed variants → ValueError (caller-fault
 /// 4xx-shape) or RuntimeError (server-fault 5xx-shape); verbose
 /// detail goes to tracing.
-fn steward_signer_err_to_py(e: crate::signing::StewardSignerError) -> PyErr {
-    use crate::signing::StewardSignerError;
-    tracing::warn!(error = %e, "steward signer error");
+fn local_signer_err_to_py(e: crate::signing::LocalSignerError) -> PyErr {
+    use crate::signing::LocalSignerError;
+    tracing::warn!(error = %e, "local signer error");
     match e {
-        StewardSignerError::SeedRead { .. } | StewardSignerError::PqcSeedLoad { .. } => {
+        LocalSignerError::SeedRead { .. } | LocalSignerError::PqcSeedLoad { .. } => {
             PyRuntimeError::new_err(format!("{e}"))
         }
-        StewardSignerError::SeedLength { .. }
-        | StewardSignerError::PqcConfigInconsistent
-        | StewardSignerError::PqcNotConfigured => PyValueError::new_err(format!("{e}")),
-        StewardSignerError::PqcSign(_) => PyRuntimeError::new_err(format!("{e}")),
+        LocalSignerError::SeedLength { .. }
+        | LocalSignerError::PqcConfigInconsistent
+        | LocalSignerError::PqcNotConfigured => PyValueError::new_err(format!("{e}")),
+        LocalSignerError::PqcSign(_) => PyRuntimeError::new_err(format!("{e}")),
     }
 }
 

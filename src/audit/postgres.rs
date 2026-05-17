@@ -54,7 +54,7 @@ async fn merkle_hook_pg(
     let Some(signer) = backend.merkle_signer() else {
         // Signer not configured — no-op. Preserves the pre-Phase-C
         // behavior for CIRIS-RED deployments + tests without a
-        // steward identity loaded.
+        // local identity loaded.
         return Ok(());
     };
 
@@ -94,7 +94,7 @@ async fn merkle_hook_pg(
         .map_err(|e| Error::Merkle(format!("append join: {e}")))?
         .map_err(|e| Error::Merkle(format!("append: {e}")))?;
 
-    // 2. Sign the STH via StewardSigner::sign_hybrid (async).
+    // 2. Sign the STH via LocalSigner::sign_hybrid (async).
     let timestamp = chrono::Utc::now();
     let signing_bytes = SignedTreeHead::signing_bytes(&log_id, tree_size, &root_hash, timestamp);
     let signature = signer
@@ -424,7 +424,7 @@ impl AuditService for PostgresBackend {
             .map_err(|e| Error::Backend(format!("commit: {e}")))?;
 
         // v1.5.0 Phase C — Merkle transparency hook. Runs only when a
-        // steward signer was installed via `set_merkle_signer`;
+        // local signer was installed via `set_merkle_signer`;
         // otherwise this is a no-op and the audit chain semantics are
         // unchanged. `sequence_number` is reused as the
         // `chain_event_id` per FSD §4.4.
@@ -1741,14 +1741,14 @@ mod tests {
     // v1.5.0 Phase C — Merkle transparency hook tests (Postgres)
     // ────────────────────────────────────────────────────────────────
 
-    fn merkle_test_signer(seed_byte: u8) -> std::sync::Arc<crate::signing::StewardSigner> {
+    fn merkle_test_signer(seed_byte: u8) -> std::sync::Arc<crate::signing::LocalSigner> {
         use ciris_keyring::MlDsa65SoftwareSigner;
         let signing_key = SigningKey::from_bytes(&[seed_byte; 32]);
         let pqc =
             MlDsa65SoftwareSigner::from_seed_bytes(&[seed_byte ^ 0x55; 32], "test-merkle-pqc")
                 .expect("seed bytes");
         let pqc_arc: std::sync::Arc<dyn ciris_keyring::PqcSigner> = std::sync::Arc::new(pqc);
-        std::sync::Arc::new(crate::signing::StewardSigner::from_parts(
+        std::sync::Arc::new(crate::signing::LocalSigner::from_parts(
             signing_key,
             "test-merkle-steward".to_string(),
             Some(pqc_arc),

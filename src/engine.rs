@@ -2,7 +2,7 @@
 //!
 //! Composes a storage backend (Postgres or SQLite, behind a public
 //! [`BackendDispatch`] enum) with a pre-loaded
-//! [`StewardSigner`](crate::signing::StewardSigner) `Arc`. Used by
+//! [`LocalSigner`](crate::signing::LocalSigner) `Arc`. Used by
 //! sovereign-mode Reticulum agents (CIRISEdge) and in-process lens-core
 //! consumers (CIRISLensCore) that want to construct substrate primitives
 //! without dragging in the full PyO3 [`PyEngine`](crate::ffi::pyo3::PyEngine)
@@ -37,12 +37,12 @@
 //!
 //! ```ignore
 //! use std::sync::Arc;
-//! use ciris_persist::{Engine, signing::StewardSigner};
+//! use ciris_persist::{Engine, signing::LocalSigner};
 //!
-//! let signer = Arc::new(StewardSigner::from_config(/* … */)?);
+//! let signer = Arc::new(LocalSigner::from_config(/* … */)?);
 //! let engine = Engine::with_signer(signer.clone(), "sqlite:///agent.db").await?;
 //!
-//! // Sign a canonical envelope with the steward identity.
+//! // Sign a canonical envelope with the local identity.
 //! let sig = engine.signer().sign_ed25519(canonical_bytes)?;
 //!
 //! // Dispatch on the backend to use the federation directory.
@@ -61,7 +61,7 @@
 
 use std::sync::Arc;
 
-use crate::signing::StewardSigner;
+use crate::signing::LocalSigner;
 #[cfg(feature = "postgres")]
 use crate::store::PostgresBackend;
 #[cfg(feature = "sqlite")]
@@ -97,18 +97,18 @@ pub enum BackendDispatch {
 
 /// v1.1.0 (CIRISPersist#43) — Rust-side substrate handle composing
 /// a storage backend plus a pre-loaded
-/// [`StewardSigner`](crate::signing::StewardSigner) `Arc`.
+/// [`LocalSigner`](crate::signing::LocalSigner) `Arc`.
 ///
 /// See module-level documentation for usage.
 #[derive(Clone)]
 pub struct Engine {
     backend: BackendDispatch,
-    signer: Arc<StewardSigner>,
+    signer: Arc<LocalSigner>,
 }
 
 impl Engine {
     /// Construct an Engine with a pre-loaded
-    /// [`StewardSigner`](crate::signing::StewardSigner) `Arc` plus a
+    /// [`LocalSigner`](crate::signing::LocalSigner) `Arc` plus a
     /// backend DSN.
     ///
     /// DSN URL-sniff (mirrors
@@ -122,7 +122,7 @@ impl Engine {
     /// Runs the backend's migrations as part of construction (the
     /// same `Backend::run_migrations` path the PyO3 surface uses), so
     /// the returned Engine is ready to read/write immediately.
-    pub async fn with_signer(signer: Arc<StewardSigner>, dsn: &str) -> Result<Self, EngineError> {
+    pub async fn with_signer(signer: Arc<LocalSigner>, dsn: &str) -> Result<Self, EngineError> {
         let backend = build_backend(dsn).await?;
         Ok(Engine { backend, signer })
     }
@@ -132,10 +132,10 @@ impl Engine {
     /// CIRISPersist#43.
     ///
     /// Wraps the components into a
-    /// [`StewardSigner`](crate::signing::StewardSigner) via
-    /// [`StewardSigner::from_parts`] before composing the Engine. Use
+    /// [`LocalSigner`](crate::signing::LocalSigner) via
+    /// [`LocalSigner::from_parts`] before composing the Engine. Use
     /// [`Engine::with_signer`] when you already hold an
-    /// `Arc<StewardSigner>`.
+    /// `Arc<LocalSigner>`.
     pub async fn with_signer_arcs(
         signing_key: ed25519_dalek::SigningKey,
         key_id: String,
@@ -143,7 +143,7 @@ impl Engine {
         pqc_key_id: Option<String>,
         dsn: &str,
     ) -> Result<Self, EngineError> {
-        let signer = Arc::new(StewardSigner::from_parts(
+        let signer = Arc::new(LocalSigner::from_parts(
             signing_key,
             key_id,
             pqc_signer,
@@ -163,8 +163,8 @@ impl Engine {
         &self.backend
     }
 
-    /// Accessor for the composed steward signer `Arc`.
-    pub fn signer(&self) -> &Arc<StewardSigner> {
+    /// Accessor for the composed local signer `Arc`.
+    pub fn signer(&self) -> &Arc<LocalSigner> {
         &self.signer
     }
 
@@ -334,11 +334,11 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
 
-    fn test_signer() -> Arc<StewardSigner> {
+    fn test_signer() -> Arc<LocalSigner> {
         // Deterministic 32-byte seed for fixture reproducibility.
         let seed = [0x7Au8; 32];
         let signing_key = SigningKey::from_bytes(&seed);
-        Arc::new(StewardSigner::from_parts(
+        Arc::new(LocalSigner::from_parts(
             signing_key,
             "test-engine-steward".to_string(),
             None,

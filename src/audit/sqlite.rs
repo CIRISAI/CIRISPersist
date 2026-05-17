@@ -36,13 +36,13 @@ use crate::ClaimResult;
 /// ride the same WAL + PRAGMA settings as the trace-ingest path.
 pub struct SqliteAuditBackend {
     conn: Arc<Mutex<Connection>>,
-    /// Optional steward signer for the v1.5.0 Merkle transparency
+    /// Optional local signer for the v1.5.0 Merkle transparency
     /// hook. Mirror of `PostgresBackend.merkle_signer`. When
     /// configured, every committed audit entry is appended to the
     /// tenant's `TransparencyLog<AuditLeaf>` and an STH is signed +
     /// stored. When `None`, the Merkle hook is a no-op. Wired by the
     /// Engine layer at construction (Phase G/H).
-    merkle_signer: std::sync::RwLock<Option<Arc<crate::signing::StewardSigner>>>,
+    merkle_signer: std::sync::RwLock<Option<Arc<crate::signing::LocalSigner>>>,
 }
 
 impl SqliteAuditBackend {
@@ -58,9 +58,9 @@ impl SqliteAuditBackend {
 
     /// Install the Merkle-hook signer for v1.5.0 audit-service
     /// transparency. Engine layer wires this in at construction with
-    /// `Arc::clone(&self.steward_signer)`. Passing `None` disables
+    /// `Arc::clone(&self.local_signer)`. Passing `None` disables
     /// the hook (no-op path). Idempotent.
-    pub fn set_merkle_signer(&self, signer: Option<Arc<crate::signing::StewardSigner>>) {
+    pub fn set_merkle_signer(&self, signer: Option<Arc<crate::signing::LocalSigner>>) {
         let mut guard = self
             .merkle_signer
             .write()
@@ -70,7 +70,7 @@ impl SqliteAuditBackend {
 
     /// Snapshot the currently-installed Merkle signer (Phase C
     /// ingest path uses this to gate the hook).
-    pub fn merkle_signer(&self) -> Option<Arc<crate::signing::StewardSigner>> {
+    pub fn merkle_signer(&self) -> Option<Arc<crate::signing::LocalSigner>> {
         let guard = self.merkle_signer.read().unwrap_or_else(|p| p.into_inner());
         guard.clone()
     }
@@ -131,7 +131,7 @@ async fn merkle_hook_sqlite(
         .map_err(|e| Error::Merkle(format!("append join: {e}")))?
         .map_err(|e| Error::Merkle(format!("append: {e}")))?;
 
-    // 2. Sign STH via StewardSigner::sign_hybrid (async).
+    // 2. Sign STH via LocalSigner::sign_hybrid (async).
     let timestamp = chrono::Utc::now();
     let signing_bytes = SignedTreeHead::signing_bytes(&log_id, tree_size, &root_hash, timestamp);
     let signature = signer
@@ -471,7 +471,7 @@ impl AuditService for SqliteAuditBackend {
         .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))??;
 
         // v1.5.0 Phase C — Merkle transparency hook (SQLite parity).
-        // Runs only when a steward signer is installed; otherwise this
+        // Runs only when a local signer is installed; otherwise this
         // is a no-op and chain semantics are unchanged. Same option
         // (b) atomicity stance as PG: chain is source of truth, Merkle
         // is projection (see `merkle_hook_sqlite` rustdoc + the PG
@@ -1873,18 +1873,18 @@ mod tests {
     // v1.5.0 Phase C — Merkle transparency hook tests (SQLite)
     // ────────────────────────────────────────────────────────────────
 
-    /// Build a StewardSigner with PQC configured via in-memory seeds.
+    /// Build a LocalSigner with PQC configured via in-memory seeds.
     /// Phase C's Merkle hook needs `sign_hybrid` (Ed25519 + ML-DSA-65),
     /// which requires a PQC signer; bare Ed25519-only signers trip the
     /// `PqcNotConfigured` path.
-    fn merkle_test_signer(seed_byte: u8) -> std::sync::Arc<crate::signing::StewardSigner> {
+    fn merkle_test_signer(seed_byte: u8) -> std::sync::Arc<crate::signing::LocalSigner> {
         use ciris_keyring::MlDsa65SoftwareSigner;
         let signing_key = SigningKey::from_bytes(&[seed_byte; 32]);
         let pqc =
             MlDsa65SoftwareSigner::from_seed_bytes(&[seed_byte ^ 0x55; 32], "test-merkle-pqc")
                 .expect("seed bytes");
         let pqc_arc: std::sync::Arc<dyn ciris_keyring::PqcSigner> = std::sync::Arc::new(pqc);
-        std::sync::Arc::new(crate::signing::StewardSigner::from_parts(
+        std::sync::Arc::new(crate::signing::LocalSigner::from_parts(
             signing_key,
             "test-merkle-steward".to_string(),
             Some(pqc_arc),

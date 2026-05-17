@@ -61,3 +61,91 @@ class Engine:
             RuntimeError: backend / IO error — caller surfaces as HTTP
                 5xx.
         """
+
+    # ── v1.5.0 Phase H: trust-grant + Merkle transparency surface ────
+    #
+    # 8 methods wrapping the federation::emit + federation::read APIs.
+    # Return shapes are JSON strings (caller parses); typed Python
+    # classes are reserved for the Phase J release cut.
+
+    def grant_trust(
+        self,
+        tenant_id: str,
+        grantee_key: str,
+        purpose: str,
+        scope: str,
+        expires_at: str | None,
+        rationale: str,
+    ) -> str:
+        """Emit a signed TrustGrant audit-chain entry (FSD §4.1).
+
+        ``purpose`` must be one of ``"technical" | "deferral" |
+        "contribution" | "service"``. ``expires_at`` is ISO-8601 or
+        ``None``. Requires a steward key configured on the Engine
+        (``local_key_id`` + ``local_key_path``).
+
+        Returns a JSON-encoded ``TrustGrantReceipt`` string with
+        ``{ grant_id, chain_event_id, chain_event_hash, tenant_id,
+        tree_size_at_emit, sth }``.
+
+        Raises:
+            ValueError: malformed purpose / expires_at, self-grant,
+                or no steward signer configured.
+            RuntimeError: signing or backend failure.
+        """
+
+    def revoke_trust_grant(
+        self,
+        tenant_id: str,
+        grantee_key: str,
+        purpose: str,
+        scope: str,
+    ) -> str:
+        """Revoke a trust grant per FSD §3.4 (re-issuance with
+        ``expires_at = now()``, rationale = ``"revocation"``). Returns
+        a JSON-encoded ``TrustGrantReceipt`` for the revocation event."""
+
+    def lookup_trust_grant(
+        self,
+        grantee_key: str,
+        purpose: str,
+        scope: str,
+    ) -> str:
+        """Look up live (non-revoked, non-expired) trust grants for
+        ``(grantee_key, purpose, scope)``. Returns a JSON-array string
+        of ``TrustGrantRow`` objects. Wildcard scope grants (``"*"``)
+        surface alongside exact matches per FSD §3.3."""
+
+    def list_trust_grants(self, filter_json: str) -> str:
+        """Filter query over ``federation_trust_grants``. ``filter_json``
+        deserializes into ``TrustGrantFilter``. Returns a JSON-array
+        string of ``TrustGrantRow`` objects."""
+
+    def get_trust_grant(self, grant_id: str) -> str | None:
+        """Point lookup by canonical UUID ``grant_id``. Returns a
+        JSON-encoded ``TrustGrantRow`` or ``None``."""
+
+    def current_sth(self, tenant_id: str) -> str | None:
+        """Fetch the current ``SignedTreeHead`` for the per-tenant
+        Merkle log. Returns a JSON-encoded ``SignedTreeHead`` or
+        ``None``."""
+
+    def trust_grant_inclusion_proof(self, grant_id: str) -> str:
+        """Generate the full inclusion-proof bundle for a trust grant.
+        Returns a JSON object with ``{ sth, merkle_proof,
+        leaf_canonical_bytes (base64) }``.
+
+        Raises:
+            KeyError: grant_id has no projection row, the tenant has
+                no STH, or the merkle leaf is missing.
+        """
+
+    def trust_grant_consistency_proof(
+        self,
+        tenant_id: str,
+        old_size: int,
+        new_size: int,
+    ) -> str:
+        """Generate an RFC 6962 §2.1.2 consistency proof between two
+        tree sizes for a tenant. Returns a JSON-encoded
+        ``ConsistencyProof``."""

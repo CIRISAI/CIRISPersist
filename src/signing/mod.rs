@@ -1,26 +1,26 @@
-//! Steward identity signing — Rust-public surface (v0.4.2,
+//! Local identity signing — Rust-public surface (v0.4.2,
 //! CIRISPersist#17).
 //!
 //! CIRISLensCore (rlib path, never PyO3) needs to sign detection
-//! events via persist's steward identity per its mission lock-in:
-//! "uses `persist.steward_sign()` exclusively." Pre-v0.4.2 the only
-//! signing surface was the PyO3 `Engine.steward_sign` method;
+//! events via persist's local identity per its mission lock-in:
+//! "uses `persist.local_sign()` exclusively." Pre-v0.4.2 the only
+//! signing surface was the PyO3 `Engine.local_sign` method;
 //! Rust callers had no way to compose against persist's signing
 //! without going through Python.
 //!
-//! [`StewardSigner`] lifts the construction + sign primitives to a
-//! Rust-public struct. PyO3 `Engine.steward_sign` /
-//! `steward_pqc_sign` are now thin wrappers — one implementation,
+//! [`LocalSigner`] lifts the construction + sign primitives to a
+//! Rust-public struct. PyO3 `Engine.local_sign` /
+//! `local_pqc_sign` are now thin wrappers — one implementation,
 //! both surfaces (CIRISPersist#7 single-source-of-truth pattern).
 //!
 //! # Construction
 //!
-//! Same shape as PyO3 Engine's steward init:
+//! Same shape as PyO3 Engine's local init:
 //!
 //! ```ignore
-//! use ciris_persist::signing::{StewardSigner, StewardSignerConfig};
+//! use ciris_persist::signing::{LocalSigner, LocalSignerConfig};
 //!
-//! let signer = StewardSigner::from_config(&StewardSignerConfig {
+//! let signer = LocalSigner::from_config(&LocalSignerConfig {
 //!     key_id: "lens-steward".into(),
 //!     key_path: "/run/secrets/lens-steward.seed".into(),
 //!     pqc_key_id: Some("lens-steward-pqc".into()),
@@ -42,17 +42,17 @@
 //!
 //! `pqc_key_id` and `pqc_key_path` are paired: configuring one
 //! without the other returns
-//! [`StewardSignerError::PqcConfigInconsistent`]. When neither is
+//! [`LocalSignerError::PqcConfigInconsistent`]. When neither is
 //! configured, the signer is Ed25519-only —
-//! [`StewardSigner::sign_ml_dsa_65`] and
-//! [`StewardSigner::sign_hybrid`] return
-//! [`StewardSignerError::PqcNotConfigured`].
+//! [`LocalSigner::sign_ml_dsa_65`] and
+//! [`LocalSigner::sign_hybrid`] return
+//! [`LocalSignerError::PqcNotConfigured`].
 //!
 //! # Seed-management discipline
 //!
 //! Same as PyO3 Engine: 32-byte raw seed files at the configured
 //! paths. Seed bytes never enter the calling process address space
-//! after [`StewardSigner::from_config`] (Ed25519 reads the seed
+//! after [`LocalSigner::from_config`] (Ed25519 reads the seed
 //! once into a `SigningKey`; ML-DSA-65 hands the path to
 //! `MlDsa65SoftwareSigner::from_seed_file` which holds the keyring
 //! reference, never returning the seed to the caller).
@@ -69,20 +69,20 @@ use ciris_crypto::{
 use ciris_keyring::{MlDsa65SoftwareSigner, PqcSigner};
 use ed25519_dalek::{Signer as _, SigningKey};
 
-/// Configuration for [`StewardSigner::from_config`]. Matches the
-/// PyO3 Engine constructor's steward-* parameter shape.
+/// Configuration for [`LocalSigner::from_config`]. Matches the
+/// PyO3 Engine constructor's local-* parameter shape.
 #[derive(Debug, Clone)]
-pub struct StewardSignerConfig {
-    /// Steward identity key_id (e.g. `"lens-steward"`,
-    /// `"persist-steward"`). Used as the `key_id` of the steward
+pub struct LocalSignerConfig {
+    /// Local identity key_id (e.g. `"lens-steward"`,
+    /// `"persist-steward"`). Used as the `key_id` of the local
     /// `federation_keys` row and as the `scrub_key_id` for federation
     /// rows the deployment publishes.
     pub key_id: String,
     /// Filesystem path to the 32-byte raw Ed25519 seed for the
-    /// steward identity. Must be readable by the calling process
+    /// local identity. Must be readable by the calling process
     /// and chmod 600 (OS handles the permission check on read).
     pub key_path: PathBuf,
-    /// Optional ML-DSA-65 PQC steward identity. Both-or-neither
+    /// Optional ML-DSA-65 PQC local identity. Both-or-neither
     /// with `pqc_key_path`.
     pub pqc_key_id: Option<String>,
     /// Filesystem path to the 32-byte raw ML-DSA-65 seed.
@@ -90,9 +90,9 @@ pub struct StewardSignerConfig {
     pub pqc_key_path: Option<PathBuf>,
 }
 
-/// Errors from [`StewardSigner`] construction + signing.
+/// Errors from [`LocalSigner`] construction + signing.
 #[derive(Debug, thiserror::Error)]
-pub enum StewardSignerError {
+pub enum LocalSignerError {
     /// `key_path` could not be read (file missing, wrong
     /// permissions, etc.).
     #[error("seed read ({path}): {source}")]
@@ -121,7 +121,7 @@ pub enum StewardSignerError {
     /// ML-DSA-65 seed file load failed (path missing, wrong
     /// length, parse error). Wraps the underlying keyring error
     /// as a string so it crosses module boundaries.
-    #[error("ML-DSA-65 steward seed load ({path}): {detail}")]
+    #[error("ML-DSA-65 local seed load ({path}): {detail}")]
     PqcSeedLoad {
         /// Path of the ML-DSA-65 seed file.
         path: String,
@@ -131,7 +131,7 @@ pub enum StewardSignerError {
 
     /// `sign_ml_dsa_65` or `sign_hybrid` called when the signer
     /// was constructed without PQC config.
-    #[error("PQC steward not configured (set pqc_key_id + pqc_key_path)")]
+    #[error("PQC local not configured (set pqc_key_id + pqc_key_path)")]
     PqcNotConfigured,
 
     /// Underlying ML-DSA-65 sign / public_key call failed.
@@ -139,24 +139,24 @@ pub enum StewardSignerError {
     PqcSign(String),
 }
 
-/// Steward identity signer — Rust-public surface for federation
+/// Local identity signer — Rust-public surface for federation
 /// peers (CIRISLensCore, CIRISEdge, registry, partner sites)
-/// that need to sign as the deployment's steward.
+/// that need to sign as the deployment's local identity.
 ///
 /// Constructed once at deployment startup; held in an `Arc` and
 /// shared across worker tasks. All sign methods take `&self`
 /// (signing key isn't mutated).
-pub struct StewardSigner {
+pub struct LocalSigner {
     signing_key: SigningKey,
     key_id: String,
     pqc_signer: Option<Arc<dyn PqcSigner>>,
     pqc_key_id: Option<String>,
 }
 
-impl std::fmt::Debug for StewardSigner {
+impl std::fmt::Debug for LocalSigner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Don't expose signing_key in Debug. Public key only.
-        f.debug_struct("StewardSigner")
+        f.debug_struct("LocalSigner")
             .field("key_id", &self.key_id)
             .field("public_key_b64", &self.public_key_b64())
             .field("pqc_key_id", &self.pqc_key_id)
@@ -165,32 +165,32 @@ impl std::fmt::Debug for StewardSigner {
     }
 }
 
-impl StewardSigner {
-    /// Load steward identity from filesystem seeds.
+impl LocalSigner {
+    /// Load local identity from filesystem seeds.
     ///
-    /// Mirrors PyO3 `Engine::__init__`'s steward-* wiring exactly:
+    /// Mirrors PyO3 `Engine::__init__`'s local-* wiring exactly:
     /// reads the 32-byte raw Ed25519 seed; if `pqc_key_id` +
     /// `pqc_key_path` are configured, also loads the ML-DSA-65
     /// signer via `MlDsa65SoftwareSigner::from_seed_file`.
     ///
-    /// Logs a `tracing::info` line with the steward pubkey on
+    /// Logs a `tracing::info` line with the local pubkey on
     /// success — same observability shape PyO3 Engine uses for
-    /// "ciris-persist: steward identity loaded".
-    pub fn from_config(cfg: &StewardSignerConfig) -> Result<Self, StewardSignerError> {
+    /// "ciris-persist: local identity loaded".
+    pub fn from_config(cfg: &LocalSignerConfig) -> Result<Self, LocalSignerError> {
         // Pair-validate PQC config first; cheaper than reading the
         // Ed25519 seed only to find the PQC config inconsistent.
         match (&cfg.pqc_key_id, &cfg.pqc_key_path) {
             (None, None) | (Some(_), Some(_)) => {}
-            _ => return Err(StewardSignerError::PqcConfigInconsistent),
+            _ => return Err(LocalSignerError::PqcConfigInconsistent),
         }
 
         let path_str = cfg.key_path.to_string_lossy().into_owned();
-        let seed = std::fs::read(&cfg.key_path).map_err(|e| StewardSignerError::SeedRead {
+        let seed = std::fs::read(&cfg.key_path).map_err(|e| LocalSignerError::SeedRead {
             path: path_str.clone(),
             source: e,
         })?;
         if seed.len() != 32 {
-            return Err(StewardSignerError::SeedLength {
+            return Err(LocalSignerError::SeedLength {
                 path: path_str,
                 got: seed.len(),
             });
@@ -202,15 +202,15 @@ impl StewardSigner {
             (Some(id), Some(path)) => {
                 let path_str = path.to_string_lossy().into_owned();
                 let signer = MlDsa65SoftwareSigner::from_seed_file(path, id).map_err(|e| {
-                    StewardSignerError::PqcSeedLoad {
+                    LocalSignerError::PqcSeedLoad {
                         path: path_str.clone(),
                         detail: format!("{e}"),
                     }
                 })?;
                 tracing::info!(
-                    steward_pqc_key_id = id.as_str(),
+                    local_pqc_key_id = id.as_str(),
                     seed_path = path_str.as_str(),
-                    "ciris-persist: PQC steward identity loaded (ML-DSA-65, software)"
+                    "ciris-persist: PQC local identity loaded (ML-DSA-65, software)"
                 );
                 let arc: Arc<dyn PqcSigner> = Arc::new(signer);
                 (Some(id.clone()), Some(arc))
@@ -220,9 +220,9 @@ impl StewardSigner {
 
         let pubkey_b64 = B64.encode(signing_key.verifying_key().to_bytes());
         tracing::info!(
-            steward_key_id = cfg.key_id.as_str(),
-            steward_pubkey_b64 = %pubkey_b64,
-            "ciris-persist: steward identity loaded"
+            local_key_id = cfg.key_id.as_str(),
+            local_pubkey_b64 = %pubkey_b64,
+            "ciris-persist: local identity loaded"
         );
 
         Ok(Self {
@@ -233,7 +233,7 @@ impl StewardSigner {
         })
     }
 
-    /// Construct a [`StewardSigner`] from already-loaded primitives.
+    /// Construct a [`LocalSigner`] from already-loaded primitives.
     /// For test fixtures and in-process key-management scenarios
     /// where the seed isn't on disk; production code should use
     /// [`Self::from_config`].
@@ -252,8 +252,8 @@ impl StewardSigner {
     }
 
     /// Ed25519 sign canonical bytes. Returns the 64-byte signature.
-    /// Hot-path; no async. Mirrors PyO3 `engine.steward_sign(message)`.
-    pub fn sign_ed25519(&self, message: &[u8]) -> Result<[u8; 64], StewardSignerError> {
+    /// Hot-path; no async. Mirrors PyO3 `engine.local_sign(message)`.
+    pub fn sign_ed25519(&self, message: &[u8]) -> Result<[u8; 64], LocalSignerError> {
         Ok(self.signing_key.sign(message).to_bytes())
     }
 
@@ -262,17 +262,17 @@ impl StewardSigner {
     /// `PqcSigner` trait is async — HW post-quantum signers may
     /// require async I/O when they land.
     ///
-    /// Returns [`StewardSignerError::PqcNotConfigured`] if the signer
+    /// Returns [`LocalSignerError::PqcNotConfigured`] if the signer
     /// was constructed without PQC config.
-    pub async fn sign_ml_dsa_65(&self, message: &[u8]) -> Result<Vec<u8>, StewardSignerError> {
+    pub async fn sign_ml_dsa_65(&self, message: &[u8]) -> Result<Vec<u8>, LocalSignerError> {
         let signer = self
             .pqc_signer
             .as_ref()
-            .ok_or(StewardSignerError::PqcNotConfigured)?;
+            .ok_or(LocalSignerError::PqcNotConfigured)?;
         signer
             .sign(message)
             .await
-            .map_err(|e| StewardSignerError::PqcSign(format!("{e}")))
+            .map_err(|e| LocalSignerError::PqcSign(format!("{e}")))
     }
 
     /// Hybrid sign canonical bytes — Ed25519 over `message`, then
@@ -286,13 +286,13 @@ impl StewardSigner {
     /// ship with. This is the convenience composition of
     /// `sign_ed25519` + `sign_ml_dsa_65` + bound-payload assembly.
     ///
-    /// Returns [`StewardSignerError::PqcNotConfigured`] if the signer
+    /// Returns [`LocalSignerError::PqcNotConfigured`] if the signer
     /// was constructed without PQC config.
-    pub async fn sign_hybrid(&self, message: &[u8]) -> Result<HybridSignature, StewardSignerError> {
+    pub async fn sign_hybrid(&self, message: &[u8]) -> Result<HybridSignature, LocalSignerError> {
         let signer = self
             .pqc_signer
             .as_ref()
-            .ok_or(StewardSignerError::PqcNotConfigured)?;
+            .ok_or(LocalSignerError::PqcNotConfigured)?;
 
         let classical_sig = self.signing_key.sign(message).to_bytes();
         let mut bound = Vec::with_capacity(message.len() + classical_sig.len());
@@ -302,11 +302,11 @@ impl StewardSigner {
         let pqc_sig = signer
             .sign(&bound)
             .await
-            .map_err(|e| StewardSignerError::PqcSign(format!("{e}")))?;
+            .map_err(|e| LocalSignerError::PqcSign(format!("{e}")))?;
         let pqc_pk = signer
             .public_key()
             .await
-            .map_err(|e| StewardSignerError::PqcSign(format!("{e}")))?;
+            .map_err(|e| LocalSignerError::PqcSign(format!("{e}")))?;
 
         Ok(HybridSignature {
             crypto_kind: CRYPTO_KIND_CIRIS_V1,
@@ -324,40 +324,40 @@ impl StewardSigner {
         })
     }
 
-    /// Steward identity key_id.
+    /// Local identity key_id.
     pub fn key_id(&self) -> &str {
         &self.key_id
     }
 
-    /// PQC steward identity key_id (when configured).
+    /// PQC local identity key_id (when configured).
     pub fn pqc_key_id(&self) -> Option<&str> {
         self.pqc_key_id.as_deref()
     }
 
-    /// Steward Ed25519 public key, base64 standard alphabet (44
+    /// Local Ed25519 public key, base64 standard alphabet (44
     /// chars). Suitable for publishing to the registry / federation
     /// directory as `pubkey_ed25519_base64`.
     pub fn public_key_b64(&self) -> String {
         B64.encode(self.signing_key.verifying_key().to_bytes())
     }
 
-    /// Steward ML-DSA-65 public key, base64 standard alphabet
+    /// Local ML-DSA-65 public key, base64 standard alphabet
     /// (~2604 chars; 1952 raw bytes). Async because `PqcSigner`'s
     /// public_key path is async (HW signers may dispatch).
     /// Returns `None` when PQC isn't configured.
-    pub async fn pqc_public_key_b64(&self) -> Result<Option<String>, StewardSignerError> {
+    pub async fn pqc_public_key_b64(&self) -> Result<Option<String>, LocalSignerError> {
         let Some(signer) = self.pqc_signer.as_ref() else {
             return Ok(None);
         };
         let pk = signer
             .public_key()
             .await
-            .map_err(|e| StewardSignerError::PqcSign(format!("{e}")))?;
+            .map_err(|e| LocalSignerError::PqcSign(format!("{e}")))?;
         Ok(Some(B64.encode(&pk)))
     }
 
     /// Internal accessor for PyO3 wrapper — exposes the underlying
-    /// `Arc<dyn PqcSigner>` so `Engine.steward_pqc_sign` and the
+    /// `Arc<dyn PqcSigner>` so `Engine.local_pqc_sign` and the
     /// cold-path PQC fill-in can call it without re-implementing
     /// the seed loading. Wired by the PyO3 Engine refactor in a
     /// follow-up release; lives `pub(crate)` for now.
@@ -391,7 +391,7 @@ mod tests {
     fn from_config_loads_ed25519_seed() {
         let seed = [0x42u8; 32];
         let f = write_seed(&seed);
-        let signer = StewardSigner::from_config(&StewardSignerConfig {
+        let signer = LocalSigner::from_config(&LocalSignerConfig {
             key_id: "test-steward".into(),
             key_path: f.path().to_path_buf(),
             pqc_key_id: None,
@@ -414,7 +414,7 @@ mod tests {
         let mut f = NamedTempFile::new().expect("tempfile");
         f.write_all(&[0x42u8; 31]).unwrap();
         f.flush().unwrap();
-        let err = StewardSigner::from_config(&StewardSignerConfig {
+        let err = LocalSigner::from_config(&LocalSignerConfig {
             key_id: "test".into(),
             key_path: f.path().to_path_buf(),
             pqc_key_id: None,
@@ -422,7 +422,7 @@ mod tests {
         })
         .unwrap_err();
         assert!(
-            matches!(err, StewardSignerError::SeedLength { got: 31, .. }),
+            matches!(err, LocalSignerError::SeedLength { got: 31, .. }),
             "got: {err:?}"
         );
     }
@@ -430,20 +430,20 @@ mod tests {
     #[test]
     fn from_config_rejects_pqc_config_inconsistent() {
         let f = write_seed(&[0x42u8; 32]);
-        let err = StewardSigner::from_config(&StewardSignerConfig {
+        let err = LocalSigner::from_config(&LocalSignerConfig {
             key_id: "test".into(),
             key_path: f.path().to_path_buf(),
             pqc_key_id: Some("pqc".into()),
             pqc_key_path: None,
         })
         .unwrap_err();
-        assert!(matches!(err, StewardSignerError::PqcConfigInconsistent));
+        assert!(matches!(err, LocalSignerError::PqcConfigInconsistent));
     }
 
     #[test]
     fn sign_ml_dsa_65_without_pqc_config_returns_typed_error() {
         let f = write_seed(&[0x42u8; 32]);
-        let signer = StewardSigner::from_config(&StewardSignerConfig {
+        let signer = LocalSigner::from_config(&LocalSignerConfig {
             key_id: "test".into(),
             key_path: f.path().to_path_buf(),
             pqc_key_id: None,
@@ -454,6 +454,6 @@ mod tests {
         let err = rt
             .block_on(async { signer.sign_ml_dsa_65(b"hello").await })
             .unwrap_err();
-        assert!(matches!(err, StewardSignerError::PqcNotConfigured));
+        assert!(matches!(err, LocalSignerError::PqcNotConfigured));
     }
 }
