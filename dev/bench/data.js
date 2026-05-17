@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778979390816,
+  "lastUpdate": 1778984501328,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -15923,6 +15923,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25930938,
             "range": "± 354381",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "494e1926888788199380822d02d54c94a9518094",
+          "message": "1.5.2 — pin bump to CIRISVerify v2.4.0 (workspace vocabulary coherence)\n\nciris-keyring / ciris-verify-core / ciris-crypto v2.3.0 → v2.4.0\nfollowing CIRISVerify's vocabulary-fix rename:\n  load_steward_seed   → load_local_seed\n  StewardSeedConfig   → LocalSeedConfig\n\nPersist doesn't import the renamed symbols (we use Ed25519SoftwareSigner,\nMlDsa65SoftwareSigner, PqcSigner, HardwareSigner — none with \"steward\"\nin the name), so the pin bump is workspace-coherence only. No code\nchanges.\n\nThe CIRISVerify v2.4.0 vocabulary lock matches what v1.4.0 (#51) +\nv1.5.0 (Phase H) baked into persist's internals:\n- steward = bootstrap-trusted root identity (Verify's\n  bootstrap_stewards.json — registry anchor pubkeys that seed\n  federation trust)\n- local = a deployment's own per-process signing identity (persist's\n  LocalSigner, edge's signer, agent's signer)\n\nCrystal-clear distinction across the stack now. No zombie steward_*\nnames anywhere in our identity / signing surface.\n\nTests: 368 lib pass (unchanged from v1.5.1 — pin-bump only).\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-16T21:12:17-05:00",
+          "tree_id": "78340076290602ef40504e9cc6ec3d34388603f2",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/494e1926888788199380822d02d54c94a9518094"
+        },
+        "date": 1778984500821,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 102353,
+            "range": "± 644",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 243382,
+            "range": "± 861",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 526909,
+            "range": "± 1731",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1864565,
+            "range": "± 34496",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 345,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1418,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7386,
+            "range": "± 117",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21170,
+            "range": "± 73",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24217,
+            "range": "± 88",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83564,
+            "range": "± 1342",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 370,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3160,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9638,
+            "range": "± 395",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42149,
+            "range": "± 462",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 621,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2308231,
+            "range": "± 96755",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6686226,
+            "range": "± 132805",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 24159754,
+            "range": "± 277089",
             "unit": "ns/iter"
           }
         ]
