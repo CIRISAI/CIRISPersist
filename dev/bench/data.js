@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778989276634,
+  "lastUpdate": 1778990530461,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -16319,6 +16319,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25739152,
             "range": "± 127568",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "823da7e685664f777f0c2d305a20b83c4ec3e7e0",
+          "message": "1.5.5 — cirisincident D1-full schema extension (closes #56)\n\nSame pattern as v1.5.3 (register_federation_key) + v1.5.4 (audit\ncanonical helpers): when agent's needs reveal a substrate gap, persist\nextends rather than asking agent to compromise. CIRISAgent's IncidentNode\ncaptures 11 forensic fields (filename, line_number, stack_trace, etc.)\nthat had no first-class home in cirislens_incident_records. Packing into\ndescription loses queryable access; dropping loses debug info; dual-\nwriting to a graph node adds split-brain risk. Schema extension is the\nclean answer.\n\nV022 (PG + SQLite, additive + nullable — no breaking changes):\n\nSchema: + 11 nullable columns (incident_type, source_component,\nhandler_name, exception_type, stack_trace, filename, line_number,\nfunction_name, impact, urgency, detection_method).\n\nIndexes: + forensic-query indexes on (filename, line_number) and\n(source_component), both partial WHERE NOT NULL — operator oncall\nqueries like \"show me all incidents from this file\" / \"from this\ncomponent\" now have indexed paths.\n\nCHECKs (relaxed; both vocabularies accepted):\n- severity: + low/medium/high (ITIL aliases alongside V016's\n  info/warning/error/critical syslog set)\n- state: + recurring (parallel-to-open per AV-55 ladder semantics)\n\nPG: DROP/ADD CONSTRAINT for the auto-named V016 checks\n(incident_records_severity_check, incident_records_state_check).\nSQLite: recreate-table dance (no DROP CONSTRAINT) preserving ALL\nV016 columns + indexes.\n\nEnum extensions:\n- IncidentSeverity + Low/Medium/High (ITIL vocabulary)\n- IncidentState + Recurring (rank=0, parallel to Open)\n\nAV-55 semantic update for Recurring:\n- can_transition_to does NOT permit Open ↔ Recurring (same-rank\n  transitions still rejected per strict-forward AV-55)\n- Caller signals \"this is recurring\" via initial INSERT with\n  state='recurring', not by transitioning from open\n- record_incident now binds caller-supplied state (was hardcoded\n  'open' in V016 INSERT) and rejects states outside {Open, Recurring}\n  at the trait surface with Error::InvalidArgument\n- Transitions still flow through transition_state per AV-55\n- Locked by incident_reject_non_initial_state_at_record test on both\n  backends\n\nRefinery transaction nesting fix: V022 omits explicit BEGIN/COMMIT\n(Refinery wraps migrations in its own tx; nesting fails with \"cannot\nstart a transaction within a transaction\" — same shape as V019 fix\nin d8b467b).\n\nWire compatibility: Incident struct's 11 new fields use\n#[serde(default, skip_serializing_if = \"Option::is_none\")]. v1.5.4\ncallers emitting JSON without forensic fields deserialize with all-\nNone defaults. Pre-V022 rows SELECTed via new decoders yield NULL →\nNone per field. Both directions clean.\n\nqa_harness count: 21 → 22.\n\nTests: 296 lib pass (was 368 at v1.5.4 with audit feature; this\nrelease builds with cirisincident feature set, 296 pass with PG live).\n20 incident-namespace tests: 3 new PG + 4 new SQLite + 5 new\ntypes-module + 8 existing.\n\nUnblocks CIRISAgent D1-full (IncidentManagementService absorption\nwith full forensic fidelity).\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-16T22:54:40-05:00",
+          "tree_id": "8468d1dc284315708e495ca3dcfe22ec9618b964",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/823da7e685664f777f0c2d305a20b83c4ec3e7e0"
+        },
+        "date": 1778990529875,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 109022,
+            "range": "± 273",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 259295,
+            "range": "± 5282",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 561169,
+            "range": "± 1718",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1991196,
+            "range": "± 7794",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 335,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1448,
+            "range": "± 33",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 6558,
+            "range": "± 99",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23220,
+            "range": "± 576",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26438,
+            "range": "± 177",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91058,
+            "range": "± 2960",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 368,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3124,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9616,
+            "range": "± 204",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41831,
+            "range": "± 845",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 632,
+            "range": "± 36",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2239528,
+            "range": "± 95655",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7027858,
+            "range": "± 85707",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25832547,
+            "range": "± 342268",
             "unit": "ns/iter"
           }
         ]
