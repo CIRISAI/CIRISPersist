@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778984501328,
+  "lastUpdate": 1778986810383,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -16055,6 +16055,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 24159754,
             "range": "± 277089",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "7668b3401da639e327ef580b9abdf124b9209e15",
+          "message": "1.5.3 — Engine.register_federation_key one-call helper (unblocks Lane C)\n\nCIRISAgent Lane C needs to register its local pubkey in the federation\ndirectory (federation_keys) but the put_public_key path requires a fully\nassembled SignedKeyRecord. The agent team shouldn't re-implement persist's\ncanonical-bytes rule in Python — that's the \"do persist's job upstream\"\nanti-pattern the substrate exists to prevent.\n\nHelper composes existing primitives:\n- canonicalize_envelope (PythonJsonDumpsCanonicalizer)\n- LocalSigner::sign_ed25519 over canonical bytes\n- hex(SHA-256) → original_content_hash\n- Self-signed KeyRecord (scrub_key_id = key_id, algorithm = \"hybrid\",\n  PQC half None — cold path fills)\n- SignedKeyRecord wrapper → put_public_key (backend dispatch + cold-path\n  PQC attach unchanged)\n\nmicros-truncation inlined (5 lines) to avoid cirisaudit-feature\ndependency — register_federation_key should be available regardless.\n\nIdempotent on (key_id) PRIMARY KEY of federation_keys.\n\nAlso clarifies register_public_key vs put_public_key vs\nregister_federation_key docstrings in the .pyi stub.\n\nUnblocks CIRISAgent 2.9.0 Lane C.\n\nTests: 368 lib pass.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-16T21:50:36-05:00",
+          "tree_id": "82dad3eb8009a8bb808e7a4c33a927bf68ddc533",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/7668b3401da639e327ef580b9abdf124b9209e15"
+        },
+        "date": 1778986809348,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 84623,
+            "range": "± 3855",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 201375,
+            "range": "± 686",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 434846,
+            "range": "± 1352",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1541563,
+            "range": "± 56773",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 248,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1101,
+            "range": "± 24",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 5047,
+            "range": "± 37",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 17980,
+            "range": "± 35",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 20506,
+            "range": "± 169",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 70608,
+            "range": "± 1288",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 276,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 2437,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 7555,
+            "range": "± 28",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 32627,
+            "range": "± 304",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 523,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2308939,
+            "range": "± 19955857",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7007110,
+            "range": "± 17230648",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 20489737,
+            "range": "± 23491895",
             "unit": "ns/iter"
           }
         ]
