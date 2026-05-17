@@ -111,6 +111,43 @@ fn decode_incident_row(row: &tokio_postgres::Row) -> Result<Incident, Error> {
         occurrences: row
             .try_get("occurrences")
             .map_err(|e| Error::Backend(format!("decode occurrences: {e}")))?,
+        // v1.5.5 — forensic fields. All NULL for pre-V022 rows or
+        // non-EXCEPTION incidents; try_get on Option<_> returns
+        // None for SQL NULL, so this is safe across the upgrade
+        // boundary.
+        incident_type: row
+            .try_get("incident_type")
+            .map_err(|e| Error::Backend(format!("decode incident_type: {e}")))?,
+        source_component: row
+            .try_get("source_component")
+            .map_err(|e| Error::Backend(format!("decode source_component: {e}")))?,
+        handler_name: row
+            .try_get("handler_name")
+            .map_err(|e| Error::Backend(format!("decode handler_name: {e}")))?,
+        exception_type: row
+            .try_get("exception_type")
+            .map_err(|e| Error::Backend(format!("decode exception_type: {e}")))?,
+        stack_trace: row
+            .try_get("stack_trace")
+            .map_err(|e| Error::Backend(format!("decode stack_trace: {e}")))?,
+        filename: row
+            .try_get("filename")
+            .map_err(|e| Error::Backend(format!("decode filename: {e}")))?,
+        line_number: row
+            .try_get("line_number")
+            .map_err(|e| Error::Backend(format!("decode line_number: {e}")))?,
+        function_name: row
+            .try_get("function_name")
+            .map_err(|e| Error::Backend(format!("decode function_name: {e}")))?,
+        impact: row
+            .try_get("impact")
+            .map_err(|e| Error::Backend(format!("decode impact: {e}")))?,
+        urgency: row
+            .try_get("urgency")
+            .map_err(|e| Error::Backend(format!("decode urgency: {e}")))?,
+        detection_method: row
+            .try_get("detection_method")
+            .map_err(|e| Error::Backend(format!("decode detection_method: {e}")))?,
     })
 }
 
@@ -124,6 +161,20 @@ impl IncidentService for PostgresBackend {
         }
         if incident.title.is_empty() {
             return Err(Error::InvalidArgument("title required".into()));
+        }
+        // v1.5.5 — only rank-0 states (Open / Recurring) are
+        // legal initial states for a fresh INSERT. Investigating
+        // / Resolved / Closed must be reached through
+        // `transition_state` so the AV-55 monotonicity guards
+        // (notes-required + rank-increasing) are enforced.
+        if !matches!(
+            incident.state,
+            IncidentState::Open | IncidentState::Recurring
+        ) {
+            return Err(Error::InvalidArgument(format!(
+                "record_incident: initial state must be Open or Recurring, got {:?}",
+                incident.state
+            )));
         }
         validate_correlation_keys(&incident.correlation_keys)?;
 
@@ -183,12 +234,23 @@ impl IncidentService for PostgresBackend {
             let new_id = parse_incident_id(&incident.incident_id)?;
             let corr_json = serde_json::to_value(&incident.correlation_keys)
                 .map_err(|e| Error::Internal(format!("correlation_keys serialize: {e}")))?;
+            // v1.5.5 (CIRISPersist#56) — INSERT extended to carry
+            // the 11 forensic columns. State now flows from the
+            // incident payload (was hard-coded to 'open' in V016);
+            // v1.5.5 admits 'recurring' as a valid initial state
+            // for "open with identified pattern" records. AV-55
+            // forward-only transition rules still apply once a row
+            // is in the table.
             tx.execute(
                 "INSERT INTO cirislens.incident_records (\
                     incident_id, tenant_id, severity, category, title, description, \
                     correlation_keys, state, first_seen_at, last_seen_at, occurrences, \
-                    persist_row_hash\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'open', $8, $9, $10, $11)",
+                    persist_row_hash, \
+                    incident_type, source_component, handler_name, exception_type, \
+                    stack_trace, filename, line_number, function_name, impact, urgency, \
+                    detection_method\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
+                           $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)",
                 &[
                     &new_id,
                     &incident.tenant_id,
@@ -197,10 +259,22 @@ impl IncidentService for PostgresBackend {
                     &incident.title,
                     &incident.description,
                     &corr_json,
+                    &incident.state.as_sql_str(),
                     &incident.first_seen_at,
                     &incident.last_seen_at,
                     &incident.occurrences.max(1),
                     &new_id.to_string(), // persist_row_hash placeholder
+                    &incident.incident_type,
+                    &incident.source_component,
+                    &incident.handler_name,
+                    &incident.exception_type,
+                    &incident.stack_trace,
+                    &incident.filename,
+                    &incident.line_number,
+                    &incident.function_name,
+                    &incident.impact,
+                    &incident.urgency,
+                    &incident.detection_method,
                 ],
             )
             .await
@@ -388,7 +462,10 @@ impl IncidentService for PostgresBackend {
         let sql = format!(
             "SELECT incident_id, tenant_id, severity, category, title, description, \
                     correlation_keys, state, first_seen_at, last_seen_at, \
-                    resolved_at, resolution_notes, occurrences \
+                    resolved_at, resolution_notes, occurrences, \
+                    incident_type, source_component, handler_name, exception_type, \
+                    stack_trace, filename, line_number, function_name, impact, urgency, \
+                    detection_method \
              FROM cirislens.incident_records \
              WHERE {where_sql} \
              ORDER BY first_seen_at DESC, incident_id DESC \
@@ -503,6 +580,20 @@ mod tests {
             resolved_at: None,
             resolution_notes: None,
             occurrences: 1,
+            // v1.5.5 forensic fields default to None in the test
+            // helper — exercises the back-compat path for existing
+            // lifecycle tests.
+            incident_type: None,
+            source_component: None,
+            handler_name: None,
+            exception_type: None,
+            stack_trace: None,
+            filename: None,
+            line_number: None,
+            function_name: None,
+            impact: None,
+            urgency: None,
+            detection_method: None,
         }
     }
 
@@ -743,5 +834,172 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(missing, Error::NotFound(_)));
+    }
+
+    /// v1.5.5 (CIRISPersist#56) — D1-full forensic fields round-trip
+    /// across INSERT + SELECT. Populates all 11 forensic columns,
+    /// reads back via list_incidents, asserts every field.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn incident_forensic_fields_round_trip() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let tenant = format!("inc-forensic-{}", Uuid::new_v4().simple());
+        let now = Utc::now();
+        let inc = Incident {
+            incident_id: Uuid::new_v4().to_string(),
+            tenant_id: tenant.clone(),
+            severity: IncidentSeverity::High,
+            category: "exception".into(),
+            title: "ValueError in dispatch".into(),
+            description: Some("payload decode failed".into()),
+            correlation_keys: vec!["component:dispatch".into(), "problem:p-42".into()],
+            state: IncidentState::Open,
+            first_seen_at: now,
+            last_seen_at: now,
+            resolved_at: None,
+            resolution_notes: None,
+            occurrences: 1,
+            incident_type: Some("EXCEPTION".into()),
+            source_component: Some("dispatch_handler".into()),
+            handler_name: Some("on_message".into()),
+            exception_type: Some("ValueError".into()),
+            stack_trace: Some("Traceback (most recent call last):\n  …".into()),
+            filename: Some("ciris_agent/dispatch.py".into()),
+            line_number: Some(142),
+            function_name: Some("on_message".into()),
+            impact: Some("medium".into()),
+            urgency: Some("high".into()),
+            detection_method: Some("exception_hook".into()),
+        };
+        let id = backend.record_incident(inc.clone()).await.unwrap();
+        assert_eq!(id, inc.incident_id);
+
+        let page = backend
+            .list_incidents(
+                IncidentFilter {
+                    tenant_id: tenant.clone(),
+                    state: None,
+                    severity: None,
+                    category: Some("exception".into()),
+                    has_correlation_keys: vec![],
+                    first_seen_after: None,
+                    first_seen_before: None,
+                },
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        let got = &page.items[0];
+        assert_eq!(got.severity, IncidentSeverity::High);
+        assert_eq!(got.incident_type.as_deref(), Some("EXCEPTION"));
+        assert_eq!(got.source_component.as_deref(), Some("dispatch_handler"));
+        assert_eq!(got.handler_name.as_deref(), Some("on_message"));
+        assert_eq!(got.exception_type.as_deref(), Some("ValueError"));
+        assert!(got.stack_trace.is_some());
+        assert_eq!(got.filename.as_deref(), Some("ciris_agent/dispatch.py"));
+        assert_eq!(got.line_number, Some(142));
+        assert_eq!(got.function_name.as_deref(), Some("on_message"));
+        assert_eq!(got.impact.as_deref(), Some("medium"));
+        assert_eq!(got.urgency.as_deref(), Some("high"));
+        assert_eq!(got.detection_method.as_deref(), Some("exception_hook"));
+    }
+
+    /// v1.5.5 — Recurring as an initial state. Confirms record →
+    /// list-filter-by-state=Recurring returns the row.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn incident_recurring_initial_state_round_trip() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let tenant = format!("inc-recurring-{}", Uuid::new_v4().simple());
+        let now = Utc::now();
+        let mut inc = mk_incident(
+            &tenant,
+            "service_failure",
+            IncidentSeverity::Warning,
+            "recurring LLM timeout pattern",
+            vec!["service:llm".into(), "problem:p-42".into()],
+        );
+        inc.state = IncidentState::Recurring;
+        inc.first_seen_at = now;
+        inc.last_seen_at = now;
+        let id = backend.record_incident(inc.clone()).await.unwrap();
+
+        // Filter by state=Recurring returns it.
+        let page = backend
+            .list_incidents(
+                IncidentFilter {
+                    tenant_id: tenant.clone(),
+                    state: Some(IncidentState::Recurring),
+                    severity: None,
+                    category: None,
+                    has_correlation_keys: vec![],
+                    first_seen_after: None,
+                    first_seen_before: None,
+                },
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].incident_id, id);
+        assert_eq!(page.items[0].state, IncidentState::Recurring);
+
+        // Recurring → Investigating is a legal forward transition
+        // (rank 0 → 1).
+        backend
+            .transition_state(IncidentTransition {
+                incident_id: id.clone(),
+                new_state: IncidentState::Investigating,
+                resolution_notes: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// v1.5.5 — record_incident rejects an initial state that is
+    /// not Open or Recurring (Investigating/Resolved/Closed must
+    /// arrive via transition_state).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn incident_reject_non_initial_state_at_record() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let tenant = format!("inc-noinit-{}", Uuid::new_v4().simple());
+        let mut inc = mk_incident(
+            &tenant,
+            "service_failure",
+            IncidentSeverity::Error,
+            "should reject",
+            vec!["service:llm".into()],
+        );
+        inc.state = IncidentState::Investigating;
+        let err = backend.record_incident(inc).await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(_)),
+            "expected InvalidArgument, got {err:?}"
+        );
     }
 }

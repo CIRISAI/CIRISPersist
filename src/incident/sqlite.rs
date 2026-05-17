@@ -135,6 +135,44 @@ fn decode_incident_row(row: &rusqlite::Row<'_>) -> Result<Incident, Error> {
         occurrences: row
             .get("occurrences")
             .map_err(|e| Error::Backend(format!("decode occurrences: {e}")))?,
+        // v1.5.5 — D1-full forensic fields. rusqlite's
+        // `get::<_, Option<T>>` returns Ok(None) for SQL NULL, so
+        // pre-V022 rows (where the columns don't exist before
+        // migration) and non-EXCEPTION incidents (where the
+        // columns are NULL) both decode cleanly.
+        incident_type: row
+            .get("incident_type")
+            .map_err(|e| Error::Backend(format!("decode incident_type: {e}")))?,
+        source_component: row
+            .get("source_component")
+            .map_err(|e| Error::Backend(format!("decode source_component: {e}")))?,
+        handler_name: row
+            .get("handler_name")
+            .map_err(|e| Error::Backend(format!("decode handler_name: {e}")))?,
+        exception_type: row
+            .get("exception_type")
+            .map_err(|e| Error::Backend(format!("decode exception_type: {e}")))?,
+        stack_trace: row
+            .get("stack_trace")
+            .map_err(|e| Error::Backend(format!("decode stack_trace: {e}")))?,
+        filename: row
+            .get("filename")
+            .map_err(|e| Error::Backend(format!("decode filename: {e}")))?,
+        line_number: row
+            .get("line_number")
+            .map_err(|e| Error::Backend(format!("decode line_number: {e}")))?,
+        function_name: row
+            .get("function_name")
+            .map_err(|e| Error::Backend(format!("decode function_name: {e}")))?,
+        impact: row
+            .get("impact")
+            .map_err(|e| Error::Backend(format!("decode impact: {e}")))?,
+        urgency: row
+            .get("urgency")
+            .map_err(|e| Error::Backend(format!("decode urgency: {e}")))?,
+        detection_method: row
+            .get("detection_method")
+            .map_err(|e| Error::Backend(format!("decode detection_method: {e}")))?,
     })
 }
 
@@ -148,6 +186,18 @@ impl IncidentService for SqliteIncidentBackend {
         }
         if incident.title.is_empty() {
             return Err(Error::InvalidArgument("title required".into()));
+        }
+        // v1.5.5 (CIRISPersist#56) — only rank-0 states are legal
+        // initial states (Open / Recurring); other states must
+        // arrive via transition_state. Mirrors postgres.rs.
+        if !matches!(
+            incident.state,
+            IncidentState::Open | IncidentState::Recurring
+        ) {
+            return Err(Error::InvalidArgument(format!(
+                "record_incident: initial state must be Open or Recurring, got {:?}",
+                incident.state
+            )));
         }
         validate_correlation_keys(&incident.correlation_keys)?;
         let corr_str = serde_json::to_string(&incident.correlation_keys)
@@ -200,13 +250,21 @@ impl IncidentService for SqliteIncidentBackend {
                 .map_err(|e| map_sqlite_error(e, "record_incident bump"))?;
                 existing_id
             } else {
+                // v1.5.5 (CIRISPersist#56) — INSERT extended to
+                // carry the 11 forensic columns + state taken
+                // from the payload (was hardcoded 'open'; v1.5.5
+                // admits 'recurring' as a valid initial state).
                 let new_id = incident.incident_id.clone();
                 tx.execute(
                     "INSERT INTO cirislens_incident_records (\
                         incident_id, tenant_id, severity, category, title, description, \
                         correlation_keys, state, first_seen_at, last_seen_at, occurrences, \
-                        persist_row_hash\
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open', ?8, ?9, ?10, ?11)",
+                        persist_row_hash, \
+                        incident_type, source_component, handler_name, exception_type, \
+                        stack_trace, filename, line_number, function_name, impact, urgency, \
+                        detection_method\
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
+                               ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
                     params![
                         new_id,
                         incident.tenant_id,
@@ -215,10 +273,22 @@ impl IncidentService for SqliteIncidentBackend {
                         incident.title,
                         incident.description,
                         corr_str,
+                        incident.state.as_sql_str(),
                         first_seen_str,
                         last_seen_str,
                         incident.occurrences.max(1),
                         new_id,
+                        incident.incident_type,
+                        incident.source_component,
+                        incident.handler_name,
+                        incident.exception_type,
+                        incident.stack_trace,
+                        incident.filename,
+                        incident.line_number,
+                        incident.function_name,
+                        incident.impact,
+                        incident.urgency,
+                        incident.detection_method,
                     ],
                 )
                 .map_err(|e| map_sqlite_error(e, "record_incident insert"))?;
@@ -400,7 +470,10 @@ impl IncidentService for SqliteIncidentBackend {
         let sql = format!(
             "SELECT incident_id, tenant_id, severity, category, title, description, \
                     correlation_keys, state, first_seen_at, last_seen_at, \
-                    resolved_at, resolution_notes, occurrences \
+                    resolved_at, resolution_notes, occurrences, \
+                    incident_type, source_component, handler_name, exception_type, \
+                    stack_trace, filename, line_number, function_name, impact, urgency, \
+                    detection_method \
              FROM cirislens_incident_records \
              WHERE {where_sql} \
              ORDER BY first_seen_at DESC, incident_id DESC \
@@ -525,6 +598,19 @@ mod tests {
             resolved_at: None,
             resolution_notes: None,
             occurrences: 1,
+            // v1.5.5 forensic fields default to None in the test
+            // helper.
+            incident_type: None,
+            source_component: None,
+            handler_name: None,
+            exception_type: None,
+            stack_trace: None,
+            filename: None,
+            line_number: None,
+            function_name: None,
+            impact: None,
+            urgency: None,
+            detection_method: None,
         }
     }
 
@@ -713,5 +799,179 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(missing, Error::NotFound(_)));
+    }
+
+    /// v1.5.5 (CIRISPersist#56) — D1-full forensic fields round-trip
+    /// across SQLite INSERT + SELECT.
+    #[tokio::test]
+    async fn cirisincident_sqlite_forensic_fields_round_trip() {
+        let (_b, svc) = fresh_backend().await;
+        let tenant = format!("inc-forensic-{}", Uuid::new_v4().simple());
+        let now = chrono::Utc::now();
+        let inc = Incident {
+            incident_id: Uuid::new_v4().to_string(),
+            tenant_id: tenant.clone(),
+            severity: IncidentSeverity::High,
+            category: "exception".into(),
+            title: "ValueError in dispatch".into(),
+            description: Some("payload decode failed".into()),
+            correlation_keys: vec!["component:dispatch".into(), "problem:p-42".into()],
+            state: IncidentState::Open,
+            first_seen_at: now,
+            last_seen_at: now,
+            resolved_at: None,
+            resolution_notes: None,
+            occurrences: 1,
+            incident_type: Some("EXCEPTION".into()),
+            source_component: Some("dispatch_handler".into()),
+            handler_name: Some("on_message".into()),
+            exception_type: Some("ValueError".into()),
+            stack_trace: Some("Traceback (most recent call last):\n  …".into()),
+            filename: Some("ciris_agent/dispatch.py".into()),
+            line_number: Some(142),
+            function_name: Some("on_message".into()),
+            impact: Some("medium".into()),
+            urgency: Some("high".into()),
+            detection_method: Some("exception_hook".into()),
+        };
+        let id = svc.record_incident(inc.clone()).await.unwrap();
+        assert_eq!(id, inc.incident_id);
+
+        let page = svc
+            .list_incidents(
+                IncidentFilter {
+                    tenant_id: tenant.clone(),
+                    state: None,
+                    severity: None,
+                    category: Some("exception".into()),
+                    has_correlation_keys: vec![],
+                    first_seen_after: None,
+                    first_seen_before: None,
+                },
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        let got = &page.items[0];
+        assert_eq!(got.severity, IncidentSeverity::High);
+        assert_eq!(got.incident_type.as_deref(), Some("EXCEPTION"));
+        assert_eq!(got.source_component.as_deref(), Some("dispatch_handler"));
+        assert_eq!(got.handler_name.as_deref(), Some("on_message"));
+        assert_eq!(got.exception_type.as_deref(), Some("ValueError"));
+        assert!(got.stack_trace.is_some());
+        assert_eq!(got.filename.as_deref(), Some("ciris_agent/dispatch.py"));
+        assert_eq!(got.line_number, Some(142));
+        assert_eq!(got.function_name.as_deref(), Some("on_message"));
+        assert_eq!(got.impact.as_deref(), Some("medium"));
+        assert_eq!(got.urgency.as_deref(), Some("high"));
+        assert_eq!(got.detection_method.as_deref(), Some("exception_hook"));
+    }
+
+    /// v1.5.5 — Recurring as an initial state; filter by
+    /// state=Recurring returns the row.
+    #[tokio::test]
+    async fn cirisincident_sqlite_recurring_initial_state_round_trip() {
+        let (_b, svc) = fresh_backend().await;
+        let tenant = format!("inc-recurring-{}", Uuid::new_v4().simple());
+        let mut inc = mk_incident(
+            &tenant,
+            "service_failure",
+            IncidentSeverity::Warning,
+            "recurring LLM timeout pattern",
+            vec!["service:llm".into(), "problem:p-42".into()],
+        );
+        inc.state = IncidentState::Recurring;
+        let id = svc.record_incident(inc).await.unwrap();
+
+        let page = svc
+            .list_incidents(
+                IncidentFilter {
+                    tenant_id: tenant.clone(),
+                    state: Some(IncidentState::Recurring),
+                    severity: None,
+                    category: None,
+                    has_correlation_keys: vec![],
+                    first_seen_after: None,
+                    first_seen_before: None,
+                },
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].incident_id, id);
+        assert_eq!(page.items[0].state, IncidentState::Recurring);
+
+        // Recurring → Investigating legal forward transition.
+        svc.transition_state(IncidentTransition {
+            incident_id: id,
+            new_state: IncidentState::Investigating,
+            resolution_notes: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    /// v1.5.5 — initial-state guard.
+    #[tokio::test]
+    async fn cirisincident_sqlite_reject_non_initial_state_at_record() {
+        let (_b, svc) = fresh_backend().await;
+        let tenant = format!("inc-noinit-{}", Uuid::new_v4().simple());
+        let mut inc = mk_incident(
+            &tenant,
+            "service_failure",
+            IncidentSeverity::Error,
+            "should reject",
+            vec!["service:llm".into()],
+        );
+        inc.state = IncidentState::Investigating;
+        let err = svc.record_incident(inc).await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(_)),
+            "expected InvalidArgument, got {err:?}"
+        );
+    }
+
+    /// v1.5.5 — ITIL severity (low/medium/high) round-trips
+    /// through the SQLite CHECK constraint.
+    #[tokio::test]
+    async fn cirisincident_sqlite_itil_severity_accepted() {
+        let (_b, svc) = fresh_backend().await;
+        let tenant = format!("inc-itil-{}", Uuid::new_v4().simple());
+        for sev in [
+            IncidentSeverity::Low,
+            IncidentSeverity::Medium,
+            IncidentSeverity::High,
+        ] {
+            let inc = mk_incident(
+                &tenant,
+                &format!("cat-{}", sev.as_sql_str()),
+                sev,
+                "itil severity",
+                vec![format!("itil:{}", sev.as_sql_str())],
+            );
+            svc.record_incident(inc).await.unwrap();
+        }
+        let page = svc
+            .list_incidents(
+                IncidentFilter {
+                    tenant_id: tenant,
+                    state: None,
+                    severity: Some(IncidentSeverity::High),
+                    category: None,
+                    has_correlation_keys: vec![],
+                    first_seen_after: None,
+                    first_seen_before: None,
+                },
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].severity, IncidentSeverity::High);
     }
 }

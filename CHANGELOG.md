@@ -5,6 +5,113 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.5.5] — 2026-05-17
+
+**Cirisincident schema extension for CIRISAgent Lane D1-full (closes [#56](https://github.com/CIRISAI/CIRISPersist/issues/56)).**
+
+Same shape as v1.5.3's `register_federation_key` and v1.5.4's audit
+canonical helpers: when agent's needs reveal a substrate gap, persist
+extends rather than asking agent to compromise. The agent's
+`IncidentNode` captured 11 forensic fields (filename, line_number,
+stack_trace, source_component, ...) that had no first-class home in
+persist's `cirislens.incident_records`. Without them the absorption
+either loses debug info or packs it into `description` as structured
+prose, losing queryable access.
+
+### Schema (V022 — additive, nullable, no breaking changes)
+
+11 new nullable columns on `cirislens.incident_records`
+(PG schema-qualified) / `cirislens_incident_records` (SQLite):
+
+| Column | Purpose |
+|---|---|
+| `incident_type` | Free-form forensic type (`ERROR` / `WARNING` / `EXCEPTION`) |
+| `source_component` | Component that raised the incident |
+| `handler_name` | Handler that was executing |
+| `exception_type` | Exception class name |
+| `stack_trace` | Captured stack trace for EXCEPTION-type incidents |
+| `filename` | Source file path |
+| `line_number` | Source line number |
+| `function_name` | Source function name |
+| `impact` | Free-form impact statement |
+| `urgency` | Free-form urgency statement |
+| `detection_method` | How the incident was detected |
+
+Forensic-query indexes added on both backends:
+- `(filename, line_number)` WHERE `filename IS NOT NULL` — "all
+  incidents from this file" oncall query
+- `(source_component)` WHERE `source_component IS NOT NULL` — "all
+  incidents from this component"
+
+### Enum extensions
+
+`IncidentSeverity` accepts the ITIL set as distinct variants alongside
+the syslog set:
+- syslog: `Info` / `Warning` / `Error` / `Critical` (V016 values)
+- ITIL (new): `Low` / `Medium` / `High` (Critical maps across)
+
+Both vocabularies are accepted in the SQL CHECK; the Rust enum
+carries them as distinct variants so round-trip is lossless. Callers
+that want "high-or-above" filtering should match on the enum, not
+string-compare.
+
+`IncidentState` gains `Recurring` — parallel to `Open` in rank (0),
+representing "open + identified as part of a known problem pattern."
+
+### AV-55 semantic update (recurring)
+
+Per CIRISPersist#56: the agent's `_identify_problems` analysis
+transitions OPEN incidents to RECURRING when they match a known
+pattern. Since `Recurring` ranks with `Open` (both 0), `can_transition_to`
+does NOT permit `Open → Recurring` (same-rank transitions still
+rejected per AV-55 strict-forward). Caller signals "this is recurring"
+by *initial-INSERT* with `state = 'recurring'`, not by transitioning
+from `open`. To support this, `record_incident` now binds the
+caller-supplied `state` (was hardcoded `'open'`) and rejects any
+state outside `{Open, Recurring}` at the trait surface with
+`Error::InvalidArgument`. Transitions still flow through
+`transition_state` per AV-55. Locked by `incident_reject_non_initial_state_at_record`
+test on both backends.
+
+### Tests
+
+`cargo test --features "postgres sqlite cirisincident" --lib` →
+**296 passed, 0 failed** (live PG via `CIRIS_PERSIST_TEST_PG_URL`).
+20 incident-namespace tests now: 3 new PG + 4 new SQLite + 5 new
+types-module + 8 existing.
+
+### Migration notes
+
+- **V022 on PG**: `ALTER TABLE ADD COLUMN` for the 11 columns + DROP
+  + ADD CONSTRAINT for relaxed severity / state CHECKs. Auto-named
+  constraints (`incident_records_severity_check` /
+  `incident_records_state_check`) confirmed live.
+- **V022 on SQLite**: recreate-table dance (SQLite can't DROP
+  CONSTRAINT). Preserves ALL V016 columns (including the
+  signature/signing_key_id/signature_verified/persist_row_hash/created_at
+  audit envelope), all V016 indexes, plus the 11 new columns +
+  forensic indexes.
+- **No explicit BEGIN/COMMIT** in either migration — Refinery wraps
+  each migration in its own transaction; nesting fails with "cannot
+  start a transaction within a transaction" (same fix shape as V019
+  in commit `d8b467b`).
+
+### Wire format compatibility
+
+`Incident` struct extends with 11 fields marked
+`#[serde(default, skip_serializing_if = "Option::is_none")]`. v1.5.4
+callers that emit JSON without forensic fields deserialize cleanly
+with all-None defaults. Pre-V022 rows SELECTed via the new decoders
+yield NULL → `None` on every forensic field. Both directions clean.
+
+### Unblocks
+
+- **CIRISAgent D1-full** (IncidentManagementService absorption with
+  full forensic fidelity)
+- **Operator oncall queries** — "show me all incidents from this
+  file" / "from this component" / "from this handler" now have
+  indexed query paths
+
 ## [1.5.4] — 2026-05-17
 
 **Audit-chain canonical-bytes helpers + bridge-entry permit (unblocks Lane A0b).**
