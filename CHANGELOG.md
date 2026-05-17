@@ -5,6 +5,187 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.5.0] — 2026-05-16
+
+**The federation trust substrate — trust grants as signed events with per-tenant Merkle transparency.**
+
+The substantive substrate cut spec'd in `FSD/FEDERATION_TRUST_INTERFACE.md`.
+Trust grants become signed Contribution events that ride the audit chain;
+every audit entry on every backend also appends a leaf to a per-tenant
+Merkle tree and gets a freshly-signed STH (RFC 6962, Sigstore Rekor every-
+append cadence). External verifiers can confirm any grant via inclusion
+proof + STH signature without trusting the directory's projection.
+Anchored on the SOTA upgrade in CIRISVerify v2.3.0
+([CIRISVerify#23](https://github.com/CIRISAI/CIRISVerify/issues/23)).
+
+### Architecture
+
+- **Transparency primitives live in CIRISVerify** (`ciris-verify-core::transparency`).
+  Persist consumes; edge consumes; no parallel Merkle implementations.
+  `TransparencyLeaf` trait, `TransparencyStore<L>` trait, `SignedTreeHead`,
+  `MerkleProof`, `ConsistencyProof`, `TransparencyLog<L>`, `verify_inclusion`,
+  `verify_consistency` all imported. Persist contributes `AuditLeaf:
+  TransparencyLeaf` + `PgMerkleStore` / `SqliteMerkleStore` adapters that
+  expose the sync trait over async pools via `tokio` block_on +
+  spawn_blocking.
+- **Hash chain remains the source of truth** per FSD §4.4. Merkle tree
+  is a projection over the existing per-tenant `cirislens.audit_log`;
+  failures in the Merkle hook or trust-grant projection surface as
+  typed errors (`Error::Merkle`, `Error::TrustGrant`) but the chain
+  row stands. Phase I backfill reconciles orphans.
+- **Per-tenant scoping** end-to-end. One Merkle tree per tenant
+  (`log_id = "tenant:<id>"` per the Phase B prefix scheme).
+  Cross-tenant correlation impossible at every layer.
+
+### New schema (V021 — applied additively; V020 columns deprecated, dropped in v1.6.0)
+
+- `cirislens.federation_trust_grants` — projection table for trust grant
+  events. `UNIQUE (grantee_key, granter_key, purpose, scope)` global
+  (federation_keys.key_id is globally unique; grant identity is the
+  relationship + purpose + scope). UPSERT-on-conflict for re-issuance;
+  revocation = re-issuance with `expires_at <= NOW()` sets `revoked_at` +
+  `revoked_by`.
+- `merkle_leaves(tenant_id, leaf_index, chain_event_id, leaf_hash,
+  canonical_bytes, leaf_serialized, appended_at)` — one row per audit
+  chain entry. Universal — applies to ALL audit entries, not just trust
+  grants.
+- `merkle_sth_log(tenant_id, tree_size, root_hash, signed_at,
+  signer_key_id, signature_blob, witness_signatures)` — STH history,
+  one row per leaf append per FSD §4.4 every-append cadence. Hybrid sig
+  (Ed25519 + ML-DSA-65) stored as full tagged JSON blob (preserves
+  algorithm/public_key/mode/crypto_kind fields). `witness_signatures`
+  reserved for forthcoming witness-cosigning protocol.
+
+### New Engine PyO3 surface (9 methods)
+
+Emit:
+- `grant_trust(tenant, grantee, purpose, scope, expires_at, rationale)`
+  → JSON `TrustGrantReceipt` with canonical `grant_id` + post-emit STH
+- `revoke_trust_grant(tenant, grantee, purpose, scope)` → same receipt
+  shape (revocation = re-emit with `expires_at = now()`)
+
+Read:
+- `lookup_trust_grant(grantee, purpose, scope)` — exact + wildcard
+  scope both surface (caller decides; FSD §3.3)
+- `list_trust_grants(filter_json)` — dynamic filter
+- `get_trust_grant(grant_id)` — by canonical PK
+- `current_sth(tenant)` — latest signed tree head
+
+Proof:
+- `trust_grant_inclusion_proof(grant_id)` → `TrustGrantInclusionProof
+  { sth, merkle_proof, leaf_canonical_bytes }`. External verifier:
+  verify STH signature → check freshness → recompute leaf_hash via
+  `sha256(0x00 || canonical)` (RFC 6962 byte prefix) → walk siblings →
+  assert reconstructed root == STH root.
+- `trust_grant_consistency_proof(tenant, old_size, new_size)` →
+  RFC 6962 §2.1.2 ConsistencyProof. Verifier confirms STH(n) → STH(m)
+  is a legal append.
+
+Migration:
+- `backfill_v020_trust_rows(tenant_id)` → JSON `BackfillReport`. One-shot
+  V020 → V021 migration. Scope-limited to rows where `trusted_by`
+  matches the local signer (only the granter can re-emit per FSD §3.1).
+  Idempotent — re-running is a no-op for already-projected rows.
+
+### TrustPurpose enum
+
+`Technical | Deferral | Contribution | Service` (FSD §3.3 scope grammars).
+The Service variant landed via the NodeCore MESSAGE_TAXONOMY 871ebab
+coordination — gates access to advertised peer LLM/embedding/tool
+services. Per-invocation RPC rides edge transport; chain records
+service_announcement / service_deprecation / service_usage_summary.
+
+### Breaking changes (clean break, no aliases)
+
+**Internal type rename — finished the v1.4.0 (#51) deferred work:**
+- `StewardSigner` → `LocalSigner`
+- `StewardSignerConfig` → `LocalSignerConfig`
+- `StewardSignerError` → `LocalSignerError`
+- `steward_signer_err_to_py` → `local_signer_err_to_py`
+- `EngineInner.steward_signer` field → `local_signer`
+
+The public PyO3 surface was already renamed in v1.4.0. This finishes the
+internals consistently, matching the [CIRISVerify v2.3.0 pattern]
+(https://github.com/CIRISAI/CIRISVerify/commit/1a8110c) — rename
+everywhere at once, no transitional aliases. Federation role-tag
+concepts (the `STEWARD` const in `src/federation/types.rs`, the
+`STEWARD_KEY_ID` in `src/server/secrets.rs`, RATCHET federation_keys
+steward references) are UNCHANGED — they're semantically distinct from
+the per-process signing identity.
+
+### New trait surface
+
+`AuditService` (the chain-write trait) grows 9 new methods (all default
+to `Error::NotImplemented`; PG + SQLite override):
+- `next_chain_position(tenant)` — probe-the-tail helper for emit-side
+  callers (Phase E)
+- `current_sth(tenant)` — read post-emit STH
+- `lookup_grant_id_by_chain_event(chain_event_id)` — canonical PK
+  lookup
+- `get_trust_grant(grant_id)` / `lookup_trust_grant(...)` /
+  `list_trust_grants(filter)`
+- `leaf_canonical_bytes_for_chain_event(tenant, chain_event_id)` —
+  inclusion-proof support
+- `inclusion_proof_for_chain_event(tenant, chain_event_id)` —
+  RFC 6962 §2.1.1
+- `consistency_proof(tenant, old_size, new_size)` — RFC 6962 §2.1.2
+- `read_v020_trust_rows_for_local(local_pubkey)` — backfill enumerator
+
+`PostgresBackend` + `SqliteBackend` gain a `merkle_signer` slot
+(`RwLock<Option<Arc<LocalSigner>>>`) and a `set_merkle_signer` setter.
+Engine constructor auto-wires its `local_signer` into both arms — no
+Python-side configuration; setting `local_key_id` + `local_key_path` is
+sufficient to activate the Merkle hook.
+
+### Threat model coverage (FSD §4.4)
+
+| Threat | Mitigation |
+|---|---|
+| Log fork / split-view | STH + reserved witness cosigning |
+| Retroactive insertion | ConsistencyProof per RFC 6962 |
+| Selective omission | InclusionProof against signed root |
+| Stale STH acceptance | STH timestamp; verifier-side freshness policy |
+| Cross-tenant correlation breach | Per-tenant trees (no global root) |
+| Cross-subsystem proof collision | RFC 6962 byte prefixes (0x00/0x01) |
+| Quantum break on signing | Hybrid Ed25519 + ML-DSA-65 STH |
+| Quantum break on tree | SHA-256 PQ-resistant |
+
+### Atomicity
+
+Order in `record_entry`: (1) chain commit with AV-49 integrity FIRST;
+(2) Merkle hook (signer-gated) SECOND; (3) projection (subject_kind-
+gated) THIRD. Merkle / projection failures surface as typed errors but
+the chain row stands — the audit chain is the source of truth, Merkle
++ projection are downstream projections. Phase I backfill reconciles
+orphans.
+
+### Tests
+
+`cargo test --features "postgres sqlite cirisaudit" --lib` —
+**368 passed** (was 274 at v1.3.3). 2 pre-existing PG-gated audit
+test failures unchanged (V020 `audit_log_action_type_check`).
+
+### Implementation phases
+
+| Phase | Commit | What |
+|---|---|---|
+| A | `bf075c2` | V021 migration + TrustPurpose + TrustGrantPayload + AuditLeaf |
+| B | `35f3953` | PgMerkleStore + SqliteMerkleStore (TransparencyStore<AuditLeaf>) |
+| C | `93841cc` | Audit-service Merkle hook (universal — every chain entry) |
+| D | `cb93e00` | TrustGrant projection materialization |
+| E | `7a2fbb1` | grant_trust / revoke_trust_grant emit API |
+| F+G | `20b5071` | Read + proof retrieval APIs |
+| H | `f41f191` | PyO3 wrappers + internal StewardSigner→LocalSigner rename |
+| I | `fc50769` | V020 → V021 backfill |
+
+### Cross-references
+
+- **FSD:** [`FSD/FEDERATION_TRUST_INTERFACE.md`](FSD/FEDERATION_TRUST_INTERFACE.md)
+- **Upstream:** CIRISVerify v2.3.0 (SOTA transparency upgrade);
+  CIRISNodeCore 871ebab (15 new subject_kinds incl. trust_grant +
+  MESSAGE_TAXONOMY)
+- **Tracking:** [CIRISPersist#53](https://github.com/CIRISAI/CIRISPersist/issues/53)
+
 ## [1.4.0] — 2026-05-16
 
 **Interim cut before v1.5.0 substrate work — SQLite federation parity + clean-break API rename + audit-bridge doc fix.**
