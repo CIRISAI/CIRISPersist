@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779120053191,
+  "lastUpdate": 1779130211650,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -17507,6 +17507,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23720239,
             "range": "± 291109",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "715a12abc4b73b3a71104ab5ed8ca49e909c8c2e",
+          "message": "1.5.14 — deferral_reports substrate (CIRISPersist#59 #6 of 11)\n\nV029 migration on both backends. 7 columns: message_id (PK), task_id\n(FK → cirislens_tasks), thought_id (FK → cirislens_thoughts), package\n(JSONB/TEXT JSON), created_at, resolved_at, resolution_notes.\n\nSubstrate adds resolved_at + resolution_notes columns beyond the\nagent's bare 5-column schema. Necessary for list_active_deferrals\nquery (WA deferrals awaiting resolution) per CIRISPersist#59. Both\nnullable — back-compat with agent's existing rows preserved.\n\n3 indexes including partial (created_at DESC) WHERE resolved_at IS\nNULL for active-only hot path.\n\nDeferralReportService trait (4 methods):\n- record_deferral → ClaimResult<DeferralReport> (INSERT-OR-IGNORE\n  on message_id; idempotent re-record returns original payload)\n- get_deferral\n- list_active_deferrals (resolved_at IS NULL; filter by task_id/\n  thought_id/created window; ordered DESC)\n- resolve_deferral (missing-row returns false)\n\nPyO3: 4 new methods gated on cirislens_deferral_reports feature.\n\n18 new tests (3 types + 1 mod kind + 7 PG + 7 SQLite). All 7 columns\nround-trip; FK rejects on both backends; ClaimResult race semantics;\nlist_active filtering; resolve_then_get reflects resolution.\n\nImplementation note: previous sub-agent timed out partway; finish\npass added SQLite impl (616 lines), Cargo.toml feature flag, pyproject\nmaturin entry, lib.rs registration, all 4 PyO3 wrappers + error-kind\ntokens, .pyi stubs, qa_harness count bump (1..=28 → 1..=29). No\nsurprises in the partial work — Postgres impl + service + types all\ncorrectly shaped.\n\n5 substrates remain: consolidation_locks (v1.5.15), creation_\nceremonies, continuity_awareness, feedback_mappings, wa_cert.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-18T13:42:03-05:00",
+          "tree_id": "7c85222c1debaf9c439450fb6600634a417f4725",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/715a12abc4b73b3a71104ab5ed8ca49e909c8c2e"
+        },
+        "date": 1779130210999,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 102617,
+            "range": "± 1574",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 242902,
+            "range": "± 1690",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 522579,
+            "range": "± 9150",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1845251,
+            "range": "± 22969",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 347,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1424,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8274,
+            "range": "± 32",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21178,
+            "range": "± 231",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24242,
+            "range": "± 85",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83678,
+            "range": "± 287",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 361,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3161,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9375,
+            "range": "± 34",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41422,
+            "range": "± 307",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 621,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2233990,
+            "range": "± 26095",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6620631,
+            "range": "± 48728",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23667201,
+            "range": "± 112662",
             "unit": "ns/iter"
           }
         ]
