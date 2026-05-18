@@ -141,7 +141,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "correlations_not_found"
         | "scheduled_tasks_not_found"
         | "tickets_not_found"
-        | "deferral_reports_not_found" => NotFound::new_err(msg),
+        | "deferral_reports_not_found"
+        | "maintenance_locks_not_found" => NotFound::new_err(msg),
 
         // Conflict family — uniqueness / version / state-transition
         // conflict; caller MUST NOT retry, MUST re-read.
@@ -155,7 +156,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "correlations_conflict"
         | "scheduled_tasks_conflict"
         | "tickets_conflict"
-        | "deferral_reports_conflict" => Conflict::new_err(msg),
+        | "deferral_reports_conflict"
+        | "maintenance_locks_conflict" => Conflict::new_err(msg),
 
         // Transient family — backend connection / timeout / pool
         // exhaustion; caller MAY retry with backoff.
@@ -171,7 +173,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "correlations_backend"
         | "scheduled_tasks_backend"
         | "tickets_backend"
-        | "deferral_reports_backend" => Transient::new_err(msg),
+        | "deferral_reports_backend"
+        | "maintenance_locks_backend" => Transient::new_err(msg),
 
         // Default — Permanent. Covers invalid arguments, signature
         // failures, crypto errors, rotation conflicts, "not authorized,"
@@ -9580,6 +9583,180 @@ impl PyEngine {
                             )
                             .await
                             .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    // ── v1.5.15 (CIRISPersist#59 #7) — maintenance_locks cluster ──
+    //
+    // 3 methods wrapping MaintenanceLockService. JSON wire format:
+    // MaintenanceLock crosses the FFI as a serde-encoded JSON object
+    // (or `None` / Python `None` on absent / contention). `metadata`
+    // is an optional opaque JSON payload — callers serialize it
+    // themselves and pass as a JSON string at the boundary.
+    //
+    // try_acquire returns `Option<json>`: `Some(...)` on win (clean
+    // acquire or steal-the-stale), `None` on contention (held by
+    // another active caller — caller treats as "try again later",
+    // NOT an exception). release returns bool. get returns
+    // `Option<json>`.
+
+    /// v1.5.15 — Atomic try-acquire of a named lock. Returns the
+    /// JSON-encoded `MaintenanceLock` (race winner) or `None`
+    /// (contention — held by another active caller). Same-holder
+    /// re-acquire succeeds as a refresh.
+    ///
+    /// `metadata_json` is an optional caller-supplied JSON string
+    /// (must parse to a `serde_json::Value` if provided). It's
+    /// stored verbatim in the row's `metadata` JSONB column for
+    /// operator observability (worker id, occurrence id, pid, etc.).
+    #[cfg(feature = "cirislens_maintenance_locks")]
+    #[pyo3(signature = (lock_key, locked_by, timeout_seconds, metadata_json=None))]
+    fn lock_try_acquire(
+        &self,
+        py: Python<'_>,
+        lock_key: &str,
+        locked_by: &str,
+        timeout_seconds: i32,
+        metadata_json: Option<&str>,
+    ) -> PyResult<Option<String>> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let lock_key = lock_key.to_owned();
+            let locked_by = locked_by.to_owned();
+            let metadata: Option<serde_json::Value> = match metadata_json {
+                None => None,
+                Some(raw) => Some(
+                    serde_json::from_str(raw)
+                        .map_err(|e| PyValueError::new_err(format!("metadata_json decode: {e}")))?,
+                ),
+            };
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::maintenance_locks::MaintenanceLockService;
+                        let got = backend
+                            .try_acquire_lock(&lock_key, &locked_by, timeout_seconds, metadata)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match got {
+                            None => Ok(None),
+                            Some(lock) => serde_json::to_string(&lock).map(Some).map_err(|e| {
+                                PyRuntimeError::new_err(format!("MaintenanceLock encode: {e}"))
+                            }),
+                        }
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::maintenance_locks::sqlite::SqliteMaintenanceLockBackend::new(
+                            sq.conn_handle(),
+                        );
+                    runtime.block_on(async move {
+                        use crate::maintenance_locks::MaintenanceLockService;
+                        let got = backend
+                            .try_acquire_lock(&lock_key, &locked_by, timeout_seconds, metadata)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match got {
+                            None => Ok(None),
+                            Some(lock) => serde_json::to_string(&lock).map(Some).map_err(|e| {
+                                PyRuntimeError::new_err(format!("MaintenanceLock encode: {e}"))
+                            }),
+                        }
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.15 — Release a lock IFF the caller still holds it.
+    /// Returns `True` when released; `False` when the row doesn't
+    /// exist or is held by someone else (no-op; caller treats
+    /// `False` as "not yours to release").
+    #[cfg(feature = "cirislens_maintenance_locks")]
+    fn lock_release(&self, py: Python<'_>, lock_key: &str, locked_by: &str) -> PyResult<bool> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let lock_key = lock_key.to_owned();
+            let locked_by = locked_by.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::maintenance_locks::MaintenanceLockService;
+                        backend
+                            .release_lock(&lock_key, &locked_by)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::maintenance_locks::sqlite::SqliteMaintenanceLockBackend::new(
+                            sq.conn_handle(),
+                        );
+                    runtime.block_on(async move {
+                        use crate::maintenance_locks::MaintenanceLockService;
+                        backend
+                            .release_lock(&lock_key, &locked_by)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.15 — Read current lock state. Returns the JSON-encoded
+    /// `MaintenanceLock` or `None` when no matching row. Callers
+    /// inspect `locked_by` / `locked_at` to decide whether the lock
+    /// is currently held.
+    #[cfg(feature = "cirislens_maintenance_locks")]
+    fn lock_get(&self, py: Python<'_>, lock_key: &str) -> PyResult<Option<String>> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let lock_key = lock_key.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::maintenance_locks::MaintenanceLockService;
+                        let got = backend
+                            .get_lock(&lock_key)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match got {
+                            None => Ok(None),
+                            Some(lock) => serde_json::to_string(&lock).map(Some).map_err(|e| {
+                                PyRuntimeError::new_err(format!("MaintenanceLock encode: {e}"))
+                            }),
+                        }
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::maintenance_locks::sqlite::SqliteMaintenanceLockBackend::new(
+                            sq.conn_handle(),
+                        );
+                    runtime.block_on(async move {
+                        use crate::maintenance_locks::MaintenanceLockService;
+                        let got = backend
+                            .get_lock(&lock_key)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match got {
+                            None => Ok(None),
+                            Some(lock) => serde_json::to_string(&lock).map(Some).map_err(|e| {
+                                PyRuntimeError::new_err(format!("MaintenanceLock encode: {e}"))
+                            }),
+                        }
                     })
                 }
             })

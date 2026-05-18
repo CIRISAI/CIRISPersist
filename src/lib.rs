@@ -57,6 +57,8 @@ pub mod ingest;
 pub mod journal;
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub mod maintenance;
+#[cfg(feature = "cirislens_maintenance_locks")]
+pub mod maintenance_locks;
 pub mod manifest;
 pub mod outbound;
 pub mod pipeline;

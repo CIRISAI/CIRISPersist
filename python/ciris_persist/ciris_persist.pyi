@@ -564,6 +564,58 @@ class Engine:
         matching row (no error — callers treat as stale id).
         """
 
+    # ── v1.5.15 (CIRISPersist#59 #7) — maintenance_locks substrate
+
+    def lock_try_acquire(
+        self,
+        lock_key: str,
+        locked_by: str,
+        timeout_seconds: int,
+        metadata_json: str | None = None,
+    ) -> str | None:
+        """v1.5.15 — Atomic try-acquire of a named lock. Returns the
+        JSON-encoded ``MaintenanceLock`` (race winner — clean
+        acquire or steal-the-stale of an expired holder) or
+        ``None`` (contention — held by another active caller; the
+        caller should treat ``None`` as "try again later", NOT as
+        an exception).
+
+        Race-safe: implemented as a single-statement UPSERT with a
+        WHERE clause that gates on
+        ``locked_by IS NULL OR locked_by = caller OR locked_at +
+        timeout < server_now``. PG uses ``NOW()`` server-side;
+        SQLite uses ``julianday('now')`` server-side. Both stamp
+        ``locked_at`` against the same server clock so the
+        steal-vs-active decision is consistent.
+
+        Same-holder re-acquire succeeds and refreshes
+        ``lock_timeout_seconds`` + ``locked_at`` + ``metadata`` to
+        the new caller-supplied values.
+
+        ``metadata_json`` is an optional JSON-encoded payload (any
+        valid JSON value: object, array, scalar). Stored verbatim
+        in the row's ``metadata`` column for operator
+        observability.
+        """
+
+    def lock_release(self, lock_key: str, locked_by: str) -> bool:
+        """v1.5.15 — Release a lock IFF the caller still holds it.
+        Returns ``True`` when the lock was cleared; ``False`` when
+        the row doesn't exist or the row's ``locked_by`` doesn't
+        match the supplied ``locked_by`` (no-op — caller treats
+        ``False`` as "not yours to release").
+        """
+
+    def lock_get(self, lock_key: str) -> str | None:
+        """v1.5.15 — Read current lock state. Returns the
+        JSON-encoded ``MaintenanceLock`` or ``None`` when no row
+        for ``lock_key`` exists. ``locked_by IS NULL`` AND
+        ``locked_at IS NULL`` means the row exists but no caller
+        currently holds the lock; callers also check ``locked_at
+        + lock_timeout_seconds`` against wall-clock to decide if a
+        present-but-expired holder is stealable.
+        """
+
     def trust_grant_consistency_proof(
         self,
         tenant_id: str,

@@ -5,6 +5,83 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.5.15] — 2026-05-18
+
+**`maintenance_locks` substrate — 7 of 11 (CIRISPersist#59 #7).**
+
+Generic `maintenance_locks` family — the agent's
+`consolidation_locks` is the first user, but the substrate is
+designed to subsume any future cross-occurrence coordination need
+(per the spec). Renamed away from `consolidation_locks` to flag the
+generality.
+
+V030 migration on both backends. 5 columns: `lock_key` (PK),
+`locked_by`, `locked_at`, `lock_timeout_seconds` (default 300, CHECK
+> 0), `metadata` (JSONB/TEXT JSON — optional lock-holder context).
+
+Partial index `(locked_at DESC) WHERE locked_by IS NOT NULL` for the
+active-lock scan.
+
+### MaintenanceLockService trait (3 methods)
+
+- `try_acquire_lock(lock_key, locked_by, timeout_seconds, metadata?)`
+  → `Option<MaintenanceLock>`. Race-safe via single-statement
+  INSERT-OR-UPDATE with a WHERE clause that filters by
+  lock-not-held OR lock-expired. Returns Some on win (clean acquire,
+  re-acquire by same holder, or steal-from-stale); None when another
+  active holder owns it.
+- `release_lock(lock_key, locked_by)` → bool. Releases iff caller
+  still holds it; mismatched caller is a no-op returning false.
+- `get_lock(lock_key)` — read current state.
+
+`MaintenanceLock::is_expired(now)` helper for client-side checks.
+
+### Cross-backend expiry parity
+
+Critical invariant verified: both backends evaluate expiry
+server-side in the same statement that performs the acquire, using
+the same server clock that stamped `locked_at`.
+
+- PG: `WHERE locked_at + (lock_timeout_seconds * interval '1 second') < NOW()`
+- SQLite: `WHERE julianday('now') > julianday(locked_at) + (lock_timeout_seconds / 86400.0)`
+
+Test `expiry_semantics_match_client_helper` runs on both: acquire
+with 1s timeout, wait 1.5s, assert client's `is_expired(Utc::now())`
+agrees with `try_acquire_lock(...) → Some(_)` from a different
+holder. Both pass; sub-millisecond clock skew tolerance.
+
+### PyO3 surface
+
+3 new Engine methods gated on `cirislens_maintenance_locks`:
+- `lock_try_acquire(lock_key, locked_by, timeout_seconds, metadata_json?) → Option<json>`
+- `lock_release(lock_key, locked_by) → bool`
+- `lock_get(lock_key) → Option<json>`
+
+Stable error kinds: `maintenance_locks_invalid_argument |
+maintenance_locks_not_found | maintenance_locks_conflict |
+maintenance_locks_backend | maintenance_locks_internal`.
+
+### Tests
+
+28 new (9 types + 1 mod kind + 9 PG + 9 SQLite):
+- All 5 columns round-trip
+- Clean acquire on empty key
+- Same-holder refresh (re-acquire is idempotent)
+- Contention: active holder → None
+- Steal-from-stale: expired lock → Some
+- Release-matches → true + cleared
+- Release-mismatches → false + no-op
+- `get_lock` returns current state
+- `is_expired` matrix (None timestamps, exact-boundary, beyond-boundary)
+- Cross-backend expiry parity test
+
+Lib suite: 304 pass.
+
+### Remaining 4 substrates
+
+`creation_ceremonies` (v1.5.16), `continuity_awareness` (v1.5.17),
+`feedback_mappings` (v1.5.18), `wa_cert` (v1.5.19).
+
 ## [1.5.14] — 2026-05-18
 
 **`deferral_reports` substrate — 6 of 11 (CIRISPersist#59 #6).**
