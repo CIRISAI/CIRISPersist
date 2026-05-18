@@ -5,6 +5,91 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.5.8] — 2026-05-18
+
+**SQLite parity for `get_classifications` + `get_features`. Plus write paths.**
+
+v1.5.1's parity sweep made these two methods return a typed
+`PyRuntimeError("pipeline-read primitives are Postgres-only")` on
+SQLite. That framing was wrong — no PG-only declarations. This ships
+the SQLite read path + adds explicit write methods on both backends
+so the agent's AdaptiveFilter output round-trips through persist as
+the storage substrate.
+
+### V023 migration (SQLite only — PG already has these via V009)
+
+```sql
+ALTER TABLE trace_events ADD COLUMN extracted_features  TEXT;
+ALTER TABLE trace_events ADD COLUMN classifications     TEXT;
+ALTER TABLE trace_events ADD COLUMN pipeline_metadata   TEXT;
+```
+
+All three nullable; pre-V023 rows stay valid; pipeline-aware
+consumers detect "no pipeline ran" via `extracted_features IS NULL`.
+
+### New backend methods
+
+- `read_features(trace_id, thought_id)` on `SqliteBackend` (mirrors
+  the existing PG method)
+- `read_classifications(trace_id, thought_id)` on `SqliteBackend`
+  (mirrors PG)
+- `write_features(trace_id, thought_id, features)` — NEW on both
+  backends; updates the column when the row exists; no-op when it
+  doesn't (caller's contract: "set this if present")
+- `write_classifications(trace_id, thought_id, classifications)` —
+  NEW on both backends; same shape
+
+### New PyO3 methods
+
+- `set_features(trace_id, thought_id, features_json)` — caller serializes
+  on Python side; persist parses into typed `Features`, dispatches to
+  backend write method
+- `set_classifications(trace_id, thought_id, classifications_json)` —
+  same shape; typed `Vec<Vec<ContentClassMatch>>`
+
+### PyO3 dispatch updates
+
+`get_features` and `get_classifications` SQLite arms now call into
+`SqliteBackend::read_features` / `read_classifications` instead of
+returning the PG-only error. Both methods work end-to-end on SQLite.
+
+### Tests (8 new)
+
+SQLite (6):
+- `write_then_read_classifications_round_trip` — write + read returns
+  equal Vec
+- `read_classifications_returns_empty_when_null`
+- `write_classifications_on_missing_row_is_noop`
+- Same trio for `features`
+
+PG (2):
+- `pipeline_write_features_and_classifications_round_trip`
+- `pipeline_write_classifications_missing_row_is_noop`
+
+Lib suite: 349 pass with features `postgres sqlite classify extract`.
+
+### What this enables
+
+- **Agent migration path:** Python AdaptiveFilter produces
+  classifications → agent calls `engine.set_classifications(...)` →
+  reads back via `engine.get_classifications(...)`. Same shape on
+  every backend.
+- **Lens-tier observability** continues to work on PG via the existing
+  pipeline-classify-stage write path (which still UPDATEs the column
+  internally during ingest).
+- **Sovereign-mode agents** (SQLite-first) now have first-class
+  classifications + features storage that round-trips through persist
+  without forcing a PG dependency.
+
+### What's still deferred (out of scope)
+
+- Wiring the pipeline classify stage to UPDATE classifications on
+  SQLite during the ingest path itself — bigger pipeline substrate
+  cut. The agent's path via explicit `set_classifications` covers the
+  current use case.
+- `pipeline_metadata` read/write PyO3 surface — column lands in V023
+  for forward-compat; methods deferred until a real consumer asks.
+
 ## [1.5.7] — 2026-05-18
 
 **`SecretsService::process_incoming_text` pipeline orchestration (closes [#57](https://github.com/CIRISAI/CIRISPersist/issues/57)).**

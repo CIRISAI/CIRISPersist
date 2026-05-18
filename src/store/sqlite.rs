@@ -610,6 +610,194 @@ impl Backend for SqliteBackend {
     }
 }
 
+// ─── Pipeline read+write surface (v1.5.8, CIRISPersist#57) ─────────
+//
+// Inherent methods on `SqliteBackend` for reading + writing the V023
+// pipeline TEXT-as-JSON columns (`extracted_features`,
+// `classifications`). Mirrors `PostgresBackend`'s v0.6.0-α5 read
+// surface (postgres.rs read_features / read_classifications) and adds
+// public write methods so the agent's AdaptiveFilter output can
+// round-trip through persist without leaning on the internal pipeline
+// classify-stage UPDATE.
+//
+// V023 stores all three columns as nullable TEXT (vs. PG JSONB). The
+// json1 extension reads TEXT as JSON natively; on decode we go
+// through `serde_json::from_str` rather than tokio-postgres'
+// JSONB→serde_json::Value decode. Wire shape matches PG byte-for-byte.
+
+impl SqliteBackend {
+    /// v1.5.8 (CIRISPersist#57) — SQLite parity for `read_features`.
+    /// Read typed [`Features`] for a `(trace_id, thought_id)` pair from
+    /// `trace_events.extracted_features` (V023 column).
+    ///
+    /// Returns `Ok(None)` when:
+    /// - The trace/thought pair has no rows, OR
+    /// - The pipeline hasn't yet run on those rows
+    ///   (`extracted_features IS NULL` — pre-V023 or pipeline-skipped
+    ///   ingest paths).
+    ///
+    /// Wire format mirrors PG V009 / SQLite V023: the TEXT column
+    /// stores the serde-encoded `Features` shape. Additive wire-shape
+    /// changes only within v1.5.x.
+    #[cfg(feature = "extract")]
+    pub async fn read_features(
+        &self,
+        trace_id: &str,
+        thought_id: &str,
+    ) -> Result<Option<crate::pipeline::extract::Features>, Error> {
+        let trace_id = trace_id.to_owned();
+        let thought_id = thought_id.to_owned();
+        let conn = self.conn.clone();
+        let row_opt =
+            tokio::task::spawn_blocking(move || -> Result<Option<String>, rusqlite::Error> {
+                let conn = conn.blocking_lock();
+                conn.query_row(
+                    "SELECT extracted_features \
+                     FROM trace_events \
+                     WHERE trace_id = ?1 AND thought_id = ?2 \
+                       AND extracted_features IS NOT NULL \
+                     LIMIT 1",
+                    rusqlite::params![trace_id, thought_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+            })
+            .await
+            .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+            .map_err(|e| Error::Backend(format!("read_features: {e}")))?;
+        match row_opt {
+            None => Ok(None),
+            Some(text) => {
+                let features: crate::pipeline::extract::Features = serde_json::from_str(&text)
+                    .map_err(|e| Error::Backend(format!("extracted_features TEXT decode: {e}")))?;
+                Ok(Some(features))
+            }
+        }
+    }
+
+    /// v1.5.8 (CIRISPersist#57) — SQLite parity for
+    /// `read_classifications`. Read per-component classification matches
+    /// for a `(trace_id, thought_id)` pair from
+    /// `trace_events.classifications` (V023 column).
+    ///
+    /// Returns an empty vec when:
+    /// - The trace/thought pair has no rows, OR
+    /// - The pipeline hasn't yet run (`classifications IS NULL`).
+    ///
+    /// Outer vec is per-component (in the order the pipeline classify
+    /// stage emitted); inner vec is per-match within that component.
+    #[cfg(feature = "classify")]
+    pub async fn read_classifications(
+        &self,
+        trace_id: &str,
+        thought_id: &str,
+    ) -> Result<Vec<Vec<crate::pipeline::classify::ContentClassMatch>>, Error> {
+        let trace_id = trace_id.to_owned();
+        let thought_id = thought_id.to_owned();
+        let conn = self.conn.clone();
+        let row_opt =
+            tokio::task::spawn_blocking(move || -> Result<Option<String>, rusqlite::Error> {
+                let conn = conn.blocking_lock();
+                conn.query_row(
+                    "SELECT classifications \
+                     FROM trace_events \
+                     WHERE trace_id = ?1 AND thought_id = ?2 \
+                       AND classifications IS NOT NULL \
+                     LIMIT 1",
+                    rusqlite::params![trace_id, thought_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+            })
+            .await
+            .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+            .map_err(|e| Error::Backend(format!("read_classifications: {e}")))?;
+        match row_opt {
+            None => Ok(Vec::new()),
+            Some(text) => {
+                let parsed: Vec<Vec<crate::pipeline::classify::ContentClassMatch>> =
+                    serde_json::from_str(&text)
+                        .map_err(|e| Error::Backend(format!("classifications TEXT decode: {e}")))?;
+                Ok(parsed)
+            }
+        }
+    }
+
+    /// v1.5.8 (CIRISPersist#57) — write the V023 `extracted_features`
+    /// column for a `(trace_id, thought_id)` pair. Public write path
+    /// for the agent's AdaptiveFilter output → persist round-trip.
+    ///
+    /// Caller contract: "set this if the row exists." If no
+    /// `trace_events` row matches `(trace_id, thought_id)`, the UPDATE
+    /// affects 0 rows and we return `Ok(())` (matches the canonical
+    /// pipeline classify-stage UPDATE semantics on PG — the row must
+    /// already be in the table; this method does not insert).
+    #[cfg(feature = "extract")]
+    pub async fn write_features(
+        &self,
+        trace_id: &str,
+        thought_id: &str,
+        features: &crate::pipeline::extract::Features,
+    ) -> Result<(), Error> {
+        let features_json = serde_json::to_string(features)
+            .map_err(|e| Error::Backend(format!("write_features encode: {e}")))?;
+        let trace_id = trace_id.to_owned();
+        let thought_id = thought_id.to_owned();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE trace_events \
+                 SET extracted_features = ?1 \
+                 WHERE trace_id = ?2 AND thought_id = ?3",
+                rusqlite::params![features_json, trace_id, thought_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| Error::Backend(format!("write_features: {e}")))?;
+        Ok(())
+    }
+
+    /// v1.5.8 (CIRISPersist#57) — write the V023 `classifications`
+    /// column for a `(trace_id, thought_id)` pair. Public write path
+    /// for the agent's AdaptiveFilter output → persist round-trip.
+    ///
+    /// Caller contract: "set this if the row exists." If no
+    /// `trace_events` row matches `(trace_id, thought_id)`, the UPDATE
+    /// affects 0 rows and we return `Ok(())` (matches the canonical
+    /// pipeline classify-stage UPDATE semantics on PG — the row must
+    /// already be in the table; this method does not insert).
+    #[cfg(feature = "classify")]
+    pub async fn write_classifications(
+        &self,
+        trace_id: &str,
+        thought_id: &str,
+        classifications: &Vec<Vec<crate::pipeline::classify::ContentClassMatch>>,
+    ) -> Result<(), Error> {
+        let cls_json = serde_json::to_string(classifications)
+            .map_err(|e| Error::Backend(format!("write_classifications encode: {e}")))?;
+        let trace_id = trace_id.to_owned();
+        let thought_id = thought_id.to_owned();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE trace_events \
+                 SET classifications = ?1 \
+                 WHERE trace_id = ?2 AND thought_id = ?3",
+                rusqlite::params![cls_json, trace_id, thought_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| Error::Backend(format!("write_classifications: {e}")))?;
+        Ok(())
+    }
+}
+
 // ─── Helpers ───────────────────────────────────────────────────────
 
 fn opt_text(v: Option<&str>) -> SqlValue {
@@ -3635,5 +3823,205 @@ mod tests {
         assert_eq!(got.roles.len(), 2);
         assert!(got.roles.contains(&"cirislens_pipeline_writer".to_owned()));
         assert!(got.roles.contains(&"cirislens_secrets_reader".to_owned()));
+    }
+
+    // ─── Pipeline read+write tests (v1.5.8, CIRISPersist#57) ────────
+    //
+    // V023 parity sweep: mirrors postgres.rs::pipeline_read_features_and_
+    // classifications_round_trip but on the SQLite substrate. Tests
+    // cover (a) write→read round-trip, (b) NULL column → empty/None,
+    // (c) UPDATE on missing-row → Ok(()) no-op.
+
+    /// Helper: insert a trace_events row directly via raw SQL — the
+    /// minimum shape needed to give the V023 UPDATEs something to
+    /// land on. No-op-friendly fixture (no audit fields, no pipeline
+    /// columns set; those are what the tests UPDATE).
+    #[cfg(any(feature = "extract", feature = "classify"))]
+    async fn insert_minimal_trace_row(backend: &SqliteBackend, trace_id: &str, thought_id: &str) {
+        let conn = backend.conn.clone();
+        let trace_id = trace_id.to_owned();
+        let thought_id = thought_id.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO trace_events (\
+                    trace_id, thought_id, event_type, attempt_index, ts, \
+                    agent_id_hash, trace_level, payload, signature, \
+                    signing_key_id, signature_verified, schema_version, \
+                    pii_scrubbed\
+                 ) VALUES (?1, ?2, 'thought_start', 0, ?3, 'deadbeef', \
+                    'generic', '{}', 'sig', 'k', 1, '2.7.0', 0)",
+                rusqlite::params![trace_id, thought_id, "2026-05-16T00:00:00+00:00"],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    #[cfg(feature = "classify")]
+    fn fixture_classifications() -> Vec<Vec<crate::pipeline::classify::ContentClassMatch>> {
+        vec![vec![crate::pipeline::classify::ContentClassMatch {
+            class: crate::pipeline::classify::ContentClass::EmailAddress,
+            method: crate::pipeline::classify::DetectionMethod::Regex,
+            sensitivity: crate::pipeline::classify::Sensitivity::Medium,
+            action: crate::pipeline::classify::Action::ScrubReplace,
+            matcher_id: "regex:email_v1".into(),
+            address: crate::pipeline::classify::MatchAddress::BatchComponent {
+                index: 0,
+                json_path: Some("$.task_description".into()),
+            },
+            span: Some((0, 16)),
+            confidence: 1.0,
+            learning: None,
+            secret_uuid: None,
+        }]]
+    }
+
+    #[cfg(feature = "extract")]
+    fn fixture_features() -> crate::pipeline::extract::Features {
+        let declared = crate::pipeline::extract::DeclaredCohortAxes {
+            agent_role: Some("ally".into()),
+            agent_template: Some("ally-v3-default".into()),
+            deployment_domain: Some("moderation".into()),
+            deployment_type: Some("production".into()),
+            deployment_region: Some("US".into()),
+            deployment_trust_mode: Some("federated_peer".into()),
+        };
+        crate::pipeline::extract::extract_features(&serde_json::json!({"components": []}), declared)
+    }
+
+    /// Write → read round-trip for classifications. Confirms the V023
+    /// TEXT-as-JSON wire shape decodes byte-identically to the input.
+    #[cfg(feature = "classify")]
+    #[tokio::test]
+    async fn write_then_read_classifications_round_trip() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let tid = "tr-pipe-rd-cls";
+        let thid = "th-pipe-rd-cls";
+        insert_minimal_trace_row(&backend, tid, thid).await;
+
+        let cls = fixture_classifications();
+        backend
+            .write_classifications(tid, thid, &cls)
+            .await
+            .unwrap();
+
+        let got = backend.read_classifications(tid, thid).await.unwrap();
+        assert_eq!(got.len(), 1, "one component classified");
+        assert_eq!(got[0].len(), 1, "one match in that component");
+        assert_eq!(
+            got[0][0].class,
+            crate::pipeline::classify::ContentClass::EmailAddress
+        );
+        assert_eq!(got[0][0].matcher_id, "regex:email_v1");
+    }
+
+    /// Read against a row with NULL classifications returns an empty
+    /// vec (matches PG `read_classifications` contract — "no pipeline
+    /// ran" is empty, not an error).
+    #[cfg(feature = "classify")]
+    #[tokio::test]
+    async fn read_classifications_returns_empty_when_null() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let tid = "tr-pipe-null-cls";
+        let thid = "th-pipe-null-cls";
+        insert_minimal_trace_row(&backend, tid, thid).await;
+        // Note: no write_classifications call — column stays NULL.
+
+        let got = backend.read_classifications(tid, thid).await.unwrap();
+        assert!(got.is_empty(), "NULL classifications → empty vec");
+    }
+
+    /// UPDATE on a (trace_id, thought_id) that has no row affects 0
+    /// rows and returns Ok(()). Documented caller contract: "set this
+    /// if the row exists."
+    #[cfg(feature = "classify")]
+    #[tokio::test]
+    async fn write_classifications_on_missing_row_is_noop() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let cls = fixture_classifications();
+        // No insert_minimal_trace_row — the (trace_id, thought_id)
+        // pair has zero rows. UPDATE matches nothing, returns Ok(()).
+        backend
+            .write_classifications("tr-missing", "th-missing", &cls)
+            .await
+            .unwrap();
+
+        // Confirm read still returns empty (no row at all).
+        let got = backend
+            .read_classifications("tr-missing", "th-missing")
+            .await
+            .unwrap();
+        assert!(got.is_empty());
+    }
+
+    /// Write → read round-trip for features.
+    #[cfg(feature = "extract")]
+    #[tokio::test]
+    async fn write_then_read_features_round_trip() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let tid = "tr-pipe-rd-feat";
+        let thid = "th-pipe-rd-feat";
+        insert_minimal_trace_row(&backend, tid, thid).await;
+
+        let features = fixture_features();
+        backend.write_features(tid, thid, &features).await.unwrap();
+
+        let got = backend
+            .read_features(tid, thid)
+            .await
+            .unwrap()
+            .expect("features present");
+        assert_eq!(
+            got.declared.deployment_domain.as_deref(),
+            Some("moderation")
+        );
+        assert_eq!(got.declared.agent_role.as_deref(), Some("ally"));
+    }
+
+    /// Read against a row with NULL extracted_features returns None
+    /// (matches PG `read_features` contract).
+    #[cfg(feature = "extract")]
+    #[tokio::test]
+    async fn read_features_returns_none_when_null() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let tid = "tr-pipe-null-feat";
+        let thid = "th-pipe-null-feat";
+        insert_minimal_trace_row(&backend, tid, thid).await;
+
+        let got = backend.read_features(tid, thid).await.unwrap();
+        assert!(got.is_none(), "NULL extracted_features → None");
+    }
+
+    /// UPDATE on a missing row is a no-op.
+    #[cfg(feature = "extract")]
+    #[tokio::test]
+    async fn write_features_on_missing_row_is_noop() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let features = fixture_features();
+        backend
+            .write_features("tr-missing-f", "th-missing-f", &features)
+            .await
+            .unwrap();
+
+        let got = backend
+            .read_features("tr-missing-f", "th-missing-f")
+            .await
+            .unwrap();
+        assert!(got.is_none());
     }
 }

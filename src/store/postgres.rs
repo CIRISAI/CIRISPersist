@@ -1014,6 +1014,68 @@ impl PostgresBackend {
             }
         }
     }
+
+    /// v1.5.8 (CIRISPersist#57) — write the V009 `extracted_features`
+    /// column for a `(trace_id, thought_id)` pair. Public write path
+    /// for the agent's AdaptiveFilter output → persist round-trip.
+    ///
+    /// Caller contract: "set this if the row exists." If no
+    /// `cirislens.trace_events` row matches `(trace_id, thought_id)`,
+    /// the UPDATE affects 0 rows and we return `Ok(())` (matches the
+    /// canonical pipeline classify-stage UPDATE semantics — the row
+    /// must already be in the table; this method does not insert).
+    #[cfg(feature = "extract")]
+    pub async fn write_features(
+        &self,
+        trace_id: &str,
+        thought_id: &str,
+        features: &crate::pipeline::extract::Features,
+    ) -> Result<(), Error> {
+        let features_json = serde_json::to_value(features)
+            .map_err(|e| Error::Backend(format!("write_features encode: {e}")))?;
+        let client = self.get_client().await?;
+        client
+            .execute(
+                "UPDATE cirislens.trace_events \
+                 SET extracted_features = $1 \
+                 WHERE trace_id = $2 AND thought_id = $3",
+                &[&features_json, &trace_id, &thought_id],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("write_features: {e}")))?;
+        Ok(())
+    }
+
+    /// v1.5.8 (CIRISPersist#57) — write the V009 `classifications`
+    /// column for a `(trace_id, thought_id)` pair. Public write path
+    /// for the agent's AdaptiveFilter output → persist round-trip.
+    ///
+    /// Caller contract: "set this if the row exists." If no
+    /// `cirislens.trace_events` row matches `(trace_id, thought_id)`,
+    /// the UPDATE affects 0 rows and we return `Ok(())` (matches the
+    /// canonical pipeline classify-stage UPDATE semantics — the row
+    /// must already be in the table; this method does not insert).
+    #[cfg(feature = "classify")]
+    pub async fn write_classifications(
+        &self,
+        trace_id: &str,
+        thought_id: &str,
+        classifications: &Vec<Vec<crate::pipeline::classify::ContentClassMatch>>,
+    ) -> Result<(), Error> {
+        let cls_json = serde_json::to_value(classifications)
+            .map_err(|e| Error::Backend(format!("write_classifications encode: {e}")))?;
+        let client = self.get_client().await?;
+        client
+            .execute(
+                "UPDATE cirislens.trace_events \
+                 SET classifications = $1 \
+                 WHERE trace_id = $2 AND thought_id = $3",
+                &[&cls_json, &trace_id, &thought_id],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("write_classifications: {e}")))?;
+        Ok(())
+    }
 }
 
 // ─── FederationDirectory impl (v0.2.0) ─────────────────────────────
@@ -8884,6 +8946,115 @@ mod tests {
             crate::pipeline::classify::ContentClass::EmailAddress
         );
         assert_eq!(c_read[0][0].matcher_id, "regex:email_v1");
+    }
+
+    /// v1.5.8 (CIRISPersist#57) — write_classifications + write_features
+    /// round-trip through the V009 columns. Public write surface for
+    /// the agent's AdaptiveFilter output (parity with SQLite V023).
+    #[cfg(all(feature = "extract", feature = "classify"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pipeline_write_features_and_classifications_round_trip() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let aid = format!("agent-pipe-wr-{}", uuid_like());
+        let tid = format!("tr-pipe-wr-{}", uuid_like());
+        let thid = format!("th-{tid}");
+        let started = chrono::Utc::now();
+        insert_section_a_fixture_trace(
+            &backend,
+            &tid,
+            &aid,
+            Some("PipeW"),
+            Some("moderation"),
+            started,
+            false,
+            0.5,
+            0.5,
+            1.0,
+        )
+        .await;
+
+        let declared = crate::pipeline::extract::DeclaredCohortAxes {
+            agent_role: Some("ally".into()),
+            agent_template: Some("ally-v3-default".into()),
+            deployment_domain: Some("moderation".into()),
+            deployment_type: Some("production".into()),
+            deployment_region: Some("US".into()),
+            deployment_trust_mode: Some("federated_peer".into()),
+        };
+        let features = crate::pipeline::extract::extract_features(
+            &serde_json::json!({"components": []}),
+            declared,
+        );
+        backend
+            .write_features(&tid, &thid, &features)
+            .await
+            .unwrap();
+
+        let cls: Vec<Vec<crate::pipeline::classify::ContentClassMatch>> =
+            vec![vec![crate::pipeline::classify::ContentClassMatch {
+                class: crate::pipeline::classify::ContentClass::EmailAddress,
+                method: crate::pipeline::classify::DetectionMethod::Regex,
+                sensitivity: crate::pipeline::classify::Sensitivity::Medium,
+                action: crate::pipeline::classify::Action::ScrubReplace,
+                matcher_id: "regex:email_v1".into(),
+                address: crate::pipeline::classify::MatchAddress::BatchComponent {
+                    index: 0,
+                    json_path: Some("$.task_description".into()),
+                },
+                span: Some((0, 16)),
+                confidence: 1.0,
+                learning: None,
+                secret_uuid: None,
+            }]];
+        backend
+            .write_classifications(&tid, &thid, &cls)
+            .await
+            .unwrap();
+
+        let f_read = backend
+            .read_features(&tid, &thid)
+            .await
+            .unwrap()
+            .expect("features present");
+        assert_eq!(
+            f_read.declared.deployment_domain.as_deref(),
+            Some("moderation")
+        );
+        let c_read = backend.read_classifications(&tid, &thid).await.unwrap();
+        assert_eq!(c_read.len(), 1);
+        assert_eq!(c_read[0][0].matcher_id, "regex:email_v1");
+    }
+
+    /// v1.5.8 (CIRISPersist#57) — write_classifications on a missing
+    /// (trace_id, thought_id) is a no-op (UPDATE affects 0 rows),
+    /// returns Ok(()). Caller contract: "set this if the row exists."
+    #[cfg(feature = "classify")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pipeline_write_classifications_missing_row_is_noop() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let cls: Vec<Vec<crate::pipeline::classify::ContentClassMatch>> = vec![];
+        let tid = format!("tr-missing-{}", uuid_like());
+        let thid = format!("th-{tid}");
+        backend
+            .write_classifications(&tid, &thid, &cls)
+            .await
+            .unwrap();
+        let got = backend.read_classifications(&tid, &thid).await.unwrap();
+        assert!(got.is_empty());
     }
 
     /// v0.7.4 (CIRISPersist#19) — `Backend::update_features_batch`

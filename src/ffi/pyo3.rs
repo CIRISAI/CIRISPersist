@@ -4209,11 +4209,21 @@ impl PyEngine {
                     })
                 }
                 #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(_) => Err(PyRuntimeError::new_err(
-                    "get_features: pipeline-read primitives are Postgres-only (v0.6.0 FSD); \
-                     SQLite backends should query their PG counterpart for observability or \
-                     wait for the sovereign-mode v0.6.x track",
-                )),
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        let opt = backend
+                            .read_features(&trace_id, &thought_id)
+                            .await
+                            .map_err(|e| PyRuntimeError::new_err(format!("read_features: {e}")))?;
+                        match opt {
+                            None => Ok(None),
+                            Some(f) => Ok(Some(serde_json::to_string(&f).map_err(|e| {
+                                PyRuntimeError::new_err(format!("Features encode: {e}"))
+                            })?)),
+                        }
+                    })
+                }
             })
         })
     }
@@ -4252,11 +4262,123 @@ impl PyEngine {
                     })
                 }
                 #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(_) => Err(PyRuntimeError::new_err(
-                    "get_classifications: pipeline-read primitives are Postgres-only \
-                     (v0.6.0 FSD); SQLite backends should query their PG counterpart for \
-                     observability or wait for the sovereign-mode v0.6.x track",
-                )),
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        let cls = backend
+                            .read_classifications(&trace_id, &thought_id)
+                            .await
+                            .map_err(|e| {
+                                PyRuntimeError::new_err(format!("read_classifications: {e}"))
+                            })?;
+                        serde_json::to_string(&cls).map_err(|e| {
+                            PyRuntimeError::new_err(format!("classifications encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.8 (CIRISPersist#57) — write typed Features for a
+    /// `(trace_id, thought_id)` pair into the V009 / V023
+    /// `extracted_features` column.
+    ///
+    /// `features_json` is the JSON-encoded `Features` shape (round-trip
+    /// safe with `get_features`'s return value). Caller contract: "set
+    /// this if the row exists." No-op when no `trace_events` row matches
+    /// — matches the pipeline classify-stage UPDATE semantics.
+    #[cfg(feature = "extract")]
+    fn set_features(
+        &self,
+        py: Python<'_>,
+        trace_id: &str,
+        thought_id: &str,
+        features_json: &str,
+    ) -> PyResult<()> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let trace_id = trace_id.to_owned();
+            let thought_id = thought_id.to_owned();
+            let features: crate::pipeline::extract::Features = serde_json::from_str(features_json)
+                .map_err(|e| PyValueError::new_err(format!("Features JSON decode: {e}")))?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        backend
+                            .write_features(&trace_id, &thought_id, &features)
+                            .await
+                            .map_err(|e| PyRuntimeError::new_err(format!("write_features: {e}")))?;
+                        Ok::<_, PyErr>(())
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        backend
+                            .write_features(&trace_id, &thought_id, &features)
+                            .await
+                            .map_err(|e| PyRuntimeError::new_err(format!("write_features: {e}")))?;
+                        Ok::<_, PyErr>(())
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.8 (CIRISPersist#57) — write per-component classification
+    /// matches for a `(trace_id, thought_id)` pair into the V009 / V023
+    /// `classifications` column.
+    ///
+    /// `classifications_json` is the JSON-encoded
+    /// `Vec<Vec<ContentClassMatch>>` shape (round-trip safe with
+    /// `get_classifications`'s return value). Caller contract: "set
+    /// this if the row exists." No-op when no `trace_events` row matches
+    /// — matches the pipeline classify-stage UPDATE semantics.
+    #[cfg(feature = "classify")]
+    fn set_classifications(
+        &self,
+        py: Python<'_>,
+        trace_id: &str,
+        thought_id: &str,
+        classifications_json: &str,
+    ) -> PyResult<()> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let trace_id = trace_id.to_owned();
+            let thought_id = thought_id.to_owned();
+            let classifications: Vec<Vec<crate::pipeline::classify::ContentClassMatch>> =
+                serde_json::from_str(classifications_json).map_err(|e| {
+                    PyValueError::new_err(format!("classifications JSON decode: {e}"))
+                })?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        backend
+                            .write_classifications(&trace_id, &thought_id, &classifications)
+                            .await
+                            .map_err(|e| {
+                                PyRuntimeError::new_err(format!("write_classifications: {e}"))
+                            })?;
+                        Ok::<_, PyErr>(())
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        backend
+                            .write_classifications(&trace_id, &thought_id, &classifications)
+                            .await
+                            .map_err(|e| {
+                                PyRuntimeError::new_err(format!("write_classifications: {e}"))
+                            })?;
+                        Ok::<_, PyErr>(())
+                    })
+                }
             })
         })
     }
