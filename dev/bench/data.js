@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779117112628,
+  "lastUpdate": 1779118160100,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -17111,6 +17111,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23758345,
             "range": "± 653251",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "5a49c067adc2c0596718cc194116e5dc2c7435b0",
+          "message": "1.5.11 — service_correlations substrate (CIRISPersist#59 #3 of 11)\n\nHot-path substrate (400+ rows on active agent). Dual-purpose schema\nabsorbs service-interaction + TSDB metrics + distributed-trace spans\n+ log correlations into one table. Caller discriminates via\ncorrelation_type column.\n\nV026 migration on both backends. 18 columns. 5 indexes including\nmetric-name + trace-id + span-tree partial indexes. 3 CHECK constraints\non status / correlation_type / retention_policy.\n\nCorrelationService trait (4 methods):\n- record_correlation (INSERT-OR-IGNORE; first writer wins;\n  state advancement via update_correlation_status)\n- get_correlation\n- update_correlation_status (response_data COALESCE; missing=false)\n- query_correlations (filter by service_type/correlation_type/\n  trace_id/metric_name/retention_policy/occurrence + event-timestamp\n  window + row-update window; cursor pagination)\n\nPyO3: 4 new Engine methods gated on cirislens_correlations feature.\n\n30 new tests (1 mod + 8 types + 9 PG live + 12 SQLite). Lib suite:\n355 pass. All 18 columns round-trip; idempotent record; TSDB hot\npath; distributed-trace assembly; cursor pagination; CHECK guards.\n\nBackend-trait collision recurred — Phase-3 stub\nBackend::record_correlation(&ServiceCorrelation) (legacy redb-era\nshape) collides with new CorrelationService::record_correlation(\nCorrelation). UFCS dispatch at PG call sites.\n\nVocabulary disclaimer: status / correlation_type / retention_policy\nvalues came from spec, not from agent v2.8.13 source. Recommend\nsanity grep against ciris_engine/schemas/runtime/enums.py once\nagent integration PR is in flight; V027 can relax CHECK if needed.\n\nrecord_correlation ON CONFLICT DO NOTHING semantics may need\nrevisiting if agent's retry path re-records with richer payloads.\nDocumented decision; revisit after integration.\n\nREAL handling: PG f32 cast up to f64 at trait boundary to match\nSQLite's f64 REAL semantic. Lossy for values outside f32 range\nbut matches agent's existing column declaration.\n\n8 substrates remain: scheduled_tasks (v1.5.12), tickets, deferral_\nreports, consolidation_locks, creation_ceremonies, continuity_\nawareness, feedback_mappings, wa_cert.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-18T10:20:49-05:00",
+          "tree_id": "b83975528b33969bd1036458dc2cf24ebfeb0bbb",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/5a49c067adc2c0596718cc194116e5dc2c7435b0"
+        },
+        "date": 1779118158897,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 111252,
+            "range": "± 1084",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 251275,
+            "range": "± 3816",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 530854,
+            "range": "± 2117",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1852953,
+            "range": "± 17149",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 341,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1415,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7535,
+            "range": "± 213",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21177,
+            "range": "± 117",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24218,
+            "range": "± 63",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83640,
+            "range": "± 142",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 365,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3182,
+            "range": "± 17",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9781,
+            "range": "± 169",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41568,
+            "range": "± 189",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2237840,
+            "range": "± 122116",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6615018,
+            "range": "± 145003",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23693142,
+            "range": "± 152673",
             "unit": "ns/iter"
           }
         ]
