@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "1.5.12"
+version = "1.5.13"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -199,6 +199,24 @@ cirislens_correlations = []
 # immediate). PG: JSONB deferral_history + TIMESTAMPTZ; SQLite:
 # TEXT JSON. Threat model AV-15.
 cirislens_scheduled_tasks = []
+
+# v1.5.13 (CIRISPersist#59 #5) — agent tickets substrate. Fifth of
+# 11 substrate absorptions. Absorbs the agent's `tickets` table —
+# work items routed by SOP, status, and assignee. UPSERT on
+# ticket_id (preserves created_at + submitted_at on conflict),
+# atomic `assign_ticket` (sets user_identifier + advances status to
+# assigned/in_progress), focused `update_ticket_status` (terminal-
+# state transitions carry caller-supplied completed_at), cursor-
+# paged `list_tickets` with filters for sop/type/status/email/
+# automated/deadline_before. 17 columns. Status vocabulary is
+# LOWERCASE 8-value (`pending/assigned/in_progress/blocked/
+# deferred/completed/cancelled/failed`) — distinct from
+# scheduled_tasks UPPERCASE 4-value and partially overlapping with
+# `tasks` 6-value. Priority 1-10 (default 5). No FKs.
+# agent_occurrence_id default `'__shared__'` (cross-occurrence
+# work). PG: JSONB metadata + TIMESTAMPTZ + BOOLEAN automated;
+# SQLite: TEXT JSON + INTEGER booleans. Threat model AV-15.
+cirislens_tickets = []
 
 # v0.1.3 — optional TLS for the Postgres connection pool. Defaults
 # to no-TLS (deployments where the lens process and Postgres are

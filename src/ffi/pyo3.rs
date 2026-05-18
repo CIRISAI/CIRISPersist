@@ -139,7 +139,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "tasks_not_found"
         | "thoughts_not_found"
         | "correlations_not_found"
-        | "scheduled_tasks_not_found" => NotFound::new_err(msg),
+        | "scheduled_tasks_not_found"
+        | "tickets_not_found" => NotFound::new_err(msg),
 
         // Conflict family — uniqueness / version / state-transition
         // conflict; caller MUST NOT retry, MUST re-read.
@@ -151,7 +152,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "tasks_conflict"
         | "thoughts_conflict"
         | "correlations_conflict"
-        | "scheduled_tasks_conflict" => Conflict::new_err(msg),
+        | "scheduled_tasks_conflict"
+        | "tickets_conflict" => Conflict::new_err(msg),
 
         // Transient family — backend connection / timeout / pool
         // exhaustion; caller MAY retry with backoff.
@@ -165,7 +167,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "tasks_backend"
         | "thoughts_backend"
         | "correlations_backend"
-        | "scheduled_tasks_backend" => Transient::new_err(msg),
+        | "scheduled_tasks_backend"
+        | "tickets_backend" => Transient::new_err(msg),
 
         // Default — Permanent. Covers invalid arguments, signature
         // failures, crypto errors, rotation conflicts, "not authorized,"
@@ -9064,6 +9067,288 @@ impl PyEngine {
                                 deferral_count,
                                 deferral_history,
                                 new_status_parsed,
+                            )
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    // ── v1.5.13 (CIRISPersist#59 #5) tickets PyO3 surface ───────
+    //
+    // 5 methods wrapping TicketService. JSON wire format mirrors
+    // the tasks/thoughts/correlations/scheduled_tasks substrate
+    // patterns: Ticket struct decoded/encoded via serde at the FFI
+    // boundary. Status vocabulary is LOWERCASE 8-value with
+    // snake_case `in_progress`; serde wire format matches the SQL
+    // string directly so callers send `"pending"` / `"in_progress"`
+    // etc. in JSON.
+
+    /// v1.5.13 — Upsert a ticket. INSERT on first call, UPDATE on
+    /// conflict by `ticket_id`. All columns except `created_at` and
+    /// `submitted_at` overwrite on conflict; both creation-time
+    /// columns are preserved.
+    #[cfg(feature = "cirislens_tickets")]
+    fn ticket_upsert(&self, py: Python<'_>, ticket_json: &str) -> PyResult<()> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let ticket: crate::tickets::Ticket = serde_json::from_str(ticket_json)
+                .map_err(|e| PyValueError::new_err(format!("Ticket decode: {e}")))?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        crate::tickets::TicketService::upsert_ticket(&*backend, ticket)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::tickets::sqlite::SqliteTicketBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::tickets::TicketService;
+                        backend
+                            .upsert_ticket(ticket)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.13 — Point lookup. Returns JSON-encoded `Ticket` or
+    /// `None` (Python `None`) when no matching row.
+    #[cfg(feature = "cirislens_tickets")]
+    fn ticket_get(&self, py: Python<'_>, ticket_id: &str) -> PyResult<Option<String>> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let ticket_id = ticket_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::tickets::TicketService;
+                        let got = backend
+                            .get_ticket(&ticket_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match got {
+                            None => Ok(None),
+                            Some(t) => serde_json::to_string(&t).map(Some).map_err(|e| {
+                                PyRuntimeError::new_err(format!("Ticket encode: {e}"))
+                            }),
+                        }
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::tickets::sqlite::SqliteTicketBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::tickets::TicketService;
+                        let got = backend
+                            .get_ticket(&ticket_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match got {
+                            None => Ok(None),
+                            Some(t) => serde_json::to_string(&t).map(Some).map_err(|e| {
+                                PyRuntimeError::new_err(format!("Ticket encode: {e}"))
+                            }),
+                        }
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.13 — Cursor-paged list. `filter_json` is a JSON-encoded
+    /// `TicketFilter`; `cursor_json` (optional) is a JSON-encoded
+    /// `TicketCursor` from the previous page's `next_cursor`.
+    /// Returns JSON-encoded `TicketListPage` (`{"items": [...],
+    /// "next_cursor": {...}|None}`).
+    #[cfg(feature = "cirislens_tickets")]
+    #[pyo3(signature = (filter_json, cursor_json, limit))]
+    fn ticket_list(
+        &self,
+        py: Python<'_>,
+        filter_json: &str,
+        cursor_json: Option<&str>,
+        limit: i64,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let filter: crate::tickets::TicketFilter = serde_json::from_str(filter_json)
+                .map_err(|e| PyValueError::new_err(format!("TicketFilter decode: {e}")))?;
+            let cursor: Option<crate::tickets::TicketCursor> = match cursor_json {
+                None => None,
+                Some(s) => Some(
+                    serde_json::from_str(s)
+                        .map_err(|e| PyValueError::new_err(format!("TicketCursor decode: {e}")))?,
+                ),
+            };
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::tickets::TicketService;
+                        let page = backend
+                            .list_tickets(filter, cursor, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&page).map_err(|e| {
+                            PyRuntimeError::new_err(format!("TicketListPage encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::tickets::sqlite::SqliteTicketBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::tickets::TicketService;
+                        let page = backend
+                            .list_tickets(filter, cursor, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&page).map_err(|e| {
+                            PyRuntimeError::new_err(format!("TicketListPage encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.13 — Atomic assignment + status flip. Sets
+    /// `user_identifier` to the supplied value, advances `status`
+    /// (default `assigned`, or caller-supplied — `new_status` is
+    /// the lowercase snake_case wire format), bumps `last_updated`.
+    /// Idempotent on `(ticket_id, user_identifier)`. Returns True
+    /// when the ticket exists, False when no matching row.
+    #[cfg(feature = "cirislens_tickets")]
+    #[pyo3(signature = (ticket_id, user_identifier, new_status=None))]
+    fn ticket_assign(
+        &self,
+        py: Python<'_>,
+        ticket_id: &str,
+        user_identifier: &str,
+        new_status: Option<&str>,
+    ) -> PyResult<bool> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let new_status_parsed: Option<crate::tickets::TicketStatus> = match new_status {
+                None => None,
+                Some(s) => {
+                    Some(crate::tickets::TicketStatus::parse_str(s).ok_or_else(|| {
+                        PyValueError::new_err(format!("unknown TicketStatus: {s}"))
+                    })?)
+                }
+            };
+            let ticket_id_owned = ticket_id.to_owned();
+            let user_identifier_owned = user_identifier.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::tickets::TicketService;
+                        backend
+                            .assign_ticket(
+                                &ticket_id_owned,
+                                &user_identifier_owned,
+                                new_status_parsed,
+                            )
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::tickets::sqlite::SqliteTicketBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::tickets::TicketService;
+                        backend
+                            .assign_ticket(
+                                &ticket_id_owned,
+                                &user_identifier_owned,
+                                new_status_parsed,
+                            )
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.13 — Focused status update. `new_status` is the
+    /// lowercase snake_case wire format. Optional
+    /// `completed_at_iso` (RFC 3339) — on terminal-state
+    /// transitions (`completed`/`cancelled`/`failed`) the caller
+    /// supplies the timestamp; the trait doesn't enforce.
+    /// Optional `notes` overwrites the existing value when
+    /// supplied. Bumps `last_updated` to NOW. Returns True when a
+    /// row was updated, False when no matching ticket.
+    #[cfg(feature = "cirislens_tickets")]
+    #[pyo3(signature = (ticket_id, new_status, completed_at_iso=None, notes=None))]
+    fn ticket_update_status(
+        &self,
+        py: Python<'_>,
+        ticket_id: &str,
+        new_status: &str,
+        completed_at_iso: Option<&str>,
+        notes: Option<&str>,
+    ) -> PyResult<bool> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let new_status_parsed = crate::tickets::TicketStatus::parse_str(new_status)
+                .ok_or_else(|| {
+                    PyValueError::new_err(format!("unknown TicketStatus: {new_status}"))
+                })?;
+            let completed_at: Option<chrono::DateTime<chrono::Utc>> = match completed_at_iso {
+                None => None,
+                Some(s) => Some(
+                    chrono::DateTime::parse_from_rfc3339(s)
+                        .map_err(|e| PyValueError::new_err(format!("completed_at_iso parse: {e}")))?
+                        .with_timezone(&chrono::Utc),
+                ),
+            };
+            let ticket_id_owned = ticket_id.to_owned();
+            let notes_owned = notes.map(|s| s.to_owned());
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::tickets::TicketService;
+                        backend
+                            .update_ticket_status(
+                                &ticket_id_owned,
+                                new_status_parsed,
+                                completed_at,
+                                notes_owned,
+                            )
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::tickets::sqlite::SqliteTicketBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::tickets::TicketService;
+                        backend
+                            .update_ticket_status(
+                                &ticket_id_owned,
+                                new_status_parsed,
+                                completed_at,
+                                notes_owned,
                             )
                             .await
                             .map_err(|e| translate_error_kind(e.kind(), e.to_string()))

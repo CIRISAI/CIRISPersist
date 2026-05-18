@@ -437,6 +437,83 @@ class Engine:
         matching task exists (no error — caller treats as stale id).
         """
 
+    # ── v1.5.13 (CIRISPersist#59 #5) — tickets substrate
+
+    def ticket_upsert(self, ticket_json: str) -> None:
+        """v1.5.13 — Upsert a ticket. ``ticket_json`` is a
+        JSON-encoded ``Ticket`` (see the ``ciris_persist.tickets``
+        module). INSERT on first call, UPDATE on conflict by
+        ``ticket_id``. All columns except ``created_at`` and
+        ``submitted_at`` overwrite on conflict; both creation-time
+        columns are preserved.
+
+        Note: the ``status`` field on the wire is lowercase
+        snake_case 8-value (``"pending"`` / ``"assigned"`` /
+        ``"in_progress"`` / ``"blocked"`` / ``"deferred"`` /
+        ``"completed"`` / ``"cancelled"`` / ``"failed"``) — matches
+        the SQL CHECK vocabulary directly. ``priority`` is 1-10
+        (default 5). ``agent_occurrence_id`` default is
+        ``"__shared__"`` (cross-occurrence work items).
+        """
+
+    def ticket_get(self, ticket_id: str) -> str | None:
+        """v1.5.13 — Point lookup. Returns JSON-encoded ``Ticket`` or
+        ``None`` when no matching row."""
+
+    def ticket_list(
+        self,
+        filter_json: str,
+        cursor_json: str | None,
+        limit: int,
+    ) -> str:
+        """v1.5.13 — Cursor-paged query. Returns JSON-encoded
+        ``TicketListPage`` (``{"items": [...], "next_cursor":
+        {...}|None}``). The filter shape mirrors ``TicketFilter`` —
+        supported fields: ``sop``, ``ticket_type``, ``status``,
+        ``email``, ``agent_occurrence_id``, ``automated``,
+        ``deadline_before`` (due-deadline scan; only tickets with a
+        non-NULL deadline at or before this timestamp),
+        ``last_updated_after`` / ``last_updated_before``
+        (row-update window). Cursor pagination on
+        ``(last_updated, ticket_id)``, newest-first.
+        """
+
+    def ticket_assign(
+        self,
+        ticket_id: str,
+        user_identifier: str,
+        new_status: str | None = None,
+    ) -> bool:
+        """v1.5.13 — Atomic assignment + status flip. Sets
+        ``user_identifier`` to the supplied value, advances
+        ``status`` (default ``assigned``, or caller-supplied via
+        ``new_status`` — lowercase snake_case wire format), bumps
+        ``last_updated`` to NOW. Idempotent on ``(ticket_id,
+        user_identifier)``: re-assigning the same ticket to the same
+        user is a no-op (returns True; the row is already in the
+        assigned state). Returns ``False`` when no matching ticket.
+        """
+
+    def ticket_update_status(
+        self,
+        ticket_id: str,
+        new_status: str,
+        completed_at_iso: str | None = None,
+        notes: str | None = None,
+    ) -> bool:
+        """v1.5.13 — Focused status update. ``new_status`` is the
+        lowercase snake_case wire format. Optional
+        ``completed_at_iso`` (RFC 3339) — on terminal-state
+        transitions (``completed`` / ``cancelled`` / ``failed``)
+        the caller supplies the timestamp; the trait doesn't enforce.
+        Optional ``notes`` overwrites the existing value when
+        supplied (``None`` preserves the existing value). Bumps
+        ``last_updated`` to NOW.
+
+        Returns ``True`` when a row was updated, ``False`` when no
+        matching ticket (no error — callers treat as stale id).
+        """
+
     def trust_grant_consistency_proof(
         self,
         tenant_id: str,

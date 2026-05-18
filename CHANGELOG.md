@@ -5,6 +5,84 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.5.13] — 2026-05-18
+
+**`tickets` substrate — 5 of 11 (CIRISPersist#59 #5).**
+
+V028 migration on both backends. 17 columns. SOP/email-bound
+substrate; lighter shape than tasks/thoughts (no FKs except a
+free-form `correlation_id` pointer). Status vocabulary: 8-value
+lowercase incl. `in_progress` (mixed snake_case;
+`#[serde(rename_all = "snake_case")]` keeps JSON wire = SQL string).
+Priority CHECK 1-10 with default 5.
+
+`agent_occurrence_id` default is **`'__shared__'`** (sentinel for
+cross-occurrence tickets; distinct from every prior substrate's
+`'default'`).
+
+4 indexes:
+- `(agent_occurrence_id, sop, status, last_updated DESC)`
+- `(email, last_updated DESC)`
+- `(status, deadline ASC) WHERE status NOT IN ('completed','cancelled','failed')`
+  — due-deadline scans
+- `(correlation_id) WHERE NOT NULL`
+
+### TicketService trait (5 methods)
+
+- `upsert_ticket` — ON CONFLICT DO UPDATE; preserves `created_at` +
+  `submitted_at`
+- `get_ticket`
+- `list_tickets` — filter by sop / type / status / email / occurrence
+  / automated / deadline_before / last_updated window; cursor pagination
+- `assign_ticket(id, user, new_status?)` — atomic assign + optional
+  status flip; idempotent on re-assign to same user; missing-row=false
+- `update_ticket_status(id, new_status, completed_at?, notes?)` —
+  terminal states (`completed`/`cancelled`/`failed`) carry `completed_at`
+
+### PyO3 surface
+
+5 new Engine methods gated on `cirislens_tickets` feature.
+
+### Tests
+
+26 new (1 mod + 8 types + 8 PG live + 9 SQLite):
+- All 17 columns round-trip
+- Idempotent upsert preserves created_at + submitted_at
+- Status CHECK rejects unknown values; priority CHECK rejects 0/11
+- Filter by sop / status / email / automated / deadline_before
+- Cursor pagination
+- Assign success + missing + reassign no-op
+- Status update success + missing + terminal-with-completed_at
+- `in_progress` snake_case round-trips through both SQL and JSON
+
+Lib suite: 302 pass with full substrate feature set.
+
+### No Backend-trait collision
+
+`upsert_ticket` / `get_ticket` / `list_tickets` / `assign_ticket` /
+`update_ticket_status` are unique across the codebase. Method-call
+dispatch suffices.
+
+### Surprises
+
+- **Nanosecond drift on PG TIMESTAMPTZ**: PG stores microsecond
+  precision; `chrono::Utc::now()` produces nanoseconds. Fixed via
+  same-second drift assertion (≤1s tolerance), matching how
+  v1.5.12 scheduled_tasks tests handle this.
+- **`'__shared__'` occurrence sentinel** is distinct from every
+  prior substrate (`tasks`/`thoughts`/`correlations`/`scheduled_tasks`
+  default to `'default'`). Codified in `default_occurrence()` helper
+  and a regression test.
+- **`TicketStatus::is_terminal()`** helper exposes the
+  `{completed, cancelled, failed}` set for callers that need to
+  branch on terminal state.
+
+### Remaining 6 substrates
+
+`deferral_reports` (v1.5.14), `consolidation_locks` (v1.5.15),
+`creation_ceremonies` (v1.5.16), `continuity_awareness` (v1.5.17),
+`feedback_mappings` (v1.5.18), `wa_cert` (v1.5.19).
+
 ## [1.5.12] — 2026-05-18
 
 **`scheduled_tasks` substrate — 4 of 11 (CIRISPersist#59 #4).**
