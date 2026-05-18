@@ -52,6 +52,8 @@ pub mod deferral_reports;
 pub mod derived;
 pub mod engine;
 pub mod federation;
+#[cfg(feature = "cirislens_feedback_mappings")]
+pub mod feedback_mappings;
 pub mod ffi;
 #[cfg(feature = "cirisgraph")]
 pub mod graph;

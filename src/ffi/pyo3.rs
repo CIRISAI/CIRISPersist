@@ -144,7 +144,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "deferral_reports_not_found"
         | "maintenance_locks_not_found"
         | "creation_ceremonies_not_found"
-        | "continuity_awareness_not_found" => NotFound::new_err(msg),
+        | "continuity_awareness_not_found"
+        | "feedback_mappings_not_found" => NotFound::new_err(msg),
 
         // Conflict family — uniqueness / version / state-transition
         // conflict; caller MUST NOT retry, MUST re-read.
@@ -161,7 +162,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "deferral_reports_conflict"
         | "maintenance_locks_conflict"
         | "creation_ceremonies_conflict"
-        | "continuity_awareness_conflict" => Conflict::new_err(msg),
+        | "continuity_awareness_conflict"
+        | "feedback_mappings_conflict" => Conflict::new_err(msg),
 
         // Transient family — backend connection / timeout / pool
         // exhaustion; caller MAY retry with backoff.
@@ -180,7 +182,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "deferral_reports_backend"
         | "maintenance_locks_backend"
         | "creation_ceremonies_backend"
-        | "continuity_awareness_backend" => Transient::new_err(msg),
+        | "continuity_awareness_backend"
+        | "feedback_mappings_backend" => Transient::new_err(msg),
 
         // Default — Permanent. Covers invalid arguments, signature
         // failures, crypto errors, rotation conflicts, "not authorized,"
@@ -10131,6 +10134,166 @@ impl PyEngine {
         })
     }
 
+    // ── v1.5.18 (CIRISPersist#59 #10) — feedback_mappings cluster ──
+    //
+    // 3 methods wrapping FeedbackMappingService. JSON wire format
+    // mirrors the deferral_reports / creation_ceremonies / continuity
+    // pattern: FeedbackMapping struct decoded/encoded via serde at
+    // the FFI boundary. `feedback_record` returns a JSON-encoded
+    // ClaimResult (`{"outcome": "stored" | "already_claimed",
+    // "feedback": <FeedbackMapping>}`).
+
+    /// v1.5.18 — Record a feedback row. INSERT ON CONFLICT
+    /// (feedback_id) DO NOTHING — write-once shape. Returns a
+    /// JSON-encoded ClaimResult shape: `{"outcome": "stored" |
+    /// "already_claimed", "feedback": <FeedbackMapping>}`. The race
+    /// winner sees `"stored"` and their own row; race losers see
+    /// `"already_claimed"` and the EXISTING row.
+    ///
+    /// FK semantics: when `target_thought_id` is non-NULL the
+    /// referenced thought MUST exist in `cirislens.thoughts`
+    /// (PG: `cirislens.thoughts`; SQLite: `cirislens_thoughts`).
+    /// Missing parent surfaces as `Conflict`. NULL `target_thought_id`
+    /// bypasses the FK on both backends.
+    #[cfg(feature = "cirislens_feedback_mappings")]
+    fn feedback_record(&self, py: Python<'_>, feedback_json: &str) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let feedback: crate::feedback_mappings::FeedbackMapping =
+                serde_json::from_str(feedback_json)
+                    .map_err(|e| PyValueError::new_err(format!("FeedbackMapping decode: {e}")))?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::feedback_mappings::FeedbackMappingService;
+                        let outcome = backend
+                            .record_feedback(feedback)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        encode_feedback_claim_result(outcome).map_err(|e| {
+                            PyRuntimeError::new_err(format!("ClaimResult encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::feedback_mappings::sqlite::SqliteFeedbackMappingBackend::new(
+                            sq.conn_handle(),
+                        );
+                    runtime.block_on(async move {
+                        use crate::feedback_mappings::FeedbackMappingService;
+                        let outcome = backend
+                            .record_feedback(feedback)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        encode_feedback_claim_result(outcome).map_err(|e| {
+                            PyRuntimeError::new_err(format!("ClaimResult encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.18 — List feedback rows attached to a specific thought.
+    /// Ordered `created_at DESC`. Returns JSON-encoded
+    /// `Vec<FeedbackMapping>`. Hits the partial index
+    /// `feedback_mappings_thought`.
+    #[cfg(feature = "cirislens_feedback_mappings")]
+    fn feedback_list_for_thought(
+        &self,
+        py: Python<'_>,
+        thought_id: &str,
+        limit: i64,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let thought_id = thought_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::feedback_mappings::FeedbackMappingService;
+                        let items = backend
+                            .list_feedback_for_thought(&thought_id, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&items).map_err(|e| {
+                            PyRuntimeError::new_err(format!("FeedbackMapping list encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::feedback_mappings::sqlite::SqliteFeedbackMappingBackend::new(
+                            sq.conn_handle(),
+                        );
+                    runtime.block_on(async move {
+                        use crate::feedback_mappings::FeedbackMappingService;
+                        let items = backend
+                            .list_feedback_for_thought(&thought_id, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&items).map_err(|e| {
+                            PyRuntimeError::new_err(format!("FeedbackMapping list encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.18 — Filter query for feedback rows. `filter_json` is a
+    /// JSON-encoded `FeedbackFilter` — supported fields:
+    /// `source_message_id`, `feedback_type`, `created_after`,
+    /// `created_before` (RFC 3339 timestamps for the time window).
+    /// Returns JSON-encoded `Vec<FeedbackMapping>`, ordered DESC by
+    /// `created_at`.
+    #[cfg(feature = "cirislens_feedback_mappings")]
+    fn feedback_list(&self, py: Python<'_>, filter_json: &str, limit: i64) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let filter: crate::feedback_mappings::FeedbackFilter =
+                serde_json::from_str(filter_json)
+                    .map_err(|e| PyValueError::new_err(format!("FeedbackFilter decode: {e}")))?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::feedback_mappings::FeedbackMappingService;
+                        let items = backend
+                            .list_feedback(filter, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&items).map_err(|e| {
+                            PyRuntimeError::new_err(format!("FeedbackMapping list encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::feedback_mappings::sqlite::SqliteFeedbackMappingBackend::new(
+                            sq.conn_handle(),
+                        );
+                    runtime.block_on(async move {
+                        use crate::feedback_mappings::FeedbackMappingService;
+                        let items = backend
+                            .list_feedback(filter, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&items).map_err(|e| {
+                            PyRuntimeError::new_err(format!("FeedbackMapping list encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
     // ── v1.2.0 (CIRISPersist#48) maintenance cluster ─────────────
     //
     // Absorbs the operations side of CIRISAgent's
@@ -10415,6 +10578,28 @@ fn encode_continuity_claim_result(
     let wire = serde_json::json!({
         "outcome": label,
         "record": record,
+    });
+    serde_json::to_string(&wire)
+}
+
+/// v1.5.18 (CIRISPersist#59 #10) — encode a
+/// [`ClaimResult<FeedbackMapping>`] onto the
+/// `{"outcome": "stored" | "already_claimed", "feedback":
+/// <FeedbackMapping>}` JSON wire shape. Same template as the
+/// tasks / deferral / ceremony / continuity helpers — keyed
+/// `"feedback"` because the substrate's row shape is named
+/// [`FeedbackMapping`].
+#[cfg(feature = "cirislens_feedback_mappings")]
+fn encode_feedback_claim_result(
+    outcome: crate::ClaimResult<crate::feedback_mappings::FeedbackMapping>,
+) -> Result<String, serde_json::Error> {
+    let (label, feedback) = match outcome {
+        crate::ClaimResult::Stored(f) => ("stored", f),
+        crate::ClaimResult::AlreadyClaimed(f) => ("already_claimed", f),
+    };
+    let wire = serde_json::json!({
+        "outcome": label,
+        "feedback": feedback,
     });
     serde_json::to_string(&wire)
 }

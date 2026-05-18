@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "1.5.17"
+version = "1.5.18"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -292,6 +292,29 @@ cirislens_creation_ceremonies = []
 # (LOCAL/IDENTITY/ENVIRONMENT/COMMUNITY). reactivation_count CHECK
 # (>= 0). Threat model AV-15.
 cirislens_continuity_awareness = ["cirisgraph"]
+
+# v1.5.18 (CIRISPersist#59 #10) — agent feedback_mappings substrate.
+# Tenth of 11 substrate absorptions. Absorbs the agent's
+# `feedback_mappings` table — the link between an inbound feedback
+# wire-message (typically a Discord message id) and the thought the
+# agent resolved against it. 5 columns matching agent verbatim.
+# target_thought_id is nullable; FK to cirislens.thoughts(thought_id)
+# / cirislens_thoughts(thought_id) fires only for non-NULL values
+# (both PG and SQLite handle nullable FKs natively).
+#
+# Design call: shipped as a dedicated substrate rather than folded
+# into cirisgraph_edges. feedback rides on a typed-substrate FK
+# (thoughts), NOT a graph_nodes FK; cirisgraph_edges expects
+# (source_node_id, target_node_id) both pointing at graph_nodes,
+# which doesn't fit the agent's table semantics.
+#
+# Trait: record_feedback (INSERT...ON CONFLICT (feedback_id) DO
+# NOTHING → readback, ClaimResult), list_feedback_for_thought
+# (DESC by created_at), list_feedback (filter by source_message_id,
+# feedback_type, time window). No JSON columns; created_at on PG is
+# TIMESTAMPTZ with NOW() default, on SQLite is TEXT with
+# datetime('now', 'subsec') default. Threat model AV-15.
+cirislens_feedback_mappings = ["cirislens_thoughts"]
 
 # v0.1.3 — optional TLS for the Postgres connection pool. Defaults
 # to no-TLS (deployments where the lens process and Postgres are

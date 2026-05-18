@@ -702,6 +702,47 @@ class Engine:
         (callers treat as "nothing to reactivate" — not an error).
         """
 
+    # ── v1.5.18 (CIRISPersist#59 #10) — feedback_mappings substrate
+
+    def feedback_record(self, feedback_json: str) -> str:
+        """v1.5.18 — Record a feedback row. ``feedback_json`` is a
+        JSON-encoded ``FeedbackMapping`` with 5 fields:
+        ``feedback_id`` (PK, required), ``source_message_id``
+        (optional wire-message id), ``target_thought_id`` (optional
+        FK to ``cirislens.thoughts``), ``feedback_type`` (free-form
+        string — agent uses ``approval`` / ``correction`` /
+        ``clarification``), ``created_at`` (RFC 3339 timestamp).
+        INSERT ON CONFLICT (feedback_id) DO NOTHING — write-once
+        shape.
+
+        FK semantics: when ``target_thought_id`` is non-NULL the
+        referenced thought MUST exist or the call returns
+        ``Conflict``. NULL ``target_thought_id`` bypasses the FK on
+        both backends.
+
+        Returns a JSON-encoded ClaimResult object:
+        ``{"outcome": "stored" | "already_claimed",
+          "feedback": <FeedbackMapping>}``.
+        The race winner sees ``"stored"`` and their own row; race
+        losers see ``"already_claimed"`` and the EXISTING row.
+        """
+
+    def feedback_list_for_thought(self, thought_id: str, limit: int) -> str:
+        """v1.5.18 — List feedback rows attached to a specific
+        thought. Ordered ``created_at DESC, feedback_id DESC``.
+        Returns JSON-encoded ``list[FeedbackMapping]``. Hits the
+        partial index ``feedback_mappings_thought``.
+        """
+
+    def feedback_list(self, filter_json: str, limit: int) -> str:
+        """v1.5.18 — Filter-query feedback rows. ``filter_json`` is a
+        JSON-encoded ``FeedbackFilter`` — supported fields:
+        ``source_message_id``, ``feedback_type``, ``created_after``,
+        ``created_before`` (RFC 3339 timestamps for the time
+        window). Returns JSON-encoded ``list[FeedbackMapping]``,
+        ordered DESC by ``created_at``.
+        """
+
     def trust_grant_consistency_proof(
         self,
         tenant_id: str,

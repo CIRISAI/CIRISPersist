@@ -5,6 +5,69 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.5.18] — 2026-05-18
+
+**`feedback_mappings` substrate — 10 of 11 (CIRISPersist#59 #10).**
+
+V033 migration on both backends. 5 columns. Light shape. Design
+decision: shipped as a **dedicated substrate**, NOT folded into
+cirisgraph_edges. Rationale: `target_thought_id` references
+cirislens_thoughts(thought_id), not graph_nodes; feedback rides on
+Discord-message-to-thought-resolution pairs that don't fit the
+node-to-node edge shape; folding would force representing thoughts as
+graph_nodes and double the write surface.
+
+Feature depends on `cirislens_thoughts` for the FK:
+
+```toml
+cirislens_feedback_mappings = ["cirislens_thoughts"]
+```
+
+3 partial indexes (all `WHERE column IS NOT NULL`):
+- `(target_thought_id)` — feedback-for-thought hot path
+- `(source_message_id)` — Discord-message lookups
+- `(feedback_type, created_at DESC)` — typed-feedback timeline
+
+### FeedbackMappingService trait (3 methods)
+
+- `record_feedback` → ClaimResult (ON CONFLICT DO NOTHING)
+- `list_feedback_for_thought(thought_id, limit)` — ORDER BY created_at DESC
+- `list_feedback(filter, limit)` — filter by source_message_id /
+  feedback_type / time window
+
+### Nullable FK passthrough
+
+Both backends handle NULL target_thought_id without firing the FK
+constraint. Test `null_target_thought_passes_fk` verifies clean Stored
+on PG (SQL standard) and SQLite (`PRAGMA foreign_keys=ON` doesn't fire
+on NULL columns). Non-NULL dangling reference returns
+`Error::Conflict` via extended-code 787 on SQLite, matching PG's
+`SqlState::FOREIGN_KEY_VIOLATION` mapping.
+
+### PyO3 surface
+
+3 new Engine methods gated on `cirislens_feedback_mappings`. Stable
+error kinds: `feedback_mappings_invalid_argument | _not_found |
+_conflict | _backend | _internal`.
+
+### Tests
+
+18 new (3 types + 1 mod kind + 7 PG + 7 SQLite):
+- All 5 columns round-trip
+- `record_feedback` ClaimResult: clean Stored + duplicate AlreadyClaimed
+- FK reject on non-NULL nonexistent target_thought_id (both backends)
+- FK passthrough on NULL target_thought_id (both backends)
+- `list_feedback_for_thought`: 3 rows pointing at one thought →
+  returns 3 ordered DESC by created_at
+- Filter by source_message_id / feedback_type / time window
+
+Lib suite: 343 pass.
+
+### Remaining 1 substrate
+
+`wa_cert` (v1.5.19) — the Wise-Authority cert directory, last
+substrate before #59 closes.
+
 ## [1.5.17] — 2026-05-18
 
 **`continuity_awareness` substrate — 9 of 11 (CIRISPersist#59 #9).**
