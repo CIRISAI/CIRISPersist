@@ -5,6 +5,89 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.5.12] — 2026-05-18
+
+**`scheduled_tasks` substrate — 4 of 11 (CIRISPersist#59 #4).**
+
+V027 migration. 15 columns. FK to `cirislens_thoughts(thought_id)` —
+DEFERRABLE on PG, immediate on SQLite. Status CHECK uses **UPPERCASE**
+vocabulary (`PENDING | ACTIVE | COMPLETE | FAILED`) per agent's
+schema — distinct from tasks' lowercase 6-value set.
+
+Three indexes:
+- `(agent_occurrence_id, next_trigger_at) WHERE next_trigger_at IS
+  NOT NULL AND status IN ('PENDING','ACTIVE')` — scheduler-tick hot path
+- `(agent_occurrence_id, status, created_at DESC)` — list-by-status
+- `(origin_thought_id)` — back-reference to triggering thought
+
+### ScheduledTaskService trait (3 methods)
+
+- `upsert_scheduled_task(task)` — ON CONFLICT (id) DO UPDATE on all
+  non-monotonic columns; preserves `created_at` across re-upsert
+- `list_due_scheduled_tasks(occurrence, now, limit)` — scheduler-tick
+  query. WHERE next_trigger_at <= now AND status IN (PENDING,
+  ACTIVE), ordered ASC by next_trigger_at. Hits the
+  scheduled_tasks_due partial index.
+- `update_after_trigger(task_id, last_triggered_at, next_trigger_at?,
+  deferral_count, deferral_history?, new_status?)` — partial-update
+  semantics; Some(...) writes, None preserves; returns false if task
+  didn't exist
+
+### Status vocabulary
+
+`UPPERCASE`. Rust enum stays TitleCase (`Pending`/`Active`/`Complete`
+/`Failed`); `as_sql_str` emits UPPERCASE; serde JSON wire format is
+snake_case (per project convention); FFI uppercases caller input
+before parse. CHECK rejects lowercase and tasks-vocab `COMPLETED`
+(with the trailing D) — only exact `COMPLETE` is valid.
+
+### PyO3 surface
+
+3 new Engine methods gated on `cirislens_scheduled_tasks` feature.
+Stable error kinds: `scheduled_tasks_invalid_argument |
+scheduled_tasks_not_found | scheduled_tasks_conflict |
+scheduled_tasks_backend | scheduled_tasks_internal`.
+
+### Tests
+
+22 new (1 mod kind + 6 types + 7 PG live + 8 SQLite):
+- All 15 columns round-trip
+- Upsert idempotency preserves `created_at`
+- FK to thoughts rejects nonexistent origin_thought_id
+- `list_due_scheduled_tasks`: 5 tasks with mixed past/future/NULL
+  next_trigger_at; only past-due PENDING/ACTIVE return; ordered ASC
+- `update_after_trigger` success + missing-row=false + partial-update
+- CHECK guards: lowercase rejected, `COMPLETED` rejected, only
+  `COMPLETE` valid
+
+Lib suite: 347 pass with full substrate feature set
+(`cirislens_tasks cirislens_thoughts cirislens_correlations
+cirislens_scheduled_tasks`).
+
+### No Backend-trait collision
+
+The Phase-3 stub sweep didn't hit any `scheduled_task_*` method names.
+UFCS dispatch used at PyO3 sites for consistency with prior substrate
+pattern; harmless.
+
+### Note on DEFERRABLE FK on PG
+
+Even with `DEFERRABLE INITIALLY DEFERRED`, tokio-postgres's
+auto-commit wraps each statement in its own implicit transaction.
+Single-statement INSERTs against a dangling `origin_thought_id` fail
+immediately at end-of-implicit-tx. The DEFERRABLE flag only matters
+for callers that open a multi-statement transaction (which the agent
+does for parent+child writes). Test
+`scheduled_tasks_pg_fk_rejects_nonexistent_origin_thought` validates
+the expected reject behavior.
+
+### Remaining 7 substrates
+
+`tickets` (v1.5.13), `deferral_reports` (v1.5.14),
+`consolidation_locks` (v1.5.15), `creation_ceremonies` (v1.5.16),
+`continuity_awareness` (v1.5.17), `feedback_mappings` (v1.5.18),
+`wa_cert` (v1.5.19).
+
 ## [1.5.11] — 2026-05-18
 
 **`service_correlations` substrate — 3 of 11 (CIRISPersist#59 #3).**

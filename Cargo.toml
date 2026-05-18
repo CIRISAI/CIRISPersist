@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "1.5.11"
+version = "1.5.12"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -186,6 +186,19 @@ cirislens_thoughts = []
 # JSONB request/response/tags + TIMESTAMPTZ; SQLite: TEXT JSON.
 # Threat model AV-15.
 cirislens_correlations = []
+
+# v1.5.12 (CIRISPersist#59 #4) — agent scheduled_tasks substrate.
+# Fourth of 11 substrate absorptions. Absorbs the scheduler's
+# deferred / cron-driven follow-up work table. UPSERT on id,
+# `list_due_scheduled_tasks` hot-path for the scheduler tick
+# (next_trigger_at <= now AND status IN (PENDING, ACTIVE)),
+# `update_after_trigger` for post-fire bookkeeping. 15 columns.
+# Status vocabulary is UPPERCASE (`PENDING/ACTIVE/COMPLETE/FAILED`)
+# — distinct from tasks/thoughts lowercase. FK to
+# `cirislens.thoughts(thought_id)` (PG: DEFERRABLE; SQLite:
+# immediate). PG: JSONB deferral_history + TIMESTAMPTZ; SQLite:
+# TEXT JSON. Threat model AV-15.
+cirislens_scheduled_tasks = []
 
 # v0.1.3 — optional TLS for the Postgres connection pool. Defaults
 # to no-TLS (deployments where the lens process and Postgres are

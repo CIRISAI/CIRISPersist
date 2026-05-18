@@ -383,6 +383,60 @@ class Engine:
         Cursor pagination on ``(updated_at, correlation_id)``.
         """
 
+    # ── v1.5.12 (CIRISPersist#59 #4) — scheduled tasks substrate
+
+    def scheduled_task_upsert(self, task_json: str) -> None:
+        """v1.5.12 — Upsert a scheduled task. ``task_json`` is a
+        JSON-encoded ``ScheduledTask`` (see the
+        ``ciris_persist.scheduled_tasks`` module). INSERT on first
+        call, UPDATE on conflict by ``id``. All columns except
+        ``created_at`` overwrite on conflict; ``created_at`` is
+        preserved.
+
+        Note: the ``status`` field on the wire is lowercase
+        snake_case (``"pending"`` / ``"active"`` / ``"complete"`` /
+        ``"failed"``) while the SQL CHECK vocabulary is UPPERCASE
+        — Rust handles the translation. ``origin_thought_id`` must
+        reference an existing row in ``cirislens.thoughts`` (PG:
+        DEFERRABLE FK; SQLite: immediate FK).
+        """
+
+    def scheduled_task_list_due(
+        self,
+        agent_occurrence_id: str,
+        now_iso: str,
+        limit: int,
+    ) -> str:
+        """v1.5.12 — Scheduler tick query. Returns JSON-encoded
+        ``list[ScheduledTask]`` of tasks where
+        ``next_trigger_at <= now`` AND status is ``PENDING`` or
+        ``ACTIVE``, scoped to the given occurrence. Ordered ASC by
+        ``next_trigger_at`` for fair scheduling. ``now_iso`` is
+        RFC 3339; ``limit`` is the batch size (typical 100). Hits
+        the ``scheduled_tasks_due`` partial index.
+        """
+
+    def scheduled_task_update_after_trigger(
+        self,
+        task_id: str,
+        last_triggered_at_iso: str,
+        next_trigger_at_iso: str | None,
+        deferral_count: int,
+        deferral_history_json: str | None = None,
+        new_status: str | None = None,
+    ) -> bool:
+        """v1.5.12 — Post-fire bookkeeping. Updates
+        ``last_triggered_at`` + ``next_trigger_at`` (None → NULL) +
+        ``deferral_count``. Optional ``deferral_history_json``
+        (None → preserve existing). Optional ``new_status`` advances
+        the lifecycle (None → preserve existing); accepts lowercase
+        snake_case wire format (``pending`` / ``active`` /
+        ``complete`` / ``failed``).
+
+        Returns ``True`` when a row was updated, ``False`` when no
+        matching task exists (no error — caller treats as stale id).
+        """
+
     def trust_grant_consistency_proof(
         self,
         tenant_id: str,

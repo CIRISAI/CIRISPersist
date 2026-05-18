@@ -138,7 +138,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "telemetry_not_found"
         | "tasks_not_found"
         | "thoughts_not_found"
-        | "correlations_not_found" => NotFound::new_err(msg),
+        | "correlations_not_found"
+        | "scheduled_tasks_not_found" => NotFound::new_err(msg),
 
         // Conflict family — uniqueness / version / state-transition
         // conflict; caller MUST NOT retry, MUST re-read.
@@ -149,7 +150,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "cirisgraph_conflict"
         | "tasks_conflict"
         | "thoughts_conflict"
-        | "correlations_conflict" => Conflict::new_err(msg),
+        | "correlations_conflict"
+        | "scheduled_tasks_conflict" => Conflict::new_err(msg),
 
         // Transient family — backend connection / timeout / pool
         // exhaustion; caller MAY retry with backoff.
@@ -162,7 +164,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "maintenance_backend"
         | "tasks_backend"
         | "thoughts_backend"
-        | "correlations_backend" => Transient::new_err(msg),
+        | "correlations_backend"
+        | "scheduled_tasks_backend" => Transient::new_err(msg),
 
         // Default — Permanent. Covers invalid arguments, signature
         // failures, crypto errors, rotation conflicts, "not authorized,"
@@ -8862,6 +8865,208 @@ impl PyEngine {
                         serde_json::to_string(&page).map_err(|e| {
                             PyRuntimeError::new_err(format!("CorrelationListPage encode: {e}"))
                         })
+                    })
+                }
+            })
+        })
+    }
+
+    // ── v1.5.12 (CIRISPersist#59 #4) scheduled_tasks PyO3 surface ──
+    //
+    // 3 methods wrapping ScheduledTaskService. JSON wire format
+    // mirrors tasks/thoughts/correlations substrate patterns:
+    // ScheduledTask struct decoded/encoded via serde at the FFI
+    // boundary. Status vocabulary is UPPERCASE at the SQL layer;
+    // the serde wire format is snake_case so callers send
+    // `"pending"` / `"active"` / `"complete"` / `"failed"` in JSON.
+
+    /// v1.5.12 — Upsert a scheduled task. INSERT on first call,
+    /// UPDATE on conflict by `id`. All columns except `created_at`
+    /// overwrite on conflict; `created_at` is preserved.
+    #[cfg(feature = "cirislens_scheduled_tasks")]
+    fn scheduled_task_upsert(&self, py: Python<'_>, task_json: &str) -> PyResult<()> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let task: crate::scheduled_tasks::ScheduledTask = serde_json::from_str(task_json)
+                .map_err(|e| PyValueError::new_err(format!("ScheduledTask decode: {e}")))?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        // No Backend-trait collision on
+                        // `upsert_scheduled_task` (verified) — but
+                        // UFCS for consistency with the rest of the
+                        // substrate PyO3 surface.
+                        crate::scheduled_tasks::ScheduledTaskService::upsert_scheduled_task(
+                            &*backend, task,
+                        )
+                        .await
+                        .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::scheduled_tasks::sqlite::SqliteScheduledTaskBackend::new(
+                        sq.conn_handle(),
+                    );
+                    runtime.block_on(async move {
+                        use crate::scheduled_tasks::ScheduledTaskService;
+                        backend
+                            .upsert_scheduled_task(task)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.12 — Scheduler tick query. Returns JSON-encoded
+    /// `list[ScheduledTask]` of tasks whose `next_trigger_at <= now`
+    /// and status is `PENDING` or `ACTIVE`, scoped to one
+    /// occurrence. Ordered ASC by `next_trigger_at`.
+    #[cfg(feature = "cirislens_scheduled_tasks")]
+    fn scheduled_task_list_due(
+        &self,
+        py: Python<'_>,
+        agent_occurrence_id: &str,
+        now_iso: &str,
+        limit: i64,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let now: chrono::DateTime<chrono::Utc> = chrono::DateTime::parse_from_rfc3339(now_iso)
+                .map_err(|e| PyValueError::new_err(format!("now_iso parse: {e}")))?
+                .with_timezone(&chrono::Utc);
+            let occ = agent_occurrence_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::scheduled_tasks::ScheduledTaskService;
+                        let items = backend
+                            .list_due_scheduled_tasks(&occ, now, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&items).map_err(|e| {
+                            PyRuntimeError::new_err(format!("ScheduledTask list encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::scheduled_tasks::sqlite::SqliteScheduledTaskBackend::new(
+                        sq.conn_handle(),
+                    );
+                    runtime.block_on(async move {
+                        use crate::scheduled_tasks::ScheduledTaskService;
+                        let items = backend
+                            .list_due_scheduled_tasks(&occ, now, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&items).map_err(|e| {
+                            PyRuntimeError::new_err(format!("ScheduledTask list encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.12 — Post-fire bookkeeping. Updates
+    /// `last_triggered_at`, `next_trigger_at` (None → NULL),
+    /// `deferral_count`, optionally `deferral_history` (None →
+    /// preserve existing), optionally `new_status` (None →
+    /// preserve existing). Returns True when the row existed and
+    /// was updated; False when no matching row.
+    ///
+    /// `new_status` is one of `pending` / `active` / `complete` /
+    /// `failed` (lowercase snake_case wire format; UPPERCASE on
+    /// the SQL side).
+    #[cfg(feature = "cirislens_scheduled_tasks")]
+    #[pyo3(signature = (task_id, last_triggered_at_iso, next_trigger_at_iso, deferral_count, deferral_history_json=None, new_status=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn scheduled_task_update_after_trigger(
+        &self,
+        py: Python<'_>,
+        task_id: &str,
+        last_triggered_at_iso: &str,
+        next_trigger_at_iso: Option<&str>,
+        deferral_count: i32,
+        deferral_history_json: Option<&str>,
+        new_status: Option<&str>,
+    ) -> PyResult<bool> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let last_triggered_at: chrono::DateTime<chrono::Utc> =
+                chrono::DateTime::parse_from_rfc3339(last_triggered_at_iso)
+                    .map_err(|e| {
+                        PyValueError::new_err(format!("last_triggered_at_iso parse: {e}"))
+                    })?
+                    .with_timezone(&chrono::Utc);
+            let next_trigger_at: Option<chrono::DateTime<chrono::Utc>> = match next_trigger_at_iso {
+                None => None,
+                Some(s) => Some(
+                    chrono::DateTime::parse_from_rfc3339(s)
+                        .map_err(|e| {
+                            PyValueError::new_err(format!("next_trigger_at_iso parse: {e}"))
+                        })?
+                        .with_timezone(&chrono::Utc),
+                ),
+            };
+            let deferral_history: Option<serde_json::Value> = match deferral_history_json {
+                None => None,
+                Some(s) => Some(serde_json::from_str(s).map_err(|e| {
+                    PyValueError::new_err(format!("deferral_history_json decode: {e}"))
+                })?),
+            };
+            let new_status_parsed: Option<crate::scheduled_tasks::ScheduledTaskStatus> =
+                match new_status {
+                    None => None,
+                    Some(s) => Some(
+                        crate::scheduled_tasks::ScheduledTaskStatus::parse_str(&s.to_uppercase())
+                            .ok_or_else(|| {
+                            PyValueError::new_err(format!("unknown ScheduledTaskStatus: {s}"))
+                        })?,
+                    ),
+                };
+            let task_id_owned = task_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::scheduled_tasks::ScheduledTaskService;
+                        backend
+                            .update_after_trigger(
+                                &task_id_owned,
+                                last_triggered_at,
+                                next_trigger_at,
+                                deferral_count,
+                                deferral_history,
+                                new_status_parsed,
+                            )
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::scheduled_tasks::sqlite::SqliteScheduledTaskBackend::new(
+                        sq.conn_handle(),
+                    );
+                    runtime.block_on(async move {
+                        use crate::scheduled_tasks::ScheduledTaskService;
+                        backend
+                            .update_after_trigger(
+                                &task_id_owned,
+                                last_triggered_at,
+                                next_trigger_at,
+                                deferral_count,
+                                deferral_history,
+                                new_status_parsed,
+                            )
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
                     })
                 }
             })

@@ -61,6 +61,8 @@ pub mod pipeline;
 pub mod prelude;
 pub mod queue;
 pub mod read;
+#[cfg(feature = "cirislens_scheduled_tasks")]
+pub mod scheduled_tasks;
 pub mod schema;
 pub mod scrub;
 #[cfg(feature = "secrets")]
