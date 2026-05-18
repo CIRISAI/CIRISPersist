@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "1.5.10"
+version = "1.5.11"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -174,6 +174,18 @@ cirislens_tasks = []
 # columns + DEFERRABLE FKs to handle parent + child in one tx;
 # SQLite: TEXT JSON + plain FKs. Threat model AV-15.
 cirislens_thoughts = []
+
+# v1.5.11 (CIRISPersist#59 #3) — agent service_correlations substrate.
+# Third of 11 substrate absorptions. Dual-purpose schema (service-
+# interaction + TSDB metric + distributed-trace span + log)
+# discriminated by `correlation_type` — record_correlation with
+# ON CONFLICT DO NOTHING for idempotent re-record, focused
+# update_correlation_status for state advancement, query_correlations
+# for hot-path reads (service / trace / metric / time-window). 18
+# columns. No FKs (parent_span_id crosses substrate boundaries). PG:
+# JSONB request/response/tags + TIMESTAMPTZ; SQLite: TEXT JSON.
+# Threat model AV-15.
+cirislens_correlations = []
 
 # v0.1.3 — optional TLS for the Postgres connection pool. Defaults
 # to no-TLS (deployments where the lens process and Postgres are

@@ -41,6 +41,8 @@
 pub mod audit;
 #[cfg(feature = "cirisnode")]
 pub mod cirisnode;
+#[cfg(feature = "cirislens_correlations")]
+pub mod correlations;
 pub mod derived;
 pub mod engine;
 pub mod federation;

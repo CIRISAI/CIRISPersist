@@ -326,6 +326,63 @@ class Engine:
         Uses a recursive CTE on both backends.
         """
 
+    # ── v1.5.11 (CIRISPersist#59 #3) — service correlations substrate
+
+    def correlation_record(self, correlation_json: str) -> None:
+        """v1.5.11 — Record a correlation. INSERT-OR-IGNORE keyed on
+        ``correlation_id``.
+
+        ``correlation_json`` is a JSON-encoded ``Correlation`` shape
+        (see the ``ciris_persist.correlations`` module). First writer
+        wins; a re-record with the same ``correlation_id`` is a
+        silent no-op (idempotent retry). State advancement is the
+        caller's responsibility — use ``correlation_update_status``
+        to advance an in-flight row.
+        """
+
+    def correlation_get(self, correlation_id: str) -> str | None:
+        """v1.5.11 — Read one correlation by id. Returns the JSON-
+        encoded ``Correlation`` row or ``None`` when no matching row.
+        """
+
+    def correlation_update_status(
+        self,
+        correlation_id: str,
+        new_status: str,
+        response_data_json: str | None,
+    ) -> bool:
+        """v1.5.11 — Focused status update + optional response_data
+        merge.
+
+        ``new_status`` is one of ``pending`` / ``active`` /
+        ``completed`` / ``failed`` / ``cancelled``.
+        ``response_data_json`` (when not None) is decoded and stored
+        into the ``response_data`` column; ``None`` preserves the
+        existing value.
+
+        Returns ``True`` when a row was updated, ``False`` when no
+        matching correlation exists (no error — caller treats as
+        stale id).
+        """
+
+    def correlation_query(
+        self,
+        filter_json: str,
+        cursor_json: str | None,
+        limit: int,
+    ) -> str:
+        """v1.5.11 — Cursor-paged query. Returns JSON-encoded
+        ``CorrelationListPage`` (``{"items": [...], "next_cursor":
+        {...}|None}``). The filter shape mirrors
+        ``CorrelationFilter`` — supported fields:
+        ``service_type``, ``correlation_type``, ``trace_id``,
+        ``metric_name``, ``retention_policy``,
+        ``agent_occurrence_id``, ``timestamp_after`` /
+        ``timestamp_before`` (event-time window),
+        ``updated_after`` / ``updated_before`` (row-update window).
+        Cursor pagination on ``(updated_at, correlation_id)``.
+        """
+
     def trust_grant_consistency_proof(
         self,
         tenant_id: str,

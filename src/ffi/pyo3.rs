@@ -137,7 +137,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "cirisgraph_not_found"
         | "telemetry_not_found"
         | "tasks_not_found"
-        | "thoughts_not_found" => NotFound::new_err(msg),
+        | "thoughts_not_found"
+        | "correlations_not_found" => NotFound::new_err(msg),
 
         // Conflict family — uniqueness / version / state-transition
         // conflict; caller MUST NOT retry, MUST re-read.
@@ -147,7 +148,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "audit_conflict"
         | "cirisgraph_conflict"
         | "tasks_conflict"
-        | "thoughts_conflict" => Conflict::new_err(msg),
+        | "thoughts_conflict"
+        | "correlations_conflict" => Conflict::new_err(msg),
 
         // Transient family — backend connection / timeout / pool
         // exhaustion; caller MAY retry with backoff.
@@ -159,7 +161,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "telemetry_backend"
         | "maintenance_backend"
         | "tasks_backend"
-        | "thoughts_backend" => Transient::new_err(msg),
+        | "thoughts_backend"
+        | "correlations_backend" => Transient::new_err(msg),
 
         // Default — Permanent. Covers invalid arguments, signature
         // failures, crypto errors, rotation conflicts, "not authorized,"
@@ -8642,6 +8645,222 @@ impl PyEngine {
                             .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
                         serde_json::to_string(&rows).map_err(|e| {
                             PyRuntimeError::new_err(format!("Vec<Thought> encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    // ── v1.5.11 (CIRISPersist#59 #3) correlations PyO3 surface ──────
+    //
+    // 4 methods wrapping CorrelationService. JSON wire format mirrors
+    // the tasks/thoughts substrate pattern: Correlation struct +
+    // CorrelationFilter + CorrelationCursor + CorrelationListPage
+    // decoded/encoded via serde at the FFI boundary. Dual-purpose
+    // schema — correlation_type discriminates service_interaction /
+    // metric / trace / log.
+
+    /// v1.5.11 — Record a correlation. INSERT-OR-IGNORE keyed on
+    /// `correlation_id`. First writer wins; re-record with the same
+    /// id is a silent no-op (idempotent retry). State advancement
+    /// is the caller's responsibility — use
+    /// `correlation_update_status` to advance an in-flight row.
+    #[cfg(feature = "cirislens_correlations")]
+    fn correlation_record(&self, py: Python<'_>, correlation_json: &str) -> PyResult<()> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let correlation: crate::correlations::Correlation =
+                serde_json::from_str(correlation_json)
+                    .map_err(|e| PyValueError::new_err(format!("Correlation decode: {e}")))?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        // UFCS — PostgresBackend has a Phase-3
+                        // `Backend::record_correlation` placeholder
+                        // (`store::backend.rs`); disambiguate to the
+                        // concrete CorrelationService impl here.
+                        crate::correlations::CorrelationService::record_correlation(
+                            &*backend,
+                            correlation,
+                        )
+                        .await
+                        .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::correlations::sqlite::SqliteCorrelationBackend::new(
+                        sq.conn_handle(),
+                    );
+                    runtime.block_on(async move {
+                        use crate::correlations::CorrelationService;
+                        backend
+                            .record_correlation(correlation)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.11 — Read one correlation by id. Returns the JSON-encoded
+    /// Correlation or None when no matching row.
+    #[cfg(feature = "cirislens_correlations")]
+    fn correlation_get(&self, py: Python<'_>, correlation_id: &str) -> PyResult<Option<String>> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let correlation_id = correlation_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::correlations::CorrelationService;
+                        let row = backend
+                            .get_correlation(&correlation_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match row {
+                            None => Ok(None),
+                            Some(c) => Ok(Some(serde_json::to_string(&c).map_err(|e| {
+                                PyRuntimeError::new_err(format!("Correlation encode: {e}"))
+                            })?)),
+                        }
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::correlations::sqlite::SqliteCorrelationBackend::new(
+                        sq.conn_handle(),
+                    );
+                    runtime.block_on(async move {
+                        use crate::correlations::CorrelationService;
+                        let row = backend
+                            .get_correlation(&correlation_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match row {
+                            None => Ok(None),
+                            Some(c) => Ok(Some(serde_json::to_string(&c).map_err(|e| {
+                                PyRuntimeError::new_err(format!("Correlation encode: {e}"))
+                            })?)),
+                        }
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.11 — Focused status update + optional response_data merge.
+    /// `new_status` is one of `pending` / `active` / `completed` /
+    /// `failed` / `cancelled`. `response_data_json` (when not None)
+    /// is decoded and stored into the `response_data` column; None
+    /// preserves the existing value. Returns true when a row was
+    /// updated; false on missing correlation (no error — caller
+    /// treats as "stale id").
+    #[cfg(feature = "cirislens_correlations")]
+    fn correlation_update_status(
+        &self,
+        py: Python<'_>,
+        correlation_id: &str,
+        new_status: &str,
+        response_data_json: Option<&str>,
+    ) -> PyResult<bool> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let status =
+                crate::correlations::CorrelationStatus::parse_str(new_status).ok_or_else(|| {
+                    PyValueError::new_err(format!("unknown CorrelationStatus: {new_status}"))
+                })?;
+            let response_data: Option<serde_json::Value> = match response_data_json {
+                None => None,
+                Some(s) => Some(serde_json::from_str(s).map_err(|e| {
+                    PyValueError::new_err(format!("response_data_json decode: {e}"))
+                })?),
+            };
+            let correlation_id = correlation_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::correlations::CorrelationService;
+                        backend
+                            .update_correlation_status(&correlation_id, status, response_data)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::correlations::sqlite::SqliteCorrelationBackend::new(
+                        sq.conn_handle(),
+                    );
+                    runtime.block_on(async move {
+                        use crate::correlations::CorrelationService;
+                        backend
+                            .update_correlation_status(&correlation_id, status, response_data)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.11 — Cursor-paged query. Returns JSON-encoded
+    /// `CorrelationListPage`. Filter shape mirrors
+    /// `CorrelationFilter` — see the
+    /// `ciris_persist.correlations` module for the supported fields
+    /// (service_type / correlation_type / trace_id / metric_name /
+    /// retention_policy / agent_occurrence_id / timestamp window /
+    /// updated window).
+    #[cfg(feature = "cirislens_correlations")]
+    fn correlation_query(
+        &self,
+        py: Python<'_>,
+        filter_json: &str,
+        cursor_json: Option<&str>,
+        limit: i64,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let filter: crate::correlations::CorrelationFilter = serde_json::from_str(filter_json)
+                .map_err(|e| PyValueError::new_err(format!("CorrelationFilter decode: {e}")))?;
+            let cursor: Option<crate::correlations::CorrelationCursor> = match cursor_json {
+                None => None,
+                Some(s) => Some(serde_json::from_str(s).map_err(|e| {
+                    PyValueError::new_err(format!("CorrelationCursor decode: {e}"))
+                })?),
+            };
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::correlations::CorrelationService;
+                        let page = backend
+                            .query_correlations(filter, cursor, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&page).map_err(|e| {
+                            PyRuntimeError::new_err(format!("CorrelationListPage encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::correlations::sqlite::SqliteCorrelationBackend::new(
+                        sq.conn_handle(),
+                    );
+                    runtime.block_on(async move {
+                        use crate::correlations::CorrelationService;
+                        let page = backend
+                            .query_correlations(filter, cursor, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&page).map_err(|e| {
+                            PyRuntimeError::new_err(format!("CorrelationListPage encode: {e}"))
                         })
                     })
                 }

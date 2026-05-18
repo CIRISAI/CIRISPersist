@@ -5,6 +5,117 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.5.11] — 2026-05-18
+
+**`service_correlations` substrate — 3 of 11 (CIRISPersist#59 #3).**
+
+The hot-path substrate: 400+ rows on an active agent. Dual-purpose
+schema absorbing service-interaction tracking + TSDB metrics +
+distributed-trace spans + log correlations into one substrate.
+Caller discriminates via `correlation_type`. Shipped as one substrate
+per spec; may split later if access patterns diverge.
+
+V026 migration on both backends with all 18 columns from
+CIRISAgent v2.8.13:
+- `correlation_id` PK, `service_type`, `handler_name`, `action_type`
+- `request_data` / `response_data` / `tags` — JSONB on PG; TEXT JSON on SQLite
+- `status`, `created_at`, `updated_at`, `correlation_type`,
+  `retention_policy`
+- `timestamp` — event time (distinct from row's `created_at`); used
+  for metric/trace time-window scans
+- `metric_name` / `metric_value` (REAL; PG f32 cast up to f64 at trait
+  boundary to match SQLite's f64 REAL semantic)
+- `log_level`, `trace_id`, `span_id`, `parent_span_id`, `tags`
+- `agent_occurrence_id` (default `"default"`)
+
+CHECKs:
+- `status IN ('pending','active','completed','failed','cancelled')`
+- `correlation_type IN ('service_interaction','metric','trace','log')`
+- `retention_policy IN ('raw','aggregated','summary','retained_indefinitely')`
+
+Indexes (5):
+- `(agent_occurrence_id, service_type, updated_at DESC)` — list-by-service hot path
+- `(correlation_type, timestamp DESC)` — metric/trace time-window scans
+- `(trace_id) WHERE NOT NULL` — distributed-trace assembly
+- `(parent_span_id) WHERE NOT NULL` — span tree walks
+- `(metric_name, timestamp DESC) WHERE NOT NULL` — TSDB-style metric queries
+
+### CorrelationService trait (4 methods)
+
+- `record_correlation(correlation)` — INSERT-OR-IGNORE (`ON CONFLICT
+  (correlation_id) DO NOTHING`); first writer wins; subsequent
+  writers are no-ops; state advancement via `update_correlation_status`
+- `get_correlation`
+- `update_correlation_status(id, new_status, response_data_json?)` —
+  response_data COALESCE merge; missing-row returns false
+- `query_correlations(filter, cursor?, limit)` — filter by
+  service_type / correlation_type / trace_id / metric_name /
+  retention_policy / occurrence / event-timestamp window / row-update
+  window; cursor pagination on `(updated_at, correlation_id)`
+
+### PyO3 surface
+
+4 new Engine methods gated on `cirislens_correlations` feature
+(added to maturin wheel features). Stable error kinds added:
+`correlations_invalid_argument | correlations_not_found |
+correlations_conflict | correlations_backend | correlations_internal`.
+
+### Tests
+
+30 new (1 mod kind + 8 types unit + 9 PG live + 12 SQLite):
+- All 18 columns round-trip
+- `record_correlation` idempotency on conflict
+- `update_correlation_status` success + missing-row=false + COALESCE merge
+- `query_correlations` filtered by service_type / correlation_type +
+  metric_name (TSDB hot path) / trace_id (distributed-trace assembly)
+  / timestamp window
+- Cursor pagination on `(updated_at, correlation_id)`
+- Span tree: insert root + 2 children + 1 grandchild; parent_span_id
+  query surfaces children
+- 3 CHECK-constraint guards (status / correlation_type /
+  retention_policy bogus values rejected)
+
+Lib suite: 355 pass with `postgres sqlite cirislens_tasks
+cirislens_thoughts cirislens_correlations`.
+
+### Backend-trait collision (recurred)
+
+`store/backend.rs` has a Phase-3 stub `Backend::record_correlation`
+taking `&ServiceCorrelation` (legacy redb-era shape) that collides
+with the new `CorrelationService::record_correlation(Correlation)`.
+Resolved via UFCS at PG call sites (same shape as v1.5.9 tasks
+collision). The legacy stub will be removed in a future cleanup once
+no consumer references it.
+
+### Vocabulary disclaimer
+
+Status / correlation_type / retention_policy vocabularies came from
+the v1.5.11 spec, not from `CIRISAgent v2.8.13` enum source. Sub-agent
+flagged this — recommend a sanity grep against
+`ciris_engine/schemas/runtime/enums.py` +
+`ciris_engine/persistence/services/service_correlations.py` once the
+agent integration PR is in flight. If the agent uses different status
+strings (e.g., `processing` instead of `active`), a V027 will relax
+the CHECK constraint. No persist-side shape change needed.
+
+### `record_correlation` ON CONFLICT decision
+
+Shipped as `DO NOTHING` (caller advances via `update_correlation_status`).
+If agent retry path re-records with richer `request_data`, those writes
+will be silently dropped. Two paths to fix if that turns out to matter:
+- Switch to conditional upsert (DO UPDATE WHERE status='pending')
+- Document the contract that callers must reuse original payload on retry
+
+Decision deferred until agent integration PR lands and shows actual
+call shapes.
+
+### Remaining 8 substrates
+
+`scheduled_tasks` (v1.5.12), `tickets` (v1.5.13), `deferral_reports`
+(v1.5.14), `consolidation_locks` (v1.5.15), `creation_ceremonies`
+(v1.5.16), `continuity_awareness` (v1.5.17), `feedback_mappings`
+(v1.5.18), `wa_cert` (v1.5.19).
+
 ## [1.5.10] — 2026-05-18
 
 **`thoughts` substrate — 2 of 11 (CIRISPersist#59 #2).**
