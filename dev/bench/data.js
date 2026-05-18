@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779114596200,
+  "lastUpdate": 1779116092151,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -16847,6 +16847,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23761466,
             "range": "± 901075",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "028df31f292043690eabbb4c4e9b28ff52a83c7e",
+          "message": "1.5.9 — tasks substrate (CIRISPersist#59 #1 of 11)\n\nFirst of 11 substrate absorptions ending dual-libsqlite WAL\ncorruption. CIRISAgent 2.9.0's full ciris_engine.db absorption: persist\nbecomes the only library that opens the file.\n\nTasks substrate ships all 17 columns from CIRISAgent v2.8.13 tasks\ntable on both PG + SQLite. V024 migration. Self-FK on parent_task_id\n(deferrable on PG, immediate on SQLite). Indexes on\n(agent_occurrence_id, status, updated_at), (channel_id, updated_at),\n(parent_task_id) WHERE NOT NULL.\n\nStatus CHECK: pending | active | completed | failed | cancelled |\ndeferred.\n\nNew TaskService trait, 6 methods:\n- upsert_task (idempotent on task_id; differing data overwrites\n  non-monotonic columns)\n- get_task\n- list_tasks (cursor pagination on (updated_at, task_id))\n- update_task_status (false = task didn't exist)\n- try_claim_shared_task (atomic INSERT OR IGNORE; ClaimResult)\n- delete_task (FK REJECT on children)\n\nPyO3: 6 new Engine methods (task_upsert / task_get / task_list /\ntask_update_status / task_try_claim_shared / task_delete). JSON-in/\nJSON-out. Both backends dispatched via BackendDispatch match.\n\nFeature gate: cirislens_tasks. Added to pyproject.toml maturin\nfeatures so the published wheel ships the surface.\n\nTests: 22 new (5 types unit + 1 mod kind + 9 SQLite integration + 7\nPG integration via CIRIS_PERSIST_TEST_PG_URL). All 17 columns round-\ntrip; idempotent upsert; cursor pagination; concurrent try_claim\nrace produces one Stored + one AlreadyClaimed; FK parent existence\nenforced on both backends. Lib suite: 298 pass. fmt + clippy clean.\n\nMethod-collision note: PostgresBackend had upsert_task and\ntry_claim_shared_task placeholders on Backend trait from a Phase 3\nstub. Resolved via UFCS at PG call sites. Stub removal deferred to\na separate cleanup once we confirm no other consumer references them.\n\nqa_harness migration-count bound bumped (1..=22) → (1..=25) for\nheadroom across the 10 remaining substrate cuts.\n\n10 substrates remain: thoughts, service_correlations, scheduled_tasks,\ntickets, deferral_reports, consolidation_locks, creation_ceremonies,\ncontinuity_awareness, feedback_mappings, wa_cert. Per-release cuts\nv1.5.10-v1.5.19.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-18T09:47:01-05:00",
+          "tree_id": "0677ff0fbc70a440c014714830fa8e7863ee853d",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/028df31f292043690eabbb4c4e9b28ff52a83c7e"
+        },
+        "date": 1779116091416,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 120105,
+            "range": "± 448",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 270444,
+            "range": "± 696",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 570548,
+            "range": "± 8716",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1996073,
+            "range": "± 5315",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 347,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1451,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7205,
+            "range": "± 82",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23162,
+            "range": "± 640",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26413,
+            "range": "± 49",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91054,
+            "range": "± 164",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 352,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3242,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9472,
+            "range": "± 39",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41607,
+            "range": "± 161",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 654,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2227913,
+            "range": "± 310814",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6994035,
+            "range": "± 47862",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25935186,
+            "range": "± 165590",
             "unit": "ns/iter"
           }
         ]
