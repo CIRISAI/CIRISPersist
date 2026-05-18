@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778990530461,
+  "lastUpdate": 1779110441783,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -16451,6 +16451,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25832547,
             "range": "± 342268",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "79e40247e18449884624670237397b7f67a80774",
+          "message": "1.5.6 — diagnostic for cirisgraph attributes UTF-8 decode failures (#58)\n\nCIRISAgent 2.9.0 staged-QA surfaced cirisgraph_get_node failing with\n'Conversion error from type Text at index: 3, invalid utf-8 sequence'\nafter a successful cirisgraph_upsert_node. Agent team can't trace\nupstream because the error has no context.\n\nThis release replaces rusqlite's default decode error with a detailed\ndiagnostic + adds defense-in-depth UTF-8 validation on the write side.\n\nread_attributes_text in src/graph/sqlite.rs:\n- Fast path: normal row.get::<_, String>(\"attributes\")\n- On UTF-8 failure: fall back to Vec<u8>, run std::str::from_utf8 to\n  pinpoint the bad byte, return Error::Backend carrying node_id +\n  byte position + invalid-sequence length + total column bytes +\n  hex dump of ±32 bytes around failure with [...] markers + ASCII\n  context (• for non-printable) + the original Utf8Error.\n\nassert_valid_utf8_or_describe defense-in-depth in encode_attributes —\nsurfaces caller context at write time if a future regression somehow\nproduces non-UTF-8 (today: impossible by serde_json::to_string\nconstruction).\n\nTests: 2 new regression tests:\n- get_node_diagnostic_on_invalid_utf8_attributes injects a 0xC0 byte\n  via raw SQL; asserts diagnostic carries node_id + byte position +\n  hex marker + invalid-byte hex form + total length\n- encode_attributes_always_produces_valid_utf8 pins write invariant\n  across nested objects + unicode + escapes + nested arrays\n\nLib suite: 403 pass. No behavior change for the happy path. No\nschema change. No migration.\n\nDoesn't fix the upstream root cause — that requires the agent team\nto see the actual bytes (which this enables) and trace where they\ncome from. Hypotheses to test: mojibake, binary-as-string,\nPython lone-surrogate round-trip, external non-persist writer.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-18T08:11:40-05:00",
+          "tree_id": "54216e9ea307fb9697926b86845c0ca37e873cdf",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/79e40247e18449884624670237397b7f67a80774"
+        },
+        "date": 1779110440938,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 109320,
+            "range": "± 2694",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 261136,
+            "range": "± 1644",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 563440,
+            "range": "± 12610",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1999605,
+            "range": "± 3935",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 339,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1438,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7266,
+            "range": "± 122",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23157,
+            "range": "± 613",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26403,
+            "range": "± 282",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91013,
+            "range": "± 169",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 385,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3281,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9651,
+            "range": "± 417",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41628,
+            "range": "± 215",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 637,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2314822,
+            "range": "± 131009",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7109192,
+            "range": "± 247498",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25774099,
+            "range": "± 190123",
             "unit": "ns/iter"
           }
         ]
