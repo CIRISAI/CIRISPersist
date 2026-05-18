@@ -710,19 +710,9 @@ impl SecretsService for SqliteSecretsBackend {
         Ok(n > 0)
     }
 
-    async fn process_incoming_text(
-        &self,
-        _text: &str,
-        _source_message_id: &str,
-        _accessor: String,
-    ) -> Result<(String, Vec<SecretReference>), SecretsError> {
-        // v0.9.3 SQLite parity: matches postgres.rs v0.6.1-α5 stub.
-        // Pipeline orchestration deferred to v0.9.x.y; this method
-        // becomes live when the classify stage's filter catalog ships.
-        Err(SecretsError::Internal(
-            "v0.9.3 SQLite: pipeline orchestration deferred to v0.9.x.y; matches postgres.rs v0.6.1-α5 stub behavior".into(),
-        ))
-    }
+    // v1.5.7 (CIRISPersist#57) — process_incoming_text uses the default
+    // trait impl which composes get_filter_config + try_claim_secret.
+    // Both primitives are SQLite-implemented; the default suffices.
 
     async fn decapsulate_secrets_in_parameters(
         &self,
@@ -1789,5 +1779,118 @@ mod tests {
             "exactly one row expected, found {}",
             our_rows.len()
         );
+    }
+
+    /// v1.5.7 (CIRISPersist#57) — process_incoming_text composes
+    /// get_filter_config + try_claim_secret as a default trait impl.
+    /// SQLite inherits it automatically. Verifies the full
+    /// detection→encrypt→store→placeholder→dedup pipeline.
+    #[tokio::test]
+    async fn process_incoming_text_detects_encrypts_and_replaces_via_default_impl() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let secrets = SqliteSecretsBackend::new(backend.conn_handle());
+
+        secrets
+            .rotate_master_key(None, "test".into())
+            .await
+            .expect("rotate master key");
+
+        // Seed a filter config with two patterns.
+        secrets
+            .update_filter_config(
+                FilterUpdateRequest {
+                    config_id: "global".into(),
+                    new_config: serde_json::json!({
+                        "patterns": [
+                            {
+                                "pattern_id": "aws_access_key",
+                                "regex": "AKIA[0-9A-Z]{16}",
+                                "description": "AWS access key",
+                                "sensitivity": "high",
+                                "auto_decapsulate_for_actions": ["tool"]
+                            },
+                            {
+                                "pattern_id": "github_pat",
+                                "regex": "ghp_[A-Za-z0-9]{20,}",
+                                "description": "GitHub PAT",
+                                "sensitivity": "high",
+                                "auto_decapsulate_for_actions": []
+                            }
+                        ]
+                    }),
+                },
+                "test".into(),
+            )
+            .await
+            .expect("seed filter config");
+
+        let text = "send AKIAEXAMPLEABCDEFGH12 and ghp_ABCDEFghijklmnopqrstuvwxyz0123 \
+                    to the deploy bot please";
+        let (filtered, refs) = secrets
+            .process_incoming_text(text, "msg-1", "agent-x".into())
+            .await
+            .expect("process_incoming_text");
+
+        // Both secrets land as SecretReferences.
+        assert_eq!(refs.len(), 2, "expected 2 refs, got {refs:?}");
+        let descriptions: Vec<_> = refs.iter().map(|r| r.description.as_str()).collect();
+        assert!(descriptions.contains(&"AWS access key"));
+        assert!(descriptions.contains(&"GitHub PAT"));
+
+        // Filtered text carries the placeholders, NOT the plaintexts.
+        assert!(
+            !filtered.contains("AKIAEXAMPLEABCDEFGH12"),
+            "plaintext leaked: {filtered}"
+        );
+        assert!(
+            !filtered.contains("ghp_ABCDEFghijklmnopqrstuvwxyz0123"),
+            "plaintext leaked: {filtered}"
+        );
+        assert!(filtered.contains("{SECRET:"), "no placeholder: {filtered}");
+        for r in &refs {
+            let placeholder = format!("{{SECRET:{}:{}}}", r.uuid, r.description);
+            assert!(
+                filtered.contains(&placeholder),
+                "missing placeholder {placeholder} in {filtered}"
+            );
+        }
+
+        // Idempotency / dedup: re-running on the same text replays through
+        // try_claim_secret which hmac-dedups; the refs returned are the
+        // same UUIDs (AlreadyClaimed under the covers).
+        let (_, refs2) = secrets
+            .process_incoming_text(text, "msg-2", "agent-x".into())
+            .await
+            .expect("process_incoming_text 2");
+        assert_eq!(refs2.len(), 2);
+        let uuids_a: std::collections::HashSet<_> = refs.iter().map(|r| &r.uuid).collect();
+        let uuids_b: std::collections::HashSet<_> = refs2.iter().map(|r| &r.uuid).collect();
+        assert_eq!(
+            uuids_a, uuids_b,
+            "dedup should yield same UUIDs across runs"
+        );
+    }
+
+    /// v1.5.7 — empty filter catalog returns the text untouched.
+    #[tokio::test]
+    async fn process_incoming_text_empty_catalog_passthrough() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let secrets = SqliteSecretsBackend::new(backend.conn_handle());
+        secrets
+            .rotate_master_key(None, "test".into())
+            .await
+            .expect("rotate master key");
+
+        // Default filter config (version=0, empty value) — no patterns
+        // → text passes through unchanged, no refs.
+        let text = "nothing sensitive here";
+        let (filtered, refs) = secrets
+            .process_incoming_text(text, "msg-1", "agent-x".into())
+            .await
+            .expect("process_incoming_text");
+        assert_eq!(filtered, text);
+        assert!(refs.is_empty());
     }
 }

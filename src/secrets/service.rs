@@ -110,7 +110,111 @@ pub trait SecretsService: Send + Sync {
         text: &str,
         source_message_id: &str,
         accessor: String,
-    ) -> impl Future<Output = Result<(String, Vec<SecretReference>), SecretsError>> + Send;
+    ) -> impl Future<Output = Result<(String, Vec<SecretReference>), SecretsError>> + Send {
+        // v1.5.7 (CIRISPersist#57) — Default impl composes the
+        // existing primitives `get_filter_config` + `try_claim_secret`
+        // so both PG and SQLite backends inherit it automatically.
+        //
+        // Pattern catalog shape (filter_config.config_value):
+        //
+        //   { "patterns": [
+        //       { "pattern_id":              "api_key",
+        //         "regex":                   "...",
+        //         "description":             "...",
+        //         "sensitivity":             "high",
+        //         "auto_decapsulate_for_actions": ["..."] },
+        //       ...
+        //     ],
+        //     "version":                     1
+        //   }
+        //
+        // Each match → try_claim_secret (race-safe content-hmac dedup
+        // per v1.0.0). Filtered text uses the
+        // `{SECRET:<uuid>:<description>}` placeholder format the
+        // decapsulation path matches on. source_message_id is
+        // currently observability-only (not threaded into the
+        // SecretRecord row); v1.6.x can extend the SecretReference
+        // shape to carry it if needed.
+        async move {
+            #[derive(serde::Deserialize)]
+            struct CatalogPattern {
+                #[serde(default)]
+                #[allow(dead_code)]
+                pattern_id: Option<String>,
+                regex: String,
+                description: String,
+                #[serde(default = "default_sensitivity")]
+                sensitivity: Sensitivity,
+                #[serde(default)]
+                auto_decapsulate_for_actions: Vec<String>,
+            }
+            fn default_sensitivity() -> Sensitivity {
+                Sensitivity::High
+            }
+
+            tracing::debug!(source_message_id, "process_incoming_text begin");
+
+            let filter = self.get_filter_config().await?;
+            let patterns_value = filter
+                .config_value
+                .get("patterns")
+                .cloned()
+                .unwrap_or(serde_json::Value::Array(Vec::new()));
+            let patterns: Vec<CatalogPattern> =
+                serde_json::from_value(patterns_value).map_err(|e| {
+                    SecretsError::Internal(format!(
+                        "filter config patterns decode (config_id={}): {e}",
+                        filter.config_id
+                    ))
+                })?;
+
+            let mut filtered = text.to_owned();
+            let mut refs: Vec<SecretReference> = Vec::new();
+            for pat in patterns {
+                let re = regex::Regex::new(&pat.regex).map_err(|e| {
+                    SecretsError::Internal(format!(
+                        "filter pattern regex compile (description={:?}): {e}",
+                        pat.description
+                    ))
+                })?;
+                // Collect matched substrings up-front so we don't mutate
+                // `filtered` while iterating. Pattern emits the FIRST
+                // match per unique plaintext; try_claim_secret's hmac
+                // dedup handles repeats inside the same text.
+                let mut matched_plaintexts: Vec<String> = Vec::new();
+                for m in re.find_iter(&filtered) {
+                    let s = m.as_str().to_owned();
+                    if !matched_plaintexts.iter().any(|x| x == &s) {
+                        matched_plaintexts.push(s);
+                    }
+                }
+                for plaintext in matched_plaintexts {
+                    let claim = self
+                        .try_claim_secret(
+                            &plaintext,
+                            &pat.description,
+                            pat.sensitivity,
+                            pat.auto_decapsulate_for_actions.clone(),
+                            accessor.clone(),
+                        )
+                        .await?;
+                    let secret_ref = match claim {
+                        ClaimResult::Stored(r) | ClaimResult::AlreadyClaimed(r) => r,
+                    };
+                    let placeholder =
+                        format!("{{SECRET:{}:{}}}", secret_ref.uuid, secret_ref.description);
+                    filtered = filtered.replace(&plaintext, &placeholder);
+                    refs.push(secret_ref);
+                }
+            }
+            tracing::debug!(
+                source_message_id,
+                detected_count = refs.len(),
+                "process_incoming_text done"
+            );
+            Ok((filtered, refs))
+        }
+    }
 
     /// Walk `action_params`, replacing every `{SECRET:uuid:...}`
     /// placeholder with the cleartext IFF the secret's

@@ -5,6 +5,108 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.5.7] — 2026-05-18
+
+**`SecretsService::process_incoming_text` pipeline orchestration (closes [#57](https://github.com/CIRISAI/CIRISPersist/issues/57)).**
+
+Ships the v0.6.2 stub that has been `Err("requires v0.6.2 pipeline
+orchestration")` on both backends. Defaults the trait method to a
+composition of existing primitives — `get_filter_config` +
+`try_claim_secret` — so both PG and SQLite inherit it automatically
+without per-backend SQL.
+
+This is the pattern CIRISAgent Lane B's write-leg has been waiting
+on. No more "do persist's job in Python" — the agent can drop its
+regex+SecretReference implementation and call
+`engine.secrets_process_incoming_text(text, source_message_id, accessor)`.
+
+### Implementation
+
+Default trait impl on `SecretsService::process_incoming_text` (composable
+across every backend that supplies `get_filter_config` + `try_claim_secret`):
+
+1. Load filter catalog via `get_filter_config()`.
+2. Parse `config_value.patterns` as a typed `CatalogPattern[]` with
+   fields `{ pattern_id?, regex, description, sensitivity?,
+   auto_decapsulate_for_actions[] }`. Defaults: `sensitivity=High`,
+   `auto_decapsulate_for_actions=[]`.
+3. For each pattern, compile regex + scan filtered text for matches.
+4. For each unique matched plaintext: `try_claim_secret(plaintext,
+   description, sensitivity, auto_decapsulate_for_actions, accessor)`
+   — race-safe HMAC dedup per v1.0.0 makes repeated calls idempotent.
+5. Replace each matched plaintext in filtered text with
+   `{SECRET:<uuid>:<description>}` placeholder.
+6. Return `(filtered_text, Vec<SecretReference>)`.
+
+### Filter catalog shape (locked)
+
+```json
+{
+  "patterns": [
+    {
+      "pattern_id": "aws_access_key",
+      "regex": "AKIA[0-9A-Z]{16}",
+      "description": "AWS access key",
+      "sensitivity": "high",
+      "auto_decapsulate_for_actions": ["tool"]
+    },
+    {
+      "pattern_id": "github_pat",
+      "regex": "ghp_[A-Za-z0-9]{20,}",
+      "description": "GitHub PAT",
+      "sensitivity": "high",
+      "auto_decapsulate_for_actions": []
+    }
+  ]
+}
+```
+
+The catalog is operator-tunable via `update_filter_config`. Agents
+seed it at deployment time with the pattern set they want;
+`process_incoming_text` reads it on every call (no caching — operator
+edits land immediately).
+
+### Backends
+
+- **Postgres**: existing `process_incoming_text` stub removed.
+  Inherits the default trait impl which calls the PG-side
+  `get_filter_config` + `try_claim_secret`.
+- **SQLite**: same. Inherits the default; both primitives are
+  SQLite-implemented per v1.5.1 parity sweep.
+
+### Tests
+
+- `process_incoming_text_detects_encrypts_and_replaces_via_default_impl`
+  (SQLite): two patterns, two distinct plaintexts; verifies refs
+  count, descriptions, no plaintext leaks, placeholder structure,
+  and idempotent re-run yielding same UUIDs (HMAC dedup).
+- `process_incoming_text_empty_catalog_passthrough` (SQLite): empty
+  filter config returns text unchanged with no refs.
+
+Lib suite: 436 pass (was 403 at v1.5.6 with the full feature set).
+
+### Was deferred to v1.6.x — reversed
+
+The v1.5.6 release notes said this method was "v1.6.x track" because
+of "PG advisory-lock + RETURNING semantics." That framing was wrong —
+the orchestration composes already-implemented primitives, no new
+SQL surface. Shipping in v1.5.7 instead.
+
+### Lane B status after this release
+
+| Method | State |
+|---|---|
+| `secrets_process_incoming_text` | ✅ Both backends via default trait impl (this release) |
+| `get_classifications` | SQLite parity is open work — separate cut. The v1.5.6 framing of "permanent PG-only" was wrong; the agent's classifier output should round-trip through persist on both backends. Tracked separately. |
+
+CIRISAgent Lane B write-leg can adopt directly. SQLite parity for
+`get_classifications` / `get_features` follows in a near-term cut —
+substrate ask is small (V023 migration adding the columns to SQLite
+trace_events + mirror PG's read path) but pairs naturally with a
+`set_classifications` / `set_features` write API so the agent can
+push their AdaptiveFilter output into persist as the storage
+substrate.
+
 ## [1.5.6] — 2026-05-18
 
 **Diagnostic for cirisgraph attributes UTF-8 decode failures (#58).**

@@ -525,18 +525,9 @@ impl SecretsService for PostgresBackend {
         Ok(n > 0)
     }
 
-    async fn process_incoming_text(
-        &self,
-        _text: &str,
-        _source_message_id: &str,
-        _accessor: String,
-    ) -> Result<(String, Vec<SecretReference>), SecretsError> {
-        // v0.6.2: wired with the pipeline's classify stage. v0.6.1
-        // ships the trait method but no detection catalog.
-        Err(SecretsError::Internal(
-            "process_incoming_text requires v0.6.2 pipeline orchestration".into(),
-        ))
-    }
+    // v1.5.7 (CIRISPersist#57) — process_incoming_text uses the default
+    // trait impl which composes get_filter_config + try_claim_secret.
+    // Both primitives are PG-implemented; the default suffices.
 
     async fn decapsulate_secrets_in_parameters(
         &self,
