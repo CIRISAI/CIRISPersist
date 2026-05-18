@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779113601340,
+  "lastUpdate": 1779114596200,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -16715,6 +16715,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23556378,
             "range": "± 109226",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "c884d916d1bdd89711fe15396d782581adba05c8",
+          "message": "1.5.8 — get_classifications + get_features SQLite parity (no more PG-only)\n\nReverses v1.5.1's PG-only framing for these two methods. SQLite gets\nthe read path; both backends get explicit write methods so the agent's\nAdaptiveFilter output round-trips through persist as the storage\nsubstrate.\n\nV023 migration (SQLite, PG already has via V009):\n  ALTER TABLE trace_events ADD COLUMN extracted_features TEXT;\n  ALTER TABLE trace_events ADD COLUMN classifications TEXT;\n  ALTER TABLE trace_events ADD COLUMN pipeline_metadata TEXT;\n\nAll nullable; pre-V023 rows stay valid; \"no pipeline ran\" signaled\nvia extracted_features IS NULL.\n\nNew backend methods:\n- read_features + read_classifications on SqliteBackend (mirror PG)\n- write_features + write_classifications on BOTH (new — caller's\n  contract: set this if the row exists; UPDATE on missing row is Ok(()))\n\nNew PyO3 methods:\n- set_features(trace_id, thought_id, features_json) — JSON-in;\n  dispatches BackendDispatch\n- set_classifications(trace_id, thought_id, classifications_json) —\n  same shape\n\nPyO3 dispatch updates:\n- get_features SQLite arm: calls SqliteBackend::read_features (was\n  PG-only PyRuntimeError)\n- get_classifications SQLite arm: calls\n  SqliteBackend::read_classifications\n\n8 new tests (6 SQLite + 2 PG): write-then-read round-trip; read-null\nreturns empty; write-on-missing-row is no-op; both features +\nclassifications shapes.\n\nLib suite: 349 pass with features postgres+sqlite+classify+extract.\n\nPattern: every method works on both backends. PG-only was the wrong\nframing — agent's classifier output is real data that should round-trip\nthrough persist regardless of which backend they run.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-18T09:17:33-05:00",
+          "tree_id": "a8624fb40d0748c08408e926fedb6fb27f6a8f4b",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/c884d916d1bdd89711fe15396d782581adba05c8"
+        },
+        "date": 1779114595010,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 95575,
+            "range": "± 673",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 237608,
+            "range": "± 4226",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 518376,
+            "range": "± 1843",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1992173,
+            "range": "± 43034",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 318,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1276,
+            "range": "± 32",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 6947,
+            "range": "± 43",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 20548,
+            "range": "± 69",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 23965,
+            "range": "± 44",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 88532,
+            "range": "± 263",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 318,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3169,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9771,
+            "range": "± 19",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 43969,
+            "range": "± 291",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 544,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2195497,
+            "range": "± 263380",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6678879,
+            "range": "± 537778",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23761466,
+            "range": "± 901075",
             "unit": "ns/iter"
           }
         ]
