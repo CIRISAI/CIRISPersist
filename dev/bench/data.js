@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779131993911,
+  "lastUpdate": 1779132756986,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -17903,6 +17903,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 24398010,
             "range": "± 552312",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "1ebc2aad96fed456180369845f6f767416b34e4a",
+          "message": "1.5.17 — continuity_awareness substrate (CIRISPersist#59 #9 of 11)\n\nFirst cross-substrate composite-key FK — references\ncirisgraph_nodes(node_id, scope) from v0.8.0. Feature requires\ncirisgraph: cirislens_continuity_awareness = [\"cirisgraph\"].\n\nV032 migration on both backends. 14 columns matching agent's\nshutdown-awareness table. preservation_scope reuses\ncrate::graph::types::GraphScope for single-source-of-truth across\nthe FK.\n\nIndexes: (agent_id, shutdown_timestamp DESC) for boot-time query;\npartial (agent_id, shutdown_timestamp DESC) WHERE is_terminal=FALSE\nfor active-session reactivation.\n\nCross-backend FK parity verified:\n- PG: DEFERRABLE INITIALLY DEFERRED; fires at commit; missing-row\n  returns Conflict via SqlState::FOREIGN_KEY_VIOLATION mapping.\n- SQLite: immediate enforcement via PRAGMA foreign_keys=ON; extended\n  code 787 (SQLITE_CONSTRAINT_FOREIGNKEY) distinguished from other\n  constraint violations to return Conflict (matching PG).\n\nContinuityAwarenessService trait (3 methods):\n- record_shutdown → ClaimResult (write-once per event)\n- get_latest_shutdown(agent_id) — ORDER BY shutdown_timestamp DESC\n  LIMIT 1\n- record_reactivation(agent_id) — increments reactivation_count on\n  most-recent non-terminal shutdown; false if only terminal\n\nPyO3: 3 new methods gated on cirislens_continuity_awareness feature.\n\n22 new tests (3 types + 1 mod kind + 9 PG + 9 SQLite). All 14\ncolumns round-trip; composite-key FK rejects on both backends;\nreactivation_count increments; terminal-only returns false; scope\nCHECK rejects unknown.\n\nSurprise: PG parent table is cirisgraph.nodes (separate schema)\nNOT cirislens.cirisgraph_nodes. Verified in V013.\n\nrusqlite ErrorCode::ConstraintViolation collapses CHECK/NOT NULL/FK/\nUNIQUE; extended code 787 distinguishes FK reject for PG parity.\n\n2 substrates remain: feedback_mappings (v1.5.18), wa_cert (v1.5.19).\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-18T14:24:56-05:00",
+          "tree_id": "025c34df145a0d9dd31acbcfb365b49050854394",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/1ebc2aad96fed456180369845f6f767416b34e4a"
+        },
+        "date": 1779132756378,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 108463,
+            "range": "± 1580",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 258493,
+            "range": "± 1315",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 557809,
+            "range": "± 3554",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1979349,
+            "range": "± 3593",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 340,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1459,
+            "range": "± 45",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7145,
+            "range": "± 34",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23146,
+            "range": "± 42",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26376,
+            "range": "± 464",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91017,
+            "range": "± 542",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 364,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3371,
+            "range": "± 97",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9902,
+            "range": "± 248",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42461,
+            "range": "± 499",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 637,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2259383,
+            "range": "± 60166",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7035853,
+            "range": "± 110017",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 26079385,
+            "range": "± 435098",
             "unit": "ns/iter"
           }
         ]
