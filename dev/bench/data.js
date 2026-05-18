@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779118160100,
+  "lastUpdate": 1779119030597,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -17243,6 +17243,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23693142,
             "range": "± 152673",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "2636e4927428cf3b71e59556c0d45ec04c72352f",
+          "message": "1.5.12 — scheduled_tasks substrate (CIRISPersist#59 #4 of 11)\n\nV027 migration on both backends. 15 columns. FK to cirislens_thoughts\n(thought_id) — DEFERRABLE on PG, immediate on SQLite. Status CHECK\nuses UPPERCASE vocabulary (PENDING | ACTIVE | COMPLETE | FAILED) per\nagent's schema — distinct from tasks' lowercase 6-value set.\n\n3 indexes, including scheduled_tasks_due partial index on\n(agent_occurrence_id, next_trigger_at) WHERE next_trigger_at IS NOT\nNULL AND status IN ('PENDING','ACTIVE') for the scheduler-tick hot\npath.\n\nScheduledTaskService trait (3 methods):\n- upsert_scheduled_task (ON CONFLICT DO UPDATE; preserves created_at)\n- list_due_scheduled_tasks (scheduler-tick query: WHERE\n  next_trigger_at <= now AND status IN (PENDING, ACTIVE),\n  ordered ASC, hits partial index)\n- update_after_trigger (partial-update semantics: Some(...) writes,\n  None preserves; missing-row returns false)\n\nStatus vocabulary: Rust enum TitleCase; as_sql_str emits UPPERCASE;\nserde JSON wire is snake_case (project convention); FFI uppercases\nbefore parse. CHECK rejects lowercase + tasks-vocab COMPLETED.\n\nPyO3: 3 new methods gated on cirislens_scheduled_tasks feature.\n\n22 new tests (1 mod + 6 types + 7 PG live + 8 SQLite). Lib suite:\n347 pass. All 15 columns round-trip; FK reject; partial-index hot\npath; CHECK guards.\n\nNo Backend-trait collision recurred. UFCS dispatch retained at PyO3\nsites for consistency with prior substrates.\n\nDEFERRABLE FK note: tokio-postgres's auto-commit wraps statements in\nimplicit txs; single-statement INSERTs against dangling FK targets\nfail immediately. DEFERRABLE only matters for multi-statement\ncallers (which the agent uses for parent+child writes).\n\n7 substrates remain: tickets (v1.5.13), deferral_reports,\nconsolidation_locks, creation_ceremonies, continuity_awareness,\nfeedback_mappings, wa_cert.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-18T10:35:42-05:00",
+          "tree_id": "00a833c23fba7dce48d52c12f37babc9eca2aa4e",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/2636e4927428cf3b71e59556c0d45ec04c72352f"
+        },
+        "date": 1779119029799,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101859,
+            "range": "± 3986",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 242255,
+            "range": "± 1423",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 522911,
+            "range": "± 1696",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1843448,
+            "range": "± 10725",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 343,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1408,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7335,
+            "range": "± 94",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21267,
+            "range": "± 219",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24324,
+            "range": "± 95",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83704,
+            "range": "± 130",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 365,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3190,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9480,
+            "range": "± 26",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41843,
+            "range": "± 113",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 622,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2260637,
+            "range": "± 88107",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6585489,
+            "range": "± 90331",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23649038,
+            "range": "± 163830",
             "unit": "ns/iter"
           }
         ]
