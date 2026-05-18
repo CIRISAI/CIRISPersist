@@ -140,7 +140,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "thoughts_not_found"
         | "correlations_not_found"
         | "scheduled_tasks_not_found"
-        | "tickets_not_found" => NotFound::new_err(msg),
+        | "tickets_not_found"
+        | "deferral_reports_not_found" => NotFound::new_err(msg),
 
         // Conflict family — uniqueness / version / state-transition
         // conflict; caller MUST NOT retry, MUST re-read.
@@ -153,7 +154,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "thoughts_conflict"
         | "correlations_conflict"
         | "scheduled_tasks_conflict"
-        | "tickets_conflict" => Conflict::new_err(msg),
+        | "tickets_conflict"
+        | "deferral_reports_conflict" => Conflict::new_err(msg),
 
         // Transient family — backend connection / timeout / pool
         // exhaustion; caller MAY retry with backoff.
@@ -168,7 +170,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "thoughts_backend"
         | "correlations_backend"
         | "scheduled_tasks_backend"
-        | "tickets_backend" => Transient::new_err(msg),
+        | "tickets_backend"
+        | "deferral_reports_backend" => Transient::new_err(msg),
 
         // Default — Permanent. Covers invalid arguments, signature
         // failures, crypto errors, rotation conflicts, "not authorized,"
@@ -9358,6 +9361,231 @@ impl PyEngine {
         })
     }
 
+    // ── v1.5.14 (CIRISPersist#59 #6) — deferral_reports cluster ──
+    //
+    // 4 methods wrapping DeferralReportService. JSON wire format
+    // mirrors the tasks/thoughts/correlations/scheduled_tasks/
+    // tickets substrate patterns: DeferralReport struct decoded/
+    // encoded via serde at the FFI boundary. `record_deferral`
+    // returns a JSON-encoded ClaimResult (`{"outcome": "stored" |
+    // "already_claimed", "report": <DeferralReport>}`) — race
+    // winner gets Stored, loser gets AlreadyClaimed carrying the
+    // existing row.
+
+    /// v1.5.14 — Record a deferral report. INSERT ON CONFLICT
+    /// (message_id) DO NOTHING — idempotent on message_id. Returns
+    /// a JSON-encoded ClaimResult shape:
+    /// `{"outcome": "stored" | "already_claimed", "report":
+    /// <DeferralReport>}`. The race winner sees `"stored"` and
+    /// their own row; race losers see `"already_claimed"` and the
+    /// EXISTING row. Both arms carry the report so callers always
+    /// have a stable identifier for downstream work.
+    ///
+    /// FK semantics: `task_id` must reference an existing row in
+    /// `cirislens.tasks`, and `thought_id` must reference an
+    /// existing row in `cirislens.thoughts`. PG: both FKs are
+    /// `DEFERRABLE INITIALLY DEFERRED` so a single tx can write
+    /// `(task, thought, deferral_report)` in order. SQLite: FKs
+    /// are immediate; agent callers ensure parent rows exist
+    /// before recording.
+    #[cfg(feature = "cirislens_deferral_reports")]
+    fn deferral_record(&self, py: Python<'_>, report_json: &str) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let report: crate::deferral_reports::DeferralReport = serde_json::from_str(report_json)
+                .map_err(|e| PyValueError::new_err(format!("DeferralReport decode: {e}")))?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::deferral_reports::DeferralReportService;
+                        let outcome = backend
+                            .record_deferral(report)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        encode_deferral_claim_result(outcome).map_err(|e| {
+                            PyRuntimeError::new_err(format!("ClaimResult encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::deferral_reports::sqlite::SqliteDeferralReportBackend::new(
+                        sq.conn_handle(),
+                    );
+                    runtime.block_on(async move {
+                        use crate::deferral_reports::DeferralReportService;
+                        let outcome = backend
+                            .record_deferral(report)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        encode_deferral_claim_result(outcome).map_err(|e| {
+                            PyRuntimeError::new_err(format!("ClaimResult encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.14 — Point lookup. Returns JSON-encoded
+    /// `DeferralReport` or `None` (Python `None`) when no matching
+    /// row.
+    #[cfg(feature = "cirislens_deferral_reports")]
+    fn deferral_get(&self, py: Python<'_>, message_id: &str) -> PyResult<Option<String>> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let message_id = message_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::deferral_reports::DeferralReportService;
+                        let got = backend
+                            .get_deferral(&message_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match got {
+                            None => Ok(None),
+                            Some(r) => serde_json::to_string(&r).map(Some).map_err(|e| {
+                                PyRuntimeError::new_err(format!("DeferralReport encode: {e}"))
+                            }),
+                        }
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::deferral_reports::sqlite::SqliteDeferralReportBackend::new(
+                        sq.conn_handle(),
+                    );
+                    runtime.block_on(async move {
+                        use crate::deferral_reports::DeferralReportService;
+                        let got = backend
+                            .get_deferral(&message_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match got {
+                            None => Ok(None),
+                            Some(r) => serde_json::to_string(&r).map(Some).map_err(|e| {
+                                PyRuntimeError::new_err(format!("DeferralReport encode: {e}"))
+                            }),
+                        }
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.14 — WA queue: list deferrals awaiting resolution
+    /// (`resolved_at IS NULL`), newest-first by `created_at`.
+    /// `filter_json` is a JSON-encoded `DeferralFilter` — supported
+    /// fields: `task_id`, `thought_id`, `created_after`,
+    /// `created_before` (RFC 3339 timestamps for the time window).
+    /// Returns JSON-encoded `Vec<DeferralReport>`. Hits the partial
+    /// index `deferral_reports_active`.
+    #[cfg(feature = "cirislens_deferral_reports")]
+    fn deferral_list_active(
+        &self,
+        py: Python<'_>,
+        filter_json: &str,
+        limit: i64,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let filter: crate::deferral_reports::DeferralFilter = serde_json::from_str(filter_json)
+                .map_err(|e| PyValueError::new_err(format!("DeferralFilter decode: {e}")))?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::deferral_reports::DeferralReportService;
+                        let items = backend
+                            .list_active_deferrals(filter, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&items).map_err(|e| {
+                            PyRuntimeError::new_err(format!("DeferralReport list encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::deferral_reports::sqlite::SqliteDeferralReportBackend::new(
+                        sq.conn_handle(),
+                    );
+                    runtime.block_on(async move {
+                        use crate::deferral_reports::DeferralReportService;
+                        let items = backend
+                            .list_active_deferrals(filter, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&items).map_err(|e| {
+                            PyRuntimeError::new_err(format!("DeferralReport list encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.14 — Mark a deferral as resolved. Sets `resolved_at`
+    /// to `resolved_at_iso` (RFC 3339) and `resolution_notes` to
+    /// the supplied value (overwrites; `None` clears). Returns
+    /// `True` when a row was updated, `False` when no matching row
+    /// (no error — callers treat as stale id).
+    #[cfg(feature = "cirislens_deferral_reports")]
+    #[pyo3(signature = (message_id, resolved_at, resolution_notes=None))]
+    fn deferral_resolve(
+        &self,
+        py: Python<'_>,
+        message_id: &str,
+        resolved_at: &str,
+        resolution_notes: Option<&str>,
+    ) -> PyResult<bool> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let resolved_at_dt: chrono::DateTime<chrono::Utc> =
+                chrono::DateTime::parse_from_rfc3339(resolved_at)
+                    .map_err(|e| PyValueError::new_err(format!("resolved_at parse: {e}")))?
+                    .with_timezone(&chrono::Utc);
+            let message_id_owned = message_id.to_owned();
+            let resolution_notes_owned = resolution_notes.map(|s| s.to_owned());
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::deferral_reports::DeferralReportService;
+                        backend
+                            .resolve_deferral(
+                                &message_id_owned,
+                                resolved_at_dt,
+                                resolution_notes_owned,
+                            )
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::deferral_reports::sqlite::SqliteDeferralReportBackend::new(
+                        sq.conn_handle(),
+                    );
+                    runtime.block_on(async move {
+                        use crate::deferral_reports::DeferralReportService;
+                        backend
+                            .resolve_deferral(
+                                &message_id_owned,
+                                resolved_at_dt,
+                                resolution_notes_owned,
+                            )
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
     // ── v1.2.0 (CIRISPersist#48) maintenance cluster ─────────────
     //
     // Absorbs the operations side of CIRISAgent's
@@ -9576,6 +9804,29 @@ fn encode_claim_result(
     let wire = serde_json::json!({
         "outcome": label,
         "task": task,
+    });
+    serde_json::to_string(&wire)
+}
+
+/// v1.5.14 (CIRISPersist#59 #6) — encode a
+/// [`ClaimResult<DeferralReport>`] onto the
+/// `{"outcome": "stored" | "already_claimed", "report":
+/// <DeferralReport>}` JSON wire shape. Same template as
+/// [`encode_claim_result`] for tasks but with a `report` key instead
+/// of `task` — the deferral_reports substrate has no HTTP server peer
+/// to share a wire crate with, so the helper lives adjacent to the
+/// FFI surface.
+#[cfg(feature = "cirislens_deferral_reports")]
+fn encode_deferral_claim_result(
+    outcome: crate::ClaimResult<crate::deferral_reports::DeferralReport>,
+) -> Result<String, serde_json::Error> {
+    let (label, report) = match outcome {
+        crate::ClaimResult::Stored(r) => ("stored", r),
+        crate::ClaimResult::AlreadyClaimed(r) => ("already_claimed", r),
+    };
+    let wire = serde_json::json!({
+        "outcome": label,
+        "report": report,
     });
     serde_json::to_string(&wire)
 }

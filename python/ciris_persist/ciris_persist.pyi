@@ -514,6 +514,56 @@ class Engine:
         matching ticket (no error — callers treat as stale id).
         """
 
+    # ── v1.5.14 (CIRISPersist#59 #6) — deferral_reports substrate
+
+    def deferral_record(self, report_json: str) -> str:
+        """v1.5.14 — Record a deferral report. ``report_json`` is a
+        JSON-encoded ``DeferralReport`` (see the
+        ``ciris_persist.deferral_reports`` module).
+
+        Returns a JSON-encoded ClaimResult wire shape:
+        ``{"outcome": "stored" | "already_claimed",
+        "report": <DeferralReport>}``. The race winner sees
+        ``"stored"`` and their own row; race losers see
+        ``"already_claimed"`` and the EXISTING row.
+
+        FK semantics: ``task_id`` must reference an existing row in
+        ``cirislens.tasks``, and ``thought_id`` must reference an
+        existing row in ``cirislens.thoughts``. PG: both FKs are
+        DEFERRABLE INITIALLY DEFERRED so a single tx can write
+        ``(task, thought, deferral_report)`` in order. SQLite: FKs
+        are immediate; callers ensure parent rows exist before
+        recording.
+        """
+
+    def deferral_get(self, message_id: str) -> str | None:
+        """v1.5.14 — Point lookup. Returns JSON-encoded
+        ``DeferralReport`` or ``None`` when no matching row."""
+
+    def deferral_list_active(self, filter_json: str, limit: int) -> str:
+        """v1.5.14 — WA queue: list deferrals awaiting resolution
+        (``resolved_at IS NULL``), newest-first by ``created_at``.
+        ``filter_json`` is a JSON-encoded ``DeferralFilter`` —
+        supported fields: ``task_id``, ``thought_id``,
+        ``created_after``, ``created_before`` (RFC 3339 timestamps).
+        Returns JSON-encoded ``list[DeferralReport]``. Hits the
+        partial index ``deferral_reports_active``.
+        """
+
+    def deferral_resolve(
+        self,
+        message_id: str,
+        resolved_at: str,
+        resolution_notes: str | None = None,
+    ) -> bool:
+        """v1.5.14 — Mark a deferral as resolved. Sets
+        ``resolved_at`` (RFC 3339 ISO string) and
+        ``resolution_notes`` (overwrites; ``None`` clears).
+
+        Returns ``True`` when a row was updated, ``False`` when no
+        matching row (no error — callers treat as stale id).
+        """
+
     def trust_grant_consistency_proof(
         self,
         tenant_id: str,

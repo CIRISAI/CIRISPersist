@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "1.5.13"
+version = "1.5.14"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -217,6 +217,22 @@ cirislens_scheduled_tasks = []
 # work). PG: JSONB metadata + TIMESTAMPTZ + BOOLEAN automated;
 # SQLite: TEXT JSON + INTEGER booleans. Threat model AV-15.
 cirislens_tickets = []
+
+# v1.5.14 (CIRISPersist#59 #6) — agent deferral_reports substrate.
+# Sixth of 11 substrate absorptions. Absorbs the agent's
+# `deferral_reports` table — WA (Wise-Authority) deferrals routed by
+# message_id and pointing back into the agent's (task, thought)
+# reasoning chain via NOT NULL FKs. UPSERT semantics use
+# INSERT...ON CONFLICT(message_id) DO NOTHING → readback (ClaimResult:
+# race winner gets Stored, loser gets AlreadyClaimed with existing
+# row). `list_active_deferrals` hot path filters `resolved_at IS NULL`
+# newest-first; `resolve_deferral` flips the persist-only nullable
+# `resolved_at` + `resolution_notes` pair. 7 columns (5 agent +
+# 2 persist-only). FKs to cirislens.tasks(task_id) +
+# cirislens.thoughts(thought_id) (PG: both DEFERRABLE; SQLite:
+# immediate). PG: JSONB package + TIMESTAMPTZ; SQLite: TEXT JSON.
+# Threat model AV-15.
+cirislens_deferral_reports = []
 
 # v0.1.3 — optional TLS for the Postgres connection pool. Defaults
 # to no-TLS (deployments where the lens process and Postgres are

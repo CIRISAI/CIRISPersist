@@ -99,6 +99,7 @@ features = [
     "cirislens_correlations",
     "cirislens_scheduled_tasks",
     "cirislens_tickets",
+    "cirislens_deferral_reports",
     "secrets",
     "cirisnode",
     "extract",

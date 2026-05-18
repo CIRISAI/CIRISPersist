@@ -5,6 +5,74 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.5.14] — 2026-05-18
+
+**`deferral_reports` substrate — 6 of 11 (CIRISPersist#59 #6).**
+
+V029 migration on both backends. 7 columns: message_id (PK),
+task_id (FK → cirislens_tasks), thought_id (FK → cirislens_thoughts),
+package (JSONB on PG / TEXT JSON on SQLite), created_at, resolved_at,
+resolution_notes.
+
+Substrate adds `resolved_at` + `resolution_notes` columns beyond the
+agent's bare 5-column schema. Necessary for the
+`list_active_deferrals` query (WA deferrals awaiting resolution)
+spec'd in CIRISPersist#59. Both nullable — back-compat with agent's
+existing rows preserved.
+
+3 indexes: `(task_id)`, `(thought_id)`, partial
+`(created_at DESC) WHERE resolved_at IS NULL` for the active-only
+hot path.
+
+### DeferralReportService trait (4 methods)
+
+- `record_deferral(report)` → `ClaimResult<DeferralReport>` —
+  INSERT-OR-IGNORE on message_id; idempotent re-record returns the
+  original row's payload
+- `get_deferral(message_id)`
+- `list_active_deferrals(filter, limit)` — only rows with
+  `resolved_at IS NULL`; filter by task_id / thought_id / created
+  window; ordered by created_at DESC
+- `resolve_deferral(message_id, resolved_at, resolution_notes?)` →
+  bool (false = didn't exist)
+
+### PyO3 surface
+
+4 new Engine methods gated on `cirislens_deferral_reports`. Stable
+error kinds: `deferral_reports_invalid_argument |
+deferral_reports_not_found | deferral_reports_conflict |
+deferral_reports_backend | deferral_reports_internal`.
+
+### Tests
+
+18 new (3 types + 1 mod kind + 7 PG + 7 SQLite):
+- All 7 columns round-trip including JSON package + nullable
+  resolved_at/resolution_notes
+- FK to tasks + thoughts: rejects nonexistent IDs on both backends
+- `record_deferral` race semantics: clean Stored on first; duplicate
+  message_id returns AlreadyClaimed carrying original row
+- `list_active_deferrals`: 3 deferrals (2 resolved, 1 active) →
+  returns 1 active; filter by task_id; filter by created_after window
+- `resolve_deferral`: success + missing-row=false + readback reflects
+  resolution
+
+Lib suite: 18/18 deferral tests pass (and prior substrates unchanged).
+
+### Notes on partial-then-finish work
+
+Previous sub-agent timed out partway. Finish pass added: SQLite impl
+(616 lines), Cargo.toml feature flag, pyproject.toml maturin entry,
+lib.rs registration, all 4 PyO3 wrappers + error-kind tokens, .pyi
+stubs, qa_harness count bump (1..=28 → 1..=29). No surprises in the
+partial work — Postgres impl + service trait + types were all
+correctly shaped.
+
+### Remaining 5 substrates
+
+`consolidation_locks` (v1.5.15), `creation_ceremonies` (v1.5.16),
+`continuity_awareness` (v1.5.17), `feedback_mappings` (v1.5.18),
+`wa_cert` (v1.5.19).
+
 ## [1.5.13] — 2026-05-18
 
 **`tickets` substrate — 5 of 11 (CIRISPersist#59 #5).**
