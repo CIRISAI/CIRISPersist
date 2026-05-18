@@ -5,6 +5,55 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.5.16] — 2026-05-18
+
+**`creation_ceremonies` substrate — 8 of 11 (CIRISPersist#59 #8).**
+
+V031 migration on both backends. 14 columns matching the agent's
+identity-creation history table verbatim. Status CHECK:
+`pending | in_progress | completed | failed | revoked`. No FKs
+(agent_id references are free-form pointers across the federation).
+
+`expected_capabilities` stays `Option<String>` rather than typed
+JSON — the agent stores TEXT and we preserve the wire format
+literally so callers ride the same payload across the absorb
+boundary.
+
+4 indexes: `(new_agent_id)`, `(creator_agent_id, timestamp DESC)`,
+`(wise_authority_id, timestamp DESC)`, `(timestamp DESC)`.
+
+### CreationCeremonyService trait (4 methods)
+
+- `record_ceremony` → ClaimResult (write-once shape; ON CONFLICT DO
+  NOTHING; AlreadyClaimed on duplicate)
+- `get_ceremony`
+- `list_ceremonies` — filter by creator/wa/new_agent/status/time
+  window; ORDER BY timestamp DESC; LIMIT
+- `update_ceremony_status` — atomic status advance; missing-row=false
+
+### PyO3 surface
+
+4 new Engine methods gated on `cirislens_creation_ceremonies`.
+Stable error kinds: `creation_ceremonies_invalid_argument |
+_not_found | _conflict | _backend | _internal`.
+
+### Tests
+
+22 new (6 types + 1 mod kind + 7 PG + 7 SQLite):
+- All 14 columns round-trip
+- AlreadyClaimed loser on duplicate ceremony_id
+- List by creator / new_agent / WA + status + window
+- Status CHECK rejects unknown
+- `update_ceremony_status` success + missing-row=false
+- Required columns validated
+
+Lib suite: 298 pass.
+
+### Remaining 3 substrates
+
+`continuity_awareness` (v1.5.17), `feedback_mappings` (v1.5.18),
+`wa_cert` (v1.5.19).
+
 ## [1.5.15] — 2026-05-18
 
 **`maintenance_locks` substrate — 7 of 11 (CIRISPersist#59 #7).**

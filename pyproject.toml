@@ -101,6 +101,7 @@ features = [
     "cirislens_tickets",
     "cirislens_deferral_reports",
     "cirislens_maintenance_locks",
+    "cirislens_creation_ceremonies",
     "secrets",
     "cirisnode",
     "extract",

@@ -616,6 +616,53 @@ class Engine:
         present-but-expired holder is stealable.
         """
 
+    # ── v1.5.16 (CIRISPersist#59 #8) — creation_ceremonies substrate
+
+    def ceremony_record(self, ceremony_json: str) -> str:
+        """v1.5.16 — Record a creation ceremony. ``ceremony_json``
+        is a JSON-encoded ``CreationCeremony`` (see the
+        ``ciris_persist.creation_ceremonies`` module). INSERT ON
+        CONFLICT (ceremony_id) DO NOTHING — write-once shape.
+
+        Returns a JSON-encoded ClaimResult object:
+        ``{"outcome": "stored" | "already_claimed",
+          "ceremony": <CreationCeremony>}``.
+        The race winner sees ``"stored"`` and their own row; race
+        losers see ``"already_claimed"`` and the EXISTING row
+        (the loser's payload is discarded — write-once contract).
+        """
+
+    def ceremony_get(self, ceremony_id: str) -> str | None:
+        """v1.5.16 — Point lookup. Returns JSON-encoded
+        ``CreationCeremony`` or ``None`` when no matching row."""
+
+    def ceremony_list(self, filter_json: str, limit: int) -> str:
+        """v1.5.16 — History query. ``filter_json`` is a
+        JSON-encoded ``CeremonyFilter`` — supported fields:
+        ``creator_agent_id``, ``creator_human_id``,
+        ``wise_authority_id``, ``new_agent_id``,
+        ``ceremony_status`` (lowercase snake_case),
+        ``timestamp_after``, ``timestamp_before`` (RFC 3339
+        timestamps).
+
+        Returns JSON-encoded ``list[CreationCeremony]`` ordered by
+        ``(timestamp, ceremony_id)``, newest-first, limited.
+        """
+
+    def ceremony_update_status(
+        self,
+        ceremony_id: str,
+        new_status: str,
+    ) -> bool:
+        """v1.5.16 — Atomic ceremony-status advance. ``new_status``
+        is a lowercase snake_case string from the 5-value
+        vocabulary (``pending`` | ``in_progress`` | ``completed`` |
+        ``failed`` | ``revoked``).
+
+        Returns ``True`` when a row was updated, ``False`` when no
+        matching row (no error — callers treat as stale id).
+        """
+
     def trust_grant_consistency_proof(
         self,
         tenant_id: str,

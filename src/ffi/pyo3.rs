@@ -142,7 +142,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "scheduled_tasks_not_found"
         | "tickets_not_found"
         | "deferral_reports_not_found"
-        | "maintenance_locks_not_found" => NotFound::new_err(msg),
+        | "maintenance_locks_not_found"
+        | "creation_ceremonies_not_found" => NotFound::new_err(msg),
 
         // Conflict family — uniqueness / version / state-transition
         // conflict; caller MUST NOT retry, MUST re-read.
@@ -157,7 +158,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "scheduled_tasks_conflict"
         | "tickets_conflict"
         | "deferral_reports_conflict"
-        | "maintenance_locks_conflict" => Conflict::new_err(msg),
+        | "maintenance_locks_conflict"
+        | "creation_ceremonies_conflict" => Conflict::new_err(msg),
 
         // Transient family — backend connection / timeout / pool
         // exhaustion; caller MAY retry with backoff.
@@ -174,7 +176,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "scheduled_tasks_backend"
         | "tickets_backend"
         | "deferral_reports_backend"
-        | "maintenance_locks_backend" => Transient::new_err(msg),
+        | "maintenance_locks_backend"
+        | "creation_ceremonies_backend" => Transient::new_err(msg),
 
         // Default — Permanent. Covers invalid arguments, signature
         // failures, crypto errors, rotation conflicts, "not authorized,"
@@ -9763,6 +9766,216 @@ impl PyEngine {
         })
     }
 
+    // ── v1.5.16 (CIRISPersist#59 #8) — creation_ceremonies cluster ──
+    //
+    // 4 methods wrapping CreationCeremonyService. JSON wire format
+    // mirrors the deferral_reports / tasks / tickets substrate
+    // pattern: CreationCeremony struct decoded/encoded via serde at
+    // the FFI boundary. `ceremony_record` returns a JSON-encoded
+    // ClaimResult (`{"outcome": "stored" | "already_claimed",
+    // "ceremony": <CreationCeremony>}`) — race winner gets Stored,
+    // loser gets AlreadyClaimed carrying the existing row.
+
+    /// v1.5.16 — Record a ceremony. INSERT ON CONFLICT
+    /// (ceremony_id) DO NOTHING — write-once shape. Returns a
+    /// JSON-encoded ClaimResult shape:
+    /// `{"outcome": "stored" | "already_claimed", "ceremony":
+    /// <CreationCeremony>}`. The race winner sees `"stored"` and
+    /// their own row; race losers see `"already_claimed"` and the
+    /// EXISTING row.
+    #[cfg(feature = "cirislens_creation_ceremonies")]
+    fn ceremony_record(&self, py: Python<'_>, ceremony_json: &str) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let ceremony: crate::creation_ceremonies::CreationCeremony =
+                serde_json::from_str(ceremony_json)
+                    .map_err(|e| PyValueError::new_err(format!("CreationCeremony decode: {e}")))?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::creation_ceremonies::CreationCeremonyService;
+                        let outcome = backend
+                            .record_ceremony(ceremony)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        encode_ceremony_claim_result(outcome).map_err(|e| {
+                            PyRuntimeError::new_err(format!("ClaimResult encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::creation_ceremonies::sqlite::SqliteCreationCeremonyBackend::new(
+                            sq.conn_handle(),
+                        );
+                    runtime.block_on(async move {
+                        use crate::creation_ceremonies::CreationCeremonyService;
+                        let outcome = backend
+                            .record_ceremony(ceremony)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        encode_ceremony_claim_result(outcome).map_err(|e| {
+                            PyRuntimeError::new_err(format!("ClaimResult encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.16 — Point lookup. Returns JSON-encoded
+    /// `CreationCeremony` or `None` (Python `None`) when no matching
+    /// row.
+    #[cfg(feature = "cirislens_creation_ceremonies")]
+    fn ceremony_get(&self, py: Python<'_>, ceremony_id: &str) -> PyResult<Option<String>> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let ceremony_id = ceremony_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::creation_ceremonies::CreationCeremonyService;
+                        let got = backend
+                            .get_ceremony(&ceremony_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match got {
+                            None => Ok(None),
+                            Some(c) => serde_json::to_string(&c).map(Some).map_err(|e| {
+                                PyRuntimeError::new_err(format!("CreationCeremony encode: {e}"))
+                            }),
+                        }
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::creation_ceremonies::sqlite::SqliteCreationCeremonyBackend::new(
+                            sq.conn_handle(),
+                        );
+                    runtime.block_on(async move {
+                        use crate::creation_ceremonies::CreationCeremonyService;
+                        let got = backend
+                            .get_ceremony(&ceremony_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match got {
+                            None => Ok(None),
+                            Some(c) => serde_json::to_string(&c).map(Some).map_err(|e| {
+                                PyRuntimeError::new_err(format!("CreationCeremony encode: {e}"))
+                            }),
+                        }
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.16 — History query. `filter_json` is a JSON-encoded
+    /// `CeremonyFilter` — supported fields: `creator_agent_id`,
+    /// `creator_human_id`, `wise_authority_id`, `new_agent_id`,
+    /// `ceremony_status`, `timestamp_after`, `timestamp_before`
+    /// (RFC 3339 timestamps for the time window). Returns
+    /// JSON-encoded `Vec<CreationCeremony>` ordered by
+    /// `timestamp DESC, ceremony_id DESC`, limited.
+    #[cfg(feature = "cirislens_creation_ceremonies")]
+    fn ceremony_list(&self, py: Python<'_>, filter_json: &str, limit: i64) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let filter: crate::creation_ceremonies::CeremonyFilter =
+                serde_json::from_str(filter_json)
+                    .map_err(|e| PyValueError::new_err(format!("CeremonyFilter decode: {e}")))?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::creation_ceremonies::CreationCeremonyService;
+                        let items = backend
+                            .list_ceremonies(filter, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&items).map_err(|e| {
+                            PyRuntimeError::new_err(format!("CreationCeremony list encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::creation_ceremonies::sqlite::SqliteCreationCeremonyBackend::new(
+                            sq.conn_handle(),
+                        );
+                    runtime.block_on(async move {
+                        use crate::creation_ceremonies::CreationCeremonyService;
+                        let items = backend
+                            .list_ceremonies(filter, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&items).map_err(|e| {
+                            PyRuntimeError::new_err(format!("CreationCeremony list encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.16 — Atomic ceremony-status advance. `new_status` is a
+    /// lowercase snake_case string from the 5-value vocabulary
+    /// (`pending | in_progress | completed | failed | revoked`).
+    /// Returns `True` when a row was updated, `False` when no
+    /// matching row (no error — callers treat as stale id).
+    #[cfg(feature = "cirislens_creation_ceremonies")]
+    fn ceremony_update_status(
+        &self,
+        py: Python<'_>,
+        ceremony_id: &str,
+        new_status: &str,
+    ) -> PyResult<bool> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let new_status_parsed = crate::creation_ceremonies::CeremonyStatus::parse_str(
+                new_status,
+            )
+            .ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "unknown ceremony_status `{new_status}`; \
+                             expected one of pending|in_progress|completed|failed|revoked"
+                ))
+            })?;
+            let ceremony_id_owned = ceremony_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::creation_ceremonies::CreationCeremonyService;
+                        backend
+                            .update_ceremony_status(&ceremony_id_owned, new_status_parsed)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::creation_ceremonies::sqlite::SqliteCreationCeremonyBackend::new(
+                            sq.conn_handle(),
+                        );
+                    runtime.block_on(async move {
+                        use crate::creation_ceremonies::CreationCeremonyService;
+                        backend
+                            .update_ceremony_status(&ceremony_id_owned, new_status_parsed)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
     // ── v1.2.0 (CIRISPersist#48) maintenance cluster ─────────────
     //
     // Absorbs the operations side of CIRISAgent's
@@ -10004,6 +10217,27 @@ fn encode_deferral_claim_result(
     let wire = serde_json::json!({
         "outcome": label,
         "report": report,
+    });
+    serde_json::to_string(&wire)
+}
+
+/// v1.5.16 (CIRISPersist#59 #8) — encode a
+/// [`ClaimResult<CreationCeremony>`] onto the
+/// `{"outcome": "stored" | "already_claimed", "ceremony":
+/// <CreationCeremony>}` JSON wire shape. Same template as the
+/// tasks / deferral helpers — keyed `"ceremony"` because the
+/// substrate's row shape is named [`CreationCeremony`].
+#[cfg(feature = "cirislens_creation_ceremonies")]
+fn encode_ceremony_claim_result(
+    outcome: crate::ClaimResult<crate::creation_ceremonies::CreationCeremony>,
+) -> Result<String, serde_json::Error> {
+    let (label, ceremony) = match outcome {
+        crate::ClaimResult::Stored(c) => ("stored", c),
+        crate::ClaimResult::AlreadyClaimed(c) => ("already_claimed", c),
+    };
+    let wire = serde_json::json!({
+        "outcome": label,
+        "ceremony": ceremony,
     });
     serde_json::to_string(&wire)
 }
