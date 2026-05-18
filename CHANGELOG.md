@@ -5,6 +5,110 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.5.9] — 2026-05-18
+
+**`tasks` substrate — first of 11 absorptions ending dual-libsqlite WAL corruption ([#59](https://github.com/CIRISAI/CIRISPersist/issues/59) #1).**
+
+CIRISAgent 2.9.0's full absorption commitment: persist becomes the
+only library that ever opens the engine DB file. This ships the first
+of 11 substrates absorbing the agent's `ciris_engine.db` legacy
+tables. v1.5.10-v1.5.19 follow with the remaining 10.
+
+### `tasks` substrate
+
+V024 migration on both backends with all 17 columns from CIRISAgent
+v2.8.13 `tasks` table:
+- `task_id` PK, `channel_id`, `description`, `status`, `priority`
+- `created_at`, `updated_at`, `parent_task_id` (self-FK, deferrable on PG)
+- `context_json` / `outcome_json` / `images_json` (JSONB on PG; TEXT on SQLite)
+- `retry_count`, `signed_by` / `signature` / `signed_at` (audit envelope)
+- `updated_info_available` / `updated_info_content` (multi-occurrence sync)
+- `agent_occurrence_id` (multi-occurrence partitioning; default `"default"`)
+
+Indexes: `(agent_occurrence_id, status, updated_at DESC)` for the hot
+list-by-status path; `(channel_id, updated_at DESC)`; `(parent_task_id)`
+WHERE NOT NULL for tree walks.
+
+Status vocabulary CHECK: `pending | active | completed | failed |
+cancelled | deferred`.
+
+### New `TaskService` trait + `Task` typed shape
+
+`src/tasks/` module (gated on new `cirislens_tasks` feature, included
+in the maturin wheel features):
+
+- `Task` struct with all 17 columns typed (`context: Option<serde_json::Value>`
+  etc.); `TaskStatus` enum with stable SQL strings; `TaskFilter` for
+  bounded queries; `TaskCursor` for pagination; `TaskListPage`.
+- `TaskService` trait, 6 methods:
+  - `upsert_task(task)` — idempotent; same task_id with differing
+    data overwrites non-monotonic columns
+  - `get_task(task_id) -> Option<Task>`
+  - `list_tasks(filter, cursor?, limit) -> TaskListPage` — cursor
+    pagination on `(updated_at, task_id)`
+  - `update_task_status(task_id, new_status, outcome_json?) -> bool` —
+    false = task didn't exist
+  - `try_claim_shared_task(task) -> ClaimResult<Task>` — atomic
+    INSERT OR IGNORE for multi-occurrence coordination (race-safe on
+    task_id PK; Stored on win, AlreadyClaimed on race)
+  - `delete_task(task_id) -> bool` — true if a row was deleted; FK
+    REJECT on children (caller deletes subtree explicitly)
+- PG + SQLite impls (`src/tasks/postgres.rs` + `src/tasks/sqlite.rs`).
+
+### PyO3 surface
+
+6 new Engine methods, all JSON-in/JSON-out and dispatching to both
+backends:
+- `task_upsert(task_json)`
+- `task_get(task_id) -> Option<json>`
+- `task_list(filter_json, cursor_json?, limit) -> json`
+- `task_update_status(task_id, new_status, outcome_json?) -> bool`
+- `task_try_claim_shared(task_json) -> json` (ClaimResult)
+- `task_delete(task_id) -> bool`
+
+Stable error-kind tokens added to `translate_error_kind`:
+`tasks_invalid_argument | tasks_not_found | tasks_conflict |
+tasks_backend | tasks_internal`. Python wrapper `.pyi` extended with
+all 6 signatures.
+
+### Tests
+
+22 new tests: 5 types unit tests + 1 mod error-kind test + 9 SQLite
+integration + 7 PG integration. All 17 columns round-trip; idempotent
+upsert; cursor pagination; concurrent try_claim race produces one
+Stored + one AlreadyClaimed referencing the same row; FK parent
+existence enforced on both backends (PG via DEFERRABLE constraint
+checked at commit, SQLite via immediate FK).
+
+Lib suite: 298 pass with `postgres sqlite cirislens_tasks` feature
+set. `cargo fmt` + `cargo clippy ... -D warnings` clean.
+
+### Method-name collision note
+
+`PostgresBackend` already had `upsert_task` + `try_claim_shared_task`
+placeholders on the `Backend` trait from a prior Phase 3 stub. The
+new `TaskService` impl on the same type collides at method-resolution
+time. Resolved via UFCS at every PG call site
+(`TaskService::upsert_task(&backend, …)`). SQLite was clean —
+`SqliteTaskBackend` is a separate wrapper. The Phase 3 `Backend` trait
+placeholders can be removed in a future cleanup once we're sure no
+other consumer references them.
+
+### Remaining 10 substrates
+
+| # | Substrate | Release |
+|---|---|---|
+| 2 | `thoughts` (FK to tasks) | v1.5.10 |
+| 3 | `service_correlations` (hot) | v1.5.11 |
+| 4 | `scheduled_tasks` | v1.5.12 |
+| 5 | `tickets` | v1.5.13 |
+| 6 | `deferral_reports` | v1.5.14 |
+| 7 | `consolidation_locks` (generic maintenance_lock_*) | v1.5.15 |
+| 8 | `creation_ceremonies` | v1.5.16 |
+| 9 | `continuity_awareness` (FK to graph_nodes) | v1.5.17 |
+| 10 | `feedback_mappings` | v1.5.18 |
+| 11 | `wa_cert` | v1.5.19 |
+
 ## [1.5.8] — 2026-05-18
 
 **SQLite parity for `get_classifications` + `get_features`. Plus write paths.**

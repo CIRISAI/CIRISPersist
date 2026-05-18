@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "1.5.8"
+version = "1.5.9"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -156,6 +156,15 @@ telemetry      = ["cirisgraph"]  # no `postgres` or `sqlite` requirement — pai
 # record + open→investigating→resolved→closed state machine.
 # Threat model AV-55 / AV-56.
 cirisincident  = []
+
+# v1.5.9 (CIRISPersist#59 #1) — agent tasks substrate. First of 11
+# substrate absorptions ending CIRISAgent's direct libsqlite access
+# to `ciris_engine.db`. Absorbs the `tasks` table — task_id PK
+# upsert, status-machine update, multi-occurrence atomic claim via
+# ClaimResult, FK-cascade-aware delete. Pairs with either backend
+# (PG: JSONB columns + DEFERRABLE self-FK; SQLite: TEXT JSON + plain
+# self-FK). Threat model AV-15 (stable kind() tokens).
+cirislens_tasks = []
 
 # v0.1.3 — optional TLS for the Postgres connection pool. Defaults
 # to no-TLS (deployments where the lens process and Postgres are

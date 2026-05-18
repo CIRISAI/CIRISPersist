@@ -208,6 +208,67 @@ class Engine:
                 no STH, or the merkle leaf is missing.
         """
 
+    # ── v1.5.9 (CIRISPersist#59 #1) — agent tasks substrate ──────────
+
+    def task_upsert(self, task_json: str) -> None:
+        """v1.5.9 — Idempotent upsert keyed on ``task_id``.
+
+        ``task_json`` is a JSON-encoded ``Task`` shape (see the
+        ``ciris_persist.tasks`` module). Re-insert with the same
+        payload is a no-op; re-insert with differing payload
+        overwrites the mutable columns and preserves ``created_at``.
+        """
+
+    def task_get(self, task_id: str) -> str | None:
+        """v1.5.9 — Read one task by id. Returns the JSON-encoded
+        ``Task`` row or ``None`` if no matching row exists.
+        """
+
+    def task_list(
+        self,
+        filter_json: str,
+        cursor_json: str | None,
+        limit: int,
+    ) -> str:
+        """v1.5.9 — Cursor-paged task listing. Returns the JSON-encoded
+        ``TaskListPage`` ({"items": [...], "next_cursor": {...}|None}).
+        """
+
+    def task_update_status(
+        self,
+        task_id: str,
+        new_status: str,
+        outcome_json: str | None,
+    ) -> bool:
+        """v1.5.9 — Focused status update + optional outcome merge.
+
+        ``new_status`` is one of ``pending`` / ``active`` /
+        ``completed`` / ``failed`` / ``cancelled`` / ``deferred``.
+        ``outcome_json`` (when not None) is decoded and stored into the
+        ``outcome_json`` column; ``None`` preserves the existing value.
+
+        Returns ``True`` when a row was updated, ``False`` when no
+        matching task exists (no error — caller treats as stale id).
+        """
+
+    def task_try_claim_shared(self, task_json: str) -> str:
+        """v1.5.9 — Atomic INSERT-OR-IGNORE claim keyed on ``task_id``.
+
+        Returns the JSON wire-shape
+        ``{"outcome": "stored" | "already_claimed", "task": <Task>}``.
+        First caller wins with ``"stored"``; subsequent callers get
+        ``"already_claimed"`` carrying the EXISTING row (not the
+        caller's payload).
+        """
+
+    def task_delete(self, task_id: str) -> bool:
+        """v1.5.9 — Delete a task by id.
+
+        Returns ``True`` if a row was deleted, ``False`` on
+        missing/already-deleted (idempotent). FK-protected: children
+        pointing at this row reject the delete as Conflict.
+        """
+
     def trust_grant_consistency_proof(
         self,
         tenant_id: str,

@@ -67,6 +67,8 @@ pub mod secrets;
 pub mod server;
 pub mod signing;
 pub mod store;
+#[cfg(feature = "cirislens_tasks")]
+pub mod tasks;
 #[cfg(feature = "telemetry")]
 pub mod telemetry;
 pub mod verify;

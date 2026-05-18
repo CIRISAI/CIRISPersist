@@ -135,7 +135,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "cirisnode_not_found"
         | "incident_not_found"
         | "cirisgraph_not_found"
-        | "telemetry_not_found" => NotFound::new_err(msg),
+        | "telemetry_not_found"
+        | "tasks_not_found" => NotFound::new_err(msg),
 
         // Conflict family — uniqueness / version / state-transition
         // conflict; caller MUST NOT retry, MUST re-read.
@@ -143,7 +144,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "cirisnode_conflict"
         | "incident_conflict"
         | "audit_conflict"
-        | "cirisgraph_conflict" => Conflict::new_err(msg),
+        | "cirisgraph_conflict"
+        | "tasks_conflict" => Conflict::new_err(msg),
 
         // Transient family — backend connection / timeout / pool
         // exhaustion; caller MAY retry with backoff.
@@ -153,7 +155,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "incident_backend"
         | "cirisgraph_backend"
         | "telemetry_backend"
-        | "maintenance_backend" => Transient::new_err(msg),
+        | "maintenance_backend"
+        | "tasks_backend" => Transient::new_err(msg),
 
         // Default — Permanent. Covers invalid arguments, signature
         // failures, crypto errors, rotation conflicts, "not authorized,"
@@ -8129,6 +8132,280 @@ impl PyEngine {
         })
     }
 
+    // ── v1.5.9 (CIRISPersist#59 #1) tasks PyO3 surface ─────────────
+    //
+    // 6 methods wrapping TaskService. JSON wire format mirrors the
+    // incident substrate pattern: Task struct + TaskFilter +
+    // TaskCursor + TaskListPage decoded/encoded via serde at the
+    // FFI boundary. ClaimResult<Task> serializes via an inline
+    // wire-shape ({"outcome":"stored"|"already_claimed","task":{...}}).
+
+    /// v1.5.9 — Idempotent upsert of a task row keyed on `task_id`.
+    /// Re-insert with same payload is a no-op; re-insert with
+    /// differing payload overwrites mutable columns and preserves
+    /// `created_at`.
+    #[cfg(feature = "cirislens_tasks")]
+    fn task_upsert(&self, py: Python<'_>, task_json: &str) -> PyResult<()> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let task: crate::tasks::Task = serde_json::from_str(task_json)
+                .map_err(|e| PyValueError::new_err(format!("Task decode: {e}")))?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        // UFCS — PostgresBackend has a Phase-3
+                        // `Backend::upsert_task` placeholder; disambiguate
+                        // to the concrete TaskService impl here.
+                        crate::tasks::TaskService::upsert_task(&*backend, task)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::tasks::sqlite::SqliteTaskBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::tasks::TaskService;
+                        backend
+                            .upsert_task(task)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.9 — Read one task by id. Returns the JSON-encoded Task
+    /// or None when no matching row.
+    #[cfg(feature = "cirislens_tasks")]
+    fn task_get(&self, py: Python<'_>, task_id: &str) -> PyResult<Option<String>> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let task_id = task_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::tasks::TaskService;
+                        let row = backend
+                            .get_task(&task_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match row {
+                            None => Ok(None),
+                            Some(t) => Ok(Some(serde_json::to_string(&t).map_err(|e| {
+                                PyRuntimeError::new_err(format!("Task encode: {e}"))
+                            })?)),
+                        }
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::tasks::sqlite::SqliteTaskBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::tasks::TaskService;
+                        let row = backend
+                            .get_task(&task_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match row {
+                            None => Ok(None),
+                            Some(t) => Ok(Some(serde_json::to_string(&t).map_err(|e| {
+                                PyRuntimeError::new_err(format!("Task encode: {e}"))
+                            })?)),
+                        }
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.9 — Cursor-paged listing. Returns JSON-encoded
+    /// `TaskListPage`.
+    #[cfg(feature = "cirislens_tasks")]
+    fn task_list(
+        &self,
+        py: Python<'_>,
+        filter_json: &str,
+        cursor_json: Option<&str>,
+        limit: i64,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let filter: crate::tasks::TaskFilter = serde_json::from_str(filter_json)
+                .map_err(|e| PyValueError::new_err(format!("TaskFilter decode: {e}")))?;
+            let cursor: Option<crate::tasks::TaskCursor> = match cursor_json {
+                None => None,
+                Some(s) => Some(
+                    serde_json::from_str(s)
+                        .map_err(|e| PyValueError::new_err(format!("TaskCursor decode: {e}")))?,
+                ),
+            };
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::tasks::TaskService;
+                        let page = backend
+                            .list_tasks(filter, cursor, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&page).map_err(|e| {
+                            PyRuntimeError::new_err(format!("TaskListPage encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::tasks::sqlite::SqliteTaskBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::tasks::TaskService;
+                        let page = backend
+                            .list_tasks(filter, cursor, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&page).map_err(|e| {
+                            PyRuntimeError::new_err(format!("TaskListPage encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.9 — Focused status update + optional outcome merge.
+    /// `outcome_json` is the JSON-encoded value to merge into the
+    /// `outcome_json` column (None preserves the existing value).
+    /// Returns true when a row was updated; false on missing task
+    /// (no error — agent treats as "stale id").
+    #[cfg(feature = "cirislens_tasks")]
+    fn task_update_status(
+        &self,
+        py: Python<'_>,
+        task_id: &str,
+        new_status: &str,
+        outcome_json: Option<&str>,
+    ) -> PyResult<bool> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let status = crate::tasks::TaskStatus::parse_str(new_status).ok_or_else(|| {
+                PyValueError::new_err(format!("unknown TaskStatus: {new_status}"))
+            })?;
+            let outcome: Option<serde_json::Value> = match outcome_json {
+                None => None,
+                Some(s) => Some(
+                    serde_json::from_str(s)
+                        .map_err(|e| PyValueError::new_err(format!("outcome_json decode: {e}")))?,
+                ),
+            };
+            let task_id = task_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::tasks::TaskService;
+                        backend
+                            .update_task_status(&task_id, status, outcome)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::tasks::sqlite::SqliteTaskBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::tasks::TaskService;
+                        backend
+                            .update_task_status(&task_id, status, outcome)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.9 — Atomic INSERT-OR-IGNORE claim keyed on `task_id`.
+    /// Returns a JSON-encoded ClaimResult shape:
+    /// `{"outcome": "stored" | "already_claimed", "task": <Task>}`.
+    #[cfg(feature = "cirislens_tasks")]
+    fn task_try_claim_shared(&self, py: Python<'_>, task_json: &str) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let task: crate::tasks::Task = serde_json::from_str(task_json)
+                .map_err(|e| PyValueError::new_err(format!("Task decode: {e}")))?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        // UFCS — PostgresBackend has a Phase-3
+                        // `Backend::try_claim_shared_task` placeholder;
+                        // disambiguate to the concrete TaskService impl
+                        // here.
+                        let outcome =
+                            crate::tasks::TaskService::try_claim_shared_task(&*backend, task)
+                                .await
+                                .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        encode_claim_result(outcome).map_err(|e| {
+                            PyRuntimeError::new_err(format!("ClaimResult encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::tasks::sqlite::SqliteTaskBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::tasks::TaskService;
+                        let outcome = backend
+                            .try_claim_shared_task(task)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        encode_claim_result(outcome).map_err(|e| {
+                            PyRuntimeError::new_err(format!("ClaimResult encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.9 — Delete a task by id. Returns true if a row was
+    /// deleted, false on missing/already-deleted (idempotent).
+    /// FK-protected: children pointing at this row reject the
+    /// delete as Conflict.
+    #[cfg(feature = "cirislens_tasks")]
+    fn task_delete(&self, py: Python<'_>, task_id: &str) -> PyResult<bool> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let task_id = task_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::tasks::TaskService;
+                        backend
+                            .delete_task(&task_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::tasks::sqlite::SqliteTaskBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::tasks::TaskService;
+                        backend
+                            .delete_task(&task_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
     // ── v1.2.0 (CIRISPersist#48) maintenance cluster ─────────────
     //
     // Absorbs the operations side of CIRISAgent's
@@ -8329,6 +8606,26 @@ impl PyEngine {
             })
         })
     }
+}
+
+/// v1.5.9 (CIRISPersist#59 #1) — encode a [`ClaimResult<Task>`] onto the
+/// `{"outcome": "stored" | "already_claimed", "task": <Task>}` JSON wire
+/// shape. Mirrors `ClaimResultWire` from `src/secrets/wire.rs` but lives
+/// adjacent to the FFI surface because the tasks substrate has no
+/// HTTP server peer to share a wire crate with.
+#[cfg(feature = "cirislens_tasks")]
+fn encode_claim_result(
+    outcome: crate::ClaimResult<crate::tasks::Task>,
+) -> Result<String, serde_json::Error> {
+    let (label, task) = match outcome {
+        crate::ClaimResult::Stored(t) => ("stored", t),
+        crate::ClaimResult::AlreadyClaimed(t) => ("already_claimed", t),
+    };
+    let wire = serde_json::json!({
+        "outcome": label,
+        "task": task,
+    });
+    serde_json::to_string(&wire)
 }
 
 /// v0.8.3 — Bridge `incident::Error` → `PyErr` at the FFI boundary.
