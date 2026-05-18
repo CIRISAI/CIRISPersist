@@ -41,6 +41,8 @@
 pub mod audit;
 #[cfg(feature = "cirisnode")]
 pub mod cirisnode;
+#[cfg(feature = "cirislens_continuity_awareness")]
+pub mod continuity_awareness;
 #[cfg(feature = "cirislens_correlations")]
 pub mod correlations;
 #[cfg(feature = "cirislens_creation_ceremonies")]

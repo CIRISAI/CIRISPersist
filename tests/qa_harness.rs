@@ -613,8 +613,8 @@ async fn av26_concurrent_boot_advisory_lock() {
         .expect("schema_history count");
     let count: i64 = row.get(0);
     assert!(
-        (1..=31).contains(&count),
-        "schema_history has {count} rows; expected 1..=31 (one per migration), \
+        (1..=32).contains(&count),
+        "schema_history has {count} rows; expected 1..=32 (one per migration), \
          not N_WORKERS×migrations — that would mean the lock didn't hold"
     );
 

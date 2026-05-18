@@ -663,6 +663,45 @@ class Engine:
         matching row (no error — callers treat as stale id).
         """
 
+    # ── v1.5.17 (CIRISPersist#59 #9) — continuity_awareness substrate
+
+    def continuity_record(self, record_json: str) -> str:
+        """v1.5.17 — Record a shutdown event. ``record_json`` is a
+        JSON-encoded ``ContinuityAwareness`` (see the
+        ``ciris_persist.continuity_awareness`` module). INSERT ON
+        CONFLICT (id) DO NOTHING — write-once shape.
+
+        First substrate with a cross-substrate FK: the
+        ``(preservation_node_id, preservation_scope)`` pair MUST
+        reference an existing cirisgraph node row. A missing parent
+        surfaces as ``Conflict``.
+
+        Returns a JSON-encoded ClaimResult object:
+        ``{"outcome": "stored" | "already_claimed",
+          "record": <ContinuityAwareness>}``.
+        The race winner sees ``"stored"`` and their own row; race
+        losers see ``"already_claimed"`` and the EXISTING row.
+        """
+
+    def continuity_get_latest(self, agent_id: str) -> str | None:
+        """v1.5.17 — Get the most recent shutdown for an agent —
+        used on next boot to surface "where did I leave off."
+        Returns JSON-encoded ``ContinuityAwareness`` or ``None``
+        when the agent has no recorded shutdowns. Ordered by
+        ``shutdown_timestamp DESC``, ``LIMIT 1``.
+        """
+
+    def continuity_record_reactivation(self, agent_id: str) -> bool:
+        """v1.5.17 — Increment ``reactivation_count`` on the
+        most-recent non-terminal shutdown for ``agent_id``. Used
+        when the agent successfully resumes from a non-terminal
+        shutdown.
+
+        Returns ``True`` when a row was updated, ``False`` when the
+        agent has only terminal shutdowns or no shutdowns at all
+        (callers treat as "nothing to reactivate" — not an error).
+        """
+
     def trust_grant_consistency_proof(
         self,
         tenant_id: str,

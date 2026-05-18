@@ -143,7 +143,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "tickets_not_found"
         | "deferral_reports_not_found"
         | "maintenance_locks_not_found"
-        | "creation_ceremonies_not_found" => NotFound::new_err(msg),
+        | "creation_ceremonies_not_found"
+        | "continuity_awareness_not_found" => NotFound::new_err(msg),
 
         // Conflict family — uniqueness / version / state-transition
         // conflict; caller MUST NOT retry, MUST re-read.
@@ -159,7 +160,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "tickets_conflict"
         | "deferral_reports_conflict"
         | "maintenance_locks_conflict"
-        | "creation_ceremonies_conflict" => Conflict::new_err(msg),
+        | "creation_ceremonies_conflict"
+        | "continuity_awareness_conflict" => Conflict::new_err(msg),
 
         // Transient family — backend connection / timeout / pool
         // exhaustion; caller MAY retry with backoff.
@@ -177,7 +179,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "tickets_backend"
         | "deferral_reports_backend"
         | "maintenance_locks_backend"
-        | "creation_ceremonies_backend" => Transient::new_err(msg),
+        | "creation_ceremonies_backend"
+        | "continuity_awareness_backend" => Transient::new_err(msg),
 
         // Default — Permanent. Covers invalid arguments, signature
         // failures, crypto errors, rotation conflicts, "not authorized,"
@@ -9976,6 +9979,158 @@ impl PyEngine {
         })
     }
 
+    // ── v1.5.17 (CIRISPersist#59 #9) — continuity_awareness cluster ──
+    //
+    // 3 methods wrapping ContinuityAwarenessService. JSON wire
+    // format mirrors the deferral_reports / creation_ceremonies
+    // pattern: ContinuityAwareness struct decoded/encoded via serde
+    // at the FFI boundary. `continuity_record` returns a
+    // JSON-encoded ClaimResult (`{"outcome": "stored" |
+    // "already_claimed", "record": <ContinuityAwareness>}`) — race
+    // winner gets Stored, loser gets AlreadyClaimed carrying the
+    // existing row.
+
+    /// v1.5.17 — Record a shutdown event. INSERT ON CONFLICT (id)
+    /// DO NOTHING — write-once shape. Returns a JSON-encoded
+    /// ClaimResult shape: `{"outcome": "stored" | "already_claimed",
+    /// "record": <ContinuityAwareness>}`. The race winner sees
+    /// `"stored"` and their own row; race losers see
+    /// `"already_claimed"` and the EXISTING row.
+    ///
+    /// The `(preservation_node_id, preservation_scope)` pair MUST
+    /// reference an existing cirisgraph node row — a missing parent
+    /// surfaces as `Conflict` (FK violation).
+    #[cfg(feature = "cirislens_continuity_awareness")]
+    fn continuity_record(&self, py: Python<'_>, record_json: &str) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let record: crate::continuity_awareness::ContinuityAwareness =
+                serde_json::from_str(record_json).map_err(|e| {
+                    PyValueError::new_err(format!("ContinuityAwareness decode: {e}"))
+                })?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::continuity_awareness::ContinuityAwarenessService;
+                        let outcome = backend
+                            .record_shutdown(record)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        encode_continuity_claim_result(outcome).map_err(|e| {
+                            PyRuntimeError::new_err(format!("ClaimResult encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::continuity_awareness::sqlite::SqliteContinuityAwarenessBackend::new(
+                            sq.conn_handle(),
+                        );
+                    runtime.block_on(async move {
+                        use crate::continuity_awareness::ContinuityAwarenessService;
+                        let outcome = backend
+                            .record_shutdown(record)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        encode_continuity_claim_result(outcome).map_err(|e| {
+                            PyRuntimeError::new_err(format!("ClaimResult encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.17 — Get the most recent shutdown for an agent. Returns
+    /// JSON-encoded `ContinuityAwareness` or `None` (Python `None`)
+    /// when the agent has no recorded shutdowns.
+    #[cfg(feature = "cirislens_continuity_awareness")]
+    fn continuity_get_latest(&self, py: Python<'_>, agent_id: &str) -> PyResult<Option<String>> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let agent_id = agent_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::continuity_awareness::ContinuityAwarenessService;
+                        let got = backend
+                            .get_latest_shutdown(&agent_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match got {
+                            None => Ok(None),
+                            Some(r) => serde_json::to_string(&r).map(Some).map_err(|e| {
+                                PyRuntimeError::new_err(format!("ContinuityAwareness encode: {e}"))
+                            }),
+                        }
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::continuity_awareness::sqlite::SqliteContinuityAwarenessBackend::new(
+                            sq.conn_handle(),
+                        );
+                    runtime.block_on(async move {
+                        use crate::continuity_awareness::ContinuityAwarenessService;
+                        let got = backend
+                            .get_latest_shutdown(&agent_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match got {
+                            None => Ok(None),
+                            Some(r) => serde_json::to_string(&r).map(Some).map_err(|e| {
+                                PyRuntimeError::new_err(format!("ContinuityAwareness encode: {e}"))
+                            }),
+                        }
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.17 — Increment `reactivation_count` on the most-recent
+    /// non-terminal shutdown for `agent_id`. Returns `True` when a
+    /// row was updated, `False` when the agent has only terminal
+    /// shutdowns or no shutdowns (callers treat as "nothing to
+    /// reactivate" — not an error).
+    #[cfg(feature = "cirislens_continuity_awareness")]
+    fn continuity_record_reactivation(&self, py: Python<'_>, agent_id: &str) -> PyResult<bool> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let agent_id = agent_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::continuity_awareness::ContinuityAwarenessService;
+                        backend
+                            .record_reactivation(&agent_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::continuity_awareness::sqlite::SqliteContinuityAwarenessBackend::new(
+                            sq.conn_handle(),
+                        );
+                    runtime.block_on(async move {
+                        use crate::continuity_awareness::ContinuityAwarenessService;
+                        backend
+                            .record_reactivation(&agent_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
     // ── v1.2.0 (CIRISPersist#48) maintenance cluster ─────────────
     //
     // Absorbs the operations side of CIRISAgent's
@@ -10238,6 +10393,28 @@ fn encode_ceremony_claim_result(
     let wire = serde_json::json!({
         "outcome": label,
         "ceremony": ceremony,
+    });
+    serde_json::to_string(&wire)
+}
+
+/// v1.5.17 (CIRISPersist#59 #9) — encode a
+/// [`ClaimResult<ContinuityAwareness>`] onto the
+/// `{"outcome": "stored" | "already_claimed", "record":
+/// <ContinuityAwareness>}` JSON wire shape. Same template as the
+/// tasks / deferral / ceremony helpers — keyed `"record"` because
+/// the substrate's row shape is named [`ContinuityAwareness`]
+/// (record-shaped, not a named ceremony / report).
+#[cfg(feature = "cirislens_continuity_awareness")]
+fn encode_continuity_claim_result(
+    outcome: crate::ClaimResult<crate::continuity_awareness::ContinuityAwareness>,
+) -> Result<String, serde_json::Error> {
+    let (label, record) = match outcome {
+        crate::ClaimResult::Stored(r) => ("stored", r),
+        crate::ClaimResult::AlreadyClaimed(r) => ("already_claimed", r),
+    };
+    let wire = serde_json::json!({
+        "outcome": label,
+        "record": record,
     });
     serde_json::to_string(&wire)
 }

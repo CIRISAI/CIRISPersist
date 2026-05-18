@@ -5,6 +5,89 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.5.17] — 2026-05-18
+
+**`continuity_awareness` substrate — 9 of 11 (CIRISPersist#59 #9).**
+
+First substrate with a **cross-substrate composite-key FK** —
+references `cirisgraph_nodes(node_id, scope)` shipped in v0.8.0
+(PG: `cirisgraph.nodes`; SQLite: `cirisgraph_nodes`). Feature depends
+on `cirisgraph` since the substrate genuinely can't function without
+the graph migrations having run first:
+
+```toml
+cirislens_continuity_awareness = ["cirisgraph"]
+```
+
+V032 migration on both backends. 14 columns matching agent's
+shutdown-awareness table. `preservation_scope` reuses
+`crate::graph::types::GraphScope` (UPPERCASE `LOCAL|IDENTITY|
+ENVIRONMENT|COMMUNITY`) — single source of truth across the cross-
+substrate FK.
+
+2 indexes:
+- `(agent_id, shutdown_timestamp DESC)` — boot-time "where did I
+  leave off"
+- `(agent_id, shutdown_timestamp DESC) WHERE is_terminal = FALSE` —
+  active-session reactivation hot path
+
+### Composite-key FK semantics on both backends
+
+- **PG**: `DEFERRABLE INITIALLY DEFERRED`. FK fires at commit time.
+  PG test seeds graph_nodes row via `GraphService::upsert_node`;
+  missing-row reject returns `Conflict` via
+  `SqlState::FOREIGN_KEY_VIOLATION` mapping.
+- **SQLite**: immediate enforcement (`PRAGMA foreign_keys=ON` set
+  by SqliteBackend). SQLite error mapper distinguishes extended code
+  787 (`SQLITE_CONSTRAINT_FOREIGNKEY`) → `Conflict` from other
+  constraint violations → `InvalidArgument`, matching PG semantics.
+
+### ContinuityAwarenessService trait (3 methods)
+
+- `record_shutdown` → ClaimResult (write-once per shutdown event)
+- `get_latest_shutdown(agent_id)` → boot-time query; ORDER BY
+  shutdown_timestamp DESC LIMIT 1
+- `record_reactivation(agent_id)` — increments `reactivation_count`
+  on the most-recent non-terminal shutdown for the agent; returns
+  false if no non-terminal shutdown exists
+
+### PyO3 surface
+
+3 new Engine methods gated on `cirislens_continuity_awareness`.
+Stable error kinds: `continuity_awareness_invalid_argument |
+_not_found | _conflict | _backend | _internal`.
+
+### Tests
+
+22 new (3 types + 1 mod kind + 9 PG + 9 SQLite):
+- All 14 columns round-trip
+- FK to graph_nodes rejects nonexistent (preservation_node_id,
+  preservation_scope) — composite-key reject works on both backends
+- `record_shutdown` ClaimResult: clean Stored; duplicate returns
+  AlreadyClaimed
+- `get_latest_shutdown`: 3 shutdowns with different timestamps;
+  returns the most recent
+- `record_reactivation` increments count (0 → 1 → 2)
+- Reactivation returns false when only terminal shutdowns exist
+- Scope CHECK rejects unknown values
+
+Lib suite: 313 pass.
+
+### Surprises
+
+- Spec said PG parent was `cirislens.cirisgraph_nodes`; actual is
+  `cirisgraph.nodes` (different schema; no `cirislens` prefix).
+  Verified in V013 migration. Used correct names in V032.
+- rusqlite's `ErrorCode::ConstraintViolation` collapses CHECK / NOT
+  NULL / FK / UNIQUE under one variant. Reading extended code 787 is
+  required to distinguish FK reject for PG parity. Earlier substrates
+  with no FKs didn't need this; documented for future cross-substrate
+  FK work.
+
+### Remaining 2 substrates
+
+`feedback_mappings` (v1.5.18), `wa_cert` (v1.5.19).
+
 ## [1.5.16] — 2026-05-18
 
 **`creation_ceremonies` substrate — 8 of 11 (CIRISPersist#59 #8).**
