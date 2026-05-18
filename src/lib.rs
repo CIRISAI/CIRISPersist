@@ -71,6 +71,8 @@ pub mod store;
 pub mod tasks;
 #[cfg(feature = "telemetry")]
 pub mod telemetry;
+#[cfg(feature = "cirislens_thoughts")]
+pub mod thoughts;
 pub mod verify;
 
 pub use engine::{BackendDispatch, Engine, EngineError};

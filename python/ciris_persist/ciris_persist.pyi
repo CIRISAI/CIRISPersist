@@ -269,6 +269,63 @@ class Engine:
         pointing at this row reject the delete as Conflict.
         """
 
+    # ── v1.5.10 (CIRISPersist#59 #2) — agent thoughts substrate ─────
+
+    def thought_upsert(self, thought_json: str) -> None:
+        """v1.5.10 — Idempotent upsert keyed on ``thought_id``.
+
+        ``thought_json`` is a JSON-encoded ``Thought`` shape (see the
+        ``ciris_persist.thoughts`` module). Re-insert with the same
+        payload is a no-op; re-insert with differing payload
+        overwrites the mutable columns and preserves ``created_at``.
+        """
+
+    def thought_get(self, thought_id: str) -> str | None:
+        """v1.5.10 — Read one thought by id. Returns the JSON-encoded
+        ``Thought`` row or ``None`` if no matching row exists.
+        """
+
+    def thought_list(
+        self,
+        filter_json: str,
+        cursor_json: str | None,
+        limit: int,
+    ) -> str:
+        """v1.5.10 — Cursor-paged thought listing. Returns the
+        JSON-encoded ``ThoughtListPage``
+        ({"items": [...], "next_cursor": {...}|None}).
+        """
+
+    def thought_update_status(
+        self,
+        thought_id: str,
+        new_status: str,
+        final_action_json: str | None,
+    ) -> bool:
+        """v1.5.10 — Focused status update + optional final_action
+        merge.
+
+        ``new_status`` is one of ``pending`` / ``processing`` /
+        ``completed`` / ``failed`` / ``deferred``.
+        ``final_action_json`` (when not None) is decoded and stored
+        into the ``final_action_json`` column; ``None`` preserves the
+        existing value.
+
+        Returns ``True`` when a row was updated, ``False`` when no
+        matching thought exists (no error — caller treats as stale
+        id).
+        """
+
+    def thought_get_descendants(self, thought_id: str) -> str:
+        """v1.5.10 — Walk the ``parent_thought_id`` chain rooted at
+        ``thought_id``.
+
+        Returns the JSON-encoded ``list[Thought]`` (root + transitive
+        descendants) ordered by ``(thought_depth ASC, thought_id ASC)``.
+        Empty list when the root has no matching row (not an error).
+        Uses a recursive CTE on both backends.
+        """
+
     def trust_grant_consistency_proof(
         self,
         tenant_id: str,

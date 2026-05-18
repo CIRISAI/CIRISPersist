@@ -5,6 +5,92 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.5.10] — 2026-05-18
+
+**`thoughts` substrate — 2 of 11 (CIRISPersist#59 #2).**
+
+Mirrors the v1.5.9 `tasks` shape with thought-specific lifecycle.
+V025 migration on both backends, FK to `cirislens_tasks`, self-FK on
+`parent_thought_id`. 14 columns. Status CHECK: `pending | processing
+| completed | failed | deferred`.
+
+### ThoughtType as transparent newtype
+
+Spec hinted at `Standard | Reflection | Action | Observation` enum.
+Inspection showed CIRISAgent's `ThoughtType` actually has 20+
+values (STANDARD, FOLLOW_UP, ERROR, OBSERVATION, MEMORY, DEFERRED,
+PONDER, FEEDBACK, GUIDANCE, IDENTITY_UPDATE, ETHICAL_REVIEW,
+CONSENSUS, REFLECTION, SYNTHESIS, DELEGATION, CLARIFICATION,
+SUMMARY, TOOL_RESULT, ACTION_REVIEW, URGENT, SCHEDULED, PATTERN,
+ADAPTATION, …). A closed enum here would drift the moment the
+agent adds a value. Shipped as a transparent `String` newtype with
+`Default == "standard"` + convenience constructors for common
+variants. SQL column is `TEXT NOT NULL DEFAULT 'standard'` with NO
+CHECK — new agent variants flow through without persist schema
+changes.
+
+### ThoughtService trait (5 methods)
+
+- `upsert_thought` — idempotent on `thought_id`; preserves
+  `created_at` on re-upsert
+- `get_thought`
+- `list_thoughts` — filter by task / status / occurrence; cursor
+  pagination on `(updated_at, thought_id)`
+- `update_thought_status` — `final_action` JSON merge via COALESCE;
+  missing-row returns `false`
+- `get_descendants` — recursive CTE walking `parent_thought_id` chain
+  from a root; ordered by `(thought_depth ASC, thought_id ASC)` for
+  determinism. Same shape on both backends (SQLite 3.8.3+ supports
+  WITH RECURSIVE; PG always has)
+
+### PyO3 surface
+
+5 new Engine methods gated on `cirislens_thoughts` feature (added to
+maturin wheel features). Stable error kinds:
+`thoughts_invalid_argument | thoughts_not_found | thoughts_conflict
+| thoughts_backend | thoughts_internal`.
+
+### Tests
+
+27 new (1 mod kind + 6 types unit + 9 PG live + 11 SQLite):
+- All 14 columns round-trip
+- Idempotent upsert preserves `created_at`
+- FK to tasks rejects nonexistent task on both backends
+- Self-FK on parent_thought_id rejects nonexistent parent
+- Filter by source_task_id / status / occurrence
+- Cursor pagination
+- `update_thought_status` success + missing-row=false + COALESCE merge
+- 3-level descendant tree (root → 2 children → 1 grandchild each) →
+  `get_descendants` from root returns 7 rows in deterministic order
+- Single-leaf descendants (just the root)
+- Unknown-root → empty Vec
+
+Lib suite: 325 pass with `postgres sqlite cirislens_tasks
+cirislens_thoughts` feature set.
+
+### No Backend-trait collision this time
+
+The Phase-3 stub sweep that hit `upsert_task` / `try_claim_shared_task`
+in v1.5.9 didn't stub any `thought_*` methods. Plain trait dispatch
+suffices; no UFCS needed.
+
+### Schema notes
+
+- `channel_id` column present per spec; nullable; no FK. Agent's own
+  migration may differ but spec is authoritative for the substrate
+  shape.
+- FKs on PG are `DEFERRABLE INITIALLY DEFERRED` (matches V024 tasks
+  pattern); SQLite uses plain `FOREIGN KEY` (immediate enforcement
+  via `PRAGMA foreign_keys=ON`).
+
+### Remaining 9 substrates
+
+`service_correlations` (v1.5.11), `scheduled_tasks` (v1.5.12),
+`tickets` (v1.5.13), `deferral_reports` (v1.5.14),
+`consolidation_locks` (v1.5.15), `creation_ceremonies` (v1.5.16),
+`continuity_awareness` (v1.5.17), `feedback_mappings` (v1.5.18),
+`wa_cert` (v1.5.19).
+
 ## [1.5.9] — 2026-05-18
 
 **`tasks` substrate — first of 11 absorptions ending dual-libsqlite WAL corruption ([#59](https://github.com/CIRISAI/CIRISPersist/issues/59) #1).**

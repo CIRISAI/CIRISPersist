@@ -95,6 +95,7 @@ features = [
     "telemetry",
     "cirisincident",
     "cirislens_tasks",
+    "cirislens_thoughts",
     "secrets",
     "cirisnode",
     "extract",

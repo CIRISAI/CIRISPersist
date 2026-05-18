@@ -136,7 +136,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "incident_not_found"
         | "cirisgraph_not_found"
         | "telemetry_not_found"
-        | "tasks_not_found" => NotFound::new_err(msg),
+        | "tasks_not_found"
+        | "thoughts_not_found" => NotFound::new_err(msg),
 
         // Conflict family — uniqueness / version / state-transition
         // conflict; caller MUST NOT retry, MUST re-read.
@@ -145,7 +146,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "incident_conflict"
         | "audit_conflict"
         | "cirisgraph_conflict"
-        | "tasks_conflict" => Conflict::new_err(msg),
+        | "tasks_conflict"
+        | "thoughts_conflict" => Conflict::new_err(msg),
 
         // Transient family — backend connection / timeout / pool
         // exhaustion; caller MAY retry with backoff.
@@ -156,7 +158,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "cirisgraph_backend"
         | "telemetry_backend"
         | "maintenance_backend"
-        | "tasks_backend" => Transient::new_err(msg),
+        | "tasks_backend"
+        | "thoughts_backend" => Transient::new_err(msg),
 
         // Default — Permanent. Covers invalid arguments, signature
         // failures, crypto errors, rotation conflicts, "not authorized,"
@@ -8400,6 +8403,246 @@ impl PyEngine {
                             .delete_task(&task_id)
                             .await
                             .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    // ── v1.5.10 (CIRISPersist#59 #2) thoughts PyO3 surface ──────────
+    //
+    // 5 methods wrapping ThoughtService. JSON wire format mirrors the
+    // tasks substrate pattern: Thought struct + ThoughtFilter +
+    // ThoughtCursor + ThoughtListPage decoded/encoded via serde at
+    // the FFI boundary. `get_descendants` returns a JSON-encoded
+    // `Vec<Thought>` (root + transitive descendants).
+
+    /// v1.5.10 — Idempotent upsert of a thought row keyed on
+    /// `thought_id`. Re-insert with same payload is a no-op; re-
+    /// insert with differing payload overwrites mutable columns and
+    /// preserves `created_at`.
+    #[cfg(feature = "cirislens_thoughts")]
+    fn thought_upsert(&self, py: Python<'_>, thought_json: &str) -> PyResult<()> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let thought: crate::thoughts::Thought = serde_json::from_str(thought_json)
+                .map_err(|e| PyValueError::new_err(format!("Thought decode: {e}")))?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::thoughts::ThoughtService;
+                        backend
+                            .upsert_thought(thought)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::thoughts::sqlite::SqliteThoughtBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::thoughts::ThoughtService;
+                        backend
+                            .upsert_thought(thought)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.10 — Read one thought by id. Returns the JSON-encoded
+    /// Thought or None when no matching row.
+    #[cfg(feature = "cirislens_thoughts")]
+    fn thought_get(&self, py: Python<'_>, thought_id: &str) -> PyResult<Option<String>> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let thought_id = thought_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::thoughts::ThoughtService;
+                        let row = backend
+                            .get_thought(&thought_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match row {
+                            None => Ok(None),
+                            Some(t) => Ok(Some(serde_json::to_string(&t).map_err(|e| {
+                                PyRuntimeError::new_err(format!("Thought encode: {e}"))
+                            })?)),
+                        }
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::thoughts::sqlite::SqliteThoughtBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::thoughts::ThoughtService;
+                        let row = backend
+                            .get_thought(&thought_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match row {
+                            None => Ok(None),
+                            Some(t) => Ok(Some(serde_json::to_string(&t).map_err(|e| {
+                                PyRuntimeError::new_err(format!("Thought encode: {e}"))
+                            })?)),
+                        }
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.10 — Cursor-paged listing. Returns JSON-encoded
+    /// `ThoughtListPage`.
+    #[cfg(feature = "cirislens_thoughts")]
+    fn thought_list(
+        &self,
+        py: Python<'_>,
+        filter_json: &str,
+        cursor_json: Option<&str>,
+        limit: i64,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let filter: crate::thoughts::ThoughtFilter = serde_json::from_str(filter_json)
+                .map_err(|e| PyValueError::new_err(format!("ThoughtFilter decode: {e}")))?;
+            let cursor: Option<crate::thoughts::ThoughtCursor> = match cursor_json {
+                None => None,
+                Some(s) => Some(
+                    serde_json::from_str(s)
+                        .map_err(|e| PyValueError::new_err(format!("ThoughtCursor decode: {e}")))?,
+                ),
+            };
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::thoughts::ThoughtService;
+                        let page = backend
+                            .list_thoughts(filter, cursor, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&page).map_err(|e| {
+                            PyRuntimeError::new_err(format!("ThoughtListPage encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::thoughts::sqlite::SqliteThoughtBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::thoughts::ThoughtService;
+                        let page = backend
+                            .list_thoughts(filter, cursor, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&page).map_err(|e| {
+                            PyRuntimeError::new_err(format!("ThoughtListPage encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.10 — Focused status update + optional final_action merge.
+    /// `final_action_json` is the JSON-encoded value to merge into
+    /// the `final_action_json` column (None preserves the existing
+    /// value). Returns true when a row was updated; false on missing
+    /// thought (no error — agent treats as "stale id").
+    #[cfg(feature = "cirislens_thoughts")]
+    fn thought_update_status(
+        &self,
+        py: Python<'_>,
+        thought_id: &str,
+        new_status: &str,
+        final_action_json: Option<&str>,
+    ) -> PyResult<bool> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let status =
+                crate::thoughts::ThoughtStatus::parse_str(new_status).ok_or_else(|| {
+                    PyValueError::new_err(format!("unknown ThoughtStatus: {new_status}"))
+                })?;
+            let final_action: Option<serde_json::Value> = match final_action_json {
+                None => None,
+                Some(s) => Some(serde_json::from_str(s).map_err(|e| {
+                    PyValueError::new_err(format!("final_action_json decode: {e}"))
+                })?),
+            };
+            let thought_id = thought_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::thoughts::ThoughtService;
+                        backend
+                            .update_thought_status(&thought_id, status, final_action)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::thoughts::sqlite::SqliteThoughtBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::thoughts::ThoughtService;
+                        backend
+                            .update_thought_status(&thought_id, status, final_action)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.10 — Walk parent_thought_id chain rooted at `thought_id`.
+    /// Returns the JSON-encoded `Vec<Thought>` (root + transitive
+    /// descendants) ordered by `(thought_depth ASC, thought_id ASC)`.
+    /// Empty array when the root has no matching row (not an error).
+    #[cfg(feature = "cirislens_thoughts")]
+    fn thought_get_descendants(&self, py: Python<'_>, thought_id: &str) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let thought_id = thought_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::thoughts::ThoughtService;
+                        let rows = backend
+                            .get_descendants(&thought_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&rows).map_err(|e| {
+                            PyRuntimeError::new_err(format!("Vec<Thought> encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::thoughts::sqlite::SqliteThoughtBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::thoughts::ThoughtService;
+                        let rows = backend
+                            .get_descendants(&thought_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&rows).map_err(|e| {
+                            PyRuntimeError::new_err(format!("Vec<Thought> encode: {e}"))
+                        })
                     })
                 }
             })
