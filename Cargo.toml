@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "1.5.18"
+version = "1.5.19"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -315,6 +315,33 @@ cirislens_continuity_awareness = ["cirisgraph"]
 # TIMESTAMPTZ with NOW() default, on SQLite is TEXT with
 # datetime('now', 'subsec') default. Threat model AV-15.
 cirislens_feedback_mappings = ["cirislens_thoughts"]
+
+# v1.5.19 (CIRISPersist#59 #11, FINAL) — agent wa_cert substrate.
+# ELEVENTH and FINAL substrate absorption ending CIRISAgent's direct
+# libsqlite access to `ciris_engine.db`. With this feature on, all 11
+# substrates are absorbed and CIRISPersist#59 closes. Absorbs the
+# agent's `wa_cert` table — the Wise-Authority cert directory keyed
+# on wa_id, with a self-FK on parent_wa_id. 24 columns matching the
+# agent verbatim (`_json`-suffixed TEXT columns drop the suffix on
+# the persist side; PG promotes them to JSONB; SQLite keeps them as
+# TEXT JSON).
+#
+# Per the "persist is the only library that opens the file"
+# guarantee these WA certs live in the engine DB (NOT a separate
+# auth.db).
+#
+# Trait: upsert_wa_cert (idempotent UPSERT on wa_id; preserves
+# `created`), get_wa_cert (point lookup), get_by_kid (JWT verify
+# hot path via unique jwt_kid), get_by_oauth (OAuth login path via
+# partial provider+external_id index), list_by_role (filtered by
+# active=TRUE; for list_observers / list_authorities),
+# set_active (activity toggle), update_last_login (last-login
+# bookkeeping). 7 methods. Self-FK on parent_wa_id is DEFERRABLE
+# INITIALLY DEFERRED on PG (one-tx parent+child ceremonies); on
+# SQLite the FK is immediate. role CHECK (root/authority/observer)
+# + token_type CHECK (standard/session/api_key/oauth/service).
+# Threat model AV-15.
+cirislens_wa_cert = []
 
 # v0.1.3 — optional TLS for the Postgres connection pool. Defaults
 # to no-TLS (deployments where the lens process and Postgres are

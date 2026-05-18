@@ -5,6 +5,118 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.5.19] — 2026-05-18
+
+**`wa_cert` substrate — 11 of 11. CIRISPersist#59 CLOSES.**
+
+Final substrate of the 11-cut absorption. With this release the
+entire CIRISAgent `ciris_engine.db` is absorbed into persist; no
+agent-side library opens the file directly anymore. The dual-WAL
+corruption pattern from CIRISPersist#58 is structurally impossible
+because persist is the only writer.
+
+V034 migration on both backends. 24 columns — the Wise-Authority
+cert directory. Lives in the engine DB (not a separate `auth.db`)
+per the "persist is the only library that opens the file"
+guarantee.
+
+Per spec discussion in #59: the blast-radius argument for a separate
+auth.db was valid but cuts against the WAL-corruption-end guarantee
+that motivated #59 in the first place. Compromise-isolation can be
+revisited as a v1.6.x track if needed without breaking the substrate
+shape.
+
+### Schema
+
+- `wa_id` PK, `name`, `role` CHECK `root|authority|observer`
+- `pubkey`, `jwt_kid` UNIQUE (JWT verification hot path)
+- `password_hash`, `api_key_hash` — credential digests
+- `oauth_provider`, `oauth_external_id`, `oauth_links` (JSONB/TEXT JSON)
+- `veilid_id`
+- `auto_minted` BOOLEAN
+- `parent_wa_id` self-FK (DEFERRABLE on PG; immediate on SQLite),
+  `parent_signature`
+- `scopes` (JSONB/TEXT JSON; NOT NULL — every WA has a scope set)
+- `custom_permissions` (JSONB/TEXT JSON)
+- `adapter_id`, `adapter_name`, `adapter_metadata` (JSONB/TEXT JSON)
+- `token_type` CHECK `standard|session|api_key|oauth|service`
+- `created`, `last_login`, `active`
+
+5 indexes:
+- `wa_cert_jwt_kid` (UNIQUE) — JWT verify hot path
+- `wa_cert_oauth (oauth_provider, oauth_external_id) WHERE NOT NULL` — OAuth login
+- `wa_cert_role_active (role, active) WHERE active = TRUE` — role-based listing
+- `wa_cert_adapter (adapter_id) WHERE NOT NULL` — adapter-bound enumeration
+- `wa_cert_parent (parent_wa_id) WHERE NOT NULL` — tree walks
+
+### WaCertService trait (7 methods)
+
+- `upsert_wa_cert` — idempotent on wa_id; preserves `created`
+- `get_wa_cert`
+- `get_by_kid(jwt_kid)` — JWT verify hot path
+- `get_by_oauth(provider, external_id)` — login path
+- `list_by_role(role, limit)` — observer/authority enumeration
+- `set_active(wa_id, active)` — activity toggle
+- `update_last_login(wa_id, login_time)`
+
+### PyO3 surface
+
+7 new Engine methods gated on `cirislens_wa_cert` feature. Stable
+error kinds: `wa_cert_invalid_argument | _not_found | _conflict |
+_backend | _internal`.
+
+### Tests
+
+36 new (8 types + error_kind + 14 PG + 14 SQLite):
+- All 24 columns round-trip
+- Self-FK: nonexistent parent_wa_id rejects; NULL passes
+- Idempotent upsert preserves `created`; differing data updates mutables
+- `jwt_kid` UNIQUE: duplicate kid → Conflict (PG SqlState
+  UNIQUE_VIOLATION; SQLite extended code 2067)
+- `get_by_kid` hits unique index
+- `get_by_oauth` hits partial index; missing oauth fields → None
+- `list_by_role` filters by role + active=TRUE; insert mix
+  (root/authority/observer/inactive) and verify
+- `set_active` toggle; missing-row=false
+- `update_last_login` success + missing-row=false
+- Role CHECK + token_type CHECK reject unknown
+- Parent tree: root + 2 children + 1 grandchild; chain holds
+
+Lib suite: 312 pass with `postgres sqlite cirislens_wa_cert`.
+
+### Token type vocabulary
+
+`standard | session | api_key | oauth | service` — inferred from
+agent's apparent TokenType taxonomy. Caller-validated either way
+(WA mint happens agent-side). The DB CHECK keeps schema truthful
+about what persist round-trips.
+
+## CIRISPersist#59 — full absorption complete
+
+11 substrates shipped across v1.5.9-v1.5.19:
+
+| Substrate | Release | Schema | API methods |
+|---|---|---|---|
+| tasks | v1.5.9 | V024 / 17 cols | 6 |
+| thoughts | v1.5.10 | V025 / 14 cols | 5 |
+| service_correlations | v1.5.11 | V026 / 18 cols | 4 |
+| scheduled_tasks | v1.5.12 | V027 / 15 cols | 3 |
+| tickets | v1.5.13 | V028 / 17 cols | 5 |
+| deferral_reports | v1.5.14 | V029 / 7 cols | 4 |
+| maintenance_locks | v1.5.15 | V030 / 5 cols | 3 |
+| creation_ceremonies | v1.5.16 | V031 / 14 cols | 4 |
+| continuity_awareness | v1.5.17 | V032 / 14 cols + cross-FK to graph_nodes | 3 |
+| feedback_mappings | v1.5.18 | V033 / 5 cols + FK to thoughts | 3 |
+| wa_cert | v1.5.19 | V034 / 24 cols + self-FK | 7 |
+
+Total: 11 migrations, 150 columns, 47 trait methods, ~250 tests across
+both backends. No legacy direct-libsqlite access remains in
+CIRISAgent's ciris_engine.db cutover surface.
+
+The agent team can drop their raw-sqlite3 callers across all 11
+substrates and adopt the persist API end-to-end. The dual-WAL
+corruption surfaced in CIRISPersist#58 is structurally prevented.
+
 ## [1.5.18] — 2026-05-18
 
 **`feedback_mappings` substrate — 10 of 11 (CIRISPersist#59 #10).**

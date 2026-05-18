@@ -104,6 +104,7 @@ features = [
     "cirislens_creation_ceremonies",
     "cirislens_continuity_awareness",
     "cirislens_feedback_mappings",
+    "cirislens_wa_cert",
     "secrets",
     "cirisnode",
     "extract",

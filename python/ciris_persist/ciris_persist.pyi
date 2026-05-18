@@ -743,6 +743,78 @@ class Engine:
         ordered DESC by ``created_at``.
         """
 
+    # ── v1.5.19 (CIRISPersist#59 #11, FINAL) — wa_cert substrate
+
+    def wa_cert_upsert(self, cert_json: str) -> None:
+        """v1.5.19 — Idempotent upsert of a WA cert. ``cert_json`` is
+        a JSON-encoded ``WaCert`` with 24 fields: ``wa_id`` (PK,
+        required), ``name`` (required), ``role`` (required;
+        ``root`` | ``authority`` | ``observer``), ``pubkey``
+        (required), ``jwt_kid`` (required, UNIQUE across the
+        directory), ``password_hash``, ``api_key_hash``,
+        ``oauth_provider``, ``oauth_external_id``, ``oauth_links``
+        (JSON object), ``veilid_id``, ``auto_minted`` (bool,
+        default False), ``parent_wa_id`` (self-FK; nullable),
+        ``parent_signature``, ``scopes`` (JSON array, required),
+        ``custom_permissions`` (JSON object), ``adapter_id``,
+        ``adapter_name``, ``adapter_metadata`` (JSON object),
+        ``token_type`` (``standard`` | ``session`` | ``api_key`` |
+        ``oauth`` | ``service``; default ``standard``), ``created``
+        (RFC 3339, required, PRESERVED across upserts),
+        ``last_login`` (RFC 3339, nullable), ``active`` (bool,
+        default True).
+
+        UPSERT on ``wa_id`` — every column except ``wa_id`` +
+        ``created`` overwrites on conflict. Duplicate ``jwt_kid``
+        across different ``wa_id``s raises ``Conflict``; non-NULL
+        ``parent_wa_id`` referencing a missing parent raises
+        ``Conflict``.
+        """
+
+    def wa_cert_get(self, wa_id: str) -> str | None:
+        """v1.5.19 — Point lookup by ``wa_id``. Returns JSON-encoded
+        ``WaCert`` or ``None`` when no row matches.
+        """
+
+    def wa_cert_get_by_kid(self, jwt_kid: str) -> str | None:
+        """v1.5.19 — JWT verification hot path. Lookup by
+        ``jwt_kid`` via the unique ``wa_cert_jwt_kid`` index.
+        Returns JSON-encoded ``WaCert`` or ``None``.
+        """
+
+    def wa_cert_get_by_oauth(
+        self, oauth_provider: str, oauth_external_id: str
+    ) -> str | None:
+        """v1.5.19 — OAuth login path. Lookup by
+        ``(oauth_provider, oauth_external_id)`` via the partial
+        ``wa_cert_oauth`` index. Returns JSON-encoded ``WaCert`` or
+        ``None``.
+        """
+
+    def wa_cert_list_by_role(self, role: str, limit: int) -> str:
+        """v1.5.19 — Role-based listing. ``role`` is the lowercase
+        SQL string (``root`` | ``authority`` | ``observer``).
+        Returns JSON-encoded ``list[WaCert]`` of certs with
+        ``active = True`` filtered by role. Ordered
+        ``created DESC, wa_id DESC``. Hits the partial
+        ``wa_cert_role_active`` index.
+        """
+
+    def wa_cert_set_active(self, wa_id: str, active: bool) -> bool:
+        """v1.5.19 — Activity toggle. Sets ``active`` to the
+        supplied value. Returns ``True`` if the row exists
+        (idempotent for same-value toggles); ``False`` if ``wa_id``
+        doesn't exist.
+        """
+
+    def wa_cert_update_last_login(
+        self, wa_id: str, login_time_iso: str
+    ) -> bool:
+        """v1.5.19 — Last-login bookkeeping. ``login_time_iso`` is
+        an RFC 3339 timestamp string. Returns ``True`` if the row
+        was updated; ``False`` if ``wa_id`` doesn't exist.
+        """
+
     def trust_grant_consistency_proof(
         self,
         tenant_id: str,

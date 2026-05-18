@@ -145,7 +145,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "maintenance_locks_not_found"
         | "creation_ceremonies_not_found"
         | "continuity_awareness_not_found"
-        | "feedback_mappings_not_found" => NotFound::new_err(msg),
+        | "feedback_mappings_not_found"
+        | "wa_cert_not_found" => NotFound::new_err(msg),
 
         // Conflict family — uniqueness / version / state-transition
         // conflict; caller MUST NOT retry, MUST re-read.
@@ -163,7 +164,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "maintenance_locks_conflict"
         | "creation_ceremonies_conflict"
         | "continuity_awareness_conflict"
-        | "feedback_mappings_conflict" => Conflict::new_err(msg),
+        | "feedback_mappings_conflict"
+        | "wa_cert_conflict" => Conflict::new_err(msg),
 
         // Transient family — backend connection / timeout / pool
         // exhaustion; caller MAY retry with backoff.
@@ -183,7 +185,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "maintenance_locks_backend"
         | "creation_ceremonies_backend"
         | "continuity_awareness_backend"
-        | "feedback_mappings_backend" => Transient::new_err(msg),
+        | "feedback_mappings_backend"
+        | "wa_cert_backend" => Transient::new_err(msg),
 
         // Default — Permanent. Covers invalid arguments, signature
         // failures, crypto errors, rotation conflicts, "not authorized,"
@@ -10288,6 +10291,337 @@ impl PyEngine {
                         serde_json::to_string(&items).map_err(|e| {
                             PyRuntimeError::new_err(format!("FeedbackMapping list encode: {e}"))
                         })
+                    })
+                }
+            })
+        })
+    }
+
+    // ── v1.5.19 (CIRISPersist#59 #11, FINAL) — wa_cert cluster ──
+    //
+    // 7 methods wrapping WaCertService. JSON wire format mirrors the
+    // tasks / thoughts / ceremony / feedback patterns: WaCert struct
+    // decoded/encoded via serde at the FFI boundary; lists encoded as
+    // JSON arrays; set_active / update_last_login return Python
+    // `bool` (true=row updated, false=missing wa_id).
+
+    /// v1.5.19 — Idempotent upsert of a WA cert. `cert_json` is a
+    /// JSON-encoded `WaCert` (24 columns). UPSERT on `wa_id` —
+    /// mutables overwrite, `created` is preserved.
+    ///
+    /// Constraint surfaces:
+    ///   * Duplicate `jwt_kid` across different `wa_id`s →
+    ///     `Conflict` (UNIQUE violation).
+    ///   * Non-NULL `parent_wa_id` referencing a missing parent →
+    ///     `Conflict` (FK violation; PG fires at COMMIT via
+    ///     DEFERRABLE, SQLite fires immediately).
+    ///   * Empty `wa_id` / `name` / `pubkey` / `jwt_kid` →
+    ///     `Permanent` (invalid argument).
+    ///   * Unknown `role` / `token_type` (only reachable via raw
+    ///     JSON typo) → serde decode error before this method runs.
+    #[cfg(feature = "cirislens_wa_cert")]
+    fn wa_cert_upsert(&self, py: Python<'_>, cert_json: &str) -> PyResult<()> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let cert: crate::wa_cert::WaCert = serde_json::from_str(cert_json)
+                .map_err(|e| PyValueError::new_err(format!("WaCert decode: {e}")))?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::wa_cert::WaCertService;
+                        backend
+                            .upsert_wa_cert(cert)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::wa_cert::sqlite::SqliteWaCertBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::wa_cert::WaCertService;
+                        backend
+                            .upsert_wa_cert(cert)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.19 — Point lookup by `wa_id`. Returns JSON-encoded
+    /// `WaCert` or `None` when no row matches.
+    #[cfg(feature = "cirislens_wa_cert")]
+    fn wa_cert_get(&self, py: Python<'_>, wa_id: &str) -> PyResult<Option<String>> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let wa_id = wa_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::wa_cert::WaCertService;
+                        let row = backend
+                            .get_wa_cert(&wa_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match row {
+                            None => Ok(None),
+                            Some(r) => serde_json::to_string(&r).map(Some).map_err(|e| {
+                                PyRuntimeError::new_err(format!("WaCert encode: {e}"))
+                            }),
+                        }
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::wa_cert::sqlite::SqliteWaCertBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::wa_cert::WaCertService;
+                        let row = backend
+                            .get_wa_cert(&wa_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match row {
+                            None => Ok(None),
+                            Some(r) => serde_json::to_string(&r).map(Some).map_err(|e| {
+                                PyRuntimeError::new_err(format!("WaCert encode: {e}"))
+                            }),
+                        }
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.19 — JWT verification hot path. Lookup by `jwt_kid` via
+    /// the unique `wa_cert_jwt_kid` index. Returns JSON-encoded
+    /// `WaCert` or `None`.
+    #[cfg(feature = "cirislens_wa_cert")]
+    fn wa_cert_get_by_kid(&self, py: Python<'_>, jwt_kid: &str) -> PyResult<Option<String>> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let kid = jwt_kid.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::wa_cert::WaCertService;
+                        let row = backend
+                            .get_by_kid(&kid)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match row {
+                            None => Ok(None),
+                            Some(r) => serde_json::to_string(&r).map(Some).map_err(|e| {
+                                PyRuntimeError::new_err(format!("WaCert encode: {e}"))
+                            }),
+                        }
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::wa_cert::sqlite::SqliteWaCertBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::wa_cert::WaCertService;
+                        let row = backend
+                            .get_by_kid(&kid)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match row {
+                            None => Ok(None),
+                            Some(r) => serde_json::to_string(&r).map(Some).map_err(|e| {
+                                PyRuntimeError::new_err(format!("WaCert encode: {e}"))
+                            }),
+                        }
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.19 — OAuth login path. Lookup by
+    /// `(oauth_provider, oauth_external_id)` via the partial
+    /// `wa_cert_oauth` index. Returns JSON-encoded `WaCert` or
+    /// `None`.
+    #[cfg(feature = "cirislens_wa_cert")]
+    fn wa_cert_get_by_oauth(
+        &self,
+        py: Python<'_>,
+        oauth_provider: &str,
+        oauth_external_id: &str,
+    ) -> PyResult<Option<String>> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let provider = oauth_provider.to_owned();
+            let ext = oauth_external_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::wa_cert::WaCertService;
+                        let row = backend
+                            .get_by_oauth(&provider, &ext)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match row {
+                            None => Ok(None),
+                            Some(r) => serde_json::to_string(&r).map(Some).map_err(|e| {
+                                PyRuntimeError::new_err(format!("WaCert encode: {e}"))
+                            }),
+                        }
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::wa_cert::sqlite::SqliteWaCertBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::wa_cert::WaCertService;
+                        let row = backend
+                            .get_by_oauth(&provider, &ext)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match row {
+                            None => Ok(None),
+                            Some(r) => serde_json::to_string(&r).map(Some).map_err(|e| {
+                                PyRuntimeError::new_err(format!("WaCert encode: {e}"))
+                            }),
+                        }
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.19 — Role-based listing. `role` is the lowercase SQL
+    /// string (`"root" | "authority" | "observer"`). Returns
+    /// JSON-encoded `list[WaCert]` of certs with `active = TRUE`
+    /// filtered by role. Ordered `created DESC, wa_id DESC`. Hits
+    /// the partial `wa_cert_role_active` index.
+    #[cfg(feature = "cirislens_wa_cert")]
+    fn wa_cert_list_by_role(&self, py: Python<'_>, role: &str, limit: i64) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let role_enum = crate::wa_cert::WaRole::parse_str(role).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "unknown role `{role}` (expected root | authority | observer)"
+                ))
+            })?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::wa_cert::WaCertService;
+                        let items = backend
+                            .list_by_role(role_enum, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&items).map_err(|e| {
+                            PyRuntimeError::new_err(format!("WaCert list encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::wa_cert::sqlite::SqliteWaCertBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::wa_cert::WaCertService;
+                        let items = backend
+                            .list_by_role(role_enum, limit)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&items).map_err(|e| {
+                            PyRuntimeError::new_err(format!("WaCert list encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.19 — Activity toggle. Sets `active` to the supplied
+    /// value. Returns `True` if the row exists (idempotent for
+    /// same-value toggles); `False` if `wa_id` doesn't exist.
+    #[cfg(feature = "cirislens_wa_cert")]
+    fn wa_cert_set_active(&self, py: Python<'_>, wa_id: &str, active: bool) -> PyResult<bool> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let wa_id = wa_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::wa_cert::WaCertService;
+                        backend
+                            .set_active(&wa_id, active)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::wa_cert::sqlite::SqliteWaCertBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::wa_cert::WaCertService;
+                        backend
+                            .set_active(&wa_id, active)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.19 — Last-login bookkeeping. `login_time_iso` is an
+    /// RFC 3339 timestamp string. Returns `True` if the row was
+    /// updated; `False` if `wa_id` doesn't exist.
+    #[cfg(feature = "cirislens_wa_cert")]
+    fn wa_cert_update_last_login(
+        &self,
+        py: Python<'_>,
+        wa_id: &str,
+        login_time_iso: &str,
+    ) -> PyResult<bool> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let wa_id = wa_id.to_owned();
+            let login_time = chrono::DateTime::parse_from_rfc3339(login_time_iso)
+                .map_err(|e| {
+                    PyValueError::new_err(format!(
+                        "login_time_iso must be RFC 3339, got `{login_time_iso}`: {e}"
+                    ))
+                })?
+                .with_timezone(&chrono::Utc);
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::wa_cert::WaCertService;
+                        backend
+                            .update_last_login(&wa_id, login_time)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::wa_cert::sqlite::SqliteWaCertBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::wa_cert::WaCertService;
+                        backend
+                            .update_last_login(&wa_id, login_time)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
                     })
                 }
             })

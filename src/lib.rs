@@ -90,6 +90,8 @@ pub mod thoughts;
 #[cfg(feature = "cirislens_tickets")]
 pub mod tickets;
 pub mod verify;
+#[cfg(feature = "cirislens_wa_cert")]
+pub mod wa_cert;
 
 pub use engine::{BackendDispatch, Engine, EngineError};
 #[cfg(feature = "sqlite")]
