@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779132756986,
+  "lastUpdate": 1779133656540,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -18035,6 +18035,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 26079385,
             "range": "± 435098",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "8d04ac7e0c4ffe56315b5e8782686aa35dc5ed87",
+          "message": "1.5.18 — feedback_mappings substrate (CIRISPersist#59 #10 of 11)\n\nV033 migration on both backends. 5 columns. Light shape. Design\ndecision: shipped as dedicated substrate, NOT folded into\ncirisgraph_edges — target_thought_id references cirislens_thoughts\n(thought_id), not graph_nodes; feedback rides on Discord-message-to-\nthought-resolution pairs, not node-to-node edges.\n\nFeature depends on cirislens_thoughts for FK:\ncirislens_feedback_mappings = [\"cirislens_thoughts\"].\n\n3 partial indexes: (target_thought_id), (source_message_id),\n(feedback_type, created_at DESC) — all WHERE NOT NULL.\n\nFeedbackMappingService trait (3 methods):\n- record_feedback → ClaimResult (ON CONFLICT DO NOTHING)\n- list_feedback_for_thought(thought_id, limit) — ORDER BY created_at DESC\n- list_feedback(filter, limit) — filter by source_message_id /\n  feedback_type / time window\n\nNullable FK passthrough verified on both backends. NULL\ntarget_thought_id passes the constraint cleanly (SQL standard;\nSQLite's PRAGMA foreign_keys=ON doesn't fire on NULL). Non-NULL\ndangling reject returns Error::Conflict via extended-code 787 on\nSQLite, matching PG SqlState::FOREIGN_KEY_VIOLATION.\n\nPyO3: 3 new methods gated on cirislens_feedback_mappings feature.\n\n18 new tests (3 types + 1 mod kind + 7 PG + 7 SQLite). All 5 columns\nround-trip; ClaimResult race; FK reject + passthrough; list ordering;\nfilter combos. Lib suite: 343 pass.\n\n1 substrate remains: wa_cert (v1.5.19), the last before #59 closes.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-18T14:39:00-05:00",
+          "tree_id": "79ab2deb7135bb069b98eedb52e6130eeeadf6b1",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/8d04ac7e0c4ffe56315b5e8782686aa35dc5ed87"
+        },
+        "date": 1779133655229,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101599,
+            "range": "± 569",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 242223,
+            "range": "± 1996",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 525187,
+            "range": "± 7012",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1858966,
+            "range": "± 14645",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 343,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1427,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8229,
+            "range": "± 27",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21208,
+            "range": "± 132",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24278,
+            "range": "± 131",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83724,
+            "range": "± 961",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 365,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3204,
+            "range": "± 36",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9497,
+            "range": "± 205",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41480,
+            "range": "± 422",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2311899,
+            "range": "± 67470",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6846247,
+            "range": "± 134392",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 24519550,
+            "range": "± 210058",
             "unit": "ns/iter"
           }
         ]
