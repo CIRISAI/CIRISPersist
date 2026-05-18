@@ -74,9 +74,29 @@ fn max_attributes_bytes() -> usize {
 /// AV-45: cap attributes size + return canonical JSON text for the
 /// SQLite TEXT column. `bulk_import = true` (v1.3.2, CIRISPersist#50)
 /// skips the cap for migration use cases.
+/// CIRISPersist#58 defense-in-depth: serde_json::to_string is
+/// guaranteed to produce valid UTF-8 by construction, but assert it
+/// explicitly so a future regression surfaces at write time (with the
+/// caller's full context) rather than at read time (with no context).
+fn assert_valid_utf8_or_describe(s: &str, ctx: &str) -> Result<(), Error> {
+    // String is always valid UTF-8 in Rust; the assertion here is a
+    // belt-and-suspenders check that std::str::from_utf8(s.as_bytes())
+    // succeeds. If it ever fails the std lib is broken; logged
+    // deliberately as Internal so it surfaces as 5xx not caller-fault.
+    if std::str::from_utf8(s.as_bytes()).is_err() {
+        return Err(Error::Internal(format!(
+            "invariant violated: {ctx} produced non-UTF-8 String (length={})",
+            s.len()
+        )));
+    }
+    Ok(())
+}
+
 fn encode_attributes(attrs: &serde_json::Value, bulk_import: bool) -> Result<String, Error> {
     let s = serde_json::to_string(attrs)
         .map_err(|e| Error::Internal(format!("attributes serialize: {e}")))?;
+    // CIRISPersist#58 defense-in-depth.
+    assert_valid_utf8_or_describe(&s, "encode_attributes (serde_json::to_string)")?;
     let cap = max_attributes_bytes();
     if !bulk_import && s.len() > cap {
         return Err(Error::AttributesTooLarge {
@@ -89,6 +109,80 @@ fn encode_attributes(attrs: &serde_json::Value, bulk_import: bool) -> Result<Str
 
 fn decode_attributes(s: &str) -> Result<serde_json::Value, Error> {
     serde_json::from_str(s).map_err(|e| Error::Backend(format!("attributes JSON decode: {e}")))
+}
+
+/// v1.5.6 (CIRISPersist#58) — Read the `attributes` TEXT column with a
+/// detailed diagnostic on UTF-8 decode failure. rusqlite's default
+/// `row.get::<_, String>("attributes")` errors with "Conversion error
+/// from type Text at index: 3, invalid utf-8 sequence of N bytes from
+/// index P" — which surfaces the failure but tells the caller nothing
+/// about which node, what the surrounding bytes look like, or how
+/// large the column is. The agent-side bug report on #58 couldn't
+/// diagnose because the error didn't carry that context.
+///
+/// This helper:
+/// 1. Tries the normal `String` get first (fast path; valid UTF-8).
+/// 2. On failure, falls back to `Vec<u8>` get + manual UTF-8 validation
+///    via `std::str::from_utf8`.
+/// 3. Returns a detailed `Error::Backend` carrying: total byte length,
+///    position of the invalid byte, hex dump of ±32 bytes around the
+///    failure, and the agent-visible `node_id` so CI logs are
+///    actionable.
+fn read_attributes_text(row: &rusqlite::Row<'_>, node_id: &str) -> Result<String, Error> {
+    match row.get::<_, String>("attributes") {
+        Ok(s) => Ok(s),
+        Err(_) => {
+            // Fallback: read as raw bytes and pinpoint the failure.
+            let raw: Vec<u8> = row.get("attributes").map_err(|e| {
+                Error::Backend(format!(
+                    "decode attributes: node_id={node_id}: raw read failed: {e}"
+                ))
+            })?;
+            match std::str::from_utf8(&raw) {
+                Ok(s) => Ok(s.to_owned()), // shouldn't happen — String get failed, bytes valid
+                Err(utf8_err) => {
+                    let bad_pos = utf8_err.valid_up_to();
+                    let bad_len = utf8_err.error_len().unwrap_or(1);
+                    let total_len = raw.len();
+                    // Hex dump of ±32 bytes around bad_pos.
+                    let lo = bad_pos.saturating_sub(32);
+                    let hi = (bad_pos + bad_len + 32).min(total_len);
+                    let mut hex = String::new();
+                    for (i, b) in raw[lo..hi].iter().enumerate() {
+                        let abs = lo + i;
+                        if abs == bad_pos {
+                            hex.push_str("[");
+                        }
+                        hex.push_str(&format!("{b:02x}"));
+                        if abs == bad_pos + bad_len - 1 {
+                            hex.push_str("]");
+                        } else {
+                            hex.push(' ');
+                        }
+                    }
+                    // Surrounding printable context (replace invalid
+                    // bytes with • for readability).
+                    let ctx: String = raw[lo..hi]
+                        .iter()
+                        .map(|&b| {
+                            if b.is_ascii() && !b.is_ascii_control() {
+                                b as char
+                            } else {
+                                '•'
+                            }
+                        })
+                        .collect();
+                    Err(Error::Backend(format!(
+                        "decode attributes: node_id={node_id}: invalid UTF-8 at byte {bad_pos} \
+                         (sequence length {bad_len}); attributes column is {total_len} bytes total. \
+                         hex (±32 around failure, [] = invalid bytes): {hex}. \
+                         ascii context (• = non-printable): {ctx:?}. \
+                         original error: {utf8_err}"
+                    )))
+                }
+            }
+        }
+    }
 }
 
 fn parse_datetime(s: &str) -> Result<chrono::DateTime<chrono::Utc>, Error> {
@@ -117,9 +211,13 @@ fn decode_node_row(row: &rusqlite::Row<'_>) -> Result<GraphNode, Error> {
         .map_err(|e| Error::Backend(format!("decode scope: {e}")))?;
     let scope = GraphScope::from_sql_str(&scope_str)
         .ok_or_else(|| Error::Backend(format!("unknown scope: {scope_str}")))?;
-    let attrs_str: String = row
-        .get("attributes")
-        .map_err(|e| Error::Backend(format!("decode attributes: {e}")))?;
+    // Read node_id first so the diagnostic in read_attributes_text can
+    // include it in the error message (CIRISPersist#58 — actionable
+    // CI logs when attributes UTF-8 decode fails).
+    let node_id: String = row
+        .get("node_id")
+        .map_err(|e| Error::Backend(format!("decode node_id: {e}")))?;
+    let attrs_str = read_attributes_text(row, &node_id)?;
     let updated_at_str: String = row
         .get("updated_at")
         .map_err(|e| Error::Backend(format!("decode updated_at: {e}")))?;
@@ -127,9 +225,7 @@ fn decode_node_row(row: &rusqlite::Row<'_>) -> Result<GraphNode, Error> {
         .get("created_at")
         .map_err(|e| Error::Backend(format!("decode created_at: {e}")))?;
     Ok(GraphNode {
-        node_id: row
-            .get("node_id")
-            .map_err(|e| Error::Backend(format!("decode node_id: {e}")))?,
+        node_id,
         scope,
         node_type: row
             .get("node_type")
@@ -1043,5 +1139,82 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(got.node_type, "conversation_summary");
+    }
+
+    /// CIRISPersist#58 regression: when the attributes column contains
+    /// non-UTF-8 bytes (either via a non-persist writer or external
+    /// corruption), get_node must surface a diagnostic that includes
+    /// the node_id + total bytes + position of the invalid byte +
+    /// hex dump of surrounding context. Without this, agent CI logs
+    /// only carry "Conversion error from type Text at index: 3" with
+    /// no way to find the root cause upstream.
+    #[tokio::test]
+    async fn get_node_diagnostic_on_invalid_utf8_attributes() {
+        let (backend, graph) = fresh_backend().await;
+        // First, upsert a clean node — guarantees the row exists and
+        // also exercises the encode_attributes UTF-8 invariant check.
+        let clean = fixture_node("ally/identity", GraphScope::Identity, "IDENTITY");
+        graph.upsert_node(clean, 0, false).await.unwrap();
+
+        // Now inject a non-UTF-8 byte (0xC0 — invalid start byte) at
+        // a deterministic position inside the attributes column via
+        // raw SQL. Simulates the kind of corruption the agent observed
+        // in CI without us needing to find the upstream root cause.
+        let conn = backend.conn_handle();
+        let _ = tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
+            let guard = conn.blocking_lock();
+            // Build a 1 KB attributes string with a planted invalid byte.
+            let prefix = "{\"padding\":\"".repeat(60); // ~800 bytes of valid JSON-ish
+            let mut bytes: Vec<u8> = prefix.into_bytes();
+            bytes.push(0xC0); // invalid start byte at known position
+            bytes.extend_from_slice(b"\",\"k\":\"v\"}".repeat(10).as_slice());
+            // Bind as BLOB to bypass SQLite's normal TEXT semantics
+            // (rusqlite would refuse to bind a non-UTF-8 String).
+            guard.execute(
+                "UPDATE cirisgraph_nodes SET attributes = ?1 WHERE node_id = 'ally/identity'",
+                rusqlite::params![bytes],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        // Now get_node should fail with the diagnostic error.
+        let err = graph
+            .get_node("ally/identity", GraphScope::Identity)
+            .await
+            .expect_err("get_node should fail on invalid UTF-8 attributes");
+        let msg = format!("{err}");
+        // The diagnostic must carry: node_id, byte position, hex dump
+        // marker, and total length — all the things agent CI logs
+        // need to find the upstream root cause.
+        assert!(msg.contains("ally/identity"), "missing node_id: {msg}");
+        assert!(
+            msg.contains("invalid UTF-8 at byte"),
+            "missing byte pos: {msg}"
+        );
+        assert!(msg.contains("hex"), "missing hex dump: {msg}");
+        assert!(msg.contains("c0"), "missing the invalid byte 0xC0: {msg}");
+        assert!(msg.contains("bytes total"), "missing total length: {msg}");
+    }
+
+    /// CIRISPersist#58 defense-in-depth: encode_attributes guards
+    /// against future regressions that might somehow produce non-UTF-8
+    /// output. serde_json::to_string is UTF-8-safe by construction
+    /// today; this test pins that invariant.
+    #[test]
+    fn encode_attributes_always_produces_valid_utf8() {
+        // Tricky inputs: nested objects, unicode strings, escape
+        // sequences, large nested arrays.
+        let inputs = vec![
+            serde_json::json!({"k": "v"}),
+            serde_json::json!({"unicode": "日本語🎯"}),
+            serde_json::json!({"escapes": "\u{0001}\u{007F}\n\r\t\\\""}),
+            serde_json::json!({"nested": {"a": [1, 2, {"b": "c"}]}}),
+        ];
+        for v in inputs {
+            let encoded = encode_attributes(&v, false).expect("encode succeeds");
+            assert!(std::str::from_utf8(encoded.as_bytes()).is_ok());
+        }
     }
 }

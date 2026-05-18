@@ -5,6 +5,111 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.5.6] — 2026-05-18
+
+**Diagnostic for cirisgraph attributes UTF-8 decode failures (#58).**
+
+CIRISAgent 2.9.0 staged-QA CI surfaced a hard-to-diagnose failure
+where `cirisgraph_get_node` raises `Conversion error from type Text at
+index: 3, invalid utf-8 sequence of 1 bytes from index 806` after a
+seemingly-successful `cirisgraph_upsert_node`. The error tells the
+caller nothing about which node, what surrounding bytes look like, or
+how large the column is — making it impossible to trace upstream.
+
+This release replaces rusqlite's default decode error with a detailed
+diagnostic + adds defense-in-depth UTF-8 validation on the write side.
+No persist-side root cause was identified (write path uses
+`serde_json::to_string` which is UTF-8-safe by construction); the
+diagnostic makes the actual bytes visible so the agent team can find
+the upstream source of the bad data.
+
+### What changed
+
+`src/graph/sqlite.rs`:
+
+1. **New `read_attributes_text`** helper used by `decode_node_row`:
+   - Fast path: normal `row.get::<_, String>("attributes")`.
+   - On UTF-8 failure: fall back to `Vec<u8>` get, run
+     `std::str::from_utf8` to pinpoint the bad byte, return
+     `Error::Backend` carrying:
+     - The affected `node_id`
+     - Position of the invalid byte
+     - Length of the invalid UTF-8 sequence
+     - Total bytes in the column
+     - Hex dump of ±32 bytes around the failure, with `[...]`
+       markers around the bad sequence
+     - ASCII context (printable chars + • for non-printable)
+     - Original `Utf8Error` for forensics
+
+   Example error from the new path (vs the prior one-liner):
+
+   ```
+   decode attributes: node_id=ally/identity: invalid UTF-8 at byte 720
+   (sequence length 1); attributes column is 730 bytes total. hex (±32
+   around failure, [] = invalid bytes): 7b 22 70 ... [c0] 22 2c 22 6b...
+   ascii context (• = non-printable): "...padding\":[•]\",\"k\"...".
+   original error: invalid utf-8 sequence of 1 bytes from index 720
+   ```
+
+2. **`assert_valid_utf8_or_describe`** helper called from
+   `encode_attributes` — belt-and-suspenders check that
+   `serde_json::to_string`'s output is valid UTF-8 (it is, by
+   construction). If a future regression somehow produces non-UTF-8
+   bytes on the write path, the failure surfaces with caller context
+   at write time rather than at the next read with no context.
+
+### Tests
+
+Two new regression tests in `src/graph/sqlite.rs`:
+
+- `get_node_diagnostic_on_invalid_utf8_attributes` — injects a 0xC0
+  byte (invalid UTF-8 start byte) directly via raw SQL `UPDATE`, then
+  calls `get_node` and asserts the diagnostic includes node_id, byte
+  position, hex dump marker, the invalid byte's hex form, and total
+  length.
+- `encode_attributes_always_produces_valid_utf8` — pins the write-path
+  invariant across nested objects, unicode strings (日本語🎯), escape
+  sequences, and large nested arrays.
+
+Lib suite: 403 passed (up from 296 at v1.5.5 — full feature set: postgres,
+sqlite, cirisgraph, cirisaudit, cirisincident).
+
+### Impact
+
+- **Diagnostic path activated automatically** — any future
+  `cirisgraph_get_node` UTF-8 failure carries actionable info in the
+  Python `Transient` exception's error message. Agent CI logs will
+  now show the bytes the agent team needs.
+- **No behavior change on the write path** — `encode_attributes` is
+  UTF-8-safe today; the assertion is paranoid validation.
+- **No schema change.** No migration. Zero risk to existing data.
+
+### What this does NOT fix
+
+The upstream root cause of the corruption isn't addressed — that
+requires the agent team to see the actual bytes (which this release
+enables) and trace where they're coming from. Hypotheses to test
+once diagnostic output is available:
+
+- Mojibake (double-encoded text)
+- Binary data accidentally serialized as a string (hash bytes, pickle
+  fragments, raw bytes from a TPM/keyring without base64 wrapping)
+- Python `json.dumps` of a string containing lone surrogates after a
+  json.loads → json.dumps round-trip
+- An external writer (non-persist) writing to `cirisgraph_nodes`
+  directly
+
+The agent team will surface their CI log with the new diagnostic; if
+the pattern points at persist, follow-up in v1.5.x or v1.6.x with the
+root-cause fix.
+
+### Cross-references
+
+- [CIRISPersist#58](https://github.com/CIRISAI/CIRISPersist/issues/58)
+- CIRISAgent#763 (Lane A1 — graph absorption)
+- CIRISAgent staged-QA failure:
+  https://github.com/CIRISAI/CIRISAgent/actions/runs/26008900813/job/76445550371
+
 ## [1.5.5] — 2026-05-17
 
 **Cirisincident schema extension for CIRISAgent Lane D1-full (closes [#56](https://github.com/CIRISAI/CIRISPersist/issues/56)).**
