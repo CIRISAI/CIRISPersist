@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779130211650,
+  "lastUpdate": 1779130991665,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -17639,6 +17639,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23667201,
             "range": "± 112662",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "a99238f6286c9d76609e7eadbbf4cdf1579cf73a",
+          "message": "1.5.15 — maintenance_locks substrate (CIRISPersist#59 #7 of 11)\n\nRenamed away from consolidation_locks — substrate is generic\nmaintenance-lock family for any cross-occurrence coordination need.\nTSDB-consolidation worker is the first user.\n\nV030 migration on both backends. 5 columns: lock_key (PK), locked_by,\nlocked_at, lock_timeout_seconds (default 300, CHECK > 0), metadata\n(JSONB/TEXT JSON optional lock-holder context). Partial index\n(locked_at DESC) WHERE locked_by IS NOT NULL for active-lock scan.\n\nMaintenanceLockService trait (3 methods):\n- try_acquire_lock → Option<MaintenanceLock>. Race-safe via\n  single-statement INSERT-OR-UPDATE with WHERE clause filtering by\n  lock-not-held OR lock-expired. Some on win (clean / refresh /\n  steal-from-stale); None when active holder owns.\n- release_lock → bool. Releases iff caller holds; mismatch is no-op\n  returning false.\n- get_lock — read current state.\n\nMaintenanceLock::is_expired(now) helper for client-side checks.\n\nCross-backend expiry parity verified — both backends evaluate\nserver-side in the same statement that acquires, using the same\nserver clock that stamped locked_at:\n- PG: WHERE locked_at + (timeout * interval) < NOW()\n- SQLite: WHERE julianday('now') > julianday(locked_at) + timeout/86400\n\nTest expiry_semantics_match_client_helper runs on both: acquire 1s\ntimeout, wait 1.5s, assert is_expired(Utc::now()) agrees with\ntry_acquire from different holder. Sub-millisecond clock skew tolerance.\n\nPyO3: 3 new methods gated on cirislens_maintenance_locks feature.\n\n28 new tests (9 types + 1 mod kind + 9 PG + 9 SQLite). All 5 columns\nround-trip; clean/refresh/steal/contention/release/mismatch paths;\nis_expired matrix; cross-backend expiry parity.\n\nLib suite: 304 pass.\n\n4 substrates remain: creation_ceremonies (v1.5.16),\ncontinuity_awareness, feedback_mappings, wa_cert.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-18T13:55:07-05:00",
+          "tree_id": "0385f592b2d0dbc70f32421ecc1abecaa8318f95",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/a99238f6286c9d76609e7eadbbf4cdf1579cf73a"
+        },
+        "date": 1779130990691,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 109055,
+            "range": "± 285",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 259188,
+            "range": "± 3481",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 558609,
+            "range": "± 3070",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1978936,
+            "range": "± 45906",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 345,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1448,
+            "range": "± 60",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7215,
+            "range": "± 98",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23145,
+            "range": "± 37",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26404,
+            "range": "± 779",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 90996,
+            "range": "± 133",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 367,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3156,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9519,
+            "range": "± 31",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41580,
+            "range": "± 380",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 631,
+            "range": "± 17",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2267863,
+            "range": "± 41271",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7018108,
+            "range": "± 48915",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25854299,
+            "range": "± 145158",
             "unit": "ns/iter"
           }
         ]
