@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779130991665,
+  "lastUpdate": 1779131993911,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -17771,6 +17771,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25854299,
             "range": "± 145158",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "f61fe9b63631e220e1c2508167029f5907b6f24a",
+          "message": "1.5.16 — creation_ceremonies substrate (CIRISPersist#59 #8 of 11)\n\nV031 migration on both backends. 14 columns matching agent's\nidentity-creation history table verbatim. Status CHECK:\npending | in_progress | completed | failed | revoked. No FKs\n(agent_id references are free-form across the federation).\n\nexpected_capabilities stays Option<String> (agent stores TEXT;\npreserve wire format literally).\n\n4 indexes: (new_agent_id), (creator_agent_id, timestamp DESC),\n(wise_authority_id, timestamp DESC), (timestamp DESC).\n\nCreationCeremonyService trait (4 methods):\n- record_ceremony → ClaimResult (write-once; ON CONFLICT DO NOTHING)\n- get_ceremony\n- list_ceremonies (filter creator/wa/new_agent/status/window;\n  ORDER BY timestamp DESC; LIMIT)\n- update_ceremony_status (atomic advance; missing=false)\n\nPyO3: 4 new methods gated on cirislens_creation_ceremonies feature.\n\n22 new tests (6 types + 1 mod + 7 PG + 7 SQLite). Lib suite: 298 pass.\n\n3 substrates remain: continuity_awareness (v1.5.17),\nfeedback_mappings, wa_cert.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-18T14:11:48-05:00",
+          "tree_id": "6cd652d18f3057dce3fd13d0d23d966c08d75135",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/f61fe9b63631e220e1c2508167029f5907b6f24a"
+        },
+        "date": 1779131993325,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 102580,
+            "range": "± 1512",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 247744,
+            "range": "± 790",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 538596,
+            "range": "± 13917",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1916151,
+            "range": "± 17713",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 338,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1409,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7367,
+            "range": "± 257",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21668,
+            "range": "± 59",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24728,
+            "range": "± 786",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 84199,
+            "range": "± 1431",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 455,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 4066,
+            "range": "± 19",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 13191,
+            "range": "± 104",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 55390,
+            "range": "± 223",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 629,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2354213,
+            "range": "± 164954",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6753499,
+            "range": "± 219997",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 24398010,
+            "range": "± 552312",
             "unit": "ns/iter"
           }
         ]
