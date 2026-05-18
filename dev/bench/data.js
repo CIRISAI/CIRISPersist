@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779133656540,
+  "lastUpdate": 1779134560911,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -18167,6 +18167,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 24519550,
             "range": "± 210058",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "a1a5c2245e5b921be6e4ec82c5a30268cab6fff2",
+          "message": "1.5.19 — wa_cert substrate (CIRISPersist#59 #11 of 11 — FINAL) closes #59\n\nFinal substrate of the 11-cut absorption. With this release the entire\nCIRISAgent ciris_engine.db is absorbed into persist; no agent-side\nlibrary opens the file directly anymore. The dual-WAL corruption\npattern from CIRISPersist#58 is structurally impossible because persist\nis the only writer.\n\nV034 migration on both backends. 24 columns — Wise-Authority cert\ndirectory. Lives in engine DB (not separate auth.db) per the\n\"persist is the only library that opens the file\" guarantee from #59.\nCompromise-isolation can be revisited as v1.6.x without breaking\nsubstrate shape.\n\nSchema highlights:\n- wa_id PK; role CHECK root|authority|observer\n- jwt_kid UNIQUE (JWT verify hot path)\n- oauth_provider/oauth_external_id partial composite index\n- parent_wa_id self-FK (DEFERRABLE on PG; immediate on SQLite)\n- scopes JSONB NOT NULL (every WA has scopes)\n- token_type CHECK standard|session|api_key|oauth|service\n\n5 indexes covering JWT verify / OAuth login / role enumeration /\nadapter-bound listing / parent tree walks.\n\nWaCertService trait (7 methods):\n- upsert_wa_cert (preserves created)\n- get_wa_cert\n- get_by_kid (JWT verify hot path)\n- get_by_oauth (OAuth login)\n- list_by_role (observer/authority enumeration; active=TRUE)\n- set_active (activity toggle)\n- update_last_login\n\nPyO3: 7 new methods gated on cirislens_wa_cert feature.\n\n36 new tests (8 types + error_kind + 14 PG + 14 SQLite). All 24\ncolumns round-trip; self-FK reject + passthrough; idempotent upsert\npreserves created; jwt_kid UNIQUE collision → Conflict (PG SqlState\nUNIQUE_VIOLATION + SQLite extended code 2067); get_by_kid + get_by_\noauth index hits; list_by_role filters by role+active; set_active +\nupdate_last_login + parent tree.\n\nLib suite: 312 pass.\n\nCIRISPersist#59 — full absorption complete.\n11 substrates across v1.5.9-v1.5.19: tasks, thoughts,\nservice_correlations, scheduled_tasks, tickets, deferral_reports,\nmaintenance_locks, creation_ceremonies, continuity_awareness,\nfeedback_mappings, wa_cert. 11 migrations, 150 columns, 47 trait\nmethods, ~250 tests across both backends.\n\nCloses #59.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-18T14:54:31-05:00",
+          "tree_id": "53b292f7f0a455b5622b5f9c1168168b03822107",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/a1a5c2245e5b921be6e4ec82c5a30268cab6fff2"
+        },
+        "date": 1779134560219,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 109395,
+            "range": "± 689",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 259608,
+            "range": "± 516",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 561245,
+            "range": "± 8405",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1990671,
+            "range": "± 4466",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 342,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1423,
+            "range": "± 38",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8408,
+            "range": "± 53",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23161,
+            "range": "± 367",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26405,
+            "range": "± 139",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91059,
+            "range": "± 1647",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 361,
+            "range": "± 19",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3150,
+            "range": "± 69",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9595,
+            "range": "± 58",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41626,
+            "range": "± 159",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 637,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2255550,
+            "range": "± 67065",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7108525,
+            "range": "± 102562",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 26271085,
+            "range": "± 715887",
             "unit": "ns/iter"
           }
         ]
