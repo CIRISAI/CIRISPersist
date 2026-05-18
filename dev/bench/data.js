@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779119030597,
+  "lastUpdate": 1779120053191,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -17375,6 +17375,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23649038,
             "range": "± 163830",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "649075320757ce588854104aca566f4b4f4982a4",
+          "message": "1.5.13 — tickets substrate (CIRISPersist#59 #5 of 11)\n\nV028 migration on both backends. 17 columns. SOP/email-bound substrate;\nlighter shape than tasks/thoughts (no FKs except free-form\ncorrelation_id pointer). Status vocabulary: 8-value lowercase incl.\nin_progress (mixed snake_case; serde rename_all keeps JSON wire = SQL\nstring). Priority CHECK 1-10 with default 5.\n\nagent_occurrence_id default '__shared__' (sentinel for cross-occurrence\ntickets; distinct from prior substrates' 'default').\n\n4 indexes including (status, deadline ASC) WHERE NOT IN terminal\nstates for due-deadline scans, and partial (correlation_id) WHERE NOT NULL.\n\nTicketService trait (5 methods):\n- upsert_ticket (preserves created_at + submitted_at)\n- get_ticket\n- list_tickets (filter sop/type/status/email/occurrence/automated/\n  deadline_before/last_updated window; cursor pagination)\n- assign_ticket (atomic assign + optional status flip; idempotent\n  on re-assign to same user; missing-row=false)\n- update_ticket_status (terminal states carry completed_at)\n\nPyO3: 5 new methods gated on cirislens_tickets feature.\n\n26 new tests (1 mod + 8 types + 8 PG live + 9 SQLite). Lib suite:\n302 pass. All 17 columns round-trip; idempotent upsert; CHECK guards\non status + priority; assign re-noop; in_progress snake_case round-\ntrips through both SQL and JSON.\n\nNo Backend-trait collision recurred.\n\nPG TIMESTAMPTZ drift: assertion uses ≤1s tolerance matching\nv1.5.12 scheduled_tasks pattern.\n\nTicketStatus::is_terminal helper exposes {completed,cancelled,failed}\nset for callers that need to branch on terminal state.\n\n6 substrates remain: deferral_reports (v1.5.14), consolidation_locks,\ncreation_ceremonies, continuity_awareness, feedback_mappings, wa_cert.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-18T10:52:53-05:00",
+          "tree_id": "f9d54d17aba2b6b4cf71daf45a45852ef71d13d3",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/649075320757ce588854104aca566f4b4f4982a4"
+        },
+        "date": 1779120052556,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101816,
+            "range": "± 950",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 242484,
+            "range": "± 811",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 525004,
+            "range": "± 2623",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1856364,
+            "range": "± 22487",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 342,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1471,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7573,
+            "range": "± 242",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21234,
+            "range": "± 33",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24283,
+            "range": "± 27",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83755,
+            "range": "± 4102",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 364,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3060,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9574,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41928,
+            "range": "± 397",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2273361,
+            "range": "± 96315",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6659270,
+            "range": "± 866379",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23720239,
+            "range": "± 291109",
             "unit": "ns/iter"
           }
         ]
