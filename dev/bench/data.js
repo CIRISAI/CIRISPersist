@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779116092151,
+  "lastUpdate": 1779117112628,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -16979,6 +16979,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25935186,
             "range": "± 165590",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "c51ca4eb9adfb83ca09b1cb6546df32c87a5e35e",
+          "message": "1.5.10 — thoughts substrate (CIRISPersist#59 #2 of 11)\n\nSecond of 11 substrate absorptions. Mirrors v1.5.9 tasks shape with\nthought-specific lifecycle. V025 migration on both backends, FK to\ncirislens_tasks, self-FK on parent_thought_id. 14 columns.\n\nThoughtType: shipped as transparent String newtype rather than\nclosed enum. CIRISAgent's ThoughtType has 20+ values (STANDARD,\nFOLLOW_UP, ERROR, OBSERVATION, MEMORY, DEFERRED, PONDER, FEEDBACK,\nGUIDANCE, IDENTITY_UPDATE, ETHICAL_REVIEW, CONSENSUS, REFLECTION,\nSYNTHESIS, DELEGATION, CLARIFICATION, SUMMARY, TOOL_RESULT,\nACTION_REVIEW, URGENT, SCHEDULED, PATTERN, ADAPTATION, ...).\nClosed enum would drift on every agent add. SQL column is TEXT\nNOT NULL DEFAULT 'standard' with NO CHECK — new agent variants\nflow through without persist schema changes.\n\nThoughtService trait (5 methods):\n- upsert_thought (idempotent on thought_id; preserves created_at)\n- get_thought\n- list_thoughts (filter by task/status/occurrence; cursor pagination\n  on (updated_at, thought_id))\n- update_thought_status (final_action JSON merge via COALESCE;\n  missing-row returns false)\n- get_descendants (recursive CTE walking parent_thought_id chain;\n  ordered (thought_depth ASC, thought_id ASC) for determinism;\n  SQLite 3.8.3+ supports WITH RECURSIVE same shape as PG)\n\nPyO3: 5 new Engine methods gated on cirislens_thoughts feature\n(added to maturin wheel features). Stable error kinds added to\ntranslate_error_kind.\n\n27 new tests (1 mod + 6 types + 9 PG live + 11 SQLite). All 14\ncolumns round-trip; idempotent upsert preserves created_at; FK to\ntasks rejects nonexistent task; self-FK rejects nonexistent parent;\n3-level descendant tree returns 7 rows in deterministic order.\nLib suite: 325 pass.\n\nNo Backend-trait collision recurred — the Phase 3 stub sweep that\nhit upsert_task in v1.5.9 didn't stub any thought_* methods. Plain\ntrait dispatch sufficed.\n\n9 substrates remain: service_correlations (v1.5.11), scheduled_tasks,\ntickets, deferral_reports, consolidation_locks, creation_ceremonies,\ncontinuity_awareness, feedback_mappings, wa_cert.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-18T10:03:40-05:00",
+          "tree_id": "22fa5eba043260572d38a170667a149147e951c5",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/c51ca4eb9adfb83ca09b1cb6546df32c87a5e35e"
+        },
+        "date": 1779117111597,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101579,
+            "range": "± 427",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 241727,
+            "range": "± 3366",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 524151,
+            "range": "± 5143",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1850984,
+            "range": "± 15329",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 345,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1414,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8209,
+            "range": "± 74",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21184,
+            "range": "± 337",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24242,
+            "range": "± 241",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83676,
+            "range": "± 392",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 363,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3240,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9718,
+            "range": "± 50",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 43771,
+            "range": "± 116",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2267735,
+            "range": "± 100486",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6616536,
+            "range": "± 153428",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23758345,
+            "range": "± 653251",
             "unit": "ns/iter"
           }
         ]
