@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779110441783,
+  "lastUpdate": 1779113601340,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -16583,6 +16583,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25774099,
             "range": "± 190123",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "b8d4647acf51141700b2e9a820b85e015ffd7cc4",
+          "message": "1.5.7 — secrets process_incoming_text pipeline orchestration (closes #57)\n\nShips the v0.6.2 stub that's been Err(\"requires v0.6.2 pipeline\norchestration\") on both backends. Defaults SecretsService::\nprocess_incoming_text to a composition of get_filter_config +\ntry_claim_secret so both PG and SQLite inherit automatically.\n\nLane B write-leg unblocked. Agent drops its Python regex+\nSecretReference path and calls engine.secrets_process_incoming_text\ndirectly.\n\nFlow:\n1. get_filter_config()\n2. Parse config_value.patterns as CatalogPattern[]\n3. Compile regex + scan filtered text per pattern\n4. try_claim_secret per unique match (HMAC dedup idempotent)\n5. Replace each with {SECRET:<uuid>:<description>} placeholder\n6. Return (filtered_text, Vec<SecretReference>)\n\nPG + SQLite stub overrides removed; both inherit the default. The\nunderlying get_filter_config + try_claim_secret are SQLite-shipped\nper v1.5.1 — no SQLite-specific gap.\n\nTests (2 new SQLite):\n- process_incoming_text_detects_encrypts_and_replaces_via_default_impl\n- process_incoming_text_empty_catalog_passthrough\n\nLib suite: 436 pass.\n\nCHANGELOG correction: v1.5.6 framed get_classifications as\n\"permanent PG-only by design\" — that was wrong. SQLite parity for\nget_classifications + get_features is open work, tracked separately.\nNo-PG-only principle: every method should work on both backends.\n\nReverses v1.5.6's \"deferred to v1.6.x\" framing for\nprocess_incoming_text. No deferral; shipping now.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-18T09:05:09-05:00",
+          "tree_id": "02074661c6329ed2df9442c9ef8c90ff331df444",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/b8d4647acf51141700b2e9a820b85e015ffd7cc4"
+        },
+        "date": 1779113600376,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101464,
+            "range": "± 330",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 242044,
+            "range": "± 711",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 525994,
+            "range": "± 1635",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1855706,
+            "range": "± 12493",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 344,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1444,
+            "range": "± 42",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8252,
+            "range": "± 91",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21473,
+            "range": "± 32",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24544,
+            "range": "± 936",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83981,
+            "range": "± 536",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 368,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3090,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9271,
+            "range": "± 39",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41688,
+            "range": "± 442",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2198666,
+            "range": "± 44106",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6539840,
+            "range": "± 47237",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23556378,
+            "range": "± 109226",
             "unit": "ns/iter"
           }
         ]
