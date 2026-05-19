@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779205628563,
+  "lastUpdate": 1779219862708,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -19355,6 +19355,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23776923,
             "range": "± 162329",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "fc8aa3ad7c17fedc514a89274213364bb6a7d433",
+          "message": "1.6.1 — cirisgraph attribute_match filter (closes #67)\n\nPhase 4 follow-up. Closes the gap CIRISAgent#763's\nmemory_query_helpers.py hit while migrating OBSERVER-tier user\nfiltering off raw SQL: the substrate had no JSON-path equality or\narray-containment predicate.\n\nNew NodeFilter.attribute_match field: AttributeMatch {\n  path: String,           // alphanumeric/underscore only\n  equals_any: Option<Vec<String>>,\n  array_contains_any: Option<Vec<String>>,\n}\n\n- equals_any: row matches when attributes->>path ∈ values.\n- array_contains_any: row matches when attributes->path is a JSON\n  array containing any of the values.\n- Both clauses OR-combine when both present (matches the agent's\n  Layer 1 OBSERVER filter shape).\n\nPG: (attributes->>$path) = ANY($vals::text[]) for equals_any;\n(attributes->$path) ?| $vals::text[] for array_contains_any.\nExplicit ::text[] casts needed for tokio-postgres' default bind to\ninfer the right type.\n\nSQLite: json_extract(attributes,'$.path') IN (...) for equals_any;\nguarded json_each walk for array_contains_any. The json_type guard\nprevents \"malformed JSON\" on rows whose path resolves to a scalar\n— common when the same OR-combined filter spans scalar + array\nshapes.\n\nSecurity: AttributeMatch.path is interpolated directly into the\nSQL fragment (PG and SQLite both reject JSON paths as bind values).\nValidated up-front to be alphanumeric + underscore. SQL injection\nvia path slot rejected with InvalidArgument.\n\nHonored in both query_nodes and count_nodes via a shared\npush_attribute_match_clause helper per backend.\n\nTests: 8 new (6 SQLite + 2 PG-gated). PyO3 surface unchanged at\nsignature level — filter_json accepts the new attribute_match key\ninside the existing NodeFilter shape. .pyi docstring extended.\n\n637/638 lib tests pass with clean PG state (the single residual\nlocal-only telemetry_daily_tier flake from cirisgraph/telemetry\nshared-DB state pollution is unaffected; CI starts fresh).\n\ncloses #67\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-19T14:35:15-05:00",
+          "tree_id": "6e1bf007ed658fdde762ebdd4f1ec86d71eb33e4",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/fc8aa3ad7c17fedc514a89274213364bb6a7d433"
+        },
+        "date": 1779219861808,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 112055,
+            "range": "± 411",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 263524,
+            "range": "± 4562",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 566307,
+            "range": "± 14480",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1996521,
+            "range": "± 4419",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 338,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1402,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7271,
+            "range": "± 53",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23173,
+            "range": "± 69",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26441,
+            "range": "± 428",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91071,
+            "range": "± 179",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 370,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3131,
+            "range": "± 47",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9488,
+            "range": "± 380",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41785,
+            "range": "± 147",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 637,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2237855,
+            "range": "± 104680",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6991695,
+            "range": "± 157770",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25866952,
+            "range": "± 494599",
             "unit": "ns/iter"
           }
         ]
