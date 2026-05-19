@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779203680201,
+  "lastUpdate": 1779204743653,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -19091,6 +19091,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 24305544,
             "range": "± 324100",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "b2b0030fa05b4fcf4e75bd022f3ca001a5efd8ff",
+          "message": "ci: harden artifact downloads with gh-run-download retry loop\n\nv1.5.24's tag CI run (26105591714) failed at the\n\"Sign + register multi-target build manifests\" step due to a\ntransient 403 Forbidden from GitHub's actions/download-artifact@v4\nListArtifacts call. The artifacts themselves downloaded successfully\nright after (SHA256 verified) but the action's non-retryable\nfailure cascaded — Publish wheel to PyPI was skipped, so v1.5.24\nwheels never reached PyPI even though every build/test/clippy job\npassed.\n\nReplaces both actions/download-artifact@v4 sites (publish-pypi +\nbuild-manifest) with a shell-based retry loop using\n`gh run download $GITHUB_RUN_ID`. Five attempts, exponential\nbackoff (10/20/30/40/50s), then hard fail. Mirrors the existing\n`gh release download` retry pattern in the build-tool install step\nof the same workflow (v1.1.2 era, CIRISVerify v2.1.1 CI hardening\narc).\n\npublish-pypi: flattens per-artifact subdirs after download to keep\nthe PyPI publish step's single-dist/*.whl expectation.\nbuild-manifest: leaves subdirs intact — the sign script walks\n`dist/wheels/ciris_persist-wheel-<target>/*.whl` per arch.\n\nBoth jobs gain `actions: read` on the GITHUB_TOKEN scope so\n`gh run download` can list the run's artifacts.\n\nNo functional change to the published wheel or build manifest\nshapes — pure infrastructure resilience.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-19T10:24:44-05:00",
+          "tree_id": "bf39b551c8efa55df8392be12602e28c2ec88a33",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/b2b0030fa05b4fcf4e75bd022f3ca001a5efd8ff"
+        },
+        "date": 1779204742919,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 109027,
+            "range": "± 200",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 259831,
+            "range": "± 624",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 559803,
+            "range": "± 2603",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1984069,
+            "range": "± 6079",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 346,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1413,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7190,
+            "range": "± 85",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23164,
+            "range": "± 117",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26391,
+            "range": "± 28",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91075,
+            "range": "± 169",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 356,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3221,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9742,
+            "range": "± 54",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42319,
+            "range": "± 402",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 632,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2253883,
+            "range": "± 131731",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7041928,
+            "range": "± 117967",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25835377,
+            "range": "± 87000",
             "unit": "ns/iter"
           }
         ]
