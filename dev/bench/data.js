@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779219862708,
+  "lastUpdate": 1779220938296,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -19487,6 +19487,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25866952,
             "range": "± 494599",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "78b2bfd8955b3a8e1fcfe7f22692cbbf7c1be80a",
+          "message": "1.6.2 — TSDB non-metric summary types (closes #68)\n\nFINAL Phase 3b blocker for CIRISAgent 2.9.0 cleared. The agent's\n6,680 LOC services/graph/tsdb_consolidation/ package — the last\nsubstrate consumer carrying raw SQL — can now retire those 5 files\nin favor of the typed consolidate methods.\n\nFour new TelemetryService trait methods, one per non-metric summary\ntype:\n\n- consolidate_tasks(req) → reads cirislens.tasks (status histogram)\n  + cirislens.thoughts (mean depth) within the window, writes a\n  TaskSummary node (node_type='task_summary').\n- consolidate_conversations(req) → reads service_correlations where\n  action_type IN ('speak','observe','speak_action','observe_action'),\n  writes ConversationSummary (total_messages + unique_actors).\n- consolidate_traces(req) → reads service_correlations where\n  correlation_type='trace', writes TraceSummary (per-action\n  histogram).\n- consolidate_audit(req) → reads cirislens.audit_log filtered by\n  tenant_id (V014 schema), writes AuditSummary (per-action_type\n  histogram + unique_actors). Uses recorded_at not created_at — V014\n  column name (sub-agent spec inversion corrected).\n\nEach returns TypedConsolidationOutcome { summary_written, source_rows }.\nEmpty-window cases still write the node (preserves \"empty period\"\nbuckets for the agent UI).\n\nPlus query_summary_nodes(node_type, level, tenant, from, to) →\nVec<serde_json::Value> for typed-attribute readback. SQLite mirrors\nthe truncate_to_micros discipline from query_summaries / get_summary\nso nanosecond chrono::Utc::now() derivatives don't miss rows.\n\nPG + SQLite parity. PyO3: tsdb_consolidate_tasks /\n_conversations / _traces / _audit + tsdb_query_summary_nodes (all\ngated on telemetry feature). .pyi stubs with per-type JSON shape\ndocs.\n\nTests: 14 new (10 SQLite + 4 PG-gated). 649/650 lib pass with clean\nPG state — the single residual telemetry_daily_tier flake is the\npre-existing local-only cirisgraph+telemetry state-pollution flake\n(CI doesn't exercise telemetry feature so it never surfaces there).\n\nPG test fixtures use tenant-scoped task_ids and CHECK-allowlist\naction_types (handler_action_speak / config_change per V018) to\navoid cross-test PK collisions in the shared local DB.\n\ncloses #68\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-19T14:54:25-05:00",
+          "tree_id": "17c474ac376fceb3df45b98a240c539690f5c30c",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/78b2bfd8955b3a8e1fcfe7f22692cbbf7c1be80a"
+        },
+        "date": 1779220937178,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 109039,
+            "range": "± 374",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 259386,
+            "range": "± 4474",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 560264,
+            "range": "± 2396",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1989507,
+            "range": "± 7570",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 353,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1418,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7178,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23176,
+            "range": "± 274",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26429,
+            "range": "± 61",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91047,
+            "range": "± 245",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 376,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3184,
+            "range": "± 27",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9787,
+            "range": "± 19",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42358,
+            "range": "± 128",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 637,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2286311,
+            "range": "± 177414",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7044510,
+            "range": "± 153210",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25702869,
+            "range": "± 368788",
             "unit": "ns/iter"
           }
         ]
