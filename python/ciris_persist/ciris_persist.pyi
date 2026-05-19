@@ -889,6 +889,75 @@ class Engine:
         revoked, ``None`` otherwise. Backed by the PRIMARY KEY index.
         """
 
+    # ── v1.6.0 (CIRISPersist#63) — TSDB query / prune primitives ────
+
+    def tsdb_query_summaries(
+        self,
+        level: str,
+        tenant_id: str,
+        from_rfc3339: str,
+        to_rfc3339: str,
+    ) -> str:
+        """v1.6.0 (CIRISPersist#63) — Return every ``MetricSummary``
+        whose ``(consolidation_level, tenant_id)`` matches and whose
+        ``period_start ∈ [from, to)``. Ordered by
+        ``(period_start ASC, metric_name ASC)``.
+
+        ``level`` is one of ``"basic" | "daily" | "weekly" |
+        "monthly"``. ``from`` / ``to`` are RFC 3339 timestamps.
+        ``to`` must be > ``from``.
+
+        Returns the JSON-encoded ``list[MetricSummary]``. Empty list
+        when no rows match (not an error).
+
+        Backs CIRISAgent 2.9.0 Phase 3b's Basic (6h) / extensive
+        (week) / profound (month) period-window queries.
+        """
+
+    def tsdb_get_summary(
+        self,
+        level: str,
+        tenant_id: str,
+        metric_name: str,
+        period_start_rfc3339: str,
+    ) -> str | None:
+        """v1.6.0 (CIRISPersist#63) — Point-lookup of one summary by
+        the deterministic ``(level, tenant_id, metric_name,
+        period_start)`` key. Returns the JSON-encoded
+        ``MetricSummary`` row or ``None``.
+        """
+
+    def tsdb_prune_summaries(
+        self,
+        level: str,
+        tenant_id: str,
+        before_rfc3339: str,
+    ) -> int:
+        """v1.6.0 (CIRISPersist#63) — Delete summary nodes whose
+        ``period_end < before`` for ``(level, tenant_id)``.
+        Cascades incident TEMPORAL_NEXT edges. Returns the count of
+        summary nodes deleted (edges deleted silently as part of the
+        cascade).
+
+        Used by CIRISAgent 2.9.0 Phase 3b's TSDB retention sweep:
+        once daily summaries roll up basic ones, the basic-tier rows
+        are purged after a retention window passes.
+        """
+
+    def tsdb_count_edges_by_relationship_in_window(
+        self,
+        from_rfc3339: str,
+        to_rfc3339: str,
+    ) -> str:
+        """v1.6.0 (CIRISPersist#63) — Histogram of edges within
+        ``[from, to)`` grouped by ``relationship``. Filters
+        ``scope='ENVIRONMENT'`` (the TSDB scope).
+
+        Returns the JSON-encoded ``dict[str, int]``. Caller's
+        ``edge_manager.py`` rolls these counts into the daily
+        summary's attributes for cross-period observability.
+        """
+
     # ── v1.5.25 (CIRISPersist#65) — cirisgraph count primitives ─────
 
     def cirisgraph_count_nodes(self, filter_json: str) -> int:

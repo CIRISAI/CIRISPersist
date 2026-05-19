@@ -8230,6 +8230,239 @@ impl PyEngine {
         })
     }
 
+    // ── v1.6.0 (CIRISPersist#63) TSDB query / prune / edges ─────────
+
+    /// v1.6.0 — Return every `MetricSummary` whose
+    /// `(consolidation_level, tenant_id)` matches and whose
+    /// `period_start ∈ [from, to)`. Returns the JSON-encoded
+    /// `list[MetricSummary]`.
+    ///
+    /// `level` is one of `"basic" | "daily" | "weekly" | "monthly"`.
+    /// `from` / `to` are RFC 3339 timestamps. `to` must be > `from`.
+    ///
+    /// Backs CIRISAgent 2.9.0 Phase 3b's "period-window queries"
+    /// (Basic 6h, extensive week, profound month).
+    #[cfg(feature = "telemetry")]
+    fn tsdb_query_summaries(
+        &self,
+        py: Python<'_>,
+        level: &str,
+        tenant_id: &str,
+        from_rfc3339: &str,
+        to_rfc3339: &str,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let level = crate::telemetry::ConsolidationLevel::from_wire_str(level)
+                .ok_or_else(|| PyValueError::new_err(format!("unknown level: {level}")))?;
+            let tenant_id = tenant_id.to_owned();
+            let from: chrono::DateTime<chrono::Utc> =
+                chrono::DateTime::parse_from_rfc3339(from_rfc3339)
+                    .map_err(|e| PyValueError::new_err(format!("from parse: {e}")))?
+                    .with_timezone(&chrono::Utc);
+            let to: chrono::DateTime<chrono::Utc> =
+                chrono::DateTime::parse_from_rfc3339(to_rfc3339)
+                    .map_err(|e| PyValueError::new_err(format!("to parse: {e}")))?
+                    .with_timezone(&chrono::Utc);
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::telemetry::TelemetryService;
+                        let rows = backend
+                            .query_summaries(level, &tenant_id, from, to)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&rows).map_err(|e| {
+                            PyRuntimeError::new_err(format!("query_summaries encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::telemetry::sqlite::SqliteTelemetryBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::telemetry::TelemetryService;
+                        let rows = backend
+                            .query_summaries(level, &tenant_id, from, to)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&rows).map_err(|e| {
+                            PyRuntimeError::new_err(format!("query_summaries encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.6.0 — Point-lookup of one summary by the deterministic
+    /// `(level, tenant_id, metric_name, period_start)` key. Returns
+    /// the JSON-encoded `MetricSummary` or `None`.
+    #[cfg(feature = "telemetry")]
+    fn tsdb_get_summary(
+        &self,
+        py: Python<'_>,
+        level: &str,
+        tenant_id: &str,
+        metric_name: &str,
+        period_start_rfc3339: &str,
+    ) -> PyResult<Option<String>> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let level = crate::telemetry::ConsolidationLevel::from_wire_str(level)
+                .ok_or_else(|| PyValueError::new_err(format!("unknown level: {level}")))?;
+            let tenant_id = tenant_id.to_owned();
+            let metric_name = metric_name.to_owned();
+            let period_start: chrono::DateTime<chrono::Utc> =
+                chrono::DateTime::parse_from_rfc3339(period_start_rfc3339)
+                    .map_err(|e| PyValueError::new_err(format!("period_start parse: {e}")))?
+                    .with_timezone(&chrono::Utc);
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::telemetry::TelemetryService;
+                        let row = backend
+                            .get_summary(level, &tenant_id, &metric_name, period_start)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match row {
+                            None => Ok(None),
+                            Some(s) => serde_json::to_string(&s).map(Some).map_err(|e| {
+                                PyRuntimeError::new_err(format!("MetricSummary encode: {e}"))
+                            }),
+                        }
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::telemetry::sqlite::SqliteTelemetryBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::telemetry::TelemetryService;
+                        let row = backend
+                            .get_summary(level, &tenant_id, &metric_name, period_start)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match row {
+                            None => Ok(None),
+                            Some(s) => serde_json::to_string(&s).map(Some).map_err(|e| {
+                                PyRuntimeError::new_err(format!("MetricSummary encode: {e}"))
+                            }),
+                        }
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.6.0 — Delete summary nodes older than `before` for
+    /// `(level, tenant_id)`. Cascades incident TEMPORAL_NEXT edges.
+    /// Returns the raw count of summary nodes deleted (edges deleted
+    /// silently as part of the cascade).
+    #[cfg(feature = "telemetry")]
+    fn tsdb_prune_summaries(
+        &self,
+        py: Python<'_>,
+        level: &str,
+        tenant_id: &str,
+        before_rfc3339: &str,
+    ) -> PyResult<u64> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let level = crate::telemetry::ConsolidationLevel::from_wire_str(level)
+                .ok_or_else(|| PyValueError::new_err(format!("unknown level: {level}")))?;
+            let tenant_id = tenant_id.to_owned();
+            let before: chrono::DateTime<chrono::Utc> =
+                chrono::DateTime::parse_from_rfc3339(before_rfc3339)
+                    .map_err(|e| PyValueError::new_err(format!("before parse: {e}")))?
+                    .with_timezone(&chrono::Utc);
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::telemetry::TelemetryService;
+                        backend
+                            .prune_summaries(level, &tenant_id, before)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::telemetry::sqlite::SqliteTelemetryBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::telemetry::TelemetryService;
+                        backend
+                            .prune_summaries(level, &tenant_id, before)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.6.0 — Histogram of edges within `[from, to)`, grouped by
+    /// `relationship`. Filters scope='ENVIRONMENT' (the TSDB scope).
+    /// Returns the JSON-encoded `dict[str, int]`.
+    #[cfg(feature = "telemetry")]
+    fn tsdb_count_edges_by_relationship_in_window(
+        &self,
+        py: Python<'_>,
+        from_rfc3339: &str,
+        to_rfc3339: &str,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let from: chrono::DateTime<chrono::Utc> =
+                chrono::DateTime::parse_from_rfc3339(from_rfc3339)
+                    .map_err(|e| PyValueError::new_err(format!("from parse: {e}")))?
+                    .with_timezone(&chrono::Utc);
+            let to: chrono::DateTime<chrono::Utc> =
+                chrono::DateTime::parse_from_rfc3339(to_rfc3339)
+                    .map_err(|e| PyValueError::new_err(format!("to parse: {e}")))?
+                    .with_timezone(&chrono::Utc);
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::telemetry::TelemetryService;
+                        let map = backend
+                            .count_edges_by_relationship_in_window(from, to)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&map).map_err(|e| {
+                            PyRuntimeError::new_err(format!(
+                                "count_edges_by_relationship encode: {e}"
+                            ))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::telemetry::sqlite::SqliteTelemetryBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::telemetry::TelemetryService;
+                        let map = backend
+                            .count_edges_by_relationship_in_window(from, to)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&map).map_err(|e| {
+                            PyRuntimeError::new_err(format!(
+                                "count_edges_by_relationship encode: {e}"
+                            ))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
     // ── v0.8.3: incident PyO3 surface (CIRISPersist#37) ──────────────
     //
     // 4 methods wrapping IncidentService.

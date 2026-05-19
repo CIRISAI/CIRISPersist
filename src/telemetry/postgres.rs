@@ -389,6 +389,196 @@ impl TelemetryService for PostgresBackend {
             broke_stale_lock,
         })
     }
+
+    // ── v1.6.0 (CIRISPersist#63) TSDB query / prune surface ─────────
+
+    async fn query_summaries(
+        &self,
+        level: ConsolidationLevel,
+        tenant_id: &str,
+        from: chrono::DateTime<chrono::Utc>,
+        to: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<MetricSummary>, Error> {
+        if from >= to {
+            return Err(Error::InvalidArgument(format!(
+                "from ({from}) must be < to ({to})"
+            )));
+        }
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let rows = client
+            .query(
+                "SELECT attributes FROM cirisgraph.nodes \
+                 WHERE node_type = 'tsdb_summary' AND scope = 'ENVIRONMENT' \
+                   AND consolidation_level = $1 \
+                   AND attributes->>'tenant_id' = $2 \
+                   AND ((attributes->>'period_start')::timestamptz) >= $3 \
+                   AND ((attributes->>'period_start')::timestamptz) <  $4 \
+                 ORDER BY (attributes->>'period_start')::timestamptz ASC, \
+                          attributes->>'metric_name' ASC",
+                &[&level.as_str(), &tenant_id, &from, &to],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "query_summaries"))?;
+        let mut out: Vec<MetricSummary> = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let attrs: serde_json::Value = r
+                .try_get("attributes")
+                .map_err(|e| Error::Backend(format!("decode attributes: {e}")))?;
+            let summary: MetricSummary = serde_json::from_value(attrs)
+                .map_err(|e| Error::Backend(format!("MetricSummary decode: {e}")))?;
+            out.push(summary);
+        }
+        Ok(out)
+    }
+
+    async fn get_summary(
+        &self,
+        level: ConsolidationLevel,
+        tenant_id: &str,
+        metric_name: &str,
+        period_start: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<MetricSummary>, Error> {
+        // Build the deterministic key the rollup write path uses
+        // (mirrors `summary_node_id` below).
+        let key = format!(
+            "tsdb:{}:{}:{}:{}",
+            level.as_str(),
+            tenant_id,
+            metric_name,
+            period_start.to_rfc3339()
+        );
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let row_opt = client
+            .query_opt(
+                "SELECT attributes FROM cirisgraph.nodes \
+                 WHERE node_id = $1 AND scope = 'ENVIRONMENT' \
+                   AND node_type = 'tsdb_summary'",
+                &[&key],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "get_summary"))?;
+        let Some(row) = row_opt else { return Ok(None) };
+        let attrs: serde_json::Value = row
+            .try_get("attributes")
+            .map_err(|e| Error::Backend(format!("decode attributes: {e}")))?;
+        let summary: MetricSummary = serde_json::from_value(attrs)
+            .map_err(|e| Error::Backend(format!("MetricSummary decode: {e}")))?;
+        Ok(Some(summary))
+    }
+
+    async fn prune_summaries(
+        &self,
+        level: ConsolidationLevel,
+        tenant_id: &str,
+        before: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, Error> {
+        let mut client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| Error::Backend(format!("begin tx: {e}")))?;
+
+        // Find pruning candidates first — caller-side cascade for the
+        // TEMPORAL_NEXT edges (V013 allows dangling edges so cascade
+        // is application-layer, mirroring the cirisgraph.delete_node
+        // contract).
+        let victim_rows = tx
+            .query(
+                "SELECT node_id FROM cirisgraph.nodes \
+                 WHERE node_type = 'tsdb_summary' AND scope = 'ENVIRONMENT' \
+                   AND consolidation_level = $1 \
+                   AND attributes->>'tenant_id' = $2 \
+                   AND ((attributes->>'period_end')::timestamptz) < $3",
+                &[&level.as_str(), &tenant_id, &before],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "prune_summaries select victims"))?;
+        if victim_rows.is_empty() {
+            tx.commit()
+                .await
+                .map_err(|e| Error::Backend(format!("commit: {e}")))?;
+            return Ok(0);
+        }
+        let node_ids: Vec<String> = victim_rows
+            .iter()
+            .map(|r| r.try_get::<_, String>("node_id"))
+            .collect::<Result<_, _>>()
+            .map_err(|e| Error::Backend(format!("decode victim node_id: {e}")))?;
+
+        // Cascade edges (incoming + outgoing) referencing victim nodes.
+        tx.execute(
+            "DELETE FROM cirisgraph.edges \
+             WHERE scope = 'ENVIRONMENT' \
+               AND (source_node_id = ANY($1) OR target_node_id = ANY($1))",
+            &[&node_ids],
+        )
+        .await
+        .map_err(|e| map_pg_error(e, "prune_summaries cascade edges"))?;
+
+        let deleted = tx
+            .execute(
+                "DELETE FROM cirisgraph.nodes \
+                 WHERE node_id = ANY($1) AND scope = 'ENVIRONMENT'",
+                &[&node_ids],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "prune_summaries delete nodes"))?;
+        tx.commit()
+            .await
+            .map_err(|e| Error::Backend(format!("commit: {e}")))?;
+        Ok(deleted)
+    }
+
+    async fn count_edges_by_relationship_in_window(
+        &self,
+        from: chrono::DateTime<chrono::Utc>,
+        to: chrono::DateTime<chrono::Utc>,
+    ) -> Result<std::collections::HashMap<String, u64>, Error> {
+        if from >= to {
+            return Err(Error::InvalidArgument(format!(
+                "from ({from}) must be < to ({to})"
+            )));
+        }
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let rows = client
+            .query(
+                "SELECT relationship, COUNT(*)::BIGINT AS c \
+                 FROM cirisgraph.edges \
+                 WHERE scope = 'ENVIRONMENT' \
+                   AND created_at >= $1 AND created_at < $2 \
+                 GROUP BY relationship",
+                &[&from, &to],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "count_edges_by_relationship_in_window"))?;
+        let mut out: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        for r in &rows {
+            let rel: String = r
+                .try_get("relationship")
+                .map_err(|e| Error::Backend(format!("decode relationship: {e}")))?;
+            let c: i64 = r
+                .try_get("c")
+                .map_err(|e| Error::Backend(format!("decode count: {e}")))?;
+            out.insert(rel, c.max(0) as u64);
+        }
+        Ok(out)
+    }
 }
 
 // ─── consolidation rollup helper ────────────────────────────────────
@@ -473,8 +663,8 @@ async fn aggregate_higher_tier(
                     SUM((attributes->>'sum')::float8)                        AS sum_v, \
                     MIN((attributes->>'min')::float8)                        AS min_v, \
                     MAX((attributes->>'max')::float8)                        AS max_v, \
-                    SUM((attributes->>'count')::bigint)                      AS count_v, \
-                    SUM((attributes->>'unique_label_combinations')::bigint)  AS unique_labels \
+                    SUM((attributes->>'count')::bigint)::bigint              AS count_v, \
+                    SUM((attributes->>'unique_label_combinations')::bigint)::bigint AS unique_labels \
              FROM cirisgraph.nodes \
              WHERE node_type = 'tsdb_summary' AND scope = 'ENVIRONMENT' \
                AND consolidation_level = $1 \
@@ -1073,5 +1263,165 @@ mod tests {
         assert_eq!(attrs["min"].as_f64(), Some(10.0));
         assert_eq!(attrs["max"].as_f64(), Some(30.0));
         assert_eq!(attrs["avg"].as_f64(), Some(20.0));
+    }
+
+    // ── v1.6.0 (CIRISPersist#63) TSDB query / prune tests ──────────
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn tsdb_pg_query_get_prune_round_trip() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let tenant = format!("tlm-{}", uuid::Uuid::new_v4().simple());
+        let now = chrono::Utc::now();
+        let period_start = now - Duration::hours(6);
+        let period_end = now;
+
+        for i in 0..3 {
+            backend
+                .record_metric(MetricObservation {
+                    metric_id: None,
+                    metric_name: "metric_a".into(),
+                    tenant_id: tenant.clone(),
+                    value: 10.0 * (i as f64 + 1.0),
+                    labels: serde_json::json!({"k": "v"}),
+                    observed_at: period_start + Duration::minutes(i as i64 * 10),
+                    expires_at: None,
+                })
+                .await
+                .unwrap();
+        }
+        backend
+            .consolidate_period(ConsolidationRequest {
+                tenant_id: tenant.clone(),
+                period_start,
+                period_end,
+                locked_by: "w".into(),
+                level: ConsolidationLevel::Basic,
+            })
+            .await
+            .unwrap();
+
+        // query_summaries returns the one summary.
+        let rows = backend
+            .query_summaries(
+                ConsolidationLevel::Basic,
+                &tenant,
+                period_start - Duration::hours(1),
+                period_end + Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].metric_name, "metric_a");
+        assert_eq!(rows[0].count, 3);
+        assert_eq!(rows[0].sum, 60.0);
+        assert_eq!(rows[0].consolidation_level, ConsolidationLevel::Basic);
+
+        // get_summary point lookup.
+        let got = backend
+            .get_summary(ConsolidationLevel::Basic, &tenant, "metric_a", period_start)
+            .await
+            .unwrap()
+            .expect("present");
+        assert_eq!(got.metric_name, "metric_a");
+        let missing = backend
+            .get_summary(ConsolidationLevel::Basic, &tenant, "absent", period_start)
+            .await
+            .unwrap();
+        assert!(missing.is_none());
+
+        // prune_summaries: cutoff = period_end + 1h → drops the row.
+        let deleted = backend
+            .prune_summaries(
+                ConsolidationLevel::Basic,
+                &tenant,
+                period_end + Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1);
+        let after = backend
+            .query_summaries(
+                ConsolidationLevel::Basic,
+                &tenant,
+                period_start - Duration::hours(1),
+                period_end + Duration::hours(2),
+            )
+            .await
+            .unwrap();
+        assert!(after.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn tsdb_pg_count_edges_by_relationship_in_window() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let tenant = format!("tlm-{}", uuid::Uuid::new_v4().simple());
+        let now = chrono::Utc::now();
+        let a_start = now - Duration::hours(12);
+        let a_end = a_start + Duration::hours(6);
+        let b_start = a_end;
+        let b_end = b_start + Duration::hours(6);
+
+        for start in [&a_start, &b_start] {
+            backend
+                .record_metric(MetricObservation {
+                    metric_id: None,
+                    metric_name: "m1".into(),
+                    tenant_id: tenant.clone(),
+                    value: 1.0,
+                    labels: serde_json::json!({"k": "v"}),
+                    observed_at: *start,
+                    expires_at: None,
+                })
+                .await
+                .unwrap();
+        }
+        backend
+            .consolidate_period(ConsolidationRequest {
+                tenant_id: tenant.clone(),
+                period_start: a_start,
+                period_end: a_end,
+                locked_by: "w".into(),
+                level: ConsolidationLevel::Basic,
+            })
+            .await
+            .unwrap();
+        backend
+            .consolidate_period(ConsolidationRequest {
+                tenant_id: tenant.clone(),
+                period_start: b_start,
+                period_end: b_end,
+                locked_by: "w".into(),
+                level: ConsolidationLevel::Basic,
+            })
+            .await
+            .unwrap();
+
+        let map = backend
+            .count_edges_by_relationship_in_window(
+                a_start - Duration::hours(1),
+                now + Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        assert!(
+            map.get("TEMPORAL_NEXT").copied().unwrap_or(0) >= 1,
+            "expected ≥1 TEMPORAL_NEXT edge (one per consecutive metric); got map={map:?}"
+        );
     }
 }

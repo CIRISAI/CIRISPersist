@@ -5,10 +5,11 @@
 use std::future::Future;
 
 use super::types::{
-    ConsolidationOutcome, ConsolidationRequest, MetricCursor, MetricFilter, MetricListPage,
-    MetricObservation,
+    ConsolidationLevel, ConsolidationOutcome, ConsolidationRequest, MetricCursor, MetricFilter,
+    MetricListPage, MetricObservation, MetricSummary,
 };
 use super::Error;
+use chrono::{DateTime, Utc};
 
 /// Telemetry write + read + consolidation surface absorbed from
 /// CIRISAgent's TelemetryService + TSDBConsolidationService.
@@ -63,4 +64,68 @@ pub trait TelemetryService: Send + Sync {
         &self,
         req: ConsolidationRequest,
     ) -> impl Future<Output = Result<ConsolidationOutcome, Error>> + Send;
+
+    // ── TSDB query / prune surface (v1.6.0, CIRISPersist#63) ────────
+
+    /// v1.6.0 — Return every `MetricSummary` whose
+    /// `(consolidation_level, tenant_id)` matches and whose
+    /// `period_start ∈ [from, to)`. Ordered by `period_start ASC,
+    /// metric_name ASC`.
+    ///
+    /// Backs the agent's "Basic (6h) / extensive (week) / profound
+    /// (month) period-window queries" requirement (CIRISPersist#63):
+    /// caller passes the window bounds and the desired tier; persist
+    /// emits a single `SELECT … FROM cirisgraph.nodes WHERE
+    /// consolidation_level = ? AND attributes->>'tenant_id' = ? AND
+    /// (attributes->>'period_start')::timestamptz IN [from, to)` —
+    /// no client-side scan/filter.
+    fn query_summaries(
+        &self,
+        level: ConsolidationLevel,
+        tenant_id: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> impl Future<Output = Result<Vec<MetricSummary>, Error>> + Send;
+
+    /// v1.6.0 — Point-lookup of one summary by the deterministic
+    /// `(level, tenant_id, metric_name, period_start)` key. Returns
+    /// `None` when no row matches.
+    fn get_summary(
+        &self,
+        level: ConsolidationLevel,
+        tenant_id: &str,
+        metric_name: &str,
+        period_start: DateTime<Utc>,
+    ) -> impl Future<Output = Result<Option<MetricSummary>, Error>> + Send;
+
+    /// v1.6.0 — Delete summary nodes older than `before` for the
+    /// given `(level, tenant_id)`. Returns the count of rows deleted.
+    /// Also cascades the agent-application-layer convention of
+    /// removing incident edges from a deleted summary (TEMPORAL_NEXT
+    /// edges sourced at or pointing at the pruned nodes are deleted
+    /// in the same transaction).
+    ///
+    /// Used by CIRISAgent#763 Phase 3b's TSDB retention sweep: once
+    /// daily summaries roll up basic ones, the basic-tier rows are
+    /// purged after a retention window passes.
+    fn prune_summaries(
+        &self,
+        level: ConsolidationLevel,
+        tenant_id: &str,
+        before: DateTime<Utc>,
+    ) -> impl Future<Output = Result<u64, Error>> + Send;
+
+    /// v1.6.0 — Histogram of edges in `[from, to)` grouped by
+    /// `relationship`. Filter on `cirisgraph.edges.scope =
+    /// 'ENVIRONMENT'` (the TSDB scope) + `created_at` window.
+    /// Returns `{relationship: count}` — the agent's
+    /// `edge_manager.py` rolls these counts into the daily summary's
+    /// attributes for cross-period observability.
+    ///
+    /// Returns an empty map when no edges match (not an error).
+    fn count_edges_by_relationship_in_window(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> impl Future<Output = Result<std::collections::HashMap<String, u64>, Error>> + Send;
 }

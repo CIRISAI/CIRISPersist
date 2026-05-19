@@ -426,6 +426,232 @@ impl TelemetryService for SqliteTelemetryBackend {
         .await
         .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
     }
+
+    // ── v1.6.0 (CIRISPersist#63) TSDB query / prune surface ─────────
+
+    async fn query_summaries(
+        &self,
+        level: ConsolidationLevel,
+        tenant_id: &str,
+        from: chrono::DateTime<chrono::Utc>,
+        to: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<MetricSummary>, Error> {
+        if from >= to {
+            return Err(Error::InvalidArgument(format!(
+                "from ({from}) must be < to ({to})"
+            )));
+        }
+        let level_str = level.as_str().to_owned();
+        let tenant_owned = tenant_id.to_owned();
+        let from_str = fmt_datetime(from);
+        let to_str = fmt_datetime(to);
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<MetricSummary>, Error> {
+            let guard = conn.blocking_lock();
+            let mut stmt = guard
+                .prepare(
+                    "SELECT attributes FROM cirisgraph_nodes \
+                     WHERE node_type = 'tsdb_summary' AND scope = 'ENVIRONMENT' \
+                       AND consolidation_level = ?1 \
+                       AND json_extract(attributes, '$.tenant_id') = ?2 \
+                       AND json_extract(attributes, '$.period_start') >= ?3 \
+                       AND json_extract(attributes, '$.period_start') <  ?4 \
+                     ORDER BY json_extract(attributes, '$.period_start') ASC, \
+                              json_extract(attributes, '$.metric_name') ASC",
+                )
+                .map_err(|e| map_sqlite_error(e, "query_summaries prepare"))?;
+            let rows = stmt
+                .query_map(params![level_str, tenant_owned, from_str, to_str], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(|e| map_sqlite_error(e, "query_summaries query"))?;
+            let mut out: Vec<MetricSummary> = Vec::new();
+            for r in rows {
+                let s = r.map_err(|e| map_sqlite_error(e, "query_summaries row"))?;
+                let summary: MetricSummary = serde_json::from_str(&s)
+                    .map_err(|e| Error::Backend(format!("MetricSummary decode: {e} (raw={s})")))?;
+                out.push(summary);
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+    }
+
+    async fn get_summary(
+        &self,
+        level: ConsolidationLevel,
+        tenant_id: &str,
+        metric_name: &str,
+        period_start: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<MetricSummary>, Error> {
+        // V019 invariant: the SQLite consolidation write path
+        // truncates period_start to microseconds before building the
+        // summary node_id (see `truncate_to_micros` above). Mirror
+        // that here so callers can pass an unmodified
+        // `chrono::Utc::now()` derivative (which may carry nanoseconds
+        // and would otherwise miss the row).
+        let period_start = truncate_to_micros(period_start);
+        let key = format!(
+            "tsdb:{}:{}:{}:{}",
+            level.as_str(),
+            tenant_id,
+            metric_name,
+            period_start.to_rfc3339()
+        );
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<MetricSummary>, Error> {
+            let guard = conn.blocking_lock();
+            let row_opt = guard
+                .query_row(
+                    "SELECT attributes FROM cirisgraph_nodes \
+                     WHERE node_id = ?1 AND scope = 'ENVIRONMENT' \
+                       AND node_type = 'tsdb_summary'",
+                    params![key],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|e| map_sqlite_error(e, "get_summary"))?;
+            let Some(s) = row_opt else { return Ok(None) };
+            let summary: MetricSummary = serde_json::from_str(&s)
+                .map_err(|e| Error::Backend(format!("MetricSummary decode: {e} (raw={s})")))?;
+            Ok(Some(summary))
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+    }
+
+    async fn prune_summaries(
+        &self,
+        level: ConsolidationLevel,
+        tenant_id: &str,
+        before: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, Error> {
+        let level_str = level.as_str().to_owned();
+        let tenant_owned = tenant_id.to_owned();
+        let before_str = fmt_datetime(before);
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<u64, Error> {
+            let mut guard = conn.blocking_lock();
+            let tx = guard
+                .transaction()
+                .map_err(|e| map_sqlite_error(e, "prune_summaries begin"))?;
+
+            let mut victim_ids: Vec<String> = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT node_id FROM cirisgraph_nodes \
+                         WHERE node_type = 'tsdb_summary' AND scope = 'ENVIRONMENT' \
+                           AND consolidation_level = ?1 \
+                           AND json_extract(attributes, '$.tenant_id') = ?2 \
+                           AND json_extract(attributes, '$.period_end') < ?3",
+                    )
+                    .map_err(|e| map_sqlite_error(e, "prune_summaries select prepare"))?;
+                let rows = stmt
+                    .query_map(params![level_str, tenant_owned, before_str], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .map_err(|e| map_sqlite_error(e, "prune_summaries select"))?;
+                let mut out: Vec<String> = Vec::new();
+                for r in rows {
+                    out.push(r.map_err(|e| map_sqlite_error(e, "prune_summaries row"))?);
+                }
+                out
+            };
+            if victim_ids.is_empty() {
+                tx.commit()
+                    .map_err(|e| map_sqlite_error(e, "prune_summaries commit"))?;
+                return Ok(0);
+            }
+
+            // Cascade incident edges. SQLite doesn't support ANY()
+            // arrays — iterate.
+            let mut total_deleted: u64 = 0;
+            for vid in victim_ids.drain(..) {
+                tx.execute(
+                    "DELETE FROM cirisgraph_edges \
+                     WHERE scope = 'ENVIRONMENT' \
+                       AND (source_node_id = ?1 OR target_node_id = ?1)",
+                    params![vid],
+                )
+                .map_err(|e| map_sqlite_error(e, "prune_summaries cascade edges"))?;
+                let deleted = tx
+                    .execute(
+                        "DELETE FROM cirisgraph_nodes \
+                         WHERE node_id = ?1 AND scope = 'ENVIRONMENT'",
+                        params![vid],
+                    )
+                    .map_err(|e| map_sqlite_error(e, "prune_summaries delete node"))?;
+                total_deleted += deleted as u64;
+            }
+            tx.commit()
+                .map_err(|e| map_sqlite_error(e, "prune_summaries commit"))?;
+            Ok(total_deleted)
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+    }
+
+    async fn count_edges_by_relationship_in_window(
+        &self,
+        from: chrono::DateTime<chrono::Utc>,
+        to: chrono::DateTime<chrono::Utc>,
+    ) -> Result<std::collections::HashMap<String, u64>, Error> {
+        if from >= to {
+            return Err(Error::InvalidArgument(format!(
+                "from ({from}) must be < to ({to})"
+            )));
+        }
+        let from_str = fmt_datetime(from);
+        let to_str = fmt_datetime(to);
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(
+            move || -> Result<std::collections::HashMap<String, u64>, Error> {
+                let guard = conn.blocking_lock();
+                // SQLite cirisgraph_edges.created_at uses the
+                // `datetime('now', 'subsec')` default which produces
+                // the space-separated form
+                // `YYYY-MM-DD HH:MM:SS.sss` — not RFC 3339. A raw
+                // lex compare against our RFC-3339-formatted bounds
+                // (`YYYY-MM-DDTHH:MM:SS.sss+00:00`) would miss every
+                // stored row because ' ' (0x20) < 'T' (0x54) at the
+                // T-separator position. Wrap both sides in SQLite's
+                // `datetime()` function which canonicalizes both
+                // formats to UTC `YYYY-MM-DD HH:MM:SS` for the
+                // compare. Defeats index use on `created_at` but the
+                // edge table is small and this is observability-tier.
+                let mut stmt = guard
+                    .prepare(
+                        "SELECT relationship, COUNT(*) FROM cirisgraph_edges \
+                         WHERE scope = 'ENVIRONMENT' \
+                           AND datetime(created_at) >= datetime(?1) \
+                           AND datetime(created_at) <  datetime(?2) \
+                         GROUP BY relationship",
+                    )
+                    .map_err(|e| {
+                        map_sqlite_error(e, "count_edges_by_relationship_in_window prepare")
+                    })?;
+                let rows = stmt
+                    .query_map(params![from_str, to_str], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })
+                    .map_err(|e| {
+                        map_sqlite_error(e, "count_edges_by_relationship_in_window query")
+                    })?;
+                let mut out: std::collections::HashMap<String, u64> =
+                    std::collections::HashMap::new();
+                for r in rows {
+                    let (rel, c) = r.map_err(|e| {
+                        map_sqlite_error(e, "count_edges_by_relationship_in_window row")
+                    })?;
+                    out.insert(rel, c.max(0) as u64);
+                }
+                Ok(out)
+            },
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+    }
 }
 
 struct AggRow {
@@ -1077,5 +1303,226 @@ mod tests {
         assert_eq!(attrs["min"].as_f64(), Some(10.0));
         assert_eq!(attrs["max"].as_f64(), Some(30.0));
         assert_eq!(attrs["avg"].as_f64(), Some(20.0));
+    }
+
+    // ── v1.6.0 (CIRISPersist#63) TSDB query / prune tests ──────────
+
+    /// Roll up 2 metrics → query_summaries returns both ordered by
+    /// `(period_start ASC, metric_name ASC)`.
+    #[tokio::test]
+    async fn tsdb_query_summaries_returns_consolidated_rows() {
+        let (_b, tlm) = fresh_backend().await;
+        let tenant = format!("tlm-{}", uuid::Uuid::new_v4().simple());
+        let now = chrono::Utc::now();
+        let period_start = now - Duration::hours(6);
+        let period_end = now;
+
+        for i in 0..3 {
+            tlm.record_metric(obs(
+                "metric_a",
+                &tenant,
+                10.0 * (i as f64 + 1.0),
+                period_start + Duration::minutes(i as i64 * 10),
+            ))
+            .await
+            .unwrap();
+            tlm.record_metric(obs(
+                "metric_b",
+                &tenant,
+                5.0 * (i as f64 + 1.0),
+                period_start + Duration::minutes(i as i64 * 10),
+            ))
+            .await
+            .unwrap();
+        }
+
+        tlm.consolidate_period(ConsolidationRequest {
+            tenant_id: tenant.clone(),
+            period_start,
+            period_end,
+            locked_by: "worker".into(),
+            level: ConsolidationLevel::Basic,
+        })
+        .await
+        .unwrap();
+
+        let rows = tlm
+            .query_summaries(
+                ConsolidationLevel::Basic,
+                &tenant,
+                period_start - Duration::hours(1),
+                period_end + Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        // Sorted by metric_name ASC for the same period_start.
+        assert_eq!(rows[0].metric_name, "metric_a");
+        assert_eq!(rows[1].metric_name, "metric_b");
+        assert_eq!(rows[0].count, 3);
+        assert_eq!(rows[0].sum, 60.0); // 10+20+30
+        assert_eq!(rows[0].consolidation_level, ConsolidationLevel::Basic);
+    }
+
+    #[tokio::test]
+    async fn tsdb_query_summaries_invalid_window_rejected() {
+        let (_b, tlm) = fresh_backend().await;
+        let now = chrono::Utc::now();
+        let err = tlm
+            .query_summaries(ConsolidationLevel::Basic, "t", now, now)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn tsdb_get_summary_round_trips_one_row() {
+        let (_b, tlm) = fresh_backend().await;
+        let tenant = format!("tlm-{}", uuid::Uuid::new_v4().simple());
+        let now = chrono::Utc::now();
+        let period_start = now - Duration::hours(6);
+        let period_end = now;
+        for i in 0..2 {
+            tlm.record_metric(obs(
+                "single_metric",
+                &tenant,
+                7.0 * (i as f64 + 1.0),
+                period_start + Duration::minutes(i as i64 * 10),
+            ))
+            .await
+            .unwrap();
+        }
+        tlm.consolidate_period(ConsolidationRequest {
+            tenant_id: tenant.clone(),
+            period_start,
+            period_end,
+            locked_by: "w".into(),
+            level: ConsolidationLevel::Basic,
+        })
+        .await
+        .unwrap();
+
+        let got = tlm
+            .get_summary(
+                ConsolidationLevel::Basic,
+                &tenant,
+                "single_metric",
+                period_start,
+            )
+            .await
+            .unwrap()
+            .expect("summary present");
+        assert_eq!(got.metric_name, "single_metric");
+        assert_eq!(got.count, 2);
+        assert_eq!(got.sum, 21.0);
+
+        let missing = tlm
+            .get_summary(
+                ConsolidationLevel::Basic,
+                &tenant,
+                "absent_metric",
+                period_start,
+            )
+            .await
+            .unwrap();
+        assert!(missing.is_none());
+    }
+
+    #[tokio::test]
+    async fn tsdb_prune_summaries_removes_old_with_cascade() {
+        let (_b, tlm) = fresh_backend().await;
+        let tenant = format!("tlm-{}", uuid::Uuid::new_v4().simple());
+        let now = chrono::Utc::now();
+
+        // 3 periods at -18h, -12h, -6h.
+        let starts: Vec<_> = (1..=3).map(|i| now - Duration::hours(6 * i)).collect();
+        for start in &starts {
+            tlm.record_metric(obs("rpm", &tenant, 1.0, *start))
+                .await
+                .unwrap();
+            tlm.consolidate_period(ConsolidationRequest {
+                tenant_id: tenant.clone(),
+                period_start: *start,
+                period_end: *start + Duration::hours(6),
+                locked_by: "w".into(),
+                level: ConsolidationLevel::Basic,
+            })
+            .await
+            .unwrap();
+        }
+
+        // Prune before -10h cutoff. period_end values are 0h, -6h,
+        // -12h for the -6h/-12h/-18h period_starts respectively. Only
+        // -12h period_end < -10h (the -18h-start period); the others'
+        // period_end is more recent than the cutoff.
+        let cutoff = now - Duration::hours(10);
+        let deleted = tlm
+            .prune_summaries(ConsolidationLevel::Basic, &tenant, cutoff)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1, "only the -18h period was pruned");
+
+        // Remaining: the -6h and -12h period_start rows.
+        let rows = tlm
+            .query_summaries(
+                ConsolidationLevel::Basic,
+                &tenant,
+                now - Duration::hours(72),
+                now + Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn tsdb_count_edges_by_relationship_in_window_groups() {
+        // Stand up two consecutive periods: persist auto-creates
+        // TEMPORAL_NEXT edges between them (one per metric_name in
+        // the second period). Then count.
+        let (_b, tlm) = fresh_backend().await;
+        let tenant = format!("tlm-{}", uuid::Uuid::new_v4().simple());
+        let now = chrono::Utc::now();
+        let a_start = now - Duration::hours(12);
+        let a_end = a_start + Duration::hours(6);
+        let b_start = a_end;
+        let b_end = b_start + Duration::hours(6);
+
+        for start in [&a_start, &b_start] {
+            tlm.record_metric(obs("m1", &tenant, 1.0, *start))
+                .await
+                .unwrap();
+            tlm.record_metric(obs("m2", &tenant, 2.0, *start))
+                .await
+                .unwrap();
+        }
+        tlm.consolidate_period(ConsolidationRequest {
+            tenant_id: tenant.clone(),
+            period_start: a_start,
+            period_end: a_end,
+            locked_by: "w".into(),
+            level: ConsolidationLevel::Basic,
+        })
+        .await
+        .unwrap();
+        tlm.consolidate_period(ConsolidationRequest {
+            tenant_id: tenant.clone(),
+            period_start: b_start,
+            period_end: b_end,
+            locked_by: "w".into(),
+            level: ConsolidationLevel::Basic,
+        })
+        .await
+        .unwrap();
+
+        let map = tlm
+            .count_edges_by_relationship_in_window(a_start, now + Duration::hours(1))
+            .await
+            .unwrap();
+        // 2 TEMPORAL_NEXT edges expected (one per metric, period B → A).
+        assert!(
+            map.get("TEMPORAL_NEXT").copied().unwrap_or(0) >= 2,
+            "expected ≥2 TEMPORAL_NEXT edges, got map={map:?}"
+        );
     }
 }

@@ -5,6 +5,136 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.6.0] — 2026-05-19
+
+**TSDB consolidation substrate — period queries + prune + edge histograms (CIRISPersist#63).**
+
+Final cut of the v1.5.19-follow-up wave. Unblocks CIRISAgent 2.9.0
+Phase 3b: the agent's 6,680 LOC `services/graph/tsdb_consolidation/`
+package (11 files of raw-SQL helpers) can now delegate query +
+prune + edge-rollup to persist instead of owning the SQL builders.
+
+Persist already shipped the consolidation engine in v0.8.2
+(`consolidate_period` + multi-tier `Basic → Daily → Weekly →
+Monthly` chain via `input_tier`). v1.6.0 adds the four primitives
+needed to retire the agent's Python query/prune/edge layer:
+
+### TelemetryService trait — 4 new methods
+
+- `query_summaries(level, tenant_id, from, to) → Vec<MetricSummary>`
+  Period-window query: every summary in `(level, tenant_id)` whose
+  `period_start ∈ [from, to)`. Ordered by `(period_start ASC,
+  metric_name ASC)`. Backs the agent's Basic (6h) / extensive
+  (week) / profound (month) period queries — caller picks the
+  window, persist emits a single indexed SELECT.
+
+- `get_summary(level, tenant_id, metric_name, period_start) →
+  Option<MetricSummary>`
+  Point-lookup via the deterministic
+  `tsdb:{level}:{tenant_id}:{metric_name}:{period_start_rfc3339}`
+  node_id.
+
+- `prune_summaries(level, tenant_id, before) → u64`
+  Retention sweep. Deletes summary nodes whose `period_end <
+  before` for the given (level, tenant) and cascades incident
+  edges (TEMPORAL_NEXT chains). Returns the count of summary nodes
+  removed. Used by Phase 3b's TSDB retention pass: once daily
+  summaries roll up basic ones, the basic-tier rows are purged
+  after a retention window.
+
+- `count_edges_by_relationship_in_window(from, to) →
+  HashMap<String, u64>`
+  Group-by-relationship histogram of edges in `[from, to)`. Filter
+  scope='ENVIRONMENT' (TSDB scope). Returns
+  `{relationship: count}` for the agent's `edge_manager.py` daily
+  rollup — agent reads this once per consolidation cycle and rolls
+  the counts into the parent-tier summary's `attributes`.
+
+### PyO3 surface — 4 new Engine methods
+
+- `tsdb_query_summaries(level, tenant_id, from_rfc3339, to_rfc3339)
+  -> str` (JSON `list[MetricSummary]`)
+- `tsdb_get_summary(level, tenant_id, metric_name,
+  period_start_rfc3339) -> str | None` (JSON `MetricSummary`)
+- `tsdb_prune_summaries(level, tenant_id, before_rfc3339) -> int`
+- `tsdb_count_edges_by_relationship_in_window(from_rfc3339,
+  to_rfc3339) -> str` (JSON `dict[str, int]`)
+
+All four gated on the `telemetry` feature. `level` is one of
+`"basic" | "daily" | "weekly" | "monthly"` (matches
+`ConsolidationLevel`'s wire shape). Timestamps are RFC 3339.
+
+### Both backends
+
+PG + SQLite parity (per `[[feedback-no-pg-only-no-deferral]]`). No
+new migration — reads against the existing
+`cirisgraph.{nodes,edges}` schema (V013) with
+`consolidation_level` column (V019).
+
+### SQLite micro-second truncation invariant
+
+`get_summary`'s SQLite impl truncates the caller's `period_start`
+to microseconds before composing the deterministic node_id —
+mirrors the write path's existing `truncate_to_micros` invariant
+(introduced for the same reason in the rollup path: nanosecond
+precision in `chrono::Utc::now()` derivatives must round to micros
+to match the stored format). PG TIMESTAMPTZ has native microsecond
+precision so the PG path doesn't need explicit truncation.
+
+### SQLite edge-timestamp lex-sort fix
+
+`count_edges_by_relationship_in_window` wraps both sides of the
+`created_at` range predicate in SQLite's `datetime()` function —
+the edge table uses the schema-default
+`datetime('now', 'subsec')` (space-separated form) which does NOT
+RFC 3339 (T-separated). Lex compare on raw strings would miss
+every row because ' ' < 'T'. `datetime()` normalizes both formats
+for the compare. Defeats index use on the rarely-large edge
+table; observability-tier cost.
+
+### Tests
+
+7 new (5 SQLite + 2 PG-gated):
+- `query_summaries` returns consolidated rows ordered correctly
+- `query_summaries` rejects empty/inverted window (InvalidArgument)
+- `get_summary` round-trips one row; absent metric → None
+- `prune_summaries` deletes only summaries with `period_end <
+  before`; cascades incident edges
+- `count_edges_by_relationship_in_window` groups TEMPORAL_NEXT
+  edges from consecutive consolidations
+- PG: full query → get → prune round-trip
+- PG: TEMPORAL_NEXT edge histogram across periods
+
+638/638 lib tests pass across `postgres + sqlite + all 12 cirislens
+features + telemetry + cirisgraph` locally; CI matrix runs the same
+sweep on a fresh PG container.
+
+### Minor version bump rationale
+
+This is the first minor since v1.5.0's federation Merkle layer.
+The TSDB additions are additive (trait extension, not signature
+change) but the agent-facing scope justifies the v1.6.0 marker —
+all six v1.5.19 follow-ups (#60, #61, #62, #64, #65, #66) plus the
+TSDB primitives complete the CIRISAgent 2.9.0 Phase-by-Phase
+unblock chain.
+
+### CI hardening (commit b2b0030)
+
+Independent of the substrate work, this release ships an
+infrastructure-resilience fix to the CI workflow: both
+`actions/download-artifact@v4` invocations in `publish-pypi` and
+`build-manifest` jobs are replaced with `gh run download` retry
+loops (5 attempts, exponential backoff, fail-loud after exhaustion).
+v1.5.24's tag CI failed at the sign step due to a transient `403
+Forbidden: Error from intermediary` from GitHub's artifact-storage
+backend — which was non-retryable in the action and cascaded into
+"PyPI publish skipped." With this hardening, the next transient
+failure absorbs into a warning and the publish completes.
+
+Same retry pattern as the existing `gh release download` retry
+block in the build-tool install step (v1.1.2 CIRISVerify v2.1.1 CI
+hardening arc).
+
 ## [1.5.25] — 2026-05-19
 
 **cirisgraph list/count/exclude gaps (CIRISPersist#65).**
