@@ -8634,6 +8634,45 @@ impl PyEngine {
         })
     }
 
+    /// v1.5.20 — Delete a thought by id. Returns true if a row was
+    /// deleted, false on missing/already-deleted (idempotent). The
+    /// self-FK on `parent_thought_id` REJECTS the delete with
+    /// Conflict if children exist — caller deletes leaves-first or
+    /// enumerates via `thought_get_descendants` first. The cascade
+    /// on `source_task_id` (V035) flows the other way:
+    /// `task_delete` of a parent task cascades its thoughts.
+    #[cfg(feature = "cirislens_thoughts")]
+    fn thought_delete(&self, py: Python<'_>, thought_id: &str) -> PyResult<bool> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let thought_id = thought_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::thoughts::ThoughtService;
+                        backend
+                            .delete_thought(&thought_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::thoughts::sqlite::SqliteThoughtBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::thoughts::ThoughtService;
+                        backend
+                            .delete_thought(&thought_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
     /// v1.5.10 — Walk parent_thought_id chain rooted at `thought_id`.
     /// Returns the JSON-encoded `Vec<Thought>` (root + transitive
     /// descendants) ordered by `(thought_depth ASC, thought_id ASC)`.

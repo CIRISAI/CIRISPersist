@@ -71,4 +71,14 @@ pub trait ThoughtService: Send + Sync {
         &self,
         thought_id: &str,
     ) -> impl Future<Output = Result<Vec<Thought>, Error>> + Send;
+
+    /// Delete by `thought_id`. Returns `true` if a row was deleted,
+    /// `false` on second call (idempotent). FK semantics mirror
+    /// `delete_task`: the self-FK on `parent_thought_id` REJECTS the
+    /// delete if children exist — caller deletes the subtree
+    /// explicitly (leaves-first), or calls [`Self::get_descendants`]
+    /// to enumerate before issuing deletes. The cascade on
+    /// `source_task_id` (V035) is one-way: `task_delete` on a parent
+    /// cascades thoughts; `thought_delete` does not touch tasks.
+    fn delete_thought(&self, thought_id: &str) -> impl Future<Output = Result<bool, Error>> + Send;
 }

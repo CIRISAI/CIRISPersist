@@ -376,6 +376,25 @@ impl ThoughtService for PostgresBackend {
         }
         Ok(items)
     }
+
+    async fn delete_thought(&self, thought_id: &str) -> Result<bool, Error> {
+        if thought_id.is_empty() {
+            return Err(Error::InvalidArgument("thought_id required".into()));
+        }
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let changed = client
+            .execute(
+                "DELETE FROM cirislens.thoughts WHERE thought_id = $1",
+                &[&thought_id],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "delete_thought"))?;
+        Ok(changed > 0)
+    }
 }
 
 #[cfg(test)]
@@ -803,5 +822,122 @@ mod tests {
             .await
             .unwrap();
         assert!(v.is_empty());
+    }
+
+    // ── v1.5.20 (CIRISPersist#60) delete_thought + FK cascade ────────
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn thoughts_pg_delete_thought_returns_true_then_false() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let task_id = format!("t-{}", Uuid::new_v4().simple());
+        TaskService::upsert_task(&backend, mk_task(&task_id, "occ-1"))
+            .await
+            .unwrap();
+        let id = format!("th-{}", Uuid::new_v4().simple());
+        backend
+            .upsert_thought(mk_thought(&id, &task_id, ThoughtStatus::Pending, "occ-1"))
+            .await
+            .unwrap();
+
+        let first = backend.delete_thought(&id).await.unwrap();
+        assert!(first);
+        let second = backend.delete_thought(&id).await.unwrap();
+        assert!(!second);
+        assert!(backend.get_thought(&id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn thoughts_pg_delete_thought_empty_id_rejected() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let err = backend.delete_thought("").await.unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn thoughts_pg_delete_thought_parent_with_children_rejects() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let task_id = format!("t-{}", Uuid::new_v4().simple());
+        TaskService::upsert_task(&backend, mk_task(&task_id, "occ-1"))
+            .await
+            .unwrap();
+
+        let parent = format!("p-{}", Uuid::new_v4().simple());
+        backend
+            .upsert_thought(mk_thought(
+                &parent,
+                &task_id,
+                ThoughtStatus::Pending,
+                "occ-1",
+            ))
+            .await
+            .unwrap();
+        let child = format!("c-{}", Uuid::new_v4().simple());
+        let mut child_t = mk_thought(&child, &task_id, ThoughtStatus::Pending, "occ-1");
+        child_t.parent_thought_id = Some(parent.clone());
+        backend.upsert_thought(child_t).await.unwrap();
+
+        let err = backend.delete_thought(&parent).await.unwrap_err();
+        assert!(
+            matches!(err, Error::Conflict(_)),
+            "expected Conflict (FK), got {err:?}"
+        );
+
+        assert!(backend.delete_thought(&child).await.unwrap());
+        assert!(backend.delete_thought(&parent).await.unwrap());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn thoughts_pg_task_delete_cascades_to_thoughts() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let task_id = format!("t-{}", Uuid::new_v4().simple());
+        TaskService::upsert_task(&backend, mk_task(&task_id, "occ-1"))
+            .await
+            .unwrap();
+        let th1 = format!("th1-{}", Uuid::new_v4().simple());
+        let th2 = format!("th2-{}", Uuid::new_v4().simple());
+        backend
+            .upsert_thought(mk_thought(&th1, &task_id, ThoughtStatus::Pending, "occ-1"))
+            .await
+            .unwrap();
+        backend
+            .upsert_thought(mk_thought(&th2, &task_id, ThoughtStatus::Pending, "occ-1"))
+            .await
+            .unwrap();
+
+        assert!(TaskService::delete_task(&backend, &task_id).await.unwrap());
+
+        assert!(backend.get_thought(&th1).await.unwrap().is_none());
+        assert!(backend.get_thought(&th2).await.unwrap().is_none());
     }
 }

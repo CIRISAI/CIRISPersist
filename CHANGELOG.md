@@ -5,6 +5,89 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.5.20] — 2026-05-19
+
+**`thought_delete` + `task_delete → thoughts` cascade (CIRISPersist#60).**
+
+First of six follow-up cuts triggered by CIRISAgent#763's absorption
+of the v1.5.19 substrate surface. Agent-side `delete_tasks_by_ids` /
+`delete_thoughts_by_ids` semantics expected `task_delete` of a parent
+with child thoughts to take the thoughts with it, and an explicit
+`thought_delete` for direct row cleanup. v1.5.19 had neither — the
+absorbed agent code fell back to a soft-cancel (status='failed') as
+a workaround. v1.5.20 ships both, so the agent's hard-delete
+semantics restore.
+
+### V035 migration — `source_task_id` ON DELETE CASCADE
+
+- **Postgres:** `ALTER TABLE cirislens.thoughts DROP CONSTRAINT
+  thoughts_task_fk` + `ADD CONSTRAINT … ON DELETE CASCADE DEFERRABLE
+  INITIALLY DEFERRED`. Two-statement migration; refinery wraps in
+  its own tx.
+- **SQLite:** 12-step rebuild dance (SQLite can't alter FK in place).
+  `PRAGMA defer_foreign_keys=ON` → CREATE `cirislens_thoughts_new`
+  with the new FK shape → `INSERT INTO new SELECT * FROM old` → DROP
+  old → RENAME new → recreate the three indexes V025 declared.
+  Data-preserving on existing rows (FK check fires at COMMIT).
+
+The self-FK on `parent_thought_id` is **left strict** — symmetric
+with `task_delete`'s parent-FK semantics. Callers walk
+`thought_get_descendants` first or delete leaves-first. This matches
+the explicit-subtree-management contract `delete_task` already
+documents and keeps the two substrates consistent.
+
+### `thought_delete(thought_id) → bool`
+
+- Mirrors `task_delete` shape exactly: `bool` return (`true` on
+  first delete, `false` on idempotent re-call).
+- Empty id → `InvalidArgument`.
+- Parent with children via self-FK → `Conflict` (PG
+  FOREIGN_KEY_VIOLATION; SQLite extended code 787).
+- Validated on both backends.
+
+### Tests
+
+8 new (4 PG-gated + 4 SQLite):
+- `delete_thought` happy path → true then false (idempotent)
+- empty id → InvalidArgument
+- parent with children via self-FK → Conflict; leaves-first works
+- `task_delete` of parent with multiple flat thoughts → cascades on
+  both backends (thoughts gone)
+
+### PyO3 + .pyi
+
+- `Engine.thought_delete(thought_id) -> bool` — gated on
+  `cirislens_thoughts` feature flag.
+- Stable error kinds: `thought_invalid_argument | _not_found |
+  _conflict | _backend | _internal` (unchanged from v1.5.10).
+
+### Compatibility
+
+- Existing `task_delete` callers: behavior changes on the failure
+  path. Previously `task_delete` of a parent with thoughts returned
+  `Conflict`. As of v1.5.20 it succeeds and cascades. Callers that
+  relied on the conflict signal as a "do I have orphans" probe
+  should use `thought_list(filter={source_task_id})` instead.
+- `thought_get_descendants` semantics unchanged.
+
+### Drive-by fix — `deferral_reports::record_deferral` commit error classification
+
+The PG impl had a pre-existing miscategorization: the FKs on
+`cirislens.deferral_reports` are `DEFERRABLE INITIALLY DEFERRED`, so
+a dangling `task_id`/`thought_id` reference fires at `tx.commit()`,
+not at INSERT. The commit error was wrapped as `Error::Backend("commit: …")`,
+swallowing the FOREIGN_KEY_VIOLATION sqlstate that callers needed to
+classify as `Conflict`. Routed the commit error through `map_pg_error`
+so the pre-existing `deferral_pg_fk_rejects_nonexistent_task_or_thought`
+test (added in v1.5.14) now passes — turned up by the full-features
+lib sweep this cut requires.
+
+Other modules with the same commit-error pattern (`tasks`, `audit`,
+`creation_ceremonies`, `incident`, `cirisnode`, `store`) are left
+unchanged for this cut — none of their FKs are DEFERRABLE today, so
+the bug is latent. Will sweep if future DEFERRABLE additions surface
+it.
+
 ## [1.5.19] — 2026-05-18
 
 **`wa_cert` substrate — 11 of 11. CIRISPersist#59 CLOSES.**

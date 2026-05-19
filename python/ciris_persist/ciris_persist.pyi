@@ -326,6 +326,19 @@ class Engine:
         Uses a recursive CTE on both backends.
         """
 
+    def thought_delete(self, thought_id: str) -> bool:
+        """v1.5.20 (CIRISPersist#60) — Delete a thought by id.
+
+        Returns ``True`` if a row was deleted, ``False`` on missing or
+        already-deleted (idempotent). The self-FK on
+        ``parent_thought_id`` rejects the delete with ``Conflict`` if
+        children exist — caller deletes leaves-first or walks
+        :meth:`thought_get_descendants` first. The cascade on
+        ``source_task_id`` (V035) is the inverse direction:
+        :meth:`task_delete` of a parent task automatically cascades
+        its thoughts.
+        """
+
     # ── v1.5.11 (CIRISPersist#59 #3) — service correlations substrate
 
     def correlation_record(self, correlation_json: str) -> None:

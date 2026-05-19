@@ -151,11 +151,11 @@ fn read_attributes_text(row: &rusqlite::Row<'_>, node_id: &str) -> Result<String
                     for (i, b) in raw[lo..hi].iter().enumerate() {
                         let abs = lo + i;
                         if abs == bad_pos {
-                            hex.push_str("[");
+                            hex.push('[');
                         }
                         hex.push_str(&format!("{b:02x}"));
                         if abs == bad_pos + bad_len - 1 {
-                            hex.push_str("]");
+                            hex.push(']');
                         } else {
                             hex.push(' ');
                         }

@@ -132,9 +132,14 @@ impl DeferralReportService for PostgresBackend {
             .await
             .map_err(|e| map_pg_error(e, "record_deferral readback"))?;
         let row = decode_deferral_row(&row)?;
+        // FKs are DEFERRABLE INITIALLY DEFERRED so a dangling
+        // task_id/thought_id surfaces at COMMIT, not at INSERT.
+        // Route the commit error through map_pg_error so
+        // FOREIGN_KEY_VIOLATION classifies as Conflict instead of
+        // a generic Backend error.
         tx.commit()
             .await
-            .map_err(|e| Error::Backend(format!("commit: {e}")))?;
+            .map_err(|e| map_pg_error(e, "record_deferral commit"))?;
         if won {
             Ok(ClaimResult::Stored(row))
         } else {
