@@ -8,8 +8,9 @@ use chrono::{DateTime, Duration, Utc};
 
 use super::service::TelemetryService;
 use super::types::{
-    ConsolidationLevel, ConsolidationOutcome, ConsolidationRequest, MetricCursor, MetricFilter,
-    MetricListPage, MetricObservation, MetricSummary,
+    AuditSummary, ConsolidationLevel, ConsolidationOutcome, ConsolidationRequest,
+    ConversationSummary, MetricCursor, MetricFilter, MetricListPage, MetricObservation,
+    MetricSummary, TaskSummary, TraceSummary, TypedConsolidationOutcome,
 };
 use super::{Error, DEFAULT_MAX_LABELS_BYTES, STALE_LOCK_SECONDS};
 use crate::store::postgres::PostgresBackend;
@@ -579,6 +580,430 @@ impl TelemetryService for PostgresBackend {
         }
         Ok(out)
     }
+
+    // ── v1.6.2 (CIRISPersist#68) typed-summary consolidate methods ──
+
+    async fn consolidate_tasks(
+        &self,
+        req: ConsolidationRequest,
+    ) -> Result<TypedConsolidationOutcome, Error> {
+        validate_typed_req(&req)?;
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+
+        // Status histogram + total. Per-spec: source data filtered by
+        // `agent_occurrence_id = tenant_id` since the tasks substrate
+        // proxies tenant via the occurrence column.
+        let status_rows = client
+            .query(
+                "SELECT status, COUNT(*)::BIGINT AS c \
+                 FROM cirislens.tasks \
+                 WHERE agent_occurrence_id = $1 \
+                   AND created_at >= $2 AND created_at < $3 \
+                 GROUP BY status",
+                &[&req.tenant_id, &req.period_start, &req.period_end],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "consolidate_tasks status histogram"))?;
+        let mut by_status: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
+        let mut total_tasks: i64 = 0;
+        for r in &status_rows {
+            let s: String = r
+                .try_get("status")
+                .map_err(|e| Error::Backend(format!("decode status: {e}")))?;
+            let c: i64 = r
+                .try_get("c")
+                .map_err(|e| Error::Backend(format!("decode count: {e}")))?;
+            total_tasks += c;
+            by_status.insert(s, c);
+        }
+
+        // Mean thought_depth via a separate query — JOINing with the
+        // status histogram would double-count when a task has many
+        // thoughts, so we keep them independent.
+        let mean_depth: f64 = client
+            .query_one(
+                "SELECT COALESCE(AVG(thought_depth), 0.0)::FLOAT8 AS mean_d \
+                 FROM cirislens.thoughts \
+                 WHERE agent_occurrence_id = $1 \
+                   AND created_at >= $2 AND created_at < $3",
+                &[&req.tenant_id, &req.period_start, &req.period_end],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "consolidate_tasks mean depth"))?
+            .try_get("mean_d")
+            .map_err(|e| Error::Backend(format!("decode mean_d: {e}")))?;
+
+        let summary = TaskSummary {
+            tenant_id: req.tenant_id.clone(),
+            period_start: req.period_start,
+            period_end: req.period_end,
+            total_tasks,
+            by_status,
+            mean_thought_depth: mean_depth,
+            consolidation_level: req.level,
+        };
+        let attrs = serde_json::to_value(&summary)
+            .map_err(|e| Error::Internal(format!("TaskSummary serialize: {e}")))?;
+        let summary_written = upsert_typed_summary(
+            &client,
+            "task_summary",
+            &req.tenant_id,
+            req.period_start,
+            req.level,
+            &attrs,
+            &req.locked_by,
+        )
+        .await?;
+        Ok(TypedConsolidationOutcome {
+            summary_written,
+            source_rows: total_tasks,
+        })
+    }
+
+    async fn consolidate_conversations(
+        &self,
+        req: ConsolidationRequest,
+    ) -> Result<TypedConsolidationOutcome, Error> {
+        validate_typed_req(&req)?;
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+
+        let row = client
+            .query_one(
+                "SELECT COUNT(*)::BIGINT                                       AS total_messages, \
+                        COUNT(DISTINCT (request_data->>'actor_id'))::BIGINT     AS unique_actors \
+                   FROM cirislens.service_correlations \
+                  WHERE agent_occurrence_id = $1 \
+                    AND timestamp >= $2 AND timestamp < $3 \
+                    AND lower(action_type) IN \
+                        ('speak', 'observe', 'speak_action', 'observe_action')",
+                &[&req.tenant_id, &req.period_start, &req.period_end],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "consolidate_conversations aggregate"))?;
+        let total_messages: i64 = row
+            .try_get("total_messages")
+            .map_err(|e| Error::Backend(format!("decode total_messages: {e}")))?;
+        let unique_actors: i64 = row
+            .try_get("unique_actors")
+            .map_err(|e| Error::Backend(format!("decode unique_actors: {e}")))?;
+
+        let summary = ConversationSummary {
+            tenant_id: req.tenant_id.clone(),
+            period_start: req.period_start,
+            period_end: req.period_end,
+            total_messages,
+            unique_actors,
+            consolidation_level: req.level,
+        };
+        let attrs = serde_json::to_value(&summary)
+            .map_err(|e| Error::Internal(format!("ConversationSummary serialize: {e}")))?;
+        let summary_written = upsert_typed_summary(
+            &client,
+            "conversation_summary",
+            &req.tenant_id,
+            req.period_start,
+            req.level,
+            &attrs,
+            &req.locked_by,
+        )
+        .await?;
+        Ok(TypedConsolidationOutcome {
+            summary_written,
+            source_rows: total_messages,
+        })
+    }
+
+    async fn consolidate_traces(
+        &self,
+        req: ConsolidationRequest,
+    ) -> Result<TypedConsolidationOutcome, Error> {
+        validate_typed_req(&req)?;
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+
+        let rows = client
+            .query(
+                "SELECT action_type, COUNT(*)::BIGINT AS c \
+                   FROM cirislens.service_correlations \
+                  WHERE agent_occurrence_id = $1 \
+                    AND correlation_type = 'trace' \
+                    AND timestamp >= $2 AND timestamp < $3 \
+                  GROUP BY action_type",
+                &[&req.tenant_id, &req.period_start, &req.period_end],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "consolidate_traces histogram"))?;
+        let mut by_action_type: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
+        let mut total_traces: i64 = 0;
+        for r in &rows {
+            let a: String = r
+                .try_get("action_type")
+                .map_err(|e| Error::Backend(format!("decode action_type: {e}")))?;
+            let c: i64 = r
+                .try_get("c")
+                .map_err(|e| Error::Backend(format!("decode count: {e}")))?;
+            total_traces += c;
+            by_action_type.insert(a, c);
+        }
+
+        let summary = TraceSummary {
+            tenant_id: req.tenant_id.clone(),
+            period_start: req.period_start,
+            period_end: req.period_end,
+            total_traces,
+            by_action_type,
+            consolidation_level: req.level,
+        };
+        let attrs = serde_json::to_value(&summary)
+            .map_err(|e| Error::Internal(format!("TraceSummary serialize: {e}")))?;
+        let summary_written = upsert_typed_summary(
+            &client,
+            "trace_summary",
+            &req.tenant_id,
+            req.period_start,
+            req.level,
+            &attrs,
+            &req.locked_by,
+        )
+        .await?;
+        Ok(TypedConsolidationOutcome {
+            summary_written,
+            source_rows: total_traces,
+        })
+    }
+
+    async fn consolidate_audit(
+        &self,
+        req: ConsolidationRequest,
+    ) -> Result<TypedConsolidationOutcome, Error> {
+        validate_typed_req(&req)?;
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+
+        // audit_log uses `tenant_id` directly (NOT
+        // agent_occurrence_id) and `recorded_at` (NOT created_at) per
+        // V014. Deviation from spec — adjusted to match the actual
+        // column shape.
+        let action_rows = client
+            .query(
+                "SELECT action_type, COUNT(*)::BIGINT AS c \
+                   FROM cirislens.audit_log \
+                  WHERE tenant_id = $1 \
+                    AND recorded_at >= $2 AND recorded_at < $3 \
+                  GROUP BY action_type",
+                &[&req.tenant_id, &req.period_start, &req.period_end],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "consolidate_audit histogram"))?;
+        let mut by_action_type: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
+        let mut total_events: i64 = 0;
+        for r in &action_rows {
+            let a: String = r
+                .try_get("action_type")
+                .map_err(|e| Error::Backend(format!("decode action_type: {e}")))?;
+            let c: i64 = r
+                .try_get("c")
+                .map_err(|e| Error::Backend(format!("decode count: {e}")))?;
+            total_events += c;
+            by_action_type.insert(a, c);
+        }
+
+        let unique_actors: i64 = client
+            .query_one(
+                "SELECT COUNT(DISTINCT actor_id)::BIGINT AS c \
+                   FROM cirislens.audit_log \
+                  WHERE tenant_id = $1 \
+                    AND recorded_at >= $2 AND recorded_at < $3",
+                &[&req.tenant_id, &req.period_start, &req.period_end],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "consolidate_audit unique_actors"))?
+            .try_get("c")
+            .map_err(|e| Error::Backend(format!("decode unique_actors: {e}")))?;
+
+        let summary = AuditSummary {
+            tenant_id: req.tenant_id.clone(),
+            period_start: req.period_start,
+            period_end: req.period_end,
+            total_events,
+            by_action_type,
+            unique_actors,
+            consolidation_level: req.level,
+        };
+        let attrs = serde_json::to_value(&summary)
+            .map_err(|e| Error::Internal(format!("AuditSummary serialize: {e}")))?;
+        let summary_written = upsert_typed_summary(
+            &client,
+            "audit_summary",
+            &req.tenant_id,
+            req.period_start,
+            req.level,
+            &attrs,
+            &req.locked_by,
+        )
+        .await?;
+        Ok(TypedConsolidationOutcome {
+            summary_written,
+            source_rows: total_events,
+        })
+    }
+
+    async fn query_summary_nodes(
+        &self,
+        node_type: &str,
+        level: ConsolidationLevel,
+        tenant_id: &str,
+        from: chrono::DateTime<chrono::Utc>,
+        to: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<serde_json::Value>, Error> {
+        validate_summary_node_type(node_type)?;
+        if from >= to {
+            return Err(Error::InvalidArgument(format!(
+                "from ({from}) must be < to ({to})"
+            )));
+        }
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let rows = client
+            .query(
+                "SELECT attributes FROM cirisgraph.nodes \
+                 WHERE node_type = $1 AND scope = 'ENVIRONMENT' \
+                   AND consolidation_level = $2 \
+                   AND attributes->>'tenant_id' = $3 \
+                   AND ((attributes->>'period_start')::timestamptz) >= $4 \
+                   AND ((attributes->>'period_start')::timestamptz) <  $5 \
+                 ORDER BY (attributes->>'period_start')::timestamptz ASC",
+                &[&node_type, &level.as_str(), &tenant_id, &from, &to],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "query_summary_nodes"))?;
+        let mut out: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let attrs: serde_json::Value = r
+                .try_get("attributes")
+                .map_err(|e| Error::Backend(format!("decode attributes: {e}")))?;
+            out.push(attrs);
+        }
+        Ok(out)
+    }
+}
+
+/// Validate `ConsolidationRequest` fields shared across the four
+/// typed-summary consolidate methods. No lock-acquisition path in
+/// v1.6.2 — caller (agent) is single-threaded for non-metric
+/// consolidation.
+fn validate_typed_req(req: &ConsolidationRequest) -> Result<(), Error> {
+    if req.tenant_id.is_empty() {
+        return Err(Error::InvalidArgument("tenant_id required".into()));
+    }
+    if req.period_end <= req.period_start {
+        return Err(Error::InvalidArgument(
+            "period_end must be > period_start".into(),
+        ));
+    }
+    if req.locked_by.is_empty() {
+        return Err(Error::InvalidArgument("locked_by required".into()));
+    }
+    Ok(())
+}
+
+/// Validate `node_type` is one of the four typed-summary tokens.
+fn validate_summary_node_type(node_type: &str) -> Result<(), Error> {
+    match node_type {
+        "task_summary" | "conversation_summary" | "trace_summary" | "audit_summary" => Ok(()),
+        _ => Err(Error::InvalidArgument(format!(
+            "unknown summary node_type: {node_type}"
+        ))),
+    }
+}
+
+/// Stable node_id for a typed summary. Format:
+/// `tsdb:{node_type}:{tenant_id}:{period_start_rfc3339}`. Mirrors
+/// the metric-summary key shape but drops the metric_name slot.
+fn typed_summary_node_id(
+    node_type: &str,
+    tenant_id: &str,
+    period_start: chrono::DateTime<chrono::Utc>,
+) -> String {
+    format!(
+        "tsdb:{}:{}:{}",
+        node_type,
+        tenant_id,
+        period_start.to_rfc3339()
+    )
+}
+
+/// UPSERT one typed-summary node. Returns `true` when the affected
+/// row count is ≥1 (mirrors the metric-summary write path's
+/// `summaries_written` semantics).
+async fn upsert_typed_summary(
+    client: &deadpool_postgres::Object,
+    node_type: &str,
+    tenant_id: &str,
+    period_start: chrono::DateTime<chrono::Utc>,
+    level: ConsolidationLevel,
+    attributes: &serde_json::Value,
+    locked_by: &str,
+) -> Result<bool, Error> {
+    let node_id = typed_summary_node_id(node_type, tenant_id, period_start);
+    // Read current version for the AV-48 expected_version gate.
+    let current_version: Option<i32> = client
+        .query_opt(
+            "SELECT version FROM cirisgraph.nodes \
+             WHERE node_id = $1 AND scope = 'ENVIRONMENT'",
+            &[&node_id],
+        )
+        .await
+        .map_err(|e| map_pg_error(e, "typed upsert read version"))?
+        .map(|r| r.get::<_, i32>("version"));
+    let expected_version = current_version.unwrap_or(0);
+    let row_hash = format!("{node_type}_v1.6.2");
+    let affected = client
+        .execute(
+            "INSERT INTO cirisgraph.nodes (\
+                node_id, scope, node_type, attributes, version, \
+                updated_by, updated_at, persist_row_hash, consolidation_level\
+             ) VALUES ($1, 'ENVIRONMENT', $7, $2, 1, $3, NOW(), $4, $6) \
+             ON CONFLICT (node_id, scope) DO UPDATE SET \
+                attributes = EXCLUDED.attributes, \
+                version = cirisgraph.nodes.version + 1, \
+                updated_by = EXCLUDED.updated_by, \
+                updated_at = NOW(), \
+                consolidation_level = EXCLUDED.consolidation_level \
+             WHERE cirisgraph.nodes.version = $5",
+            &[
+                &node_id,
+                attributes,
+                &locked_by,
+                &row_hash,
+                &expected_version,
+                &level.as_str(),
+                &node_type,
+            ],
+        )
+        .await
+        .map_err(|e| map_pg_error(e, "typed upsert"))?;
+    Ok(affected > 0)
 }
 
 // ─── consolidation rollup helper ────────────────────────────────────
@@ -1423,5 +1848,330 @@ mod tests {
             map.get("TEMPORAL_NEXT").copied().unwrap_or(0) >= 1,
             "expected ≥1 TEMPORAL_NEXT edge (one per consecutive metric); got map={map:?}"
         );
+    }
+
+    // ── v1.6.2 (CIRISPersist#68) typed-summary consolidate tests ────
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn tsdb_pg_consolidate_tasks_writes_task_summary() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let tenant = format!("task-{}", uuid::Uuid::new_v4().simple());
+        let period_start = Utc::now() - Duration::hours(6);
+        let period_end = period_start + Duration::hours(6);
+
+        let client = backend.pool().get().await.unwrap();
+        // Tenant-scoped task_ids so re-runs (and parallel test runs in
+        // PG's shared DB) don't collide on the PK.
+        let t1 = format!("t1-{tenant}");
+        let t2 = format!("t2-{tenant}");
+        let t3 = format!("t3-{tenant}");
+        for (tid, status, offset_min) in &[
+            (t1.clone(), "completed", 0i64),
+            (t2.clone(), "completed", 5),
+            (t3.clone(), "failed", 10),
+        ] {
+            let when = period_start + Duration::minutes(*offset_min);
+            client
+                .execute(
+                    "INSERT INTO cirislens.tasks \
+                     (task_id, channel_id, description, status, created_at, updated_at, agent_occurrence_id) \
+                     VALUES ($1, 'chan', 'desc', $2, $3, $3, $4)",
+                    &[tid, status, &when, &tenant],
+                )
+                .await
+                .unwrap();
+        }
+        let th1 = format!("th1-{tenant}");
+        let th2 = format!("th2-{tenant}");
+        for (thid, src, depth, offset_min) in
+            &[(th1, t1.clone(), 1i32, 0i64), (th2, t2.clone(), 3, 5)]
+        {
+            let when = period_start + Duration::minutes(*offset_min);
+            client
+                .execute(
+                    "INSERT INTO cirislens.thoughts \
+                     (thought_id, source_task_id, status, created_at, updated_at, content, thought_depth, agent_occurrence_id) \
+                     VALUES ($1, $2, 'completed', $3, $3, 'c', $4, $5)",
+                    &[thid, src, &when, depth, &tenant],
+                )
+                .await
+                .unwrap();
+        }
+        drop(client);
+
+        let outcome = backend
+            .consolidate_tasks(ConsolidationRequest {
+                tenant_id: tenant.clone(),
+                period_start,
+                period_end,
+                locked_by: "w".into(),
+                level: ConsolidationLevel::Basic,
+            })
+            .await
+            .unwrap();
+        assert!(outcome.summary_written);
+        assert_eq!(outcome.source_rows, 3);
+
+        let rows = backend
+            .query_summary_nodes(
+                "task_summary",
+                ConsolidationLevel::Basic,
+                &tenant,
+                period_start - Duration::hours(1),
+                period_end + Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["total_tasks"].as_i64(), Some(3));
+        assert_eq!(rows[0]["by_status"]["completed"].as_i64(), Some(2));
+        assert_eq!(rows[0]["by_status"]["failed"].as_i64(), Some(1));
+        assert_eq!(rows[0]["mean_thought_depth"].as_f64(), Some(2.0));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn tsdb_pg_consolidate_conversations_writes_summary() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let tenant = format!("conv-{}", uuid::Uuid::new_v4().simple());
+        let period_start = Utc::now() - Duration::hours(6);
+        let period_end = period_start + Duration::hours(6);
+
+        let client = backend.pool().get().await.unwrap();
+        for (cid, action, actor, offset_min) in &[
+            ("c1", "SPEAK", "alice", 0i64),
+            ("c2", "observe", "alice", 5),
+            ("c3", "speak_action", "bob", 10),
+            ("c4", "observe_action", "bob", 15),
+        ] {
+            let cid_full = format!("conv-c-{cid}-{}", uuid::Uuid::new_v4().simple());
+            let when = period_start + Duration::minutes(*offset_min);
+            let req_data = serde_json::json!({"actor_id": actor});
+            client
+                .execute(
+                    "INSERT INTO cirislens.service_correlations \
+                 (correlation_id, service_type, handler_name, action_type, request_data, \
+                  status, created_at, updated_at, correlation_type, timestamp, \
+                  retention_policy, agent_occurrence_id) \
+                 VALUES ($1, 'svc', 'h', $2, $3, 'completed', $4, $4, \
+                         'service_interaction', $4, 'raw', $5)",
+                    &[&cid_full, action, &req_data, &when, &tenant],
+                )
+                .await
+                .unwrap();
+        }
+        // Off-shape — excluded.
+        let cid_off = format!("conv-off-{}", uuid::Uuid::new_v4().simple());
+        let when_off = period_start + Duration::minutes(20);
+        let req_off = serde_json::json!({"actor_id": "carol"});
+        client
+            .execute(
+                "INSERT INTO cirislens.service_correlations \
+             (correlation_id, service_type, handler_name, action_type, request_data, \
+              status, created_at, updated_at, correlation_type, timestamp, \
+              retention_policy, agent_occurrence_id) \
+             VALUES ($1, 'svc', 'h', 'tool', $2, 'completed', $3, $3, \
+                     'service_interaction', $3, 'raw', $4)",
+                &[&cid_off, &req_off, &when_off, &tenant],
+            )
+            .await
+            .unwrap();
+        drop(client);
+
+        let outcome = backend
+            .consolidate_conversations(ConsolidationRequest {
+                tenant_id: tenant.clone(),
+                period_start,
+                period_end,
+                locked_by: "w".into(),
+                level: ConsolidationLevel::Basic,
+            })
+            .await
+            .unwrap();
+        assert!(outcome.summary_written);
+        assert_eq!(outcome.source_rows, 4);
+
+        let rows = backend
+            .query_summary_nodes(
+                "conversation_summary",
+                ConsolidationLevel::Basic,
+                &tenant,
+                period_start - Duration::hours(1),
+                period_end + Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["total_messages"].as_i64(), Some(4));
+        assert_eq!(rows[0]["unique_actors"].as_i64(), Some(2));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn tsdb_pg_consolidate_traces_writes_summary() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let tenant = format!("trace-{}", uuid::Uuid::new_v4().simple());
+        let period_start = Utc::now() - Duration::hours(6);
+        let period_end = period_start + Duration::hours(6);
+
+        let client = backend.pool().get().await.unwrap();
+        for (action, ctype, offset_min) in &[
+            ("call", "trace", 0i64),
+            ("call", "trace", 5),
+            ("tool_invoke", "trace", 10),
+            ("call", "service_interaction", 15), // excluded
+        ] {
+            let cid = uuid::Uuid::new_v4().to_string();
+            let when = period_start + Duration::minutes(*offset_min);
+            client
+                .execute(
+                    "INSERT INTO cirislens.service_correlations \
+                 (correlation_id, service_type, handler_name, action_type, \
+                  status, created_at, updated_at, correlation_type, timestamp, \
+                  retention_policy, agent_occurrence_id) \
+                 VALUES ($1, 'svc', 'h', $2, 'completed', $3, $3, \
+                         $4, $3, 'raw', $5)",
+                    &[&cid, action, &when, ctype, &tenant],
+                )
+                .await
+                .unwrap();
+        }
+        drop(client);
+
+        let outcome = backend
+            .consolidate_traces(ConsolidationRequest {
+                tenant_id: tenant.clone(),
+                period_start,
+                period_end,
+                locked_by: "w".into(),
+                level: ConsolidationLevel::Basic,
+            })
+            .await
+            .unwrap();
+        assert!(outcome.summary_written);
+        assert_eq!(outcome.source_rows, 3);
+
+        let rows = backend
+            .query_summary_nodes(
+                "trace_summary",
+                ConsolidationLevel::Basic,
+                &tenant,
+                period_start - Duration::hours(1),
+                period_end + Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["total_traces"].as_i64(), Some(3));
+        assert_eq!(rows[0]["by_action_type"]["call"].as_i64(), Some(2));
+        assert_eq!(rows[0]["by_action_type"]["tool_invoke"].as_i64(), Some(1));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn tsdb_pg_consolidate_audit_writes_summary() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let tenant = format!("aud-{}", uuid::Uuid::new_v4().simple());
+        let period_start = Utc::now() - Duration::hours(6);
+        let period_end = period_start + Duration::hours(6);
+
+        let client = backend.pool().get().await.unwrap();
+        let prev_hash: [u8; 32] = [0; 32];
+        let payload = serde_json::json!({});
+        // Use action_types from V018's CHECK constraint allow-list.
+        for (i, (actor, action, offset_min)) in [
+            ("alice", "handler_action_speak", 0i64),
+            ("alice", "handler_action_speak", 5),
+            ("bob", "config_change", 10),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let when = period_start + Duration::minutes(*offset_min);
+            let entry_id = uuid::Uuid::new_v4();
+            let entry_hash: Vec<u8> = (0..32).map(|n: u8| n.wrapping_add(i as u8 + 1)).collect();
+            let seq: i64 = i as i64 + 1;
+            client.execute(
+                "INSERT INTO cirislens.audit_log \
+                 (entry_id, sequence_number, tenant_id, actor_id, action_type, \
+                  subject_kind, subject_id, payload, prev_hash, entry_hash, \
+                  recorded_at, signature, signing_key_id, signature_verified, persist_row_hash) \
+                 VALUES ($1, $2, $3, $4, $5, 'task', 'sub', $6, $7, $8, $9, 'sig', 'k', FALSE, 'rh')",
+                &[
+                    &entry_id,
+                    &seq,
+                    &tenant,
+                    actor,
+                    action,
+                    &payload,
+                    &prev_hash.as_slice(),
+                    &entry_hash.as_slice(),
+                    &when,
+                ],
+            )
+            .await
+            .unwrap();
+        }
+        drop(client);
+
+        let outcome = backend
+            .consolidate_audit(ConsolidationRequest {
+                tenant_id: tenant.clone(),
+                period_start,
+                period_end,
+                locked_by: "w".into(),
+                level: ConsolidationLevel::Basic,
+            })
+            .await
+            .unwrap();
+        assert!(outcome.summary_written);
+        assert_eq!(outcome.source_rows, 3);
+
+        let rows = backend
+            .query_summary_nodes(
+                "audit_summary",
+                ConsolidationLevel::Basic,
+                &tenant,
+                period_start - Duration::hours(1),
+                period_end + Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["total_events"].as_i64(), Some(3));
+        assert_eq!(
+            rows[0]["by_action_type"]["handler_action_speak"].as_i64(),
+            Some(2)
+        );
+        assert_eq!(rows[0]["unique_actors"].as_i64(), Some(2));
     }
 }

@@ -5,6 +5,178 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.6.2] — 2026-05-19
+
+**TSDB non-metric summary types — task / conversation / trace / audit
+rollups (CIRISPersist#68). FINAL Phase 3b blocker for CIRISAgent
+2.9.0.**
+
+Persist's existing `telemetry_consolidate_period` covers the METRIC
+summary type; the agent's TSDB pipeline produces FOUR additional
+summary node types over non-metric source data, all of which were
+still riding raw SQL against `cirislens.tasks` /
+`cirislens.thoughts` / `cirislens.service_correlations` /
+`cirislens.audit_log`. v1.6.2 closes the substrate gap with four
+typed consolidate methods + a unified `query_summary_nodes` reader.
+
+### Four new typed summary structs (`src/telemetry/types.rs`)
+
+```rust
+TaskSummary {
+    tenant_id, period_start, period_end,
+    total_tasks: i64,
+    by_status: HashMap<String, i64>,
+    mean_thought_depth: f64,
+    consolidation_level,
+}
+ConversationSummary {
+    tenant_id, period_start, period_end,
+    total_messages: i64, unique_actors: i64,
+    consolidation_level,
+}
+TraceSummary {
+    tenant_id, period_start, period_end,
+    total_traces: i64,
+    by_action_type: HashMap<String, i64>,
+    consolidation_level,
+}
+AuditSummary {
+    tenant_id, period_start, period_end,
+    total_events: i64,
+    by_action_type: HashMap<String, i64>,
+    unique_actors: i64,
+    consolidation_level,
+}
+
+TypedConsolidationOutcome { summary_written: bool, source_rows: i64 }
+```
+
+Each summary serializes to the `attributes` JSON of a graph node
+in `cirisgraph.nodes` (scope `ENVIRONMENT`) under the matching
+`node_type` token — `task_summary`, `conversation_summary`,
+`trace_summary`, `audit_summary`. Stable `node_id` shape:
+`tsdb:{node_type}:{tenant_id}:{period_start_rfc3339}` (mirrors the
+metric-summary key without the metric_name slot).
+
+### Five new `TelemetryService` trait methods
+
+```rust
+fn consolidate_tasks(req: ConsolidationRequest)         -> TypedConsolidationOutcome
+fn consolidate_conversations(req: ConsolidationRequest) -> TypedConsolidationOutcome
+fn consolidate_traces(req: ConsolidationRequest)        -> TypedConsolidationOutcome
+fn consolidate_audit(req: ConsolidationRequest)         -> TypedConsolidationOutcome
+fn query_summary_nodes(
+    node_type, level, tenant_id, from, to,
+) -> Vec<serde_json::Value>
+```
+
+`query_summary_nodes` returns raw JSON `attributes` so callers
+deserialize per summary type on their side. Lock acquisition is
+skipped in v1.6.2 — the agent's non-metric consolidator is
+single-threaded; lock arbitration parity with `consolidate_period`
+is a v1.7.x extension if concurrent typed consolidations land.
+
+### Aggregation SQL per type
+
+**TaskSummary** — two queries against `cirislens.tasks` +
+`cirislens.thoughts`:
+
+```sql
+-- Status histogram + total.
+SELECT status, COUNT(*) FROM cirislens.tasks
+ WHERE agent_occurrence_id = $tenant
+   AND created_at >= $start AND created_at < $end
+ GROUP BY status;
+
+-- Mean thought_depth (COALESCE to 0.0 on empty).
+SELECT AVG(thought_depth) FROM cirislens.thoughts
+ WHERE agent_occurrence_id = $tenant
+   AND created_at >= $start AND created_at < $end;
+```
+
+**ConversationSummary** — one query against
+`cirislens.service_correlations`, filtered to the speak/observe
+action shapes (case-insensitive):
+
+```sql
+SELECT COUNT(*), COUNT(DISTINCT request_data->>'actor_id')
+  FROM cirislens.service_correlations
+ WHERE agent_occurrence_id = $tenant
+   AND timestamp >= $start AND timestamp < $end
+   AND lower(action_type) IN
+       ('speak', 'observe', 'speak_action', 'observe_action');
+```
+
+**TraceSummary** — `correlation_type = 'trace'` histogram:
+
+```sql
+SELECT action_type, COUNT(*) FROM cirislens.service_correlations
+ WHERE agent_occurrence_id = $tenant
+   AND correlation_type = 'trace'
+   AND timestamp >= $start AND timestamp < $end
+ GROUP BY action_type;
+```
+
+**AuditSummary** — `cirislens.audit_log` histogram + distinct
+actor count. **Deviation from initial spec**: `audit_log` uses
+`tenant_id` directly (NOT `agent_occurrence_id`) and `recorded_at`
+(NOT `created_at`) per the V014 column shape — implementation
+adjusted to match the actual schema. SQLite mirrors the same
+column names.
+
+### Unified `query_summary_nodes` read API
+
+```sql
+SELECT attributes FROM cirisgraph.nodes
+ WHERE node_type = $1                             -- "task_summary" | etc.
+   AND scope = 'ENVIRONMENT'
+   AND consolidation_level = $2
+   AND attributes->>'tenant_id' = $3
+   AND ((attributes->>'period_start')::timestamptz) >= $4
+   AND ((attributes->>'period_start')::timestamptz) <  $5
+ ORDER BY (attributes->>'period_start')::timestamptz ASC;
+```
+
+SQLite uses `json_extract(attributes, '$.tenant_id')` /
+`'$.period_start'` analogs and applies the v1.6.0
+`truncate_to_micros` discipline on the period boundaries (mirrors
+the metric `get_summary` write/read alignment).
+
+`node_type` is validated against the four allowed tokens
+up-front; unknown values yield `Error::InvalidArgument` (stable
+`telemetry_invalid_argument` kind token, AV-15).
+
+### PyO3 surface — 5 new `Engine` methods (`feature = "telemetry"`)
+
+- `tsdb_consolidate_tasks(req_json) -> str`
+- `tsdb_consolidate_conversations(req_json) -> str`
+- `tsdb_consolidate_traces(req_json) -> str`
+- `tsdb_consolidate_audit(req_json) -> str`
+- `tsdb_query_summary_nodes(node_type, level, tenant_id, from_rfc3339, to_rfc3339) -> str`
+
+Mirror the v1.6.0 `tsdb_*` shape — JSON wire for request +
+response. Error kinds propagate through `translate_error_kind`
+unchanged; no new error variants in `telemetry::Error`. `.pyi`
+stubs document each summary type's JSON `attributes` shape so the
+agent UI can shape per-period rollup cells without reading the
+Rust source.
+
+### Tests — 10 SQLite + 4 PG
+
+SQLite: happy-path per summary type (with source-data seeded via
+direct SQL into `cirislens_*` tables, so tests don't pull in the
+substrate feature flags), `query_summary_nodes` validation
+rejects (unknown `node_type` + inverted window), empty-window
+sanity (summary node still written so the UI sees the bucket),
+shared validation rejects across all four methods. PG: one
+parity test per summary type, gated on `CIRIS_PERSIST_TEST_PG_URL`.
+
+### Schema — no new migrations
+
+v1.6.2 reads against existing `cirislens.*` substrates (V014,
+V024, V025, V026) + writes against `cirisgraph.nodes` (V013 +
+V019). `qa_harness` schema_history count unchanged.
+
 ## [1.6.1] — 2026-05-19
 
 **cirisgraph `attribute_match` filter — JSON-path equality + array

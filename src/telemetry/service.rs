@@ -6,7 +6,7 @@ use std::future::Future;
 
 use super::types::{
     ConsolidationLevel, ConsolidationOutcome, ConsolidationRequest, MetricCursor, MetricFilter,
-    MetricListPage, MetricObservation, MetricSummary,
+    MetricListPage, MetricObservation, MetricSummary, TypedConsolidationOutcome,
 };
 use super::Error;
 use chrono::{DateTime, Utc};
@@ -128,4 +128,94 @@ pub trait TelemetryService: Send + Sync {
         from: DateTime<Utc>,
         to: DateTime<Utc>,
     ) -> impl Future<Output = Result<std::collections::HashMap<String, u64>, Error>> + Send;
+
+    // ── v1.6.2 (CIRISPersist#68) non-metric summary types ───────────
+    //
+    // The agent's TSDB pipeline produces FIVE summary node types, of
+    // which one (`tsdb_summary`) is the metric rollup covered by
+    // `consolidate_period` above. The remaining four —
+    // `task_summary`, `conversation_summary`, `trace_summary`,
+    // `audit_summary` — aggregate non-metric source data:
+    //
+    //   task_summary         ← cirislens.tasks + cirislens.thoughts
+    //   conversation_summary ← cirislens.service_correlations
+    //                          (action_type ∈ speak/observe shapes)
+    //   trace_summary        ← cirislens.service_correlations
+    //                          (correlation_type = 'trace')
+    //   audit_summary        ← cirislens.audit_log
+    //
+    // Each emits a `*_summary` graph node into `cirisgraph.nodes`
+    // (scope `ENVIRONMENT`) carrying the aggregation result as the
+    // JSON `attributes` blob. v1.6.2 covers Basic-tier rollups only;
+    // higher-tier rollups of typed summaries are a future cut.
+    //
+    // No lock acquisition — caller (agent) is single-threaded for
+    // non-metric consolidation. (Lock-arbitration parity with
+    // `consolidate_period` is a v1.7.x extension if concurrent
+    // consolidations land.)
+
+    /// v1.6.2 (CIRISPersist#68) — Consolidate task/thought source
+    /// data over `[period_start, period_end)` into a `TaskSummary`
+    /// node. `total_tasks` is the count over `cirislens.tasks`
+    /// (filtered by `agent_occurrence_id = tenant_id`,
+    /// `created_at ∈ window`); `by_status` is the
+    /// `GROUP BY status` histogram; `mean_thought_depth` is
+    /// `AVG(thought_depth)` over `cirislens.thoughts` for the same
+    /// window (0.0 when no thoughts).
+    fn consolidate_tasks(
+        &self,
+        req: ConsolidationRequest,
+    ) -> impl Future<Output = Result<TypedConsolidationOutcome, Error>> + Send;
+
+    /// v1.6.2 — Consolidate conversation-shaped service correlations
+    /// (`action_type` ∈ `speak | observe | speak_action |
+    /// observe_action`, case-insensitive) over the window into a
+    /// `ConversationSummary` node. `total_messages` is the matching
+    /// row count; `unique_actors` is the distinct
+    /// `request_data->>'actor_id'` count.
+    fn consolidate_conversations(
+        &self,
+        req: ConsolidationRequest,
+    ) -> impl Future<Output = Result<TypedConsolidationOutcome, Error>> + Send;
+
+    /// v1.6.2 — Consolidate trace-shaped service correlations
+    /// (`correlation_type = 'trace'`) over the window into a
+    /// `TraceSummary` node. `total_traces` is the matching row
+    /// count; `by_action_type` is the `GROUP BY action_type`
+    /// histogram.
+    fn consolidate_traces(
+        &self,
+        req: ConsolidationRequest,
+    ) -> impl Future<Output = Result<TypedConsolidationOutcome, Error>> + Send;
+
+    /// v1.6.2 — Consolidate audit-log rows over the window into an
+    /// `AuditSummary` node. `total_events` is the row count;
+    /// `by_action_type` is the histogram; `unique_actors` is the
+    /// distinct `actor_id` count. Note: `cirislens.audit_log` uses
+    /// `tenant_id` (NOT `agent_occurrence_id`) and `recorded_at`
+    /// (NOT `created_at`) — schema's direct shape.
+    fn consolidate_audit(
+        &self,
+        req: ConsolidationRequest,
+    ) -> impl Future<Output = Result<TypedConsolidationOutcome, Error>> + Send;
+
+    /// v1.6.2 — Query typed summary nodes by `node_type`. Returns
+    /// the raw JSON attributes for each matching row so callers
+    /// deserialize per-summary-type (`TaskSummary`,
+    /// `ConversationSummary`, `TraceSummary`, `AuditSummary`) on
+    /// their side. Ordered by `period_start ASC`.
+    ///
+    /// `node_type` is one of `"task_summary" |
+    /// "conversation_summary" | "trace_summary" | "audit_summary"`.
+    /// `level` filters the `consolidation_level` column;
+    /// `tenant_id` matches `attributes->>'tenant_id'`; `from` / `to`
+    /// bracket `attributes->>'period_start'` (half-open).
+    fn query_summary_nodes(
+        &self,
+        node_type: &str,
+        level: ConsolidationLevel,
+        tenant_id: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> impl Future<Output = Result<Vec<serde_json::Value>, Error>> + Send;
 }

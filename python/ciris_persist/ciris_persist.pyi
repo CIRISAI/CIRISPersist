@@ -958,6 +958,163 @@ class Engine:
         summary's attributes for cross-period observability.
         """
 
+    # ── v1.6.2 (CIRISPersist#68) — non-metric typed summaries ───────
+
+    def tsdb_consolidate_tasks(self, req_json: str) -> str:
+        """v1.6.2 (CIRISPersist#68) — Consolidate task source data
+        over the request's period window into a ``task_summary``
+        graph node.
+
+        ``req_json`` is a JSON-encoded ``ConsolidationRequest`` — same
+        shape ``telemetry_consolidate_period`` accepts:
+
+        .. code-block:: json
+
+            {
+              "tenant_id": "agent-datum",
+              "period_start": "2026-05-19T00:00:00Z",
+              "period_end":   "2026-05-19T06:00:00Z",
+              "locked_by":    "tsdb-worker",
+              "level":        "basic"
+            }
+
+        Aggregates ``cirislens.tasks`` (status histogram, total) +
+        ``cirislens.thoughts`` (mean ``thought_depth``) over the
+        window, filtered by ``agent_occurrence_id = tenant_id``.
+        UPSERTs one ``task_summary`` row into ``cirisgraph.nodes``
+        (scope ``ENVIRONMENT``) carrying a ``TaskSummary`` JSON
+        ``attributes`` blob:
+
+        .. code-block:: json
+
+            {
+              "tenant_id": "agent-datum",
+              "period_start": "...",
+              "period_end":   "...",
+              "total_tasks": 42,
+              "by_status": {"completed": 30, "failed": 2, ...},
+              "mean_thought_depth": 1.8,
+              "consolidation_level": "basic"
+            }
+
+        Returns the JSON-encoded ``TypedConsolidationOutcome``
+        (``{"summary_written": bool, "source_rows": int}``).
+
+        Final blocker for CIRISAgent 2.9.0 Phase 3b — the agent's
+        TSDB pipeline emits these typed summaries alongside the
+        metric ``tsdb_summary`` so the UI can surface per-period
+        task / conversation / trace / audit rollups.
+        """
+
+    def tsdb_consolidate_conversations(self, req_json: str) -> str:
+        """v1.6.2 (CIRISPersist#68) — Consolidate conversation-shaped
+        service correlations into a ``conversation_summary`` graph
+        node.
+
+        Filters ``cirislens.service_correlations`` to rows whose
+        ``action_type`` is one of ``speak | observe | speak_action |
+        observe_action`` (case-insensitive). Counts total matches +
+        distinct ``request_data->>'actor_id'`` over the window
+        (scoped by ``agent_occurrence_id = tenant_id``).
+
+        Emits a ``ConversationSummary`` JSON ``attributes`` blob:
+
+        .. code-block:: json
+
+            {
+              "tenant_id": "...",
+              "period_start": "...",
+              "period_end":   "...",
+              "total_messages": 17,
+              "unique_actors": 3,
+              "consolidation_level": "basic"
+            }
+
+        Returns the JSON-encoded ``TypedConsolidationOutcome``.
+        """
+
+    def tsdb_consolidate_traces(self, req_json: str) -> str:
+        """v1.6.2 (CIRISPersist#68) — Consolidate trace-shaped
+        service correlations into a ``trace_summary`` graph node.
+
+        Filters ``cirislens.service_correlations`` where
+        ``correlation_type = 'trace'`` over the window (scoped by
+        ``agent_occurrence_id = tenant_id``). Builds a
+        ``by_action_type`` histogram + total count.
+
+        Emits a ``TraceSummary`` JSON ``attributes`` blob:
+
+        .. code-block:: json
+
+            {
+              "tenant_id": "...",
+              "period_start": "...",
+              "period_end":   "...",
+              "total_traces": 8,
+              "by_action_type": {"call": 5, "tool_invoke": 3},
+              "consolidation_level": "basic"
+            }
+
+        Returns the JSON-encoded ``TypedConsolidationOutcome``.
+        """
+
+    def tsdb_consolidate_audit(self, req_json: str) -> str:
+        """v1.6.2 (CIRISPersist#68) — Consolidate audit-log rows into
+        an ``audit_summary`` graph node.
+
+        Aggregates ``cirislens.audit_log`` over the window. The
+        audit_log schema uses ``tenant_id`` directly (NOT
+        ``agent_occurrence_id``) and ``recorded_at`` (NOT
+        ``created_at``) per the V014 column shape. Builds a
+        ``by_action_type`` histogram + total count + distinct
+        ``actor_id`` count.
+
+        Emits an ``AuditSummary`` JSON ``attributes`` blob:
+
+        .. code-block:: json
+
+            {
+              "tenant_id": "...",
+              "period_start": "...",
+              "period_end":   "...",
+              "total_events": 12,
+              "by_action_type": {"task_signed": 6, "config_changed": 2},
+              "unique_actors": 4,
+              "consolidation_level": "basic"
+            }
+
+        Returns the JSON-encoded ``TypedConsolidationOutcome``.
+        """
+
+    def tsdb_query_summary_nodes(
+        self,
+        node_type: str,
+        level: str,
+        tenant_id: str,
+        from_rfc3339: str,
+        to_rfc3339: str,
+    ) -> str:
+        """v1.6.2 (CIRISPersist#68) — Read typed summary nodes by
+        ``node_type``. Returns a JSON ``list[dict]`` — each entry is
+        the raw ``attributes`` JSON for one matching summary row.
+
+        ``node_type`` is one of
+        ``"task_summary" | "conversation_summary" |
+        "trace_summary" | "audit_summary"``.
+
+        Callers deserialize the dict per summary type
+        (``TaskSummary``, ``ConversationSummary``, ``TraceSummary``,
+        ``AuditSummary``) on their side — persist doesn't enforce
+        the per-type Python class because the agent owns those.
+
+        ``level`` filters ``consolidation_level``; ``tenant_id``
+        matches ``attributes.tenant_id``; ``from_rfc3339`` /
+        ``to_rfc3339`` bracket ``attributes.period_start``
+        (half-open). Results ordered by ``period_start ASC``.
+
+        Empty list when no rows match (not an error).
+        """
+
     # ── v1.5.25 (CIRISPersist#65) — cirisgraph count primitives ─────
 
     def cirisgraph_count_nodes(self, filter_json: str) -> int:

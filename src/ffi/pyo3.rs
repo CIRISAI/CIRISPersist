@@ -8406,6 +8406,261 @@ impl PyEngine {
         })
     }
 
+    // ── v1.6.2 (CIRISPersist#68) — non-metric typed summaries ───────
+
+    /// v1.6.2 (CIRISPersist#68) — Consolidate task source data over
+    /// the request's period window into a `task_summary` graph node.
+    /// `req_json` is a JSON `ConsolidationRequest`; returns a JSON
+    /// `TypedConsolidationOutcome` (`{summary_written: bool,
+    /// source_rows: int}`). The emitted `task_summary` attributes
+    /// carry `total_tasks`, `by_status` (histogram), and
+    /// `mean_thought_depth`.
+    #[cfg(feature = "telemetry")]
+    fn tsdb_consolidate_tasks(&self, py: Python<'_>, req_json: &str) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let req: crate::telemetry::ConsolidationRequest = serde_json::from_str(req_json)
+                .map_err(|e| PyValueError::new_err(format!("ConsolidationRequest decode: {e}")))?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::telemetry::TelemetryService;
+                        let outcome = backend
+                            .consolidate_tasks(req)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&outcome).map_err(|e| {
+                            PyRuntimeError::new_err(format!(
+                                "TypedConsolidationOutcome encode: {e}"
+                            ))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::telemetry::sqlite::SqliteTelemetryBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::telemetry::TelemetryService;
+                        let outcome = backend
+                            .consolidate_tasks(req)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&outcome).map_err(|e| {
+                            PyRuntimeError::new_err(format!(
+                                "TypedConsolidationOutcome encode: {e}"
+                            ))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.6.2 — Consolidate conversation-shaped service correlations
+    /// into a `conversation_summary` node. Returns JSON
+    /// `TypedConsolidationOutcome`.
+    #[cfg(feature = "telemetry")]
+    fn tsdb_consolidate_conversations(&self, py: Python<'_>, req_json: &str) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let req: crate::telemetry::ConsolidationRequest = serde_json::from_str(req_json)
+                .map_err(|e| PyValueError::new_err(format!("ConsolidationRequest decode: {e}")))?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::telemetry::TelemetryService;
+                        let outcome = backend
+                            .consolidate_conversations(req)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&outcome).map_err(|e| {
+                            PyRuntimeError::new_err(format!(
+                                "TypedConsolidationOutcome encode: {e}"
+                            ))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::telemetry::sqlite::SqliteTelemetryBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::telemetry::TelemetryService;
+                        let outcome = backend
+                            .consolidate_conversations(req)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&outcome).map_err(|e| {
+                            PyRuntimeError::new_err(format!(
+                                "TypedConsolidationOutcome encode: {e}"
+                            ))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.6.2 — Consolidate trace-shaped service correlations into a
+    /// `trace_summary` node. Returns JSON `TypedConsolidationOutcome`.
+    #[cfg(feature = "telemetry")]
+    fn tsdb_consolidate_traces(&self, py: Python<'_>, req_json: &str) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let req: crate::telemetry::ConsolidationRequest = serde_json::from_str(req_json)
+                .map_err(|e| PyValueError::new_err(format!("ConsolidationRequest decode: {e}")))?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::telemetry::TelemetryService;
+                        let outcome = backend
+                            .consolidate_traces(req)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&outcome).map_err(|e| {
+                            PyRuntimeError::new_err(format!(
+                                "TypedConsolidationOutcome encode: {e}"
+                            ))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::telemetry::sqlite::SqliteTelemetryBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::telemetry::TelemetryService;
+                        let outcome = backend
+                            .consolidate_traces(req)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&outcome).map_err(|e| {
+                            PyRuntimeError::new_err(format!(
+                                "TypedConsolidationOutcome encode: {e}"
+                            ))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.6.2 — Consolidate audit-log events into an `audit_summary`
+    /// node. Returns JSON `TypedConsolidationOutcome`.
+    #[cfg(feature = "telemetry")]
+    fn tsdb_consolidate_audit(&self, py: Python<'_>, req_json: &str) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let req: crate::telemetry::ConsolidationRequest = serde_json::from_str(req_json)
+                .map_err(|e| PyValueError::new_err(format!("ConsolidationRequest decode: {e}")))?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::telemetry::TelemetryService;
+                        let outcome = backend
+                            .consolidate_audit(req)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&outcome).map_err(|e| {
+                            PyRuntimeError::new_err(format!(
+                                "TypedConsolidationOutcome encode: {e}"
+                            ))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::telemetry::sqlite::SqliteTelemetryBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::telemetry::TelemetryService;
+                        let outcome = backend
+                            .consolidate_audit(req)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&outcome).map_err(|e| {
+                            PyRuntimeError::new_err(format!(
+                                "TypedConsolidationOutcome encode: {e}"
+                            ))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.6.2 — Query typed summary nodes by `node_type`. Returns a
+    /// JSON `list[dict]` — each entry is the raw `attributes` JSON
+    /// for one matching summary row. Callers deserialize per
+    /// summary type (`TaskSummary`, `ConversationSummary`,
+    /// `TraceSummary`, `AuditSummary`) on their side.
+    ///
+    /// `node_type` is one of `"task_summary" |
+    /// "conversation_summary" | "trace_summary" | "audit_summary"`.
+    /// `level` is one of `"basic" | "daily" | "weekly" | "monthly"`.
+    /// `from` / `to` bracket `period_start` (half-open).
+    #[cfg(feature = "telemetry")]
+    fn tsdb_query_summary_nodes(
+        &self,
+        py: Python<'_>,
+        node_type: &str,
+        level: &str,
+        tenant_id: &str,
+        from_rfc3339: &str,
+        to_rfc3339: &str,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let level = crate::telemetry::ConsolidationLevel::from_wire_str(level)
+                .ok_or_else(|| PyValueError::new_err(format!("unknown level: {level}")))?;
+            let node_type = node_type.to_owned();
+            let tenant_id = tenant_id.to_owned();
+            let from: chrono::DateTime<chrono::Utc> =
+                chrono::DateTime::parse_from_rfc3339(from_rfc3339)
+                    .map_err(|e| PyValueError::new_err(format!("from parse: {e}")))?
+                    .with_timezone(&chrono::Utc);
+            let to: chrono::DateTime<chrono::Utc> =
+                chrono::DateTime::parse_from_rfc3339(to_rfc3339)
+                    .map_err(|e| PyValueError::new_err(format!("to parse: {e}")))?
+                    .with_timezone(&chrono::Utc);
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::telemetry::TelemetryService;
+                        let rows = backend
+                            .query_summary_nodes(&node_type, level, &tenant_id, from, to)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&rows).map_err(|e| {
+                            PyRuntimeError::new_err(format!("query_summary_nodes encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::telemetry::sqlite::SqliteTelemetryBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::telemetry::TelemetryService;
+                        let rows = backend
+                            .query_summary_nodes(&node_type, level, &tenant_id, from, to)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&rows).map_err(|e| {
+                            PyRuntimeError::new_err(format!("query_summary_nodes encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
     /// v1.6.0 — Histogram of edges within `[from, to)`, grouped by
     /// `relationship`. Filters scope='ENVIRONMENT' (the TSDB scope).
     /// Returns the JSON-encoded `dict[str, int]`.

@@ -194,6 +194,86 @@ pub struct ConsolidationOutcome {
     pub broke_stale_lock: bool,
 }
 
+// ─── v1.6.2 (CIRISPersist#68) typed-summary structs ──────────────────
+//
+// The agent pipeline produces four NON-METRIC summary node types in
+// addition to `tsdb_summary` (which `MetricSummary` covers). v1.6.2
+// gives each its own typed Summary + a unified `query_summary_nodes`
+// reader. The summaries are stored as JSON attributes on
+// `cirisgraph.nodes` rows with `node_type` ∈
+// `{"task_summary", "conversation_summary", "trace_summary",
+//   "audit_summary"}` and `scope = 'ENVIRONMENT'`.
+//
+// All four share a `consolidation_level` field (default Basic) — the
+// agent only emits Basic-tier rollups for non-metric source data in
+// 2.9.0 Phase 3b; higher-tier rollups of these are a future cut.
+
+/// Task lifecycle rollup. Aggregates `cirislens.tasks` (status
+/// histogram) + `cirislens.thoughts` (mean thought_depth).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskSummary {
+    pub tenant_id: String,
+    pub period_start: DateTime<Utc>,
+    pub period_end: DateTime<Utc>,
+    pub total_tasks: i64,
+    pub by_status: std::collections::HashMap<String, i64>,
+    pub mean_thought_depth: f64,
+    #[serde(default)]
+    pub consolidation_level: ConsolidationLevel,
+}
+
+/// Conversation rollup. Aggregates `cirislens.service_correlations`
+/// rows whose `action_type` is one of the speak/observe shapes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConversationSummary {
+    pub tenant_id: String,
+    pub period_start: DateTime<Utc>,
+    pub period_end: DateTime<Utc>,
+    pub total_messages: i64,
+    pub unique_actors: i64,
+    #[serde(default)]
+    pub consolidation_level: ConsolidationLevel,
+}
+
+/// Distributed-trace rollup. Aggregates `cirislens.service_correlations`
+/// rows where `correlation_type = 'trace'`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TraceSummary {
+    pub tenant_id: String,
+    pub period_start: DateTime<Utc>,
+    pub period_end: DateTime<Utc>,
+    pub total_traces: i64,
+    pub by_action_type: std::collections::HashMap<String, i64>,
+    #[serde(default)]
+    pub consolidation_level: ConsolidationLevel,
+}
+
+/// Audit-event rollup. Aggregates `cirislens.audit_log` rows.
+/// Note: audit_log uses `tenant_id` directly (not
+/// `agent_occurrence_id`) and `recorded_at` (not `created_at`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuditSummary {
+    pub tenant_id: String,
+    pub period_start: DateTime<Utc>,
+    pub period_end: DateTime<Utc>,
+    pub total_events: i64,
+    pub by_action_type: std::collections::HashMap<String, i64>,
+    pub unique_actors: i64,
+    #[serde(default)]
+    pub consolidation_level: ConsolidationLevel,
+}
+
+/// Outcome envelope shared by all four typed consolidate methods.
+/// `summary_written` is true iff a row landed in `cirisgraph.nodes`
+/// (UPSERT affected ≥1 row); `source_rows` is the count of source
+/// rows scanned in the window (raw `tasks` count, raw
+/// `service_correlations` count, etc.).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TypedConsolidationOutcome {
+    pub summary_written: bool,
+    pub source_rows: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

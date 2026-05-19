@@ -13,8 +13,9 @@ use tokio::sync::Mutex;
 
 use super::service::TelemetryService;
 use super::types::{
-    ConsolidationLevel, ConsolidationOutcome, ConsolidationRequest, MetricCursor, MetricFilter,
-    MetricListPage, MetricObservation, MetricSummary,
+    AuditSummary, ConsolidationLevel, ConsolidationOutcome, ConsolidationRequest,
+    ConversationSummary, MetricCursor, MetricFilter, MetricListPage, MetricObservation,
+    MetricSummary, TaskSummary, TraceSummary, TypedConsolidationOutcome,
 };
 use super::{Error, DEFAULT_MAX_LABELS_BYTES, STALE_LOCK_SECONDS};
 
@@ -652,6 +653,442 @@ impl TelemetryService for SqliteTelemetryBackend {
         .await
         .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
     }
+
+    // ── v1.6.2 (CIRISPersist#68) typed-summary consolidate methods ──
+
+    async fn consolidate_tasks(
+        &self,
+        req: ConsolidationRequest,
+    ) -> Result<TypedConsolidationOutcome, Error> {
+        validate_typed_req(&req)?;
+        let period_start_str = fmt_datetime(req.period_start);
+        let period_end_str = fmt_datetime(req.period_end);
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<TypedConsolidationOutcome, Error> {
+            let mut guard = conn.blocking_lock();
+
+            let mut by_status: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
+            let mut total_tasks: i64 = 0;
+            {
+                let mut stmt = guard
+                    .prepare(
+                        "SELECT status, COUNT(*) AS c \
+                           FROM cirislens_tasks \
+                          WHERE agent_occurrence_id = ?1 \
+                            AND created_at >= ?2 AND created_at < ?3 \
+                          GROUP BY status",
+                    )
+                    .map_err(|e| map_sqlite_error(e, "consolidate_tasks histogram prepare"))?;
+                let rows = stmt
+                    .query_map(
+                        params![req.tenant_id, period_start_str, period_end_str],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .map_err(|e| map_sqlite_error(e, "consolidate_tasks histogram query"))?;
+                for r in rows {
+                    let (s, c) =
+                        r.map_err(|e| map_sqlite_error(e, "consolidate_tasks histogram row"))?;
+                    total_tasks += c;
+                    by_status.insert(s, c);
+                }
+            }
+
+            // Mean thought_depth — COALESCE to 0.0 so no-thoughts
+            // windows still emit a numeric value.
+            let mean_thought_depth: f64 = guard
+                .query_row(
+                    "SELECT COALESCE(AVG(thought_depth), 0.0) AS mean_d \
+                       FROM cirislens_thoughts \
+                      WHERE agent_occurrence_id = ?1 \
+                        AND created_at >= ?2 AND created_at < ?3",
+                    params![req.tenant_id, period_start_str, period_end_str],
+                    |row| row.get(0),
+                )
+                .map_err(|e| map_sqlite_error(e, "consolidate_tasks mean depth"))?;
+
+            let summary = TaskSummary {
+                tenant_id: req.tenant_id.clone(),
+                period_start: truncate_to_micros(req.period_start),
+                period_end: truncate_to_micros(req.period_end),
+                total_tasks,
+                by_status,
+                mean_thought_depth,
+                consolidation_level: req.level,
+            };
+            let attrs = serde_json::to_string(&summary)
+                .map_err(|e| Error::Internal(format!("TaskSummary serialize: {e}")))?;
+            let summary_written = upsert_typed_summary(
+                &mut guard,
+                "task_summary",
+                &req.tenant_id,
+                summary.period_start,
+                req.level,
+                &attrs,
+                &req.locked_by,
+            )?;
+            Ok(TypedConsolidationOutcome {
+                summary_written,
+                source_rows: total_tasks,
+            })
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+    }
+
+    async fn consolidate_conversations(
+        &self,
+        req: ConsolidationRequest,
+    ) -> Result<TypedConsolidationOutcome, Error> {
+        validate_typed_req(&req)?;
+        let period_start_str = fmt_datetime(req.period_start);
+        let period_end_str = fmt_datetime(req.period_end);
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<TypedConsolidationOutcome, Error> {
+            let mut guard = conn.blocking_lock();
+
+            // SQLite stores request_data as TEXT (raw JSON string).
+            // `json_extract(request_data, '$.actor_id')` returns the
+            // scalar value (or NULL if absent / not JSON). NULLs are
+            // already excluded by `COUNT(DISTINCT)` (per SQL spec),
+            // so the count matches PG's `request_data->>'actor_id'`.
+            let (total_messages, unique_actors): (i64, i64) = guard
+                .query_row(
+                    "SELECT COUNT(*), \
+                            COUNT(DISTINCT json_extract(request_data, '$.actor_id')) \
+                       FROM cirislens_service_correlations \
+                      WHERE agent_occurrence_id = ?1 \
+                        AND timestamp >= ?2 AND timestamp < ?3 \
+                        AND lower(action_type) IN \
+                            ('speak', 'observe', 'speak_action', 'observe_action')",
+                    params![req.tenant_id, period_start_str, period_end_str],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|e| map_sqlite_error(e, "consolidate_conversations aggregate"))?;
+
+            let summary = ConversationSummary {
+                tenant_id: req.tenant_id.clone(),
+                period_start: truncate_to_micros(req.period_start),
+                period_end: truncate_to_micros(req.period_end),
+                total_messages,
+                unique_actors,
+                consolidation_level: req.level,
+            };
+            let attrs = serde_json::to_string(&summary)
+                .map_err(|e| Error::Internal(format!("ConversationSummary serialize: {e}")))?;
+            let summary_written = upsert_typed_summary(
+                &mut guard,
+                "conversation_summary",
+                &req.tenant_id,
+                summary.period_start,
+                req.level,
+                &attrs,
+                &req.locked_by,
+            )?;
+            Ok(TypedConsolidationOutcome {
+                summary_written,
+                source_rows: total_messages,
+            })
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+    }
+
+    async fn consolidate_traces(
+        &self,
+        req: ConsolidationRequest,
+    ) -> Result<TypedConsolidationOutcome, Error> {
+        validate_typed_req(&req)?;
+        let period_start_str = fmt_datetime(req.period_start);
+        let period_end_str = fmt_datetime(req.period_end);
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<TypedConsolidationOutcome, Error> {
+            let mut guard = conn.blocking_lock();
+
+            let mut by_action_type: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
+            let mut total_traces: i64 = 0;
+            {
+                let mut stmt = guard
+                    .prepare(
+                        "SELECT action_type, COUNT(*) AS c \
+                           FROM cirislens_service_correlations \
+                          WHERE agent_occurrence_id = ?1 \
+                            AND correlation_type = 'trace' \
+                            AND timestamp >= ?2 AND timestamp < ?3 \
+                          GROUP BY action_type",
+                    )
+                    .map_err(|e| map_sqlite_error(e, "consolidate_traces histogram prepare"))?;
+                let rows = stmt
+                    .query_map(
+                        params![req.tenant_id, period_start_str, period_end_str],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .map_err(|e| map_sqlite_error(e, "consolidate_traces histogram query"))?;
+                for r in rows {
+                    let (a, c) =
+                        r.map_err(|e| map_sqlite_error(e, "consolidate_traces histogram row"))?;
+                    total_traces += c;
+                    by_action_type.insert(a, c);
+                }
+            }
+
+            let summary = TraceSummary {
+                tenant_id: req.tenant_id.clone(),
+                period_start: truncate_to_micros(req.period_start),
+                period_end: truncate_to_micros(req.period_end),
+                total_traces,
+                by_action_type,
+                consolidation_level: req.level,
+            };
+            let attrs = serde_json::to_string(&summary)
+                .map_err(|e| Error::Internal(format!("TraceSummary serialize: {e}")))?;
+            let summary_written = upsert_typed_summary(
+                &mut guard,
+                "trace_summary",
+                &req.tenant_id,
+                summary.period_start,
+                req.level,
+                &attrs,
+                &req.locked_by,
+            )?;
+            Ok(TypedConsolidationOutcome {
+                summary_written,
+                source_rows: total_traces,
+            })
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+    }
+
+    async fn consolidate_audit(
+        &self,
+        req: ConsolidationRequest,
+    ) -> Result<TypedConsolidationOutcome, Error> {
+        validate_typed_req(&req)?;
+        let period_start_str = fmt_datetime(req.period_start);
+        let period_end_str = fmt_datetime(req.period_end);
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<TypedConsolidationOutcome, Error> {
+            let mut guard = conn.blocking_lock();
+
+            // V014 audit_log: tenant_id column (not occurrence proxy)
+            // + recorded_at (not created_at).
+            let mut by_action_type: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
+            let mut total_events: i64 = 0;
+            {
+                let mut stmt = guard
+                    .prepare(
+                        "SELECT action_type, COUNT(*) AS c \
+                           FROM cirislens_audit_log \
+                          WHERE tenant_id = ?1 \
+                            AND recorded_at >= ?2 AND recorded_at < ?3 \
+                          GROUP BY action_type",
+                    )
+                    .map_err(|e| map_sqlite_error(e, "consolidate_audit histogram prepare"))?;
+                let rows = stmt
+                    .query_map(
+                        params![req.tenant_id, period_start_str, period_end_str],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .map_err(|e| map_sqlite_error(e, "consolidate_audit histogram query"))?;
+                for r in rows {
+                    let (a, c) =
+                        r.map_err(|e| map_sqlite_error(e, "consolidate_audit histogram row"))?;
+                    total_events += c;
+                    by_action_type.insert(a, c);
+                }
+            }
+
+            let unique_actors: i64 = guard
+                .query_row(
+                    "SELECT COUNT(DISTINCT actor_id) \
+                       FROM cirislens_audit_log \
+                      WHERE tenant_id = ?1 \
+                        AND recorded_at >= ?2 AND recorded_at < ?3",
+                    params![req.tenant_id, period_start_str, period_end_str],
+                    |row| row.get(0),
+                )
+                .map_err(|e| map_sqlite_error(e, "consolidate_audit unique_actors"))?;
+
+            let summary = AuditSummary {
+                tenant_id: req.tenant_id.clone(),
+                period_start: truncate_to_micros(req.period_start),
+                period_end: truncate_to_micros(req.period_end),
+                total_events,
+                by_action_type,
+                unique_actors,
+                consolidation_level: req.level,
+            };
+            let attrs = serde_json::to_string(&summary)
+                .map_err(|e| Error::Internal(format!("AuditSummary serialize: {e}")))?;
+            let summary_written = upsert_typed_summary(
+                &mut guard,
+                "audit_summary",
+                &req.tenant_id,
+                summary.period_start,
+                req.level,
+                &attrs,
+                &req.locked_by,
+            )?;
+            Ok(TypedConsolidationOutcome {
+                summary_written,
+                source_rows: total_events,
+            })
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+    }
+
+    async fn query_summary_nodes(
+        &self,
+        node_type: &str,
+        level: ConsolidationLevel,
+        tenant_id: &str,
+        from: chrono::DateTime<chrono::Utc>,
+        to: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<serde_json::Value>, Error> {
+        validate_summary_node_type(node_type)?;
+        if from >= to {
+            return Err(Error::InvalidArgument(format!(
+                "from ({from}) must be < to ({to})"
+            )));
+        }
+        let node_type_owned = node_type.to_owned();
+        let level_str = level.as_str().to_owned();
+        let tenant_owned = tenant_id.to_owned();
+        // V019 invariant: the SQLite consolidation write path
+        // truncates period_start to microseconds (matches the
+        // metric-summary path's `truncate_to_micros` discipline).
+        // Mirror that bound here so a caller passing nanosecond-
+        // precision boundaries still includes rows stored with
+        // microsecond precision.
+        let from_str = fmt_datetime(truncate_to_micros(from));
+        let to_str = fmt_datetime(truncate_to_micros(to));
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<serde_json::Value>, Error> {
+            let guard = conn.blocking_lock();
+            let mut stmt = guard
+                .prepare(
+                    "SELECT attributes FROM cirisgraph_nodes \
+                     WHERE node_type = ?1 AND scope = 'ENVIRONMENT' \
+                       AND consolidation_level = ?2 \
+                       AND json_extract(attributes, '$.tenant_id') = ?3 \
+                       AND json_extract(attributes, '$.period_start') >= ?4 \
+                       AND json_extract(attributes, '$.period_start') <  ?5 \
+                     ORDER BY json_extract(attributes, '$.period_start') ASC",
+                )
+                .map_err(|e| map_sqlite_error(e, "query_summary_nodes prepare"))?;
+            let rows = stmt
+                .query_map(
+                    params![node_type_owned, level_str, tenant_owned, from_str, to_str],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|e| map_sqlite_error(e, "query_summary_nodes query"))?;
+            let mut out: Vec<serde_json::Value> = Vec::new();
+            for r in rows {
+                let s = r.map_err(|e| map_sqlite_error(e, "query_summary_nodes row"))?;
+                let v: serde_json::Value = serde_json::from_str(&s)
+                    .map_err(|e| Error::Backend(format!("attributes decode: {e} (raw={s})")))?;
+                out.push(v);
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+    }
+}
+
+/// Validate `ConsolidationRequest` fields shared across the four
+/// typed-summary consolidate methods. No lock acquisition in v1.6.2.
+fn validate_typed_req(req: &ConsolidationRequest) -> Result<(), Error> {
+    if req.tenant_id.is_empty() {
+        return Err(Error::InvalidArgument("tenant_id required".into()));
+    }
+    if req.period_end <= req.period_start {
+        return Err(Error::InvalidArgument(
+            "period_end must be > period_start".into(),
+        ));
+    }
+    if req.locked_by.is_empty() {
+        return Err(Error::InvalidArgument("locked_by required".into()));
+    }
+    Ok(())
+}
+
+fn validate_summary_node_type(node_type: &str) -> Result<(), Error> {
+    match node_type {
+        "task_summary" | "conversation_summary" | "trace_summary" | "audit_summary" => Ok(()),
+        _ => Err(Error::InvalidArgument(format!(
+            "unknown summary node_type: {node_type}"
+        ))),
+    }
+}
+
+fn typed_summary_node_id(
+    node_type: &str,
+    tenant_id: &str,
+    period_start: chrono::DateTime<chrono::Utc>,
+) -> String {
+    format!(
+        "tsdb:{}:{}:{}",
+        node_type,
+        tenant_id,
+        period_start.to_rfc3339()
+    )
+}
+
+/// UPSERT one typed-summary node into `cirisgraph_nodes`. Returns
+/// `true` on affected ≥1.
+fn upsert_typed_summary(
+    conn: &mut Connection,
+    node_type: &str,
+    tenant_id: &str,
+    period_start: chrono::DateTime<chrono::Utc>,
+    level: ConsolidationLevel,
+    attributes_str: &str,
+    locked_by: &str,
+) -> Result<bool, Error> {
+    let node_id = typed_summary_node_id(node_type, tenant_id, period_start);
+    let current_version: Option<i32> = conn
+        .query_row(
+            "SELECT version FROM cirisgraph_nodes \
+             WHERE node_id = ?1 AND scope = 'ENVIRONMENT'",
+            params![node_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| map_sqlite_error(e, "typed upsert read version"))?;
+    let expected_version = current_version.unwrap_or(0);
+    let row_hash = format!("{node_type}_v1.6.2");
+    let now_str = fmt_datetime(chrono::Utc::now());
+    let affected = conn
+        .execute(
+            "INSERT INTO cirisgraph_nodes (\
+                node_id, scope, node_type, attributes, version, \
+                updated_by, updated_at, persist_row_hash, consolidation_level\
+             ) VALUES (?1, 'ENVIRONMENT', ?8, ?2, 1, ?3, ?4, ?5, ?7) \
+             ON CONFLICT (node_id, scope) DO UPDATE SET \
+                attributes = excluded.attributes, \
+                version = cirisgraph_nodes.version + 1, \
+                updated_by = excluded.updated_by, \
+                updated_at = excluded.updated_at, \
+                consolidation_level = excluded.consolidation_level \
+             WHERE cirisgraph_nodes.version = ?6",
+            params![
+                node_id,
+                attributes_str,
+                locked_by,
+                now_str,
+                row_hash,
+                expected_version,
+                level.as_str(),
+                node_type,
+            ],
+        )
+        .map_err(|e| map_sqlite_error(e, "typed upsert"))?;
+    Ok(affected > 0)
 }
 
 struct AggRow {
@@ -1473,6 +1910,538 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), 2);
+    }
+
+    // ── v1.6.2 (CIRISPersist#68) typed-summary consolidate tests ────
+
+    fn seed_task(
+        conn: &Connection,
+        task_id: &str,
+        tenant: &str,
+        status: &str,
+        when: chrono::DateTime<chrono::Utc>,
+    ) {
+        let when_str = fmt_datetime(when);
+        conn.execute(
+            "INSERT INTO cirislens_tasks (\
+                task_id, channel_id, description, status, priority, \
+                created_at, updated_at, agent_occurrence_id\
+             ) VALUES (?1, 'chan', 'desc', ?2, 0, ?3, ?3, ?4)",
+            params![task_id, status, when_str, tenant],
+        )
+        .unwrap();
+    }
+
+    fn seed_thought(
+        conn: &Connection,
+        thought_id: &str,
+        source_task_id: &str,
+        tenant: &str,
+        depth: i64,
+        when: chrono::DateTime<chrono::Utc>,
+    ) {
+        let when_str = fmt_datetime(when);
+        conn.execute(
+            "INSERT INTO cirislens_thoughts (\
+                thought_id, source_task_id, status, created_at, updated_at, \
+                content, thought_depth, agent_occurrence_id\
+             ) VALUES (?1, ?2, 'completed', ?3, ?3, 'c', ?4, ?5)",
+            params![thought_id, source_task_id, when_str, depth, tenant],
+        )
+        .unwrap();
+    }
+
+    fn seed_correlation(
+        conn: &Connection,
+        correlation_id: &str,
+        tenant: &str,
+        action_type: &str,
+        correlation_type: &str,
+        request_data: Option<&str>,
+        when: chrono::DateTime<chrono::Utc>,
+    ) {
+        let when_str = fmt_datetime(when);
+        conn.execute(
+            "INSERT INTO cirislens_service_correlations (\
+                correlation_id, service_type, handler_name, action_type, \
+                request_data, status, created_at, updated_at, \
+                correlation_type, timestamp, retention_policy, \
+                agent_occurrence_id\
+             ) VALUES (?1, 'svc', 'h', ?2, ?3, 'completed', ?4, ?4, \
+                       ?5, ?4, 'raw', ?6)",
+            params![
+                correlation_id,
+                action_type,
+                request_data,
+                when_str,
+                correlation_type,
+                tenant,
+            ],
+        )
+        .unwrap();
+    }
+
+    fn seed_audit(
+        conn: &Connection,
+        entry_id: &str,
+        sequence_number: i64,
+        tenant: &str,
+        actor_id: &str,
+        action_type: &str,
+        when: chrono::DateTime<chrono::Utc>,
+    ) {
+        let when_str = fmt_datetime(when);
+        // sha256 prev_hash zero-sentinel; entry_hash unique placeholder.
+        let prev: [u8; 32] = [0; 32];
+        let entry: Vec<u8> = (0..32)
+            .map(|i: u8| i.wrapping_add(sequence_number as u8))
+            .collect();
+        conn.execute(
+            "INSERT INTO cirislens_audit_log (\
+                entry_id, sequence_number, tenant_id, actor_id, action_type, \
+                subject_kind, subject_id, payload, prev_hash, entry_hash, \
+                recorded_at, signature, signing_key_id, signature_verified, \
+                persist_row_hash\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'task', 'sub', '{}', ?6, ?7, ?8, \
+                       'sig', 'k', 0, 'rh')",
+            params![
+                entry_id,
+                sequence_number,
+                tenant,
+                actor_id,
+                action_type,
+                prev.as_slice(),
+                entry.as_slice(),
+                when_str,
+            ],
+        )
+        .unwrap();
+    }
+
+    /// TaskSummary happy path: 3 tasks + 2 thoughts in window →
+    /// status histogram + mean_thought_depth, summary node landed.
+    #[tokio::test]
+    async fn tsdb_consolidate_tasks_writes_task_summary() {
+        let (b, tlm) = fresh_backend().await;
+        let tenant = format!("task-{}", uuid::Uuid::new_v4().simple());
+        let period_start = chrono::Utc::now() - Duration::hours(6);
+        let period_end = period_start + Duration::hours(6);
+
+        {
+            let conn = b.conn_handle();
+            let guard = conn.lock().await;
+            seed_task(&guard, "t1", &tenant, "completed", period_start);
+            seed_task(
+                &guard,
+                "t2",
+                &tenant,
+                "completed",
+                period_start + Duration::minutes(10),
+            );
+            seed_task(
+                &guard,
+                "t3",
+                &tenant,
+                "failed",
+                period_start + Duration::minutes(20),
+            );
+            seed_thought(&guard, "th1", "t1", &tenant, 1, period_start);
+            seed_thought(&guard, "th2", "t2", &tenant, 3, period_start);
+        }
+
+        let outcome = tlm
+            .consolidate_tasks(ConsolidationRequest {
+                tenant_id: tenant.clone(),
+                period_start,
+                period_end,
+                locked_by: "w".into(),
+                level: ConsolidationLevel::Basic,
+            })
+            .await
+            .unwrap();
+        assert!(outcome.summary_written);
+        assert_eq!(outcome.source_rows, 3);
+
+        let rows = tlm
+            .query_summary_nodes(
+                "task_summary",
+                ConsolidationLevel::Basic,
+                &tenant,
+                period_start - Duration::hours(1),
+                period_end + Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let attrs = &rows[0];
+        assert_eq!(attrs["tenant_id"], tenant);
+        assert_eq!(attrs["total_tasks"].as_i64(), Some(3));
+        assert_eq!(attrs["by_status"]["completed"].as_i64(), Some(2));
+        assert_eq!(attrs["by_status"]["failed"].as_i64(), Some(1));
+        assert_eq!(attrs["mean_thought_depth"].as_f64(), Some(2.0));
+        assert_eq!(attrs["consolidation_level"], "basic");
+    }
+
+    /// ConversationSummary happy path: 4 SPEAK/OBSERVE correlations
+    /// across 2 actors → total + distinct actor count.
+    #[tokio::test]
+    async fn tsdb_consolidate_conversations_writes_summary() {
+        let (b, tlm) = fresh_backend().await;
+        let tenant = format!("conv-{}", uuid::Uuid::new_v4().simple());
+        let period_start = chrono::Utc::now() - Duration::hours(6);
+        let period_end = period_start + Duration::hours(6);
+
+        {
+            let conn = b.conn_handle();
+            let guard = conn.lock().await;
+            seed_correlation(
+                &guard,
+                "c1",
+                &tenant,
+                "SPEAK",
+                "service_interaction",
+                Some(r#"{"actor_id":"alice"}"#),
+                period_start,
+            );
+            seed_correlation(
+                &guard,
+                "c2",
+                &tenant,
+                "observe",
+                "service_interaction",
+                Some(r#"{"actor_id":"alice"}"#),
+                period_start + Duration::minutes(5),
+            );
+            seed_correlation(
+                &guard,
+                "c3",
+                &tenant,
+                "speak_action",
+                "service_interaction",
+                Some(r#"{"actor_id":"bob"}"#),
+                period_start + Duration::minutes(10),
+            );
+            seed_correlation(
+                &guard,
+                "c4",
+                &tenant,
+                "observe_action",
+                "service_interaction",
+                Some(r#"{"actor_id":"bob"}"#),
+                period_start + Duration::minutes(15),
+            );
+            // Off-action — should be excluded.
+            seed_correlation(
+                &guard,
+                "c5_offshape",
+                &tenant,
+                "tool",
+                "service_interaction",
+                Some(r#"{"actor_id":"carol"}"#),
+                period_start + Duration::minutes(20),
+            );
+        }
+
+        let outcome = tlm
+            .consolidate_conversations(ConsolidationRequest {
+                tenant_id: tenant.clone(),
+                period_start,
+                period_end,
+                locked_by: "w".into(),
+                level: ConsolidationLevel::Basic,
+            })
+            .await
+            .unwrap();
+        assert!(outcome.summary_written);
+        assert_eq!(outcome.source_rows, 4);
+
+        let rows = tlm
+            .query_summary_nodes(
+                "conversation_summary",
+                ConsolidationLevel::Basic,
+                &tenant,
+                period_start - Duration::hours(1),
+                period_end + Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["total_messages"].as_i64(), Some(4));
+        assert_eq!(rows[0]["unique_actors"].as_i64(), Some(2));
+    }
+
+    /// TraceSummary happy path: trace correlations grouped by
+    /// action_type. Non-trace rows excluded.
+    #[tokio::test]
+    async fn tsdb_consolidate_traces_writes_summary() {
+        let (b, tlm) = fresh_backend().await;
+        let tenant = format!("trace-{}", uuid::Uuid::new_v4().simple());
+        let period_start = chrono::Utc::now() - Duration::hours(6);
+        let period_end = period_start + Duration::hours(6);
+
+        {
+            let conn = b.conn_handle();
+            let guard = conn.lock().await;
+            seed_correlation(&guard, "tr1", &tenant, "call", "trace", None, period_start);
+            seed_correlation(
+                &guard,
+                "tr2",
+                &tenant,
+                "call",
+                "trace",
+                None,
+                period_start + Duration::minutes(5),
+            );
+            seed_correlation(
+                &guard,
+                "tr3",
+                &tenant,
+                "tool_invoke",
+                "trace",
+                None,
+                period_start + Duration::minutes(10),
+            );
+            // Non-trace correlation — excluded.
+            seed_correlation(
+                &guard,
+                "tr4_skip",
+                &tenant,
+                "call",
+                "service_interaction",
+                None,
+                period_start + Duration::minutes(15),
+            );
+        }
+
+        let outcome = tlm
+            .consolidate_traces(ConsolidationRequest {
+                tenant_id: tenant.clone(),
+                period_start,
+                period_end,
+                locked_by: "w".into(),
+                level: ConsolidationLevel::Basic,
+            })
+            .await
+            .unwrap();
+        assert!(outcome.summary_written);
+        assert_eq!(outcome.source_rows, 3);
+
+        let rows = tlm
+            .query_summary_nodes(
+                "trace_summary",
+                ConsolidationLevel::Basic,
+                &tenant,
+                period_start - Duration::hours(1),
+                period_end + Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["total_traces"].as_i64(), Some(3));
+        assert_eq!(rows[0]["by_action_type"]["call"].as_i64(), Some(2));
+        assert_eq!(rows[0]["by_action_type"]["tool_invoke"].as_i64(), Some(1));
+    }
+
+    /// AuditSummary happy path: audit_log over the window, action
+    /// histogram + unique_actors.
+    #[tokio::test]
+    async fn tsdb_consolidate_audit_writes_summary() {
+        let (b, tlm) = fresh_backend().await;
+        let tenant = format!("aud-{}", uuid::Uuid::new_v4().simple());
+        let period_start = chrono::Utc::now() - Duration::hours(6);
+        let period_end = period_start + Duration::hours(6);
+
+        {
+            let conn = b.conn_handle();
+            let guard = conn.lock().await;
+            seed_audit(
+                &guard,
+                &uuid::Uuid::new_v4().to_string(),
+                1,
+                &tenant,
+                "alice",
+                "task_signed",
+                period_start,
+            );
+            seed_audit(
+                &guard,
+                &uuid::Uuid::new_v4().to_string(),
+                2,
+                &tenant,
+                "alice",
+                "task_signed",
+                period_start + Duration::minutes(5),
+            );
+            seed_audit(
+                &guard,
+                &uuid::Uuid::new_v4().to_string(),
+                3,
+                &tenant,
+                "bob",
+                "config_changed",
+                period_start + Duration::minutes(10),
+            );
+            // Out of window — excluded.
+            seed_audit(
+                &guard,
+                &uuid::Uuid::new_v4().to_string(),
+                4,
+                &tenant,
+                "carol",
+                "wa_intervention",
+                period_end + Duration::minutes(5),
+            );
+        }
+
+        let outcome = tlm
+            .consolidate_audit(ConsolidationRequest {
+                tenant_id: tenant.clone(),
+                period_start,
+                period_end,
+                locked_by: "w".into(),
+                level: ConsolidationLevel::Basic,
+            })
+            .await
+            .unwrap();
+        assert!(outcome.summary_written);
+        assert_eq!(outcome.source_rows, 3);
+
+        let rows = tlm
+            .query_summary_nodes(
+                "audit_summary",
+                ConsolidationLevel::Basic,
+                &tenant,
+                period_start - Duration::hours(1),
+                period_end + Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["total_events"].as_i64(), Some(3));
+        assert_eq!(rows[0]["by_action_type"]["task_signed"].as_i64(), Some(2));
+        assert_eq!(
+            rows[0]["by_action_type"]["config_changed"].as_i64(),
+            Some(1)
+        );
+        assert_eq!(rows[0]["unique_actors"].as_i64(), Some(2));
+    }
+
+    /// `query_summary_nodes` rejects unknown node_type.
+    #[tokio::test]
+    async fn tsdb_query_summary_nodes_rejects_unknown_type() {
+        let (_b, tlm) = fresh_backend().await;
+        let now = chrono::Utc::now();
+        let err = tlm
+            .query_summary_nodes(
+                "bogus_summary",
+                ConsolidationLevel::Basic,
+                "t",
+                now - Duration::hours(1),
+                now,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    /// `query_summary_nodes` rejects inverted window.
+    #[tokio::test]
+    async fn tsdb_query_summary_nodes_rejects_inverted_window() {
+        let (_b, tlm) = fresh_backend().await;
+        let now = chrono::Utc::now();
+        let err = tlm
+            .query_summary_nodes("task_summary", ConsolidationLevel::Basic, "t", now, now)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    /// Empty source window → summary_written=true (UPSERT version
+    /// bump still affects a row on second run; first write still
+    /// emits the node even with zero source rows so downstream
+    /// queries see the empty-period bucket).
+    #[tokio::test]
+    async fn tsdb_consolidate_tasks_empty_window_still_writes() {
+        let (_b, tlm) = fresh_backend().await;
+        let tenant = format!("empty-{}", uuid::Uuid::new_v4().simple());
+        let period_start = chrono::Utc::now() - Duration::hours(6);
+        let period_end = period_start + Duration::hours(6);
+
+        let outcome = tlm
+            .consolidate_tasks(ConsolidationRequest {
+                tenant_id: tenant.clone(),
+                period_start,
+                period_end,
+                locked_by: "w".into(),
+                level: ConsolidationLevel::Basic,
+            })
+            .await
+            .unwrap();
+        // Source rows zero, but the summary node was written so the
+        // agent UI can render an "empty period" cell.
+        assert!(outcome.summary_written);
+        assert_eq!(outcome.source_rows, 0);
+
+        let rows = tlm
+            .query_summary_nodes(
+                "task_summary",
+                ConsolidationLevel::Basic,
+                &tenant,
+                period_start - Duration::hours(1),
+                period_end + Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["total_tasks"].as_i64(), Some(0));
+        assert_eq!(rows[0]["mean_thought_depth"].as_f64(), Some(0.0));
+    }
+
+    /// Validation rejects empty tenant / inverted window / empty
+    /// locked_by uniformly across all four consolidate methods.
+    #[tokio::test]
+    async fn tsdb_consolidate_typed_validation_errors() {
+        let (_b, tlm) = fresh_backend().await;
+        let now = chrono::Utc::now();
+        let bad_tenant = ConsolidationRequest {
+            tenant_id: "".into(),
+            period_start: now - Duration::hours(1),
+            period_end: now,
+            locked_by: "w".into(),
+            level: ConsolidationLevel::Basic,
+        };
+        assert!(matches!(
+            tlm.consolidate_tasks(bad_tenant.clone()).await.unwrap_err(),
+            Error::InvalidArgument(_)
+        ));
+        assert!(matches!(
+            tlm.consolidate_conversations(bad_tenant.clone())
+                .await
+                .unwrap_err(),
+            Error::InvalidArgument(_)
+        ));
+        assert!(matches!(
+            tlm.consolidate_traces(bad_tenant.clone())
+                .await
+                .unwrap_err(),
+            Error::InvalidArgument(_)
+        ));
+        assert!(matches!(
+            tlm.consolidate_audit(bad_tenant).await.unwrap_err(),
+            Error::InvalidArgument(_)
+        ));
+
+        let inverted = ConsolidationRequest {
+            tenant_id: "t".into(),
+            period_start: now,
+            period_end: now - Duration::hours(1),
+            locked_by: "w".into(),
+            level: ConsolidationLevel::Basic,
+        };
+        assert!(matches!(
+            tlm.consolidate_tasks(inverted).await.unwrap_err(),
+            Error::InvalidArgument(_)
+        ));
     }
 
     #[tokio::test]

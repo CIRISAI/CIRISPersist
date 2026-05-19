@@ -57,8 +57,9 @@ pub mod types;
 
 pub use service::TelemetryService;
 pub use types::{
-    ConsolidationLevel, ConsolidationOutcome, ConsolidationRequest, MetricFilter, MetricListPage,
-    MetricObservation, MetricSummary,
+    AuditSummary, ConsolidationLevel, ConsolidationOutcome, ConsolidationRequest,
+    ConversationSummary, MetricFilter, MetricListPage, MetricObservation, MetricSummary,
+    TaskSummary, TraceSummary, TypedConsolidationOutcome,
 };
 
 /// Telemetry-layer errors.
