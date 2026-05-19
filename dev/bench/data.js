@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779134560911,
+  "lastUpdate": 1779201010699,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -18299,6 +18299,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 26271085,
             "range": "± 715887",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "2aabdd6586c32b39447ecbcb9abfc68cb1350dde",
+          "message": "1.5.20 — thought_delete + task_delete cascade (closes #60)\n\nV035 migration on both backends: cirislens_thoughts.source_task_id\nFK becomes ON DELETE CASCADE so task_delete of a parent task takes\nits thoughts with it. PG uses ALTER TABLE DROP/ADD CONSTRAINT;\nSQLite uses the standard 12-step rebuild dance (PRAGMA\ndefer_foreign_keys + CREATE NEW + INSERT SELECT + DROP + RENAME +\nindexes).\n\nThe parent_thought_id self-FK is left strict — symmetric with\ndelete_task's parent-FK contract.\n\nNew API: ThoughtService::delete_thought(thought_id) → bool. Empty\nid → InvalidArgument. Children-via-self-FK → Conflict. Mirrors\ntask_delete shape exactly. PyO3 surface (cirislens_thoughts gated)\n+ .pyi stub.\n\nDrive-by: deferral_reports::record_deferral commit error routed\nthrough map_pg_error so DEFERRABLE-FK violations at COMMIT classify\nas Conflict instead of generic Backend error. Unblocks the\npre-existing deferral_pg_fk_rejects test (added v1.5.14, never\ngreen locally; lib sweep this cut requires it).\n\nTests: 4 SQLite + 4 PG (delete idempotent, empty rejection,\nparent-children rejection, task→thoughts cascade). 570/570 pass\nacross postgres+sqlite+all-11-cirislens features.\n\ncloses #60\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-19T09:20:42-05:00",
+          "tree_id": "a31a68cfa4ab754c349e65826ed91b2dc7ee7e18",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/2aabdd6586c32b39447ecbcb9abfc68cb1350dde"
+        },
+        "date": 1779201008737,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 84228,
+            "range": "± 776",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 200855,
+            "range": "± 382",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 432597,
+            "range": "± 2061",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1537774,
+            "range": "± 7964",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 268,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1104,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 5511,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 17994,
+            "range": "± 309",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 20502,
+            "range": "± 357",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 70614,
+            "range": "± 385",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 282,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 2525,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 7601,
+            "range": "± 93",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 32575,
+            "range": "± 85",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 511,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2207922,
+            "range": "± 4715545",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 5976434,
+            "range": "± 10940832",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 21055613,
+            "range": "± 39983894",
             "unit": "ns/iter"
           }
         ]
