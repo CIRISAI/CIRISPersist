@@ -315,6 +315,14 @@ impl ThoughtService for SqliteThoughtBackend {
             sql_params.push(SqlValue::Text(fmt_datetime(before)));
             where_parts.push(format!("updated_at <= ?{}", sql_params.len()));
         }
+        if let Some(before) = filter.created_before {
+            sql_params.push(SqlValue::Text(fmt_datetime(before)));
+            where_parts.push(format!("created_at < ?{}", sql_params.len()));
+        }
+        if let Some(after) = filter.created_after {
+            sql_params.push(SqlValue::Text(fmt_datetime(after)));
+            where_parts.push(format!("created_at >= ?{}", sql_params.len()));
+        }
         if let Some(cur) = &cursor {
             if cur.version != "v1" {
                 return Err(Error::InvalidArgument(format!(
@@ -942,6 +950,42 @@ mod tests {
         // Leaves-first works.
         assert!(thoughts.delete_thought(&child).await.unwrap());
         assert!(thoughts.delete_thought(&parent).await.unwrap());
+    }
+
+    // ── v1.5.21 (CIRISPersist#62) created_before/created_after ───────
+
+    #[tokio::test]
+    async fn list_filter_created_range_combination() {
+        use chrono::Duration as ChronoDuration;
+        let (_b, tasks, thoughts) = fresh_backend().await;
+        let task_id = format!("t-{}", Uuid::new_v4().simple());
+        tasks.upsert_task(mk_task(&task_id, "occ-1")).await.unwrap();
+
+        let now = chrono::Utc::now();
+        // 3 thoughts at -72h / -24h / now.
+        for (label, offset_h) in &[("a", -72), ("b", -24), ("c", 0)] {
+            let id = format!("{label}-{}", Uuid::new_v4().simple());
+            let mut t = mk_thought(&id, &task_id, ThoughtStatus::Pending, "occ-1");
+            t.created_at = now + ChronoDuration::hours(*offset_h);
+            t.updated_at = t.created_at;
+            thoughts.upsert_thought(t).await.unwrap();
+        }
+
+        let page = thoughts
+            .list_thoughts(
+                ThoughtFilter {
+                    agent_occurrence_id: Some("occ-1".into()),
+                    created_after: Some(now - ChronoDuration::hours(48)),
+                    created_before: Some(now - ChronoDuration::hours(12)),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert!(page.items[0].thought_id.starts_with("b-"));
     }
 
     #[tokio::test]

@@ -336,6 +336,14 @@ impl TaskService for SqliteTaskBackend {
             sql_params.push(SqlValue::Text(fmt_datetime(before)));
             where_parts.push(format!("updated_at <= ?{}", sql_params.len()));
         }
+        if let Some(before) = filter.created_before {
+            sql_params.push(SqlValue::Text(fmt_datetime(before)));
+            where_parts.push(format!("created_at < ?{}", sql_params.len()));
+        }
+        if let Some(after) = filter.created_after {
+            sql_params.push(SqlValue::Text(fmt_datetime(after)));
+            where_parts.push(format!("created_at >= ?{}", sql_params.len()));
+        }
         if let Some(cur) = &cursor {
             if cur.version != "v1" {
                 return Err(Error::InvalidArgument(format!(
@@ -912,5 +920,115 @@ mod tests {
         svc.upsert_task(t).await.unwrap();
         let got = svc.get_task(&child_id).await.unwrap().expect("present");
         assert!(got.parent_task_id.is_some());
+    }
+
+    // ── v1.5.21 (CIRISPersist#62) created_before/created_after ───────
+
+    #[tokio::test]
+    async fn list_filter_created_before_excludes_newer() {
+        use chrono::Duration as ChronoDuration;
+        let (_b, svc) = fresh_backend().await;
+        let occ = format!("occ-{}", Uuid::new_v4().simple());
+        let now = chrono::Utc::now();
+
+        // Older task: created_at 1 day ago.
+        let old_id = format!("old-{}", Uuid::new_v4().simple());
+        let mut older = mk_task(&old_id, TaskStatus::Pending, &occ);
+        older.created_at = now - ChronoDuration::days(1);
+        older.updated_at = older.created_at;
+        svc.upsert_task(older).await.unwrap();
+
+        // Newer task: created_at right now.
+        let new_id = format!("new-{}", Uuid::new_v4().simple());
+        let mut newer = mk_task(&new_id, TaskStatus::Pending, &occ);
+        newer.created_at = now;
+        newer.updated_at = now;
+        svc.upsert_task(newer).await.unwrap();
+
+        // created_before midpoint → only older survives.
+        let cutoff = now - ChronoDuration::hours(1);
+        let page = svc
+            .list_tasks(
+                TaskFilter {
+                    agent_occurrence_id: Some(occ.clone()),
+                    created_before: Some(cutoff),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].task_id, old_id);
+    }
+
+    #[tokio::test]
+    async fn list_filter_created_after_excludes_older() {
+        use chrono::Duration as ChronoDuration;
+        let (_b, svc) = fresh_backend().await;
+        let occ = format!("occ-{}", Uuid::new_v4().simple());
+        let now = chrono::Utc::now();
+
+        let old_id = format!("old-{}", Uuid::new_v4().simple());
+        let mut older = mk_task(&old_id, TaskStatus::Pending, &occ);
+        older.created_at = now - ChronoDuration::days(1);
+        older.updated_at = older.created_at;
+        svc.upsert_task(older).await.unwrap();
+
+        let new_id = format!("new-{}", Uuid::new_v4().simple());
+        let mut newer = mk_task(&new_id, TaskStatus::Pending, &occ);
+        newer.created_at = now;
+        newer.updated_at = now;
+        svc.upsert_task(newer).await.unwrap();
+
+        let cutoff = now - ChronoDuration::hours(1);
+        let page = svc
+            .list_tasks(
+                TaskFilter {
+                    agent_occurrence_id: Some(occ.clone()),
+                    created_after: Some(cutoff),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].task_id, new_id);
+    }
+
+    #[tokio::test]
+    async fn list_filter_created_range_combination() {
+        use chrono::Duration as ChronoDuration;
+        let (_b, svc) = fresh_backend().await;
+        let occ = format!("occ-{}", Uuid::new_v4().simple());
+        let now = chrono::Utc::now();
+
+        // 3 tasks: -3d, -1d, now. Window: [-2d, -12h] keeps only -1d.
+        for (label, offset_h) in &[("a", -72), ("b", -24), ("c", 0)] {
+            let id = format!("{label}-{}", Uuid::new_v4().simple());
+            let mut t = mk_task(&id, TaskStatus::Pending, &occ);
+            t.created_at = now + ChronoDuration::hours(*offset_h);
+            t.updated_at = t.created_at;
+            svc.upsert_task(t).await.unwrap();
+        }
+
+        let page = svc
+            .list_tasks(
+                TaskFilter {
+                    agent_occurrence_id: Some(occ.clone()),
+                    created_after: Some(now - ChronoDuration::hours(48)),
+                    created_before: Some(now - ChronoDuration::hours(12)),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert!(page.items[0].task_id.starts_with("b-"));
     }
 }

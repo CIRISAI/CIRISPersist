@@ -232,6 +232,14 @@ class Engine:
     ) -> str:
         """v1.5.9 — Cursor-paged task listing. Returns the JSON-encoded
         ``TaskListPage`` ({"items": [...], "next_cursor": {...}|None}).
+
+        ``filter_json`` accepts (all optional): ``agent_occurrence_id``,
+        ``status``, ``channel_id``, ``parent_task_id``,
+        ``updated_after``, ``updated_before``, and as of v1.5.21
+        (CIRISPersist#62) ``created_before`` / ``created_after``
+        (RFC 3339 timestamps; emitted as SQL ``created_at < ?`` /
+        ``created_at >= ?`` predicates so callers don't paginate
+        whole occurrences and filter in Python).
         """
 
     def task_update_status(
@@ -294,6 +302,13 @@ class Engine:
         """v1.5.10 — Cursor-paged thought listing. Returns the
         JSON-encoded ``ThoughtListPage``
         ({"items": [...], "next_cursor": {...}|None}).
+
+        ``filter_json`` accepts (all optional): ``source_task_id``,
+        ``status``, ``agent_occurrence_id``, ``parent_thought_id``,
+        ``updated_after``, ``updated_before``, and as of v1.5.21
+        (CIRISPersist#62) ``created_before`` / ``created_after``
+        (RFC 3339 timestamps; SQL ``created_at`` range predicate
+        emitted server-side).
         """
 
     def thought_update_status(

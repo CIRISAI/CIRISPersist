@@ -242,6 +242,14 @@ impl ThoughtService for PostgresBackend {
             params.push(Box::new(before));
             where_parts.push(format!("updated_at <= ${}", params.len()));
         }
+        if let Some(before) = filter.created_before {
+            params.push(Box::new(before));
+            where_parts.push(format!("created_at < ${}", params.len()));
+        }
+        if let Some(after) = filter.created_after {
+            params.push(Box::new(after));
+            where_parts.push(format!("created_at >= ${}", params.len()));
+        }
         if let Some(cur) = &cursor {
             if cur.version != "v1" {
                 return Err(Error::InvalidArgument(format!(
@@ -907,6 +915,51 @@ mod tests {
 
         assert!(backend.delete_thought(&child).await.unwrap());
         assert!(backend.delete_thought(&parent).await.unwrap());
+    }
+
+    // ── v1.5.21 (CIRISPersist#62) created_before/created_after ───────
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn thoughts_pg_list_filter_created_range() {
+        use crate::store::backend::Backend;
+        use chrono::Duration as ChronoDuration;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let task_id = format!("t-{}", Uuid::new_v4().simple());
+        TaskService::upsert_task(&backend, mk_task(&task_id, "occ-1"))
+            .await
+            .unwrap();
+
+        let now = Utc::now();
+        for (label, offset_h) in &[("a", -72i64), ("b", -24), ("c", 0)] {
+            let id = format!("{label}-{}", Uuid::new_v4().simple());
+            let mut t = mk_thought(&id, &task_id, ThoughtStatus::Pending, "occ-1");
+            t.created_at = now + ChronoDuration::hours(*offset_h);
+            t.updated_at = t.created_at;
+            backend.upsert_thought(t).await.unwrap();
+        }
+
+        let page = backend
+            .list_thoughts(
+                ThoughtFilter {
+                    source_task_id: Some(task_id.clone()),
+                    created_after: Some(now - ChronoDuration::hours(48)),
+                    created_before: Some(now - ChronoDuration::hours(12)),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert!(page.items[0].thought_id.starts_with("b-"));
     }
 
     #[tokio::test]

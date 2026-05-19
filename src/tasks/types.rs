@@ -119,6 +119,15 @@ pub struct TaskFilter {
     pub updated_after: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_before: Option<DateTime<Utc>>,
+    /// v1.5.21 (CIRISPersist#62) — push agent's `get_tasks_older_than`
+    /// cutoff into a SQL `created_at < ?` predicate instead of
+    /// paginating the whole occurrence and filtering in Python.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_before: Option<DateTime<Utc>>,
+    /// v1.5.21 (CIRISPersist#62) — symmetric `created_at >= ?` for
+    /// archive sweep upper-bound queries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_after: Option<DateTime<Utc>>,
 }
 
 /// Cursor for list-tasks pagination. Captures the trailing

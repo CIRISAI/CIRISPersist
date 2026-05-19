@@ -199,6 +199,15 @@ pub struct ThoughtFilter {
     pub updated_after: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_before: Option<DateTime<Utc>>,
+    /// v1.5.21 (CIRISPersist#62) — agent's `get_thoughts_older_than`
+    /// cutoff. SQL `created_at < ?` predicate so callers don't paginate
+    /// the whole occurrence and filter in Python.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_before: Option<DateTime<Utc>>,
+    /// v1.5.21 (CIRISPersist#62) — symmetric `created_at >= ?` for
+    /// archive sweep lower-bound queries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_after: Option<DateTime<Utc>>,
 }
 
 /// Cursor for list-thoughts pagination. Captures the trailing

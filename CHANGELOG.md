@@ -5,6 +5,64 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.5.21] — 2026-05-19
+
+**`created_before` / `created_after` filters on `task_list` + `thought_list` (CIRISPersist#62).**
+
+Second of six v1.5.19 follow-ups. CIRISAgent#763's migrated cleanup
+paths (`get_tasks_older_than`, `get_thoughts_older_than`,
+`get_latest_shared_task`) needed `created_at < cutoff` queries.
+v1.5.20 silently no-op'd unknown filter keys — the agent paginated
+the whole occurrence and filtered in Python (O(N) per cleanup pass
+on a long-running production agent). v1.5.21 emits the predicate
+server-side.
+
+### Filter additions
+
+Two new optional keys on both `TaskFilter` and `ThoughtFilter`:
+
+- `created_before` — RFC 3339 timestamp → SQL `created_at < ?`
+  (strict inequality matches Python `task.created_at < cutoff`
+  semantics; agent's `get_tasks_older_than` uses the same).
+- `created_after` — RFC 3339 timestamp → SQL `created_at >= ?`
+  (inclusive lower bound; symmetric with `updated_after`'s
+  inclusive semantics).
+
+Both keys compose with existing filter keys via AND. Both honored
+on both backends (PG: `created_at` TIMESTAMPTZ comparison;
+SQLite: `created_at` TEXT lexicographic, valid because we always
+write RFC 3339 microseconds with TZ marker).
+
+### No migration
+
+These read against the existing `created_at` column (V024 + V025).
+PG already has `created_at` as a sortable TIMESTAMPTZ; SQLite stores
+RFC 3339 strings that lex-sort correctly. No index added — the
+existing happy-path indexes (`tasks_status_occurrence`,
+`thoughts_task_recency`, etc.) drive the WHERE clause down to a
+small set that the date predicate filters in-memory, which is the
+shape the agent's cleanup queries already assume.
+
+### Tests
+
+6 new (3 SQLite + 3 PG-gated):
+- `created_before` excludes newer rows (2 rows, midpoint cutoff,
+  only older survives).
+- `created_after` excludes older rows.
+- `created_after` + `created_before` window keeps middle row only
+  (3 rows at -72h / -24h / now; window [-48h, -12h] keeps -24h).
+- Thoughts: combined range filter on a thought tree with 3 thoughts
+  at varied `created_at`.
+
+### Compatibility
+
+- Wire format additive — existing `TaskFilter` / `ThoughtFilter`
+  decode unchanged (both new fields `Option<DateTime<Utc>>` with
+  serde `default` + `skip_serializing_if = "Option::is_none"`).
+- PyO3 surface (`task_list` / `thought_list`) accepts the keys
+  inside `filter_json` — no method-signature change.
+- .pyi docstrings extended to document the new keys.
+
 ## [1.5.20] — 2026-05-19
 
 **`thought_delete` + `task_delete → thoughts` cascade (CIRISPersist#60).**

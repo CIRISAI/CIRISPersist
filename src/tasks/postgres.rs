@@ -246,6 +246,14 @@ impl TaskService for PostgresBackend {
             params.push(Box::new(before));
             where_parts.push(format!("updated_at <= ${}", params.len()));
         }
+        if let Some(before) = filter.created_before {
+            params.push(Box::new(before));
+            where_parts.push(format!("created_at < ${}", params.len()));
+        }
+        if let Some(after) = filter.created_after {
+            params.push(Box::new(after));
+            where_parts.push(format!("created_at >= ${}", params.len()));
+        }
         if let Some(cur) = &cursor {
             if cur.version != "v1" {
                 return Err(Error::InvalidArgument(format!(
@@ -745,5 +753,82 @@ mod tests {
             matches!(err, Error::Conflict(_)),
             "expected Conflict (FK), got {err:?}"
         );
+    }
+
+    // ── v1.5.21 (CIRISPersist#62) created_before/created_after ───────
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn tasks_pg_list_filter_created_range() {
+        use crate::store::backend::Backend;
+        use chrono::Duration as ChronoDuration;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let occ = format!("occ-{}", Uuid::new_v4().simple());
+        let now = Utc::now();
+        // 3 tasks: -72h / -24h / now. created_at exact, updated_at
+        // matches so the cursor on (updated_at, task_id) doesn't
+        // shadow the filter.
+        let mut ids: Vec<(String, i64)> = Vec::new();
+        for (label, offset_h) in &[("a", -72i64), ("b", -24), ("c", 0)] {
+            let id = format!("{label}-{}", Uuid::new_v4().simple());
+            ids.push((id.clone(), *offset_h));
+            let mut t = mk_task(&id, TaskStatus::Pending, &occ);
+            t.created_at = now + ChronoDuration::hours(*offset_h);
+            t.updated_at = t.created_at;
+            TaskService::upsert_task(&backend, t).await.unwrap();
+        }
+
+        // created_before -12h → keeps a (-72h) and b (-24h).
+        let page = backend
+            .list_tasks(
+                TaskFilter {
+                    agent_occurrence_id: Some(occ.clone()),
+                    created_before: Some(now - ChronoDuration::hours(12)),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 2);
+
+        // created_after -48h → keeps b (-24h) and c (now).
+        let page = backend
+            .list_tasks(
+                TaskFilter {
+                    agent_occurrence_id: Some(occ.clone()),
+                    created_after: Some(now - ChronoDuration::hours(48)),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 2);
+
+        // [-48h, -12h] window → keeps only b (-24h).
+        let page = backend
+            .list_tasks(
+                TaskFilter {
+                    agent_occurrence_id: Some(occ.clone()),
+                    created_after: Some(now - ChronoDuration::hours(48)),
+                    created_before: Some(now - ChronoDuration::hours(12)),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert!(page.items[0].task_id.starts_with("b-"));
     }
 }
