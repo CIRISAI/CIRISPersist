@@ -79,6 +79,8 @@ pub mod scrub;
 pub mod secrets;
 #[cfg(feature = "server")]
 pub mod server;
+#[cfg(feature = "cirislens_service_token_revocation")]
+pub mod service_token_revocation;
 pub mod signing;
 pub mod store;
 #[cfg(feature = "cirislens_tasks")]

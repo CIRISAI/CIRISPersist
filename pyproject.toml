@@ -105,6 +105,7 @@ features = [
     "cirislens_continuity_awareness",
     "cirislens_feedback_mappings",
     "cirislens_wa_cert",
+    "cirislens_service_token_revocation",
     "secrets",
     "cirisnode",
     "extract",

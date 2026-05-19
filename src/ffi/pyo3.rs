@@ -146,7 +146,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "creation_ceremonies_not_found"
         | "continuity_awareness_not_found"
         | "feedback_mappings_not_found"
-        | "wa_cert_not_found" => NotFound::new_err(msg),
+        | "wa_cert_not_found"
+        | "service_token_revocation_not_found" => NotFound::new_err(msg),
 
         // Conflict family — uniqueness / version / state-transition
         // conflict; caller MUST NOT retry, MUST re-read.
@@ -165,7 +166,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "creation_ceremonies_conflict"
         | "continuity_awareness_conflict"
         | "feedback_mappings_conflict"
-        | "wa_cert_conflict" => Conflict::new_err(msg),
+        | "wa_cert_conflict"
+        | "service_token_revocation_conflict" => Conflict::new_err(msg),
 
         // Transient family — backend connection / timeout / pool
         // exhaustion; caller MAY retry with backoff.
@@ -186,7 +188,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "creation_ceremonies_backend"
         | "continuity_awareness_backend"
         | "feedback_mappings_backend"
-        | "wa_cert_backend" => Transient::new_err(msg),
+        | "wa_cert_backend"
+        | "service_token_revocation_backend" => Transient::new_err(msg),
 
         // Default — Permanent. Covers invalid arguments, signature
         // failures, crypto errors, rotation conflicts, "not authorized,"
@@ -10674,6 +10677,173 @@ impl PyEngine {
                             .update_last_login(&wa_id, login_time)
                             .await
                             .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    // ── v1.5.23 (CIRISPersist#64) — service-token revocation cluster ──
+    //
+    // 3 methods wrapping ServiceTokenRevocationService. Absorbs
+    // CIRISAgent's standalone `revoked_service_tokens.db` aiosqlite
+    // file — last aiosqlite consumer in the agent. JSON wire format
+    // mirrors the wa_cert pattern: RevokedServiceToken decoded /
+    // encoded via serde at the FFI boundary; lists encoded as JSON
+    // arrays; check_revocation returns JSON-encoded row or None.
+
+    /// v1.5.23 — Record a service-token revocation.
+    ///
+    /// `revocation_json` is a JSON-encoded `RevokedServiceToken`
+    /// shape: `{token_hash, revoked_at, revoked_by, reason}`. All
+    /// four fields required (non-empty). Idempotent on
+    /// `token_hash` (PK; `ON CONFLICT DO NOTHING` — first record
+    /// wins; subsequent records with the same hash are silently
+    /// ignored).
+    ///
+    /// Replaces CIRISAgent's standalone `revoked_service_tokens.db`
+    /// aiosqlite file — last aiosqlite consumer in the agent.
+    #[cfg(feature = "cirislens_service_token_revocation")]
+    fn service_token_revocation_record(
+        &self,
+        py: Python<'_>,
+        revocation_json: &str,
+    ) -> PyResult<()> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let revocation: crate::service_token_revocation::RevokedServiceToken =
+                serde_json::from_str(revocation_json).map_err(|e| {
+                    PyValueError::new_err(format!("RevokedServiceToken decode: {e}"))
+                })?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::service_token_revocation::ServiceTokenRevocationService;
+                        backend
+                            .record_revocation(revocation)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::service_token_revocation::sqlite::SqliteServiceTokenRevocationBackend::new(
+                            sq.conn_handle(),
+                        );
+                    runtime.block_on(async move {
+                        use crate::service_token_revocation::ServiceTokenRevocationService;
+                        backend
+                            .record_revocation(revocation)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.23 — List ALL revoked tokens.
+    ///
+    /// Returns JSON-encoded `list[RevokedServiceToken]`. Agent
+    /// caches in memory on startup; this method runs once at boot.
+    /// Order is unspecified (caller indexes by `token_hash`).
+    #[cfg(feature = "cirislens_service_token_revocation")]
+    fn service_token_revocation_list(&self, py: Python<'_>) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::service_token_revocation::ServiceTokenRevocationService;
+                        let items = backend
+                            .list_revocations()
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&items).map_err(|e| {
+                            PyRuntimeError::new_err(format!(
+                                "RevokedServiceToken list encode: {e}"
+                            ))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::service_token_revocation::sqlite::SqliteServiceTokenRevocationBackend::new(
+                            sq.conn_handle(),
+                        );
+                    runtime.block_on(async move {
+                        use crate::service_token_revocation::ServiceTokenRevocationService;
+                        let items = backend
+                            .list_revocations()
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&items).map_err(|e| {
+                            PyRuntimeError::new_err(format!(
+                                "RevokedServiceToken list encode: {e}"
+                            ))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.23 — Point-lookup check.
+    ///
+    /// Returns JSON-encoded `RevokedServiceToken` row if revoked,
+    /// `None` otherwise. Backed by the PRIMARY KEY index.
+    #[cfg(feature = "cirislens_service_token_revocation")]
+    fn service_token_revocation_check(
+        &self,
+        py: Python<'_>,
+        token_hash: &str,
+    ) -> PyResult<Option<String>> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let token_hash = token_hash.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::service_token_revocation::ServiceTokenRevocationService;
+                        let row = backend
+                            .check_revocation(&token_hash)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match row {
+                            None => Ok(None),
+                            Some(r) => serde_json::to_string(&r).map(Some).map_err(|e| {
+                                PyRuntimeError::new_err(format!(
+                                    "RevokedServiceToken encode: {e}"
+                                ))
+                            }),
+                        }
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::service_token_revocation::sqlite::SqliteServiceTokenRevocationBackend::new(
+                            sq.conn_handle(),
+                        );
+                    runtime.block_on(async move {
+                        use crate::service_token_revocation::ServiceTokenRevocationService;
+                        let row = backend
+                            .check_revocation(&token_hash)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match row {
+                            None => Ok(None),
+                            Some(r) => serde_json::to_string(&r).map(Some).map_err(|e| {
+                                PyRuntimeError::new_err(format!(
+                                    "RevokedServiceToken encode: {e}"
+                                ))
+                            }),
+                        }
                     })
                 }
             })

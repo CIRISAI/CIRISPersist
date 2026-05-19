@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "1.5.22"
+version = "1.5.23"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -342,6 +342,22 @@ cirislens_feedback_mappings = ["cirislens_thoughts"]
 # + token_type CHECK (standard/session/api_key/oauth/service).
 # Threat model AV-15.
 cirislens_wa_cert = []
+
+# v1.5.23 (CIRISPersist#64) — service-token revocation substrate.
+# Absorbs CIRISAgent's standalone `revoked_service_tokens.db`
+# aiosqlite file — the last direct `aiosqlite` consumer in the
+# agent. With this feature on, CIRISAgent 2.9.0 Phase 2b can drop
+# `aiosqlite` from `requirements.txt`. 4-column table keyed on a
+# SHA-based `token_hash` digest (NOT a wa_id; service tokens don't
+# map to WA certs — see issue #64 for the two-table distinction).
+# All four columns NOT NULL: revocations always carry context
+# (when, by whom, why). Trait: record_revocation (idempotent UPSERT
+# on token_hash via `ON CONFLICT DO NOTHING` — first record wins),
+# list_revocations (full table dump for the agent's boot-time
+# cache load; empty Vec on cold tables), check_revocation
+# (point-lookup, returns Option). No FKs, no JSONB. Threat model
+# AV-15.
+cirislens_service_token_revocation = []
 
 # v0.1.3 — optional TLS for the Postgres connection pool. Defaults
 # to no-TLS (deployments where the lens process and Postgres are

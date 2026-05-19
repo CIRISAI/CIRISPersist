@@ -859,6 +859,36 @@ class Engine:
         was updated; ``False`` if ``wa_id`` doesn't exist.
         """
 
+    # ── v1.5.23 (CIRISPersist#64) — service-token revocation substrate
+
+    def service_token_revocation_record(self, revocation_json: str) -> None:
+        """v1.5.23 (CIRISPersist#64) — Record a service-token revocation.
+
+        Idempotent on ``token_hash`` (PK; ON CONFLICT DO NOTHING).
+        First record wins. ``revocation_json`` is a JSON-encoded
+        ``RevokedServiceToken`` shape:
+        ``{"token_hash": "...", "revoked_at": "<rfc3339>", "revoked_by": "...", "reason": "..."}``.
+        All four fields required (non-empty).
+
+        Replaces CIRISAgent's standalone ``revoked_service_tokens.db``
+        aiosqlite file — last aiosqlite consumer in the agent.
+        """
+
+    def service_token_revocation_list(self) -> str:
+        """v1.5.23 (CIRISPersist#64) — List ALL revoked tokens.
+
+        Returns the JSON-encoded ``list[RevokedServiceToken]``.
+        Agent caches in memory on startup; this method runs once at
+        boot. Order unspecified (caller indexes by token_hash).
+        """
+
+    def service_token_revocation_check(self, token_hash: str) -> str | None:
+        """v1.5.23 (CIRISPersist#64) — Point-lookup check.
+
+        Returns the JSON-encoded ``RevokedServiceToken`` row if
+        revoked, ``None`` otherwise. Backed by the PRIMARY KEY index.
+        """
+
     def trust_grant_consistency_proof(
         self,
         tenant_id: str,

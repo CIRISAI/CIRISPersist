@@ -5,6 +5,76 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.5.23] — 2026-05-19
+
+**`service_token_revocation_*` substrate — last aiosqlite consumer absorbed (CIRISPersist#64).**
+
+Fourth of six v1.5.19 follow-ups. New substrate replacing CIRISAgent's
+standalone `revoked_service_tokens.db` SQLite file (the agent's
+auth_service was the only remaining `aiosqlite` consumer in
+`requirements.txt`). Lands the dependency-removal blocker for
+CIRISAgent 2.9.0 Phase 2b.
+
+### V037 schema (both backends)
+
+```
+revoked_service_tokens(
+    token_hash  TEXT PRIMARY KEY,
+    revoked_at  TIMESTAMPTZ NOT NULL,
+    revoked_by  TEXT NOT NULL,
+    reason      TEXT NOT NULL
+)
+```
+
+`token_hash` is the SHA-based digest of a service token (NOT a
+`wa_id` — service tokens don't map to WA certs; see #64 for the
+two-table distinction with `wa_cert.active`).
+
+### Trait — `ServiceTokenRevocationService` (3 methods)
+
+- `record_revocation(revocation)` — idempotent on `token_hash` via
+  `ON CONFLICT(token_hash) DO NOTHING`. First record wins;
+  re-records are silent no-ops (timestamp + reason are stable once
+  recorded — re-recording with different values does NOT overwrite,
+  matching the agent's intent).
+- `list_revocations()` — full table dump. Agent caches in memory at
+  startup. Order unspecified. Empty Vec on cold table.
+- `check_revocation(token_hash)` — point lookup. PK-indexed.
+
+### Validation
+
+`record_revocation` rejects empty `token_hash`, empty `revoked_by`,
+empty `reason` with `InvalidArgument`.
+
+### PyO3 surface + .pyi
+
+3 new `Engine` methods gated on `cirislens_service_token_revocation`
+feature:
+- `service_token_revocation_record(revocation_json) -> None`
+- `service_token_revocation_list() -> str` (JSON `list[...]`)
+- `service_token_revocation_check(token_hash) -> str | None`
+
+Stable AV-15 error kinds: `service_token_revocation_invalid_argument
+| _not_found | _conflict | _backend | _internal`.
+
+### Tests
+
+15 new (6 PG-gated + 6 SQLite + 1 error-kind + 2 types serde):
+- Record then check returns row.
+- Idempotent same-hash no-op.
+- `list` on populated table returns all rows.
+- `list` on empty table returns empty Vec.
+- `check` on unknown hash returns None.
+- Empty token_hash → `InvalidArgument`.
+
+596/596 pass across `postgres + sqlite + all 12 cirislens features`.
+
+### Feature flag
+
+`cirislens_service_token_revocation = []` in Cargo.toml +
+pyproject.toml maturin features list. Independent of other
+substrates — no transitive cirislens dep.
+
 ## [1.5.22] — 2026-05-19
 
 **`correlation_id` uniqueness + `task_upsert` outcome envelope (CIRISPersist#61).**
