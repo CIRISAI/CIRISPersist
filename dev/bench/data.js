@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779204743653,
+  "lastUpdate": 1779205628563,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -19223,6 +19223,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25835377,
             "range": "± 87000",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "b1025b0f6a482b5c0d5a4ceef806cae4a436ce50",
+          "message": "1.6.0 — TSDB consolidation substrate (closes #63)\n\nFinal cut of the v1.5.19 follow-up wave. Unblocks CIRISAgent 2.9.0\nPhase 3b: the agent's 6,680 LOC services/graph/tsdb_consolidation/\npackage (11 files of raw-SQL helpers) can now delegate query +\nprune + edge-rollup to persist instead of owning the SQL builders.\n\nPersist already shipped the consolidation engine in v0.8.2\n(consolidate_period + multi-tier Basic → Daily → Weekly → Monthly\nchain via input_tier). v1.6.0 adds four new primitives to retire\nthe agent's Python query/prune/edge layer:\n\n- TelemetryService::query_summaries(level, tenant, from, to)\n  → Vec<MetricSummary>: period-window query, ordered\n  (period_start ASC, metric_name ASC).\n- TelemetryService::get_summary(level, tenant, metric_name,\n  period_start) → Option<MetricSummary>: point lookup via\n  deterministic node_id.\n- TelemetryService::prune_summaries(level, tenant, before) → u64:\n  retention sweep with TEMPORAL_NEXT-edge cascade.\n- TelemetryService::count_edges_by_relationship_in_window(from, to)\n  → HashMap<String, u64>: edge-relationship histogram for the\n  agent's daily edge rollup.\n\nPG + SQLite parity. PyO3: tsdb_query_summaries, tsdb_get_summary,\ntsdb_prune_summaries, tsdb_count_edges_by_relationship_in_window\n(all gated on `telemetry` feature). .pyi stubs included.\n\nDrive-by fixes:\n- aggregate_higher_tier PG SQL: SUM((attrs->>'count')::bigint)::bigint\n  cast so tokio-postgres can decode the i64 (previously surfaced as\n  \"decode count_v: error deserializing column 4\" when running the\n  telemetry feature locally; CI uses the postgres+server+pyo3\n  feature set which never exercises this path).\n- SQLite get_summary truncates caller's period_start to micros so\n  it matches the write-path's existing truncate_to_micros\n  invariant (otherwise nanosecond chrono::Utc::now() derivatives\n  would miss the row by precision-suffix lex compare).\n- SQLite count_edges_by_relationship_in_window wraps both sides of\n  the created_at range predicate in datetime() — the edge table\n  uses `datetime('now', 'subsec')` (space-separated) which doesn't\n  RFC 3339 lex-sort against the bound bind strings.\n\nTests: 7 new (5 SQLite + 2 PG-gated). 630/630 lib tests pass across\npostgres + sqlite + all 12 cirislens features + telemetry +\ncirisgraph (clean PG state).\n\ncloses #63\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-19T10:39:11-05:00",
+          "tree_id": "3a669e6e4e98d31682e4d8ecaf81978141e8ac78",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/b1025b0f6a482b5c0d5a4ceef806cae4a436ce50"
+        },
+        "date": 1779205627785,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101844,
+            "range": "± 775",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 243134,
+            "range": "± 748",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 525277,
+            "range": "± 3130",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1852234,
+            "range": "± 35400",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 341,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1414,
+            "range": "± 18",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7521,
+            "range": "± 77",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21213,
+            "range": "± 40",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24259,
+            "range": "± 74",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83710,
+            "range": "± 1140",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 359,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3047,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9449,
+            "range": "± 69",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42006,
+            "range": "± 199",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2249095,
+            "range": "± 77700",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6625061,
+            "range": "± 302456",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23776923,
+            "range": "± 162329",
             "unit": "ns/iter"
           }
         ]
