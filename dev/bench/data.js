@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779203204041,
+  "lastUpdate": 1779203680201,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -18959,6 +18959,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25899394,
             "range": "± 135273",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "3052c061b78a605249c86d9577b4bb0e978edf2e",
+          "message": "1.5.25 — cirisgraph list/count/exclude gaps (closes #65)\n\nCloses the remaining cirisgraph surface gap blocking CIRISAgent\n2.9.0 Phase 4 (API memory routes dropping raw import sqlite3).\n\nThree additions:\n\nGap A — NodeExcludeRule on NodeFilter. New optional `exclude` field\n{ node_type, node_id_pattern } emitting\nNOT (node_type = ? AND node_id LIKE ?) server-side. Models the\nagent's NOT (node_type='tsdb_data' AND node_id LIKE 'metric_%')\nmemory-route exclusion verbatim. Honored by both query_nodes and\nthe new count_nodes.\n\nGap B — count_nodes(NodeFilter) -> u64 and\ncount_edges(GraphScope) -> u64.\n\nGap C — count_nodes_by_type(GraphScope) -> HashMap<String, u64>.\nReplaces agent's raw GROUP BY node_type SQL.\n\nAll four methods on GraphService trait; PG + SQLite parity (no\nPG-only declarations per feedback-no-pg-only-no-deferral). AV-47\nscope-required preserved on count_nodes + count_nodes_by_type.\n\nPyO3: cirisgraph_count_nodes (filter_json → int),\ncirisgraph_count_edges (scope → int), cirisgraph_count_nodes_by_type\n(scope → JSON dict). .pyi stubs added with full docstrings.\n\nTests: 8 new (6 SQLite + 2 PG-gated):\n- count_nodes total in scope\n- count_nodes honors exclude rule (3-of-5 dropped)\n- count_edges total in scope\n- count_nodes_by_type histogram\n- missing scope → InvalidArgument (AV-47)\n- query_nodes honors exclude rule\n- PG count_nodes_honors_exclude + count_nodes_by_type_groups\n  (probe-attribute scoping to isolate from shared-DB state)\n\nWire compatibility: NodeFilter `exclude` defaults to None, serde\nskip_serializing_if when None — existing payloads decode unchanged.\n\ncloses #65\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-19T10:07:04-05:00",
+          "tree_id": "b0f1f35947d2388b340e6a742a36bede429a14e3",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/3052c061b78a605249c86d9577b4bb0e978edf2e"
+        },
+        "date": 1779203679439,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 105681,
+            "range": "± 336",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 246462,
+            "range": "± 2031",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 528444,
+            "range": "± 2117",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1862984,
+            "range": "± 24809",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 343,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1443,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7585,
+            "range": "± 98",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21305,
+            "range": "± 1534",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24335,
+            "range": "± 407",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83793,
+            "range": "± 589",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 396,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3196,
+            "range": "± 24",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9386,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41890,
+            "range": "± 169",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 621,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2394758,
+            "range": "± 151818",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6805772,
+            "range": "± 143140",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 24305544,
+            "range": "± 324100",
             "unit": "ns/iter"
           }
         ]
