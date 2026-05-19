@@ -966,14 +966,34 @@ class Engine:
         ``filter_json`` is a JSON-encoded ``NodeFilter`` — same shape
         accepted by :meth:`cirisgraph_query_nodes`, including the
         v1.5.25 ``exclude`` field for the compound exclusion rule
-        (``NOT (node_type = ... AND node_id LIKE ...)``). The
-        ``scope`` field is required (AV-47 — no implicit "all scopes"
-        reads).
+        (``NOT (node_type = ... AND node_id LIKE ...)``) and the
+        v1.6.1 ``attribute_match`` field for JSON-attribute-path
+        equality / array-containment filtering:
+
+        .. code-block:: json
+
+            {
+              "scope": "local",
+              "attribute_match": {
+                "path": "created_by",
+                "equals_any": ["alice", "bob"],
+                "array_contains_any": ["alice"]
+              }
+            }
+
+        Both ``equals_any`` and ``array_contains_any`` are optional;
+        when both are set they OR-combine (row matches if either arm
+        does). ``path`` must be alphanumeric + underscore.
+
+        The ``scope`` field is required (AV-47 — no implicit
+        "all scopes" reads).
 
         Returns the raw integer (not a JSON envelope).
 
         Unblocks CIRISAgent 2.9.0 Phase 4
-        (``COUNT(*) FROM graph_nodes`` API tile).
+        (``COUNT(*) FROM graph_nodes`` API tile) and Phase 5
+        (the agent's OBSERVER user-filter Layer 1 in
+        ``memory_query_helpers.py``).
         """
 
     def cirisgraph_count_edges(self, scope: str) -> int:

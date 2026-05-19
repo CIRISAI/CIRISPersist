@@ -67,6 +67,59 @@ fn encode_attributes(
     Ok(attrs.clone())
 }
 
+/// v1.6.1 (CIRISPersist#67) — emit the WHERE-clause fragment for an
+/// `AttributeMatch` filter onto the supplied `where_parts` + `params`
+/// vectors. Both clauses (`equals_any`, `array_contains_any`) are
+/// optional; when both are set they OR-combine. If neither is set,
+/// nothing is emitted (the filter is a no-op).
+///
+/// PG operators: `->>` for scalar text extraction; `?|` for "does
+/// JSON array contain any of the given keys". The `?|` operator
+/// expects a `text[]` right-hand side, which we bind as
+/// `Vec<String>`.
+fn push_attribute_match_clause(
+    am: &super::types::AttributeMatch,
+    where_parts: &mut Vec<String>,
+    params: &mut Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+) -> Result<(), Error> {
+    if am.path.is_empty() {
+        return Err(Error::InvalidArgument(
+            "AttributeMatch.path must be non-empty".into(),
+        ));
+    }
+    let path_owned = am.path.clone();
+    let mut or_arms: Vec<String> = Vec::new();
+    if let Some(values) = am.equals_any.clone() {
+        if !values.is_empty() {
+            params.push(Box::new(path_owned.clone()));
+            let p_path = params.len();
+            params.push(Box::new(values));
+            let p_vals = params.len();
+            or_arms.push(format!("(attributes->>${p_path}) = ANY(${p_vals}::text[])"));
+        }
+    }
+    if let Some(values) = am.array_contains_any.clone() {
+        if !values.is_empty() {
+            // PG's `?|` operator: jsonb ?| text[] — true when the
+            // JSON value contains ANY of the given keys (top-level)
+            // OR any of the given strings inside a JSON array.
+            params.push(Box::new(path_owned.clone()));
+            let p_path = params.len();
+            params.push(Box::new(values));
+            let p_vals = params.len();
+            or_arms.push(format!("(attributes->${p_path}) ?| ${p_vals}::text[]"));
+        }
+    }
+    if !or_arms.is_empty() {
+        if or_arms.len() == 1 {
+            where_parts.push(or_arms.pop().unwrap());
+        } else {
+            where_parts.push(format!("({})", or_arms.join(" OR ")));
+        }
+    }
+    Ok(())
+}
+
 fn direction_clause(direction: EdgeDirection) -> &'static str {
     match direction {
         EdgeDirection::Outgoing => "source_node_id = $1 AND scope = $2",
@@ -561,6 +614,9 @@ impl GraphService for PostgresBackend {
                 "NOT (node_type = ${p_type} AND node_id LIKE ${p_pat})"
             ));
         }
+        if let Some(am) = filter.attribute_match {
+            push_attribute_match_clause(&am, &mut where_parts, &mut params)?;
+        }
         if let Some(cur) = &cursor {
             if cur.version != "v1" {
                 return Err(Error::InvalidArgument(format!(
@@ -645,6 +701,9 @@ impl GraphService for PostgresBackend {
             where_parts.push(format!(
                 "NOT (node_type = ${p_type} AND node_id LIKE ${p_pat})"
             ));
+        }
+        if let Some(am) = filter.attribute_match {
+            push_attribute_match_clause(&am, &mut where_parts, &mut params)?;
         }
         let where_sql = where_parts.join(" AND ");
         let sql = format!("SELECT COUNT(*)::BIGINT FROM cirisgraph.nodes WHERE {where_sql}");
@@ -1024,6 +1083,125 @@ mod tests {
             count_excluded, 2,
             "3 metric_* rows excluded; 2 summary_* remain"
         );
+    }
+
+    // ── v1.6.1 (CIRISPersist#67) attribute_match tests ──────────────
+
+    fn fixture_node_with_attrs(
+        node_id: &str,
+        node_type: &str,
+        attrs: serde_json::Value,
+    ) -> GraphNode {
+        let mut n = fixture_node(node_id, GraphScope::Local, node_type);
+        n.attributes = attrs;
+        n
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn cirisgraph_pg_attribute_match_equals_any() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let probe = Uuid::new_v4().simple().to_string();
+        for who in &["alice", "bob", "carol"] {
+            backend
+                .upsert_node(
+                    fixture_node_with_attrs(
+                        &format!("{who}-{probe}"),
+                        "memory",
+                        serde_json::json!({"created_by": who, "probe": probe.clone()}),
+                    ),
+                    0,
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        let n = backend
+            .count_nodes(NodeFilter {
+                scope: Some(GraphScope::Local),
+                attributes_contains: Some(serde_json::json!({"probe": probe.clone()})),
+                attribute_match: Some(crate::graph::AttributeMatch {
+                    path: "created_by".into(),
+                    equals_any: Some(vec!["alice".into(), "bob".into()]),
+                    array_contains_any: None,
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn cirisgraph_pg_attribute_match_array_contains_any() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let probe = Uuid::new_v4().simple().to_string();
+        backend
+            .upsert_node(
+                fixture_node_with_attrs(
+                    &format!("a-{probe}"),
+                    "memory",
+                    serde_json::json!({"user_list": ["alice", "bob"], "probe": probe.clone()}),
+                ),
+                0,
+                false,
+            )
+            .await
+            .unwrap();
+        backend
+            .upsert_node(
+                fixture_node_with_attrs(
+                    &format!("b-{probe}"),
+                    "memory",
+                    serde_json::json!({"user_list": ["carol"], "probe": probe.clone()}),
+                ),
+                0,
+                false,
+            )
+            .await
+            .unwrap();
+        backend
+            .upsert_node(
+                fixture_node_with_attrs(
+                    &format!("c-{probe}"),
+                    "memory",
+                    serde_json::json!({"user_list": ["dave", "alice"], "probe": probe.clone()}),
+                ),
+                0,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let n = backend
+            .count_nodes(NodeFilter {
+                scope: Some(GraphScope::Local),
+                attributes_contains: Some(serde_json::json!({"probe": probe.clone()})),
+                attribute_match: Some(crate::graph::AttributeMatch {
+                    path: "user_list".into(),
+                    equals_any: None,
+                    array_contains_any: Some(vec!["alice".into()]),
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
     }
 
     #[tokio::test]

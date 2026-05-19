@@ -119,6 +119,34 @@ pub enum EdgeDirection {
     Both,
 }
 
+/// Attribute-path equality / array-containment predicate (v1.6.1,
+/// CIRISPersist#67).
+///
+/// Models the agent's `memory_query_helpers.py` OBSERVER user filter
+/// — a JSON-path-equality OR JSON-array-containment match against a
+/// single nested key in `attributes`. Both clauses are optional; when
+/// both are set the row matches if EITHER arm matches (OR semantics,
+/// matching the agent's Layer-1 access-control composition).
+///
+/// `path` is a single-segment key (no `.` traversal yet — the agent's
+/// current use cases all match against top-level attribute keys like
+/// `created_by` and `user_list`; a future deep-path extension can add
+/// dotted-path support if needed without breaking this shape).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttributeMatch {
+    /// Top-level attribute key (e.g. `"created_by"`).
+    pub path: String,
+    /// Scalar equality — row matches when `attributes->>path` equals
+    /// any of these values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub equals_any: Option<Vec<String>>,
+    /// Array containment — row matches when `attributes->path` is a
+    /// JSON array containing any of these values. PG uses the `?|`
+    /// operator; SQLite walks via `json_each` + IN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub array_contains_any: Option<Vec<String>>,
+}
+
 /// Compound exclusion rule (v1.5.25, CIRISPersist#65). Excludes
 /// rows that match BOTH `node_type` AND `node_id_pattern` (SQL LIKE
 /// pattern). Models the agent's
@@ -159,6 +187,12 @@ pub struct NodeFilter {
     /// `NOT (node_type = rule.node_type AND node_id LIKE rule.node_id_pattern)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclude: Option<NodeExcludeRule>,
+    /// v1.6.1 (CIRISPersist#67) — JSON-attribute-path equality /
+    /// array-containment filter. Models the agent's
+    /// `memory_query_helpers.py` OBSERVER user-filter shape. See
+    /// [`AttributeMatch`] for semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribute_match: Option<AttributeMatch>,
 }
 
 /// Cursor-paged result page for [`super::GraphService::query_nodes`].

@@ -205,6 +205,91 @@ fn fmt_datetime(dt: chrono::DateTime<chrono::Utc>) -> String {
     dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
 
+/// v1.6.1 (CIRISPersist#67) — emit the WHERE-clause fragment for an
+/// `AttributeMatch` filter onto the supplied `where_parts` + `params`
+/// vectors. SQLite has no JSONB containment operator, so:
+///
+/// - `equals_any`: `json_extract(attributes, '$.<path>') IN (?, ?, …)`
+/// - `array_contains_any`: `EXISTS (SELECT 1 FROM
+///   json_each(json_extract(attributes, '$.<path>')) WHERE value IN
+///   (?, ?, …))`
+///
+/// Both OR-combine when present. Path is interpolated into the SQL
+/// (not bound) so callers must use a single-segment attribute key —
+/// validated up-front to be alphanumeric/underscore only so a hostile
+/// caller can't inject SQL via the JSON path.
+fn push_attribute_match_clause(
+    am: &super::types::AttributeMatch,
+    where_parts: &mut Vec<String>,
+    params: &mut Vec<SqlValue>,
+) -> Result<(), Error> {
+    if am.path.is_empty() {
+        return Err(Error::InvalidArgument(
+            "AttributeMatch.path must be non-empty".into(),
+        ));
+    }
+    if !am
+        .path
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(Error::InvalidArgument(format!(
+            "AttributeMatch.path must be alphanumeric/underscore (got {:?})",
+            am.path
+        )));
+    }
+    let json_path = format!("$.{}", am.path);
+    let mut or_arms: Vec<String> = Vec::new();
+
+    if let Some(values) = am.equals_any.clone() {
+        if !values.is_empty() {
+            let placeholders: Vec<String> = values
+                .iter()
+                .map(|v| {
+                    params.push(SqlValue::Text(v.clone()));
+                    format!("?{}", params.len())
+                })
+                .collect();
+            or_arms.push(format!(
+                "json_extract(attributes, '{}') IN ({})",
+                json_path,
+                placeholders.join(", ")
+            ));
+        }
+    }
+    if let Some(values) = am.array_contains_any.clone() {
+        if !values.is_empty() {
+            let placeholders: Vec<String> = values
+                .iter()
+                .map(|v| {
+                    params.push(SqlValue::Text(v.clone()));
+                    format!("?{}", params.len())
+                })
+                .collect();
+            // Guard the json_each walk with a json_type check —
+            // calling json_each on a non-array (or non-object) value
+            // raises "malformed JSON" at SQLite. When the same `path`
+            // arm of the OR also has `equals_any` set against scalar
+            // rows, those scalar rows would otherwise blow up here.
+            or_arms.push(format!(
+                "(json_type(attributes, '{json_path}') = 'array' \
+                  AND EXISTS (SELECT 1 FROM json_each(json_extract(attributes, '{json_path}')) \
+                              WHERE value IN ({placeholders})))",
+                json_path = json_path,
+                placeholders = placeholders.join(", ")
+            ));
+        }
+    }
+    if !or_arms.is_empty() {
+        if or_arms.len() == 1 {
+            where_parts.push(or_arms.pop().unwrap());
+        } else {
+            where_parts.push(format!("({})", or_arms.join(" OR ")));
+        }
+    }
+    Ok(())
+}
+
 fn decode_node_row(row: &rusqlite::Row<'_>) -> Result<GraphNode, Error> {
     let scope_str: String = row
         .get("scope")
@@ -756,6 +841,9 @@ impl GraphService for SqliteGraphBackend {
             params.push(SqlValue::Text(rule.node_id_pattern));
             where_parts.push("NOT (node_type = ? AND node_id LIKE ?)".to_string());
         }
+        if let Some(am) = filter.attribute_match {
+            push_attribute_match_clause(&am, &mut where_parts, &mut params)?;
+        }
         if let Some(cur) = &cursor {
             if cur.version != "v1" {
                 return Err(Error::InvalidArgument(format!(
@@ -853,6 +941,9 @@ impl GraphService for SqliteGraphBackend {
             params.push(SqlValue::Text(rule.node_type));
             params.push(SqlValue::Text(rule.node_id_pattern));
             where_parts.push("NOT (node_type = ? AND node_id LIKE ?)".to_string());
+        }
+        if let Some(am) = filter.attribute_match {
+            push_attribute_match_clause(&am, &mut where_parts, &mut params)?;
         }
         let where_sql = where_parts.join(" AND ");
         let sql = format!("SELECT COUNT(*) FROM cirisgraph_nodes WHERE {where_sql}");
@@ -1513,6 +1604,306 @@ mod tests {
             .collect();
         assert_eq!(ours.len(), 1);
         assert!(ours[0].node_id.starts_with("summary-"));
+    }
+
+    // ── v1.6.1 (CIRISPersist#67) attribute_match tests ──────────────
+
+    /// Helper — build a node with caller-controlled attributes.
+    fn fixture_node_with_attrs(
+        node_id: &str,
+        node_type: &str,
+        attrs: serde_json::Value,
+    ) -> GraphNode {
+        let mut n = fixture_node(node_id, GraphScope::Local, node_type);
+        n.attributes = attrs;
+        n
+    }
+
+    #[tokio::test]
+    async fn attribute_match_equals_any_filters_by_created_by() {
+        let (_b, graph) = fresh_backend().await;
+        let suffix = Uuid::new_v4().simple().to_string();
+
+        // Three nodes with different `created_by`:
+        graph
+            .upsert_node(
+                fixture_node_with_attrs(
+                    &format!("alice-{suffix}"),
+                    "memory",
+                    serde_json::json!({"created_by": "alice"}),
+                ),
+                0,
+                false,
+            )
+            .await
+            .unwrap();
+        graph
+            .upsert_node(
+                fixture_node_with_attrs(
+                    &format!("bob-{suffix}"),
+                    "memory",
+                    serde_json::json!({"created_by": "bob"}),
+                ),
+                0,
+                false,
+            )
+            .await
+            .unwrap();
+        graph
+            .upsert_node(
+                fixture_node_with_attrs(
+                    &format!("carol-{suffix}"),
+                    "memory",
+                    serde_json::json!({"created_by": "carol"}),
+                ),
+                0,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Filter to {alice, bob} — should return 2 rows.
+        let page = graph
+            .query_nodes(
+                NodeFilter {
+                    scope: Some(GraphScope::Local),
+                    attribute_match: Some(crate::graph::AttributeMatch {
+                        path: "created_by".into(),
+                        equals_any: Some(vec!["alice".into(), "bob".into()]),
+                        array_contains_any: None,
+                    }),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        let ours: Vec<_> = page
+            .items
+            .iter()
+            .filter(|n| n.node_id.contains(&suffix))
+            .collect();
+        assert_eq!(ours.len(), 2);
+        let names: std::collections::HashSet<&str> =
+            ours.iter().map(|n| n.node_id.as_str()).collect();
+        assert!(names.iter().any(|n| n.starts_with("alice-")));
+        assert!(names.iter().any(|n| n.starts_with("bob-")));
+    }
+
+    #[tokio::test]
+    async fn attribute_match_array_contains_any_filters_user_list() {
+        let (_b, graph) = fresh_backend().await;
+        let suffix = Uuid::new_v4().simple().to_string();
+
+        graph
+            .upsert_node(
+                fixture_node_with_attrs(
+                    &format!("a-{suffix}"),
+                    "memory",
+                    serde_json::json!({"user_list": ["alice", "bob"]}),
+                ),
+                0,
+                false,
+            )
+            .await
+            .unwrap();
+        graph
+            .upsert_node(
+                fixture_node_with_attrs(
+                    &format!("b-{suffix}"),
+                    "memory",
+                    serde_json::json!({"user_list": ["carol"]}),
+                ),
+                0,
+                false,
+            )
+            .await
+            .unwrap();
+        graph
+            .upsert_node(
+                fixture_node_with_attrs(
+                    &format!("c-{suffix}"),
+                    "memory",
+                    serde_json::json!({"user_list": ["dave", "alice"]}),
+                ),
+                0,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // user_list ∋ alice → matches a-* and c-*.
+        let page = graph
+            .query_nodes(
+                NodeFilter {
+                    scope: Some(GraphScope::Local),
+                    attribute_match: Some(crate::graph::AttributeMatch {
+                        path: "user_list".into(),
+                        equals_any: None,
+                        array_contains_any: Some(vec!["alice".into()]),
+                    }),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        let ours: Vec<_> = page
+            .items
+            .iter()
+            .filter(|n| n.node_id.contains(&suffix))
+            .collect();
+        assert_eq!(ours.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn attribute_match_or_combines_equals_and_array_contains() {
+        let (_b, graph) = fresh_backend().await;
+        let suffix = Uuid::new_v4().simple().to_string();
+
+        // a: created_by=alice (scalar match arm)
+        graph
+            .upsert_node(
+                fixture_node_with_attrs(
+                    &format!("a-{suffix}"),
+                    "memory",
+                    serde_json::json!({"created_by": "alice"}),
+                ),
+                0,
+                false,
+            )
+            .await
+            .unwrap();
+        // b: user_list=[bob] (array-contains arm — same path different shape)
+        graph
+            .upsert_node(
+                fixture_node_with_attrs(
+                    &format!("b-{suffix}"),
+                    "memory",
+                    serde_json::json!({"created_by": ["bob"]}),
+                ),
+                0,
+                false,
+            )
+            .await
+            .unwrap();
+        // c: created_by=eve (neither arm matches → excluded)
+        graph
+            .upsert_node(
+                fixture_node_with_attrs(
+                    &format!("c-{suffix}"),
+                    "memory",
+                    serde_json::json!({"created_by": "eve"}),
+                ),
+                0,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let page = graph
+            .query_nodes(
+                NodeFilter {
+                    scope: Some(GraphScope::Local),
+                    attribute_match: Some(crate::graph::AttributeMatch {
+                        path: "created_by".into(),
+                        equals_any: Some(vec!["alice".into()]),
+                        array_contains_any: Some(vec!["bob".into()]),
+                    }),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        let ours: Vec<_> = page
+            .items
+            .iter()
+            .filter(|n| n.node_id.contains(&suffix))
+            .collect();
+        assert_eq!(ours.len(), 2, "alice (scalar) + bob (array) match");
+    }
+
+    #[tokio::test]
+    async fn attribute_match_count_nodes_honors_filter() {
+        let (_b, graph) = fresh_backend().await;
+        let suffix = Uuid::new_v4().simple().to_string();
+        for who in &["alice", "bob", "carol", "alice"] {
+            graph
+                .upsert_node(
+                    fixture_node_with_attrs(
+                        &format!("{who}-{}-{suffix}", Uuid::new_v4().simple()),
+                        "memory",
+                        serde_json::json!({"created_by": who}),
+                    ),
+                    0,
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        let n = graph
+            .count_nodes(NodeFilter {
+                scope: Some(GraphScope::Local),
+                attribute_match: Some(crate::graph::AttributeMatch {
+                    path: "created_by".into(),
+                    equals_any: Some(vec!["alice".into()]),
+                    array_contains_any: None,
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // We inserted 2 alice nodes for this suffix. May also include
+        // leftover alice nodes from other tests; just check >= 2.
+        assert!(n >= 2);
+    }
+
+    #[tokio::test]
+    async fn attribute_match_empty_path_rejected() {
+        let (_b, graph) = fresh_backend().await;
+        let err = graph
+            .query_nodes(
+                NodeFilter {
+                    scope: Some(GraphScope::Local),
+                    attribute_match: Some(crate::graph::AttributeMatch {
+                        path: "".into(),
+                        equals_any: Some(vec!["x".into()]),
+                        array_contains_any: None,
+                    }),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn attribute_match_path_with_sql_injection_rejected() {
+        let (_b, graph) = fresh_backend().await;
+        let err = graph
+            .query_nodes(
+                NodeFilter {
+                    scope: Some(GraphScope::Local),
+                    attribute_match: Some(crate::graph::AttributeMatch {
+                        path: "x'; DROP TABLE--".into(),
+                        equals_any: Some(vec!["x".into()]),
+                        array_contains_any: None,
+                    }),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
     }
 
     /// CIRISPersist#58 defense-in-depth: encode_attributes guards

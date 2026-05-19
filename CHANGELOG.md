@@ -5,6 +5,103 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.6.1] — 2026-05-19
+
+**cirisgraph `attribute_match` filter — JSON-path equality + array
+containment (CIRISPersist#67).**
+
+Phase 4 follow-up cut. CIRISAgent#763's `memory_query_helpers.py`
+needs to enforce the OBSERVER user filter (Layer 1 access control:
+"OBSERVER users see only graph nodes they created") via persist
+instead of raw SQL. The substrate's `NodeFilter` had no JSON-
+path-equality predicate, so the agent route either kept the raw
+SQL or paginated the entire graph client-side. v1.6.1 closes the
+gap.
+
+### New `NodeFilter.attribute_match` field
+
+```rust
+NodeFilter {
+    scope: GraphScope,
+    node_type: Option<String>,
+    attributes_contains: Option<Value>,
+    updated_after / updated_before / created_after / created_before:
+        Option<DateTime<Utc>>,
+    exclude: Option<NodeExcludeRule>,
+    attribute_match: Option<AttributeMatch>,          // ← NEW
+}
+
+AttributeMatch {
+    path: String,                       // alphanumeric/underscore
+    equals_any: Option<Vec<String>>,
+    array_contains_any: Option<Vec<String>>,
+}
+```
+
+- `equals_any`: row matches when `attributes->>path` ∈ values.
+- `array_contains_any`: row matches when `attributes->path` is a
+  JSON array containing any of the supplied values.
+- Both clauses are independently optional; when both are set, they
+  OR-combine (matches the agent's Layer 1 OBSERVER filter shape).
+
+### PG dialect
+
+- `equals_any` → `(attributes->>$path) = ANY($vals::text[])`
+- `array_contains_any` → `(attributes->$path) ?| $vals::text[]`
+
+Explicit `::text[]` casts on the right-hand side — tokio-postgres'
+default bind for `Vec<String>` infers correctly with the cast,
+without it the `?|` operator silently no-ops in some PG versions.
+
+### SQLite dialect
+
+- `equals_any` → `json_extract(attributes, '$.<path>') IN (...)`
+- `array_contains_any` →
+  `json_type(attributes, '$.<path>') = 'array' AND EXISTS (
+    SELECT 1 FROM json_each(json_extract(attributes, '$.<path>'))
+    WHERE value IN (...))`
+
+The `json_type = 'array'` guard prevents `json_each` from raising
+`malformed JSON` on rows whose `<path>` value is a scalar — common
+when the same OR-combined filter targets both scalar (`created_by`)
+and array-shaped rows in the same query.
+
+### Security: SQL injection guard on `path`
+
+`AttributeMatch.path` is interpolated directly into the SQL
+fragment (not bound as a parameter — PG and SQLite both reject JSON
+paths as bind values). Validated up-front to be alphanumeric +
+underscore only. Hostile callers can't inject SQL via the path
+slot.
+
+### Honored in both `query_nodes` and `count_nodes`
+
+Both endpoints emit the same WHERE-clause fragment via a shared
+`push_attribute_match_clause` helper per backend.
+
+### Tests
+
+8 new (6 SQLite + 2 PG-gated):
+- `equals_any` filters by `created_by` (scalar match)
+- `array_contains_any` filters by `user_list` (array containment)
+- OR-combine: scalar arm + array arm in the same query, neither-
+  matches row excluded
+- `count_nodes` honors the filter (parity with `query_nodes`)
+- Empty `path` rejected as `InvalidArgument`
+- Path with SQL-injection chars rejected as `InvalidArgument`
+- PG: equals_any + array_contains_any with probe-scoped fixtures
+
+PyO3 surface unchanged at the signature level —
+`cirisgraph_query_nodes` and `cirisgraph_count_nodes` accept the
+new `attribute_match` key inside `filter_json`. `.pyi` docstring
+extended with the JSON shape + Layer 1 OBSERVER-filter rationale.
+
+### Compatibility
+
+Additive — existing `NodeFilter` payloads decode unchanged
+(`attribute_match` defaults to `None` and serde skips the key when
+absent).
+
 ## [1.6.0] — 2026-05-19
 
 **TSDB consolidation substrate — period queries + prune + edge histograms (CIRISPersist#63).**

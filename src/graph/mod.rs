@@ -50,8 +50,8 @@ pub mod types;
 
 pub use service::GraphService;
 pub use types::{
-    EdgeDirection, GraphEdge, GraphNode, GraphScope, KhopEntry, ListCursor, NodeExcludeRule,
-    NodeFilter, NodeListPage, TraversalConfig,
+    AttributeMatch, EdgeDirection, GraphEdge, GraphNode, GraphScope, KhopEntry, ListCursor,
+    NodeExcludeRule, NodeFilter, NodeListPage, TraversalConfig,
 };
 
 /// cirisgraph-layer errors.
