@@ -297,18 +297,43 @@ jobs:
       # publishing. Scope is the workflow's GitHub-issued JWT only;
       # no long-lived secret.
       id-token: write
+      # v1.6.0 hardening — `gh run download` (used below to absorb
+      # transient ListArtifacts 403s) needs actions:read on the
+      # GITHUB_TOKEN.
+      actions: read
+      contents: read
     steps:
-      - name: download all multi-arch wheels
-        # v0.1.13 — pull every wheel the matrix produced into one
-        # dist/ dir for the upload action. `merge-multiple: true`
-        # flattens the per-artifact subdirs since the .whl
-        # filenames already encode the target tag (e.g.
-        # `-manylinux_2_34_aarch64`) so there's no collision.
-        uses: actions/download-artifact@v4
-        with:
-          pattern: ciris_persist-wheel-*
-          merge-multiple: true
-          path: dist
+      - name: download all multi-arch wheels (with retry)
+        # v1.6.0 — replaces `actions/download-artifact@v4` to absorb
+        # transient `403 Forbidden: Error from intermediary` failures
+        # from the v4 action's ListArtifacts call (v1.5.24's tag CI
+        # hit this exact mode — see commit 0df1665's CI run 26105591714).
+        # Same retry shape as the `gh release download` block in the
+        # build-manifest job below.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist
+          for attempt in 1 2 3 4 5; do
+            if gh run download "$GITHUB_RUN_ID" \
+                --repo "$GITHUB_REPOSITORY" \
+                --pattern 'ciris_persist-wheel-*' \
+                --dir dist; then
+              echo "✓ wheel download succeeded on attempt $attempt"
+              break
+            fi
+            if [ "$attempt" = "5" ]; then
+              echo "::error::wheel download failed 5 times — investigate"
+              exit 1
+            fi
+            echo "::warning::wheel download attempt $attempt failed; retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+          # `gh run download` nests artifacts under per-artifact
+          # subdirs (no merge-multiple equivalent). Flatten so the
+          # PyPI publish step sees a single dist/*.whl listing.
+          find dist -mindepth 2 -name '*.whl' -exec mv {} dist/ \;
+          find dist -mindepth 1 -type d -empty -delete
       - name: sanity-check wheel shapes before publish
         # Reject anything that isn't cp311-abi3 — the v0.1.10
         # regression showed mixed-mode maturin can silently emit
@@ -365,6 +390,9 @@ jobs:
     needs: pyo3-wheel
     permissions:
       contents: read
+      # v1.6.0 hardening — `gh run download` retry block below needs
+      # actions:read on the GITHUB_TOKEN.
+      actions: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -431,15 +459,37 @@ jobs:
             > "dist/persist-extras-${{ steps.version.outputs.version }}.json"
           echo "PersistExtras emitted:"
           cat "dist/persist-extras-${{ steps.version.outputs.version }}.json"
-      - name: download all multi-arch wheels for per-target manifest signing
+      - name: download all multi-arch wheels for per-target manifest signing (with retry)
         # v0.9.2 (CIRISPersist#42) — every wheel target needs its
         # own BuildManifest row in CanonicalBuild v2 so consumer-
         # side `verify_tree(project="ciris-persist", target=...)`
         # can match. Single artifact dir per target.
-        uses: actions/download-artifact@v4
-        with:
-          pattern: ciris_persist-wheel-*
-          path: dist/wheels
+        #
+        # v1.6.0 — replaces `actions/download-artifact@v4` to absorb
+        # transient ListArtifacts 403s (see publish-pypi for the
+        # underlying GitHub Actions infrastructure flake the v1.5.24
+        # tag run surfaced). No flatten step here — the sign script
+        # below walks per-target subdirs to map wheel → arch.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist/wheels
+          for attempt in 1 2 3 4 5; do
+            if gh run download "$GITHUB_RUN_ID" \
+                --repo "$GITHUB_REPOSITORY" \
+                --pattern 'ciris_persist-wheel-*' \
+                --dir dist/wheels; then
+              echo "✓ wheel download succeeded on attempt $attempt"
+              break
+            fi
+            if [ "$attempt" = "5" ]; then
+              echo "::error::wheel download failed 5 times — investigate"
+              exit 1
+            fi
+            echo "::warning::wheel download attempt $attempt failed; retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+          ls -la dist/wheels/
       - name: sign multi-target manifests (CanonicalBuild v2)
         # v0.9.2 — replaces the single-target sign of v0.9.1. Four
         # manifests get produced:
