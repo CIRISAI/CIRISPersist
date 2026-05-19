@@ -5,6 +5,76 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.5.25] — 2026-05-19
+
+**cirisgraph list/count/exclude gaps (CIRISPersist#65).**
+
+Sixth of the v1.5.19 follow-ups. Closes the remaining cirisgraph
+surface gap blocking CIRISAgent 2.9.0 Phase 4 (API memory routes
+dropping raw `import sqlite3`). Three additions:
+
+### Gap A — `NodeExcludeRule` on `NodeFilter`
+
+New optional field `exclude: Option<NodeExcludeRule>` where
+`NodeExcludeRule { node_type, node_id_pattern }`. Emits
+`NOT (node_type = ? AND node_id LIKE ?)` server-side. Models the
+agent's
+`NOT (node_type = 'tsdb_data' AND node_id LIKE 'metric_%')`
+memory-route exclusion verbatim. Honored by both `query_nodes` and
+the v1.5.25 `count_nodes`.
+
+PG: parameterized `LIKE` clause. SQLite: identical shape against
+`json_extract`-friendly column types.
+
+### Gap B — `count_nodes` + `count_edges`
+
+- `count_nodes(NodeFilter) -> u64` — honors every `NodeFilter`
+  key including the new `exclude` rule and existing
+  `attributes_contains` / `updated_after` / `updated_before` /
+  `node_type`. AV-47: scope is required.
+- `count_edges(GraphScope) -> u64` — single
+  `SELECT COUNT(*) FROM cirisgraph.edges WHERE scope = $1`.
+
+### Gap C — `count_nodes_by_type`
+
+- `count_nodes_by_type(GraphScope) -> HashMap<String, u64>` —
+  `SELECT node_type, COUNT(*) FROM cirisgraph.nodes WHERE scope = $1
+  GROUP BY node_type`. Replaces the agent's raw group-by-SQL on the
+  dashboard "memory composition by type" tile.
+
+### PyO3 + .pyi
+
+3 new `Engine` methods gated on `cirisgraph` feature:
+- `cirisgraph_count_nodes(filter_json) -> int`
+- `cirisgraph_count_edges(scope: str) -> int`
+- `cirisgraph_count_nodes_by_type(scope: str) -> str` (JSON dict)
+
+`.pyi` stubs added with full docstrings. `cirisgraph_query_nodes`
+unchanged at the signature level — the new `exclude` filter key is
+additive inside `filter_json`.
+
+### Tests
+
+8 new (6 SQLite + 2 PG-gated):
+- `count_nodes` returns total in scope
+- `count_nodes` honors exclude rule (3-of-5 dropped)
+- `count_edges` returns total in scope
+- `count_nodes_by_type` group-by histogram
+- Missing scope on `count_nodes` rejected (AV-47)
+- `query_nodes` honors exclude rule in listing (drops matching rows
+  from the page)
+- PG: count_nodes_honors_exclude_rule + count_nodes_by_type_groups
+  (with serial_test::serial(postgres))
+
+### Compatibility
+
+- `NodeFilter` wire shape additive — `exclude` field defaults to
+  None and serde skips serialization when None. Existing JSON
+  payloads decode unchanged.
+- `query_nodes` / `count_nodes` / `count_edges` /
+  `count_nodes_by_type` all on `GraphService` trait. PG + SQLite
+  parity (no PG-only declarations per `[[feedback-no-pg-only-no-deferral]]`).
+
 ## [1.5.24] — 2026-05-19
 
 **`secrets_store_detected_secret` + docstring fix (CIRISPersist#66).**

@@ -119,6 +119,24 @@ pub enum EdgeDirection {
     Both,
 }
 
+/// Compound exclusion rule (v1.5.25, CIRISPersist#65). Excludes
+/// rows that match BOTH `node_type` AND `node_id_pattern` (SQL LIKE
+/// pattern). Models the agent's
+/// `NOT (node_type = 'tsdb_data' AND node_id LIKE 'metric_%')`
+/// memory-query exclusion verbatim.
+///
+/// Both fields are required — single-field excludes are not
+/// supported (use the existing `node_type` filter to match a type,
+/// or a future `node_id_prefix` filter for LIKE-only filters).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NodeExcludeRule {
+    /// Apply the exclusion only to rows with this `node_type`.
+    pub node_type: String,
+    /// SQL LIKE pattern (e.g. `"metric_%"`) — `%` for wildcard.
+    /// Caller is responsible for shape; we pass through verbatim.
+    pub node_id_pattern: String,
+}
+
 /// Filter for [`super::GraphService::query_nodes`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeFilter {
@@ -137,6 +155,10 @@ pub struct NodeFilter {
     /// Inclusive upper bound on `updated_at`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_before: Option<DateTime<Utc>>,
+    /// v1.5.25 (CIRISPersist#65) — compound exclusion rule.
+    /// `NOT (node_type = rule.node_type AND node_id LIKE rule.node_id_pattern)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude: Option<NodeExcludeRule>,
 }
 
 /// Cursor-paged result page for [`super::GraphService::query_nodes`].

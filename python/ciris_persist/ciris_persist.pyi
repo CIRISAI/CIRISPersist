@@ -889,6 +889,44 @@ class Engine:
         revoked, ``None`` otherwise. Backed by the PRIMARY KEY index.
         """
 
+    # ── v1.5.25 (CIRISPersist#65) — cirisgraph count primitives ─────
+
+    def cirisgraph_count_nodes(self, filter_json: str) -> int:
+        """v1.5.25 (CIRISPersist#65) — Count nodes matching ``filter_json``.
+
+        ``filter_json`` is a JSON-encoded ``NodeFilter`` — same shape
+        accepted by :meth:`cirisgraph_query_nodes`, including the
+        v1.5.25 ``exclude`` field for the compound exclusion rule
+        (``NOT (node_type = ... AND node_id LIKE ...)``). The
+        ``scope`` field is required (AV-47 — no implicit "all scopes"
+        reads).
+
+        Returns the raw integer (not a JSON envelope).
+
+        Unblocks CIRISAgent 2.9.0 Phase 4
+        (``COUNT(*) FROM graph_nodes`` API tile).
+        """
+
+    def cirisgraph_count_edges(self, scope: str) -> int:
+        """v1.5.25 (CIRISPersist#65) — Count edges within ``scope``.
+
+        ``scope`` is one of ``"local"``, ``"identity"``,
+        ``"environment"``, ``"community"`` (the
+        :class:`cirisgraph.GraphScope` SQL strings). Returns the raw
+        integer.
+        """
+
+    def cirisgraph_count_nodes_by_type(self, scope: str) -> str:
+        """v1.5.25 (CIRISPersist#65) — Group-by-type histogram of
+        nodes in ``scope``.
+
+        Returns the JSON-encoded ``dict[str, int]`` mapping
+        ``node_type`` → row count. Useful for the dashboard
+        "memory composition by type" tile (replacing the agent's raw
+        ``SELECT node_type, COUNT(*) FROM graph_nodes GROUP BY
+        node_type`` SQL).
+        """
+
     # ── v1.5.24 (CIRISPersist#66) — agent-detected secret store ─────
 
     def secrets_store_detected_secret(

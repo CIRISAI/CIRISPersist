@@ -551,6 +551,16 @@ impl GraphService for PostgresBackend {
             params.push(Box::new(before));
             where_parts.push(format!("updated_at <= ${}", params.len()));
         }
+        if let Some(rule) = filter.exclude {
+            // NOT (node_type = $T AND node_id LIKE $P).
+            params.push(Box::new(rule.node_type));
+            let p_type = params.len();
+            params.push(Box::new(rule.node_id_pattern));
+            let p_pat = params.len();
+            where_parts.push(format!(
+                "NOT (node_type = ${p_type} AND node_id LIKE ${p_pat})"
+            ));
+        }
         if let Some(cur) = &cursor {
             if cur.version != "v1" {
                 return Err(Error::InvalidArgument(format!(
@@ -600,6 +610,113 @@ impl GraphService for PostgresBackend {
             None
         };
         Ok(NodeListPage { items, next_cursor })
+    }
+
+    async fn count_nodes(&self, filter: NodeFilter) -> Result<u64, Error> {
+        let scope = filter
+            .scope
+            .ok_or_else(|| Error::InvalidArgument("NodeFilter.scope is required (AV-47)".into()))?;
+        let mut where_parts: Vec<String> = vec!["scope = $1".to_string()];
+        let scope_str = scope.as_sql_str().to_string();
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
+            vec![Box::new(scope_str)];
+
+        if let Some(nt) = filter.node_type {
+            params.push(Box::new(nt));
+            where_parts.push(format!("node_type = ${}", params.len()));
+        }
+        if let Some(contains) = filter.attributes_contains {
+            params.push(Box::new(contains));
+            where_parts.push(format!("attributes @> ${}", params.len()));
+        }
+        if let Some(after) = filter.updated_after {
+            params.push(Box::new(after));
+            where_parts.push(format!("updated_at >= ${}", params.len()));
+        }
+        if let Some(before) = filter.updated_before {
+            params.push(Box::new(before));
+            where_parts.push(format!("updated_at <= ${}", params.len()));
+        }
+        if let Some(rule) = filter.exclude {
+            params.push(Box::new(rule.node_type));
+            let p_type = params.len();
+            params.push(Box::new(rule.node_id_pattern));
+            let p_pat = params.len();
+            where_parts.push(format!(
+                "NOT (node_type = ${p_type} AND node_id LIKE ${p_pat})"
+            ));
+        }
+        let where_sql = where_parts.join(" AND ");
+        let sql = format!("SELECT COUNT(*)::BIGINT FROM cirisgraph.nodes WHERE {where_sql}");
+
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let row = client
+            .query_one(&sql, &params_ref[..])
+            .await
+            .map_err(|e| map_pg_error(e, "count_nodes"))?;
+        let count: i64 = row
+            .try_get(0)
+            .map_err(|e| Error::Backend(format!("decode count: {e}")))?;
+        Ok(count.max(0) as u64)
+    }
+
+    async fn count_edges(&self, scope: GraphScope) -> Result<u64, Error> {
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let scope_str = scope.as_sql_str().to_string();
+        let row = client
+            .query_one(
+                "SELECT COUNT(*)::BIGINT FROM cirisgraph.edges WHERE scope = $1",
+                &[&scope_str],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "count_edges"))?;
+        let count: i64 = row
+            .try_get(0)
+            .map_err(|e| Error::Backend(format!("decode count: {e}")))?;
+        Ok(count.max(0) as u64)
+    }
+
+    async fn count_nodes_by_type(
+        &self,
+        scope: GraphScope,
+    ) -> Result<std::collections::HashMap<String, u64>, Error> {
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let scope_str = scope.as_sql_str().to_string();
+        let rows = client
+            .query(
+                "SELECT node_type, COUNT(*)::BIGINT \
+                 FROM cirisgraph.nodes \
+                 WHERE scope = $1 \
+                 GROUP BY node_type",
+                &[&scope_str],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "count_nodes_by_type"))?;
+        let mut out: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        for row in &rows {
+            let nt: String = row
+                .try_get(0)
+                .map_err(|e| Error::Backend(format!("decode node_type: {e}")))?;
+            let c: i64 = row
+                .try_get(1)
+                .map_err(|e| Error::Backend(format!("decode count: {e}")))?;
+            out.insert(nt, c.max(0) as u64);
+        }
+        Ok(out)
     }
 }
 
@@ -819,9 +936,7 @@ mod tests {
                 NodeFilter {
                     scope: Some(GraphScope::Local),
                     node_type: Some("test".into()),
-                    attributes_contains: None,
-                    updated_after: None,
-                    updated_before: None,
+                    ..Default::default()
                 },
                 None,
                 100,
@@ -845,5 +960,103 @@ mod tests {
         assert!(deleted);
         let gone = backend.get_node(&n_a, GraphScope::Local).await.unwrap();
         assert!(gone.is_none(), "hard-deleted node should be gone");
+    }
+
+    // ── v1.5.25 (CIRISPersist#65) count + exclude PG tests ─────────
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn cirisgraph_pg_count_nodes_honors_exclude_rule() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        // Tag fixtures with a unique probe attribute so the count is
+        // isolated from prior test-run state in the shared DB.
+        let probe = Uuid::new_v4().simple().to_string();
+        let mk = |nid: &str| {
+            let mut n = fixture_node(nid, GraphScope::Local, "tsdb_data");
+            n.attributes = serde_json::json!({"probe": probe.clone()});
+            n
+        };
+        for i in 0..3 {
+            backend
+                .upsert_node(mk(&format!("metric_{i}-{probe}")), 0, false)
+                .await
+                .unwrap();
+        }
+        for i in 0..2 {
+            backend
+                .upsert_node(mk(&format!("summary_{i}-{probe}")), 0, false)
+                .await
+                .unwrap();
+        }
+
+        let count_all = backend
+            .count_nodes(NodeFilter {
+                scope: Some(GraphScope::Local),
+                node_type: Some("tsdb_data".into()),
+                attributes_contains: Some(serde_json::json!({"probe": probe.clone()})),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(count_all, 5, "5 fresh fixtures expected");
+
+        let count_excluded = backend
+            .count_nodes(NodeFilter {
+                scope: Some(GraphScope::Local),
+                node_type: Some("tsdb_data".into()),
+                attributes_contains: Some(serde_json::json!({"probe": probe.clone()})),
+                exclude: Some(crate::graph::NodeExcludeRule {
+                    node_type: "tsdb_data".into(),
+                    node_id_pattern: "metric_%".into(),
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            count_excluded, 2,
+            "3 metric_* rows excluded; 2 summary_* remain"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn cirisgraph_pg_count_nodes_by_type_groups() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let suffix = Uuid::new_v4().simple().to_string();
+        for (label, ty, n) in &[
+            ("m", "memory_pg", 3),
+            ("c", "concept_pg", 2),
+            ("t", "tsdb_summary_pg", 1),
+        ] {
+            for i in 0..*n {
+                let nid = format!("{label}{i}-{suffix}");
+                backend
+                    .upsert_node(fixture_node(&nid, GraphScope::Local, ty), 0, false)
+                    .await
+                    .unwrap();
+            }
+        }
+        let map = backend
+            .count_nodes_by_type(GraphScope::Local)
+            .await
+            .unwrap();
+        assert!(map.get("memory_pg").copied().unwrap_or(0) >= 3);
+        assert!(map.get("concept_pg").copied().unwrap_or(0) >= 2);
+        assert!(map.get("tsdb_summary_pg").copied().unwrap_or(0) >= 1);
     }
 }

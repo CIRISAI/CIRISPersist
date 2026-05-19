@@ -7159,6 +7159,116 @@ impl PyEngine {
         })
     }
 
+    /// v1.5.25 (CIRISPersist#65) — Count nodes matching `filter`.
+    /// Returns the raw integer (not a JSON envelope).
+    /// AV-47: filter MUST name a scope.
+    #[cfg(feature = "cirisgraph")]
+    fn cirisgraph_count_nodes(&self, py: Python<'_>, filter_json: &str) -> PyResult<u64> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let filter: crate::graph::NodeFilter = serde_json::from_str(filter_json)
+                .map_err(|e| PyValueError::new_err(format!("NodeFilter decode: {e}")))?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::graph::GraphService;
+                        backend
+                            .count_nodes(filter)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::graph::sqlite::SqliteGraphBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::graph::GraphService;
+                        backend
+                            .count_nodes(filter)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.25 (CIRISPersist#65) — Count edges within `scope`.
+    /// Returns the raw integer.
+    #[cfg(feature = "cirisgraph")]
+    fn cirisgraph_count_edges(&self, py: Python<'_>, scope: &str) -> PyResult<u64> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let scope_parsed = crate::graph::GraphScope::from_sql_str(scope)
+                .ok_or_else(|| PyValueError::new_err(format!("unknown scope: {scope}")))?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::graph::GraphService;
+                        backend
+                            .count_edges(scope_parsed)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::graph::sqlite::SqliteGraphBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::graph::GraphService;
+                        backend
+                            .count_edges(scope_parsed)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.5.25 (CIRISPersist#65) — Group-by-type histogram of nodes
+    /// in `scope`. Returns the JSON-encoded `dict[str, int]`
+    /// `{node_type: count}`.
+    #[cfg(feature = "cirisgraph")]
+    fn cirisgraph_count_nodes_by_type(&self, py: Python<'_>, scope: &str) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let scope_parsed = crate::graph::GraphScope::from_sql_str(scope)
+                .ok_or_else(|| PyValueError::new_err(format!("unknown scope: {scope}")))?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::graph::GraphService;
+                        let map = backend
+                            .count_nodes_by_type(scope_parsed)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&map).map_err(|e| {
+                            PyRuntimeError::new_err(format!("count_nodes_by_type encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::graph::sqlite::SqliteGraphBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::graph::GraphService;
+                        let map = backend
+                            .count_nodes_by_type(scope_parsed)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&map).map_err(|e| {
+                            PyRuntimeError::new_err(format!("count_nodes_by_type encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
     // ── v0.8.1: audit-log PyO3 surface (CIRISPersist#35) ─────────────
     //
     // 3 methods wrapping AuditService. JSON-in / JSON-out across the

@@ -751,6 +751,11 @@ impl GraphService for SqliteGraphBackend {
             params.push(SqlValue::Text(fmt_datetime(before)));
             where_parts.push("updated_at <= ?".to_string());
         }
+        if let Some(rule) = filter.exclude {
+            params.push(SqlValue::Text(rule.node_type));
+            params.push(SqlValue::Text(rule.node_id_pattern));
+            where_parts.push("NOT (node_type = ? AND node_id LIKE ?)".to_string());
+        }
         if let Some(cur) = &cursor {
             if cur.version != "v1" {
                 return Err(Error::InvalidArgument(format!(
@@ -799,6 +804,118 @@ impl GraphService for SqliteGraphBackend {
             };
             Ok(NodeListPage { items, next_cursor })
         })
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+    }
+
+    async fn count_nodes(&self, filter: NodeFilter) -> Result<u64, Error> {
+        let scope = filter
+            .scope
+            .ok_or_else(|| Error::InvalidArgument("NodeFilter.scope is required (AV-47)".into()))?;
+        let mut where_parts: Vec<String> = vec!["scope = ?".to_string()];
+        let scope_str = scope.as_sql_str().to_owned();
+        let mut params: Vec<SqlValue> = vec![SqlValue::Text(scope_str)];
+
+        if let Some(nt) = filter.node_type {
+            params.push(SqlValue::Text(nt));
+            where_parts.push("node_type = ?".to_string());
+        }
+        if let Some(contains) = filter.attributes_contains {
+            if let Some(obj) = contains.as_object() {
+                for (k, v) in obj {
+                    let json_path = format!("$.{k}");
+                    let v_str = serde_json::to_string(v).map_err(|e| {
+                        Error::Internal(format!("attributes_contains serialize: {e}"))
+                    })?;
+                    params.push(SqlValue::Text(json_path));
+                    params.push(SqlValue::Text(v_str));
+                    where_parts.push(format!(
+                        "json_extract(attributes, ?{}) = json(?{})",
+                        params.len() - 1,
+                        params.len()
+                    ));
+                }
+            } else {
+                return Err(Error::InvalidArgument(
+                    "attributes_contains must be a JSON object".into(),
+                ));
+            }
+        }
+        if let Some(after) = filter.updated_after {
+            params.push(SqlValue::Text(fmt_datetime(after)));
+            where_parts.push("updated_at >= ?".to_string());
+        }
+        if let Some(before) = filter.updated_before {
+            params.push(SqlValue::Text(fmt_datetime(before)));
+            where_parts.push("updated_at <= ?".to_string());
+        }
+        if let Some(rule) = filter.exclude {
+            params.push(SqlValue::Text(rule.node_type));
+            params.push(SqlValue::Text(rule.node_id_pattern));
+            where_parts.push("NOT (node_type = ? AND node_id LIKE ?)".to_string());
+        }
+        let where_sql = where_parts.join(" AND ");
+        let sql = format!("SELECT COUNT(*) FROM cirisgraph_nodes WHERE {where_sql}");
+
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<u64, Error> {
+            let guard = conn.blocking_lock();
+            let count: i64 = guard
+                .query_row(&sql, params_from_iter(params.iter()), |row| row.get(0))
+                .map_err(|e| map_sqlite_error(e, "count_nodes"))?;
+            Ok(count.max(0) as u64)
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+    }
+
+    async fn count_edges(&self, scope: GraphScope) -> Result<u64, Error> {
+        let scope_str = scope.as_sql_str().to_owned();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<u64, Error> {
+            let guard = conn.blocking_lock();
+            let count: i64 = guard
+                .query_row(
+                    "SELECT COUNT(*) FROM cirisgraph_edges WHERE scope = ?1",
+                    params![scope_str],
+                    |row| row.get(0),
+                )
+                .map_err(|e| map_sqlite_error(e, "count_edges"))?;
+            Ok(count.max(0) as u64)
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+    }
+
+    async fn count_nodes_by_type(
+        &self,
+        scope: GraphScope,
+    ) -> Result<std::collections::HashMap<String, u64>, Error> {
+        let scope_str = scope.as_sql_str().to_owned();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(
+            move || -> Result<std::collections::HashMap<String, u64>, Error> {
+                let guard = conn.blocking_lock();
+                let mut stmt = guard
+                    .prepare(
+                        "SELECT node_type, COUNT(*) FROM cirisgraph_nodes \
+                         WHERE scope = ?1 GROUP BY node_type",
+                    )
+                    .map_err(|e| map_sqlite_error(e, "count_nodes_by_type prepare"))?;
+                let rows = stmt
+                    .query_map(params![scope_str], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })
+                    .map_err(|e| map_sqlite_error(e, "count_nodes_by_type query"))?;
+                let mut out: std::collections::HashMap<String, u64> =
+                    std::collections::HashMap::new();
+                for r in rows {
+                    let (nt, c) = r.map_err(|e| map_sqlite_error(e, "count_nodes_by_type row"))?;
+                    out.insert(nt, c.max(0) as u64);
+                }
+                Ok(out)
+            },
+        )
         .await
         .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
     }
@@ -1196,6 +1313,206 @@ mod tests {
         assert!(msg.contains("hex"), "missing hex dump: {msg}");
         assert!(msg.contains("c0"), "missing the invalid byte 0xC0: {msg}");
         assert!(msg.contains("bytes total"), "missing total length: {msg}");
+    }
+
+    // ── v1.5.25 (CIRISPersist#65) count + exclude tests ─────────────
+
+    #[tokio::test]
+    async fn count_nodes_returns_total_in_scope() {
+        let (_b, graph) = fresh_backend().await;
+        let suffix = Uuid::new_v4().simple().to_string();
+        for i in 0..5 {
+            let nid = format!("count:{i}-{suffix}");
+            graph
+                .upsert_node(fixture_node(&nid, GraphScope::Local, "test"), 0, false)
+                .await
+                .unwrap();
+        }
+        // Insert a different-scope node — should NOT count toward Local.
+        let other_scope_id = format!("count:other-{suffix}");
+        graph
+            .upsert_node(
+                fixture_node(&other_scope_id, GraphScope::Environment, "test"),
+                0,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let count = graph
+            .count_nodes(NodeFilter {
+                scope: Some(GraphScope::Local),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // At least our 5 (other tests may also have inserted in-mem; check >= 5).
+        assert!(count >= 5, "got {count}");
+    }
+
+    #[tokio::test]
+    async fn count_nodes_honors_exclude_rule() {
+        let (_b, graph) = fresh_backend().await;
+        let suffix = Uuid::new_v4().simple().to_string();
+        // 3 tsdb_data nodes named `metric_*` (target of exclusion).
+        for i in 0..3 {
+            let nid = format!("metric_{i}-{suffix}");
+            graph
+                .upsert_node(fixture_node(&nid, GraphScope::Local, "tsdb_data"), 0, false)
+                .await
+                .unwrap();
+        }
+        // 2 tsdb_data nodes NOT named metric_* (kept).
+        for i in 0..2 {
+            let nid = format!("summary_{i}-{suffix}");
+            graph
+                .upsert_node(fixture_node(&nid, GraphScope::Local, "tsdb_data"), 0, false)
+                .await
+                .unwrap();
+        }
+        // 1 other-typed node (kept regardless of pattern).
+        let other_id = format!("memory_x-{suffix}");
+        graph
+            .upsert_node(
+                fixture_node(&other_id, GraphScope::Local, "memory"),
+                0,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let count_all = graph
+            .count_nodes(NodeFilter {
+                scope: Some(GraphScope::Local),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let count_excluded = graph
+            .count_nodes(NodeFilter {
+                scope: Some(GraphScope::Local),
+                exclude: Some(crate::graph::NodeExcludeRule {
+                    node_type: "tsdb_data".into(),
+                    node_id_pattern: "metric_%".into(),
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // 3 metric_* rows should be excluded.
+        assert_eq!(count_excluded + 3, count_all);
+    }
+
+    #[tokio::test]
+    async fn count_edges_in_scope() {
+        let (_b, graph) = fresh_backend().await;
+        let suffix = Uuid::new_v4().simple().to_string();
+        let a = format!("e:a-{suffix}");
+        let b = format!("e:b-{suffix}");
+        graph
+            .upsert_node(fixture_node(&a, GraphScope::Local, "test"), 0, false)
+            .await
+            .unwrap();
+        graph
+            .upsert_node(fixture_node(&b, GraphScope::Local, "test"), 0, false)
+            .await
+            .unwrap();
+        for _ in 0..4 {
+            graph
+                .upsert_edge(fixture_edge(&a, &b, GraphScope::Local, "rel"), false)
+                .await
+                .unwrap();
+        }
+        let count = graph.count_edges(GraphScope::Local).await.unwrap();
+        assert!(count >= 4, "got {count}");
+    }
+
+    #[tokio::test]
+    async fn count_nodes_by_type_groups_correctly() {
+        let (_b, graph) = fresh_backend().await;
+        let suffix = Uuid::new_v4().simple().to_string();
+        // 3 memory + 2 concept + 1 tsdb_summary.
+        for (label, ty, n) in &[
+            ("m", "memory", 3),
+            ("c", "concept", 2),
+            ("t", "tsdb_summary", 1),
+        ] {
+            for i in 0..*n {
+                let nid = format!("{label}{i}-{suffix}");
+                graph
+                    .upsert_node(fixture_node(&nid, GraphScope::Local, ty), 0, false)
+                    .await
+                    .unwrap();
+            }
+        }
+        let map = graph.count_nodes_by_type(GraphScope::Local).await.unwrap();
+        // The map may have prior in-mem rows; just check our types.
+        assert!(map.get("memory").copied().unwrap_or(0) >= 3);
+        assert!(map.get("concept").copied().unwrap_or(0) >= 2);
+        assert!(map.get("tsdb_summary").copied().unwrap_or(0) >= 1);
+    }
+
+    #[tokio::test]
+    async fn count_nodes_missing_scope_rejected() {
+        let (_b, graph) = fresh_backend().await;
+        let err = graph.count_nodes(NodeFilter::default()).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn query_nodes_honors_exclude_rule_in_listing() {
+        let (_b, graph) = fresh_backend().await;
+        let suffix = Uuid::new_v4().simple().to_string();
+        // 2 metric tsdb_data + 1 summary tsdb_data.
+        for i in 0..2 {
+            graph
+                .upsert_node(
+                    fixture_node(
+                        &format!("metric_{i}-{suffix}"),
+                        GraphScope::Local,
+                        "tsdb_data",
+                    ),
+                    0,
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        graph
+            .upsert_node(
+                fixture_node(&format!("summary-{suffix}"), GraphScope::Local, "tsdb_data"),
+                0,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let page = graph
+            .query_nodes(
+                NodeFilter {
+                    scope: Some(GraphScope::Local),
+                    node_type: Some("tsdb_data".into()),
+                    exclude: Some(crate::graph::NodeExcludeRule {
+                        node_type: "tsdb_data".into(),
+                        node_id_pattern: "metric_%".into(),
+                    }),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        // Filter to OUR suffix to exclude prior in-mem state.
+        let ours: Vec<_> = page
+            .items
+            .iter()
+            .filter(|n| n.node_id.contains(&suffix))
+            .collect();
+        assert_eq!(ours.len(), 1);
+        assert!(ours[0].node_id.starts_with("summary-"));
     }
 
     /// CIRISPersist#58 defense-in-depth: encode_attributes guards

@@ -122,4 +122,27 @@ pub trait GraphService: Send + Sync {
         cursor: Option<ListCursor>,
         limit: i64,
     ) -> impl Future<Output = Result<NodeListPage, Error>> + Send;
+
+    // ── Count primitives (v1.5.25, CIRISPersist#65) ─────────────
+
+    /// v1.5.25 — Count nodes matching the filter. Honors all
+    /// `NodeFilter` keys including the v1.5.25 `exclude` rule.
+    /// Filter MUST name a scope (AV-47).
+    fn count_nodes(&self, filter: NodeFilter) -> impl Future<Output = Result<u64, Error>> + Send;
+
+    /// v1.5.25 — Count edges within a scope. Hot-path observation:
+    /// the agent's API routes need a total-edges figure for
+    /// dashboard tiles; this is a single
+    /// `SELECT COUNT(*) FROM graph_edges WHERE scope = $1` and
+    /// fires the existing `(scope, …)` indexes.
+    fn count_edges(&self, scope: GraphScope) -> impl Future<Output = Result<u64, Error>> + Send;
+
+    /// v1.5.25 — Group-by-type histogram of nodes in a scope.
+    /// Returns a map `{node_type: count}` for the dashboard
+    /// "memory composition by type" tile. Filter MUST name a scope
+    /// (AV-47).
+    fn count_nodes_by_type(
+        &self,
+        scope: GraphScope,
+    ) -> impl Future<Output = Result<std::collections::HashMap<String, u64>, Error>> + Send;
 }
