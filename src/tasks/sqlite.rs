@@ -17,7 +17,7 @@ use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, O
 use tokio::sync::Mutex;
 
 use super::service::TaskService;
-use super::types::{Task, TaskCursor, TaskFilter, TaskListPage, TaskStatus};
+use super::types::{Task, TaskCursor, TaskFilter, TaskListPage, TaskStatus, TaskUpsertOutcome};
 use super::Error;
 use crate::ClaimResult;
 
@@ -48,6 +48,30 @@ fn map_sqlite_error(e: rusqlite::Error, op: &str) -> Error {
         }
     }
     Error::Backend(format!("{op}: {e}"))
+}
+
+/// `true` when the rusqlite error is a UNIQUE-constraint violation
+/// on `tasks_correlation_id_unique` (V036). Matches by extended
+/// error-code + substring of the index name in the message — SQLite
+/// surfaces the index name in the error text for constraint
+/// violations.
+fn is_correlation_unique_violation(e: &rusqlite::Error) -> bool {
+    if let rusqlite::Error::SqliteFailure(err, _msg) = e {
+        // 2067 = SQLITE_CONSTRAINT_UNIQUE (extended)
+        if err.extended_code == 2067 {
+            return e.to_string().contains("tasks_correlation_id_unique");
+        }
+    }
+    false
+}
+
+/// Extract `context.correlation_id` from a task. Mirrors the PG-side
+/// helper.
+fn correlation_id_from_task(task: &Task) -> Option<&str> {
+    let ctx = task.context.as_ref()?;
+    ctx.get("correlation_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
 }
 
 fn parse_datetime(s: &str) -> Result<chrono::DateTime<chrono::Utc>, Error> {
@@ -192,7 +216,7 @@ fn decode_task_row(row: &rusqlite::Row<'_>) -> Result<Task, Error> {
 }
 
 impl TaskService for SqliteTaskBackend {
-    async fn upsert_task(&self, task: Task) -> Result<(), Error> {
+    async fn upsert_task(&self, task: Task) -> Result<TaskUpsertOutcome, Error> {
         validate_task(&task)?;
         let context_str = encode_json_opt(task.context.as_ref())?;
         let outcome_str = encode_json_opt(task.outcome.as_ref())?;
@@ -202,18 +226,17 @@ impl TaskService for SqliteTaskBackend {
         let signed_at_str = task.signed_at.map(fmt_datetime);
         let status_str = task.status.as_sql_str().to_owned();
         let updated_info_int: i64 = if task.updated_info_available { 1 } else { 0 };
+        let correlation_id = correlation_id_from_task(&task).map(str::to_owned);
+        let task_id_owned = task.task_id.clone();
+        let agent_occurrence = task.agent_occurrence_id.clone();
 
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), Error> {
+        tokio::task::spawn_blocking(move || -> Result<TaskUpsertOutcome, Error> {
             let mut guard = conn.blocking_lock();
             let tx = guard
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|e| map_sqlite_error(e, "upsert_task begin"))?;
-            // ON CONFLICT (task_id) DO UPDATE — preserves created_at
-            // (excluded.created_at is ignored). retry_count taken
-            // from the new row so callers can monotonically advance
-            // it.
-            tx.execute(
+            let insert_res = tx.execute(
                 "INSERT INTO cirislens_tasks (\
                     task_id, channel_id, description, status, priority, \
                     created_at, updated_at, parent_task_id, context_json, outcome_json, \
@@ -259,11 +282,51 @@ impl TaskService for SqliteTaskBackend {
                     task.agent_occurrence_id,
                     images_str,
                 ],
-            )
-            .map_err(|e| map_sqlite_error(e, "upsert_task insert"))?;
-            tx.commit()
-                .map_err(|e| map_sqlite_error(e, "upsert_task commit"))?;
-            Ok(())
+            );
+            match insert_res {
+                Ok(_) => {
+                    let row = tx
+                        .query_row(
+                            "SELECT task_id, channel_id, description, status, priority, \
+                                    created_at, updated_at, parent_task_id, context_json, outcome_json, \
+                                    retry_count, signed_by, signature, signed_at, \
+                                    updated_info_available, updated_info_content, \
+                                    agent_occurrence_id, images_json \
+                             FROM cirislens_tasks WHERE task_id = ?1",
+                            params![task_id_owned],
+                            |row| Ok(decode_task_row(row)),
+                        )
+                        .map_err(|e| map_sqlite_error(e, "upsert_task readback"))??;
+                    tx.commit()
+                        .map_err(|e| map_sqlite_error(e, "upsert_task commit"))?;
+                    Ok(TaskUpsertOutcome::Stored(row))
+                }
+                Err(ref e) if is_correlation_unique_violation(e) => {
+                    let Some(cid) = correlation_id else {
+                        return Err(Error::Backend(format!(
+                            "upsert_task: tasks_correlation_id_unique fired with no correlation_id: {e}"
+                        )));
+                    };
+                    let row = tx
+                        .query_row(
+                            "SELECT task_id, channel_id, description, status, priority, \
+                                    created_at, updated_at, parent_task_id, context_json, outcome_json, \
+                                    retry_count, signed_by, signature, signed_at, \
+                                    updated_info_available, updated_info_content, \
+                                    agent_occurrence_id, images_json \
+                             FROM cirislens_tasks \
+                             WHERE agent_occurrence_id = ?1 \
+                               AND json_extract(context_json, '$.correlation_id') = ?2",
+                            params![agent_occurrence, cid],
+                            |row| Ok(decode_task_row(row)),
+                        )
+                        .map_err(|e| map_sqlite_error(e, "upsert_task correlation readback"))??;
+                    tx.commit()
+                        .map_err(|e| map_sqlite_error(e, "upsert_task commit"))?;
+                    Ok(TaskUpsertOutcome::AlreadyExists(row))
+                }
+                Err(e) => Err(map_sqlite_error(e, "upsert_task insert")),
+            }
         })
         .await
         .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
@@ -1030,5 +1093,110 @@ mod tests {
             .unwrap();
         assert_eq!(page.items.len(), 1);
         assert!(page.items[0].task_id.starts_with("b-"));
+    }
+
+    // ── v1.5.22 (CIRISPersist#61) correlation_id dedup ───────────────
+
+    fn mk_task_with_correlation(id: &str, occ: &str, correlation_id: &str) -> Task {
+        let mut t = mk_task(id, TaskStatus::Pending, occ);
+        t.context = Some(serde_json::json!({"correlation_id": correlation_id}));
+        t
+    }
+
+    #[tokio::test]
+    async fn upsert_task_returns_stored_envelope_on_clean_insert() {
+        let (_b, svc) = fresh_backend().await;
+        let id = format!("t-{}", Uuid::new_v4().simple());
+        let t = mk_task(&id, TaskStatus::Pending, "occ-1");
+        let outcome = svc.upsert_task(t).await.unwrap();
+        match outcome {
+            TaskUpsertOutcome::Stored(row) => assert_eq!(row.task_id, id),
+            other => panic!("expected Stored, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn upsert_task_returns_stored_on_same_task_id_re_upsert() {
+        let (_b, svc) = fresh_backend().await;
+        let id = format!("t-{}", Uuid::new_v4().simple());
+        let occ = "occ-1";
+        let cid = format!("upstream-{}", Uuid::new_v4().simple());
+        let t1 = mk_task_with_correlation(&id, occ, &cid);
+        let _ = svc.upsert_task(t1.clone()).await.unwrap();
+
+        // Re-upsert same task_id (mutables change): ON CONFLICT(task_id)
+        // UPDATE wins — should NOT trip the correlation unique index.
+        let mut t2 = t1.clone();
+        t2.description = "updated".into();
+        let outcome = svc.upsert_task(t2).await.unwrap();
+        match outcome {
+            TaskUpsertOutcome::Stored(row) => {
+                assert_eq!(row.task_id, id);
+                assert_eq!(row.description, "updated");
+            }
+            other => panic!("expected Stored on re-upsert, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn upsert_task_returns_already_exists_on_correlation_collision() {
+        let (_b, svc) = fresh_backend().await;
+        let occ = "occ-1";
+        let cid = format!("upstream-{}", Uuid::new_v4().simple());
+        let first_id = format!("t1-{}", Uuid::new_v4().simple());
+        let first = mk_task_with_correlation(&first_id, occ, &cid);
+        let _ = svc.upsert_task(first.clone()).await.unwrap();
+
+        // Different task_id, same (occ, correlation_id) → dedup.
+        let second_id = format!("t2-{}", Uuid::new_v4().simple());
+        let second = mk_task_with_correlation(&second_id, occ, &cid);
+        let outcome = svc.upsert_task(second).await.unwrap();
+        match outcome {
+            TaskUpsertOutcome::AlreadyExists(row) => {
+                // Canonical row is the FIRST, not the caller's.
+                assert_eq!(row.task_id, first_id);
+                assert_ne!(row.task_id, second_id);
+            }
+            other => panic!("expected AlreadyExists, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn upsert_task_correlation_index_scoped_to_occurrence() {
+        // Same correlation_id under different occurrence is allowed.
+        let (_b, svc) = fresh_backend().await;
+        let cid = format!("upstream-{}", Uuid::new_v4().simple());
+        let id1 = format!("t1-{}", Uuid::new_v4().simple());
+        let id2 = format!("t2-{}", Uuid::new_v4().simple());
+
+        let _ = svc
+            .upsert_task(mk_task_with_correlation(&id1, "occ-a", &cid))
+            .await
+            .unwrap();
+        let outcome = svc
+            .upsert_task(mk_task_with_correlation(&id2, "occ-b", &cid))
+            .await
+            .unwrap();
+        match outcome {
+            TaskUpsertOutcome::Stored(row) => assert_eq!(row.task_id, id2),
+            other => panic!("expected Stored across occurrences, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn upsert_task_no_correlation_id_inserts_normally() {
+        // Tasks without correlation_id (or with NULL context) don't
+        // participate in the partial index — even thousands of them
+        // can coexist without dedup.
+        let (_b, svc) = fresh_backend().await;
+        let occ = "occ-1";
+        for _ in 0..3 {
+            let id = format!("t-{}", Uuid::new_v4().simple());
+            let outcome = svc
+                .upsert_task(mk_task(&id, TaskStatus::Pending, occ))
+                .await
+                .unwrap();
+            assert!(matches!(outcome, TaskUpsertOutcome::Stored(_)));
+        }
     }
 }

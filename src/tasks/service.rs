@@ -7,7 +7,7 @@ use std::future::Future;
 
 use crate::ClaimResult;
 
-use super::types::{Task, TaskCursor, TaskFilter, TaskListPage, TaskStatus};
+use super::types::{Task, TaskCursor, TaskFilter, TaskListPage, TaskStatus, TaskUpsertOutcome};
 use super::Error;
 
 /// Agent tasks substrate trait — absorbs CIRISAgent's `tasks`
@@ -19,7 +19,32 @@ pub trait TaskService: Send + Sync {
     /// context, outcome, retry_count, signature triple,
     /// updated_info_*, images) while preserving `created_at` from the
     /// original row.
-    fn upsert_task(&self, task: Task) -> impl Future<Output = Result<(), Error>> + Send;
+    ///
+    /// # Correlation-id dedup (v1.5.22, CIRISPersist#61)
+    ///
+    /// V036 added a partial UNIQUE index on
+    /// `(agent_occurrence_id, context_json->>'correlation_id')`
+    /// where `correlation_id IS NOT NULL`. When a caller submits a
+    /// new `task_id` whose `context.correlation_id` already exists
+    /// under the same occurrence, the INSERT trips the index and
+    /// this method returns
+    /// [`TaskUpsertOutcome::AlreadyExists`]`(existing_task)` carrying
+    /// the EXISTING row (with its existing `task_id` — NOT the
+    /// caller's). Mirrors the `try_claim_shared_task` envelope shape.
+    ///
+    /// Without a `correlation_id` (or with a NULL `context_json`)
+    /// the partial index doesn't apply and the row inserts normally
+    /// as [`TaskUpsertOutcome::Stored`].
+    ///
+    /// Re-upsert with the SAME `task_id` (regardless of
+    /// correlation_id) still resolves via `ON CONFLICT(task_id) DO
+    /// UPDATE` and returns
+    /// [`TaskUpsertOutcome::Stored`]`(canonical_row)` — idempotency
+    /// preserved.
+    fn upsert_task(
+        &self,
+        task: Task,
+    ) -> impl Future<Output = Result<TaskUpsertOutcome, Error>> + Send;
 
     /// Read one task by id. Returns `None` if no matching row.
     fn get_task(&self, task_id: &str) -> impl Future<Output = Result<Option<Task>, Error>> + Send;

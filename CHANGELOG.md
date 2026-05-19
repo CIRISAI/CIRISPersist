@@ -5,6 +5,94 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.5.22] — 2026-05-19
+
+**`correlation_id` uniqueness + `task_upsert` outcome envelope (CIRISPersist#61).**
+
+Third of six v1.5.19 follow-ups. Restores the legacy CIRISAgent
+migration-006 invariant that `add_task` won't duplicate when the
+same upstream event (Reddit comment, Discord message, etc.) arrives
+twice within the same `agent_occurrence_id`. Persist now enforces
+this at the DB layer instead of relying on the agent's racey
+client-side pre-check (paginates every task in the occurrence,
+TOCTOU between get and upsert).
+
+### V036 migration — partial UNIQUE index
+
+- **Postgres:** `CREATE UNIQUE INDEX tasks_correlation_id_unique
+  ON cirislens.tasks (agent_occurrence_id,
+  (context_json->>'correlation_id')) WHERE context_json IS NOT NULL
+  AND context_json->>'correlation_id' IS NOT NULL`.
+- **SQLite:** same shape using `json_extract(context_json,
+  '$.correlation_id')`. Partial expression index supported since
+  SQLite 3.9.0.
+
+Partial so correlation-less rows (most agent-internal tasks) skip
+the index entirely. Index name `tasks_correlation_id_unique` is the
+load-bearing identifier — the impl matches by constraint/index name
+to distinguish from PK conflicts.
+
+### `task_upsert` outcome envelope — breaking change
+
+`TaskService::upsert_task` signature: `(Task) -> Result<(), Error>`
+→ `(Task) -> Result<TaskUpsertOutcome, Error>`.
+
+`TaskUpsertOutcome` is `Stored(Task) | AlreadyExists(Task)`:
+
+- `Stored` — INSERT clean, or `ON CONFLICT(task_id) DO UPDATE`
+  resolved to the caller's row. Canonical post-upsert shape
+  returned (the impl re-reads to capture computed columns).
+- `AlreadyExists` — V036 unique index tripped. A different `task_id`
+  with the same `(agent_occurrence_id, correlation_id)` already
+  exists. Returned `Task` carries the EXISTING row (its existing
+  `task_id`, not the caller's). Mirrors `try_claim_shared_task`'s
+  `ClaimResult` envelope shape.
+
+The `AlreadyExists` outcome only fires when the caller's
+`context.correlation_id` is set. Tasks without one insert normally
+as `Stored`.
+
+Per [[feedback-clean-break-renames]] / [[feedback-rename-consistency]]:
+no deprecation alias, no second-method scaffold. Done in one cut
+while CIRISAgent#763 is mid-absorption so callers reconcile against
+the new shape directly.
+
+### PyO3 + .pyi
+
+- `Engine.task_upsert(task_json) -> str` (was `-> None`). Returns
+  the JSON envelope `{"outcome": "stored" | "already_exists",
+  "task": <Task>}`. Callers that previously discarded the return
+  continue to work; callers that need dedup-detection unpack the
+  envelope.
+- `.pyi` docstring updated with the breaking-change note.
+
+### Tests
+
+9 new (5 SQLite + 4 PG-gated):
+- Clean insert → `Stored` envelope, canonical row carries caller's
+  task_id.
+- Re-upsert same task_id with mutated payload → `Stored`
+  (ON CONFLICT(task_id) UPDATE wins; correlation index does NOT
+  trip).
+- Different task_id, same (occurrence, correlation_id) → `AlreadyExists`
+  carrying the first task_id.
+- Same correlation_id under different occurrences → both `Stored`
+  (index is per-occurrence).
+- No correlation_id → many `Stored` inserts coexist.
+
+585/585 pass across `postgres + sqlite + all 11 cirislens features`.
+
+### Migration-rollout note
+
+If the existing PG/SQLite data carries duplicate
+`(agent_occurrence_id, correlation_id)` pairs (e.g. from CIRISAgent
+v2.8.x pre-absorption), V036 will fail with a UNIQUE_VIOLATION at
+index creation. Pre-existing data sets need a one-shot dedup pass
+before this migration applies cleanly. The 11-substrate landings
+(v1.5.9-v1.5.19) shipped before any agent traffic flowed through
+them so there are no production duplicates today, but operators
+running pre-1.5.x snapshots should validate before applying V036.
+
 ## [1.5.21] — 2026-05-19
 
 **`created_before` / `created_after` filters on `task_list` + `thought_list` (CIRISPersist#62).**

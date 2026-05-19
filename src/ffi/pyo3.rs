@@ -8174,8 +8174,15 @@ impl PyEngine {
     /// Re-insert with same payload is a no-op; re-insert with
     /// differing payload overwrites mutable columns and preserves
     /// `created_at`.
+    ///
+    /// v1.5.22 (CIRISPersist#61): returns the JSON-encoded outcome
+    /// envelope `{"outcome": "stored" | "already_exists", "task":
+    /// <Task>}`. When `context.correlation_id` is set and a
+    /// different task with the same `(agent_occurrence_id,
+    /// correlation_id)` already exists, the V036 unique index
+    /// resolves to `already_exists` carrying the EXISTING row.
     #[cfg(feature = "cirislens_tasks")]
-    fn task_upsert(&self, py: Python<'_>, task_json: &str) -> PyResult<()> {
+    fn task_upsert(&self, py: Python<'_>, task_json: &str) -> PyResult<String> {
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let task: crate::tasks::Task = serde_json::from_str(task_json)
@@ -8187,9 +8194,12 @@ impl PyEngine {
                         // UFCS — PostgresBackend has a Phase-3
                         // `Backend::upsert_task` placeholder; disambiguate
                         // to the concrete TaskService impl here.
-                        crate::tasks::TaskService::upsert_task(&*backend, task)
+                        let outcome = crate::tasks::TaskService::upsert_task(&*backend, task)
                             .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&outcome).map_err(|e| {
+                            PyRuntimeError::new_err(format!("TaskUpsertOutcome encode: {e}"))
+                        })
                     })
                 }
                 #[cfg(feature = "sqlite")]
@@ -8197,10 +8207,13 @@ impl PyEngine {
                     let backend = crate::tasks::sqlite::SqliteTaskBackend::new(sq.conn_handle());
                     runtime.block_on(async move {
                         use crate::tasks::TaskService;
-                        backend
+                        let outcome = backend
                             .upsert_task(task)
                             .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&outcome).map_err(|e| {
+                            PyRuntimeError::new_err(format!("TaskUpsertOutcome encode: {e}"))
+                        })
                     })
                 }
             })

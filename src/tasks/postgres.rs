@@ -8,7 +8,7 @@
 //! child in the same tx passes constraint check at COMMIT.
 
 use super::service::TaskService;
-use super::types::{Task, TaskCursor, TaskFilter, TaskListPage, TaskStatus};
+use super::types::{Task, TaskCursor, TaskFilter, TaskListPage, TaskStatus, TaskUpsertOutcome};
 use super::Error;
 use crate::store::postgres::PostgresBackend;
 use crate::ClaimResult;
@@ -120,16 +120,29 @@ fn decode_task_row(row: &tokio_postgres::Row) -> Result<Task, Error> {
     })
 }
 
+/// Extract the `context.correlation_id` string from the task's
+/// `context_json`. Returns `Some(id)` only when the field is present
+/// and a non-empty string (matches the V036 partial-index WHERE
+/// clause).
+fn correlation_id_from_task(task: &Task) -> Option<&str> {
+    let ctx = task.context.as_ref()?;
+    ctx.get("correlation_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+}
+
 impl TaskService for PostgresBackend {
-    async fn upsert_task(&self, task: Task) -> Result<(), Error> {
+    async fn upsert_task(&self, task: Task) -> Result<TaskUpsertOutcome, Error> {
         validate_task(&task)?;
         let status_str = task.status.as_sql_str().to_owned();
+        let correlation_id = correlation_id_from_task(&task).map(str::to_owned);
+        let agent_occurrence = task.agent_occurrence_id.clone();
         let client = self
             .pool()
             .get()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
-        client
+        let insert_res = client
             .execute(
                 "INSERT INTO cirislens.tasks (\
                     task_id, channel_id, description, status, priority, \
@@ -177,9 +190,68 @@ impl TaskService for PostgresBackend {
                     &task.images,
                 ],
             )
-            .await
-            .map_err(|e| map_pg_error(e, "upsert_task"))?;
-        Ok(())
+            .await;
+        match insert_res {
+            Ok(_) => {
+                // Re-read the row so callers always get the canonical
+                // post-upsert shape (matters for the ON CONFLICT path
+                // where some columns differ from the caller's input).
+                let row = client
+                    .query_one(
+                        "SELECT task_id, channel_id, description, status, priority, \
+                                created_at, updated_at, parent_task_id, context_json, outcome_json, \
+                                retry_count, signed_by, signature, signed_at, \
+                                updated_info_available, updated_info_content, \
+                                agent_occurrence_id, images_json \
+                         FROM cirislens.tasks WHERE task_id = $1",
+                        &[&task.task_id],
+                    )
+                    .await
+                    .map_err(|e| map_pg_error(e, "upsert_task readback"))?;
+                Ok(TaskUpsertOutcome::Stored(decode_task_row(&row)?))
+            }
+            Err(e) => {
+                // V036 correlation-id unique violation → dedup path.
+                // Identify by SqlState UNIQUE_VIOLATION + constraint
+                // name `tasks_correlation_id_unique`. Anything else
+                // (including PK conflict, which would never reach
+                // here since ON CONFLICT(task_id) handles it) bubbles
+                // up as Conflict/Backend per map_pg_error.
+                let is_correlation_conflict = e
+                    .as_db_error()
+                    .map(|d| {
+                        d.code() == &tokio_postgres::error::SqlState::UNIQUE_VIOLATION
+                            && d.constraint() == Some("tasks_correlation_id_unique")
+                    })
+                    .unwrap_or(false);
+                if is_correlation_conflict {
+                    let Some(cid) = correlation_id else {
+                        // Theoretical: unique-constraint fired with no
+                        // correlation_id → schema invariant broken.
+                        return Err(Error::Backend(format!(
+                            "upsert_task: tasks_correlation_id_unique fired with no correlation_id: {e}"
+                        )));
+                    };
+                    let row = client
+                        .query_one(
+                            "SELECT task_id, channel_id, description, status, priority, \
+                                    created_at, updated_at, parent_task_id, context_json, outcome_json, \
+                                    retry_count, signed_by, signature, signed_at, \
+                                    updated_info_available, updated_info_content, \
+                                    agent_occurrence_id, images_json \
+                             FROM cirislens.tasks \
+                             WHERE agent_occurrence_id = $1 \
+                               AND context_json->>'correlation_id' = $2",
+                            &[&agent_occurrence, &cid],
+                        )
+                        .await
+                        .map_err(|e| map_pg_error(e, "upsert_task correlation readback"))?;
+                    Ok(TaskUpsertOutcome::AlreadyExists(decode_task_row(&row)?))
+                } else {
+                    Err(map_pg_error(e, "upsert_task"))
+                }
+            }
+        }
     }
 
     async fn get_task(&self, task_id: &str) -> Result<Option<Task>, Error> {
@@ -830,5 +902,129 @@ mod tests {
             .unwrap();
         assert_eq!(page.items.len(), 1);
         assert!(page.items[0].task_id.starts_with("b-"));
+    }
+
+    // ── v1.5.22 (CIRISPersist#61) correlation_id dedup ───────────────
+
+    fn mk_task_with_correlation(id: &str, occ: &str, correlation_id: &str) -> Task {
+        let mut t = mk_task(id, TaskStatus::Pending, occ);
+        t.context = Some(serde_json::json!({"correlation_id": correlation_id}));
+        t
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn tasks_pg_upsert_returns_stored_on_clean_insert() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let id = format!("t-{}", Uuid::new_v4().simple());
+        let outcome =
+            TaskService::upsert_task(&backend, mk_task(&id, TaskStatus::Pending, "occ-1"))
+                .await
+                .unwrap();
+        match outcome {
+            TaskUpsertOutcome::Stored(row) => assert_eq!(row.task_id, id),
+            other => panic!("expected Stored, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn tasks_pg_upsert_returns_already_exists_on_correlation_collision() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let occ = format!("occ-{}", Uuid::new_v4().simple());
+        let cid = format!("upstream-{}", Uuid::new_v4().simple());
+        let first_id = format!("t1-{}", Uuid::new_v4().simple());
+        let _ = TaskService::upsert_task(&backend, mk_task_with_correlation(&first_id, &occ, &cid))
+            .await
+            .unwrap();
+
+        let second_id = format!("t2-{}", Uuid::new_v4().simple());
+        let outcome =
+            TaskService::upsert_task(&backend, mk_task_with_correlation(&second_id, &occ, &cid))
+                .await
+                .unwrap();
+        match outcome {
+            TaskUpsertOutcome::AlreadyExists(row) => {
+                assert_eq!(row.task_id, first_id);
+                assert_ne!(row.task_id, second_id);
+            }
+            other => panic!("expected AlreadyExists, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn tasks_pg_upsert_correlation_scope_isolated_per_occurrence() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let cid = format!("upstream-{}", Uuid::new_v4().simple());
+        let id1 = format!("t1-{}", Uuid::new_v4().simple());
+        let id2 = format!("t2-{}", Uuid::new_v4().simple());
+        let occ_a = format!("occ-a-{}", Uuid::new_v4().simple());
+        let occ_b = format!("occ-b-{}", Uuid::new_v4().simple());
+
+        let _ = TaskService::upsert_task(&backend, mk_task_with_correlation(&id1, &occ_a, &cid))
+            .await
+            .unwrap();
+        let outcome =
+            TaskService::upsert_task(&backend, mk_task_with_correlation(&id2, &occ_b, &cid))
+                .await
+                .unwrap();
+        match outcome {
+            TaskUpsertOutcome::Stored(row) => assert_eq!(row.task_id, id2),
+            other => panic!("expected Stored across occurrences, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn tasks_pg_upsert_re_upsert_same_task_id_returns_stored() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let occ = format!("occ-{}", Uuid::new_v4().simple());
+        let cid = format!("upstream-{}", Uuid::new_v4().simple());
+        let id = format!("t-{}", Uuid::new_v4().simple());
+        let t1 = mk_task_with_correlation(&id, &occ, &cid);
+        let _ = TaskService::upsert_task(&backend, t1.clone())
+            .await
+            .unwrap();
+
+        // Re-upsert: same task_id, different mutables. ON CONFLICT
+        // (task_id) UPDATE wins; correlation index does NOT trip.
+        let mut t2 = t1;
+        t2.description = "updated-by-second-call".into();
+        let outcome = TaskService::upsert_task(&backend, t2).await.unwrap();
+        match outcome {
+            TaskUpsertOutcome::Stored(row) => {
+                assert_eq!(row.task_id, id);
+                assert_eq!(row.description, "updated-by-second-call");
+            }
+            other => panic!("expected Stored on re-upsert, got {other:?}"),
+        }
     }
 }

@@ -210,13 +210,29 @@ class Engine:
 
     # ── v1.5.9 (CIRISPersist#59 #1) — agent tasks substrate ──────────
 
-    def task_upsert(self, task_json: str) -> None:
+    def task_upsert(self, task_json: str) -> str:
         """v1.5.9 — Idempotent upsert keyed on ``task_id``.
 
         ``task_json`` is a JSON-encoded ``Task`` shape (see the
         ``ciris_persist.tasks`` module). Re-insert with the same
         payload is a no-op; re-insert with differing payload
         overwrites the mutable columns and preserves ``created_at``.
+
+        Returns the JSON-encoded ``TaskUpsertOutcome`` envelope
+        ``{"outcome": "stored" | "already_exists", "task": <Task>}``
+        (v1.5.22, CIRISPersist#61). ``stored`` carries the
+        canonical post-upsert row (caller's ``task_id`` wins).
+        ``already_exists`` carries the EXISTING row when the V036
+        unique index on ``(agent_occurrence_id,
+        context_json->>'correlation_id')`` would have been violated
+        by a fresh ``task_id`` — caller reconciles to the canonical
+        ``task_id``. The ``already_exists`` outcome only fires when
+        ``context.correlation_id`` is set; rows without one insert
+        normally as ``stored``.
+
+        **Breaking change in v1.5.22:** prior versions returned
+        ``None``. Callers that ignored the return value continue to
+        work; callers that want dedup-detection use the new envelope.
         """
 
     def task_get(self, task_id: str) -> str | None:

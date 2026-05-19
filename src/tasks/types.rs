@@ -159,6 +159,35 @@ pub struct TaskListPage {
     pub next_cursor: Option<TaskCursor>,
 }
 
+/// Outcome of [`super::TaskService::upsert_task`] (v1.5.22,
+/// CIRISPersist#61). Carries the canonical row the caller should
+/// treat as authoritative.
+///
+/// - [`Self::Stored`] — INSERT (or ON CONFLICT(task_id) DO UPDATE
+///   resolving to the caller's row). The caller's `task_id` won.
+/// - [`Self::AlreadyExists`] — V036 unique index on
+///   `(agent_occurrence_id, context_json->>'correlation_id')`
+///   tripped: a different task with the same correlation_id is
+///   already present under this occurrence. The returned `Task` is
+///   the **existing** row, with the existing `task_id` (NOT the
+///   caller's). Mirrors the
+///   [`crate::ClaimResult::AlreadyClaimed`] shape on
+///   `try_claim_shared_task` — callers reconcile to the canonical
+///   id.
+///
+/// The outcome only fires when `context.correlation_id` is non-null;
+/// without a correlation_id the V036 partial index doesn't apply and
+/// the row inserts normally as `Stored`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "outcome", content = "task", rename_all = "snake_case")]
+pub enum TaskUpsertOutcome {
+    /// INSERT (clean) or ON CONFLICT(task_id) UPSERT — caller's row.
+    Stored(Task),
+    /// Unique-index violation on the V036 (agent_occurrence_id,
+    /// correlation_id) constraint. Carries the existing row.
+    AlreadyExists(Task),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
