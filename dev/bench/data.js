@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779201418506,
+  "lastUpdate": 1779201706581,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -18563,6 +18563,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 20595101,
             "range": "± 10197586",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "9fc5e7e725ded898dd292b2aeebb67ef45f0e1cc",
+          "message": "1.5.22 — correlation_id uniqueness + task_upsert outcome envelope (closes #61)\n\nV036 migration on both backends: partial UNIQUE index\ntasks_correlation_id_unique on\n(agent_occurrence_id, context_json->>'correlation_id')\nWHERE correlation_id IS NOT NULL.\n\nRestores the legacy CIRISAgent migration-006 invariant lost when\nv1.5.9 absorbed ciris_engine.db.tasks: the same upstream-event\ncorrelation_id within an occurrence resolves to the existing row\ninstead of creating a duplicate.\n\nBreaking change: TaskService::upsert_task signature\n(Task) -> Result<(), Error> → (Task) -> Result<TaskUpsertOutcome, Error>.\nTaskUpsertOutcome = Stored(Task) | AlreadyExists(Task). AlreadyExists\ncarries the EXISTING row (its existing task_id, not the caller's).\nMirrors try_claim_shared_task's ClaimResult envelope.\n\nPyO3: task_upsert now returns the JSON envelope\n{\"outcome\": \"stored\" | \"already_exists\", \"task\": <Task>} instead of\nNone. .pyi docstring updated.\n\nPer feedback-clean-break-renames: no deprecation alias, no\nsecond-method scaffold — done in one cut while CIRISAgent#763 is\nmid-absorption so callers wire against the new shape directly.\n\nTests: 5 SQLite + 4 PG (clean Stored, re-upsert same task_id stays\nStored, different task_id + same correlation → AlreadyExists,\ncorrelation index scoped per-occurrence, no-correlation tasks\ninsert independently). 585/585 pass.\n\nMigration-rollout note in CHANGELOG: pre-existing\n(occurrence, correlation_id) duplicates need a one-shot dedup pass\nbefore V036 applies cleanly.\n\ncloses #61\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-19T09:33:26-05:00",
+          "tree_id": "95f6a8632d486fc12effc3367b9b65b5836f07fe",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/9fc5e7e725ded898dd292b2aeebb67ef45f0e1cc"
+        },
+        "date": 1779201705912,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 107359,
+            "range": "± 362",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 247129,
+            "range": "± 1631",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 529245,
+            "range": "± 2125",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1851959,
+            "range": "± 15561",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 352,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1459,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7298,
+            "range": "± 51",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21288,
+            "range": "± 44",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24319,
+            "range": "± 53",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83710,
+            "range": "± 394",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 373,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3081,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9217,
+            "range": "± 51",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 40772,
+            "range": "± 170",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 631,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2543376,
+            "range": "± 191135",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6889817,
+            "range": "± 183674",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23955100,
+            "range": "± 275783",
             "unit": "ns/iter"
           }
         ]
