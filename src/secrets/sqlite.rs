@@ -1,3 +1,10 @@
+// Five callsites with multi-tuple SELECT projections that lint hot
+// under clippy 1.95's `type_complexity`. Pre-existing v0.9.3 shape;
+// extracting type aliases is invasive across the closure boundaries
+// (each query_row closure binds the tuple locally). Silenced module-
+// wide for now; type-alias refactor tracked as cleanup work.
+#![allow(clippy::type_complexity)]
+
 //! SQLite impl of [`SecretsService`] (v0.9.3, CIRISPersist#39).
 //!
 //! Mirrors v0.6.1-α5 Postgres impl with SQLite-dialect translations:
@@ -1503,6 +1510,260 @@ impl SecretsService for SqliteSecretsBackend {
 
         Ok(outcome)
     }
+
+    async fn store_detected_secret(
+        &self,
+        payload: super::DetectedSecret,
+        accessor: String,
+    ) -> Result<ClaimResult<SecretReference>, SecretsError> {
+        // ── Validation ──────────────────────────────────────────────
+        if payload.secret_uuid.is_empty() {
+            return Err(SecretsError::InvalidArgument("secret_uuid required".into()));
+        }
+        let agent_uuid = Uuid::parse_str(&payload.secret_uuid).map_err(|e| {
+            SecretsError::InvalidArgument(format!("secret_uuid is not a valid UUID: {e}"))
+        })?;
+        if payload.value.is_empty() {
+            return Err(SecretsError::InvalidArgument("value required".into()));
+        }
+        if payload.detected_pattern.is_empty() {
+            return Err(SecretsError::InvalidArgument(
+                "detected_pattern required".into(),
+            ));
+        }
+        if payload.description.is_empty() {
+            return Err(SecretsError::InvalidArgument("description required".into()));
+        }
+
+        // ── Crypto setup ────────────────────────────────────────────
+        let master = self.active_master_key().await?;
+        let content_hmac = crypto::hmac_sha256(&master.bytes, payload.value.as_bytes()).to_vec();
+        let salt = crypto::random_salt()?;
+        let nonce = crypto::random_nonce()?;
+        let secret_key = crypto::derive_secret_key(&master.bytes, &salt)?;
+        let ciphertext = crypto::encrypt(&secret_key, &nonce, payload.value.as_bytes())?;
+        let sensitivity_tag = sensitivity_str(payload.sensitivity).to_owned();
+        let actions_json = serde_json::to_string(&payload.auto_decapsulate_for_actions)
+            .map_err(|e| SecretsError::Internal(format!("actions serialize: {e}")))?;
+
+        let conn = self.conn.clone();
+        let secret_uuid_str = agent_uuid.to_string();
+        let key_ref = master.key_ref.clone();
+        let salt_vec = salt.to_vec();
+        let nonce_vec = nonce.to_vec();
+        let description_owned = payload.description.clone();
+        let detected_pattern_owned = payload.detected_pattern.clone();
+        let context_hint_owned = payload.context_hint.clone();
+        let source_message_id_owned = payload.source_message_id.clone();
+        let manual_access_only_int: i64 = if payload.manual_access_only { 1 } else { 0 };
+        let content_hmac_for_tx = content_hmac.clone();
+
+        // Three possible outcomes:
+        //   inserted=1 (won), uuid==caller's      → Stored
+        //   inserted=0, existing row by content   → AlreadyClaimed
+        //   inserted=0 + no existing by content   → UUID PK conflict
+        //                                            (caller bug)
+        type ClaimRow = (
+            String,
+            String,
+            Option<String>,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+        );
+        enum Outcome {
+            Stored(ClaimRow),
+            AlreadyClaimed(ClaimRow),
+            UuidConflict,
+        }
+        let outcome_enum = tokio::task::spawn_blocking(move || -> Result<Outcome, SecretsError> {
+            let guard = conn.blocking_lock();
+            let changed = guard
+                .execute(
+                    "INSERT OR IGNORE INTO cirislens_secrets_secrets (\
+                        secret_uuid, encrypted_value, encryption_key_ref, salt, nonce, \
+                        description, sensitivity_level, detected_pattern, context_hint, \
+                        source_message_id, auto_decapsulate_for_actions, manual_access_only, \
+                        content_hmac \
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    params![
+                        secret_uuid_str,
+                        ciphertext,
+                        key_ref,
+                        salt_vec,
+                        nonce_vec,
+                        description_owned,
+                        sensitivity_tag,
+                        detected_pattern_owned,
+                        context_hint_owned,
+                        source_message_id_owned,
+                        actions_json,
+                        manual_access_only_int,
+                        content_hmac_for_tx,
+                    ],
+                )
+                .map_err(|e| map_sqlite_error(e, "store_detected_secret insert"))?;
+            if changed > 0 {
+                // Won — re-read our row for the canonical reference.
+                let row = guard
+                    .query_row(
+                        "SELECT secret_uuid, description, context_hint, sensitivity_level, \
+                                detected_pattern, auto_decapsulate_for_actions, \
+                                created_at, last_accessed \
+                         FROM cirislens_secrets_secrets WHERE secret_uuid = ?1",
+                        params![secret_uuid_str],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, String>(4)?,
+                                row.get::<_, String>(5)?,
+                                row.get::<_, String>(6)?,
+                                row.get::<_, Option<String>>(7)?,
+                            ))
+                        },
+                    )
+                    .map_err(|e| map_sqlite_error(e, "store_detected_secret readback"))?;
+                return Ok(Outcome::Stored(row));
+            }
+            // INSERT OR IGNORE failed silently — could be content_hmac
+            // collision (same plaintext under any caller path) or
+            // secret_uuid PK collision (caller reuse with a *different*
+            // plaintext). Look up by content_hmac first.
+            let by_hmac: Option<ClaimRow> = guard
+                .query_row(
+                    "SELECT secret_uuid, description, context_hint, sensitivity_level, \
+                            detected_pattern, auto_decapsulate_for_actions, \
+                            created_at, last_accessed \
+                     FROM cirislens_secrets_secrets WHERE content_hmac = ?1",
+                    params![content_hmac_for_tx],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, Option<String>>(7)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| map_sqlite_error(e, "store_detected_secret conflict-recovery"))?;
+            match by_hmac {
+                Some(row) => Ok(Outcome::AlreadyClaimed(row)),
+                None => Ok(Outcome::UuidConflict),
+            }
+        })
+        .await
+        .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))??;
+
+        let (result, audit_uuid) = match outcome_enum {
+            Outcome::Stored(row) => {
+                let (
+                    uuid_str,
+                    desc,
+                    ctx_hint,
+                    sens_str,
+                    pattern,
+                    actions_str,
+                    created_str,
+                    accessed_str,
+                ) = row;
+                let last_accessed = match accessed_str {
+                    Some(s) => Some(parse_datetime(&s)?),
+                    None => None,
+                };
+                let reference = SecretReference {
+                    uuid: uuid_str,
+                    description: desc,
+                    context_hint: ctx_hint,
+                    sensitivity: sensitivity_from_str(&sens_str)?,
+                    detected_pattern: pattern,
+                    auto_decapsulate_actions: parse_actions(&actions_str)?,
+                    created_at: parse_datetime(&created_str)?,
+                    last_accessed,
+                };
+                (Ok(ClaimResult::Stored(reference)), Some(agent_uuid))
+            }
+            Outcome::AlreadyClaimed(row) => {
+                let (
+                    uuid_str,
+                    desc,
+                    ctx_hint,
+                    sens_str,
+                    pattern,
+                    actions_str,
+                    created_str,
+                    accessed_str,
+                ) = row;
+                let last_accessed = match accessed_str {
+                    Some(s) => Some(parse_datetime(&s)?),
+                    None => None,
+                };
+                let reference = SecretReference {
+                    uuid: uuid_str.clone(),
+                    description: desc,
+                    context_hint: ctx_hint,
+                    sensitivity: sensitivity_from_str(&sens_str)?,
+                    detected_pattern: pattern,
+                    auto_decapsulate_actions: parse_actions(&actions_str)?,
+                    created_at: parse_datetime(&created_str)?,
+                    last_accessed,
+                };
+                let existing_uuid = Uuid::parse_str(&uuid_str)
+                    .map_err(|e| SecretsError::Internal(format!("uuid parse: {e}")))?;
+                (
+                    Ok(ClaimResult::AlreadyClaimed(reference)),
+                    Some(existing_uuid),
+                )
+            }
+            Outcome::UuidConflict => (
+                Err(SecretsError::InvalidArgument(format!(
+                    "secret_uuid {} already in use for a different plaintext",
+                    payload.secret_uuid
+                ))),
+                Some(agent_uuid),
+            ),
+        };
+
+        // Audit row.
+        let (success, err_msg, purpose) = match &result {
+            Ok(ClaimResult::Stored(_)) => (
+                true,
+                None,
+                format!("store_detected_secret stored: {}", payload.detected_pattern),
+            ),
+            Ok(ClaimResult::AlreadyClaimed(_)) => (
+                true,
+                None,
+                format!(
+                    "store_detected_secret already_claimed: {}",
+                    payload.detected_pattern
+                ),
+            ),
+            Err(e) => (
+                false,
+                Some(e.to_string()),
+                format!("store_detected_secret failed: {}", payload.detected_pattern),
+            ),
+        };
+        let mut record = AuditRecord::new(AccessOp::Store, &accessor).with_purpose(purpose);
+        if let Some(uuid) = audit_uuid {
+            record = record.with_secret(uuid);
+        }
+        let _ = self
+            .secrets_audit(record, success, err_msg.as_deref())
+            .await;
+
+        result
+    }
 }
 
 #[cfg(test)]
@@ -1870,6 +2131,232 @@ mod tests {
             uuids_a, uuids_b,
             "dedup should yield same UUIDs across runs"
         );
+    }
+
+    // ── v1.5.24 (CIRISPersist#66) store_detected_secret tests ───────
+
+    fn mk_payload(value: &str, pattern: &str) -> super::super::DetectedSecret {
+        super::super::DetectedSecret {
+            secret_uuid: Uuid::new_v4().to_string(),
+            value: value.to_owned(),
+            description: "GitHub PAT".to_owned(),
+            sensitivity: Sensitivity::High,
+            detected_pattern: pattern.to_owned(),
+            context_hint: Some("found in tool_args.token".to_owned()),
+            source_message_id: Some("msg-123".to_owned()),
+            auto_decapsulate_for_actions: vec!["tool".to_owned()],
+            manual_access_only: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn store_detected_secret_stores_with_caller_uuid_and_full_metadata() {
+        let (_b, secrets) = fresh_backend().await;
+        secrets
+            .rotate_master_key(None, "test".into())
+            .await
+            .unwrap();
+
+        let payload = mk_payload("ghp_TESTPAT_ABCDEFG", "regex:github_pat_v1");
+        let caller_uuid = payload.secret_uuid.clone();
+
+        let outcome = secrets
+            .store_detected_secret(payload, "agent-x".into())
+            .await
+            .expect("store_detected_secret");
+        match outcome {
+            ClaimResult::Stored(r) => {
+                assert_eq!(r.uuid, caller_uuid, "caller UUID must be preserved");
+                assert_eq!(r.description, "GitHub PAT");
+                assert_eq!(r.detected_pattern, "regex:github_pat_v1");
+                assert_eq!(r.context_hint.as_deref(), Some("found in tool_args.token"));
+                assert_eq!(r.sensitivity, Sensitivity::High);
+                assert_eq!(r.auto_decapsulate_actions, vec!["tool".to_string()]);
+            }
+            other => panic!("expected Stored, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn store_detected_secret_same_uuid_same_plaintext_idempotent() {
+        let (_b, secrets) = fresh_backend().await;
+        secrets
+            .rotate_master_key(None, "test".into())
+            .await
+            .unwrap();
+
+        let mut payload = mk_payload("ghp_TESTPAT_IDEMPOTENT", "regex:github_pat_v1");
+        let caller_uuid = payload.secret_uuid.clone();
+        let _ = secrets
+            .store_detected_secret(payload.clone(), "agent-x".into())
+            .await
+            .expect("first store");
+
+        // Re-store with the SAME UUID and SAME plaintext — should be
+        // AlreadyClaimed (content_hmac collision; the row already
+        // exists with the caller's UUID).
+        let payload2 = payload.clone();
+        payload.description = "rev2".into(); // unused; metadata is sticky on conflict
+        let _ = payload;
+        let r2 = secrets
+            .store_detected_secret(payload2, "agent-x".into())
+            .await
+            .expect("second store");
+        match r2 {
+            ClaimResult::AlreadyClaimed(r) => assert_eq!(r.uuid, caller_uuid),
+            other => panic!("expected AlreadyClaimed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn store_detected_secret_different_uuid_same_plaintext_returns_canonical() {
+        let (_b, secrets) = fresh_backend().await;
+        secrets
+            .rotate_master_key(None, "test".into())
+            .await
+            .unwrap();
+
+        let p1 = mk_payload("ghp_SHARED_PLAINTEXT", "regex:github_pat_v1");
+        let first_uuid = p1.secret_uuid.clone();
+        let _ = secrets
+            .store_detected_secret(p1, "agent-a".into())
+            .await
+            .expect("first");
+
+        // Second agent supplies a DIFFERENT UUID for the same
+        // plaintext. content_hmac collision → AlreadyClaimed with
+        // the FIRST UUID (canonical).
+        let mut p2 = mk_payload("ghp_SHARED_PLAINTEXT", "regex:github_pat_v1");
+        p2.secret_uuid = Uuid::new_v4().to_string();
+        let second_caller_uuid = p2.secret_uuid.clone();
+        assert_ne!(first_uuid, second_caller_uuid);
+
+        let r2 = secrets
+            .store_detected_secret(p2, "agent-b".into())
+            .await
+            .expect("second");
+        match r2 {
+            ClaimResult::AlreadyClaimed(r) => {
+                assert_eq!(r.uuid, first_uuid);
+                assert_ne!(r.uuid, second_caller_uuid);
+            }
+            other => panic!("expected AlreadyClaimed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn store_detected_secret_same_uuid_different_plaintext_invalid_argument() {
+        let (_b, secrets) = fresh_backend().await;
+        secrets
+            .rotate_master_key(None, "test".into())
+            .await
+            .unwrap();
+
+        let p1 = mk_payload("ghp_FIRST_PT", "regex:github_pat_v1");
+        let shared_uuid = p1.secret_uuid.clone();
+        let _ = secrets
+            .store_detected_secret(p1, "agent-x".into())
+            .await
+            .expect("first");
+
+        let mut p2 = mk_payload("ghp_SECOND_PT_DIFFERENT", "regex:github_pat_v1");
+        p2.secret_uuid = shared_uuid;
+        let err = secrets
+            .store_detected_secret(p2, "agent-x".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SecretsError::InvalidArgument(_)),
+            "expected InvalidArgument (UUID reused for different plaintext), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_detected_secret_empty_fields_rejected() {
+        let (_b, secrets) = fresh_backend().await;
+        secrets
+            .rotate_master_key(None, "test".into())
+            .await
+            .unwrap();
+
+        // empty UUID
+        let mut p = mk_payload("v", "regex:p1");
+        p.secret_uuid = String::new();
+        assert!(matches!(
+            secrets
+                .store_detected_secret(p, "a".into())
+                .await
+                .unwrap_err(),
+            SecretsError::InvalidArgument(_)
+        ));
+
+        // malformed UUID
+        let mut p = mk_payload("v", "regex:p1");
+        p.secret_uuid = "not-a-uuid".into();
+        assert!(matches!(
+            secrets
+                .store_detected_secret(p, "a".into())
+                .await
+                .unwrap_err(),
+            SecretsError::InvalidArgument(_)
+        ));
+
+        // empty value
+        let mut p = mk_payload("v", "regex:p1");
+        p.value = String::new();
+        assert!(matches!(
+            secrets
+                .store_detected_secret(p, "a".into())
+                .await
+                .unwrap_err(),
+            SecretsError::InvalidArgument(_)
+        ));
+
+        // empty detected_pattern
+        let mut p = mk_payload("v", "regex:p1");
+        p.detected_pattern = String::new();
+        assert!(matches!(
+            secrets
+                .store_detected_secret(p, "a".into())
+                .await
+                .unwrap_err(),
+            SecretsError::InvalidArgument(_)
+        ));
+
+        // empty description
+        let mut p = mk_payload("v", "regex:p1");
+        p.description = String::new();
+        assert!(matches!(
+            secrets
+                .store_detected_secret(p, "a".into())
+                .await
+                .unwrap_err(),
+            SecretsError::InvalidArgument(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn store_detected_secret_recall_round_trips_value_and_metadata() {
+        let (_b, secrets) = fresh_backend().await;
+        secrets
+            .rotate_master_key(None, "test".into())
+            .await
+            .unwrap();
+
+        let payload = mk_payload("ghp_RECALL_TEST_VALUE", "regex:github_pat_v1");
+        let caller_uuid = payload.secret_uuid.clone();
+        let _ = secrets
+            .store_detected_secret(payload, "agent-x".into())
+            .await
+            .expect("store");
+
+        let recalled = secrets
+            .recall_secret(&caller_uuid, "test-recall".into(), "agent-x".into(), true)
+            .await
+            .expect("recall_secret")
+            .expect("recalled row exists");
+        assert!(recalled.found);
+        assert_eq!(recalled.value.as_deref(), Some("ghp_RECALL_TEST_VALUE"));
     }
 
     /// v1.5.7 — empty filter catalog returns the text untouched.

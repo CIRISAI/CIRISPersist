@@ -209,6 +209,59 @@ pub struct AccessLogEntry {
     pub created_at: DateTime<Utc>,
 }
 
+/// Caller-supplied detected-secret payload (v1.5.24, CIRISPersist#66).
+///
+/// Carries an agent-assigned UUID + the full Python-side
+/// `DetectedSecret` metadata bundle. Stored verbatim into
+/// `cirislens_secrets.secrets` via
+/// [`super::SecretsService::store_detected_secret`].
+///
+/// Distinct from the
+/// [`super::SecretsService::try_claim_secret`] / [`super::SecretsService::store_secret`]
+/// paths:
+///
+/// - `store_secret(key, value)` — manually-keyed, persist generates
+///   the UUID, stores under `detected_pattern = "manual"`, with
+///   defaulted sensitivity. No `context_hint`, no
+///   `source_message_id`, no `auto_decapsulate_for_actions`, no
+///   `manual_access_only`.
+/// - `try_claim_secret(plaintext, description, sensitivity, ...)` —
+///   race-safe dedup by `content_hmac`; persist generates the UUID;
+///   supports a subset of metadata.
+/// - **`store_detected_secret`** — agent owns the UUID, supplies the
+///   full metadata bundle. Race-safe by `content_hmac` (same plaintext
+///   under any caller path resolves to the existing row).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DetectedSecret {
+    /// Agent-assigned UUID v4 — becomes the row's `secret_uuid` PK
+    /// on clean insert. Caller must supply a valid UUID string;
+    /// persist does NOT regenerate.
+    pub secret_uuid: String,
+    /// Plaintext to encrypt and store.
+    pub value: String,
+    /// Human-readable description (e.g. `"OpenAI API key"`).
+    pub description: String,
+    /// Sensitivity tier.
+    pub sensitivity: Sensitivity,
+    /// Detected-pattern matcher id (e.g. `"regex:openai_key_v1"`).
+    /// Required (cannot be empty) — distinguishes from
+    /// `store_secret`'s `"manual"` sentinel.
+    pub detected_pattern: String,
+    /// Surrounding-text snippet for operator context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_hint: Option<String>,
+    /// Where the detection fired (message id, trace id, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_message_id: Option<String>,
+    /// Whitelist of action_type tokens that may auto-decapsulate.
+    #[serde(default)]
+    pub auto_decapsulate_for_actions: Vec<String>,
+    /// Hard manual-access override. `true` blocks all auto-
+    /// decapsulation regardless of `auto_decapsulate_for_actions`.
+    #[serde(default)]
+    pub manual_access_only: bool,
+}
+
 /// Filter for `list_stored_secrets` — every field optional;
 /// composes AND-style.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

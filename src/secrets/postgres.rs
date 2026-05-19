@@ -1127,6 +1127,228 @@ impl SecretsService for PostgresBackend {
 
         outcome
     }
+
+    async fn store_detected_secret(
+        &self,
+        payload: super::DetectedSecret,
+        accessor: String,
+    ) -> Result<ClaimResult<SecretReference>, SecretsError> {
+        // ── Validation ──────────────────────────────────────────────
+        if payload.secret_uuid.is_empty() {
+            return Err(SecretsError::InvalidArgument("secret_uuid required".into()));
+        }
+        let agent_uuid = Uuid::parse_str(&payload.secret_uuid).map_err(|e| {
+            SecretsError::InvalidArgument(format!("secret_uuid is not a valid UUID: {e}"))
+        })?;
+        if payload.value.is_empty() {
+            return Err(SecretsError::InvalidArgument("value required".into()));
+        }
+        if payload.detected_pattern.is_empty() {
+            return Err(SecretsError::InvalidArgument(
+                "detected_pattern required".into(),
+            ));
+        }
+        if payload.description.is_empty() {
+            return Err(SecretsError::InvalidArgument("description required".into()));
+        }
+
+        // ── Crypto setup ────────────────────────────────────────────
+        let master = self.active_master_key().await?;
+        let content_hmac = crypto::hmac_sha256(&master.bytes, payload.value.as_bytes()).to_vec();
+        let salt = crypto::random_salt()?;
+        let nonce = crypto::random_nonce()?;
+        let secret_key = crypto::derive_secret_key(&master.bytes, &salt)?;
+        let ciphertext = crypto::encrypt(&secret_key, &nonce, payload.value.as_bytes())?;
+        let sensitivity_tag = sensitivity_str(payload.sensitivity).to_owned();
+
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| SecretsError::Backend(format!("pool: {e}")))?;
+
+        // ── Atomic insert with full metadata ────────────────────────
+        // ON CONFLICT (content_hmac) DO NOTHING — race-safe across
+        // store_detected_secret + try_claim_secret callers under the
+        // same active master key. Empty RETURNING == another caller
+        // already owns this plaintext.
+        let claim_row = client
+            .query_opt(
+                "INSERT INTO cirislens_secrets.secrets (\
+                    secret_uuid, encrypted_value, encryption_key_ref, salt, nonce, \
+                    description, sensitivity_level, detected_pattern, context_hint, \
+                    source_message_id, auto_decapsulate_for_actions, manual_access_only, \
+                    content_hmac \
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+                 ON CONFLICT (content_hmac) DO NOTHING \
+                 RETURNING secret_uuid::text, description, context_hint, sensitivity_level, \
+                           detected_pattern, auto_decapsulate_for_actions, \
+                           created_at, last_accessed",
+                &[
+                    &agent_uuid,
+                    &ciphertext,
+                    &master.key_ref,
+                    &salt.to_vec(),
+                    &nonce.to_vec(),
+                    &payload.description,
+                    &sensitivity_tag,
+                    &payload.detected_pattern,
+                    &payload.context_hint,
+                    &payload.source_message_id,
+                    &payload.auto_decapsulate_for_actions,
+                    &payload.manual_access_only,
+                    &content_hmac,
+                ],
+            )
+            .await;
+
+        let (outcome, audit_uuid) = match claim_row {
+            Ok(Some(row)) => {
+                let sensitivity_str_v: String = row
+                    .try_get(3)
+                    .map_err(|e| SecretsError::Backend(format!("decode sensitivity: {e}")))?;
+                let reference = SecretReference {
+                    uuid: row
+                        .try_get(0)
+                        .map_err(|e| SecretsError::Backend(format!("decode uuid: {e}")))?,
+                    description: row
+                        .try_get(1)
+                        .map_err(|e| SecretsError::Backend(format!("decode description: {e}")))?,
+                    context_hint: row
+                        .try_get(2)
+                        .map_err(|e| SecretsError::Backend(format!("decode context_hint: {e}")))?,
+                    sensitivity: sensitivity_from_str(&sensitivity_str_v)?,
+                    detected_pattern: row.try_get(4).map_err(|e| {
+                        SecretsError::Backend(format!("decode detected_pattern: {e}"))
+                    })?,
+                    auto_decapsulate_actions: row.try_get(5).map_err(|e| {
+                        SecretsError::Backend(format!("decode auto_decapsulate: {e}"))
+                    })?,
+                    created_at: row
+                        .try_get(6)
+                        .map_err(|e| SecretsError::Backend(format!("decode created_at: {e}")))?,
+                    last_accessed: row
+                        .try_get(7)
+                        .map_err(|e| SecretsError::Backend(format!("decode last_accessed: {e}")))?,
+                };
+                (Ok(ClaimResult::Stored(reference)), Some(agent_uuid))
+            }
+            Ok(None) => {
+                // content_hmac collision — same plaintext already
+                // stored. Fetch existing row's reference. Note: the
+                // existing UUID may differ from the caller's agent_uuid
+                // (different agent run, different detection-state, but
+                // same plaintext).
+                let existing = client
+                    .query_one(
+                        "SELECT secret_uuid::text, description, context_hint, sensitivity_level, \
+                                detected_pattern, auto_decapsulate_for_actions, \
+                                created_at, last_accessed \
+                         FROM cirislens_secrets.secrets \
+                         WHERE content_hmac = $1",
+                        &[&content_hmac],
+                    )
+                    .await
+                    .map_err(|e| {
+                        SecretsError::Backend(format!(
+                            "store_detected_secret conflict-recovery: {e}"
+                        ))
+                    })?;
+                let sensitivity_str_v: String = existing
+                    .try_get(3)
+                    .map_err(|e| SecretsError::Backend(format!("decode sensitivity: {e}")))?;
+                let reference = SecretReference {
+                    uuid: existing
+                        .try_get(0)
+                        .map_err(|e| SecretsError::Backend(format!("decode uuid: {e}")))?,
+                    description: existing
+                        .try_get(1)
+                        .map_err(|e| SecretsError::Backend(format!("decode description: {e}")))?,
+                    context_hint: existing
+                        .try_get(2)
+                        .map_err(|e| SecretsError::Backend(format!("decode context_hint: {e}")))?,
+                    sensitivity: sensitivity_from_str(&sensitivity_str_v)?,
+                    detected_pattern: existing.try_get(4).map_err(|e| {
+                        SecretsError::Backend(format!("decode detected_pattern: {e}"))
+                    })?,
+                    auto_decapsulate_actions: existing.try_get(5).map_err(|e| {
+                        SecretsError::Backend(format!("decode auto_decapsulate: {e}"))
+                    })?,
+                    created_at: existing
+                        .try_get(6)
+                        .map_err(|e| SecretsError::Backend(format!("decode created_at: {e}")))?,
+                    last_accessed: existing
+                        .try_get(7)
+                        .map_err(|e| SecretsError::Backend(format!("decode last_accessed: {e}")))?,
+                };
+                let existing_uuid = Uuid::parse_str(&reference.uuid)
+                    .map_err(|e| SecretsError::Internal(format!("uuid parse: {e}")))?;
+                (
+                    Ok(ClaimResult::AlreadyClaimed(reference)),
+                    Some(existing_uuid),
+                )
+            }
+            Err(e) => {
+                // Map secret_uuid PK conflicts → InvalidArgument
+                // (agent supplied a UUID already used for a different
+                // plaintext). Other backend errors pass through.
+                let is_pk_conflict = e
+                    .as_db_error()
+                    .map(|d| {
+                        d.code() == &tokio_postgres::error::SqlState::UNIQUE_VIOLATION
+                            && d.constraint() == Some("secrets_pkey")
+                    })
+                    .unwrap_or(false);
+                if is_pk_conflict {
+                    (
+                        Err(SecretsError::InvalidArgument(format!(
+                            "secret_uuid {} already in use for a different plaintext",
+                            payload.secret_uuid
+                        ))),
+                        Some(agent_uuid),
+                    )
+                } else {
+                    (
+                        Err(SecretsError::Backend(format!(
+                            "store_detected_secret insert: {e}"
+                        ))),
+                        None,
+                    )
+                }
+            }
+        };
+
+        // Audit-log row — invariant: every method writes one.
+        let (success, err_msg, purpose) = match &outcome {
+            Ok(ClaimResult::Stored(_)) => (
+                true,
+                None,
+                format!("store_detected_secret stored: {}", payload.detected_pattern),
+            ),
+            Ok(ClaimResult::AlreadyClaimed(_)) => (
+                true,
+                None,
+                format!(
+                    "store_detected_secret already_claimed: {}",
+                    payload.detected_pattern
+                ),
+            ),
+            Err(e) => (
+                false,
+                Some(e.to_string()),
+                format!("store_detected_secret failed: {}", payload.detected_pattern),
+            ),
+        };
+        let mut record = AuditRecord::new(AccessOp::Store, &accessor).with_purpose(purpose);
+        if let Some(uuid) = audit_uuid {
+            record = record.with_secret(uuid);
+        }
+        let _ = self
+            .secrets_audit(record, success, err_msg.as_deref())
+            .await;
+
+        outcome
+    }
 }
 
 #[cfg(test)]
@@ -1278,5 +1500,153 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SecretsError::Internal(_)));
+    }
+
+    // ── v1.5.24 (CIRISPersist#66) store_detected_secret tests ───────
+
+    /// Reset the secrets-table family so per-test rotate_master_key
+    /// satisfies `active_master_key()`'s "exactly 1 row" invariant.
+    /// CI starts with a fresh DB; local PG leftovers compound.
+    async fn reset_secrets_state(backend: &PostgresBackend) {
+        let client = backend.pool().get().await.unwrap();
+        client
+            .batch_execute(
+                "TRUNCATE cirislens_secrets.secrets, \
+                 cirislens_secrets.access_log, \
+                 cirislens_secrets.master_key_meta, \
+                 cirislens_secrets.filter_config CASCADE",
+            )
+            .await
+            .ok();
+    }
+
+    fn mk_detected_payload(value: &str, pattern: &str) -> super::super::DetectedSecret {
+        super::super::DetectedSecret {
+            secret_uuid: Uuid::new_v4().to_string(),
+            value: value.to_owned(),
+            description: "OpenAI key".to_owned(),
+            sensitivity: Sensitivity::High,
+            detected_pattern: pattern.to_owned(),
+            context_hint: Some("tool_args.api_key".to_owned()),
+            source_message_id: Some("msg-pg-test".to_owned()),
+            auto_decapsulate_for_actions: vec!["tool".to_owned()],
+            manual_access_only: false,
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn store_detected_secret_pg_stores_with_caller_uuid_and_full_metadata() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        reset_secrets_state(&backend).await;
+        backend
+            .rotate_master_key(None, "test".into())
+            .await
+            .unwrap();
+
+        let payload = mk_detected_payload(
+            &format!("sk-{}", Uuid::new_v4().simple()),
+            "regex:openai_v1",
+        );
+        let caller_uuid = payload.secret_uuid.clone();
+        let outcome = backend
+            .store_detected_secret(payload, "agent-x".into())
+            .await
+            .expect("store_detected_secret");
+        match outcome {
+            ClaimResult::Stored(r) => {
+                assert_eq!(r.uuid, caller_uuid);
+                assert_eq!(r.detected_pattern, "regex:openai_v1");
+                assert_eq!(r.context_hint.as_deref(), Some("tool_args.api_key"));
+                assert_eq!(r.sensitivity, Sensitivity::High);
+                assert_eq!(r.auto_decapsulate_actions, vec!["tool".to_string()]);
+            }
+            other => panic!("expected Stored, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn store_detected_secret_pg_different_uuid_same_plaintext_returns_canonical() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        reset_secrets_state(&backend).await;
+        backend
+            .rotate_master_key(None, "test".into())
+            .await
+            .unwrap();
+
+        let shared_value = format!("sk-{}", Uuid::new_v4().simple());
+        let p1 = mk_detected_payload(&shared_value, "regex:openai_v1");
+        let first_uuid = p1.secret_uuid.clone();
+        let _ = backend
+            .store_detected_secret(p1, "agent-a".into())
+            .await
+            .expect("first");
+
+        let mut p2 = mk_detected_payload(&shared_value, "regex:openai_v1");
+        p2.secret_uuid = Uuid::new_v4().to_string();
+        assert_ne!(p2.secret_uuid, first_uuid);
+
+        let r2 = backend
+            .store_detected_secret(p2, "agent-b".into())
+            .await
+            .expect("second");
+        match r2 {
+            ClaimResult::AlreadyClaimed(r) => assert_eq!(r.uuid, first_uuid),
+            other => panic!("expected AlreadyClaimed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn store_detected_secret_pg_same_uuid_different_plaintext_invalid_argument() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        reset_secrets_state(&backend).await;
+        backend
+            .rotate_master_key(None, "test".into())
+            .await
+            .unwrap();
+
+        let p1 = mk_detected_payload(
+            &format!("sk-first-{}", Uuid::new_v4().simple()),
+            "regex:openai_v1",
+        );
+        let shared_uuid = p1.secret_uuid.clone();
+        let _ = backend
+            .store_detected_secret(p1, "agent-x".into())
+            .await
+            .expect("first");
+
+        let mut p2 = mk_detected_payload(
+            &format!("sk-second-{}", Uuid::new_v4().simple()),
+            "regex:openai_v1",
+        );
+        p2.secret_uuid = shared_uuid;
+        let err = backend
+            .store_detected_secret(p2, "agent-x".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SecretsError::InvalidArgument(_)),
+            "expected InvalidArgument, got {err:?}"
+        );
     }
 }

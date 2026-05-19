@@ -5481,8 +5481,43 @@ impl PyEngine {
         })
     }
 
-    /// v0.6.1 — Stub: v0.6.2 wires this with the pipeline classify
-    /// stage. Until then returns SecretsError::Internal.
+    /// v1.5.7 (CIRISPersist#57) — Detect and encrypt-and-store every
+    /// secret in `text` per the configured filter catalog.
+    ///
+    /// Composes [`SecretsService::get_filter_config`] +
+    /// [`SecretsService::try_claim_secret`] in a default trait impl
+    /// shared by both backends. Iterates each configured pattern,
+    /// regex-matches against `text`, race-safely stores each unique
+    /// match under a fresh UUID, and emits the filtered text with
+    /// `{SECRET:<uuid>:<description>}` placeholders for the
+    /// decapsulation path.
+    ///
+    /// Returns the JSON envelope `{"filtered_text": "...",
+    /// "refs": [<SecretReference>, ...]}`. **Empty `refs` array
+    /// means no patterns matched** — either the input is clean,
+    /// OR the filter catalog hasn't been seeded (call
+    /// `secrets_set_filter_config` first to install patterns).
+    ///
+    /// Patterns are JSON shape:
+    /// ```json
+    /// {
+    ///   "patterns": [
+    ///     {
+    ///       "pattern_id": "openai_key",
+    ///       "regex": "sk-[A-Za-z0-9]{48}",
+    ///       "description": "OpenAI API key",
+    ///       "sensitivity": "high",
+    ///       "auto_decapsulate_for_actions": ["tool"]
+    ///     }
+    ///   ],
+    ///   "version": 1
+    /// }
+    /// ```
+    ///
+    /// For an agent-side detection flow (caller pre-detects and
+    /// assigns the UUID + full metadata), use
+    /// `secrets_store_detected_secret` (v1.5.24, CIRISPersist#66)
+    /// instead — that method bypasses the regex pipeline.
     #[cfg(feature = "secrets")]
     fn secrets_process_incoming_text(
         &self,
@@ -5537,7 +5572,96 @@ impl PyEngine {
         })
     }
 
-    /// v0.6.1 — Stub: v0.6.2 wires this. Returns SecretsError::Internal.
+    /// v1.5.24 (CIRISPersist#66) — Store an agent-detected secret
+    /// with a caller-supplied UUID + full metadata bundle.
+    ///
+    /// `payload_json` decodes to `DetectedSecret`:
+    /// ```json
+    /// {
+    ///   "secret_uuid": "<uuid-v4>",
+    ///   "value": "<plaintext>",
+    ///   "description": "...",
+    ///   "sensitivity": "low" | "medium" | "high" | "critical",
+    ///   "detected_pattern": "regex:openai_key_v1",
+    ///   "context_hint": "in tool_args.api_key",
+    ///   "source_message_id": "msg-123",
+    ///   "auto_decapsulate_for_actions": ["tool"],
+    ///   "manual_access_only": false
+    /// }
+    /// ```
+    ///
+    /// Returns the JSON envelope
+    /// `{"outcome": "stored" | "already_claimed", "ref": <SecretReference>}`.
+    ///
+    /// **Race-safety** — INSERT with `content_hmac` dedup. Same
+    /// plaintext under any caller path (this method or
+    /// `try_claim_secret` inside `process_incoming_text`) resolves
+    /// to `already_claimed` with the canonical existing
+    /// `SecretReference` (which may carry a *different* UUID than
+    /// the caller supplied — agent reconciles).
+    ///
+    /// **Idempotency** — re-supplying the same `(secret_uuid,
+    /// value)` returns `already_claimed`. Re-supplying the same
+    /// `secret_uuid` with a *different* `value` returns
+    /// `InvalidArgument` (caller has a UUID-allocation bug).
+    ///
+    /// Distinct from `secrets_store_secret` (manually-keyed; persist
+    /// generates the UUID; no detection metadata).
+    /// Distinct from `secrets_process_incoming_text` (persist
+    /// detects via regex catalog; agent has no UUID control).
+    #[cfg(feature = "secrets")]
+    fn secrets_store_detected_secret(
+        &self,
+        py: Python<'_>,
+        payload_json: &str,
+        accessor: &str,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let payload: crate::secrets::DetectedSecret = serde_json::from_str(payload_json)
+                .map_err(|e| PyValueError::new_err(format!("DetectedSecret decode: {e}")))?;
+            let accessor = accessor.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        let outcome = backend
+                            .store_detected_secret(payload, accessor)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        encode_secret_claim_result(outcome).map_err(|e| {
+                            PyRuntimeError::new_err(format!("store_detected_secret encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::secrets::sqlite::SqliteSecretsBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::secrets::SecretsService;
+                        let outcome = backend
+                            .store_detected_secret(payload, accessor)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        encode_secret_claim_result(outcome).map_err(|e| {
+                            PyRuntimeError::new_err(format!("store_detected_secret encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// Walk `action_params_json`, replacing every
+    /// `{SECRET:<uuid>:<description>}` placeholder with the
+    /// decrypted plaintext (when the action_type is in the secret's
+    /// `auto_decapsulate_for_actions` whitelist and
+    /// `manual_access_only` is false). Returns the JSON-encoded
+    /// `DecapsulateResult` carrying the rewritten params + per-secret
+    /// outcomes. Audited via `access_log` with
+    /// `operation = 'decrypt'`.
     #[cfg(feature = "secrets")]
     fn secrets_decapsulate(
         &self,
@@ -12453,6 +12577,25 @@ fn _test_inject_panic(panic_msg: &str) -> PyResult<()> {
 }
 
 /// `ciris_persist` Python module entry point. The build script
+/// v1.5.24 (CIRISPersist#66) — encode a
+/// [`ClaimResult<SecretReference>`] onto the
+/// `{"outcome": "stored" | "already_claimed", "ref": <SecretReference>}`
+/// JSON wire shape. Used by `secrets_store_detected_secret`.
+#[cfg(feature = "secrets")]
+fn encode_secret_claim_result(
+    outcome: crate::ClaimResult<crate::secrets::SecretReference>,
+) -> Result<String, serde_json::Error> {
+    let (label, secret_ref) = match outcome {
+        crate::ClaimResult::Stored(r) => ("stored", r),
+        crate::ClaimResult::AlreadyClaimed(r) => ("already_claimed", r),
+    };
+    let wire = serde_json::json!({
+        "outcome": label,
+        "ref": secret_ref,
+    });
+    serde_json::to_string(&wire)
+}
+
 /// (maturin) generates the C entry that Python imports.
 #[pymodule]
 fn ciris_persist(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {

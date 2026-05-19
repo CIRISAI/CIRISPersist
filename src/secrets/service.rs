@@ -18,9 +18,9 @@
 use std::future::Future;
 
 use super::types::{
-    AccessLogEntry, DecapsulationContext, FilterConfig, FilterUpdateRequest, FilterUpdateResult,
-    MasterKeyRef, RotationResult, SecretRecallResult, SecretReference, SecretsListFilter,
-    SecretsServiceStats,
+    AccessLogEntry, DecapsulationContext, DetectedSecret, FilterConfig, FilterUpdateRequest,
+    FilterUpdateResult, MasterKeyRef, RotationResult, SecretRecallResult, SecretReference,
+    SecretsListFilter, SecretsServiceStats,
 };
 use super::SecretsError;
 use crate::pipeline::classify::Sensitivity;
@@ -373,6 +373,51 @@ pub trait SecretsService: Send + Sync {
         async {
             Err(SecretsError::Internal(
                 "try_claim_secret not implemented for this backend".into(),
+            ))
+        }
+    }
+
+    // ── Caller-supplied detected-secret store (v1.5.24, CIRISPersist#66) ──
+
+    /// Store an agent-detected secret with a **caller-supplied
+    /// UUID** + full metadata bundle.
+    ///
+    /// Distinct from [`Self::try_claim_secret`] (persist generates
+    /// the UUID, accepts a subset of metadata) and
+    /// [`Self::store_secret`] (manually-keyed, no detection
+    /// metadata). The agent owns the UUID + assigns rich detection
+    /// context (`context_hint`, `source_message_id`,
+    /// `detected_pattern`, `auto_decapsulate_for_actions`,
+    /// `manual_access_only`) — persist stores it verbatim.
+    ///
+    /// # Race-safety + idempotency
+    ///
+    /// Returns [`ClaimResult::Stored`] on clean insert,
+    /// [`ClaimResult::AlreadyClaimed`] when the row already exists
+    /// (either same plaintext under a different caller UUID via the
+    /// V017 `content_hmac` UNIQUE index, OR same UUID re-supplied
+    /// idempotently). Both arms return the **canonical**
+    /// [`SecretReference`] — caller reconciles to that UUID.
+    ///
+    /// # UUID collision with a *different* plaintext
+    ///
+    /// If the caller's `secret_uuid` is already in use for a
+    /// different `content_hmac`, returns `InvalidArgument` —
+    /// the agent has a UUID-allocation bug.
+    ///
+    /// # Default impl
+    ///
+    /// Returns [`SecretsError::Internal`] — backends opt in
+    /// explicitly (PG + SQLite ship the impl in v1.5.24).
+    fn store_detected_secret(
+        &self,
+        payload: DetectedSecret,
+        accessor: String,
+    ) -> impl Future<Output = Result<ClaimResult<SecretReference>, SecretsError>> + Send {
+        let _ = (payload, accessor);
+        async {
+            Err(SecretsError::Internal(
+                "store_detected_secret not implemented for this backend".into(),
             ))
         }
     }

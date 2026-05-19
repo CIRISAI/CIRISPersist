@@ -5,6 +5,90 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.5.24] — 2026-05-19
+
+**`secrets_store_detected_secret` + docstring fix (CIRISPersist#66).**
+
+Fifth of six v1.5.19 follow-ups. Closes the secrets-substrate gap
+that blocked CIRISAgent 2.9.0 Phase 2a. Two distinct fixes in one
+cut:
+
+### Gap A — `secrets_process_incoming_text` docstring was stale
+
+The PyO3 wrapper's docstring still carried the v0.6.1 prose
+`"Stub: v0.6.2 wires this with the pipeline classify stage. Until
+then returns SecretsError::Internal."`. The body has been a fully
+wired composition since v1.5.7 — `get_filter_config` +
+`try_claim_secret` as a default trait impl shared by both
+backends. The "empty `refs` array" the agent team observed is the
+*correct* behavior of the wired code given an empty filter
+catalog: no patterns configured → no detection. Docstring now
+documents the catalog dependency, the JSON schema agents must seed
+via `secrets_set_filter_config`, and points to
+`secrets_store_detected_secret` as the agent-detection alternative.
+Same docstring sweep for `secrets_decapsulate` (also pre-wired
+since v0.6.1 but never relabeled).
+
+### Gap B — `store_detected_secret` for agent-detection flow
+
+New method on `SecretsService` accepting a **caller-supplied UUID**
+plus the full `DetectedSecret` metadata bundle:
+`description`, `sensitivity`, `detected_pattern`, `context_hint`,
+`source_message_id`, `auto_decapsulate_for_actions`,
+`manual_access_only`. Persist stores verbatim under the agent's UUID.
+
+Distinct from existing paths:
+- `store_secret(key, value)` — persist generates UUID; no detection
+  metadata; `detected_pattern="manual"`.
+- `try_claim_secret(plaintext, …)` — persist generates UUID;
+  accepts a subset of metadata.
+- `process_incoming_text(text, …)` — persist's regex catalog
+  detects; agent has no UUID control.
+
+### Semantics
+
+- Returns `ClaimResult<SecretReference>` envelope:
+  - `Stored(ref)` — clean insert under caller's UUID; reference
+    carries the canonical row shape.
+  - `AlreadyClaimed(ref)` — `content_hmac` collision (V017 unique
+    index). Same plaintext exists from any caller path. The
+    reference may carry a **different** UUID than the caller
+    supplied — agent reconciles.
+- Caller's UUID reused for a *different* plaintext →
+  `InvalidArgument` (caller UUID-allocation bug).
+- Audited via `access_log` with `operation = 'store'`, purpose
+  carries outcome label.
+
+### PyO3 + .pyi
+
+`Engine.secrets_store_detected_secret(payload_json, accessor) -> str`.
+Returns the JSON envelope
+`{"outcome": "stored" | "already_claimed", "ref": <SecretReference>}`.
+.pyi stub added with full docstring; PyO3 docstring fixes on
+`secrets_process_incoming_text` + `secrets_decapsulate` deployed in
+the same cut.
+
+### Tests
+
+9 new (6 SQLite + 3 PG-gated):
+- Clean store with full metadata round-trips (caller UUID
+  preserved, description / pattern / context_hint / sensitivity /
+  auto_decapsulate all persisted).
+- Same UUID + same plaintext → `AlreadyClaimed` (idempotent).
+- Different UUID + same plaintext → `AlreadyClaimed` with
+  *canonical* (first) UUID.
+- Same UUID + different plaintext → `InvalidArgument`.
+- Empty UUID / value / pattern / description / malformed UUID →
+  `InvalidArgument`.
+- Recall after store round-trips the value + metadata.
+
+PG tests use a local `reset_secrets_state` helper that TRUNCATEs
+the secrets-schema family before each test — addresses the
+pre-existing test-pollution bug where rerunning master-key rotation
+in a populated local DB tripped `active_master_key()`'s
+"exactly 1 row" invariant. CI starts fresh so this is local-only
+hygiene.
+
 ## [1.5.23] — 2026-05-19
 
 **`service_token_revocation_*` substrate — last aiosqlite consumer absorbed (CIRISPersist#64).**

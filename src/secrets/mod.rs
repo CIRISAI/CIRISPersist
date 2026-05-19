@@ -77,9 +77,9 @@ pub use client::FederatedSecretsClient;
 
 #[cfg(feature = "secrets")]
 pub use types::{
-    AccessLogEntry, AccessOp, DecapsulationContext, EncryptedSecretRecord, FilterConfig,
-    FilterUpdateRequest, FilterUpdateResult, MasterKeyRef, RotationResult, SecretRecallResult,
-    SecretRecord, SecretReference, SecretsListFilter, SecretsServiceStats,
+    AccessLogEntry, AccessOp, DecapsulationContext, DetectedSecret, EncryptedSecretRecord,
+    FilterConfig, FilterUpdateRequest, FilterUpdateResult, MasterKeyRef, RotationResult,
+    SecretRecallResult, SecretRecord, SecretReference, SecretsListFilter, SecretsServiceStats,
 };
 
 /// SecretsService-layer errors.

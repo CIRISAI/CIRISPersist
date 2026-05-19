@@ -889,6 +889,58 @@ class Engine:
         revoked, ``None`` otherwise. Backed by the PRIMARY KEY index.
         """
 
+    # ── v1.5.24 (CIRISPersist#66) — agent-detected secret store ─────
+
+    def secrets_store_detected_secret(
+        self,
+        payload_json: str,
+        accessor: str,
+    ) -> str:
+        """v1.5.24 (CIRISPersist#66) — Store an agent-detected secret
+        with a **caller-supplied UUID** + full metadata bundle.
+
+        ``payload_json`` is a JSON-encoded ``DetectedSecret`` shape:
+
+        .. code-block:: json
+
+            {
+              "secret_uuid": "<uuid-v4>",
+              "value": "<plaintext>",
+              "description": "...",
+              "sensitivity": "low" | "medium" | "high" | "critical",
+              "detected_pattern": "regex:openai_key_v1",
+              "context_hint": "in tool_args.api_key",
+              "source_message_id": "msg-123",
+              "auto_decapsulate_for_actions": ["tool"],
+              "manual_access_only": false
+            }
+
+        Returns the JSON envelope
+        ``{"outcome": "stored" | "already_claimed", "ref": <SecretReference>}``.
+
+        ``stored`` — clean insert under the caller's UUID.
+        ``already_claimed`` — same plaintext exists (content_hmac
+        match across any caller path). The returned ``ref`` may
+        carry a **different** ``uuid`` than the caller supplied —
+        agent reconciles to the canonical id.
+
+        Distinct from :meth:`secrets_store_secret` (manually-keyed;
+        persist generates the UUID; no detection metadata) and
+        :meth:`secrets_process_incoming_text` (persist's regex
+        catalog detects; agent has no UUID control).
+
+        Raises:
+            ValueError: empty ``secret_uuid`` / ``value`` /
+                ``detected_pattern`` / ``description``, malformed
+                UUID, or ``secret_uuid`` already in use for a
+                *different* plaintext (agent UUID-allocation bug).
+            RuntimeError: backend / IO error.
+
+        Replaces the agent-side ``SecretRecord`` write path in
+        CIRISAgent ``secrets/store.py`` for the 2.9.0 Phase 2a
+        cutover.
+        """
+
     def trust_grant_consistency_proof(
         self,
         tenant_id: str,

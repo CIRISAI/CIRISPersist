@@ -87,6 +87,8 @@ use std::future::Future;
 // the unused-imports warning under the CI's `-D warnings` for builds
 // without any pipeline feature.
 #[cfg(any(feature = "extract", feature = "classify", feature = "scrub"))]
+#[allow(unused_imports)] // re-exported under test+feature; the `use` line
+// also pulls the type into scope for doc-references.
 use crate::schema::BatchEnvelope;
 
 // v1.1.0 (CIRISPersist#33): `WireEnvelope` is the trait the generic
