@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779201706581,
+  "lastUpdate": 1779202202541,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -18695,6 +18695,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23955100,
             "range": "± 275783",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "c7bce0dab1e25d05d25e86858391b70c036dcab9",
+          "message": "1.5.23 — service_token_revocation substrate (closes #64)\n\nNew substrate replacing CIRISAgent's standalone\nrevoked_service_tokens.db SQLite file — the last aiosqlite consumer\nin agent requirements.txt. Lands CIRISAgent 2.9.0 Phase 2b\nunblocker.\n\nV037 migration on both backends: revoked_service_tokens table\n(token_hash PK + revoked_at TIMESTAMPTZ + revoked_by + reason).\ntoken_hash is a SHA-based digest of a service token — distinct from\nwa_id (service tokens don't map to WA certs).\n\nServiceTokenRevocationService trait — 3 methods:\n- record_revocation: idempotent on token_hash via ON CONFLICT DO\n  NOTHING. First record wins; re-records are silent no-ops.\n- list_revocations: full table dump. Agent caches in memory at\n  startup.\n- check_revocation: point lookup. PK-indexed.\n\nValidation rejects empty token_hash / revoked_by / reason with\nInvalidArgument.\n\nFeature flag cirislens_service_token_revocation (Cargo + pyproject).\nPyO3 surface (3 methods) + .pyi stubs. Stable AV-15 kinds:\nservice_token_revocation_{invalid_argument | not_found | conflict |\nbackend | internal}.\n\nTests: 15 (6 PG + 6 SQLite + 1 error-kind + 2 types serde).\n600/600 pass across postgres + sqlite + all 12 cirislens features.\n\ncloses #64\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-19T09:42:23-05:00",
+          "tree_id": "d3417cba7cb3c252d4da3b697487f601e8388baa",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/c7bce0dab1e25d05d25e86858391b70c036dcab9"
+        },
+        "date": 1779202201259,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 102195,
+            "range": "± 616",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 247315,
+            "range": "± 2113",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 534466,
+            "range": "± 7029",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1889257,
+            "range": "± 15591",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 357,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1522,
+            "range": "± 40",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8275,
+            "range": "± 83",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21814,
+            "range": "± 284",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24956,
+            "range": "± 421",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 84565,
+            "range": "± 683",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 379,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3180,
+            "range": "± 91",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9599,
+            "range": "± 107",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42440,
+            "range": "± 681",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 657,
+            "range": "± 18",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2474976,
+            "range": "± 135222",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6859167,
+            "range": "± 163956",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 24293254,
+            "range": "± 303637",
             "unit": "ns/iter"
           }
         ]
