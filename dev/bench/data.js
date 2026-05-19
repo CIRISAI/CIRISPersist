@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779201010699,
+  "lastUpdate": 1779201418506,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -18431,6 +18431,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 21055613,
             "range": "± 39983894",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "943db82d9f54627cc61578444740d1c57fe2d907",
+          "message": "1.5.21 — created_before/created_after on task_list/thought_list (closes #62)\n\nTwo new optional filter keys on TaskFilter and ThoughtFilter:\n- created_before → SQL `created_at < ?` (strict; matches agent's\n  `get_tasks_older_than` semantics)\n- created_after → SQL `created_at >= ?` (inclusive; symmetric with\n  updated_after)\n\nBoth honored on both backends; both compose with existing filter\nkeys via AND. No migration — reads against the existing created_at\ncolumn.\n\nRemoves the O(N)-per-cleanup pagination workaround in\nCIRISAgent#763's migrated `get_tasks_older_than` /\n`get_thoughts_older_than` / archive-sweep paths.\n\nTests: 3 SQLite + 3 PG (created_before excludes newer,\ncreated_after excludes older, combined window keeps middle row;\nthoughts mirror). 576/576 pass across all 11 cirislens features.\n\n.pyi docstrings extended to document the new keys (PyO3 surface is\nunchanged — `task_list`/`thought_list` accept the keys inside\nfilter_json).\n\ncloses #62\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-19T09:25:55-05:00",
+          "tree_id": "a188348452d3acc5130be57b9672e56a0aa6a26b",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/943db82d9f54627cc61578444740d1c57fe2d907"
+        },
+        "date": 1779201417249,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 87717,
+            "range": "± 674",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 203942,
+            "range": "± 292",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 436882,
+            "range": "± 987",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1539410,
+            "range": "± 7470",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 264,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1080,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 5481,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 17972,
+            "range": "± 35",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 20498,
+            "range": "± 45",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 70621,
+            "range": "± 165",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 273,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 2448,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 7641,
+            "range": "± 35",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 32699,
+            "range": "± 99",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 527,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2170457,
+            "range": "± 2055707",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 5849149,
+            "range": "± 10384577",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 20595101,
+            "range": "± 10197586",
             "unit": "ns/iter"
           }
         ]
