@@ -1,3 +1,10 @@
+// Four query_row closures with multi-tuple SELECT projections that
+// lint under clippy 1.95's `type_complexity`. Pre-existing v0.9.4
+// shape; the tuples bind locally inside each closure so extracting
+// a type alias is invasive for no readability gain. Silenced
+// module-wide — same call made for src/secrets/sqlite.rs.
+#![allow(clippy::type_complexity)]
+
 //! SQLite impl of [`NodeCoreService`] (v0.9.4, CIRISPersist#40).
 //!
 //! Mirrors the v0.7.0-α4 / v0.7.1 / v0.7.2 Postgres impl with SQLite-

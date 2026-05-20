@@ -36,3 +36,28 @@ def test_typed_exception_hierarchy_exported() -> None:
     # Base extends the built-in Exception (NOT BaseException — uvicorn-
     # style `except Exception:` must catch them).
     assert issubclass(ciris_persist.PersistError, Exception)
+
+
+def test_engine_lifecycle_exceptions_exported() -> None:
+    """v1.6.8 (CIRISPersist#75-78) — the three engine-lifecycle
+    exception classes are exported and derive from PersistError, so
+    in-process adapter code can `except EngineConfigMismatch:` /
+    `except EngineClosed:` / `except EngineUsedAcrossFork:` or catch
+    the `PersistError` umbrella."""
+    for name in ("EngineConfigMismatch", "EngineClosed", "EngineUsedAcrossFork"):
+        assert hasattr(ciris_persist, name), f"{name} not exported"
+        cls = getattr(ciris_persist, name)
+        assert issubclass(cls, ciris_persist.PersistError), (
+            f"{name} must derive from PersistError"
+        )
+        # And therefore from the built-in Exception.
+        assert issubclass(cls, Exception)
+
+
+def test_engine_has_lifecycle_surface() -> None:
+    """v1.6.8 — the Engine class exposes the close() teardown door
+    and the is_closed lifecycle getter (CIRISPersist#77). Construction
+    itself is exercised by the Rust-side substrate tests + the
+    CIRISAgent 2.9.0 suite; this just pins the public surface."""
+    assert hasattr(ciris_persist.Engine, "close")
+    assert hasattr(ciris_persist.Engine, "is_closed")

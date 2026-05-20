@@ -5,6 +5,101 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.6.8] — 2026-05-20
+
+**`Engine` is a process-singleton — ends the multi-consumer deadlock
+(CIRISPersist#75 / #76 / #77 / #78). 2.9.0 ship gate.**
+
+Pre-v1.6.8 every `Engine(...)` constructed its own multi-thread
+tokio runtime. Two `Engine`s in one process → two runtimes
+contending on the shared DB → the 39-minute hang CIRISAgent 2.9.0
+auth-suite testing hit (#75). The CIRIS 3.0 in-process model (agent
++ NodeCore + LensCore each consuming persist) made this a hard
+blocker.
+
+### #75 — process-singleton runtime
+
+The runtime + backend pool + signer state now live in one
+process-global `EngineCell`, built exactly once, guarded by an
+`OnceLock<Mutex<…>>`. The global lock is held for the **whole**
+constructor — two threads cannot both run `Runtime::new()` (the #75
+"no check-then-init race" requirement). A second `Engine(...)` with
+the same config returns a cheap handle cloned from the singleton —
+no second runtime, no second pool.
+
+### #76 — config-mismatch raises, never silently rebinds
+
+A second `Engine(...)` whose config fingerprint (DSN +
+signing-key-id + local key ids) differs from the live engine's
+raises the new typed `EngineConfigMismatch`. Silent rebind — caller
+thinks it holds Postgres engine B, actually holds SQLite engine A —
+would corrupt data, strictly worse than the deadlock. "Idempotent"
+means *same-args → no-op*, never *always no-op*.
+
+### #77 — `close()` teardown door
+
+New `Engine.close()` flips the singleton's shared `closed` flag
+(every handle sees it) and clears the global slot so a later
+`Engine(...)` rebuilds. Idempotent. New `Engine.is_closed` getter.
+Lifecycle rule: **one owner** constructs + closes; in-process
+adapters attach and detach but never close. Use after `close()`
+raises the typed `EngineClosed` instead of running against a
+torn-down runtime.
+
+### #78 — fork-safety guard
+
+Every `Engine` method records the construction pid and compares it
+to the calling pid; a mismatch (the process forked — uvicorn/gunicorn
+preload, `multiprocessing` with the default `fork` start method)
+raises the typed `EngineUsedAcrossFork` rather than deadlocking on a
+runtime whose worker threads don't exist in the child. The contract
+("construct after forking, or use the `spawn` start method") is
+documented in `docs/COHABITATION.md`'s new in-process section.
+
+### Per-method guard
+
+`ensure_usable()` — the closed-check + fork-check — runs as the
+first statement of all **214** `Engine` methods that touch the
+runtime/pool. Pure local-read accessors (`keyring_path`,
+`keyring_storage_kind`) are exempt — they can't deadlock and don't
+return `PyResult`.
+
+### Typed exceptions
+
+`EngineConfigMismatch`, `EngineClosed`, `EngineUsedAcrossFork` —
+new `create_exception!` classes, all deriving from `PersistError`
+(so `except PersistError:` catches the umbrella), registered in the
+module and exported. AV-15/AV-43 typed-error pattern.
+
+### docs/COHABITATION.md
+
+New "In-process cohabitation" section — the doc previously covered
+only multi-*process* cohabitation (keyring flock). Now documents the
+one-process-multiple-consumer model: one owner constructs, adapters
+attach, one owner closes, construct-after-fork. Notes the #79–#84
+enabler set (consumer registry, lifecycle refcount, injected-engine
+handle) as the 3.0 follow-on this floor builds toward.
+
+### Tests
+
+- Rust unit test — `engine_config_fingerprint` distinguishes every
+  config field, NUL-separated so field boundaries can't alias.
+- Python tests — the three lifecycle exceptions are exported and
+  derive from `PersistError`; `Engine` exposes `close` + `is_closed`.
+- The singleton/close/fork *behavior* is exercised end-to-end by the
+  CIRISAgent 2.9.0 suite (the suite that surfaced #75) — a Rust test
+  can't cleanly exercise a process-global across cargo's
+  shared-process test runner.
+
+### Compatibility
+
+The Python `Engine(...)` API is unchanged for the single-consumer
+case — first construction behaves exactly as before. The new
+behavior only triggers on a *second* construction in the same
+process: same config → handle (was: second runtime); different
+config → `EngineConfigMismatch` (was: second runtime). No SQL
+migration. No wire-format change.
+
 ## [1.6.7] — 2026-05-20
 
 **SQLite validates `incident_id` / `metric_id` as UUID — PG-parity,

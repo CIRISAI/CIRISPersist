@@ -193,6 +193,80 @@ cold-start path.
 
 ---
 
+## In-process cohabitation — one process, multiple consumers (v1.6.8)
+
+Everything above addresses **multi-process** cohabitation on a host
+(uvicorn workers, separate lens/bridge containers) — the keyring
+flock serializes cold-start identity creation across processes.
+
+CIRIS 3.0 introduces a different shape: **one process** (the
+CIRISAgent runtime) hosting the agent **plus** CIRISNodeCore **plus**
+CIRISLensCore as always-on in-process adapters, all consuming
+persist. Pre-v1.6.8 this deadlocked — `Engine(...)` built a fresh
+multi-thread tokio runtime on every construction, so two consumers
+in one process produced two runtimes contending on the shared DB
+(CIRISPersist#75: a 39-minute hang in the CIRISAgent 2.9.0 auth
+suite).
+
+### The v1.6.8 contract
+
+**`Engine` is a process-singleton.** The tokio runtime + connection
+pool are built exactly once per process. The lifecycle rules:
+
+1. **One owner constructs.** Whoever boots the process (the
+   CIRISAgent runtime) calls `Engine(dsn, signing_key_id, …)` first.
+   That call builds the runtime + pool.
+
+2. **Adapters attach, never rebuild.** NodeCore / LensCore (and any
+   other in-process consumer) call `Engine(...)` with the **same
+   config**. They get a cheap handle to the already-built engine —
+   no second runtime. A different DSN / signing-key-id raises
+   `EngineConfigMismatch` (CIRISPersist#76): a process hosts exactly
+   one persist engine, and a silent rebind to a different backend
+   would corrupt data, not just hang.
+
+3. **One owner closes.** At process shutdown / test teardown the
+   owner calls `engine.close()` (CIRISPersist#77). Adapters do
+   **not** call `close()` — they attached, they don't own the
+   lifecycle. After `close()` every method raises `EngineClosed`
+   instead of running against a torn-down runtime; a fresh
+   `Engine(...)` afterward rebuilds.
+
+4. **Construct after forking.** A tokio runtime does **not** survive
+   `fork()` — the child inherits worker threads that don't exist and
+   mutexes that may be held. Construct `Engine` **after** all
+   forking is done (after uvicorn/gunicorn spawn their workers), or
+   set the process-wide `multiprocessing` start method to `"spawn"`.
+   Every `Engine` method verifies the calling pid against the
+   construction pid; a mismatch raises `EngineUsedAcrossFork`
+   (CIRISPersist#78) rather than deadlocking silently.
+
+`EngineConfigMismatch`, `EngineClosed`, and `EngineUsedAcrossFork`
+all derive from `PersistError` — `except PersistError:` catches the
+umbrella, or branch on the specific subclass.
+
+### Relationship to the multi-process flock
+
+The two mechanisms are orthogonal and compose:
+
+- **Multi-process** (uvicorn workers, separate containers) — the
+  keyring flock serializes cold-start identity creation. Each
+  process still has its own singleton engine.
+- **In-process** (3.0 agent + NodeCore + LensCore) — the
+  process-singleton ensures the *one* process has *one* runtime,
+  shared by all in-process consumers.
+
+A 3.0 deployment uses both: N worker processes, each flock-serialized
+for keyring convergence, and within each worker a single shared
+engine for the co-resident adapters.
+
+The richer in-process model — an explicit consumer registry, a
+lifecycle refcount so the engine tears down only when the *last*
+consumer detaches, and an injected-engine handle so adapters never
+even call the `Engine(...)` constructor — is tracked as the
+CIRISPersist#79–#84 enabler set for 3.0. v1.6.8 ships the
+deadlock-ending floor those build on.
+
 ## What v0.1.14 does NOT do
 
 - **Doesn't add a daemon.** Persist is and remains a Python wheel.

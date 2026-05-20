@@ -59,6 +59,12 @@ use crate::verify::PythonJsonDumpsCanonicalizer;
 /// CIRISAgent#755 Option A: URL-sniff single Engine class, internal enum
 /// dispatch. Smallest agent-side diff — the Python API is identical
 /// across backends.
+///
+/// `Clone` is cheap — each arm wraps an `Arc`, so cloning a
+/// `BackendDispatch` shares the same pool/connection (v1.6.8: the
+/// process-singleton cell hands `Arc`-shared clones to every
+/// `PyEngine` handle).
+#[derive(Clone)]
 pub(crate) enum BackendDispatch {
     Postgres(Arc<PostgresBackend>),
     /// v1.5.1 — every PyEngine method body now reads this arm via
@@ -107,8 +113,30 @@ mod persist_errors {
         Permanent,
         super::persist_errors::PersistError
     );
+    // v1.6.8 (CIRISPersist#75-78) — engine-lifecycle errors. All
+    // derive from `PersistError` so `except PersistError` still
+    // catches them; callers branch on the specific subclass for
+    // lifecycle handling.
+    pyo3::create_exception!(
+        ciris_persist,
+        EngineConfigMismatch,
+        super::persist_errors::PersistError
+    );
+    pyo3::create_exception!(
+        ciris_persist,
+        EngineClosed,
+        super::persist_errors::PersistError
+    );
+    pyo3::create_exception!(
+        ciris_persist,
+        EngineUsedAcrossFork,
+        super::persist_errors::PersistError
+    );
 }
-pub use persist_errors::{Conflict, NotFound, Permanent, PersistError, Transient};
+pub use persist_errors::{
+    Conflict, EngineClosed, EngineConfigMismatch, EngineUsedAcrossFork, NotFound, Permanent,
+    PersistError, Transient,
+};
 
 /// v1.0.0-scaffold helper — map a stable substrate error `kind()` token
 /// (e.g. `"audit_not_found"`, `"cirisgraph_conflict"`, `"secrets_backend"`)
@@ -203,13 +231,98 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
     }
 }
 
-/// `ciris_persist.Engine` — one instance per (DSN, scrubber)
-/// configuration.
+// ── v1.6.8 (CIRISPersist#75-78) — process-singleton engine ──────────
+//
+// Pre-v1.6.8 every `Engine(...)` constructed its own multi-thread
+// tokio runtime. Two `Engine`s in one process → two runtimes
+// contending on the shared DB → the 39-minute deadlock CIRISAgent
+// 2.9.0 testing hit (#75). The CIRIS 3.0 in-process model (agent +
+// NodeCore + LensCore each consuming persist) makes this a hard
+// blocker.
+//
+// Fix: the runtime + backend pool + signer state live in ONE
+// process-global `EngineCell`, built exactly once. Every
+// `Engine(...)` call consults the singleton:
+//   * empty / previously-closed slot → build the cell.
+//   * live slot, same config        → return a handle cloned from it.
+//   * live slot, different config    → raise `EngineConfigMismatch`
+//     (#76 — silent rebind would corrupt data).
+//
+// `close()` (#77) flips the shared `closed` flag and clears the slot
+// so a fresh construction can rebuild. `ensure_usable()` guards
+// every method: `EngineClosed` after close, `EngineUsedAcrossFork`
+// when the calling pid differs from the construction pid (#78 — a
+// tokio runtime does not survive `fork()`).
+
+/// Process-global canonical engine state. Built once; `PyEngine`
+/// handles clone Arc fields out of it.
+struct EngineCell {
+    backend: BackendDispatch,
+    runtime: Arc<Runtime>,
+    scrubber: Arc<dyn Scrubber>,
+    signer: Arc<dyn HardwareSigner>,
+    signer_key_id: String,
+    local_signer: Option<Arc<crate::signing::LocalSigner>>,
+    #[cfg(all(feature = "sqlite", feature = "cirisaudit"))]
+    sqlite_audit: Option<Arc<crate::audit::sqlite::SqliteAuditBackend>>,
+    /// Identity of the construction config — DSN + key ids. A second
+    /// `Engine(...)` whose fingerprint differs raises
+    /// `EngineConfigMismatch` rather than silently rebinding.
+    config_fingerprint: String,
+    /// `std::process::id()` at construction. A mismatch on a later
+    /// call means the process forked — the runtime's worker threads
+    /// don't exist in the child.
+    construction_pid: u32,
+    /// Shared with every `PyEngine` handle. `close()` sets it; every
+    /// method checks it.
+    closed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The one global slot. `OnceLock` initializes the `Mutex` once;
+/// the `Option` is `None` until first construction and after
+/// `close()`.
+static ENGINE_SINGLETON: std::sync::OnceLock<std::sync::Mutex<Option<Arc<EngineCell>>>> =
+    std::sync::OnceLock::new();
+
+fn engine_slot() -> std::sync::MutexGuard<'static, Option<Arc<EngineCell>>> {
+    ENGINE_SINGLETON
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        // Recover from a poisoned lock rather than cascading the
+        // panic — a prior panicked construction shouldn't wedge the
+        // singleton permanently.
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Fingerprint the construction config. Two `Engine(...)` calls are
+/// "the same engine" iff this matches. The scrubber (an opaque
+/// Python callable) is deliberately excluded — DSN + signing
+/// identities are the data-affecting config; a second caller's
+/// scrubber is ignored in favor of the singleton's (documented on
+/// `Engine.__init__`).
+fn engine_config_fingerprint(
+    dsn: &str,
+    signing_key_id: &str,
+    local_key_id: &Option<String>,
+    local_pqc_key_id: &Option<String>,
+) -> String {
+    format!(
+        "dsn={dsn}\0sk={signing_key_id}\0lk={}\0lpk={}",
+        local_key_id.as_deref().unwrap_or(""),
+        local_pqc_key_id.as_deref().unwrap_or(""),
+    )
+}
+
+/// `ciris_persist.Engine` — **process-singleton** handle to the
+/// persistence pipeline.
 ///
-/// Holds the Postgres pool and the tokio runtime. Method calls are
-/// synchronous from Python's perspective; internally they
-/// `block_on` the runtime so the FastAPI thread that called us can
-/// hand off to other workers via `py.allow_threads`.
+/// v1.6.8 (CIRISPersist#75-78): the tokio runtime + backend pool are
+/// built exactly once per process. Constructing `Engine(...)` again
+/// with the same config returns a cheap handle to the existing
+/// engine; a different config raises `EngineConfigMismatch`. Call
+/// `close()` for deterministic teardown; using a closed engine
+/// raises `EngineClosed`; using one across `fork()` raises
+/// `EngineUsedAcrossFork`.
 #[pyclass(name = "Engine", module = "ciris_persist")]
 pub struct PyEngine {
     /// v1.0.0-scaffold (CIRISPersist#193) introduced; v1.5.1 finished
@@ -260,6 +373,62 @@ pub struct PyEngine {
     /// reuse the same backend for every call.
     #[cfg(all(feature = "sqlite", feature = "cirisaudit"))]
     sqlite_audit: Option<Arc<crate::audit::sqlite::SqliteAuditBackend>>,
+    /// v1.6.8 (CIRISPersist#77) — shared with the process-singleton
+    /// [`EngineCell`]. `close()` sets it; [`PyEngine::ensure_usable`]
+    /// checks it on every method so use-after-close raises
+    /// `EngineClosed` instead of hanging on a torn-down runtime.
+    closed: Arc<std::sync::atomic::AtomicBool>,
+    /// v1.6.8 (CIRISPersist#78) — `std::process::id()` at
+    /// construction. Every method compares it against the current
+    /// pid; a mismatch (the process forked) raises
+    /// `EngineUsedAcrossFork` rather than deadlocking on a runtime
+    /// whose worker threads don't exist in the child.
+    construction_pid: u32,
+}
+
+impl PyEngine {
+    /// Build a `PyEngine` handle from the process-singleton cell —
+    /// every field is a cheap `Arc`/`String` clone. All handles
+    /// share the cell's `closed` flag.
+    fn from_cell(cell: &EngineCell) -> Self {
+        PyEngine {
+            backend: cell.backend.clone(),
+            runtime: cell.runtime.clone(),
+            scrubber: cell.scrubber.clone(),
+            signer: cell.signer.clone(),
+            signer_key_id: cell.signer_key_id.clone(),
+            local_signer: cell.local_signer.clone(),
+            #[cfg(all(feature = "sqlite", feature = "cirisaudit"))]
+            sqlite_audit: cell.sqlite_audit.clone(),
+            closed: cell.closed.clone(),
+            construction_pid: cell.construction_pid,
+        }
+    }
+
+    /// v1.6.8 — guard run at the top of every method that touches
+    /// the runtime / pool. `EngineClosed` after `close()`;
+    /// `EngineUsedAcrossFork` when the process forked since
+    /// construction. Both fail fast with a typed error instead of
+    /// the silent native-FFI hang those states otherwise produce.
+    fn ensure_usable(&self) -> PyResult<()> {
+        use std::sync::atomic::Ordering;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(PyErr::new::<EngineClosed, _>(
+                "engine has been closed — construct a new Engine(...)",
+            ));
+        }
+        let pid = std::process::id();
+        if pid != self.construction_pid {
+            return Err(PyErr::new::<EngineUsedAcrossFork, _>(format!(
+                "engine was constructed in pid {} but used in pid {} — \
+                 a tokio runtime does not survive fork(); construct the \
+                 Engine after all forking is done, or set the process \
+                 multiprocessing start method to 'spawn'",
+                self.construction_pid, pid
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[pymethods]
@@ -321,7 +490,40 @@ impl PyEngine {
         local_pqc_key_path: Option<String>,
         pqc_sweep_on_init: bool,
     ) -> PyResult<Self> {
-        // Build a multi-thread runtime once per Engine instance.
+        // ── v1.6.8 (CIRISPersist#75-78) — process-singleton gate ────
+        //
+        // The global slot lock is held for the WHOLE constructor.
+        // This is the #75 "no check-then-init race" guarantee: two
+        // threads cannot both run `Runtime::new()`. A concurrent
+        // `Engine(...)` blocks here, then returns the singleton — it
+        // never builds a second runtime. (Construction does
+        // connect + migrate under the lock; acceptable — a process
+        // builds its one engine once, and the second caller *should*
+        // wait for it.)
+        let fingerprint =
+            engine_config_fingerprint(dsn, signing_key_id, &local_key_id, &local_pqc_key_id);
+        let mut slot = engine_slot();
+        if let Some(cell) = slot.as_ref() {
+            use std::sync::atomic::Ordering;
+            if !cell.closed.load(Ordering::Acquire) {
+                if cell.config_fingerprint != fingerprint {
+                    return Err(PyErr::new::<EngineConfigMismatch, _>(
+                        "Engine already constructed in this process with a \
+                         different config (DSN / signing-key-id). A process \
+                         hosts exactly one persist engine — attach to the \
+                         existing one, or close() it before constructing a \
+                         differently-configured engine.",
+                    ));
+                }
+                // Same config → return a handle to the singleton.
+                // No second runtime, no second pool.
+                return Ok(PyEngine::from_cell(cell));
+            }
+            // Slot holds a closed cell — fall through and rebuild.
+        }
+
+        // First construction (or rebuild after close()). Build the
+        // multi-thread runtime exactly once for the process.
         let runtime =
             Runtime::new().map_err(|e| PyRuntimeError::new_err(format!("tokio runtime: {e}")))?;
         let runtime = Arc::new(runtime);
@@ -605,7 +807,10 @@ impl PyEngine {
             }
         }
 
-        Ok(PyEngine {
+        // v1.6.8 — install the canonical cell into the process
+        // singleton, then hand back a handle cloned from it. `slot`
+        // (the global lock) has been held since the top of `new`.
+        let cell = Arc::new(EngineCell {
             backend,
             runtime,
             scrubber,
@@ -614,7 +819,53 @@ impl PyEngine {
             local_signer,
             #[cfg(all(feature = "sqlite", feature = "cirisaudit"))]
             sqlite_audit,
-        })
+            config_fingerprint: fingerprint,
+            construction_pid: std::process::id(),
+            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        let handle = PyEngine::from_cell(&cell);
+        *slot = Some(cell);
+        Ok(handle)
+    }
+
+    /// v1.6.8 (CIRISPersist#77) — deterministic teardown door.
+    ///
+    /// Flips the process-singleton's `closed` flag (every
+    /// `Engine` handle shares it, so all of them start raising
+    /// `EngineClosed`) and clears the global slot so a subsequent
+    /// `Engine(...)` rebuilds a fresh runtime + pool.
+    ///
+    /// **Lifecycle rule:** exactly one owner constructs and closes
+    /// the engine. In-process adapters (NodeCore, LensCore) attach
+    /// via `Engine(...)` with the same config and must NOT call
+    /// `close()` — the owner does, at process shutdown / test
+    /// teardown.
+    ///
+    /// The tokio runtime + connection pool are released when the
+    /// last `Engine` handle is dropped (Python GC); `close()` makes
+    /// the *logical* shutdown deterministic — no method runs against
+    /// a half-torn-down runtime, it fails fast with `EngineClosed`.
+    /// Idempotent: calling `close()` twice is a no-op.
+    fn close(&self) -> PyResult<()> {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        let mut slot = engine_slot();
+        // Only clear the slot if it still points at *this* engine —
+        // guard against clearing a fresh post-close rebuild.
+        if let Some(cell) = slot.as_ref() {
+            if Arc::ptr_eq(&cell.closed, &self.closed) {
+                *slot = None;
+            }
+        }
+        Ok(())
+    }
+
+    /// v1.6.8 — `True` once `close()` has run on this engine (or any
+    /// handle sharing its singleton cell). Lets a caller check
+    /// before dispatching rather than catching `EngineClosed`.
+    #[getter]
+    fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// v0.1.9 — return the **authoritative** seed-storage path for
@@ -665,6 +916,7 @@ impl PyEngine {
     /// envelope; same key that becomes the Reticulum destination
     /// when Phase 2.3 lands (one key, three roles).
     fn public_key_b64(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             use base64::engine::general_purpose::STANDARD as BASE64;
             use base64::Engine as _;
@@ -699,6 +951,7 @@ impl PyEngine {
     /// for the cold-path PQC kickoff per
     /// `docs/FEDERATION_DIRECTORY.md` §"Trust contract".
     fn sign<'py>(&self, py: Python<'py>, message: &Bound<'py, PyBytes>) -> PyResult<Py<PyBytes>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let signer = self.signer.clone();
             let runtime = self.runtime.clone();
@@ -740,6 +993,7 @@ impl PyEngine {
         py: Python<'py>,
         envelope_json: &str,
     ) -> PyResult<Py<PyBytes>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let value: serde_json::Value = serde_json::from_str(envelope_json)
                 .map_err(|e| PyValueError::new_err(format!("envelope JSON decode: {e}")))?;
@@ -772,6 +1026,7 @@ impl PyEngine {
     /// `local_key_id` + `local_key_path` (no local signing identity
     /// configured).
     fn local_public_key_b64(&self, _py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             // v0.4.2 — thin wrapper over LocalSigner::public_key_b64.
             self.local_signer
@@ -798,6 +1053,7 @@ impl PyEngine {
     ///
     /// Raises `ValueError` if no local signing identity is configured.
     fn local_key_id(&self, _py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             // v0.4.2 — thin wrapper over LocalSigner::key_id.
             self.local_signer
@@ -835,6 +1091,7 @@ impl PyEngine {
         py: Python<'py>,
         message: &Bound<'py, PyBytes>,
     ) -> PyResult<Py<PyBytes>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             // v0.4.2 — thin wrapper over LocalSigner::sign_ed25519.
             // Single-source-of-truth: Rust callers (CIRISLensCore) and
@@ -869,6 +1126,7 @@ impl PyEngine {
     /// `local_pqc_key_id` + `local_pqc_key_path` (the cold-path PQC
     /// identity isn't configured).
     fn local_pqc_public_key_b64(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             // v0.4.2 — thin wrapper over LocalSigner::pqc_public_key_b64.
             let signer = self.local_signer.clone().ok_or_else(|| {
@@ -898,6 +1156,7 @@ impl PyEngine {
     /// role-tag conceptual leak. The old name is fully removed —
     /// callers must update to `local_pqc_key_id`.
     fn local_pqc_key_id(&self, _py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             // v0.4.2 — thin wrapper over LocalSigner::pqc_key_id.
             self.local_signer
@@ -939,6 +1198,7 @@ impl PyEngine {
         py: Python<'py>,
         message: &Bound<'py, PyBytes>,
     ) -> PyResult<Py<PyBytes>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             // v0.4.2 — thin wrapper over LocalSigner::sign_ml_dsa_65.
             let signer = self.local_signer.clone().ok_or_else(|| {
@@ -994,6 +1254,7 @@ impl PyEngine {
         py: Python<'py>,
         body: &Bound<'py, PyBytes>,
     ) -> PyResult<Bound<'py, pyo3::types::PyList>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             use crate::schema::{BatchEnvelope, BatchEvent};
             use crate::verify::ed25519::canonical_payload_sha256s;
@@ -1071,6 +1332,7 @@ impl PyEngine {
         expires_at: Option<&str>,
         added_by: Option<&str>,
     ) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let key_id = signature_key_id.to_owned();
@@ -1166,6 +1428,7 @@ impl PyEngine {
         py: Python<'py>,
         body: &Bound<'py, PyBytes>,
     ) -> PyResult<Bound<'py, PyDict>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let bytes = body.as_bytes().to_vec();
             let scrubber = self.scrubber.clone();
@@ -1288,6 +1551,7 @@ impl PyEngine {
     /// signing on the cold path and calls `attach_key_pqc_signature`
     /// to fill them in. `algorithm` MUST be `"hybrid"`.
     fn put_public_key(&self, py: Python<'_>, signed_key_record_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let record: crate::federation::SignedKeyRecord =
@@ -1469,6 +1733,7 @@ impl PyEngine {
         registration_envelope_json: Option<&str>,
         roles: Option<Vec<String>>,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             use base64::engine::general_purpose::STANDARD as B64;
             use base64::Engine as _;
@@ -1566,6 +1831,7 @@ impl PyEngine {
     /// Federation directory: lookup a public key by `key_id`.
     /// Returns the JSON-encoded `KeyRecord` string, or `None`.
     fn lookup_public_key(&self, py: Python<'_>, key_id: &str) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let key_id = key_id.to_owned();
@@ -1612,6 +1878,7 @@ impl PyEngine {
     /// Federation directory: lookup all public keys for an identity_ref.
     /// Returns a JSON array string of `KeyRecord` objects.
     fn lookup_keys_for_identity(&self, py: Python<'_>, identity_ref: &str) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let identity_ref = identity_ref.to_owned();
@@ -1649,6 +1916,7 @@ impl PyEngine {
 
     /// Federation directory: write an attestation.
     fn put_attestation(&self, py: Python<'_>, signed_attestation_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let att: crate::federation::SignedAttestation =
@@ -1774,6 +2042,7 @@ impl PyEngine {
 
     /// Federation directory: list attestations targeting `attested_key_id`.
     fn list_attestations_for(&self, py: Python<'_>, attested_key_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let attested_key_id = attested_key_id.to_owned();
@@ -1811,6 +2080,7 @@ impl PyEngine {
 
     /// Federation directory: list attestations issued by `attesting_key_id`.
     fn list_attestations_by(&self, py: Python<'_>, attesting_key_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let attesting_key_id = attesting_key_id.to_owned();
@@ -1848,6 +2118,7 @@ impl PyEngine {
 
     /// Federation directory: write a revocation.
     fn put_revocation(&self, py: Python<'_>, signed_revocation_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let rev: crate::federation::SignedRevocation =
@@ -1969,6 +2240,7 @@ impl PyEngine {
 
     /// Federation directory: list revocations targeting `revoked_key_id`.
     fn revocations_for(&self, py: Python<'_>, revoked_key_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let revoked_key_id = revoked_key_id.to_owned();
@@ -2015,6 +2287,7 @@ impl PyEngine {
         pubkey_ml_dsa_65_base64: &str,
         scrub_signature_pqc: &str,
     ) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let key_id = key_id.to_owned();
@@ -2054,6 +2327,7 @@ impl PyEngine {
         attestation_id: &str,
         scrub_signature_pqc: &str,
     ) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let attestation_id = attestation_id.to_owned();
@@ -2092,6 +2366,7 @@ impl PyEngine {
         revocation_id: &str,
         scrub_signature_pqc: &str,
     ) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let revocation_id = revocation_id.to_owned();
@@ -2141,6 +2416,7 @@ impl PyEngine {
     /// Raises `ValueError` on self-trust (trusted_by == key),
     /// missing-domains-on-Registry, or unknown key_id.
     fn federation_grant_trust(&self, py: Python<'_>, trust_grant_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let grant: crate::federation::TrustGrant = serde_json::from_str(trust_grant_json)
@@ -2174,6 +2450,7 @@ impl PyEngine {
     /// Federation directory: revoke trust for a key. Idempotent —
     /// revoking an already-expired key is a no-op.
     fn federation_revoke_trust(&self, py: Python<'_>, key: &str, revoked_by: &str) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let key = key.to_owned();
@@ -2208,6 +2485,7 @@ impl PyEngine {
     /// Returns a JSON-encoded `TrustRow` string, or `None` if no
     /// trust grant exists.
     fn federation_lookup_trust(&self, py: Python<'_>, key: &str) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let key = key.to_owned();
@@ -2261,6 +2539,7 @@ impl PyEngine {
         py: Python<'_>,
         trust_filter_json: &str,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             // TrustFilter doesn't derive Serialize/Deserialize (the
@@ -2372,6 +2651,7 @@ impl PyEngine {
     /// shape as `local_pqc_sign`).
     #[pyo3(signature = (batch_size=1000))]
     fn run_pqc_sweep<'py>(&self, py: Python<'py>, batch_size: i64) -> PyResult<Bound<'py, PyDict>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let signer = self
                 .local_signer
@@ -2471,6 +2751,7 @@ impl PyEngine {
         signature_key_id: &str,
         include_federation_key: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let agent_id_hash = agent_id_hash.to_owned();
@@ -2557,6 +2838,7 @@ impl PyEngine {
         limit: i64,
         agent_id_hash: Option<&str>,
     ) -> PyResult<pyo3::Bound<'py, pyo3::types::PyList>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let agent_filter = agent_id_hash.map(str::to_owned);
@@ -2695,6 +2977,7 @@ impl PyEngine {
         soft_freshness_window_seconds: Option<f64>,
         row_age_seconds: Option<f64>,
     ) -> PyResult<Bound<'py, PyDict>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             use crate::verify::VerifyOutcome;
             let parsed_policy = parse_hybrid_policy(policy, soft_freshness_window_seconds)?;
@@ -2771,6 +3054,7 @@ impl PyEngine {
         py: Python<'py>,
         complete_trace_json: &str,
     ) -> PyResult<Bound<'py, PyDict>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             use crate::schema::CompleteTrace;
             use crate::verify::{verify_trace_via_directory, PythonJsonDumpsCanonicalizer};
@@ -2845,6 +3129,7 @@ impl PyEngine {
         soft_freshness_window_seconds: Option<f64>,
         row_age_seconds: Option<f64>,
     ) -> PyResult<Bound<'py, PyDict>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             use crate::verify::{HybridPolicy, VerifyOutcome};
             let parsed_policy = parse_hybrid_policy(policy, soft_freshness_window_seconds)?;
@@ -2939,6 +3224,7 @@ impl PyEngine {
         py: Python<'py>,
         envelope_json: &str,
     ) -> PyResult<Py<PyBytes>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let value: serde_json::Value = serde_json::from_str(envelope_json)
                 .map_err(|e| PyValueError::new_err(format!("envelope JSON decode: {e}")))?;
@@ -2954,6 +3240,7 @@ impl PyEngine {
     /// `in_reply_to` content-derived ACK matching. Persist hashes
     /// the bytes as supplied — does NOT re-canonicalize.
     fn body_sha256<'py>(&self, py: Python<'py>, body_bytes: &[u8]) -> PyResult<Py<PyBytes>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             use sha2::{Digest, Sha256};
             let mut hasher = Sha256::new();
@@ -2987,6 +3274,7 @@ impl PyEngine {
         soft_freshness_window_seconds: Option<f64>,
         row_age_seconds: Option<f64>,
     ) -> PyResult<Bound<'py, PyDict>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let signed: crate::federation::SignedKeyRecord =
                 serde_json::from_str(signed_key_record_json).map_err(|e| {
@@ -3023,6 +3311,7 @@ impl PyEngine {
         soft_freshness_window_seconds: Option<f64>,
         row_age_seconds: Option<f64>,
     ) -> PyResult<Bound<'py, PyDict>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let signed: crate::federation::SignedAttestation =
                 serde_json::from_str(signed_attestation_json).map_err(|e| {
@@ -3059,6 +3348,7 @@ impl PyEngine {
         soft_freshness_window_seconds: Option<f64>,
         row_age_seconds: Option<f64>,
     ) -> PyResult<Bound<'py, PyDict>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let signed: crate::federation::SignedRevocation =
                 serde_json::from_str(signed_revocation_json).map_err(|e| {
@@ -3118,6 +3408,7 @@ impl PyEngine {
         initial_next_attempt_after_rfc3339: &str,
         ack_timeout_seconds: Option<i64>,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             if body_sha256.len() != 32 {
                 return Err(PyValueError::new_err(format!(
@@ -3199,6 +3490,7 @@ impl PyEngine {
         claim_duration_seconds: i64,
         claimed_by: &str,
     ) -> PyResult<pyo3::Bound<'py, pyo3::types::PyList>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let claimed_by_owned = claimed_by.to_owned();
@@ -3246,6 +3538,7 @@ impl PyEngine {
         queue_id: &str,
         transport: &str,
     ) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let qid = queue_id.to_owned();
@@ -3282,6 +3575,7 @@ impl PyEngine {
         transport: &str,
         next_attempt_after_rfc3339: &str,
     ) -> PyResult<Bound<'py, PyDict>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let next_attempt_after: chrono::DateTime<chrono::Utc> =
                 next_attempt_after_rfc3339.parse().map_err(|e| {
@@ -3346,6 +3640,7 @@ impl PyEngine {
     /// receiver replied `replay_detected`; the original send already
     /// landed before the ACK could arrive).
     fn mark_replay_resolved(&self, py: Python<'_>, queue_id: &str) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let qid = queue_id.to_owned();
@@ -3377,6 +3672,7 @@ impl PyEngine {
         py: Python<'py>,
         in_reply_to_sha256: &[u8],
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             if in_reply_to_sha256.len() != 32 {
                 return Err(PyValueError::new_err(format!(
@@ -3421,6 +3717,7 @@ impl PyEngine {
         queue_id: &str,
         ack_envelope_bytes: &[u8],
     ) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let qid = queue_id.to_owned();
@@ -3449,6 +3746,7 @@ impl PyEngine {
     /// v0.4.0 — Sweep ACK timeouts. Returns the count of rows
     /// touched (retried or abandoned).
     fn sweep_ack_timeouts(&self, py: Python<'_>) -> PyResult<i64> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
@@ -3474,6 +3772,7 @@ impl PyEngine {
 
     /// v0.4.0 — Sweep TTL-expired rows.
     fn sweep_ttl_expired(&self, py: Python<'_>) -> PyResult<i64> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
@@ -3500,6 +3799,7 @@ impl PyEngine {
     /// v0.4.0 — Sweep expired claims (revert sending → pending for
     /// rows whose claimed_until elapsed).
     fn sweep_expired_claims(&self, py: Python<'_>) -> PyResult<i64> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
@@ -3530,6 +3830,7 @@ impl PyEngine {
         py: Python<'py>,
         queue_id: &str,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let qid = queue_id.to_owned();
@@ -3581,6 +3882,7 @@ impl PyEngine {
         message_type: Option<&str>,
         enqueued_after_rfc3339: Option<&str>,
     ) -> PyResult<pyo3::Bound<'py, pyo3::types::PyList>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let status_parsed = match status {
                 Some(s) => Some(
@@ -3628,6 +3930,7 @@ impl PyEngine {
 
     /// v0.4.0 — Operator-driven cancellation. Idempotent.
     fn cancel_outbound(&self, py: Python<'_>, queue_id: &str) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let qid = queue_id.to_owned();
@@ -3655,6 +3958,7 @@ impl PyEngine {
     /// v0.4.0 — Operator-driven replay. Resets attempt_count=0 and
     /// requeues an abandoned row.
     fn replay_abandoned(&self, py: Python<'_>, queue_id: &str) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let qid = queue_id.to_owned();
@@ -3704,6 +4008,7 @@ impl PyEngine {
     /// with the standard `verify_*` token. On verify success, the
     /// row is inserted (idempotent on `detection_id`).
     fn put_detection_event(&self, py: Python<'_>, event_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let event: crate::derived::DetectionEvent = serde_json::from_str(event_json)
@@ -3802,6 +4107,7 @@ impl PyEngine {
     /// any field may be null/absent). Returns a JSON array string
     /// of `DetectionEvent` objects, ordered by `ts DESC`.
     fn get_detection_events(&self, py: Python<'_>, filter_json: Option<&str>) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::derived::EventFilter = match filter_json {
@@ -3863,6 +4169,7 @@ impl PyEngine {
     /// flips `is_current` on the previous current row and inserts the
     /// new row in a single transaction.
     fn put_calibration_bundle(&self, py: Python<'_>, bundle_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let bundle: crate::derived::CalibrationBundle = serde_json::from_str(bundle_json)
@@ -3956,6 +4263,7 @@ impl PyEngine {
     /// Lens-derived: get the bundle with `is_current = TRUE`.
     /// Returns JSON-encoded `CalibrationBundle` or `None`.
     fn get_current_calibration_bundle(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
@@ -4007,6 +4315,7 @@ impl PyEngine {
         py: Python<'_>,
         version: i32,
     ) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
@@ -4078,6 +4387,7 @@ impl PyEngine {
         cursor_json: Option<&str>,
         limit: i64,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
@@ -4124,6 +4434,7 @@ impl PyEngine {
     /// Single-trace summary lookup. Returns JSON-encoded
     /// `TraceSummary` or `None`.
     fn get_trace_summary(&self, py: Python<'_>, trace_id: &str) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let trace_id = trace_id.to_owned();
@@ -4170,6 +4481,7 @@ impl PyEngine {
     /// Full trace reconstruction. Returns JSON-encoded `TraceDetail`
     /// or `None`. Drives `/repository/traces/{trace_id}`.
     fn get_trace_detail(&self, py: Python<'_>, trace_id: &str) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let trace_id = trace_id.to_owned();
@@ -4227,6 +4539,7 @@ impl PyEngine {
         trace_id: &str,
         thought_id: &str,
     ) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let trace_id = trace_id.to_owned();
@@ -4281,6 +4594,7 @@ impl PyEngine {
         trace_id: &str,
         thought_id: &str,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let trace_id = trace_id.to_owned();
@@ -4335,6 +4649,7 @@ impl PyEngine {
         thought_id: &str,
         features_json: &str,
     ) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let trace_id = trace_id.to_owned();
@@ -4384,6 +4699,7 @@ impl PyEngine {
         thought_id: &str,
         classifications_json: &str,
     ) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let trace_id = trace_id.to_owned();
@@ -4439,6 +4755,7 @@ impl PyEngine {
         cursor_json: Option<&str>,
         limit: i64,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::read::TaskFilter = serde_json::from_str(filter_json)
@@ -4494,6 +4811,7 @@ impl PyEngine {
         cursor_json: Option<&str>,
         limit: i64,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::read::LlmCallFilter = serde_json::from_str(filter_json)
@@ -4539,6 +4857,7 @@ impl PyEngine {
     /// Cost rollup by model / agent / deployment domain + window
     /// totals. Returns JSON-encoded `LlmCostAggregate`.
     fn aggregate_llm_costs(&self, py: Python<'_>, filter_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::read::LlmCallFilter = serde_json::from_str(filter_json)
@@ -4582,6 +4901,7 @@ impl PyEngine {
     /// primary model, deployment region. Returns JSON-encoded
     /// `CorpusShape`.
     fn corpus_shape(&self, py: Python<'_>, filter_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::read::CorpusShapeFilter = serde_json::from_str(filter_json)
@@ -4626,6 +4946,7 @@ impl PyEngine {
         since_iso8601: &str,
         until_iso8601: &str,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let since = chrono::DateTime::parse_from_rfc3339(since_iso8601)
@@ -4678,6 +4999,7 @@ impl PyEngine {
         cursor_json: Option<&str>,
         limit: i64,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::read::FederationKeyFilter = serde_json::from_str(filter_json)
@@ -4731,6 +5053,7 @@ impl PyEngine {
         cursor_json: Option<&str>,
         limit: i64,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::read::AttestationFilter = serde_json::from_str(filter_json)
@@ -4784,6 +5107,7 @@ impl PyEngine {
         cursor_json: Option<&str>,
         limit: i64,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::read::RevocationFilter = serde_json::from_str(filter_json)
@@ -4840,6 +5164,7 @@ impl PyEngine {
         window_json: &str,
         metric: &str,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let domain = deployment_domain.to_owned();
@@ -4889,6 +5214,7 @@ impl PyEngine {
         baseline_json: &str,
         comparison_json: &str,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let aid = agent_id_hash.to_owned();
@@ -4936,6 +5262,7 @@ impl PyEngine {
         agent_id_hash: &str,
         window_json: &str,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let aid = agent_id_hash.to_owned();
@@ -4981,6 +5308,7 @@ impl PyEngine {
         deployment_domain: &str,
         window_json: &str,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let domain = deployment_domain.to_owned();
@@ -5031,6 +5359,7 @@ impl PyEngine {
         window_json: &str,
         baseline_window_json: Option<&str>,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let aid = agent_id_hash.to_owned();
@@ -5085,6 +5414,7 @@ impl PyEngine {
         window_json: &str,
         baseline_window_json: Option<&str>,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let aids: Vec<String> = serde_json::from_str(agent_id_hashes_json)
@@ -5131,6 +5461,7 @@ impl PyEngine {
 
     /// Granular: count distinct trace_id matching filter.
     fn count_traces(&self, py: Python<'_>, filter_json: &str) -> PyResult<i64> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
@@ -5157,6 +5488,7 @@ impl PyEngine {
 
     /// Granular: count traces where conscience overrode the action.
     fn count_overrides(&self, py: Python<'_>, filter_json: &str) -> PyResult<i64> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
@@ -5189,6 +5521,7 @@ impl PyEngine {
 
     /// Granular: count agent_name changes (identity changes).
     fn count_identity_changes(&self, py: Python<'_>, filter_json: &str) -> PyResult<i64> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
@@ -5222,6 +5555,7 @@ impl PyEngine {
     /// Granular: audit-chain aggregate.
     /// Returns JSON-encoded `AuditChainAggregate`.
     fn aggregate_audit_chain(&self, py: Python<'_>, filter_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
@@ -5275,6 +5609,7 @@ impl PyEngine {
         value: &str,
         accessor: &str,
     ) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let key = key.to_owned();
@@ -5316,6 +5651,7 @@ impl PyEngine {
         key: &str,
         accessor: &str,
     ) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let key = key.to_owned();
@@ -5358,6 +5694,7 @@ impl PyEngine {
         accessor: &str,
         decrypt: bool,
     ) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let uuid = uuid.to_owned();
@@ -5411,6 +5748,7 @@ impl PyEngine {
         limit: usize,
         filter_json: &str,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::secrets::SecretsListFilter = serde_json::from_str(filter_json)
@@ -5453,6 +5791,7 @@ impl PyEngine {
     /// v0.6.1 — Audited delete. Returns `true` if the secret existed.
     #[cfg(feature = "secrets")]
     fn secrets_forget_secret(&self, py: Python<'_>, uuid: &str, accessor: &str) -> PyResult<bool> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let uuid = uuid.to_owned();
@@ -5529,6 +5868,7 @@ impl PyEngine {
         source_message_id: &str,
         accessor: &str,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let text = text.to_owned();
@@ -5619,6 +5959,7 @@ impl PyEngine {
         payload_json: &str,
         accessor: &str,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let payload: crate::secrets::DetectedSecret = serde_json::from_str(payload_json)
@@ -5673,6 +6014,7 @@ impl PyEngine {
         action_params_json: &str,
         ctx_json: &str,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let action_type = action_type.to_owned();
@@ -5717,6 +6059,7 @@ impl PyEngine {
     /// `base64(salt || nonce || ciphertext)`.
     #[cfg(feature = "secrets")]
     fn secrets_encrypt(&self, py: Python<'_>, plaintext: &str) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let pt = plaintext.to_owned();
@@ -5750,6 +6093,7 @@ impl PyEngine {
     /// v0.6.1 — Direct AES-GCM decrypt.
     #[cfg(feature = "secrets")]
     fn secrets_decrypt(&self, py: Python<'_>, ciphertext: &str) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let ct = ciphertext.to_owned();
@@ -5784,6 +6128,7 @@ impl PyEngine {
     /// JSON-encoded `FilterConfig`.
     #[cfg(feature = "secrets")]
     fn secrets_get_filter_config(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
@@ -5828,6 +6173,7 @@ impl PyEngine {
         updates_json: &str,
         accessor: &str,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let req: crate::secrets::FilterUpdateRequest = serde_json::from_str(updates_json)
@@ -5870,6 +6216,7 @@ impl PyEngine {
     /// JSON-encoded `SecretsServiceStats`.
     #[cfg(feature = "secrets")]
     fn secrets_get_service_stats(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
@@ -5908,6 +6255,7 @@ impl PyEngine {
     /// v0.6.1 — Liveness probe.
     #[cfg(feature = "secrets")]
     fn secrets_is_healthy(&self, py: Python<'_>) -> PyResult<bool> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
@@ -5946,6 +6294,7 @@ impl PyEngine {
         secret_uuid: Option<&str>,
         limit: usize,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let uuid = secret_uuid.map(str::to_owned);
@@ -5991,6 +6340,7 @@ impl PyEngine {
         new_master_key_ref_json: &str,
         accessor: &str,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let key_ref: crate::secrets::MasterKeyRef =
@@ -6040,6 +6390,7 @@ impl PyEngine {
         new_master_b64: Option<&str>,
         accessor: &str,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let new_master: Option<Vec<u8>> = match new_master_b64 {
@@ -6089,6 +6440,7 @@ impl PyEngine {
     /// v0.6.1 — Encrypt-decrypt round-trip health check.
     #[cfg(feature = "secrets")]
     fn secrets_test_encryption(&self, py: Python<'_>) -> PyResult<bool> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
@@ -6123,6 +6475,7 @@ impl PyEngine {
     /// on ciris-keyring/symmetric-derivation upstream).
     #[cfg(feature = "secrets")]
     fn secrets_migrate_to_hardware_key(&self, py: Python<'_>, accessor: &str) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let accessor = accessor.to_owned();
@@ -6169,6 +6522,7 @@ impl PyEngine {
     /// v0.7.0 — Verify-and-insert a Contribution envelope.
     #[cfg(feature = "cirisnode")]
     fn cirisnode_put_contribution(&self, py: Python<'_>, envelope_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let env: crate::cirisnode::ContributionEnvelope = serde_json::from_str(envelope_json)
@@ -6205,6 +6559,7 @@ impl PyEngine {
     /// v0.7.0 — Verify-and-insert a Vote envelope.
     #[cfg(feature = "cirisnode")]
     fn cirisnode_cast_vote(&self, py: Python<'_>, envelope_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let env: crate::cirisnode::VoteEnvelope = serde_json::from_str(envelope_json)
@@ -6239,6 +6594,7 @@ impl PyEngine {
     /// v0.7.0 — Upsert one row in credits_ledger.
     #[cfg(feature = "cirisnode")]
     fn cirisnode_update_credits_ledger(&self, py: Python<'_>, update_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let update: crate::cirisnode::CreditsUpdate = serde_json::from_str(update_json)
@@ -6273,6 +6629,7 @@ impl PyEngine {
     /// v0.7.0 — Upsert one row in expertise_ledger.
     #[cfg(feature = "cirisnode")]
     fn cirisnode_update_expertise_ledger(&self, py: Python<'_>, update_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let update: crate::cirisnode::ExpertiseUpdate = serde_json::from_str(update_json)
@@ -6307,6 +6664,7 @@ impl PyEngine {
     /// v0.7.0 — Verify-and-insert a ModerationEvent.
     #[cfg(feature = "cirisnode")]
     fn cirisnode_put_moderation_event(&self, py: Python<'_>, event_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let event: crate::cirisnode::ModerationEvent = serde_json::from_str(event_json)
@@ -6341,6 +6699,7 @@ impl PyEngine {
     /// v0.7.0 — Verify-and-insert a SlashingAttestation.
     #[cfg(feature = "cirisnode")]
     fn cirisnode_put_slashing_attestation(&self, py: Python<'_>, att_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let att: crate::cirisnode::SlashingAttestation = serde_json::from_str(att_json)
@@ -6379,6 +6738,7 @@ impl PyEngine {
         py: Python<'_>,
         req_json: &str,
     ) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let req: crate::cirisnode::ReconsiderationRequest = serde_json::from_str(req_json)
@@ -6419,6 +6779,7 @@ impl PyEngine {
         py: Python<'_>,
         att_json: &str,
     ) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let att: crate::cirisnode::ReconsiderationAttestation = serde_json::from_str(att_json)
@@ -6460,6 +6821,7 @@ impl PyEngine {
     /// `cirisnode.promotion_attestations`.
     #[cfg(feature = "cirisnode")]
     fn cirisnode_put_promotion_attestation(&self, py: Python<'_>, att_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let att: crate::cirisnode::PromotionAttestation = serde_json::from_str(att_json)
@@ -6500,6 +6862,7 @@ impl PyEngine {
         domain: &str,
         language: &str,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let domain = domain.to_owned();
@@ -6549,6 +6912,7 @@ impl PyEngine {
         language: &str,
         subject: &str,
     ) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let contributor_id = contributor_id.to_owned();
@@ -6604,6 +6968,7 @@ impl PyEngine {
         cursor_json: Option<&str>,
         limit: i64,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::cirisnode::ContributionsFilter = serde_json::from_str(filter_json)
@@ -6660,6 +7025,7 @@ impl PyEngine {
         cursor_json: Option<&str>,
         limit: i64,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::cirisnode::VotesFilter = serde_json::from_str(filter_json)
@@ -6714,6 +7080,7 @@ impl PyEngine {
         language: &str,
         subject: &str,
     ) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let contributor_id = contributor_id.to_owned();
@@ -6768,6 +7135,7 @@ impl PyEngine {
         domain: &str,
         language: &str,
     ) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let contributor_id = contributor_id.to_owned();
@@ -6835,6 +7203,7 @@ impl PyEngine {
         expected_version: i32,
         bulk_import: bool,
     ) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let node: crate::graph::GraphNode = serde_json::from_str(node_json)
@@ -6878,6 +7247,7 @@ impl PyEngine {
         edge_json: &str,
         bulk_import: bool,
     ) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let edge: crate::graph::GraphEdge = serde_json::from_str(edge_json)
@@ -6918,6 +7288,7 @@ impl PyEngine {
         scope: &str,
         hard: bool,
     ) -> PyResult<bool> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let node_id = node_id.to_owned();
@@ -6958,6 +7329,7 @@ impl PyEngine {
         node_id: &str,
         scope: &str,
     ) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let node_id = node_id.to_owned();
@@ -7014,6 +7386,7 @@ impl PyEngine {
         direction: &str,
         relationship_filter_json: Option<&str>,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let node_id = node_id.to_owned();
@@ -7070,6 +7443,7 @@ impl PyEngine {
         scope: &str,
         config_json: &str,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let start_node_id = start_node_id.to_owned();
@@ -7119,6 +7493,7 @@ impl PyEngine {
         cursor_json: Option<&str>,
         limit: i64,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::graph::NodeFilter = serde_json::from_str(filter_json)
@@ -7167,6 +7542,7 @@ impl PyEngine {
     /// AV-47: filter MUST name a scope.
     #[cfg(feature = "cirisgraph")]
     fn cirisgraph_count_nodes(&self, py: Python<'_>, filter_json: &str) -> PyResult<u64> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::graph::NodeFilter = serde_json::from_str(filter_json)
@@ -7201,6 +7577,7 @@ impl PyEngine {
     /// Returns the raw integer.
     #[cfg(feature = "cirisgraph")]
     fn cirisgraph_count_edges(&self, py: Python<'_>, scope: &str) -> PyResult<u64> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let scope_parsed = crate::graph::GraphScope::from_sql_str(scope)
@@ -7236,6 +7613,7 @@ impl PyEngine {
     /// `{node_type: count}`.
     #[cfg(feature = "cirisgraph")]
     fn cirisgraph_count_nodes_by_type(&self, py: Python<'_>, scope: &str) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let scope_parsed = crate::graph::GraphScope::from_sql_str(scope)
@@ -7303,6 +7681,7 @@ impl PyEngine {
         py: Python<'py>,
         entry_json: &str,
     ) -> PyResult<Py<PyBytes>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             // Parse the caller's JSON through the AuditEntry struct so the
             // canonical bytes match what crate::audit::verify::compute_entry_hash
@@ -7345,6 +7724,7 @@ impl PyEngine {
         py: Python<'py>,
         entry_json: &str,
     ) -> PyResult<Py<PyBytes>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             // Same parse-through-struct discipline as audit_canonicalize_for_hash
             // — guarantees byte-equal canonical bytes with what persist's
@@ -7364,6 +7744,7 @@ impl PyEngine {
     /// hash-chain integrity (AV-49) + sequence monotonicity + signature.
     #[cfg(feature = "cirisaudit")]
     fn audit_record_entry(&self, py: Python<'_>, entry_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let entry: crate::audit::AuditEntry = serde_json::from_str(entry_json)
@@ -7404,6 +7785,7 @@ impl PyEngine {
         cursor_json: Option<&str>,
         limit: i64,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::audit::AuditFilter = serde_json::from_str(filter_json)
@@ -7458,6 +7840,7 @@ impl PyEngine {
         from_sequence: i64,
         to_sequence: Option<i64>,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let tenant_id = tenant_id.to_owned();
@@ -7533,6 +7916,7 @@ impl PyEngine {
         expires_at: Option<&str>,
         rationale: &str,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let tenant_id = tenant_id.to_owned();
@@ -7620,6 +8004,7 @@ impl PyEngine {
         purpose: &str,
         scope: &str,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let tenant_id = tenant_id.to_owned();
@@ -7696,6 +8081,7 @@ impl PyEngine {
         purpose: &str,
         scope: &str,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let grantee_key = grantee_key.to_owned();
@@ -7755,6 +8141,7 @@ impl PyEngine {
     /// [`crate::federation::trust_grant::TrustGrantRow`] objects.
     #[cfg(feature = "cirisaudit")]
     fn list_trust_grants(&self, py: Python<'_>, filter_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::federation::trust_grant::TrustGrantFilter =
@@ -7799,6 +8186,7 @@ impl PyEngine {
     /// when no projection row exists for the grant id.
     #[cfg(feature = "cirisaudit")]
     fn get_trust_grant(&self, py: Python<'_>, grant_id: &str) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let grant_uuid: uuid::Uuid = grant_id
@@ -7850,6 +8238,7 @@ impl PyEngine {
     /// disabled).
     #[cfg(feature = "cirisaudit")]
     fn current_sth(&self, py: Python<'_>, tenant_id: &str) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let tenant_id = tenant_id.to_owned();
@@ -7903,6 +8292,7 @@ impl PyEngine {
     /// tenant has no STH, or the merkle leaf is missing.
     #[cfg(feature = "cirisaudit")]
     fn trust_grant_inclusion_proof(&self, py: Python<'_>, grant_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let grant_uuid: uuid::Uuid = grant_id
@@ -7962,6 +8352,7 @@ impl PyEngine {
         old_size: u64,
         new_size: u64,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let tenant_id = tenant_id.to_owned();
@@ -8023,6 +8414,7 @@ impl PyEngine {
     /// `ValueError` if no signer is configured.
     #[cfg(feature = "cirisaudit")]
     fn backfill_v020_trust_rows(&self, py: Python<'_>, tenant_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let tenant_id = tenant_id.to_owned();
@@ -8071,6 +8463,7 @@ impl PyEngine {
     /// v0.8.2 — Record one telemetry observation.
     #[cfg(feature = "telemetry")]
     fn telemetry_record_metric(&self, py: Python<'_>, obs_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let obs: crate::telemetry::MetricObservation = serde_json::from_str(obs_json)
@@ -8105,6 +8498,7 @@ impl PyEngine {
     /// v0.8.2 — Bulk-record N observations. Returns affected row count.
     #[cfg(feature = "telemetry")]
     fn telemetry_record_metrics_batch(&self, py: Python<'_>, obs_json: &str) -> PyResult<u64> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let obs: Vec<crate::telemetry::MetricObservation> = serde_json::from_str(obs_json)
@@ -8147,6 +8541,7 @@ impl PyEngine {
         cursor_json: Option<&str>,
         limit: i64,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::telemetry::MetricFilter = serde_json::from_str(filter_json)
@@ -8196,6 +8591,7 @@ impl PyEngine {
     /// Returns JSON `ConsolidationOutcome`.
     #[cfg(feature = "telemetry")]
     fn telemetry_consolidate_period(&self, py: Python<'_>, req_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let req: crate::telemetry::ConsolidationRequest = serde_json::from_str(req_json)
@@ -8254,6 +8650,7 @@ impl PyEngine {
         from_rfc3339: &str,
         to_rfc3339: &str,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let level = crate::telemetry::ConsolidationLevel::from_wire_str(level)
@@ -8312,6 +8709,7 @@ impl PyEngine {
         metric_name: &str,
         period_start_rfc3339: &str,
     ) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let level = crate::telemetry::ConsolidationLevel::from_wire_str(level)
@@ -8373,6 +8771,7 @@ impl PyEngine {
         tenant_id: &str,
         before_rfc3339: &str,
     ) -> PyResult<u64> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let level = crate::telemetry::ConsolidationLevel::from_wire_str(level)
@@ -8420,6 +8819,7 @@ impl PyEngine {
     /// `mean_thought_depth`.
     #[cfg(feature = "telemetry")]
     fn tsdb_consolidate_tasks(&self, py: Python<'_>, req_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let req: crate::telemetry::ConsolidationRequest = serde_json::from_str(req_json)
@@ -8466,6 +8866,7 @@ impl PyEngine {
     /// `TypedConsolidationOutcome`.
     #[cfg(feature = "telemetry")]
     fn tsdb_consolidate_conversations(&self, py: Python<'_>, req_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let req: crate::telemetry::ConsolidationRequest = serde_json::from_str(req_json)
@@ -8511,6 +8912,7 @@ impl PyEngine {
     /// `trace_summary` node. Returns JSON `TypedConsolidationOutcome`.
     #[cfg(feature = "telemetry")]
     fn tsdb_consolidate_traces(&self, py: Python<'_>, req_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let req: crate::telemetry::ConsolidationRequest = serde_json::from_str(req_json)
@@ -8556,6 +8958,7 @@ impl PyEngine {
     /// node. Returns JSON `TypedConsolidationOutcome`.
     #[cfg(feature = "telemetry")]
     fn tsdb_consolidate_audit(&self, py: Python<'_>, req_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let req: crate::telemetry::ConsolidationRequest = serde_json::from_str(req_json)
@@ -8617,6 +9020,7 @@ impl PyEngine {
         from_rfc3339: &str,
         to_rfc3339: &str,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let level = crate::telemetry::ConsolidationLevel::from_wire_str(level)
@@ -8674,6 +9078,7 @@ impl PyEngine {
         from_rfc3339: &str,
         to_rfc3339: &str,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let from: chrono::DateTime<chrono::Utc> =
@@ -8730,6 +9135,7 @@ impl PyEngine {
     /// `incident_id` of the row that took the write.
     #[cfg(feature = "cirisincident")]
     fn incident_record(&self, py: Python<'_>, incident_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let inc: crate::incident::Incident = serde_json::from_str(incident_json)
@@ -8765,6 +9171,7 @@ impl PyEngine {
     /// Resolved/Closed targets.
     #[cfg(feature = "cirisincident")]
     fn incident_transition(&self, py: Python<'_>, transition_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let t: crate::incident::IncidentTransition = serde_json::from_str(transition_json)
@@ -8805,6 +9212,7 @@ impl PyEngine {
         cursor_json: Option<&str>,
         limit: i64,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::incident::IncidentFilter = serde_json::from_str(filter_json)
@@ -8853,6 +9261,7 @@ impl PyEngine {
     /// key. Returns JSON array of `IncidentRef`.
     #[cfg(feature = "cirisincident")]
     fn incident_correlate(&self, py: Python<'_>, tenant_id: &str, key: &str) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let tenant_id = tenant_id.to_owned();
@@ -8911,6 +9320,7 @@ impl PyEngine {
     /// resolves to `already_exists` carrying the EXISTING row.
     #[cfg(feature = "cirislens_tasks")]
     fn task_upsert(&self, py: Python<'_>, task_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let task: crate::tasks::Task = serde_json::from_str(task_json)
@@ -8952,6 +9362,7 @@ impl PyEngine {
     /// or None when no matching row.
     #[cfg(feature = "cirislens_tasks")]
     fn task_get(&self, py: Python<'_>, task_id: &str) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let task_id = task_id.to_owned();
@@ -9003,6 +9414,7 @@ impl PyEngine {
         cursor_json: Option<&str>,
         limit: i64,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::tasks::TaskFilter = serde_json::from_str(filter_json)
@@ -9059,6 +9471,7 @@ impl PyEngine {
         new_status: &str,
         outcome_json: Option<&str>,
     ) -> PyResult<bool> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let status = crate::tasks::TaskStatus::parse_str(new_status).ok_or_else(|| {
@@ -9103,6 +9516,7 @@ impl PyEngine {
     /// `{"outcome": "stored" | "already_claimed", "task": <Task>}`.
     #[cfg(feature = "cirislens_tasks")]
     fn task_try_claim_shared(&self, py: Python<'_>, task_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let task: crate::tasks::Task = serde_json::from_str(task_json)
@@ -9148,6 +9562,7 @@ impl PyEngine {
     /// delete as Conflict.
     #[cfg(feature = "cirislens_tasks")]
     fn task_delete(&self, py: Python<'_>, task_id: &str) -> PyResult<bool> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let task_id = task_id.to_owned();
@@ -9191,6 +9606,7 @@ impl PyEngine {
     /// preserves `created_at`.
     #[cfg(feature = "cirislens_thoughts")]
     fn thought_upsert(&self, py: Python<'_>, thought_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let thought: crate::thoughts::Thought = serde_json::from_str(thought_json)
@@ -9226,6 +9642,7 @@ impl PyEngine {
     /// Thought or None when no matching row.
     #[cfg(feature = "cirislens_thoughts")]
     fn thought_get(&self, py: Python<'_>, thought_id: &str) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let thought_id = thought_id.to_owned();
@@ -9278,6 +9695,7 @@ impl PyEngine {
         cursor_json: Option<&str>,
         limit: i64,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::thoughts::ThoughtFilter = serde_json::from_str(filter_json)
@@ -9335,6 +9753,7 @@ impl PyEngine {
         new_status: &str,
         final_action_json: Option<&str>,
     ) -> PyResult<bool> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let status =
@@ -9384,6 +9803,7 @@ impl PyEngine {
     /// `task_delete` of a parent task cascades its thoughts.
     #[cfg(feature = "cirislens_thoughts")]
     fn thought_delete(&self, py: Python<'_>, thought_id: &str) -> PyResult<bool> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let thought_id = thought_id.to_owned();
@@ -9420,6 +9840,7 @@ impl PyEngine {
     /// Empty array when the root has no matching row (not an error).
     #[cfg(feature = "cirislens_thoughts")]
     fn thought_get_descendants(&self, py: Python<'_>, thought_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let thought_id = thought_id.to_owned();
@@ -9472,6 +9893,7 @@ impl PyEngine {
     /// `correlation_update_status` to advance an in-flight row.
     #[cfg(feature = "cirislens_correlations")]
     fn correlation_record(&self, py: Python<'_>, correlation_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let correlation: crate::correlations::Correlation =
@@ -9514,6 +9936,7 @@ impl PyEngine {
     /// Correlation or None when no matching row.
     #[cfg(feature = "cirislens_correlations")]
     fn correlation_get(&self, py: Python<'_>, correlation_id: &str) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let correlation_id = correlation_id.to_owned();
@@ -9572,6 +9995,7 @@ impl PyEngine {
         new_status: &str,
         response_data_json: Option<&str>,
     ) -> PyResult<bool> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let status =
@@ -9628,6 +10052,7 @@ impl PyEngine {
         cursor_json: Option<&str>,
         limit: i64,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::correlations::CorrelationFilter = serde_json::from_str(filter_json)
@@ -9686,6 +10111,7 @@ impl PyEngine {
     /// overwrite on conflict; `created_at` is preserved.
     #[cfg(feature = "cirislens_scheduled_tasks")]
     fn scheduled_task_upsert(&self, py: Python<'_>, task_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let task: crate::scheduled_tasks::ScheduledTask = serde_json::from_str(task_json)
@@ -9734,6 +10160,7 @@ impl PyEngine {
         now_iso: &str,
         limit: i64,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let now: chrono::DateTime<chrono::Utc> = chrono::DateTime::parse_from_rfc3339(now_iso)
@@ -9797,6 +10224,7 @@ impl PyEngine {
         deferral_history_json: Option<&str>,
         new_status: Option<&str>,
     ) -> PyResult<bool> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let last_triggered_at: chrono::DateTime<chrono::Utc> =
@@ -9890,6 +10318,7 @@ impl PyEngine {
     /// columns are preserved.
     #[cfg(feature = "cirislens_tickets")]
     fn ticket_upsert(&self, py: Python<'_>, ticket_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let ticket: crate::tickets::Ticket = serde_json::from_str(ticket_json)
@@ -9923,6 +10352,7 @@ impl PyEngine {
     /// `None` (Python `None`) when no matching row.
     #[cfg(feature = "cirislens_tickets")]
     fn ticket_get(&self, py: Python<'_>, ticket_id: &str) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let ticket_id = ticket_id.to_owned();
@@ -9979,6 +10409,7 @@ impl PyEngine {
         cursor_json: Option<&str>,
         limit: i64,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::tickets::TicketFilter = serde_json::from_str(filter_json)
@@ -10038,6 +10469,7 @@ impl PyEngine {
         user_identifier: &str,
         new_status: Option<&str>,
     ) -> PyResult<bool> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let new_status_parsed: Option<crate::tickets::TicketStatus> = match new_status {
@@ -10103,6 +10535,7 @@ impl PyEngine {
         completed_at_iso: Option<&str>,
         notes: Option<&str>,
     ) -> PyResult<bool> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let new_status_parsed = crate::tickets::TicketStatus::parse_str(new_status)
@@ -10185,6 +10618,7 @@ impl PyEngine {
     /// before recording.
     #[cfg(feature = "cirislens_deferral_reports")]
     fn deferral_record(&self, py: Python<'_>, report_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let report: crate::deferral_reports::DeferralReport = serde_json::from_str(report_json)
@@ -10228,6 +10662,7 @@ impl PyEngine {
     /// row.
     #[cfg(feature = "cirislens_deferral_reports")]
     fn deferral_get(&self, py: Python<'_>, message_id: &str) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let message_id = message_id.to_owned();
@@ -10285,6 +10720,7 @@ impl PyEngine {
         filter_json: &str,
         limit: i64,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::deferral_reports::DeferralFilter = serde_json::from_str(filter_json)
@@ -10337,6 +10773,7 @@ impl PyEngine {
         resolved_at: &str,
         resolution_notes: Option<&str>,
     ) -> PyResult<bool> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let resolved_at_dt: chrono::DateTime<chrono::Utc> =
@@ -10414,6 +10851,7 @@ impl PyEngine {
         timeout_seconds: i32,
         metadata_json: Option<&str>,
     ) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let lock_key = lock_key.to_owned();
@@ -10472,6 +10910,7 @@ impl PyEngine {
     /// `False` as "not yours to release").
     #[cfg(feature = "cirislens_maintenance_locks")]
     fn lock_release(&self, py: Python<'_>, lock_key: &str, locked_by: &str) -> PyResult<bool> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let lock_key = lock_key.to_owned();
@@ -10511,6 +10950,7 @@ impl PyEngine {
     /// is currently held.
     #[cfg(feature = "cirislens_maintenance_locks")]
     fn lock_get(&self, py: Python<'_>, lock_key: &str) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let lock_key = lock_key.to_owned();
@@ -10574,6 +11014,7 @@ impl PyEngine {
     /// EXISTING row.
     #[cfg(feature = "cirislens_creation_ceremonies")]
     fn ceremony_record(&self, py: Python<'_>, ceremony_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let ceremony: crate::creation_ceremonies::CreationCeremony =
@@ -10619,6 +11060,7 @@ impl PyEngine {
     /// row.
     #[cfg(feature = "cirislens_creation_ceremonies")]
     fn ceremony_get(&self, py: Python<'_>, ceremony_id: &str) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let ceremony_id = ceremony_id.to_owned();
@@ -10672,6 +11114,7 @@ impl PyEngine {
     /// `timestamp DESC, ceremony_id DESC`, limited.
     #[cfg(feature = "cirislens_creation_ceremonies")]
     fn ceremony_list(&self, py: Python<'_>, filter_json: &str, limit: i64) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::creation_ceremonies::CeremonyFilter =
@@ -10724,6 +11167,7 @@ impl PyEngine {
         ceremony_id: &str,
         new_status: &str,
     ) -> PyResult<bool> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let new_status_parsed = crate::creation_ceremonies::CeremonyStatus::parse_str(
@@ -10788,6 +11232,7 @@ impl PyEngine {
     /// surfaces as `Conflict` (FK violation).
     #[cfg(feature = "cirislens_continuity_awareness")]
     fn continuity_record(&self, py: Python<'_>, record_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let record: crate::continuity_awareness::ContinuityAwareness =
@@ -10834,6 +11279,7 @@ impl PyEngine {
     /// when the agent has no recorded shutdowns.
     #[cfg(feature = "cirislens_continuity_awareness")]
     fn continuity_get_latest(&self, py: Python<'_>, agent_id: &str) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let agent_id = agent_id.to_owned();
@@ -10885,6 +11331,7 @@ impl PyEngine {
     /// reactivate" — not an error).
     #[cfg(feature = "cirislens_continuity_awareness")]
     fn continuity_record_reactivation(&self, py: Python<'_>, agent_id: &str) -> PyResult<bool> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let agent_id = agent_id.to_owned();
@@ -10940,6 +11387,7 @@ impl PyEngine {
     /// bypasses the FK on both backends.
     #[cfg(feature = "cirislens_feedback_mappings")]
     fn feedback_record(&self, py: Python<'_>, feedback_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let feedback: crate::feedback_mappings::FeedbackMapping =
@@ -10991,6 +11439,7 @@ impl PyEngine {
         thought_id: &str,
         limit: i64,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let thought_id = thought_id.to_owned();
@@ -11037,6 +11486,7 @@ impl PyEngine {
     /// `created_at`.
     #[cfg(feature = "cirislens_feedback_mappings")]
     fn feedback_list(&self, py: Python<'_>, filter_json: &str, limit: i64) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::feedback_mappings::FeedbackFilter =
@@ -11101,6 +11551,7 @@ impl PyEngine {
     ///     JSON typo) → serde decode error before this method runs.
     #[cfg(feature = "cirislens_wa_cert")]
     fn wa_cert_upsert(&self, py: Python<'_>, cert_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let cert: crate::wa_cert::WaCert = serde_json::from_str(cert_json)
@@ -11136,6 +11587,7 @@ impl PyEngine {
     /// `WaCert` or `None` when no row matches.
     #[cfg(feature = "cirislens_wa_cert")]
     fn wa_cert_get(&self, py: Python<'_>, wa_id: &str) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let wa_id = wa_id.to_owned();
@@ -11183,6 +11635,7 @@ impl PyEngine {
     /// `WaCert` or `None`.
     #[cfg(feature = "cirislens_wa_cert")]
     fn wa_cert_get_by_kid(&self, py: Python<'_>, jwt_kid: &str) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let kid = jwt_kid.to_owned();
@@ -11236,6 +11689,7 @@ impl PyEngine {
         oauth_provider: &str,
         oauth_external_id: &str,
     ) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let provider = oauth_provider.to_owned();
@@ -11286,6 +11740,7 @@ impl PyEngine {
     /// the partial `wa_cert_role_active` index.
     #[cfg(feature = "cirislens_wa_cert")]
     fn wa_cert_list_by_role(&self, py: Python<'_>, role: &str, limit: i64) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let role_enum = crate::wa_cert::WaRole::parse_str(role).ok_or_else(|| {
@@ -11331,6 +11786,7 @@ impl PyEngine {
     /// same-value toggles); `False` if `wa_id` doesn't exist.
     #[cfg(feature = "cirislens_wa_cert")]
     fn wa_cert_set_active(&self, py: Python<'_>, wa_id: &str, active: bool) -> PyResult<bool> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let wa_id = wa_id.to_owned();
@@ -11371,6 +11827,7 @@ impl PyEngine {
         wa_id: &str,
         login_time_iso: &str,
     ) -> PyResult<bool> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let wa_id = wa_id.to_owned();
@@ -11434,6 +11891,7 @@ impl PyEngine {
         py: Python<'_>,
         revocation_json: &str,
     ) -> PyResult<()> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let revocation: crate::service_token_revocation::RevokedServiceToken =
@@ -11476,6 +11934,7 @@ impl PyEngine {
     /// Order is unspecified (caller indexes by `token_hash`).
     #[cfg(feature = "cirislens_service_token_revocation")]
     fn service_token_revocation_list(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
@@ -11527,6 +11986,7 @@ impl PyEngine {
         py: Python<'_>,
         token_hash: &str,
     ) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let token_hash = token_hash.to_owned();
@@ -11611,6 +12071,7 @@ impl PyEngine {
     /// can close.
     #[cfg(feature = "cirislens_legacy_migration")]
     fn run_legacy_graph_migration(&self, py: Python<'_>, options_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let options: crate::legacy_migration::LegacyMigrationOptions =
@@ -11667,6 +12128,7 @@ impl PyEngine {
     /// SQLite: `VACUUM; ANALYZE;` via spawn_blocking). Returns a
     /// JSON-encoded `VacuumReport`.
     fn maintenance_vacuum(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
@@ -11715,6 +12177,7 @@ impl PyEngine {
         py: Python<'_>,
         window_seconds: Option<u64>,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let window = match window_seconds {
@@ -11767,6 +12230,7 @@ impl PyEngine {
         tenant: &str,
         before: &str,
     ) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let tenant = tenant.to_owned();
@@ -11817,6 +12281,7 @@ impl PyEngine {
     /// part of the umbrella — callers run it on a tenant-scoped
     /// schedule separately.
     fn maintain(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
@@ -13008,6 +13473,64 @@ fn storage_kind_token(descriptor: &StorageDescriptor) -> &'static str {
 mod tests {
     use super::*;
 
+    /// v1.6.8 (CIRISPersist#76) — the config fingerprint must change
+    /// when ANY of DSN / signing-key-id / local key ids change, and
+    /// stay stable when they don't. This is what distinguishes a
+    /// "same engine, return the singleton" call from a
+    /// `EngineConfigMismatch`.
+    #[test]
+    fn engine_config_fingerprint_distinguishes_config() {
+        let base = engine_config_fingerprint(
+            "postgresql://h/db",
+            "sk-1",
+            &Some("lk-1".into()),
+            &Some("lpk-1".into()),
+        );
+        // Identical inputs → identical fingerprint.
+        assert_eq!(
+            base,
+            engine_config_fingerprint(
+                "postgresql://h/db",
+                "sk-1",
+                &Some("lk-1".into()),
+                &Some("lpk-1".into()),
+            )
+        );
+        // Any single field change → different fingerprint.
+        assert_ne!(
+            base,
+            engine_config_fingerprint(
+                "sqlite::memory:",
+                "sk-1",
+                &Some("lk-1".into()),
+                &Some("lpk-1".into()),
+            )
+        );
+        assert_ne!(
+            base,
+            engine_config_fingerprint(
+                "postgresql://h/db",
+                "sk-2",
+                &Some("lk-1".into()),
+                &Some("lpk-1".into()),
+            )
+        );
+        assert_ne!(
+            base,
+            engine_config_fingerprint("postgresql://h/db", "sk-1", &None, &Some("lpk-1".into()))
+        );
+        assert_ne!(
+            base,
+            engine_config_fingerprint("postgresql://h/db", "sk-1", &Some("lk-1".into()), &None)
+        );
+        // The NUL separator prevents field-boundary ambiguity — a
+        // value ending where the next begins can't alias.
+        assert_ne!(
+            engine_config_fingerprint("a", "bc", &None, &None),
+            engine_config_fingerprint("ab", "c", &None, &None),
+        );
+    }
+
     #[test]
     fn ephemeral_paths_flagged() {
         for ephemeral in [
@@ -13298,6 +13821,16 @@ fn ciris_persist(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("Conflict", py.get_type::<Conflict>())?;
     m.add("Transient", py.get_type::<Transient>())?;
     m.add("Permanent", py.get_type::<Permanent>())?;
+    // v1.6.8 (CIRISPersist#75-78) — engine-lifecycle exceptions.
+    m.add(
+        "EngineConfigMismatch",
+        py.get_type::<EngineConfigMismatch>(),
+    )?;
+    m.add("EngineClosed", py.get_type::<EngineClosed>())?;
+    m.add(
+        "EngineUsedAcrossFork",
+        py.get_type::<EngineUsedAcrossFork>(),
+    )?;
     // v0.5.4 (CIRISPersist#29) — feature-gated panic injector for the
     // Python regression suite. Off in release wheels.
     #[cfg(feature = "test-panic")]

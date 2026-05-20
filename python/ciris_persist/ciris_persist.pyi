@@ -31,14 +31,45 @@ class BatchSummary(TypedDict):
 ScrubberCallable = Callable[[dict[str, Any]], tuple[dict[str, Any], int]]
 
 class Engine:
-    """One-instance-per-DSN handle to the Rust persistence pipeline.
+    """Process-singleton handle to the Rust persistence pipeline.
 
-    Construction connects to Postgres and runs migrations. Method
-    calls are synchronous from Python's view; internally async work
-    runs on a tokio runtime cached on the Engine instance.
+    v1.6.8 (CIRISPersist#75-78): the tokio runtime + connection pool
+    are built **exactly once per process**. Constructing ``Engine``
+    again with the same config returns a cheap handle to the
+    existing engine — no second runtime. A different config raises
+    :class:`EngineConfigMismatch`.
+
+    In-process cohabitation contract (CIRIS 3.0 — agent + NodeCore +
+    LensCore in one process):
+
+    - One owner constructs ``Engine(...)`` first; adapters attach by
+      constructing with the **same** config.
+    - The owner calls :meth:`close` at shutdown; adapters do not.
+      Use after :meth:`close` raises :class:`EngineClosed`.
+    - Construct ``Engine`` **after** all forking is done — a tokio
+      runtime does not survive ``fork()``. Use across a fork raises
+      :class:`EngineUsedAcrossFork`.
+
+    See ``docs/COHABITATION.md`` for the full doctrine.
     """
 
     def __init__(self, dsn: str, scrubber: ScrubberCallable | None = None) -> None: ...
+
+    def close(self) -> None:
+        """v1.6.8 (CIRISPersist#77) — deterministic teardown.
+
+        Flips the process-singleton's closed flag (every ``Engine``
+        handle shares it) and clears the global slot so a later
+        ``Engine(...)`` rebuilds. Idempotent. Only the lifecycle
+        owner should call this; in-process adapters attach and
+        detach but never close. After ``close()`` every method
+        raises :class:`EngineClosed`.
+        """
+
+    @property
+    def is_closed(self) -> bool:
+        """v1.6.8 — ``True`` once :meth:`close` has run on this
+        engine (or any handle sharing its singleton cell)."""
 
     def register_public_key(
         self,
