@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779240074138,
+  "lastUpdate": 1779241413928,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -19751,6 +19751,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23709667,
             "range": "± 431428",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "829f91375b307996864648ebd12157296bf40d88",
+          "message": "1.6.4 — absorb A0a legacy-graph migration (closes #70)\n\nCloses the LAST raw-SQL gap in CIRISAgent 2.9.0. The agent's\ntools/ops/migrate_to_persist.py (psycopg2 + sqlite3 reader) can\nretire — persist now owns the legacy read + re-upsert loop.\n\nNew substrate: legacy_migration (feature flag\ncirislens_legacy_migration). Single trait method\nrun_legacy_graph_migration(options) → stats.\n\nReads from public.graph_nodes + public.graph_edges (8-column\npre-v2.9.0 agent schema, verified via deepwiki against\nmemory_query_helpers / memory_queries / get_all_graph_nodes /\nsql_builders — none of those touch the signature envelope columns).\nRe-upserts into cirisgraph.nodes + cirisgraph.edges via the\nexisting GraphService::{upsert_node, upsert_edge} primitives with\nbulk_import=true so the AV-45 cap is bypassed (we re-check against\nthe operator's own attributes_cap_bytes override).\n\nLegacyMigrationOptions:\n- dry_run: bool — count what would migrate; no writes.\n- attributes_cap_bytes: Option<usize> — override the per-row size\n  cap. Honors the agent's bonus ask in #70 (legacy data may exceed\n  the modern 1 MiB cap).\n- legacy_schema: String (default \"public\") — for PG operators with\n  non-default agent schemas. SQLite returns InvalidArgument if\n  non-\"public\" is supplied (no schema namespace).\n- stop_after_errors: Option<u64> (default 100) — safety bound.\n\nLegacyMigrationStats:\n- outcome: \"ok\" | \"errors\" | \"partial\"\n- nodes_read / nodes_written / nodes_skipped_already_present /\n  nodes_skipped_too_large\n- edges_read / edges_written / edges_skipped_already_present /\n  edges_skipped_dangling_fk\n- errors + first_error_at_node_id\n\nIdempotent — running twice yields the second run as\n*_skipped_already_present counts. SQLite legacy-tables-absent case\nreturns outcome=\"ok\" with all-zero counts (graceful no-op).\n\nPG SQL-injection-safe: legacy_schema is validated against\n[a-z_][a-z0-9_]{0,62} before being interpolated (PG doesn't bind\nidentifiers).\n\nPyO3: Engine.run_legacy_graph_migration(options_json) → str (JSON\nLegacyMigrationStats). Stable AV-15 kinds:\nlegacy_migration_{invalid_argument | not_found | conflict | backend\n| internal}.\n\nTests: 14 new (7 SQLite + 7 PG-gated):\n- happy path: 3 nodes + 2 edges round-trip into cirisgraph.*\n- re-run idempotent: skip-already-present counts\n- oversized attributes: respect cap, skip-too-large\n- dry_run: read but don't write\n- dangling edge FK: counted, not errored\n- SQLite: legacy tables absent → all-zero stats (no error)\n- SQLite: non-\"public\" legacy_schema → InvalidArgument\n- PG: validate_legacy_schema rejects unsafe input + accepts default\n\n676/677 lib tests pass with clean PG state (single residual is the\npre-existing local-only telemetry_daily_tier flake — CI doesn't\nexercise telemetry feature).\n\ncloses #70\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-19T20:35:36-05:00",
+          "tree_id": "05e4ab57acf569b009ea2160c86fe0bb8154244a",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/829f91375b307996864648ebd12157296bf40d88"
+        },
+        "date": 1779241413405,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 109309,
+            "range": "± 550",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 260500,
+            "range": "± 3992",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 561701,
+            "range": "± 3107",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1992863,
+            "range": "± 18733",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 343,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1383,
+            "range": "± 39",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8199,
+            "range": "± 24",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23174,
+            "range": "± 703",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26374,
+            "range": "± 50",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91006,
+            "range": "± 2031",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 355,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3125,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9580,
+            "range": "± 42",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42128,
+            "range": "± 245",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 654,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2263036,
+            "range": "± 92124",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7041863,
+            "range": "± 1007426",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 26000254,
+            "range": "± 324122",
             "unit": "ns/iter"
           }
         ]
