@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779320703054,
+  "lastUpdate": 1779321190348,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -20807,6 +20807,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25788447,
             "range": "± 88602",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "f2a46ba69d4f97557721598691d30c44df260334",
+          "message": "1.7.3 — occurrence registration + liveness heartbeat (closes #81)\n\nThird CIRIS 3.0 enabler. CIRISAgent infers live occurrences by\nscanning task-row activity — an inference that can't tell clean\nshutdown from crash and has no TTL. All occurrences share one\nEd25519 identity, so occurrence churn is endpoint liveness under a\nstable identity.\n\nNew occurrence substrate. OccurrenceService (4 methods):\n- register_occurrence(occurrence_id, identity, ttl_seconds,\n  metadata) — expires_at = now + ttl. Idempotent.\n- heartbeat_occurrence(occurrence_id, ttl_seconds) -> bool — bump\n  last_heartbeat + expires_at; false for unknown occurrence.\n- deregister_occurrence(occurrence_id) -> bool — clean shutdown.\n- list_live_occurrences(identity) -> Vec<OccurrenceRecord> — rows\n  with expires_at > now; crashed occurrences age out via TTL.\n\nV039 migration both backends: occurrence_registry(occurrence_id PK,\nidentity, registered_at, last_heartbeat, expires_at, metadata) +\n(identity, expires_at) index. Feature flag cirislens_occurrence.\nPyO3 4 methods (ensure_usable guarded) + .pyi.\n\nTests: 17 (PG + SQLite) — register/list round-trip, re-register\nin-place, heartbeat bump + unknown->false, deregister + absent->\nfalse, TTL expiry filtering, identity isolation, arg validation.\n\nCIRISAgent's discover_active_occurrences retires in favor of this.\n\ncloses #81\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-20T18:45:12-05:00",
+          "tree_id": "f56c84b59a880b436de4a0d2d385811cc17ea980",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/f2a46ba69d4f97557721598691d30c44df260334"
+        },
+        "date": 1779321189724,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 109473,
+            "range": "± 327",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 260397,
+            "range": "± 1371",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 560601,
+            "range": "± 4624",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1988618,
+            "range": "± 8156",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 350,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1451,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7226,
+            "range": "± 16",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23242,
+            "range": "± 115",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26470,
+            "range": "± 530",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91085,
+            "range": "± 661",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 349,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3249,
+            "range": "± 73",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9686,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41805,
+            "range": "± 448",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 631,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2229347,
+            "range": "± 21617",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7006936,
+            "range": "± 52531",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25820257,
+            "range": "± 112320",
             "unit": "ns/iter"
           }
         ]
