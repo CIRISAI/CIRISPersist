@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779304844214,
+  "lastUpdate": 1779305286359,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -20147,6 +20147,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23892120,
             "range": "± 206921",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "9a3bf4ba95215b012191eb9af243d3b5c1ab35af",
+          "message": "1.6.7 — SQLite validates incident_id/metric_id as UUID (closes #74)\n\nincident_record accepted any string for incident_id on SQLite but\nrejected non-UUID values on Postgres: cirislens.incident_records.\nincident_id is a PG uuid column; SQLite's is untyped TEXT. A caller\npassing a prefixed id (the agent's incident_<uuid> shape) stored\nfine on SQLite then failed on every call once switched to Postgres\n— invisible until a backend swap. In CIRISAgent this amplified into\na 12k-error self-sustaining incident loop.\n\nSame divergence class as #72 (naive timestamps) / #73 (text edge_id\nvs uuid column): SQLite's permissive typing masks a contract\nPostgres enforces.\n\nFix (validate-on-both, the agent's preferred option): SQLite now\nrejects a non-UUID incident_id with the same InvalidArgument\nPostgres raises, before any I/O. New validate_incident_id guard\nwired into record_incident, transition_state, and the\nlist_incidents cursor last_id (PG already validated all three).\n\nAudit of other caller-supplied PG uuid columns: most are\npersist-generated (secret_uuid, entry_id, edge_id post-#73,\ncirisnode ids). One real parallel — telemetry metric_id:\ncirisgraph.telemetry_metrics.metric_id is PG uuid, MetricObservation\n.metric_id is caller-supplied Option<String>. SQLite resolve_metric_id\naccepted any string; PG parsed it as UUID. Fixed — SQLite now\nvalidates a caller-supplied metric_id identically.\n\nTests: 1 new SQLite test (record_incident + transition_state reject\nnon-UUID incident_id; valid UUID still works). 20 existing incident\n+ 68 SQLite telemetry/incident tests pass unchanged.\n\nBehavioral change on SQLite: a caller storing a non-UUID incident_id\n/metric_id now gets InvalidArgument — the same failure Postgres\nalways gave. Intended fail-fast. No migration. No PyO3 change.\n\ncloses #74\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-20T14:19:29-05:00",
+          "tree_id": "21ace876eaff699f9fd7ce8473128eab2f5aa163",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/9a3bf4ba95215b012191eb9af243d3b5c1ab35af"
+        },
+        "date": 1779305285020,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101630,
+            "range": "± 324",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 241587,
+            "range": "± 1006",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 523183,
+            "range": "± 1767",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1845639,
+            "range": "± 10434",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 345,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1451,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7335,
+            "range": "± 99",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21159,
+            "range": "± 51",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24191,
+            "range": "± 64",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83528,
+            "range": "± 203",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 387,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3192,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9318,
+            "range": "± 95",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41209,
+            "range": "± 179",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2265479,
+            "range": "± 128773",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6608624,
+            "range": "± 91241",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23902219,
+            "range": "± 315906",
             "unit": "ns/iter"
           }
         ]
