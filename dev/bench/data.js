@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779321190348,
+  "lastUpdate": 1779321593696,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -20939,6 +20939,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25820257,
             "range": "± 112320",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "11aaa2e9847e015177a9281ba195484ebf27014c",
+          "message": "1.7.4 — per-consumer substrate ownership declaration (closes #82)\n\nregister_consumer validates declared substrate names against the\nfive persist families (raises ValueError on a typo). New\nEngine.substrate_owner(substrate) advisory ownership lookup. Hard\nper-call write-rejection documented as a deliberate 1.7.x non-goal\n(needs consumer-scoped handles, tracked in #79-#84); ownership table\nadded to docs/COHABITATION.md.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-20T18:52:01-05:00",
+          "tree_id": "adf4dcab64c02d27da118f259136c733eb263510",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/11aaa2e9847e015177a9281ba195484ebf27014c"
+        },
+        "date": 1779321592703,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 95829,
+            "range": "± 1511",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 237471,
+            "range": "± 997",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 518860,
+            "range": "± 1726",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1948301,
+            "range": "± 27338",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 314,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1236,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 6830,
+            "range": "± 49",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 20573,
+            "range": "± 71",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 23996,
+            "range": "± 74",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 88571,
+            "range": "± 186",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 317,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3267,
+            "range": "± 43",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9836,
+            "range": "± 198",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 44161,
+            "range": "± 104",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 560,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2073098,
+            "range": "± 37281",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6350670,
+            "range": "± 78333",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23278899,
+            "range": "± 183197",
             "unit": "ns/iter"
           }
         ]
