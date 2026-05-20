@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779220938296,
+  "lastUpdate": 1779240074138,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -19619,6 +19619,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25702869,
             "range": "± 368788",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "4c85940a15fe5eaf34f74e151baf03282dca5624",
+          "message": "1.6.3 — task_upsert/thought_upsert honor caller created_at (closes #71)\n\nCloses the inconsistency between cirisgraph_upsert_node (which has\nhonored supplied created_at since v1.3.1/#49) and the tasks/thoughts\nsubstrates absorbed in v1.5.9/v1.5.10 (which were preserving the\noriginal created_at across re-upsert).\n\nUnblocks CIRISAgent 2.9.0's _backdate_task_created_at test helper +\nthe 3 stale-task code-path tests it serves\n(test_get_shared_task_status_outside_window,\ntest_try_claim_shared_task_deletes_old_active_task,\ntest_try_claim_shared_task_datum_bug_scenario).\n\nSQL:\n- cirislens.tasks ON CONFLICT(task_id) DO UPDATE — added\n  created_at = EXCLUDED.created_at / excluded.created_at on PG+SQLite.\n- cirislens.thoughts ON CONFLICT(thought_id) DO UPDATE — same.\n\nAudit of other *_upsert surfaces (tickets, scheduled_tasks, wa_cert)\n— each has an explicit upsert_idempotent_preserves_created_at test\nasserting the preserve behavior is intentional per their substrate\nspecs (those model domain entities with genuinely immutable creation\ntimestamps). Left unchanged.\n\nTests: 4 new (2 SQLite + 2 PG-gated). Each re-upserts a row with a\n24h-backdated created_at and asserts get returns the backdated value\n(<= 1s drift). Existing upsert_idempotent tests still pass — they\nre-upsert with the SAME created_at so the preserve-or-honor\ndistinction doesn't fire.\n\nNo migration. PyO3 / .pyi signatures unchanged.\n\n653/654 lib tests pass with clean PG state (single residual flake is\nthe pre-existing local-only telemetry_daily_tier from cirisgraph+\ntelemetry shared-DB pollution — unaffected, CI doesn't exercise\ntelemetry feature).\n\ncloses #71\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-19T20:12:50-05:00",
+          "tree_id": "9b74fdfba4e5a96885d2fb3974afc3e41364d6b8",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/4c85940a15fe5eaf34f74e151baf03282dca5624"
+        },
+        "date": 1779240072749,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 102055,
+            "range": "± 215",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 242753,
+            "range": "± 1060",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 525533,
+            "range": "± 5278",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1855718,
+            "range": "± 17662",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 345,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1445,
+            "range": "± 31",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7307,
+            "range": "± 95",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21194,
+            "range": "± 60",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24234,
+            "range": "± 101",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83618,
+            "range": "± 282",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 365,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3035,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9323,
+            "range": "± 66",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41177,
+            "range": "± 298",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 621,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2252243,
+            "range": "± 139173",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6655710,
+            "range": "± 222643",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23709667,
+            "range": "± 431428",
             "unit": "ns/iter"
           }
         ]
