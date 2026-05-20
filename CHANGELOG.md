@@ -5,6 +5,64 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.6.7] — 2026-05-20
+
+**SQLite validates `incident_id` / `metric_id` as UUID — PG-parity,
+no silent backend divergence (CIRISPersist#74).**
+
+`incident_record` accepted any string for `incident_id` on SQLite
+but rejected non-UUID values on Postgres: `cirislens.incident_records.incident_id`
+is a PG `uuid` column, SQLite's is untyped TEXT. A caller passing a
+prefixed id (the agent's `incident_<uuid>` shape) stored fine on
+SQLite and then failed on **every** call once switched to Postgres
+— a divergence invisible until a backend swap. In CIRISAgent this
+amplified into a 12,000-error self-sustaining incident loop (an
+ERROR-log handler re-capturing its own save failures; agent-side
+loop-guard already fixed — persist's job is to make the trigger
+impossible).
+
+Same divergence class as #72 (naive timestamps) and #73 (text
+edge_id vs uuid column): SQLite's permissive typing masks a
+contract violation Postgres enforces.
+
+### Fix — validate-on-both (option 1, the agent's preferred)
+
+SQLite now rejects a non-UUID `incident_id` with the *same*
+`InvalidArgument` Postgres raises, before any I/O — a malformed id
+fails fast on the first call regardless of backend.
+
+`incident` SQLite backend — new `validate_incident_id` guard wired
+into:
+- `record_incident` (`incident.incident_id`)
+- `transition_state` (`transition.incident_id`)
+- `list_incidents` (the cursor's `last_id` — PG already validated it)
+
+### Audit of other caller-supplied uuid columns
+
+Swept every PG `uuid`-typed column for the same asymmetry. Most
+are persist-generated (`secret_uuid`, `entry_id`, `edge_id` post-#73,
+the cirisnode ids) — no caller divergence. One real parallel:
+**`telemetry` `metric_id`** — `cirisgraph.telemetry_metrics.metric_id`
+is PG `uuid`; `MetricObservation.metric_id` is caller-supplied
+`Option<String>`. SQLite's `resolve_metric_id` accepted any string;
+PG's parsed it as UUID. Fixed — SQLite `resolve_metric_id` now
+validates a caller-supplied `metric_id` identically.
+
+### Tests
+
+1 new SQLite test — `record_incident` + `transition_state` reject a
+non-UUID `incident_id` with `InvalidArgument`; a well-formed UUID
+still works (regression guard). The 20 existing incident tests +
+68 SQLite telemetry/incident tests pass unchanged (they seed valid
+UUIDs).
+
+### Compatibility
+
+Behavioral change on SQLite: a caller that previously stored a
+non-UUID `incident_id` / `metric_id` on SQLite now gets
+`InvalidArgument` — the same failure Postgres always gave. This is
+the intended fail-fast. No SQL migration. No PyO3 signature change.
+
 ## [1.6.6] — 2026-05-20
 
 **Legacy edge migration maps non-UUID `edge_id` to a deterministic

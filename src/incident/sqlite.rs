@@ -63,6 +63,19 @@ fn validate_correlation_keys(keys: &[String]) -> Result<(), Error> {
     Ok(())
 }
 
+/// v1.6.7 (CIRISPersist#74) — validate that an `incident_id` is a
+/// well-formed UUID. The Postgres backend's `incident_id` column is
+/// typed `uuid` and rejects non-UUID strings at the driver; SQLite's
+/// column is untyped TEXT and would silently accept them. We
+/// validate up-front on the SQLite path so a malformed id fails
+/// fast with the SAME `InvalidArgument` on both backends — no
+/// hidden divergence that only surfaces on a backend swap.
+fn validate_incident_id(s: &str) -> Result<(), Error> {
+    uuid::Uuid::parse_str(s)
+        .map(|_| ())
+        .map_err(|e| Error::InvalidArgument(format!("incident_id parse: {e}")))
+}
+
 fn parse_datetime(s: &str) -> Result<chrono::DateTime<chrono::Utc>, Error> {
     let normalized = if s.contains('T') {
         s.to_owned()
@@ -178,6 +191,9 @@ fn decode_incident_row(row: &rusqlite::Row<'_>) -> Result<Incident, Error> {
 
 impl IncidentService for SqliteIncidentBackend {
     async fn record_incident(&self, incident: Incident) -> Result<String, Error> {
+        // v1.6.7 (CIRISPersist#74) — reject a non-UUID incident_id
+        // the same way Postgres' `uuid` column does, before any I/O.
+        validate_incident_id(&incident.incident_id)?;
         if incident.tenant_id.is_empty() {
             return Err(Error::InvalidArgument("tenant_id required".into()));
         }
@@ -304,6 +320,8 @@ impl IncidentService for SqliteIncidentBackend {
     }
 
     async fn transition_state(&self, transition: IncidentTransition) -> Result<(), Error> {
+        // v1.6.7 (CIRISPersist#74) — PG-parity incident_id validation.
+        validate_incident_id(&transition.incident_id)?;
         if matches!(
             transition.new_state,
             IncidentState::Resolved | IncidentState::Closed
@@ -461,6 +479,9 @@ impl IncidentService for SqliteIncidentBackend {
                     cur.version
                 )));
             }
+            // v1.6.7 (CIRISPersist#74) — PG validates the cursor's
+            // last_id as a UUID; mirror that on SQLite.
+            validate_incident_id(&cur.last_id)?;
             params.push(SqlValue::Text(fmt_datetime(cur.last_ts)));
             params.push(SqlValue::Text(cur.last_id.clone()));
             where_parts.push("(first_seen_at, incident_id) < (?, ?)".to_string());
@@ -973,5 +994,42 @@ mod tests {
             .unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].severity, IncidentSeverity::High);
+    }
+
+    /// v1.6.7 (CIRISPersist#74) — a non-UUID `incident_id` is
+    /// rejected with `InvalidArgument` on SQLite, exactly as the
+    /// Postgres `uuid` column does. No silent cross-backend
+    /// divergence: a malformed id fails fast on the first call.
+    #[tokio::test]
+    async fn cirisincident_sqlite_rejects_non_uuid_incident_id() {
+        let (_b, svc) = fresh_backend().await;
+
+        // record_incident — prefixed non-UUID id (the agent's
+        // `incident_<uuid>` shape that triggered the #74 loop).
+        let mut inc = mk_incident("t", "log_error", IncidentSeverity::Error, "x", vec![]);
+        inc.incident_id = format!("incident_{}", Uuid::new_v4());
+        let err = svc.record_incident(inc).await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(_)),
+            "non-UUID incident_id must reject, got {err:?}"
+        );
+
+        // transition_state — same guard.
+        let err = svc
+            .transition_state(IncidentTransition {
+                incident_id: "not-a-uuid".into(),
+                new_state: IncidentState::Investigating,
+                resolution_notes: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(_)),
+            "non-UUID transition incident_id must reject, got {err:?}"
+        );
+
+        // A well-formed UUID still works (regression guard).
+        let ok = mk_incident("t", "log_error", IncidentSeverity::Error, "x", vec![]);
+        assert!(svc.record_incident(ok).await.is_ok());
     }
 }

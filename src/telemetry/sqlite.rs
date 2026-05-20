@@ -63,7 +63,15 @@ fn resolve_expires_at(obs: &MetricObservation) -> chrono::DateTime<chrono::Utc> 
 
 fn resolve_metric_id(obs: &MetricObservation) -> Result<String, Error> {
     match &obs.metric_id {
-        Some(s) => Ok(s.clone()),
+        // v1.6.7 (CIRISPersist#74) — a caller-supplied metric_id is
+        // validated as a UUID to match the Postgres `uuid` column
+        // (`cirisgraph.telemetry_metrics.metric_id`). Without this,
+        // a non-UUID id would store fine on SQLite and then fail on
+        // every call once switched to Postgres — the silent
+        // backend divergence #74 locked down for incident_id.
+        Some(s) => uuid::Uuid::parse_str(s)
+            .map(|_| s.clone())
+            .map_err(|e| Error::InvalidArgument(format!("metric_id parse: {e}"))),
         None => Ok(uuid::Uuid::new_v4().to_string()),
     }
 }
