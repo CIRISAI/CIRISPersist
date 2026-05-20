@@ -83,6 +83,11 @@ pub struct LegacyMigrationStats {
     /// agent's bootstrap log line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_error_at_node_id: Option<String>,
+    /// v1.6.5 (CIRISPersist#72) — human-readable text of the first
+    /// error encountered (node OR edge). Callers diagnose without
+    /// bisecting; pairs with `first_error_at_node_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_error_message: Option<String>,
 }
 
 impl LegacyMigrationStats {
@@ -102,6 +107,7 @@ impl LegacyMigrationStats {
             edges_skipped_dangling_fk: 0,
             errors: 0,
             first_error_at_node_id: None,
+            first_error_message: None,
         }
     }
 

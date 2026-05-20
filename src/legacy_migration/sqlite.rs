@@ -312,6 +312,7 @@ impl LegacyMigrationService for SqliteLegacyMigrationBackend {
                         stats.errors += 1;
                         if stats.first_error_at_node_id.is_none() {
                             stats.first_error_at_node_id = Some(row.node_id.clone());
+                            stats.first_error_message = Some(format!("scope normalize: {e}"));
                         }
                         tracing::warn!(node_id = %row.node_id, error = %e, "scope normalize failed");
                         if stats.errors as u64 >= stop_at {
@@ -327,6 +328,7 @@ impl LegacyMigrationService for SqliteLegacyMigrationBackend {
                         stats.errors += 1;
                         if stats.first_error_at_node_id.is_none() {
                             stats.first_error_at_node_id = Some(row.node_id.clone());
+                            stats.first_error_message = Some(format!("attributes parse: {e}"));
                         }
                         tracing::warn!(node_id = %row.node_id, error = %e, "attributes parse failed");
                         if stats.errors as u64 >= stop_at {
@@ -342,6 +344,7 @@ impl LegacyMigrationService for SqliteLegacyMigrationBackend {
                         stats.errors += 1;
                         if stats.first_error_at_node_id.is_none() {
                             stats.first_error_at_node_id = Some(row.node_id.clone());
+                            stats.first_error_message = Some(format!("attributes serialize: {e}"));
                         }
                         tracing::warn!(node_id = %row.node_id, error = %e, "attributes serialize failed");
                         if stats.errors as u64 >= stop_at {
@@ -369,6 +372,7 @@ impl LegacyMigrationService for SqliteLegacyMigrationBackend {
                         stats.errors += 1;
                         if stats.first_error_at_node_id.is_none() {
                             stats.first_error_at_node_id = Some(row.node_id.clone());
+                            stats.first_error_message = Some(format!("created_at parse: {e}"));
                         }
                         tracing::warn!(node_id = %row.node_id, error = %e, "created_at parse failed");
                         if stats.errors as u64 >= stop_at {
@@ -412,6 +416,7 @@ impl LegacyMigrationService for SqliteLegacyMigrationBackend {
                         stats.errors += 1;
                         if stats.first_error_at_node_id.is_none() {
                             stats.first_error_at_node_id = Some(row.node_id.clone());
+                            stats.first_error_message = Some(format!("node upsert: {e}"));
                         }
                         tracing::warn!(node_id = %row.node_id, error = %e, "legacy node upsert failed");
                         if stats.errors as u64 >= stop_at {

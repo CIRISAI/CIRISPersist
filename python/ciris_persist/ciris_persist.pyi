@@ -918,7 +918,20 @@ class Engine:
              "edges_skipped_already_present": int,
              "edges_skipped_dangling_fk": int,
              "errors": int,
-             "first_error_at_node_id": str | null}
+             "first_error_at_node_id": str | null,
+             "first_error_message": str | null}
+
+        ``first_error_message`` (v1.6.5, CIRISPersist#72) carries the
+        human-readable text of the first error so callers can
+        diagnose without bisecting.
+
+        v1.6.5 also fixes the legacy ``timestamp without time zone``
+        column type: the pre-v2.9.0 agent schema declares
+        ``graph_nodes.created_at`` / ``updated_at`` as naive
+        timestamps. The reader now casts them ``::text`` and parses
+        both naive (UTC-assumed) and offset-bearing forms — earlier
+        versions errored on every node against a real legacy
+        Postgres database.
 
         Per-row decision tree:
 

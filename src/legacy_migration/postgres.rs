@@ -34,6 +34,48 @@ fn map_pg_error(e: tokio_postgres::Error, op: &str) -> Error {
     Error::Backend(format!("{op}: {detail}"))
 }
 
+/// Parse a legacy timestamp string into a UTC `DateTime`
+/// (CIRISPersist#72). The legacy 2.8.x agent schema declares
+/// `created_at` / `updated_at` as `timestamp without time zone`;
+/// the read SELECT casts them `::text`. This accepts both:
+///
+/// - **RFC 3339 / ISO 8601 with offset** — `timestamptz` columns
+///   render as `2026-01-21 20:07:17.391754+00` or
+///   `...T...+00:00`; parsed via `DateTime::parse_from_rfc3339`
+///   after normalizing the space separator to `T`.
+/// - **Naive (no offset)** — `timestamp` columns render as
+///   `2026-01-21 20:07:17.391754` (or without sub-seconds);
+///   parsed as `NaiveDateTime` and assumed UTC, mirroring the
+///   pre-absorption `migrate_to_persist.py::normalize_datetime()`.
+fn parse_legacy_timestamp(raw: &str) -> Result<chrono::DateTime<chrono::Utc>, Error> {
+    let trimmed = raw.trim();
+    // Normalize the PG `::text` space separator to the RFC 3339 'T'
+    // for the offset-bearing attempt.
+    let t_form = trimmed.replacen(' ', "T", 1);
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&t_form) {
+        return Ok(dt.with_timezone(&chrono::Utc));
+    }
+    // PG `::text` of a timestamptz uses a 2-digit offset (`+00`),
+    // which RFC 3339 rejects — retry with `:00` appended.
+    if let Some(stripped) = t_form.strip_suffix("+00") {
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&format!("{stripped}+00:00")) {
+            return Ok(dt.with_timezone(&chrono::Utc));
+        }
+    }
+    // Naive forms — with and without fractional seconds. Assume UTC.
+    for fmt in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"] {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(&t_form, fmt) {
+            return Ok(chrono::DateTime::from_naive_utc_and_offset(
+                naive,
+                chrono::Utc,
+            ));
+        }
+    }
+    Err(Error::InvalidArgument(format!(
+        "unparseable legacy timestamp: {raw:?}"
+    )))
+}
+
 /// Validate that a caller-supplied legacy schema name is a safe PG
 /// identifier. PG identifiers are case-folded to lowercase when
 /// unquoted; we accept the lowercase form only to avoid the quoting
@@ -106,9 +148,21 @@ async fn migrate_nodes(
     // default them to NULL/false on the read side. The agent's
     // newer audit-envelope signing happens at write time on the new
     // cirisgraph schema, not on the legacy reader path.
+    //
+    // v1.6.5 (CIRISPersist#72): `created_at` / `updated_at` are
+    // cast `::text` in the SELECT. The legacy 2.8.x agent schema
+    // declares them `timestamp without time zone` (NaiveDateTime),
+    // not `timestamptz` — tokio-postgres refuses to decode a
+    // `timestamp` value into `chrono::DateTime<Utc>`. The `::text`
+    // cast sidesteps the type mismatch entirely: a `timestamptz`
+    // renders as `2026-01-21 20:07:17.391754+00`, a `timestamp` as
+    // `2026-01-21 20:07:17.391754` — `parse_legacy_timestamp` below
+    // accepts both (naive → UTC-assumed, mirroring the old
+    // migrate_to_persist.py `normalize_datetime()`).
     let sql = format!(
         "SELECT node_id, scope, node_type, attributes_json, version, \
-                updated_by, updated_at, created_at \
+                updated_by, updated_at::text AS updated_at, \
+                created_at::text AS created_at \
          FROM {schema}.graph_nodes"
     );
     let rows = client
@@ -218,14 +272,36 @@ async fn migrate_nodes(
             .ok()
             .flatten()
             .unwrap_or_else(|| "legacy_unattributed".to_owned());
-        let created_at: chrono::DateTime<chrono::Utc> = match row.try_get("created_at") {
+        // created_at / updated_at arrive as `::text` (see SELECT
+        // above) so a legacy `timestamp without time zone` column
+        // doesn't fail the typed decode. parse_legacy_timestamp
+        // accepts RFC 3339 and naive forms.
+        let created_at_raw: String = match row.try_get::<_, Option<String>>("created_at") {
+            Ok(Some(v)) => v,
+            Ok(None) | Err(_) => {
+                stats.errors += 1;
+                if stats.first_error_at_node_id.is_none() {
+                    stats.first_error_at_node_id = Some(node_id.clone());
+                    stats.first_error_message =
+                        Some("created_at is NULL or undecodable".to_owned());
+                }
+                tracing::warn!(node_id = %node_id, "decode created_at failed");
+                if stats.errors as u64 >= stop_at {
+                    break;
+                }
+                continue;
+            }
+        };
+        let created_at = match parse_legacy_timestamp(&created_at_raw) {
             Ok(v) => v,
             Err(e) => {
                 stats.errors += 1;
                 if stats.first_error_at_node_id.is_none() {
                     stats.first_error_at_node_id = Some(node_id.clone());
+                    stats.first_error_message =
+                        Some(format!("created_at parse: {e} (raw={created_at_raw})"));
                 }
-                tracing::warn!(node_id = %node_id, error = %e, "decode created_at failed");
+                tracing::warn!(node_id = %node_id, error = %e, "parse created_at failed");
                 if stats.errors as u64 >= stop_at {
                     break;
                 }
@@ -233,9 +309,10 @@ async fn migrate_nodes(
             }
         };
         let updated_at: chrono::DateTime<chrono::Utc> = row
-            .try_get::<_, Option<chrono::DateTime<chrono::Utc>>>("updated_at")
+            .try_get::<_, Option<String>>("updated_at")
             .ok()
             .flatten()
+            .and_then(|s| parse_legacy_timestamp(&s).ok())
             .unwrap_or(created_at);
         // Legacy 8-column shape has no signature envelope — default
         // to None / false. The destination cirisgraph.nodes columns
@@ -281,6 +358,7 @@ async fn migrate_nodes(
                 stats.errors += 1;
                 if stats.first_error_at_node_id.is_none() {
                     stats.first_error_at_node_id = Some(node_id.clone());
+                    stats.first_error_message = Some(format!("node upsert: {e}"));
                 }
                 tracing::warn!(node_id = %node_id, error = %e, "legacy node upsert failed");
                 if stats.errors as u64 >= stop_at {
@@ -365,9 +443,10 @@ async fn migrate_edges(
         .get()
         .await
         .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+    // created_at::text — same #72 rationale as the node read.
     let sql = format!(
         "SELECT edge_id, source_node_id, target_node_id, scope, relationship, \
-                weight, attributes_json, created_at \
+                weight, attributes_json, created_at::text AS created_at \
          FROM {schema}.graph_edges"
     );
     let rows = client
@@ -478,17 +557,36 @@ async fn migrate_edges(
             .try_get::<_, Option<serde_json::Value>>("attributes_json")
             .map(|opt| opt.unwrap_or(serde_json::Value::Object(Default::default())))
             .unwrap_or(serde_json::Value::Object(Default::default()));
-        let created_at: chrono::DateTime<chrono::Utc> = match row.try_get("created_at") {
-            Ok(v) => v,
-            Err(e) => {
-                stats.errors += 1;
-                tracing::warn!(edge_id = %edge_id, error = %e, "decode created_at failed");
-                if stats.errors as u64 >= stop_at {
-                    break;
+        let created_at: chrono::DateTime<chrono::Utc> =
+            match row.try_get::<_, Option<String>>("created_at") {
+                Ok(Some(raw)) => match parse_legacy_timestamp(&raw) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        stats.errors += 1;
+                        if stats.first_error_message.is_none() {
+                            stats.first_error_message =
+                                Some(format!("edge created_at parse: {e} (raw={raw})"));
+                        }
+                        tracing::warn!(edge_id = %edge_id, error = %e, "parse created_at failed");
+                        if stats.errors as u64 >= stop_at {
+                            break;
+                        }
+                        continue;
+                    }
+                },
+                Ok(None) | Err(_) => {
+                    stats.errors += 1;
+                    if stats.first_error_message.is_none() {
+                        stats.first_error_message =
+                            Some("edge created_at is NULL or undecodable".to_owned());
+                    }
+                    tracing::warn!(edge_id = %edge_id, "decode created_at failed");
+                    if stats.errors as u64 >= stop_at {
+                        break;
+                    }
+                    continue;
                 }
-                continue;
-            }
-        };
+            };
 
         let edge = graph::GraphEdge {
             edge_id: edge_id.clone(),
@@ -890,5 +988,137 @@ mod tests {
         );
         assert_eq!(stats.errors, 0, "dangling FK must not raise");
         cleanup_legacy(&backend, &prefix).await;
+    }
+
+    /// CIRISPersist#72 — legacy 2.8.x agent schema declares
+    /// `created_at` / `updated_at` as `timestamp without time zone`
+    /// (NOT `timestamptz`). Pre-fix, every node errored on the typed
+    /// decode and Postgres production upgrades copied 0 rows. This
+    /// test seeds a dedicated schema with naive-timestamp columns
+    /// and confirms the migration succeeds end-to-end.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn naive_timestamp_legacy_columns_migrate_ok() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        // Dedicated schema so the naive-timestamp DDL doesn't collide
+        // with the shared `public.graph_nodes` (timestamptz) other
+        // tests created. Also exercises the `legacy_schema` override.
+        let client = backend.pool().get().await.unwrap();
+        client
+            .batch_execute(
+                "DROP SCHEMA IF EXISTS legacy_naive_probe CASCADE;\
+                 CREATE SCHEMA legacy_naive_probe;\
+                 CREATE TABLE legacy_naive_probe.graph_nodes (\
+                    node_id text NOT NULL, scope text NOT NULL, \
+                    node_type text NOT NULL, attributes_json jsonb, \
+                    version integer DEFAULT 1, updated_by text, \
+                    updated_at timestamp without time zone, \
+                    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+                    PRIMARY KEY (node_id, scope));\
+                 CREATE TABLE legacy_naive_probe.graph_edges (\
+                    edge_id text PRIMARY KEY, source_node_id text, \
+                    target_node_id text, scope text, relationship text, \
+                    weight real DEFAULT 1.0, attributes_json jsonb, \
+                    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP);",
+            )
+            .await
+            .unwrap();
+
+        let prefix = unique_prefix();
+        let n1 = format!("{prefix}naive-n1");
+        let n2 = format!("{prefix}naive-n2");
+        // Naive timestamp literals — no offset, exactly the shape a
+        // legacy `timestamp` column yields under `::text`.
+        client
+            .execute(
+                "INSERT INTO legacy_naive_probe.graph_nodes \
+                 (node_id, scope, node_type, attributes_json, version, \
+                  updated_by, updated_at, created_at) \
+                 VALUES ($1,'local','concept','{\"k\":\"v\"}'::jsonb,1,'t', \
+                         '2026-01-21 20:07:17.391754', \
+                         '2026-01-21 20:07:17.410044'), \
+                        ($2,'local','concept','{\"k\":\"v\"}'::jsonb,1,'t', \
+                         '2026-01-21 20:07:18', '2026-01-21 20:07:18')",
+                &[&n1, &n2],
+            )
+            .await
+            .unwrap();
+        let e_id = Uuid::new_v4().to_string();
+        client
+            .execute(
+                "INSERT INTO legacy_naive_probe.graph_edges \
+                 (edge_id, source_node_id, target_node_id, scope, \
+                  relationship, weight, attributes_json, created_at) \
+                 VALUES ($1,$2,$3,'local','RELATED',1.0,'{}'::jsonb, \
+                         '2026-01-21 20:07:19.5')",
+                &[&e_id, &n1, &n2],
+            )
+            .await
+            .unwrap();
+        drop(client);
+
+        let opts = LegacyMigrationOptions {
+            legacy_schema: "legacy_naive_probe".to_owned(),
+            ..LegacyMigrationOptions::default()
+        };
+        let stats = backend.run_legacy_graph_migration(opts).await.unwrap();
+        assert_eq!(
+            stats.errors, 0,
+            "naive-timestamp nodes must not error, got {stats:?}"
+        );
+        assert_eq!(stats.nodes_written, 2, "both nodes written: {stats:?}");
+        assert_eq!(stats.edges_written, 1, "edge written: {stats:?}");
+        assert_eq!(stats.outcome, "ok");
+        assert!(stats.first_error_message.is_none());
+
+        // Verify the naive created_at landed as UTC.
+        use graph::GraphService;
+        let got = backend
+            .get_node(&n1, GraphScope::Local)
+            .await
+            .unwrap()
+            .expect("n1 in cirisgraph");
+        assert_eq!(
+            got.created_at.to_rfc3339(),
+            "2026-01-21T20:07:17.410044+00:00"
+        );
+
+        // Cleanup.
+        let client = backend.pool().get().await.unwrap();
+        let _ = client
+            .batch_execute("DROP SCHEMA IF EXISTS legacy_naive_probe CASCADE;")
+            .await;
+        let _ = client
+            .execute(
+                "DELETE FROM cirisgraph.nodes WHERE node_id LIKE $1",
+                &[&format!("{prefix}%")],
+            )
+            .await;
+    }
+
+    /// CIRISPersist#72 helper-coverage — `parse_legacy_timestamp`
+    /// accepts the three shapes the `::text` cast can yield.
+    #[test]
+    fn parse_legacy_timestamp_accepts_naive_and_tz_forms() {
+        // Naive with fractional seconds (legacy `timestamp` column).
+        let a = parse_legacy_timestamp("2026-01-21 20:07:17.391754").unwrap();
+        assert_eq!(a.to_rfc3339(), "2026-01-21T20:07:17.391754+00:00");
+        // Naive without fractional seconds.
+        let b = parse_legacy_timestamp("2026-01-21 20:07:18").unwrap();
+        assert_eq!(b.to_rfc3339(), "2026-01-21T20:07:18+00:00");
+        // timestamptz `::text` 2-digit offset.
+        let c = parse_legacy_timestamp("2026-01-21 20:07:17.391754+00").unwrap();
+        assert_eq!(c.to_rfc3339(), "2026-01-21T20:07:17.391754+00:00");
+        // Full RFC 3339.
+        let d = parse_legacy_timestamp("2026-01-21T20:07:17.391754+00:00").unwrap();
+        assert_eq!(d.to_rfc3339(), "2026-01-21T20:07:17.391754+00:00");
+        // Garbage rejects.
+        assert!(parse_legacy_timestamp("not-a-timestamp").is_err());
     }
 }

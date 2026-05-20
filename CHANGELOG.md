@@ -5,6 +5,71 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.6.5] — 2026-05-20
+
+**`run_legacy_graph_migration` handles `timestamp without time zone`
+legacy columns (CIRISPersist#72).**
+
+v1.6.4's A0a absorption errored on **every node** when the legacy
+Postgres `public.graph_nodes` table declares `created_at` /
+`updated_at` as `timestamp without time zone` — which the real
+pre-v2.9.0 CIRISAgent schema does (confirmed against a pgEdge pg17
+`ciris-scoutdb` production dump: 114k nodes, all naive-timestamp).
+Every Postgres production upgrade copied 0 rows. SQLite was
+unaffected (TEXT timestamps).
+
+### Root cause
+
+The PG reader bound `created_at` / `updated_at` as
+`chrono::DateTime<Utc>` — i.e. it expected the column to be
+`timestamptz`. tokio-postgres refuses to decode a
+`timestamp without time zone` value into a TZ-aware type, so the
+typed decode failed per row.
+
+### Fix
+
+The node + edge read SELECTs now cast both timestamp columns
+`::text`. A new `parse_legacy_timestamp` helper accepts all three
+shapes the cast can yield:
+
+- **Naive** (`2026-01-21 20:07:17.391754` — `timestamp` column) —
+  parsed as `NaiveDateTime`, **UTC assumed**, mirroring the
+  pre-absorption `migrate_to_persist.py::normalize_datetime()`.
+- **timestamptz `::text`** (`2026-01-21 20:07:17.391754+00` —
+  2-digit offset) — RFC 3339 rejects the 2-digit offset, so the
+  helper retries with `+00:00`.
+- **Full RFC 3339** (`...T...+00:00`) — parsed directly.
+
+`timestamptz` legacy columns (the v1.6.4 happy path) keep working.
+
+### `first_error_message` field added to `LegacyMigrationStats`
+
+Per #72's bonus ask — `LegacyMigrationStats` now carries
+`first_error_message: Option<String>` alongside
+`first_error_at_node_id`. Callers diagnose the first failure
+without bisecting. Populated at every node/edge error site on both
+backends (timestamp parse, scope normalize, attributes parse,
+upsert failure).
+
+### Tests
+
+3 new:
+- PG `naive_timestamp_legacy_columns_migrate_ok` — seeds a
+  dedicated `legacy_naive_probe` schema with
+  `timestamp without time zone` columns (also exercises the
+  `legacy_schema` override), confirms 2 nodes + 1 edge migrate
+  with `errors == 0` and the naive `created_at` lands as UTC.
+- PG `parse_legacy_timestamp_accepts_naive_and_tz_forms` — unit
+  coverage of all four accepted shapes + garbage rejection.
+- The existing 22 legacy_migration tests still pass (the v1.6.4
+  PG happy-path seed uses `timestamptz`, so it now exercises the
+  offset-bearing parse arm).
+
+### Compatibility
+
+Wire-additive — `first_error_message` defaults to `None`, serde
+skips it when absent. No migration. PyO3 signature unchanged.
+
 ## [1.6.4] — 2026-05-19
 
 **Closes #70 — the LAST raw-SQL gap in CIRISAgent 2.9.0.**
