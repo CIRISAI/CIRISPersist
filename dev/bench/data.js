@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779286776567,
+  "lastUpdate": 1779304844214,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -20015,6 +20015,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25825118,
             "range": "± 447351",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "8cf1d03a014cbaf08cf656afeb8637da01f7abde",
+          "message": "1.6.6 — legacy edge_id text→UUID mapping (closes #73)\n\nv1.6.4's A0a absorption errored on every edge when the legacy\ngraph_edges.edge_id is a plain string that isn't a valid UUID.\nscoutdb: nodes 114184/114184 (v1.6.5 #72 timestamp fix works),\nedges 0/100 errors:100.\n\n#73 was filed as a timestamp issue but the v1.6.5 edge SELECT\nalready casts created_at::text. Actual root cause:\ncirisgraph.edges.edge_id is PG-typed uuid (V013); legacy\ngraph_edges.edge_id is arbitrary text; GraphService::upsert_edge\nparses edge_id into uuid::Uuid — non-UUID legacy ids fail\nInvalidArgument. The v1.6.5 test masked it by seeding the edge with\nUuid::new_v4().to_string().\n\nFix: new legacy_migration::canonical_edge_uuid(legacy_id) — a valid\nUUID passes verbatim; a non-UUID derives a deterministic UUIDv5\n(Uuid::NAMESPACE_OID + legacy id as name). v5 is a pure hash so\nre-runs derive the same UUID — ON CONFLICT(edge_id) DO NOTHING\nidempotency holds. Applied identically on PG + SQLite (SQLite's\nedge_id is untyped TEXT but mapping it the same way keeps migrated\nedge_ids byte-identical across backends). Computed once after\ndecode, used for both the already-present check and the upsert.\n\nAlso: first_error_message (the #72 field) now populated on every\nedge error site on both backends — #73 noted it was absent from\nthe returned JSON for edge failures.\n\nuuid crate gains the v5 feature.\n\nTests: 4 new (2 PG + 2 SQLite) — non-UUID edge_id migrates with\nerrors==0, edge found under the canonical UUIDv5, re-run idempotent;\ncanonical_edge_uuid unit coverage (verbatim UUID passthrough,\ndeterministic v5, no collision). 28/28 legacy_migration tests pass.\n\nThe migrated edge_id for non-UUID legacy edges is the derived\nUUIDv5 — the legacy edge_id is a PK surrogate (semantics live in\nthe source/target/relationship tuple) so the remap is transparent.\nNo SQL migration. PyO3 signature unchanged.\n\ncloses #73\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-20T14:13:06-05:00",
+          "tree_id": "2707fb856f7585a6e4bfb0a785faf16dff547335",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/8cf1d03a014cbaf08cf656afeb8637da01f7abde"
+        },
+        "date": 1779304843505,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 102316,
+            "range": "± 1481",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 242773,
+            "range": "± 1626",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 523699,
+            "range": "± 5648",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1855289,
+            "range": "± 19796",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 354,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1452,
+            "range": "± 30",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7316,
+            "range": "± 97",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21197,
+            "range": "± 37",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24201,
+            "range": "± 89",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83533,
+            "range": "± 1509",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 357,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3235,
+            "range": "± 52",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9281,
+            "range": "± 76",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41196,
+            "range": "± 194",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2286149,
+            "range": "± 68509",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6691244,
+            "range": "± 118667",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23892120,
+            "range": "± 206921",
             "unit": "ns/iter"
           }
         ]
