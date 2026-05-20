@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779319982847,
+  "lastUpdate": 1779320387528,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -20543,6 +20543,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23940113,
             "range": "± 370965",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "d62819084f59eea3f546074025b0ff8d4a4f83c0",
+          "message": "1.7.1 — atomic per-identity monotonic sequence primitive (closes #83)\n\nSecond CIRIS 3.0 enabler. A CIRIS runtime holds one Ed25519\nidentity; every in-process consumer (agent, NodeCore, LensCore) and\nevery occurrence signs with it. Ordered signed output (NodeCore\nmessage sequence numbers) needs a counter atomic across all of them\nor the signed stream forks.\n\nNew sequence substrate. SequenceService:\n- next_sequence(identity, stream) -> u64 — atomically bump+return\n  via a single INSERT ON CONFLICT(identity,stream) DO UPDATE SET\n  next_value = next_value + 1 RETURNING. Correct under concurrent\n  callers across occurrences + in-process consumers.\n- peek_sequence(identity, stream) -> u64 — read last-issued without\n  bumping; 0 if never issued.\n\nV038 migration both backends: identity_sequences(identity, stream,\nnext_value, updated_at, PK(identity,stream)). Feature flag\ncirislens_sequence. PyO3 next_sequence/peek_sequence (ensure_usable\nguarded) + .pyi.\n\nTests: 13 (PG + SQLite) — increments 1->2->3, per-stream and\nper-identity independence, peek-doesn't-bump, empty-arg rejection,\nand a 20-way concurrent next_sequence yielding exactly {1..=20}\nwith no duplicates (atomicity proof).\n\ncloses #83\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-20T18:31:09-05:00",
+          "tree_id": "0ee3806363a3fa6d73e8aa60a634afb2908f21ae",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/d62819084f59eea3f546074025b0ff8d4a4f83c0"
+        },
+        "date": 1779320386900,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 102012,
+            "range": "± 311",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 242175,
+            "range": "± 1114",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 523425,
+            "range": "± 7976",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1849706,
+            "range": "± 19984",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 343,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1463,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7362,
+            "range": "± 60",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21204,
+            "range": "± 367",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24226,
+            "range": "± 67",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83527,
+            "range": "± 361",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 367,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3054,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9219,
+            "range": "± 38",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 40887,
+            "range": "± 541",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 622,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2364537,
+            "range": "± 158561",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6827656,
+            "range": "± 483630",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23727166,
+            "range": "± 256855",
             "unit": "ns/iter"
           }
         ]
