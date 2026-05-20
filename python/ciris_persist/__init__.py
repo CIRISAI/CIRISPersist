@@ -28,6 +28,9 @@ Engine rejects schema-altering scrubber output.
 from .ciris_persist import (
     Conflict,
     Engine,
+    EngineClosed,
+    EngineConfigMismatch,
+    EngineUsedAcrossFork,
     LensQueryError,
     NotFound,
     Permanent,
@@ -40,6 +43,10 @@ from .ciris_persist import (
 __all__ = [
     "Conflict",
     "Engine",
+    # v1.6.8 (CIRISPersist#75-78) — engine-lifecycle exceptions.
+    "EngineClosed",
+    "EngineConfigMismatch",
+    "EngineUsedAcrossFork",
     "LensQueryError",
     "NotFound",
     "Permanent",

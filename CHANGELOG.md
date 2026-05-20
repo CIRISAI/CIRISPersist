@@ -5,6 +5,43 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.7.2] — 2026-05-20
+
+**Fix: the v1.6.8 engine-lifecycle exceptions weren't re-exported
+from the Python package — publish-blocker for v1.6.8 / v1.7.0 /
+v1.7.1.**
+
+`python/ciris_persist/__init__.py` carries an **explicit**
+`from .ciris_persist import (...)` list + `__all__` (not a
+wildcard). v1.6.8 added `EngineConfigMismatch`, `EngineClosed`,
+`EngineUsedAcrossFork` to the Rust extension module and registered
+them via `m.add(...)` — but the package `__init__.py` re-export
+list was not updated, so `import ciris_persist;
+ciris_persist.EngineConfigMismatch` resolved through `__init__.py`
+and raised `AttributeError`.
+
+The v1.6.8 `test_engine_lifecycle_exceptions_exported` pytest case
+caught it — CI's `pytest tests/python/` job failed, which gates the
+`Publish wheel to PyPI` step. Result: **v1.6.8, v1.7.0, and v1.7.1
+all built green but never published** (the same `__init__.py` gap
+rode along in each). v1.7.2 is the fix.
+
+Pure-Python one-liner: the three exception names added to the
+`from .ciris_persist import (...)` block and `__all__`. The Rust
+side was correct since v1.6.8 — only the wrapper package's
+hand-maintained export list lagged.
+
+Rust `cargo` builds + the pre-push hook never caught this: they
+exercise the extension module directly, not the `__init__.py`
+wrapper. Only `pytest tests/python/` (which does
+`import ciris_persist`) goes through the wrapper.
+
+No code/behavior change beyond the export list. v1.7.2 carries
+everything in v1.6.8 + v1.7.0 + v1.7.1 (singleton lifecycle,
+engine_handle, consumer registry, sequence primitive) — it is the
+first **publishable** release of that line and the version the
+federation should pin.
+
 ## [1.7.1] — 2026-05-20
 
 **Atomic per-identity monotonic sequence primitive (CIRISPersist#83).**
