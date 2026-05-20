@@ -55,7 +55,7 @@ class Engine:
 
     def __init__(self, dsn: str, scrubber: ScrubberCallable | None = None) -> None: ...
 
-    def close(self) -> None:
+    def close(self, force: bool = False) -> None:
         """v1.6.8 (CIRISPersist#77) — deterministic teardown.
 
         Flips the process-singleton's closed flag (every ``Engine``
@@ -64,12 +64,58 @@ class Engine:
         owner should call this; in-process adapters attach and
         detach but never close. After ``close()`` every method
         raises :class:`EngineClosed`.
+
+        v1.7.0 (CIRISPersist#80): refuses with ``RuntimeError`` if
+        any consumer is still registered (see
+        :meth:`register_consumer`). Pass ``force=True`` to close
+        regardless — for a hard process shutdown.
         """
 
     @property
     def is_closed(self) -> bool:
         """v1.6.8 — ``True`` once :meth:`close` has run on this
         engine (or any handle sharing its singleton cell)."""
+
+    def engine_handle(self) -> Engine:
+        """v1.7.0 (CIRISPersist#79) — return a fresh handle to the
+        process-singleton engine.
+
+        Cheap ``Arc``-clone — shares the runtime, pool, signer,
+        closed flag, and consumer registry. The lifecycle owner uses
+        this to hand the engine to an in-process adapter (NodeCore,
+        LensCore) explicitly ("injected engine, first parameter")
+        without the adapter needing the DSN / signing key.
+        """
+
+    def register_consumer(
+        self, name: str, substrates: list[str] | None = None
+    ) -> None:
+        """v1.7.0 (CIRISPersist#80) — register an attached consumer.
+
+        In-process adapters call this on bring-up. ``substrates``
+        declares the substrate families the consumer owns (e.g.
+        ``["cirisnode"]``). Idempotent — re-registering an existing
+        ``name`` updates its substrate list. While any consumer is
+        registered, :meth:`close` refuses without ``force=True``.
+        """
+
+    def deregister_consumer(self, name: str) -> bool:
+        """v1.7.0 (CIRISPersist#80) — deregister a consumer on its
+        teardown. Returns ``True`` if it was registered. Idempotent.
+        """
+
+    def list_consumers(self) -> str:
+        """v1.7.0 (CIRISPersist#80) — JSON snapshot of the attached-
+        consumer registry: ``{name: {"substrates": [...],
+        "registered_at": "<rfc3339>"}}``. Diagnostics — "who is
+        using persist right now."
+        """
+
+    @property
+    def consumer_count(self) -> int:
+        """v1.7.0 (CIRISPersist#80) — number of registered
+        consumers. :meth:`close` (without ``force``) refuses while
+        this is non-zero."""
 
     def register_public_key(
         self,

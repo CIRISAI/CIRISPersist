@@ -5,6 +5,70 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.7.0] — 2026-05-20
+
+**In-process cohabitation foundation — `engine_handle()` + consumer
+registry (CIRISPersist#79 / #80).**
+
+First of the CIRIS 3.0 enabler cuts. v1.6.8 ended the
+multi-consumer deadlock (the `Engine` process-singleton); v1.7.0
+adds the surface in-process adapters (NodeCore, LensCore) use to
+attach to and detach from that shared engine.
+
+### #79 — `Engine.engine_handle()`
+
+Returns a fresh handle to the process-singleton engine — a cheap
+`Arc`-clone sharing the runtime, pool, signer, `closed` flag, and
+consumer registry. The lifecycle owner (the CIRISAgent runtime)
+uses it to inject the engine into an in-process adapter explicitly
+— "injected engine, first parameter" (LensCore's existing pattern,
+now the formal contract) — without the adapter needing the DSN /
+signing key to re-call the constructor.
+
+The COHABITATION.md in-process chapter landed in v1.6.8; v1.7.0
+completes #79 with the accessor.
+
+### #80 — consumer registry + lifecycle refcount
+
+The engine now tracks who is attached:
+
+- `register_consumer(name, substrates=None)` — an adapter calls
+  this on bring-up. `substrates` declares the substrate families it
+  owns (`["cirisnode"]` for NodeCore, etc.) — recorded for
+  introspection; the per-owner-migration + write-rejection
+  enforcement is the CIRISPersist#82 follow-on. Idempotent.
+- `deregister_consumer(name) -> bool` — on the adapter's teardown.
+  Idempotent.
+- `list_consumers() -> str` — JSON snapshot
+  `{name: {substrates, registered_at}}` for "who is using persist"
+  diagnostics.
+- `consumer_count` getter.
+
+`close()` gains a `force` parameter and now **refuses while
+consumers are still registered** — tearing the runtime out from
+under an attached NodeCore/LensCore would deadlock them. The
+well-behaved path: every adapter `deregister_consumer()` on its own
+teardown, then the owner's `close()` finds the registry empty.
+`close(force=True)` overrides — for a hard process shutdown.
+
+The registry is in-memory on the singleton cell (an
+`Arc<Mutex<HashMap>>` every handle shares); no DB, no migration.
+
+### Tests
+
+- Rust: the engine-config-fingerprint unit test (v1.6.8) covers the
+  singleton config gate.
+- Python: surface test pinning `engine_handle` + the four registry
+  methods on the `Engine` class. Registry *behavior* is exercised
+  by the downstream cohabitation suite.
+
+### Compatibility
+
+Purely additive — `close()`'s new `force` parameter defaults
+`False`, so `engine.close()` is unchanged for a single-consumer
+process (empty registry → closes cleanly). No SQL migration, no
+wire-format change.
+
 ## [1.6.8] — 2026-05-20
 
 **`Engine` is a process-singleton — ends the multi-consumer deadlock

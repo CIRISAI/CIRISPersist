@@ -61,3 +61,20 @@ def test_engine_has_lifecycle_surface() -> None:
     CIRISAgent 2.9.0 suite; this just pins the public surface."""
     assert hasattr(ciris_persist.Engine, "close")
     assert hasattr(ciris_persist.Engine, "is_closed")
+
+
+def test_engine_has_cohabitation_surface() -> None:
+    """v1.7.0 (CIRISPersist#79 + #80) — the Engine class exposes the
+    in-process-cohabitation surface: engine_handle() for injecting
+    the singleton into an adapter, and the consumer registry
+    (register/deregister/list/count) so the agent + NodeCore +
+    LensCore can attach/detach safely. Behavior is exercised by the
+    downstream cohabitation suite; this pins the public surface."""
+    for attr in (
+        "engine_handle",
+        "register_consumer",
+        "deregister_consumer",
+        "list_consumers",
+        "consumer_count",
+    ):
+        assert hasattr(ciris_persist.Engine, attr), f"Engine.{attr} missing"

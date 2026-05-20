@@ -254,6 +254,25 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
 // when the calling pid differs from the construction pid (#78 — a
 // tokio runtime does not survive `fork()`).
 
+/// v1.7.0 (CIRISPersist#80) — one attached consumer's registry
+/// record. The agent + NodeCore + LensCore each register on
+/// bring-up so the engine knows who is attached (safe teardown,
+/// `list_consumers()` diagnostics).
+#[derive(Clone)]
+struct ConsumerRecord {
+    /// Substrates this consumer declared ownership of at
+    /// registration (CIRISPersist#82 ties into this list). Free-form
+    /// today; the per-owner migration + write-rejection enforcement
+    /// is the #82 follow-on.
+    substrates: Vec<String>,
+    registered_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Shared consumer registry — `Arc`'d so every `PyEngine` handle
+/// sees the same map (register on handle A, `list_consumers()` on
+/// handle B).
+type ConsumerRegistry = Arc<std::sync::Mutex<std::collections::HashMap<String, ConsumerRecord>>>;
+
 /// Process-global canonical engine state. Built once; `PyEngine`
 /// handles clone Arc fields out of it.
 struct EngineCell {
@@ -265,6 +284,8 @@ struct EngineCell {
     local_signer: Option<Arc<crate::signing::LocalSigner>>,
     #[cfg(all(feature = "sqlite", feature = "cirisaudit"))]
     sqlite_audit: Option<Arc<crate::audit::sqlite::SqliteAuditBackend>>,
+    /// v1.7.0 (CIRISPersist#80) — attached-consumer registry.
+    consumers: ConsumerRegistry,
     /// Identity of the construction config — DSN + key ids. A second
     /// `Engine(...)` whose fingerprint differs raises
     /// `EngineConfigMismatch` rather than silently rebinding.
@@ -384,6 +405,9 @@ pub struct PyEngine {
     /// `EngineUsedAcrossFork` rather than deadlocking on a runtime
     /// whose worker threads don't exist in the child.
     construction_pid: u32,
+    /// v1.7.0 (CIRISPersist#80) — shared attached-consumer registry.
+    /// Same `Arc` every handle holds.
+    consumers: ConsumerRegistry,
 }
 
 impl PyEngine {
@@ -402,6 +426,7 @@ impl PyEngine {
             sqlite_audit: cell.sqlite_audit.clone(),
             closed: cell.closed.clone(),
             construction_pid: cell.construction_pid,
+            consumers: cell.consumers.clone(),
         }
     }
 
@@ -822,6 +847,7 @@ impl PyEngine {
             config_fingerprint: fingerprint,
             construction_pid: std::process::id(),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            consumers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         });
         let handle = PyEngine::from_cell(&cell);
         *slot = Some(cell);
@@ -846,7 +872,30 @@ impl PyEngine {
     /// the *logical* shutdown deterministic — no method runs against
     /// a half-torn-down runtime, it fails fast with `EngineClosed`.
     /// Idempotent: calling `close()` twice is a no-op.
-    fn close(&self) -> PyResult<()> {
+    ///
+    /// **v1.7.0 (CIRISPersist#80)** — `close()` refuses if consumers
+    /// are still registered: a teardown while NodeCore / LensCore
+    /// are attached would pull the runtime out from under them. Pass
+    /// `force=True` to close anyway (process is going down hard).
+    /// The well-behaved path is: every adapter `deregister_consumer`
+    /// on its own teardown, then the owner's `close()` finds the
+    /// registry empty.
+    #[pyo3(signature = (force=false))]
+    fn close(&self, force: bool) -> PyResult<()> {
+        if !force {
+            let registry = self.consumers.lock().unwrap_or_else(|e| e.into_inner());
+            if !registry.is_empty() {
+                let mut names: Vec<&str> = registry.keys().map(String::as_str).collect();
+                names.sort_unstable();
+                return Err(PyRuntimeError::new_err(format!(
+                    "close() refused — {} consumer(s) still registered: [{}]. \
+                     Each adapter must deregister_consumer() on teardown, or \
+                     pass force=True to close anyway.",
+                    names.len(),
+                    names.join(", ")
+                )));
+            }
+        }
         self.closed
             .store(true, std::sync::atomic::Ordering::Release);
         let mut slot = engine_slot();
@@ -866,6 +915,108 @@ impl PyEngine {
     #[getter]
     fn is_closed(&self) -> bool {
         self.closed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// v1.7.0 (CIRISPersist#79) — return a fresh handle to the
+    /// process-singleton engine.
+    ///
+    /// Every `Engine` is already a handle to the one process
+    /// singleton, so this is a cheap `Arc`-clone. It exists so the
+    /// lifecycle owner can hand the engine to an in-process adapter
+    /// (NodeCore, LensCore) explicitly — "injected engine, first
+    /// parameter" — without the adapter needing the DSN / signing
+    /// key to re-call the `Engine(...)` constructor. The returned
+    /// handle shares the runtime, pool, signer, `closed` flag, and
+    /// consumer registry with every other handle.
+    fn engine_handle(&self) -> PyResult<PyEngine> {
+        self.ensure_usable()?;
+        Ok(PyEngine {
+            backend: self.backend.clone(),
+            runtime: self.runtime.clone(),
+            scrubber: self.scrubber.clone(),
+            signer: self.signer.clone(),
+            signer_key_id: self.signer_key_id.clone(),
+            local_signer: self.local_signer.clone(),
+            #[cfg(all(feature = "sqlite", feature = "cirisaudit"))]
+            sqlite_audit: self.sqlite_audit.clone(),
+            closed: self.closed.clone(),
+            construction_pid: self.construction_pid,
+            consumers: self.consumers.clone(),
+        })
+    }
+
+    /// v1.7.0 (CIRISPersist#80) — register an attached consumer.
+    ///
+    /// In-process adapters call this on bring-up so the engine knows
+    /// who is attached: safe teardown (`close()` refuses while
+    /// consumers remain) and `list_consumers()` diagnostics.
+    /// `substrates` declares the substrate families the consumer
+    /// owns (e.g. `["cirisnode"]` for NodeCore) — the
+    /// per-owner-migration + write-rejection enforcement is the
+    /// CIRISPersist#82 follow-on; today the list is recorded for
+    /// introspection.
+    ///
+    /// Idempotent: re-registering an existing `name` updates its
+    /// substrate list + refreshes the timestamp.
+    #[pyo3(signature = (name, substrates=None))]
+    fn register_consumer(&self, name: &str, substrates: Option<Vec<String>>) -> PyResult<()> {
+        self.ensure_usable()?;
+        if name.is_empty() {
+            return Err(PyValueError::new_err("consumer name must be non-empty"));
+        }
+        let mut registry = self.consumers.lock().unwrap_or_else(|e| e.into_inner());
+        registry.insert(
+            name.to_owned(),
+            ConsumerRecord {
+                substrates: substrates.unwrap_or_default(),
+                registered_at: chrono::Utc::now(),
+            },
+        );
+        Ok(())
+    }
+
+    /// v1.7.0 (CIRISPersist#80) — deregister an attached consumer.
+    /// Adapters call this on their own teardown. Returns `True` if
+    /// the consumer was registered, `False` if it wasn't (idempotent
+    /// — double-deregister is not an error).
+    fn deregister_consumer(&self, name: &str) -> PyResult<bool> {
+        self.ensure_usable()?;
+        let mut registry = self.consumers.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(registry.remove(name).is_some())
+    }
+
+    /// v1.7.0 (CIRISPersist#80) — JSON-encoded snapshot of the
+    /// attached-consumer registry: `{name: {"substrates": [...],
+    /// "registered_at": "<rfc3339>"}}`. For diagnostics — "who is
+    /// using persist right now."
+    fn list_consumers(&self) -> PyResult<String> {
+        self.ensure_usable()?;
+        let registry = self.consumers.lock().unwrap_or_else(|e| e.into_inner());
+        let view: std::collections::BTreeMap<String, serde_json::Value> = registry
+            .iter()
+            .map(|(name, rec)| {
+                (
+                    name.clone(),
+                    serde_json::json!({
+                        "substrates": rec.substrates,
+                        "registered_at": rec.registered_at.to_rfc3339(),
+                    }),
+                )
+            })
+            .collect();
+        serde_json::to_string(&view)
+            .map_err(|e| PyRuntimeError::new_err(format!("consumer registry encode: {e}")))
+    }
+
+    /// v1.7.0 (CIRISPersist#80) — count of currently-registered
+    /// consumers. `close()` (without `force`) refuses while this is
+    /// non-zero.
+    #[getter]
+    fn consumer_count(&self) -> usize {
+        self.consumers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 
     /// v0.1.9 — return the **authoritative** seed-storage path for
