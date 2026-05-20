@@ -147,7 +147,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "continuity_awareness_not_found"
         | "feedback_mappings_not_found"
         | "wa_cert_not_found"
-        | "service_token_revocation_not_found" => NotFound::new_err(msg),
+        | "service_token_revocation_not_found"
+        | "legacy_migration_not_found" => NotFound::new_err(msg),
 
         // Conflict family — uniqueness / version / state-transition
         // conflict; caller MUST NOT retry, MUST re-read.
@@ -167,7 +168,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "continuity_awareness_conflict"
         | "feedback_mappings_conflict"
         | "wa_cert_conflict"
-        | "service_token_revocation_conflict" => Conflict::new_err(msg),
+        | "service_token_revocation_conflict"
+        | "legacy_migration_conflict" => Conflict::new_err(msg),
 
         // Transient family — backend connection / timeout / pool
         // exhaustion; caller MAY retry with backoff.
@@ -189,7 +191,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "continuity_awareness_backend"
         | "feedback_mappings_backend"
         | "wa_cert_backend"
-        | "service_token_revocation_backend" => Transient::new_err(msg),
+        | "service_token_revocation_backend"
+        | "legacy_migration_backend" => Transient::new_err(msg),
 
         // Default — Permanent. Covers invalid arguments, signature
         // failures, crypto errors, rotation conflicts, "not authorized,"
@@ -11566,6 +11569,83 @@ impl PyEngine {
                                 ))
                             }),
                         }
+                    })
+                }
+            })
+        })
+    }
+
+    // ── v1.6.4 (CIRISPersist#70) legacy-graph migration ──────────
+    //
+    // Absorbs the agent-side `tools/ops/migrate_to_persist.py`
+    // psycopg2/sqlite3 reader. The LAST raw-SQL gap in CIRISAgent
+    // 2.9.0 — with this method wired, the agent drops both deps
+    // from production `requirements.txt`. Options + stats cross
+    // the FFI as JSON strings (matching the rest of the v1.x
+    // dispatch shape); errors thread through `translate_error_kind`
+    // (legacy_migration_backend → Transient,
+    // legacy_migration_invalid_argument → Permanent).
+
+    /// v1.6.4 (CIRISPersist#70) — Absorb the A0a legacy-graph
+    /// migration. Reads `public.graph_nodes` + `public.graph_edges`
+    /// (legacy 2.8.x agent schema) and re-upserts each row into
+    /// `cirisgraph.nodes` + `cirisgraph.edges` via the existing
+    /// typed-write surface.
+    ///
+    /// `options_json` is a JSON-encoded `LegacyMigrationOptions`:
+    ///   `{"dry_run": bool, "attributes_cap_bytes": int | null,
+    ///     "legacy_schema": "public", "stop_after_errors": int | null}`.
+    /// All fields optional; `{}` decodes to safe defaults.
+    ///
+    /// Returns a JSON-encoded `LegacyMigrationStats`:
+    ///   `{"outcome": "ok" | "errors" | "partial",
+    ///     "nodes_read": int, "nodes_written": int,
+    ///     "nodes_skipped_already_present": int,
+    ///     "nodes_skipped_too_large": int,
+    ///     "edges_read": int, ..., "errors": int,
+    ///     "first_error_at_node_id": str | null}`.
+    ///
+    /// Idempotent: re-running is safe (existing substrate rows
+    /// skip via `expected_version` / PK semantics). Replaces the
+    /// agent-side psycopg2/sqlite3 reader so CIRISAgent#763 Phase 5
+    /// can close.
+    #[cfg(feature = "cirislens_legacy_migration")]
+    fn run_legacy_graph_migration(&self, py: Python<'_>, options_json: &str) -> PyResult<String> {
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let options: crate::legacy_migration::LegacyMigrationOptions =
+                serde_json::from_str(options_json).map_err(|e| {
+                    PyValueError::new_err(format!("LegacyMigrationOptions decode: {e}"))
+                })?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::legacy_migration::LegacyMigrationService;
+                        let stats = backend
+                            .run_legacy_graph_migration(options)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&stats).map_err(|e| {
+                            PyRuntimeError::new_err(format!("LegacyMigrationStats encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::legacy_migration::sqlite::SqliteLegacyMigrationBackend::new(
+                            sq.conn_handle(),
+                        );
+                    runtime.block_on(async move {
+                        use crate::legacy_migration::LegacyMigrationService;
+                        let stats = backend
+                            .run_legacy_graph_migration(options)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&stats).map_err(|e| {
+                            PyRuntimeError::new_err(format!("LegacyMigrationStats encode: {e}"))
+                        })
                     })
                 }
             })

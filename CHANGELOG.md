@@ -5,6 +5,189 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.6.4] — 2026-05-19
+
+**Closes #70 — the LAST raw-SQL gap in CIRISAgent 2.9.0.**
+
+Absorbs the agent's `tools/ops/migrate_to_persist.py` A0a graph
+reader into a typed substrate method. With this method wired,
+CIRISAgent 2.9.0 drops both `psycopg2` (PG path) and `sqlite3` (SQLite
+path) from production `requirements.txt` and CIRISAgent#763 Phase 5
+closes — no more direct DB driver imports in the agent.
+
+### New substrate: `src/legacy_migration/`
+
+Five files mirroring other v0.8.x / v1.x substrate layout:
+
+- `mod.rs` — `Error` + stable `kind()` tokens
+  (`legacy_migration_invalid_argument` /
+  `legacy_migration_not_found` / `legacy_migration_conflict` /
+  `legacy_migration_backend` / `legacy_migration_internal`) +
+  re-exports.
+- `types.rs` — `LegacyMigrationOptions` (4 optional fields, all
+  with safe defaults) + `LegacyMigrationStats` (10 counters +
+  `outcome` discriminator + `first_error_at_node_id` debug hint).
+- `service.rs` — `LegacyMigrationService` trait (1 method).
+- `postgres.rs` — `LegacyMigrationService for PostgresBackend` +
+  identifier-validated `legacy_schema` interpolation (lowercase
+  letters / digits / underscores, leading letter or underscore,
+  ≤ 63 chars).
+- `sqlite.rs` — `SqliteLegacyMigrationBackend` (shared
+  `Arc<Mutex<Connection>>` with the rest of the SQLite stack);
+  rejects non-`"public"` `legacy_schema` (SQLite has no schema
+  namespace); probes `sqlite_master` for the legacy tables and
+  returns zeroed `outcome="ok"` if absent (graceful no-op for
+  fresh installs).
+
+### Options shape
+
+```python
+{"dry_run": False,
+ "attributes_cap_bytes": 1048576,   # None = 1 MiB default
+ "legacy_schema": "public",          # PG only; SQLite enforces public
+ "stop_after_errors": 100}           # None = unbounded
+```
+
+All fields optional; `{}` decodes to the documented defaults.
+
+### Stats shape
+
+```python
+{"outcome": "ok" | "errors" | "partial",
+ "nodes_read": int, "nodes_written": int,
+ "nodes_skipped_already_present": int,
+ "nodes_skipped_too_large": int,
+ "edges_read": int, "edges_written": int,
+ "edges_skipped_already_present": int,
+ "edges_skipped_dangling_fk": int,
+ "errors": int,
+ "first_error_at_node_id": str | None}
+```
+
+`outcome` is the sentinel the agent's bootstrap layer reads to
+decide whether to write the `.persist_migrated` flag — it writes
+only on `"ok"`; `"partial"` / `"errors"` leaves the sentinel absent
+so the next boot retries.
+
+### Per-row decision tree
+
+For each legacy node (in order):
+
+1. Decode + normalize scope (`"local"` / `"identity"` /
+   `"community"` / `"environment"` lowercase → UPPERCASE persist
+   enum value; unrecognized scopes increment `errors`).
+2. Re-serialize attributes once and check byte length against
+   `options.attributes_cap_bytes` (defaults to
+   `crate::graph::DEFAULT_MAX_ATTRIBUTES_BYTES`, 1 MiB). Over-cap
+   rows increment `nodes_skipped_too_large` and DO NOT touch
+   `upsert_node`.
+3. If `dry_run`, increment `nodes_read` and continue (no write).
+4. Call `upsert_node(node, expected_version = 0, bulk_import = true)`.
+   `bulk_import=true` skips the graph layer's AV-45 cap — this
+   substrate already enforced its own bound in step 2, so the
+   re-check at the graph layer would double-count. On `Ok`
+   increment `nodes_written`. On `Conflict` (version mismatch =
+   "row already present") increment
+   `nodes_skipped_already_present`. Other errors increment
+   `errors` + record `first_error_at_node_id` (if unset); if
+   `errors >= stop_after_errors.unwrap_or(100)`, break the loop.
+
+For each legacy edge (in order):
+
+1. If `dry_run`, increment `edges_read` and continue.
+2. Pre-check source + target presence in `cirisgraph.nodes` /
+   `cirisgraph_nodes`. V013 doesn't enforce the FK at the schema
+   level by design (the substrate's k-hop CTE tolerates dangling
+   edges), so the integrity check is at the substrate layer —
+   absent source/target increments `edges_skipped_dangling_fk`.
+3. Pre-check `edge_id` presence in the modern edges table.
+   Already-present increments `edges_skipped_already_present`
+   (`upsert_edge` swallows duplicates via `ON CONFLICT DO NOTHING`
+   so the pre-check is the only way to count idempotent re-runs).
+4. Call `upsert_edge(edge, bulk_import = true)`. `Ok` increments
+   `edges_written`; `InvalidArgument` carrying `"FK"` substring
+   maps to `edges_skipped_dangling_fk` (defensive — fires only if
+   an operator added a schema-level FK); `Conflict` maps to
+   `edges_skipped_already_present` (race winner); other errors
+   increment `errors`.
+
+### `bulk_import` cap bypass + re-check
+
+`upsert_node` accepts `bulk_import: bool` (v1.3.2,
+CIRISPersist#50). The flag was designed for exactly this case:
+one-time historical migration where the operator wants to write
+rows whose attributes payload might exceed the AV-45 1 MiB cap.
+The legacy-migration substrate:
+
+- Re-checks the cap itself against
+  `options.attributes_cap_bytes.unwrap_or(DEFAULT_MAX_ATTRIBUTES_BYTES)`
+  BEFORE the upsert call, so over-cap rows surface in the
+  `nodes_skipped_too_large` counter (not silently written).
+- Calls `upsert_node` with `bulk_import = true` so the graph
+  layer's re-check doesn't double-fire on the rows that DID pass
+  the operator-supplied bound.
+
+An operator who raises the cap (e.g. `attributes_cap_bytes = 5 *
+1024 * 1024`) gets exactly what they asked for — rows up to 5 MiB
+land, rows over 5 MiB get counted as `nodes_skipped_too_large`.
+
+### Cargo + maturin
+
+- New feature `cirislens_legacy_migration = ["cirisgraph"]` —
+  load-bearing dep on `cirisgraph` (the upsert path goes through
+  it).
+- Added to `pyproject.toml` `[tool.maturin] features` list so the
+  release wheel ships the FFI method.
+
+### PyO3 surface (one method)
+
+`run_legacy_graph_migration(options_json: str) -> str`. Options +
+stats round-trip as JSON strings (matching the rest of the v1.x
+dispatch shape). Errors thread through `translate_error_kind`:
+`legacy_migration_backend` → `Transient`,
+`legacy_migration_invalid_argument` → `Permanent`.
+
+### Tests
+
+13 total covering all 6 SQLite scenarios from the spec +
+2 PG validation tests + 5 PG behavior tests + the standard
+mod-level `kind()` round trip:
+
+- **Happy path** (both backends): seed 3 nodes + 2 edges → assert
+  3/2 written + outcome `"ok"` + rows present via the
+  `GraphService` reader.
+- **Re-run idempotent** (both): 2x run; second yields
+  `nodes_skipped_already_present == 3` + `edges_skipped_already_present == 2`.
+- **Oversized attributes** (both): 1.5 MiB blob row → assert
+  `nodes_skipped_too_large >= 1` and the over-cap row is NOT
+  present in `cirisgraph.nodes` afterwards.
+- **Dry run** (both): N seeded → `nodes_read == N` AND
+  `nodes_written == 0` AND `cirisgraph.nodes` is empty.
+- **Dangling edge FK** (both): edge → absent source/target →
+  assert `edges_skipped_dangling_fk >= 1`, no `errors`.
+- **SQLite legacy tables absent** (SQLite-only): fresh in-memory
+  backend → `outcome == "ok"`, all counts zero.
+- **SQLite non-`"public"` legacy_schema rejected** (SQLite-only):
+  `legacy_schema = "other"` → `Err(InvalidArgument)`.
+- **PG `validate_legacy_schema`** (PG-only): accepts `"public"` /
+  `"_underscore"` / `"agent_v2"`; rejects empty, uppercase,
+  injection-shaped (`"public; DROP"`), hyphenated, and over-63-char
+  inputs.
+
+PG tests use per-test UUID-prefixed rows + cleanup via per-prefix
+`DELETE` (no `DROP TABLE` — the qa-postgres container is shared
+with other serial tests).
+
+### No `qa_harness` schema_history bump
+
+No new migration. The substrate reads existing legacy tables and
+writes via the already-shipped `cirisgraph_*` surface.
+
+### Compatibility
+
+Additive. Nothing existing changes shape; deployments that don't
+turn on `cirislens_legacy_migration` see no change.
+
 ## [1.6.3] — 2026-05-19
 
 **`task_upsert` + `thought_upsert` honor caller-supplied `created_at`

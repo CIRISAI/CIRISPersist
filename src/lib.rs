@@ -61,6 +61,8 @@ pub mod graph;
 pub mod incident;
 pub mod ingest;
 pub mod journal;
+#[cfg(feature = "cirislens_legacy_migration")]
+pub mod legacy_migration;
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub mod maintenance;
 #[cfg(feature = "cirislens_maintenance_locks")]

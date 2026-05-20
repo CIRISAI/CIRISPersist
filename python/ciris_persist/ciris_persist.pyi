@@ -889,6 +889,69 @@ class Engine:
         revoked, ``None`` otherwise. Backed by the PRIMARY KEY index.
         """
 
+    # ── v1.6.4 (CIRISPersist#70) — A0a legacy-graph migration ───────
+
+    def run_legacy_graph_migration(self, options_json: str) -> str:
+        """v1.6.4 (CIRISPersist#70) — Absorb the A0a legacy-graph
+        migration. Reads ``public.graph_nodes`` + ``public.graph_edges``
+        (legacy 2.8.x agent schema) and re-upserts into
+        ``cirisgraph.nodes`` / ``cirisgraph.edges``.
+
+        ``options_json`` is a JSON-encoded ``LegacyMigrationOptions``::
+
+            {"dry_run": false,
+             "attributes_cap_bytes": 1048576,
+             "legacy_schema": "public",
+             "stop_after_errors": 100}
+
+        All fields optional; ``{}`` decodes to safe defaults
+        (``dry_run=False``, default 1 MiB cap, ``legacy_schema="public"``,
+        ``stop_after_errors=100``).
+
+        Returns the JSON-encoded ``LegacyMigrationStats``::
+
+            {"outcome": "ok" | "errors" | "partial",
+             "nodes_read": int, "nodes_written": int,
+             "nodes_skipped_already_present": int,
+             "nodes_skipped_too_large": int,
+             "edges_read": int, "edges_written": int,
+             "edges_skipped_already_present": int,
+             "edges_skipped_dangling_fk": int,
+             "errors": int,
+             "first_error_at_node_id": str | null}
+
+        Per-row decision tree:
+
+        - Lowercase legacy scope values are normalized to UPPERCASE
+          before lookup against the ``cirisgraph`` schema's CHECK
+          constraint.
+        - Attributes JSON is re-serialized and size-checked against
+          ``attributes_cap_bytes`` (default 1 MiB). Over-cap rows
+          increment ``nodes_skipped_too_large`` and do NOT call
+          ``upsert_node``.
+        - ``dry_run=True`` reads + parses + size-checks every row
+          but does NOT write.
+        - The underlying ``upsert_node`` is called with
+          ``bulk_import=true`` so the graph layer's AV-45 cap is
+          bypassed — this method re-checks against the operator-
+          supplied bound itself so the count stays honest.
+        - ``stop_after_errors=Some(n)`` halts the per-row loop once
+          the error count reaches ``n`` (default 100). Partial
+          progress is still returned (with ``outcome="partial"`` if
+          any nodes were written, ``"errors"`` otherwise).
+
+        Idempotent — re-running is safe (existing substrate rows
+        are skipped via ``expected_version`` / PK semantics). On
+        SQLite, if the legacy tables are absent (fresh install that
+        never ran the 2.8.x agent), returns a zeroed-counter
+        ``outcome="ok"`` so the agent's bootstrap path can proceed.
+
+        Replaces the agent-side ``tools/ops/migrate_to_persist.py``
+        psycopg2/sqlite3 reader so CIRISAgent can drop both deps
+        from production ``requirements.txt`` (CIRISAgent#763 Phase 5
+        close-out — the LAST raw-SQL gap in CIRISAgent 2.9.0).
+        """
+
     # ── v1.6.0 (CIRISPersist#63) — TSDB query / prune primitives ────
 
     def tsdb_query_summaries(
