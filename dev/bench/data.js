@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779241413928,
+  "lastUpdate": 1779286776567,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -19883,6 +19883,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 26000254,
             "range": "± 324122",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "cc97ee10792dec3119805da49288f2bf9d908db6",
+          "message": "1.6.5 — legacy migration handles timestamp-without-tz columns (closes #72)\n\nv1.6.4's A0a absorption errored on every node when the legacy\nPostgres public.graph_nodes table declares created_at/updated_at as\n`timestamp without time zone` — which the real pre-v2.9.0 CIRISAgent\nschema does (confirmed against a pgEdge pg17 scoutdb production dump:\n114k nodes, all naive-timestamp). Every Postgres production upgrade\ncopied 0 rows. SQLite was unaffected.\n\nRoot cause: the PG reader bound created_at/updated_at as\nchrono::DateTime<Utc> (= timestamptz). tokio-postgres refuses to\ndecode a `timestamp without time zone` value into a TZ-aware type.\n\nFix: the node + edge read SELECTs cast both timestamp columns\n::text. New parse_legacy_timestamp helper accepts all three shapes:\n- naive (2026-01-21 20:07:17.391754) → NaiveDateTime, UTC assumed\n  (mirrors the pre-absorption migrate_to_persist.py normalize_datetime)\n- timestamptz ::text 2-digit offset (...+00) → retry with +00:00\n- full RFC 3339 → parsed directly\ntimestamptz legacy columns (the v1.6.4 happy path) keep working.\n\nBonus ask: LegacyMigrationStats gains first_error_message:\nOption<String> alongside first_error_at_node_id — populated at\nevery node/edge error site on both backends so callers diagnose\nwithout bisecting.\n\nTests: 3 new — PG naive_timestamp_legacy_columns_migrate_ok (seeds\na dedicated legacy_naive_probe schema with timestamp-without-tz\ncolumns, also exercises the legacy_schema override; confirms\nerrors==0 + naive created_at lands as UTC),\nparse_legacy_timestamp_accepts_naive_and_tz_forms unit coverage.\n25/25 legacy_migration tests pass.\n\nWire-additive: first_error_message defaults to None, serde-skipped\nwhen absent. No migration. PyO3 signature unchanged.\n\ncloses #72\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-20T09:10:37-05:00",
+          "tree_id": "6f7b5743f611fcdc5a4c8dd9be9b01292a3361b8",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/cc97ee10792dec3119805da49288f2bf9d908db6"
+        },
+        "date": 1779286775287,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 109287,
+            "range": "± 4527",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 260634,
+            "range": "± 3205",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 560896,
+            "range": "± 8962",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1994295,
+            "range": "± 48186",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 353,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1404,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7308,
+            "range": "± 45",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23126,
+            "range": "± 41",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26401,
+            "range": "± 783",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91014,
+            "range": "± 2415",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 356,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3063,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9864,
+            "range": "± 131",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41779,
+            "range": "± 648",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 657,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2294703,
+            "range": "± 176961",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7076632,
+            "range": "± 164224",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25825118,
+            "range": "± 447351",
             "unit": "ns/iter"
           }
         ]
