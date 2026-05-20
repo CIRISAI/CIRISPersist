@@ -154,6 +154,7 @@ impl TaskService for PostgresBackend {
                            $15, $16, $17, $18) \
                  ON CONFLICT (task_id) DO UPDATE SET \
                     channel_id = EXCLUDED.channel_id, \
+                    created_at = EXCLUDED.created_at, \
                     description = EXCLUDED.description, \
                     status = EXCLUDED.status, \
                     priority = EXCLUDED.priority, \
@@ -627,6 +628,33 @@ mod tests {
         assert_eq!(got2.description, "second");
         assert_eq!(got2.status, TaskStatus::Active);
         assert_eq!(got2.created_at, original_created);
+    }
+
+    /// v1.6.3 (CIRISPersist#71) — task_upsert honors caller-supplied
+    /// `created_at` on UPDATE. Mirrors the SQLite test.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn tasks_pg_upsert_honors_supplied_created_at_on_update() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let id = format!("t-{}", Uuid::new_v4().simple());
+        let initial = mk_task(&id, TaskStatus::Pending, "occ-1");
+        TaskService::upsert_task(&backend, initial.clone())
+            .await
+            .unwrap();
+        let mut backdated = initial.clone();
+        backdated.created_at = chrono::Utc::now() - chrono::Duration::hours(24);
+        TaskService::upsert_task(&backend, backdated.clone())
+            .await
+            .unwrap();
+        let got = backend.get_task(&id).await.unwrap().expect("present");
+        let drift = (got.created_at - backdated.created_at).num_seconds().abs();
+        assert!(drift <= 1, "created_at honored: drift {drift}s");
     }
 
     #[tokio::test]

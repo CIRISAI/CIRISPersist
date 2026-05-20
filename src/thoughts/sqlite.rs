@@ -197,8 +197,10 @@ impl ThoughtService for SqliteThoughtBackend {
             let tx = guard
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|e| map_sqlite_error(e, "upsert_thought begin"))?;
-            // ON CONFLICT (thought_id) DO UPDATE — preserves created_at
-            // (excluded.created_at is ignored). Every other column is
+            // ON CONFLICT (thought_id) DO UPDATE — v1.6.3 honors
+            // caller-supplied created_at on UPDATE so test scaffolding
+            // can backdate rows (mirrors cirisgraph_upsert_node's
+            // v1.3.1/#49 behavior). Every other mutable column is
             // updated from the new row.
             tx.execute(
                 "INSERT INTO cirislens_thoughts (\
@@ -209,6 +211,7 @@ impl ThoughtService for SqliteThoughtBackend {
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
                            ?15) \
                  ON CONFLICT(thought_id) DO UPDATE SET \
+                    created_at = excluded.created_at, \
                     source_task_id = excluded.source_task_id, \
                     channel_id = excluded.channel_id, \
                     thought_type = excluded.thought_type, \
@@ -595,6 +598,27 @@ mod tests {
         assert_eq!(got.parent_thought_id, t.parent_thought_id);
         assert_eq!(got.final_action, t.final_action);
         assert_eq!(got.agent_occurrence_id, t.agent_occurrence_id);
+    }
+
+    /// v1.6.3 (CIRISPersist#71) — thought_upsert honors caller-supplied
+    /// `created_at` on UPDATE (mirrors the task_upsert fix; sibling
+    /// substrate gets the same treatment so test-scaffolding
+    /// backdating works uniformly).
+    #[tokio::test]
+    async fn thought_upsert_honors_supplied_created_at_on_update() {
+        let (_b, tasks, thoughts) = fresh_backend().await;
+        let task_id = format!("t-{}", Uuid::new_v4().simple());
+        tasks.upsert_task(mk_task(&task_id, "occ-1")).await.unwrap();
+        let id = format!("th-{}", Uuid::new_v4().simple());
+        let initial = mk_thought(&id, &task_id, ThoughtStatus::Pending, "occ-1");
+        thoughts.upsert_thought(initial.clone()).await.unwrap();
+
+        let mut backdated = initial.clone();
+        backdated.created_at = chrono::Utc::now() - chrono::Duration::hours(24);
+        thoughts.upsert_thought(backdated.clone()).await.unwrap();
+        let got = thoughts.get_thought(&id).await.unwrap().expect("present");
+        let drift = (got.created_at - backdated.created_at).num_seconds().abs();
+        assert!(drift <= 1, "created_at honored: drift {drift}s");
     }
 
     #[tokio::test]

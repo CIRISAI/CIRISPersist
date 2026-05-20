@@ -17,8 +17,13 @@ pub trait TaskService: Send + Sync {
     /// data is a no-op; re-insert with differing data overwrites
     /// mutable columns (description, channel_id, status, priority,
     /// context, outcome, retry_count, signature triple,
-    /// updated_info_*, images) while preserving `created_at` from the
-    /// original row.
+    /// updated_info_*, images).
+    ///
+    /// **v1.6.3 (CIRISPersist#71)** — `created_at` is **honored**
+    /// from the caller's payload on UPDATE (was: preserved from
+    /// the original row). Matches cirisgraph_upsert_node's
+    /// v1.3.1 / #49 behavior and unblocks test-scaffolding patterns
+    /// that backdate rows to exercise stale-task code paths.
     ///
     /// # Correlation-id dedup (v1.5.22, CIRISPersist#61)
     ///

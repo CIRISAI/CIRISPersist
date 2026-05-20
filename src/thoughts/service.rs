@@ -15,8 +15,11 @@ pub trait ThoughtService: Send + Sync {
     /// same data is a no-op; re-insert with differing data overwrites
     /// mutable columns (status, content, channel_id, thought_type,
     /// round_number, context, thought_depth, ponder_notes,
-    /// final_action, parent_thought_id, agent_occurrence_id) while
-    /// preserving `created_at` from the original row.
+    /// final_action, parent_thought_id, agent_occurrence_id).
+    ///
+    /// **v1.6.3 (CIRISPersist#71)** — `created_at` is **honored**
+    /// from the caller's payload on UPDATE (was: preserved from the
+    /// original row). Sibling to the v1.6.3 task_upsert fix.
     fn upsert_thought(&self, thought: Thought) -> impl Future<Output = Result<(), Error>> + Send;
 
     /// Read one thought by id. Returns `None` if no matching row.

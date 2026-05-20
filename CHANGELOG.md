@@ -5,6 +5,66 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.6.3] — 2026-05-19
+
+**`task_upsert` + `thought_upsert` honor caller-supplied `created_at`
+on UPDATE (CIRISPersist#71).**
+
+Closes the inconsistency between cirisgraph_upsert_node (which has
+honored supplied `created_at` since v1.3.1 / CIRISPersist#49) and
+the tasks/thoughts substrates absorbed in v1.5.9 / v1.5.10 (which
+were preserving the original `created_at` across re-upsert).
+
+Unblocks CIRISAgent 2.9.0's test scaffolding for stale-task code
+paths in `try_claim_shared_task` — the agent's
+`_backdate_task_created_at` helper now works against persist as
+expected. Three previously-skipped tests
+(`test_get_shared_task_status_outside_window`,
+`test_try_claim_shared_task_deletes_old_active_task`,
+`test_try_claim_shared_task_datum_bug_scenario`) become unblocked.
+
+### SQL changes
+
+- `cirislens.tasks` ON CONFLICT(task_id) DO UPDATE — added
+  `created_at = EXCLUDED.created_at` (PG) /
+  `created_at = excluded.created_at` (SQLite).
+- `cirislens.thoughts` ON CONFLICT(thought_id) DO UPDATE — same
+  addition.
+
+### Tests
+
+4 new (2 SQLite + 2 PG-gated) — each backdates a row by 24h via
+re-upsert and asserts `get` returns the backdated value within 1s
+drift. The existing
+`upsert_idempotent_same_payload_noop_diff_payload_overwrites`
+tests still pass — they re-upsert with the SAME `created_at`, so
+the assertion `got2.created_at == original_created` holds under
+either preserve-or-honor semantics.
+
+### Audit of other `*_upsert` surfaces
+
+Reviewed `tickets_upsert`, `scheduled_task_upsert`, `wa_cert_upsert`
+for the same gap. **Each has an explicit
+`upsert_idempotent_preserves_created_at` test** asserting the
+PRESERVE behavior as intentional (per the v1.5.13 / v1.5.12 /
+v1.5.19 substrate-design specs respectively — those substrates
+model domain entities whose `created` timestamp is genuinely
+immutable). Leaving them unchanged. If a future agent path needs
+backdating on one of those substrates we can extend with an opt-in
+flag per substrate; today none requires it.
+
+### Compatibility
+
+Behavioral change on the UPDATE path: callers that **relied on** the
+preserve semantics for tasks/thoughts (sending a stale `created_at`
+inadvertently and expecting persist to ignore it) will see their
+caller's value land. Audit your `*_upsert` callers if they
+construct the payload from a partial source where `created_at` may
+be wrong.
+
+No SQL migration. PyO3 / `.pyi` signatures unchanged — wire shape
+identical.
+
 ## [1.6.2] — 2026-05-19
 
 **TSDB non-metric summary types — task / conversation / trace / audit

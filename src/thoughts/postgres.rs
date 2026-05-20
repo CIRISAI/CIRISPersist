@@ -143,6 +143,7 @@ impl ThoughtService for PostgresBackend {
                  ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
                            $15) \
                  ON CONFLICT (thought_id) DO UPDATE SET \
+                    created_at = EXCLUDED.created_at, \
                     source_task_id = EXCLUDED.source_task_id, \
                     channel_id = EXCLUDED.channel_id, \
                     thought_type = EXCLUDED.thought_type, \
@@ -547,6 +548,35 @@ mod tests {
         assert_eq!(got2.content, "second");
         assert_eq!(got2.status, ThoughtStatus::Processing);
         assert_eq!(got2.created_at, original_created);
+    }
+
+    /// v1.6.3 (CIRISPersist#71) — thought_upsert honors caller-supplied
+    /// `created_at` on UPDATE.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn thoughts_pg_upsert_honors_supplied_created_at_on_update() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let task_id = format!("t-{}", Uuid::new_v4().simple());
+        TaskService::upsert_task(&backend, mk_task(&task_id, "occ-1"))
+            .await
+            .unwrap();
+        let id = format!("th-{}", Uuid::new_v4().simple());
+        let initial = mk_thought(&id, &task_id, ThoughtStatus::Pending, "occ-1");
+        backend.upsert_thought(initial.clone()).await.unwrap();
+
+        let mut backdated = initial.clone();
+        backdated.created_at = chrono::Utc::now() - chrono::Duration::hours(24);
+        backend.upsert_thought(backdated.clone()).await.unwrap();
+        let got = backend.get_thought(&id).await.unwrap().expect("present");
+        let drift = (got.created_at - backdated.created_at).num_seconds().abs();
+        assert!(drift <= 1, "created_at honored: drift {drift}s");
     }
 
     #[tokio::test]

@@ -250,6 +250,7 @@ impl TaskService for SqliteTaskBackend {
                     description = excluded.description, \
                     status = excluded.status, \
                     priority = excluded.priority, \
+                    created_at = excluded.created_at, \
                     updated_at = excluded.updated_at, \
                     parent_task_id = excluded.parent_task_id, \
                     context_json = excluded.context_json, \
@@ -726,7 +727,32 @@ mod tests {
         assert_eq!(got2.status, TaskStatus::Active);
         assert_eq!(
             got2.created_at, original_created,
-            "created_at preserved across overwrites"
+            "created_at preserved when caller supplies the same value"
+        );
+    }
+
+    /// v1.6.3 (CIRISPersist#71) — task_upsert honors caller-supplied
+    /// `created_at` on UPDATE (was: preserved original). Backs the
+    /// agent's test-scaffolding pattern that backdates rows to
+    /// exercise stale-task code paths in `try_claim_shared_task`.
+    #[tokio::test]
+    async fn upsert_honors_supplied_created_at_on_update() {
+        let (_b, svc) = fresh_backend().await;
+        let id = format!("t-{}", Uuid::new_v4().simple());
+        let initial = mk_task(&id, TaskStatus::Pending, "occ-1");
+        svc.upsert_task(initial.clone()).await.unwrap();
+
+        // Re-upsert with an EARLIER created_at — should win.
+        let mut backdated = initial.clone();
+        backdated.created_at = chrono::Utc::now() - chrono::Duration::hours(24);
+        svc.upsert_task(backdated.clone()).await.unwrap();
+        let got = svc.get_task(&id).await.unwrap().expect("present");
+        let drift = (got.created_at - backdated.created_at).num_seconds().abs();
+        assert!(
+            drift <= 1,
+            "created_at honored: expected ~{}, got {} (drift {drift}s)",
+            backdated.created_at,
+            got.created_at
         );
     }
 
