@@ -966,6 +966,38 @@ class Engine:
         revoked, ``None`` otherwise. Backed by the PRIMARY KEY index.
         """
 
+    # ── v1.7.1 (CIRISPersist#83) — identity-sequence substrate ──────
+
+    def next_sequence(self, identity: str, stream: str) -> int:
+        """v1.7.1 (CIRISPersist#83) — Atomically bump and return the
+        next monotonic value for ``(identity, stream)``.
+
+        First call for a pair returns 1, then 2, 3, … Durable,
+        monotonic, and correct under concurrent callers.
+
+        A CIRIS 3.0 runtime holds exactly one Ed25519 identity, and
+        every in-process consumer (agent, NodeCore, LensCore) plus
+        every agent occurrence signs with that one key. Anything
+        emitting *ordered* signed output (e.g. NodeCore
+        network-message sequence numbers) needs a counter atomic
+        across all of those signers — otherwise two occurrences both
+        emit seq N and the signed stream forks. This is that
+        counter. The bump is a single atomic
+        ``INSERT ... ON CONFLICT DO UPDATE ... RETURNING``.
+
+        ``identity`` and ``stream`` must both be non-empty. The
+        ``stream`` namespaces independent counters under one
+        identity (e.g. one stream per signed output kind).
+        """
+
+    def peek_sequence(self, identity: str, stream: str) -> int:
+        """v1.7.1 (CIRISPersist#83) — Read the last-issued value for
+        ``(identity, stream)`` WITHOUT bumping it.
+
+        Returns ``0`` if the pair has never been issued. ``identity``
+        and ``stream`` must both be non-empty.
+        """
+
     # ── v1.6.4 (CIRISPersist#70) — A0a legacy-graph migration ───────
 
     def run_legacy_graph_migration(self, options_json: str) -> str:

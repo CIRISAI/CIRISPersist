@@ -79,6 +79,8 @@ pub mod schema;
 pub mod scrub;
 #[cfg(feature = "secrets")]
 pub mod secrets;
+#[cfg(feature = "cirislens_sequence")]
+pub mod sequence;
 #[cfg(feature = "server")]
 pub mod server;
 #[cfg(feature = "cirislens_service_token_revocation")]

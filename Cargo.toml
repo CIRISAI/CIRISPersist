@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "1.7.0"
+version = "1.7.1"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -358,6 +358,20 @@ cirislens_wa_cert = []
 # (point-lookup, returns Option). No FKs, no JSONB. Threat model
 # AV-15.
 cirislens_service_token_revocation = []
+
+# v1.7.1 (CIRISPersist#83) — atomic per-identity monotonic sequence
+# primitive for the CIRIS 3.0 in-process cohabitation model. A CIRIS
+# runtime holds one Ed25519 identity; every in-process consumer
+# (agent, NodeCore, LensCore) and every agent occurrence signs with
+# it. Anything emitting ordered signed output (NodeCore
+# network-message sequence numbers) needs a counter atomic across
+# all of them, else the signed stream forks. One row per
+# (identity, stream); next_sequence is a single-statement
+# INSERT ... ON CONFLICT DO UPDATE ... RETURNING. Trait:
+# next_sequence (atomic bump-and-return, first call → 1),
+# peek_sequence (read last-issued without bumping, 0 on cold pair).
+# No FKs, no JSONB. Threat model AV-15.
+cirislens_sequence = []
 
 # v1.6.4 (CIRISPersist#70) — A0a legacy-graph migration absorption.
 # LAST raw-SQL gap in CIRISAgent 2.9.0. Absorbs the agent-side

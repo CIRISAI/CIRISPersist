@@ -12186,6 +12186,94 @@ impl PyEngine {
         })
     }
 
+    // ── v1.7.1 (CIRISPersist#83) — identity-sequence substrate ───
+    //
+    // Atomic per-identity monotonic counters. A CIRIS 3.0 runtime
+    // holds one Ed25519 identity; every in-process consumer (agent,
+    // NodeCore, LensCore) and every agent occurrence signs with it.
+    // Anything emitting ordered signed output needs a counter
+    // atomic across all of them, else the signed stream forks.
+    // The bump is a single atomic UPSERT ... RETURNING.
+
+    /// v1.7.1 — Atomically bump and return the next monotonic value
+    /// for `(identity, stream)`.
+    ///
+    /// First call for a pair returns 1, then 2, 3, … Durable,
+    /// monotonic, correct under concurrent callers across
+    /// occurrences + in-process consumers sharing one Ed25519
+    /// identity.
+    #[cfg(feature = "cirislens_sequence")]
+    fn next_sequence(&self, py: Python<'_>, identity: &str, stream: &str) -> PyResult<u64> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let identity = identity.to_owned();
+            let stream = stream.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::sequence::SequenceService;
+                        backend
+                            .next_sequence(&identity, &stream)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::sequence::sqlite::SqliteSequenceBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::sequence::SequenceService;
+                        backend
+                            .next_sequence(&identity, &stream)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.7.1 — Read the last-issued value WITHOUT bumping.
+    ///
+    /// Returns 0 if the `(identity, stream)` pair has never been
+    /// issued.
+    #[cfg(feature = "cirislens_sequence")]
+    fn peek_sequence(&self, py: Python<'_>, identity: &str, stream: &str) -> PyResult<u64> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let identity = identity.to_owned();
+            let stream = stream.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::sequence::SequenceService;
+                        backend
+                            .peek_sequence(&identity, &stream)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::sequence::sqlite::SqliteSequenceBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::sequence::SequenceService;
+                        backend
+                            .peek_sequence(&identity, &stream)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
     // ── v1.6.4 (CIRISPersist#70) legacy-graph migration ──────────
     //
     // Absorbs the agent-side `tools/ops/migrate_to_persist.py`

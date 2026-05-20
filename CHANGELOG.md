@@ -5,6 +5,53 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.7.1] — 2026-05-20
+
+**Atomic per-identity monotonic sequence primitive (CIRISPersist#83).**
+
+Second CIRIS 3.0 enabler cut. A CIRIS runtime holds one Ed25519
+identity (PoB §3.2 one-key-three-roles); every in-process consumer
+(agent, NodeCore, LensCore) and every occurrence signs with it.
+Anything emitting *ordered* signed output — NodeCore network-message
+sequence numbers — needs a counter atomic across all of them, or
+two occurrences both emit seq N and the signed stream forks.
+
+### New `sequence` substrate
+
+`SequenceService` — two methods:
+
+- `next_sequence(identity, stream) -> u64` — atomically bump and
+  return the next value for `(identity, stream)`. First call → 1,
+  then 2, 3, … One `INSERT … ON CONFLICT (identity, stream) DO
+  UPDATE SET next_value = next_value + 1 … RETURNING next_value` —
+  a single atomic statement, correct under concurrent callers
+  across occurrences + in-process consumers.
+- `peek_sequence(identity, stream) -> u64` — read the last-issued
+  value without bumping; 0 if the pair was never issued.
+
+`(identity, stream)` keying: one identity runs many independent
+ordered streams (one per message channel / signed-output kind);
+the counters never interfere.
+
+### V038 migration (both backends)
+
+`identity_sequences(identity, stream, next_value, updated_at,
+PRIMARY KEY(identity, stream))`. Feature flag `cirislens_sequence`.
+
+### PyO3 + .pyi
+
+`Engine.next_sequence(identity, stream) -> int` /
+`Engine.peek_sequence(identity, stream) -> int`, gated on
+`cirislens_sequence`, both behind the v1.6.8 `ensure_usable` guard.
+
+### Tests
+
+13 (PG + SQLite): increments 1→2→3; streams under one identity are
+independent; identities are independent; `peek` returns 0 then the
+last value without bumping; empty identity/stream → `InvalidArgument`;
+**20-way concurrent `next_sequence` yields exactly the set {1..=20}
+with no duplicates** — the atomicity proof.
+
 ## [1.7.0] — 2026-05-20
 
 **In-process cohabitation foundation — `engine_handle()` + consumer
