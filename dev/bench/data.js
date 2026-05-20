@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779320387528,
+  "lastUpdate": 1779320703054,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -20675,6 +20675,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23727166,
             "range": "± 256855",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "6c2d9b56135091e84154408b7a4e91ee8794b5d8",
+          "message": "1.7.2 — re-export engine-lifecycle exceptions from the Python package\n\nv1.6.8 added EngineConfigMismatch / EngineClosed / EngineUsedAcrossFork\nto the Rust extension module + registered them via m.add(...), but\npython/ciris_persist/__init__.py carries an explicit\n`from .ciris_persist import (...)` list + __all__ (not a wildcard)\nand that list wasn't updated. `import ciris_persist;\nciris_persist.EngineConfigMismatch` resolves through __init__.py →\nAttributeError.\n\nThe v1.6.8 test_engine_lifecycle_exceptions_exported pytest case\ncaught it — CI's pytest job failed, which gates Publish wheel to\nPyPI. v1.6.8, v1.7.0, and v1.7.1 all built green but never\npublished (the gap rode along in each).\n\nFix: the three exception names added to the __init__.py from-import\nblock + __all__. Pure-Python one-liner; the Rust side was correct\nsince v1.6.8.\n\ncargo builds + the pre-push hook never caught this — they exercise\nthe extension module directly, not the __init__.py wrapper; only\n`pytest tests/python/` (which does `import ciris_persist`) goes\nthrough the wrapper.\n\nv1.7.2 carries everything in v1.6.8 + v1.7.0 + v1.7.1 (singleton\nlifecycle, engine_handle, consumer registry, sequence primitive) —\nthe first publishable release of that line; the version the\nfederation should pin.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-20T18:36:57-05:00",
+          "tree_id": "59ae3235f2a9f2c21508fbdf6779ed9c412f96cb",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/6c2d9b56135091e84154408b7a4e91ee8794b5d8"
+        },
+        "date": 1779320701930,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 116855,
+            "range": "± 1167",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 267236,
+            "range": "± 1127",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 566381,
+            "range": "± 2792",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1996882,
+            "range": "± 5232",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 358,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1405,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7182,
+            "range": "± 27",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23193,
+            "range": "± 37",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26428,
+            "range": "± 47",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91133,
+            "range": "± 2708",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 354,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3123,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9702,
+            "range": "± 62",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41716,
+            "range": "± 224",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2253263,
+            "range": "± 70257",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7039059,
+            "range": "± 59955",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25788447,
+            "range": "± 88602",
             "unit": "ns/iter"
           }
         ]
