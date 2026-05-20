@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779305286359,
+  "lastUpdate": 1779319484480,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -20279,6 +20279,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23902219,
             "range": "± 315906",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "e5e8ed9303a2482ef909e13e888e8f6fc010896f",
+          "message": "1.6.8 — Engine process-singleton + lifecycle (closes #75 #76 #77 #78)\n\n2.9.0 ship gate. Pre-v1.6.8 every Engine(...) built its own\nmulti-thread tokio runtime — two Engines in one process → two\nruntimes contending on the shared DB → the 39-minute deadlock the\nCIRISAgent 2.9.0 auth suite hit. The CIRIS 3.0 in-process model\n(agent + NodeCore + LensCore each consuming persist) made this a\nhard blocker.\n\n#75 — process-singleton. Runtime + backend pool + signer state live\nin one process-global EngineCell, built exactly once, guarded by\nOnceLock<Mutex<..>>. The global lock is held for the whole\nconstructor — no check-then-init race, two threads cannot both run\nRuntime::new(). Second same-config Engine(...) returns a cheap\nhandle cloned from the singleton.\n\n#76 — second Engine(...) with a different config fingerprint\n(DSN + signing-key-id + local key ids) raises typed\nEngineConfigMismatch. Silent rebind would corrupt data.\n\n#77 — Engine.close() flips the singleton's shared closed flag and\nclears the global slot so a later Engine(...) rebuilds. Idempotent.\nNew is_closed getter. Use-after-close raises typed EngineClosed.\nLifecycle rule: one owner constructs+closes; adapters attach/detach.\n\n#78 — every method records the construction pid; a calling-pid\nmismatch (process forked) raises typed EngineUsedAcrossFork instead\nof deadlocking on a runtime whose worker threads don't exist in the\nchild.\n\nensure_usable() (closed-check + fork-check) runs as the first\nstatement of all 214 Engine methods that touch the runtime/pool;\npure local-read accessors exempt.\n\nThree new create_exception! classes (EngineConfigMismatch,\nEngineClosed, EngineUsedAcrossFork) all derive from PersistError,\nregistered + exported.\n\ndocs/COHABITATION.md gains an in-process-cohabitation section (the\ndoc previously covered only multi-process keyring-flock\ncohabitation). .pyi documents the singleton contract + close/\nis_closed.\n\nTests: Rust unit test for engine_config_fingerprint (every config\nfield distinguished, NUL-separated so boundaries can't alias);\nPython tests for the 3 lifecycle exceptions + Engine.close/is_closed\nsurface. Singleton/close/fork behavior is exercised end-to-end by\nthe CIRISAgent 2.9.0 suite (which surfaced #75) — a Rust test can't\ncleanly exercise a process-global under cargo's shared-process test\nrunner.\n\nDrive-by: module-level allow(clippy::type_complexity) on\ncirisnode/sqlite.rs (pre-existing clippy-1.95 lint, same call as\nsecrets/sqlite.rs).\n\nPython Engine(...) API unchanged for the single-consumer case.\nNo SQL migration. No wire-format change.\n\ncloses #75\ncloses #76\ncloses #77\ncloses #78\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-20T18:16:54-05:00",
+          "tree_id": "de02341a4c8e76a5a22aaea1132c6d41f4289f09",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/e5e8ed9303a2482ef909e13e888e8f6fc010896f"
+        },
+        "date": 1779319483798,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101647,
+            "range": "± 530",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 241087,
+            "range": "± 825",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 521554,
+            "range": "± 5734",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1848481,
+            "range": "± 16032",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 352,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1409,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7335,
+            "range": "± 44",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21196,
+            "range": "± 64",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24249,
+            "range": "± 175",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83543,
+            "range": "± 132",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 373,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3163,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9405,
+            "range": "± 237",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41592,
+            "range": "± 126",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2373605,
+            "range": "± 92428",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6750263,
+            "range": "± 275968",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23614969,
+            "range": "± 714621",
             "unit": "ns/iter"
           }
         ]
