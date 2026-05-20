@@ -440,10 +440,21 @@ impl LegacyMigrationService for SqliteLegacyMigrationBackend {
                     continue;
                 }
 
+                // CIRISPersist#73 — map the legacy `text` edge_id to
+                // the canonical UUID. Applied on SQLite too (even
+                // though SQLite's edge_id column is untyped TEXT) so
+                // the same legacy DB migrates to byte-identical
+                // edge_ids on both backends. Used for the
+                // already-present check + the upsert.
+                let edge_id = super::canonical_edge_uuid(&row.edge_id);
+
                 let scope = match normalize_scope_str(&row.scope_raw) {
                     Ok(s) => s,
                     Err(e) => {
                         stats.errors += 1;
+                        if stats.first_error_message.is_none() {
+                            stats.first_error_message = Some(format!("edge scope normalize: {e}"));
+                        }
                         tracing::warn!(edge_id = %row.edge_id, error = %e, "edge scope normalize failed");
                         if stats.errors as u64 >= stop_at {
                             break;
@@ -460,7 +471,7 @@ impl LegacyMigrationService for SqliteLegacyMigrationBackend {
                     continue;
                 }
 
-                if present_edges.contains(&row.edge_id) {
+                if present_edges.contains(&edge_id) {
                     stats.edges_skipped_already_present += 1;
                     continue;
                 }
@@ -469,6 +480,9 @@ impl LegacyMigrationService for SqliteLegacyMigrationBackend {
                     Ok(v) => v,
                     Err(e) => {
                         stats.errors += 1;
+                        if stats.first_error_message.is_none() {
+                            stats.first_error_message = Some(format!("edge attributes parse: {e}"));
+                        }
                         tracing::warn!(edge_id = %row.edge_id, error = %e, "edge attributes parse failed");
                         if stats.errors as u64 >= stop_at {
                             break;
@@ -481,6 +495,9 @@ impl LegacyMigrationService for SqliteLegacyMigrationBackend {
                     Ok(dt) => dt,
                     Err(e) => {
                         stats.errors += 1;
+                        if stats.first_error_message.is_none() {
+                            stats.first_error_message = Some(format!("edge created_at parse: {e}"));
+                        }
                         tracing::warn!(edge_id = %row.edge_id, error = %e, "edge created_at parse failed");
                         if stats.errors as u64 >= stop_at {
                             break;
@@ -490,7 +507,7 @@ impl LegacyMigrationService for SqliteLegacyMigrationBackend {
                 };
 
                 let edge = graph::GraphEdge {
-                    edge_id: row.edge_id.clone(),
+                    edge_id: edge_id.clone(),
                     source_node_id: row.source_node_id,
                     target_node_id: row.target_node_id,
                     scope,
@@ -510,6 +527,10 @@ impl LegacyMigrationService for SqliteLegacyMigrationBackend {
                     }
                     Err(e) => {
                         stats.errors += 1;
+                        if stats.first_error_message.is_none() {
+                            stats.first_error_message =
+                                Some(format!("edge upsert ({}): {e}", row.edge_id));
+                        }
                         tracing::warn!(edge_id = %row.edge_id, error = %e, "legacy edge upsert failed");
                         if stats.errors as u64 >= stop_at {
                             break;
@@ -790,5 +811,48 @@ mod tests {
         };
         let r = svc.run_legacy_graph_migration(opts).await;
         assert!(matches!(r, Err(Error::InvalidArgument(_))));
+    }
+
+    /// CIRISPersist#73 — non-UUID legacy edge_id is mapped to the
+    /// deterministic UUIDv5 (same treatment as PG, for cross-backend
+    /// parity). SQLite's edge_id column is untyped TEXT so the raw
+    /// value would "work" — but persist applies the mapping anyway
+    /// so a legacy DB migrates to byte-identical edge_ids on either
+    /// backend.
+    #[tokio::test]
+    async fn non_uuid_legacy_edge_id_mapped_to_uuid() {
+        let (sqlite, svc) = fresh_backend().await;
+        ensure_legacy_tables(&sqlite).await;
+        seed_node(&sqlite, "n1", "local", serde_json::json!({})).await;
+        seed_node(&sqlite, "n2", "local", serde_json::json!({})).await;
+        // Plain-text edge_id — the #73 scoutdb shape.
+        seed_edge(&sqlite, "edge-plain-1", "n1", "n2", "local").await;
+
+        let stats = svc
+            .run_legacy_graph_migration(LegacyMigrationOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            stats.errors, 0,
+            "non-UUID edge_id must not error: {stats:?}"
+        );
+        assert_eq!(stats.edges_written, 1, "{stats:?}");
+
+        // The edge is stored under the canonical UUIDv5, not 'edge-plain-1'.
+        let canonical = super::super::canonical_edge_uuid("edge-plain-1");
+        assert!(canonical.parse::<Uuid>().is_ok());
+        assert_ne!(canonical, "edge-plain-1");
+
+        // Re-run is idempotent — deterministic v5 means the second
+        // pass sees the edge already present.
+        let rerun = svc
+            .run_legacy_graph_migration(LegacyMigrationOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(rerun.edges_written, 0, "re-run writes nothing: {rerun:?}");
+        assert_eq!(
+            rerun.edges_skipped_already_present, 1,
+            "re-run skips the migrated edge: {rerun:?}"
+        );
     }
 }

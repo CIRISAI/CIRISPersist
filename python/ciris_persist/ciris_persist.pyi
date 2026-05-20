@@ -933,6 +933,14 @@ class Engine:
         versions errored on every node against a real legacy
         Postgres database.
 
+        v1.6.6 (CIRISPersist#73): legacy ``graph_edges.edge_id`` is
+        arbitrary ``text``, but ``cirisgraph.edges.edge_id`` is a
+        ``uuid`` column. Non-UUID legacy edge ids are now mapped to
+        a deterministic UUIDv5 (valid-UUID ids pass through
+        verbatim) — applied on both backends so a legacy DB migrates
+        to identical edge ids regardless of target. Earlier versions
+        errored on every non-UUID edge.
+
         Per-row decision tree:
 
         - Lowercase legacy scope values are normalized to UPPERCASE

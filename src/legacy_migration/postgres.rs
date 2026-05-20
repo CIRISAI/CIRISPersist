@@ -461,10 +461,13 @@ async fn migrate_edges(
     for row in &rows {
         stats.edges_read += 1;
 
-        let edge_id: String = match row.try_get("edge_id") {
+        let legacy_edge_id: String = match row.try_get("edge_id") {
             Ok(v) => v,
             Err(e) => {
                 stats.errors += 1;
+                if stats.first_error_message.is_none() {
+                    stats.first_error_message = Some(format!("edge_id decode: {e}"));
+                }
                 tracing::warn!(error = %e, "legacy edge_id decode failed");
                 if stats.errors as u64 >= stop_at {
                     break;
@@ -472,6 +475,11 @@ async fn migrate_edges(
                 continue;
             }
         };
+        // CIRISPersist#73 — map the legacy `text` edge_id to the
+        // canonical UUID the modern `uuid`-typed column requires.
+        // Used for BOTH the already-present check and the upsert so
+        // re-runs correctly detect "already migrated".
+        let edge_id = super::canonical_edge_uuid(&legacy_edge_id);
 
         if options.dry_run {
             continue;
@@ -589,6 +597,8 @@ async fn migrate_edges(
             };
 
         let edge = graph::GraphEdge {
+            // `edge_id` is already the #73 canonical UUID (mapped
+            // right after decode, above).
             edge_id: edge_id.clone(),
             source_node_id: source,
             target_node_id: target,
@@ -615,6 +625,10 @@ async fn migrate_edges(
             }
             Err(e) => {
                 stats.errors += 1;
+                if stats.first_error_message.is_none() {
+                    stats.first_error_message =
+                        Some(format!("edge upsert ({legacy_edge_id}): {e}"));
+                }
                 tracing::warn!(edge_id = %edge_id, error = %e, "legacy edge upsert failed");
                 if stats.errors as u64 >= stop_at {
                     break;
@@ -1120,5 +1134,100 @@ mod tests {
         assert_eq!(d.to_rfc3339(), "2026-01-21T20:07:17.391754+00:00");
         // Garbage rejects.
         assert!(parse_legacy_timestamp("not-a-timestamp").is_err());
+    }
+
+    /// CIRISPersist#73 — legacy `graph_edges.edge_id` is arbitrary
+    /// `text`; `cirisgraph.edges.edge_id` is PG-typed `uuid`. A
+    /// non-UUID legacy edge_id (`'e1'`-style — the scoutdb shape)
+    /// must migrate via the deterministic UUIDv5 mapping. Pre-fix
+    /// every such edge errored at `upsert_edge`'s UUID parse.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn non_uuid_legacy_edge_id_migrates_via_uuid_mapping() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        ensure_legacy_tables(&backend).await;
+
+        let prefix = unique_prefix();
+        cleanup_legacy(&backend, &prefix).await;
+
+        let n1 = format!("{prefix}n1");
+        let n2 = format!("{prefix}n2");
+        seed_node(&backend, &n1, "local", serde_json::json!({})).await;
+        seed_node(&backend, &n2, "local", serde_json::json!({})).await;
+        // Plain-text edge_id — NOT a UUID. This is the #73 case.
+        let legacy_edge_id = format!("{prefix}edge-plain-1");
+        seed_edge(&backend, &legacy_edge_id, &n1, &n2, "local").await;
+
+        let stats = backend
+            .run_legacy_graph_migration(LegacyMigrationOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            stats.errors, 0,
+            "non-UUID edge_id must not error, got {stats:?}"
+        );
+        assert!(stats.edges_written >= 1, "edge must migrate, got {stats:?}");
+
+        // The edge landed under the deterministic UUIDv5 derivation.
+        let canonical = super::super::canonical_edge_uuid(&legacy_edge_id);
+        let canonical_uuid: Uuid = canonical
+            .parse()
+            .expect("canonical id must be a valid UUID");
+        let client = backend.pool().get().await.unwrap();
+        let found = client
+            .query_one(
+                "SELECT COUNT(*)::BIGINT FROM cirisgraph.edges WHERE edge_id = $1",
+                &[&canonical_uuid],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            found.get::<_, i64>(0),
+            1,
+            "edge present under canonical UUID"
+        );
+
+        // Re-run is idempotent — the canonical id is deterministic so
+        // the second pass detects already-present.
+        let rerun = backend
+            .run_legacy_graph_migration(LegacyMigrationOptions::default())
+            .await
+            .unwrap();
+        assert!(
+            rerun.edges_skipped_already_present >= 1,
+            "re-run must skip the already-migrated edge, got {rerun:?}"
+        );
+        assert_eq!(rerun.edges_written, 0, "re-run writes nothing new");
+
+        cleanup_legacy(&backend, &prefix).await;
+        let _ = client
+            .execute(
+                "DELETE FROM cirisgraph.edges WHERE edge_id = $1",
+                &[&canonical_uuid],
+            )
+            .await;
+    }
+
+    /// CIRISPersist#73 — `canonical_edge_uuid` helper coverage.
+    #[test]
+    fn canonical_edge_uuid_maps_text_keeps_uuid() {
+        // A valid UUID passes through verbatim (lowercased).
+        let u = Uuid::new_v4().to_string();
+        assert_eq!(super::super::canonical_edge_uuid(&u), u);
+        // A non-UUID derives a stable v5 — deterministic across calls.
+        let a = super::super::canonical_edge_uuid("e1");
+        let b = super::super::canonical_edge_uuid("e1");
+        assert_eq!(a, b, "v5 derivation is deterministic");
+        assert!(a.parse::<Uuid>().is_ok(), "derived value is a UUID");
+        // Distinct legacy ids never collide.
+        assert_ne!(
+            super::super::canonical_edge_uuid("e1"),
+            super::super::canonical_edge_uuid("e2")
+        );
     }
 }

@@ -5,6 +5,81 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.6.6] — 2026-05-20
+
+**Legacy edge migration maps non-UUID `edge_id` to a deterministic
+UUID (CIRISPersist#73).**
+
+v1.6.4's A0a absorption errored on **every edge** when the legacy
+`graph_edges.edge_id` is a plain string that isn't a valid UUID.
+Against the scoutdb dump: nodes migrated 114,184/114,184 (the
+v1.6.5 #72 timestamp fix works), but edges were 0/100, `errors:100`.
+
+#73 was filed as a timestamp issue ("edge read still binds
+created_at as timestamptz"). It wasn't — the v1.6.5 edge SELECT
+already casts `created_at::text` and parses via
+`parse_legacy_timestamp`. The actual root cause:
+
+- `cirisgraph.edges.edge_id` is PG-typed **`uuid`** (V013 schema).
+- The legacy 2.8.x `graph_edges.edge_id` is arbitrary **`text`**.
+- `GraphService::upsert_edge` parses `edge.edge_id` into
+  `uuid::Uuid` — a non-UUID legacy id (`'e1'`, scoutdb's
+  `metric_*`-style ids) fails with `InvalidArgument`.
+
+The v1.6.5 test masked it: `naive_timestamp_legacy_columns_migrate_ok`
+seeded the edge with `Uuid::new_v4().to_string()` — an already-valid
+UUID — so the upsert's parse never tripped.
+
+### Fix — `canonical_edge_uuid`
+
+New `legacy_migration::canonical_edge_uuid(legacy_id) -> String`:
+
+- If `legacy_id` already parses as a UUID → returned verbatim.
+- Otherwise → a deterministic **UUIDv5** under a fixed namespace
+  (`Uuid::NAMESPACE_OID`, legacy id as the name). v5 is a pure
+  hash of (namespace, name): re-running the migration derives the
+  *same* UUID, so the `ON CONFLICT (edge_id) DO NOTHING`
+  idempotency contract holds. Distinct legacy ids never collide.
+
+Applied **identically on PG and SQLite**. SQLite's `edge_id`
+column is untyped TEXT and would tolerate the raw legacy string —
+but mapping it the same way means a legacy DB migrates to
+byte-identical `edge_id`s regardless of target backend (closing the
+silent cross-backend divergence #73 also flagged). The mapped id
+is computed once, right after decode, and used for BOTH the
+already-present check and the upsert so re-run detection stays
+correct.
+
+### `first_error_message` now populated on edge paths
+
+#72's `LegacyMigrationStats.first_error_message` field existed but
+wasn't being set on the edge error sites — #73 noted the field was
+absent from the returned JSON. Now populated at every edge error
+path (edge_id decode, scope normalize, attributes parse, created_at
+parse, upsert failure) on both backends, alongside the existing
+node-path coverage.
+
+### Tests
+
+4 new (2 PG + 2 SQLite):
+- non-UUID legacy `edge_id` migrates with `errors == 0`; the edge
+  is found in `cirisgraph.edges` under the canonical UUIDv5;
+  re-run is idempotent (`edges_skipped_already_present`,
+  `edges_written == 0`).
+- `canonical_edge_uuid` unit coverage — valid UUID passes through,
+  non-UUID derives a stable v5, distinct ids don't collide.
+
+`uuid` crate gains the `v5` feature.
+
+### Compatibility
+
+The migrated `edge_id` for non-UUID legacy edges is the derived
+UUIDv5, not the original text. The legacy `edge_id` is a
+primary-key surrogate, not a federation-meaningful identifier — the
+edge's `(source, target, relationship)` tuple carries the
+semantics — so the remap is transparent. Re-running the migration
+is safe. No SQL migration. PyO3 signature unchanged.
+
 ## [1.6.5] — 2026-05-20
 
 **`run_legacy_graph_migration` handles `timestamp without time zone`

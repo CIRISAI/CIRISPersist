@@ -148,6 +148,41 @@ impl Error {
     }
 }
 
+/// Map a legacy `graph_edges.edge_id` (arbitrary `text` in the
+/// 2.8.x agent schema) to a canonical UUID string accepted by the
+/// modern `cirisgraph.edges` substrate, whose `edge_id` column is
+/// PG-typed `uuid` (CIRISPersist#73).
+///
+/// - If `legacy_id` already parses as a UUID, it's returned
+///   verbatim (lowercased hyphenated form) — no remapping for the
+///   well-formed case.
+/// - Otherwise a deterministic UUIDv5 is derived from `legacy_id`
+///   under a fixed namespace. v5 is a pure hash of (namespace,
+///   name): re-running the migration yields the *same* UUID, so
+///   the `ON CONFLICT (edge_id) DO NOTHING` idempotency contract
+///   still holds. Two distinct legacy edge_ids never collide.
+///
+/// Without this, `GraphService::upsert_edge` rejects every
+/// non-UUID legacy edge_id with `InvalidArgument` (`upsert_edge`
+/// parses `edge_id` into `uuid::Uuid`) — the failure mode #73
+/// reported (scoutdb: 100/100 edges errored, all `edge_id` plain
+/// text like `'e1'`).
+///
+/// Applied identically on PG and SQLite so the same legacy DB
+/// migrates to byte-identical `edge_id`s regardless of target
+/// backend (SQLite's `edge_id` is untyped TEXT and would otherwise
+/// keep the raw legacy string — a silent cross-backend divergence).
+pub(crate) fn canonical_edge_uuid(legacy_id: &str) -> String {
+    if let Ok(parsed) = legacy_id.parse::<uuid::Uuid>() {
+        return parsed.to_string();
+    }
+    // Fixed namespace — `Uuid::new_v5` is SHA-1 over (ns, name);
+    // deterministic + collision-resistant across distinct names.
+    // NAMESPACE_OID is a stable built-in; the legacy edge_id is the
+    // name. Re-derivation on re-run is identical.
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, legacy_id.as_bytes()).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
