@@ -12274,6 +12274,202 @@ impl PyEngine {
         })
     }
 
+    // ── v1.7.3 (CIRISPersist#81) occurrence registry ─────────────
+    //
+    // First-class occurrence registration + liveness heartbeat.
+    // CIRISAgent previously inferred live occurrences by scanning
+    // recent task-row activity and dedup'ing agent_occurrence_id —
+    // an inference, not a registration, with no TTL and no clean
+    // shutdown vs crash signal. Under the one-key model (PoB §3.2)
+    // every occurrence of an agent signs with the same Ed25519
+    // identity, so occurrence churn is endpoint liveness under a
+    // stable identity. expires_at is TTL-based: a crashed occurrence
+    // ages out without a clean deregister.
+
+    /// v1.7.3 (CIRISPersist#81) — Register (or re-register) an
+    /// occurrence with a liveness TTL.
+    ///
+    /// Idempotent on `occurrence_id`: re-registering refreshes
+    /// `registered_at`, `last_heartbeat`, and `expires_at`.
+    /// `ttl_seconds` must be > 0; `expires_at = now + ttl_seconds`.
+    /// `metadata_json`, if provided, must be a JSON object/value.
+    #[cfg(feature = "cirislens_occurrence")]
+    fn register_occurrence(
+        &self,
+        py: Python<'_>,
+        occurrence_id: &str,
+        identity: &str,
+        ttl_seconds: i64,
+        metadata_json: Option<&str>,
+    ) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let occurrence_id = occurrence_id.to_owned();
+            let identity = identity.to_owned();
+            let metadata: Option<serde_json::Value> = match metadata_json {
+                None => None,
+                Some(s) => Some(serde_json::from_str(s).map_err(|e| {
+                    translate_error_kind(
+                        "occurrence_invalid_argument",
+                        format!("metadata_json: {e}"),
+                    )
+                })?),
+            };
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::occurrence::OccurrenceService;
+                        backend
+                            .register_occurrence(&occurrence_id, &identity, ttl_seconds, metadata)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::occurrence::sqlite::SqliteOccurrenceBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::occurrence::OccurrenceService;
+                        backend
+                            .register_occurrence(&occurrence_id, &identity, ttl_seconds, metadata)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.7.3 (CIRISPersist#81) — Bump `last_heartbeat` + `expires_at`
+    /// for an already-registered occurrence.
+    ///
+    /// Returns `False` if the `occurrence_id` is not in the registry
+    /// (a heartbeat for an unknown occurrence is a no-op, not an
+    /// error — the caller should `register_occurrence` first).
+    /// `ttl_seconds` must be > 0.
+    #[cfg(feature = "cirislens_occurrence")]
+    fn heartbeat_occurrence(
+        &self,
+        py: Python<'_>,
+        occurrence_id: &str,
+        ttl_seconds: i64,
+    ) -> PyResult<bool> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let occurrence_id = occurrence_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::occurrence::OccurrenceService;
+                        backend
+                            .heartbeat_occurrence(&occurrence_id, ttl_seconds)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::occurrence::sqlite::SqliteOccurrenceBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::occurrence::OccurrenceService;
+                        backend
+                            .heartbeat_occurrence(&occurrence_id, ttl_seconds)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.7.3 (CIRISPersist#81) — Clean shutdown: remove the
+    /// occurrence row immediately, don't wait for TTL expiry.
+    ///
+    /// Returns `True` if a row was removed, `False` if it wasn't
+    /// registered. Idempotent.
+    #[cfg(feature = "cirislens_occurrence")]
+    fn deregister_occurrence(&self, py: Python<'_>, occurrence_id: &str) -> PyResult<bool> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let occurrence_id = occurrence_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::occurrence::OccurrenceService;
+                        backend
+                            .deregister_occurrence(&occurrence_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::occurrence::sqlite::SqliteOccurrenceBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::occurrence::OccurrenceService;
+                        backend
+                            .deregister_occurrence(&occurrence_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    /// v1.7.3 (CIRISPersist#81) — List currently-live occurrences for
+    /// `identity` (rows whose `expires_at > now`).
+    ///
+    /// Returns a JSON-encoded array of `OccurrenceRecord`, ordered by
+    /// `occurrence_id` ASC. Expired rows are filtered out (not
+    /// deleted — read-only). All occurrences of one agent share a
+    /// single Ed25519 identity; this is endpoint liveness under that
+    /// stable identity.
+    #[cfg(feature = "cirislens_occurrence")]
+    fn list_live_occurrences(&self, py: Python<'_>, identity: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let identity = identity.to_owned();
+            let records = py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::occurrence::OccurrenceService;
+                        backend
+                            .list_live_occurrences(&identity)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::occurrence::sqlite::SqliteOccurrenceBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::occurrence::OccurrenceService;
+                        backend
+                            .list_live_occurrences(&identity)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })?;
+            serde_json::to_string(&records).map_err(|e| {
+                translate_error_kind("occurrence_internal", format!("encode records: {e}"))
+            })
+        })
+    }
+
     // ── v1.6.4 (CIRISPersist#70) legacy-graph migration ──────────
     //
     // Absorbs the agent-side `tools/ops/migrate_to_persist.py`

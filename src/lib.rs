@@ -68,6 +68,8 @@ pub mod maintenance;
 #[cfg(feature = "cirislens_maintenance_locks")]
 pub mod maintenance_locks;
 pub mod manifest;
+#[cfg(feature = "cirislens_occurrence")]
+pub mod occurrence;
 pub mod outbound;
 pub mod pipeline;
 pub mod prelude;

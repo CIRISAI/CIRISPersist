@@ -5,6 +5,62 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.7.3] — 2026-05-20
+
+**First-class occurrence registration + liveness heartbeat
+(CIRISPersist#81).**
+
+Third CIRIS 3.0 enabler cut. CIRISAgent currently *infers* live
+occurrences by scanning recent task-row activity and dedup'ing
+`agent_occurrence_id` — an inference, not a registration: it can't
+tell a clean shutdown from a crash and has no TTL. Under the
+single-key model all occurrences of an agent share one Ed25519
+identity, so occurrence churn is **endpoint liveness under a stable
+identity**. The node layer needs an authoritative answer to "which
+endpoints for identity X are reachable right now."
+
+### New `occurrence` substrate — `OccurrenceService` (4 methods)
+
+- `register_occurrence(occurrence_id, identity, ttl_seconds,
+  metadata)` — register / re-register. `expires_at = now +
+  ttl_seconds`. Idempotent on `occurrence_id`.
+- `heartbeat_occurrence(occurrence_id, ttl_seconds) -> bool` —
+  bump `last_heartbeat` + `expires_at`. Returns `false` for an
+  unknown occurrence (heartbeat-before-register is a no-op, not an
+  error).
+- `deregister_occurrence(occurrence_id) -> bool` — clean shutdown,
+  removes the row immediately. Idempotent.
+- `list_live_occurrences(identity) -> Vec<OccurrenceRecord>` — rows
+  whose `expires_at > now`. TTL-based: a crashed occurrence ages
+  out without a clean deregister. Read-only — expired rows are
+  filtered, not deleted.
+
+### V039 migration (both backends)
+
+`occurrence_registry(occurrence_id PK, identity, registered_at,
+last_heartbeat, expires_at, metadata)` + an
+`(identity, expires_at)` index for the live-listing hot path.
+Feature flag `cirislens_occurrence`.
+
+### PyO3 + .pyi
+
+`Engine.register_occurrence` / `heartbeat_occurrence` /
+`deregister_occurrence` / `list_live_occurrences`, gated on
+`cirislens_occurrence`, all behind the v1.6.8 `ensure_usable`
+guard.
+
+### Tests
+
+17 (PG + SQLite): register→list round-trip; re-register updates in
+place (one row); heartbeat bumps `expires_at`, unknown→false;
+deregister removes, absent→false; **TTL expiry — a row with a
+past `expires_at` is filtered from `list_live_occurrences`**; two
+identities are isolated; empty id / empty identity / `ttl <= 0` →
+`InvalidArgument`.
+
+CIRISAgent's inference-based `discover_active_occurrences` retires
+in favor of this once the agent adopts v1.7.3.
+
 ## [1.7.2] — 2026-05-20
 
 **Fix: the v1.6.8 engine-lifecycle exceptions weren't re-exported

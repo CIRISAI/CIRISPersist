@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "1.7.2"
+version = "1.7.3"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -372,6 +372,21 @@ cirislens_service_token_revocation = []
 # peek_sequence (read last-issued without bumping, 0 on cold pair).
 # No FKs, no JSONB. Threat model AV-15.
 cirislens_sequence = []
+
+# v1.7.3 (CIRISPersist#81) — first-class occurrence registration +
+# liveness heartbeat. CIRISAgent previously inferred live occurrences
+# by scanning recent task-row activity and dedup'ing
+# agent_occurrence_id — an inference, not a registration, with no TTL
+# and no clean-shutdown vs crash signal. Under the one-key model
+# (PoB §3.2) all occurrences of an agent share one Ed25519 identity,
+# so occurrence churn is endpoint liveness under a stable identity.
+# One row per live occurrence in cirislens.occurrence_registry;
+# expires_at is TTL-based so a crashed occurrence ages out.
+# Trait: register_occurrence (idempotent upsert), heartbeat_occurrence
+# (bump TTL), deregister_occurrence (clean shutdown removal),
+# list_live_occurrences (read-only, expires_at > now). JSONB metadata,
+# no FKs. Threat model AV-15.
+cirislens_occurrence = []
 
 # v1.6.4 (CIRISPersist#70) — A0a legacy-graph migration absorption.
 # LAST raw-SQL gap in CIRISAgent 2.9.0. Absorbs the agent-side

@@ -998,6 +998,63 @@ class Engine:
         and ``stream`` must both be non-empty.
         """
 
+    # ── v1.7.3 (CIRISPersist#81) — occurrence registry ──────────────
+
+    def register_occurrence(
+        self,
+        occurrence_id: str,
+        identity: str,
+        ttl_seconds: int,
+        metadata_json: str | None = None,
+    ) -> None:
+        """v1.7.3 (CIRISPersist#81) — Register (or re-register) a live
+        occurrence with a liveness TTL.
+
+        Idempotent on ``occurrence_id``: re-registering refreshes
+        ``registered_at``, ``last_heartbeat``, and ``expires_at``.
+        ``ttl_seconds`` must be > 0; ``expires_at = now + ttl_seconds``.
+        A crashed occurrence ages out past ``expires_at`` without a
+        clean deregister — TTL-based liveness, not membership.
+
+        Under the one-key model (PoB §3.2) every occurrence of an
+        agent signs with the *same* Ed25519 ``identity``, so this
+        registry is endpoint liveness under a stable identity, not a
+        membership change. ``metadata_json``, if provided, must be a
+        JSON value (e.g. endpoint addresses, version).
+
+        ``occurrence_id`` and ``identity`` must both be non-empty.
+        """
+
+    def heartbeat_occurrence(self, occurrence_id: str, ttl_seconds: int) -> bool:
+        """v1.7.3 (CIRISPersist#81) — Bump ``last_heartbeat`` and
+        ``expires_at`` for an already-registered occurrence.
+
+        Returns ``False`` if ``occurrence_id`` is not in the registry
+        — a heartbeat for an unknown occurrence is a no-op, not an
+        error; the caller should ``register_occurrence`` first.
+        ``ttl_seconds`` must be > 0.
+        """
+
+    def deregister_occurrence(self, occurrence_id: str) -> bool:
+        """v1.7.3 (CIRISPersist#81) — Clean shutdown: remove the
+        occurrence row immediately, without waiting for TTL expiry.
+
+        Returns ``True`` if a row was removed, ``False`` if it wasn't
+        registered. Idempotent. This is what distinguishes a clean
+        shutdown from a crash (which ages out via TTL instead).
+        """
+
+    def list_live_occurrences(self, identity: str) -> str:
+        """v1.7.3 (CIRISPersist#81) — List currently-live occurrences
+        for ``identity`` — rows whose ``expires_at > now``.
+
+        Returns a JSON-encoded array of ``OccurrenceRecord``, ordered
+        by ``occurrence_id`` ascending. Expired rows are filtered out
+        (not deleted — this method is read-only). All occurrences of
+        one agent share a single Ed25519 ``identity``; this answers
+        "which endpoints for identity X are reachable right now."
+        """
+
     # ── v1.6.4 (CIRISPersist#70) — A0a legacy-graph migration ───────
 
     def run_legacy_graph_migration(self, options_json: str) -> str:

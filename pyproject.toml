@@ -107,6 +107,7 @@ features = [
     "cirislens_wa_cert",
     "cirislens_service_token_revocation",
     "cirislens_sequence",
+    "cirislens_occurrence",
     "cirislens_legacy_migration",
     "secrets",
     "cirisnode",
