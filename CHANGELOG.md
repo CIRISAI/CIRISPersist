@@ -5,6 +5,56 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.7.4] — 2026-05-20
+
+**Per-consumer substrate ownership declaration (CIRISPersist#82).**
+
+Fourth and final CIRIS 3.0 in-process enabler cut. v1.7.0 added
+`register_consumer(name, substrates=[...])` but recorded the
+declared substrate list verbatim — a typo (`cirsnode`) declared a
+consumer that owns nothing, silently. #82 closes that gap and gives
+co-resident consumers a way to ask "who owns this substrate" before
+writing under the shared singleton engine.
+
+### `register_consumer` — substrate-name validation
+
+Each name in `substrates` is now validated against persist's five
+substrate families: `cirislens`, `cirislens_secrets`,
+`cirislens_derived`, `cirisgraph`, `cirisnode`. An unknown name
+raises `ValueError` at declaration time instead of becoming a
+silent no-op.
+
+### New `Engine.substrate_owner(substrate) -> str | None`
+
+Returns the registered consumer that declared ownership of
+`substrate`, or `None`. Cooperative, advisory check — an in-process
+adapter calls it to confirm ownership before a write. If two
+consumers declared the same family, the lexicographically-first
+name is returned (stable). Behind the v1.6.8 `ensure_usable` guard.
+
+### Scope — what this is NOT
+
+Per-call write-rejection (the engine refusing a write to a
+substrate the *calling* consumer didn't declare) is a deliberate
+**non-goal** of the 1.7.x line, and this is stated plainly rather
+than left as an implied capability. Under the process-singleton the
+engine has no per-call consumer identity to enforce against:
+whichever consumer constructs `Engine(...)` first migrates *all*
+substrate schemas (V001–V039), and per-owner migration is therefore
+moot. Hard enforcement needs consumer-scoped engine handles (each
+adapter holding a handle that carries its own identity) — the
+injected-engine-handle item still tracked in the #79–#84 set.
+Until that lands, ownership is a cooperative contract: the
+consumer→substrate ownership table now in `docs/COHABITATION.md`,
+plus code review. No migration, no schema change, no new substrate.
+
+### Docs
+
+`docs/COHABITATION.md` gains a "Consumer → substrate ownership"
+section: the ownership table (which consumer-class owns which
+family) and an explicit statement of the singleton's
+all-schemas-one-owner reality and the non-goal above.
+
 ## [1.7.3] — 2026-05-20
 
 **First-class occurrence registration + liveness heartbeat

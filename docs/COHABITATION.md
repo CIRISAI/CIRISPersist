@@ -267,6 +267,50 @@ even call the `Engine(...)` constructor — is tracked as the
 CIRISPersist#79–#84 enabler set for 3.0. v1.6.8 ships the
 deadlock-ending floor those build on.
 
+## Consumer → substrate ownership (v1.7.4, CIRISPersist#82)
+
+Under the process-singleton, the *one* engine owns *all* substrate
+schemas: whichever consumer constructs `Engine(...)` first runs the
+full refinery migration set (V001–V039) for every substrate, and
+every co-resident consumer then shares that schema. There is no
+per-consumer schema partition and no per-call write enforcement —
+the singleton has no caller identity to enforce against.
+
+What persist *does* provide is a **cooperative ownership
+declaration**. A consumer calls `register_consumer(name,
+substrates=[...])` to declare which substrate families it owns;
+`substrate_owner(substrate)` lets any consumer ask who owns a given
+family before writing to it. This is advisory: it catches
+mis-wiring and double-ownership in diagnostics, not a write
+firewall.
+
+The declared substrate names are validated against persist's five
+substrate families (`register_consumer` raises `ValueError` on a
+typo). The ownership contract — which consumer-class *should*
+declare which family — is:
+
+| Substrate family | Postgres schema | Owning consumer | Absorbs |
+|---|---|---|---|
+| `cirisgraph` | `cirisgraph` | CIRISAgent (3.0) | MemoryService, ConfigService |
+| `cirislens` | `cirislens` | CIRISLensCore | observability ingest, tasks/thoughts/correlations/tickets/etc. |
+| `cirislens_secrets` | `cirislens_secrets` | CIRISLensCore | SecretsService |
+| `cirislens_derived` | `cirislens_derived` | CIRISLensCore | telemetry rollups, derived audit views |
+| `cirisnode` | `cirisnode` | CIRISNodeCore | federation-consensus substrate |
+
+Audit, incident, telemetry, sequence, and occurrence substrate
+tables live within `cirislens` / `cirislens_derived` and are owned
+transitively by the LensCore declaration. A consumer that touches
+no substrate of its own (a pure reader) may register with an empty
+`substrates=[]` purely for the lifecycle refcount.
+
+Hard per-call write-rejection — refusing a write to a substrate the
+*calling* consumer didn't declare — is a deliberate **non-goal** of
+the 1.7.x line. It requires consumer-scoped engine handles (each
+adapter holding a handle that carries its own identity), which is
+the injected-engine-handle item still tracked in the #79–#84 set.
+Until that lands, ownership is a cooperative contract enforced by
+this table and by code review, not by the engine.
+
 ## What v0.1.14 does NOT do
 
 - **Doesn't add a daemon.** Persist is and remains a Python wheel.

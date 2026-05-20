@@ -97,6 +97,20 @@ class Engine:
         ``["cirisnode"]``). Idempotent — re-registering an existing
         ``name`` updates its substrate list. While any consumer is
         registered, :meth:`close` refuses without ``force=True``.
+
+        v1.7.4 (CIRISPersist#82) — each declared substrate name is
+        validated against the known persist substrate-family set
+        (``cirislens``, ``cirislens_secrets``, ``cirislens_derived``,
+        ``cirisgraph``, ``cirisnode``); an unknown name raises
+        ``ValueError``.
+        """
+
+    def substrate_owner(self, substrate: str) -> str | None:
+        """v1.7.4 (CIRISPersist#82) — name of the registered consumer
+        that declared ownership of ``substrate``, or ``None`` if none
+        does. Cooperative, advisory check — persist does not hard-
+        reject foreign writes under the singleton engine. If multiple
+        consumers declared it, the lexicographically-first name wins.
         """
 
     def deregister_consumer(self, name: str) -> bool:

@@ -254,6 +254,23 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
 // when the calling pid differs from the construction pid (#78 — a
 // tokio runtime does not survive `fork()`).
 
+/// v1.7.4 (CIRISPersist#82) — the persist substrate-family names a
+/// consumer may declare ownership of at `register_consumer` time.
+/// These are the five Postgres schemas persist partitions into (and
+/// their SQLite flat-name equivalents). `register_consumer` rejects
+/// any declared name not in this set, catching typos.
+///
+/// The consumer→substrate ownership table (which consumer-class
+/// *should* own which family) lives in `docs/COHABITATION.md` — it
+/// is a federation design contract, not enforced per-call here.
+const KNOWN_SUBSTRATES: &[&str] = &[
+    "cirislens",
+    "cirislens_secrets",
+    "cirislens_derived",
+    "cirisgraph",
+    "cirisnode",
+];
+
 /// v1.7.0 (CIRISPersist#80) — one attached consumer's registry
 /// record. The agent + NodeCore + LensCore each register on
 /// bring-up so the engine knows who is attached (safe teardown,
@@ -950,11 +967,17 @@ impl PyEngine {
     /// In-process adapters call this on bring-up so the engine knows
     /// who is attached: safe teardown (`close()` refuses while
     /// consumers remain) and `list_consumers()` diagnostics.
+    ///
     /// `substrates` declares the substrate families the consumer
-    /// owns (e.g. `["cirisnode"]` for NodeCore) — the
-    /// per-owner-migration + write-rejection enforcement is the
-    /// CIRISPersist#82 follow-on; today the list is recorded for
-    /// introspection.
+    /// owns (e.g. `["cirisnode"]` for NodeCore). **v1.7.4
+    /// (CIRISPersist#82)** — each name is validated against the
+    /// known persist substrate-family set ([`KNOWN_SUBSTRATES`]); an
+    /// unknown name raises `ValueError`, catching typos before they
+    /// become silent no-ops. The declared list is queryable via
+    /// `substrate_owner()` for cooperative cross-consumer ownership
+    /// checks. (Hard per-call write-rejection is a deliberate
+    /// non-goal for the 1.7.x line — see the v1.7.4 CHANGELOG +
+    /// `docs/COHABITATION.md`.)
     ///
     /// Idempotent: re-registering an existing `name` updates its
     /// substrate list + refreshes the timestamp.
@@ -964,15 +987,53 @@ impl PyEngine {
         if name.is_empty() {
             return Err(PyValueError::new_err("consumer name must be non-empty"));
         }
+        let substrates = substrates.unwrap_or_default();
+        // v1.7.4 (#82) — reject substrate-family typos at declaration
+        // time. A consumer that mis-declares `cirsnode` would
+        // otherwise silently own nothing.
+        for s in &substrates {
+            if !KNOWN_SUBSTRATES.contains(&s.as_str()) {
+                return Err(PyValueError::new_err(format!(
+                    "unknown substrate family {s:?} — must be one of {KNOWN_SUBSTRATES:?}"
+                )));
+            }
+        }
         let mut registry = self.consumers.lock().unwrap_or_else(|e| e.into_inner());
         registry.insert(
             name.to_owned(),
             ConsumerRecord {
-                substrates: substrates.unwrap_or_default(),
+                substrates,
                 registered_at: chrono::Utc::now(),
             },
         );
         Ok(())
+    }
+
+    /// v1.7.4 (CIRISPersist#82) — which registered consumer declared
+    /// ownership of `substrate`, or `None` if no consumer claims it.
+    ///
+    /// Cooperative cross-consumer ownership check: an in-process
+    /// adapter calls this before writing to a shared-engine
+    /// substrate to confirm it owns it (or that nobody else does).
+    /// Persist does NOT hard-reject a write to an unowned/foreign
+    /// substrate — the singleton engine has no per-call consumer
+    /// identity to enforce against; ownership is advisory + the
+    /// ownership table in `docs/COHABITATION.md` is the contract.
+    /// If two consumers both declared the same substrate, the
+    /// lexicographically-first consumer name is returned (stable).
+    fn substrate_owner(&self, substrate: &str) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
+        let registry = self.consumers.lock().unwrap_or_else(|e| e.into_inner());
+        let mut owner: Option<&str> = None;
+        for (name, rec) in registry.iter() {
+            if rec.substrates.iter().any(|s| s == substrate) {
+                owner = Some(match owner {
+                    Some(prev) if prev <= name.as_str() => prev,
+                    _ => name.as_str(),
+                });
+            }
+        }
+        Ok(owner.map(str::to_owned))
     }
 
     /// v1.7.0 (CIRISPersist#80) — deregister an attached consumer.
