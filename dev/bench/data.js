@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779319484480,
+  "lastUpdate": 1779319982847,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -20411,6 +20411,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23614969,
             "range": "± 714621",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "e7cfe9dabd08b1cce0bdc774a5a773672d934b33",
+          "message": "1.7.0 — engine_handle + consumer registry (closes #79 #80)\n\nFirst CIRIS 3.0 enabler cut. v1.6.8 ended the multi-consumer\ndeadlock (Engine process-singleton); v1.7.0 adds the attach/detach\nsurface in-process adapters use.\n\n#79 — Engine.engine_handle() returns a fresh handle to the\nprocess-singleton: a cheap Arc-clone sharing runtime, pool, signer,\nclosed flag, consumer registry. The lifecycle owner injects the\nengine into an adapter explicitly (injected-engine-first-parameter\ncontract) without the adapter needing the DSN/key. The COHABITATION\nin-process chapter landed v1.6.8; this completes #79's accessor.\n\n#80 — consumer registry + lifecycle refcount:\n- register_consumer(name, substrates=None) — adapter calls on\n  bring-up; substrates declares owned families (recorded for\n  introspection; #82 enforcement is the follow-on). Idempotent.\n- deregister_consumer(name) -> bool — on teardown. Idempotent.\n- list_consumers() -> str — JSON {name: {substrates, registered_at}}.\n- consumer_count getter.\n- close() gains a force param and refuses while consumers remain\n  registered (teardown under an attached adapter would deadlock it);\n  force=True overrides for hard shutdown.\n\nRegistry is in-memory on the singleton cell (Arc<Mutex<HashMap>>\nshared by every handle) — no DB, no migration.\n\nTests: Python surface test pins engine_handle + the 4 registry\nmethods. Registry behavior is exercised by the downstream\ncohabitation suite.\n\nAdditive — close()'s force param defaults false; engine.close() is\nunchanged for a single-consumer process. No migration, no\nwire-format change.\n\ncloses #79\ncloses #80\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-20T18:24:36-05:00",
+          "tree_id": "cc89ecec2b1170dea6c149b30758d214fc642571",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/e7cfe9dabd08b1cce0bdc774a5a773672d934b33"
+        },
+        "date": 1779319981495,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101666,
+            "range": "± 585",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 241539,
+            "range": "± 739",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 522809,
+            "range": "± 6064",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1844653,
+            "range": "± 8948",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 344,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1437,
+            "range": "± 32",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7326,
+            "range": "± 94",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21206,
+            "range": "± 156",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24297,
+            "range": "± 54",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83579,
+            "range": "± 245",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 362,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3013,
+            "range": "± 30",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9433,
+            "range": "± 35",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41094,
+            "range": "± 156",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2307069,
+            "range": "± 95432",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6683908,
+            "range": "± 199215",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23940113,
+            "range": "± 370965",
             "unit": "ns/iter"
           }
         ]
