@@ -136,6 +136,51 @@ class Engine:
         consumers. :meth:`close` (without ``force``) refuses while
         this is non-zero."""
 
+    # ── v1.9.0 (CIRISPersist#84) — change-feed / subscription API ──
+
+    def subscribe(
+        self, substrate: str, callback: Callable[[str, str], object]
+    ) -> int:
+        """v1.9.0 (CIRISPersist#84) — register a change-feed callback.
+
+        ``callback`` is invoked as ``callback(substrate, event_json)``
+        each time a producer calls :meth:`publish_change` for
+        ``substrate``. ``substrate`` must be a known substrate family
+        (``cirislens``, ``cirislens_secrets``, ``cirislens_derived``,
+        ``cirisgraph``, ``cirisnode``) — an unknown name raises
+        ``ValueError``. Returns an opaque subscription id for
+        :meth:`unsubscribe`.
+        """
+
+    def unsubscribe(self, subscription_id: int) -> bool:
+        """v1.9.0 (CIRISPersist#84) — remove a change-feed callback by
+        the id :meth:`subscribe` returned. ``True`` if it was
+        registered. Idempotent."""
+
+    def publish_change(self, substrate: str, event_json: str) -> int:
+        """v1.9.0 (CIRISPersist#84) — publish a change event to every
+        callback subscribed to ``substrate``; returns the number of
+        callbacks invoked.
+
+        ``event_json`` is an opaque JSON string (the wire shape is a
+        producer/subscriber contract; persist does not parse it).
+        Dispatch is synchronous and in-process: every matching
+        callback runs, in subscription-id order, before this returns.
+        A callback that raises is caught and logged — the exception
+        does not propagate here and does not stop the other
+        callbacks. No persistence/replay: a subscriber attaching after
+        a publish does not see that event.
+        """
+
+    def list_subscriptions(self) -> str:
+        """v1.9.0 (CIRISPersist#84) — JSON snapshot of the change-feed
+        subscription registry: ``{"<id>": "<substrate>", ...}``."""
+
+    @property
+    def subscription_count(self) -> int:
+        """v1.9.0 (CIRISPersist#84) — number of live change-feed
+        subscriptions."""
+
     def register_public_key(
         self,
         signature_key_id: str,

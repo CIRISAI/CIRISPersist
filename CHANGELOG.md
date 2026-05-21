@@ -5,6 +5,55 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.9.0] — 2026-05-21
+
+**Change-feed / subscription API for cross-consumer notification
+(CIRISPersist#84) — the last in-process-cohabitation enabler.**
+
+Under the process-singleton engine, co-resident consumers (agent +
+NodeCore + LensCore) previously had no way to react to each other's
+writes except polling. v1.9.0 adds an in-process pub/sub bus keyed
+by substrate family — the final enabler of the #85 cohabitation
+EPIC.
+
+### New `Engine` methods
+
+- `subscribe(substrate, callback) -> id` — register a Python
+  callable, invoked as `callback(substrate, event_json)`.
+  `substrate` is validated against the five known substrate
+  families (same namespace as `register_consumer`); unknown raises
+  `ValueError`. Returns an opaque subscription id.
+- `unsubscribe(id) -> bool` — idempotent removal.
+- `publish_change(substrate, event_json) -> int` — deliver an event
+  to every callback subscribed to `substrate`; returns the count
+  delivered. `event_json` is opaque (producer/subscriber contract;
+  persist does not parse it).
+- `list_subscriptions() -> str` / `subscription_count` —
+  diagnostics, parallel to the consumer registry.
+
+### Delivery semantics (documented honestly)
+
+Dispatch is **synchronous and in-process**: `publish_change`
+invokes every matching callback, in subscription-id order, before
+it returns. Each subscriber is invoked exactly once per event. A
+callback that raises is caught and logged — it does not propagate
+to the publisher or abort the other callbacks. Publishers are
+GIL-serialized, so per-substrate event order is the order
+`publish_change` was called. There is **no persistence and no
+replay**: a subscriber that attaches after an event is published
+does not see it — this is in-process notification, not a durable
+log. (The issue floated "at-least-once"; the honest in-process
+guarantee is the synchronous one above, and that is what the docs
+state.)
+
+The registry is bounded at 256 live subscriptions and is
+re-entrancy-safe — a callback may `subscribe` / `unsubscribe` /
+`publish_change` without deadlocking (the dispatch snapshots its
+target list before invoking any Python).
+
+No migration, no schema change. With #84 landed, every enabler in
+the #85 in-process-cohabitation EPIC (#75–#84) is complete.
+
 ## [1.8.1] — 2026-05-21
 
 **Fix: `audit_list_entries` rejected an empty-`last_id` cursor on

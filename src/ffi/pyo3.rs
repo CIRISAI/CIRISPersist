@@ -290,6 +290,13 @@ const MAX_CONSUMERS: usize = 64;
 /// generous for `"<repo>-<adapter>"` while bounding map growth.
 const MAX_CONSUMER_NAME_LEN: usize = 256;
 
+/// v1.9.0 (CIRISPersist#84) — cap on live change-feed subscriptions.
+/// The registry is process-global; a consumer that leaks `subscribe`
+/// calls without `unsubscribe` would otherwise grow it without
+/// limit. 256 is far above any real in-process deployment (a handful
+/// of consumers, each with a few substrate callbacks).
+const MAX_SUBSCRIPTIONS: usize = 256;
+
 /// v1.7.0 (CIRISPersist#80) — one attached consumer's registry
 /// record. The agent + NodeCore + LensCore each register on
 /// bring-up so the engine knows who is attached (safe teardown,
@@ -309,6 +316,34 @@ struct ConsumerRecord {
 /// handle B).
 type ConsumerRegistry = Arc<std::sync::Mutex<std::collections::HashMap<String, ConsumerRecord>>>;
 
+/// v1.9.0 (CIRISPersist#84) — one change-feed subscription: a Python
+/// callable bound to a substrate family. Invoked as
+/// `callback(substrate, event_json)` when a producer calls
+/// `publish_change` for that substrate.
+struct Subscription {
+    /// Substrate family the callback listens on (a [`KNOWN_SUBSTRATES`]
+    /// entry).
+    substrate: String,
+    /// The Python callable. `Py<PyAny>` is `Send + Sync` and
+    /// GIL-independent; it is invoked under the GIL in `publish_change`.
+    callback: pyo3::Py<pyo3::PyAny>,
+}
+
+/// v1.9.0 (CIRISPersist#84) — change-feed subscription state. `next_id`
+/// is monotonic (never reused, so a stale id can't collide with a
+/// fresh subscription); `subs` is an ordered map so a `publish_change`
+/// dispatch visits subscribers in stable subscription-id order.
+#[derive(Default)]
+struct SubscriptionState {
+    next_id: u64,
+    subs: std::collections::BTreeMap<u64, Subscription>,
+}
+
+/// Shared change-feed subscription registry — `Arc`'d so a
+/// `subscribe` on one `PyEngine` handle is visible to a
+/// `publish_change` on any other.
+type SubscriptionRegistry = Arc<std::sync::Mutex<SubscriptionState>>;
+
 /// Process-global canonical engine state. Built once; `PyEngine`
 /// handles clone Arc fields out of it.
 struct EngineCell {
@@ -322,6 +357,8 @@ struct EngineCell {
     sqlite_audit: Option<Arc<crate::audit::sqlite::SqliteAuditBackend>>,
     /// v1.7.0 (CIRISPersist#80) — attached-consumer registry.
     consumers: ConsumerRegistry,
+    /// v1.9.0 (CIRISPersist#84) — change-feed subscription registry.
+    subscriptions: SubscriptionRegistry,
     /// Identity of the construction config — DSN + key ids. A second
     /// `Engine(...)` whose fingerprint differs raises
     /// `EngineConfigMismatch` rather than silently rebinding.
@@ -444,6 +481,9 @@ pub struct PyEngine {
     /// v1.7.0 (CIRISPersist#80) — shared attached-consumer registry.
     /// Same `Arc` every handle holds.
     consumers: ConsumerRegistry,
+    /// v1.9.0 (CIRISPersist#84) — shared change-feed subscription
+    /// registry. Same `Arc` every handle holds.
+    subscriptions: SubscriptionRegistry,
 }
 
 impl PyEngine {
@@ -463,6 +503,7 @@ impl PyEngine {
             closed: cell.closed.clone(),
             construction_pid: cell.construction_pid,
             consumers: cell.consumers.clone(),
+            subscriptions: cell.subscriptions.clone(),
         }
     }
 
@@ -884,6 +925,7 @@ impl PyEngine {
             construction_pid: std::process::id(),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             consumers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            subscriptions: Arc::new(std::sync::Mutex::new(SubscriptionState::default())),
         });
         let handle = PyEngine::from_cell(&cell);
         *slot = Some(cell);
@@ -992,6 +1034,7 @@ impl PyEngine {
             closed: self.closed.clone(),
             construction_pid: self.construction_pid,
             consumers: self.consumers.clone(),
+            subscriptions: self.subscriptions.clone(),
         })
     }
 
@@ -1142,6 +1185,141 @@ impl PyEngine {
         self.consumers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
+    // ── v1.9.0 (CIRISPersist#84) — change-feed / subscription API ──
+    //
+    // An in-process pub/sub bus keyed by substrate family. A producer
+    // (the agent's streaming-step path, a substrate writer) calls
+    // `publish_change(substrate, event_json)`; every callback a
+    // co-resident consumer registered via `subscribe(substrate, cb)`
+    // is invoked. Replaces cross-consumer polling under the shared
+    // singleton engine.
+    //
+    // Delivery semantics (documented, honest — not "at-least-once"
+    // with a hidden queue): dispatch is **synchronous and in-process**
+    // — `publish_change` invokes every matching callback before it
+    // returns, in ascending subscription-id order. Each subscriber is
+    // invoked exactly once per event. A callback that raises is
+    // caught and logged; the exception does not propagate to the
+    // publisher and does not stop the remaining callbacks. Publishers
+    // are GIL-serialized, so per-substrate event order == the order
+    // `publish_change` was called. There is no persistence and no
+    // replay: a subscriber that attaches after an event is published
+    // does not see it (in-process notification, not a durable log).
+
+    /// v1.9.0 (CIRISPersist#84) — register a change-feed callback.
+    ///
+    /// `callback` is invoked as `callback(substrate, event_json)`
+    /// each time a producer calls [`PyEngine::publish_change`] for
+    /// `substrate`. `substrate` must be a known substrate family
+    /// (the [`KNOWN_SUBSTRATES`] set — same namespace as
+    /// `register_consumer`); an unknown name raises `ValueError`.
+    /// Returns an opaque subscription id for [`PyEngine::unsubscribe`].
+    fn subscribe(&self, substrate: &str, callback: &Bound<'_, PyAny>) -> PyResult<u64> {
+        self.ensure_usable()?;
+        if !KNOWN_SUBSTRATES.contains(&substrate) {
+            return Err(PyValueError::new_err(format!(
+                "unknown substrate family {substrate:?} — must be one of {KNOWN_SUBSTRATES:?}"
+            )));
+        }
+        if !callback.is_callable() {
+            return Err(PyValueError::new_err("callback must be callable"));
+        }
+        let mut state = self.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
+        if state.subs.len() >= MAX_SUBSCRIPTIONS {
+            return Err(PyRuntimeError::new_err(format!(
+                "subscription registry full ({MAX_SUBSCRIPTIONS}) — a consumer is \
+                 likely leaking subscriptions without unsubscribe()"
+            )));
+        }
+        let id = state.next_id;
+        state.next_id += 1;
+        state.subs.insert(
+            id,
+            Subscription {
+                substrate: substrate.to_owned(),
+                callback: callback.clone().unbind(),
+            },
+        );
+        Ok(id)
+    }
+
+    /// v1.9.0 (CIRISPersist#84) — remove a change-feed callback by the
+    /// id `subscribe` returned. `True` if it was registered, `False`
+    /// if not (idempotent — double-unsubscribe is not an error).
+    fn unsubscribe(&self, subscription_id: u64) -> PyResult<bool> {
+        let mut state = self.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state.subs.remove(&subscription_id).is_some())
+    }
+
+    /// v1.9.0 (CIRISPersist#84) — publish a change event to every
+    /// callback subscribed to `substrate`. Returns the number of
+    /// callbacks invoked.
+    ///
+    /// `event_json` is an opaque JSON string — persist does not parse
+    /// it; the wire shape is a contract between the producer and its
+    /// subscribers. Dispatch is synchronous: every matching callback
+    /// runs before this returns. A callback that raises is caught and
+    /// logged (it does not abort the publish or the other callbacks).
+    fn publish_change(&self, py: Python<'_>, substrate: &str, event_json: &str) -> PyResult<usize> {
+        self.ensure_usable()?;
+        if !KNOWN_SUBSTRATES.contains(&substrate) {
+            return Err(PyValueError::new_err(format!(
+                "unknown substrate family {substrate:?} — must be one of {KNOWN_SUBSTRATES:?}"
+            )));
+        }
+        // Snapshot the matching callbacks under the lock, then release
+        // it before invoking any Python — a callback is free to call
+        // subscribe / unsubscribe / publish_change re-entrantly
+        // without deadlocking on this (non-reentrant) Mutex.
+        let targets: Vec<pyo3::Py<pyo3::PyAny>> = {
+            let state = self.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
+            state
+                .subs
+                .values()
+                .filter(|s| s.substrate == substrate)
+                .map(|s| s.callback.clone_ref(py))
+                .collect()
+        };
+        let delivered = targets.len();
+        for cb in targets {
+            if let Err(e) = cb.call1(py, (substrate, event_json)) {
+                // One bad subscriber must not break the publish or the
+                // other subscribers. Surface to tracing, keep going.
+                tracing::warn!(
+                    substrate,
+                    error = %e,
+                    "change-feed subscriber callback raised; continuing"
+                );
+            }
+        }
+        Ok(delivered)
+    }
+
+    /// v1.9.0 (CIRISPersist#84) — JSON snapshot of the change-feed
+    /// subscription registry: `{"<id>": "<substrate>", ...}`. For
+    /// diagnostics — "who is listening to what."
+    fn list_subscriptions(&self) -> PyResult<String> {
+        let state = self.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
+        let view: std::collections::BTreeMap<String, &str> = state
+            .subs
+            .iter()
+            .map(|(id, s)| (id.to_string(), s.substrate.as_str()))
+            .collect();
+        serde_json::to_string(&view)
+            .map_err(|e| PyRuntimeError::new_err(format!("subscription registry encode: {e}")))
+    }
+
+    /// v1.9.0 (CIRISPersist#84) — count of live change-feed
+    /// subscriptions.
+    #[getter]
+    fn subscription_count(&self) -> usize {
+        self.subscriptions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .subs
             .len()
     }
 

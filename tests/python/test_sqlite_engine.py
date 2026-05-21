@@ -77,6 +77,12 @@ def test_engine_has_cohabitation_surface() -> None:
         "list_consumers",
         "consumer_count",
         "substrate_owner",
+        # v1.9.0 (#84) — change-feed surface.
+        "subscribe",
+        "unsubscribe",
+        "publish_change",
+        "list_subscriptions",
+        "subscription_count",
     ):
         assert hasattr(ciris_persist.Engine, attr), f"Engine.{attr} missing"
 
@@ -110,5 +116,48 @@ def test_register_consumer_validation() -> None:
         # v1.7.5 — over-long consumer name is rejected.
         with pytest.raises(ValueError):
             eng.register_consumer("x" * 300, [])
+    finally:
+        eng.close(force=True)
+
+
+def test_change_feed_pubsub() -> None:
+    """v1.9.0 (CIRISPersist#84) — subscribe/publish_change/unsubscribe:
+    a callback fires for its substrate with (substrate, event_json),
+    not for others; unsubscribe stops delivery; an unknown substrate
+    raises ValueError. Skips on a non-sqlite wheel (see
+    test_register_consumer_validation)."""
+    import pytest
+
+    try:
+        eng = ciris_persist.Engine(dsn="sqlite://:memory:", signing_key_id="qa-key")
+    except ValueError as exc:
+        if "sqlite" in str(exc) and "feature" in str(exc):
+            pytest.skip("wheel built without the sqlite feature")
+        raise
+    try:
+        received: list[tuple[str, str]] = []
+        sub_id = eng.subscribe("cirisnode", lambda s, ev: received.append((s, ev)))
+        assert eng.subscription_count == 1
+
+        delivered = eng.publish_change("cirisnode", '{"seq":1}')
+        assert delivered == 1
+        assert received == [("cirisnode", '{"seq":1}')]
+
+        # A publish on a different substrate must not reach this sub.
+        assert eng.publish_change("cirisgraph", '{"x":1}') == 0
+        assert received == [("cirisnode", '{"seq":1}')]
+
+        # Unsubscribe stops delivery.
+        assert eng.unsubscribe(sub_id) is True
+        assert eng.subscription_count == 0
+        assert eng.publish_change("cirisnode", '{"seq":2}') == 0
+        assert received == [("cirisnode", '{"seq":1}')]
+
+        # Double-unsubscribe is idempotent; unknown substrate rejected.
+        assert eng.unsubscribe(sub_id) is False
+        with pytest.raises(ValueError):
+            eng.subscribe("bogus_substrate", lambda s, ev: None)
+        with pytest.raises(ValueError):
+            eng.publish_change("bogus_substrate", "{}")
     finally:
         eng.close(force=True)
