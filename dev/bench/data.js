@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779379705770,
+  "lastUpdate": 1779385775139,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -21731,6 +21731,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25940636,
             "range": "± 519625",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "cdc5e29274459460dd91f9cdef97ba8a93d8db82",
+          "message": "1.10.0 — hardware-backed secrets-at-rest (closes #87)\n\nSecretsService::migrate_to_hardware_key was an unconditional\nHardwareKeyUnavailable stub. It now derives the secrets-store master\nkey from a hardware-sealed seed and re-encrypts every secret under\nit — closing the last gap in a CIRISAgent's crypto-at-rest story.\n\n- Verify owns the crypto: the master key is derived via\n  ciris_verify_core::derive_symmetric_key (HKDF over a seed loaded\n  from a hardware-backed SecureBlobStorage). Persist never rolls its\n  own KDF. CIRISVerify pins move v2.4.0 -> v2.5.0 (CIRISVerify#25\n  promoted derive_symmetric_key into the verify-core rlib).\n- Hardware-capable per platform: ciris-keyring's storage backends\n  are enabled via [target.*] tables — tpm on Linux, ios on iOS,\n  android on Android. create_platform_storage runtime-detects the\n  hardware; migrate_to_hardware_key returns HardwareKeyUnavailable\n  on a host without and the caller keeps the software master key.\n  CI Linux jobs apt-install libtss2-dev for the tss-esapi build dep.\n- [profile.dev] debug = \"line-tables-only\" — caps target/ bloat\n  (full debuginfo across many feature sets had reached 122 GiB)\n  while keeping panic backtraces.\n\nNo migration, no schema change — the hardware key is recorded as\nmaster_key_meta.key_kind = 'hardware' in the existing V010 table.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-21T12:39:48-05:00",
+          "tree_id": "1b8a9b77cd8b0e7516a01a2968c60bb9a7609613",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/cdc5e29274459460dd91f9cdef97ba8a93d8db82"
+        },
+        "date": 1779385774505,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 109339,
+            "range": "± 1200",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 259998,
+            "range": "± 931",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 562479,
+            "range": "± 44273",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1996685,
+            "range": "± 8421",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 345,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1394,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8221,
+            "range": "± 187",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23156,
+            "range": "± 250",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26397,
+            "range": "± 229",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91005,
+            "range": "± 133",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 359,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3047,
+            "range": "± 19",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9716,
+            "range": "± 30",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 42298,
+            "range": "± 212",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 637,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2272705,
+            "range": "± 122611",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7045794,
+            "range": "± 217985",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25691503,
+            "range": "± 218329",
             "unit": "ns/iter"
           }
         ]
