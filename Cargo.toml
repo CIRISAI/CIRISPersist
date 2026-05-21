@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "1.10.1"
+version = "1.10.2"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -94,12 +94,13 @@ default-sovereign-light = ["scrub", "extract"]
 # - secrets-server:  HTTP API (axum) for federated secrets CRUD per
 #                    FSD §8. Requires the `server` feature too.
 #
-# The hardware-key migration path (FSD §3.1 #18 — `migrate_to_hardware_key`)
-# is DEFERRED. Today's ciris-keyring v2.0.2 doesn't expose a
-# `symmetric-derivation` feature; once CIRISVerify ships that
-# upstream we'll add a `secrets-hw = ["secrets", "ciris-keyring/symmetric-derivation"]`
-# feature here. Until then the trait method exists but always
-# returns SecretsError::HardwareKeyUnavailable.
+# The hardware-key migration path (FSD §3.1 #18 —
+# `migrate_to_hardware_key`) is ACTIVE as of v1.10.0 (CIRISPersist#87).
+# It derives the secrets master key via
+# `ciris_verify_core::derive_symmetric_key` (CIRISVerify v2.5.0+) over
+# a hardware-sealed seed; no separate Cargo feature — the per-platform
+# `ciris-keyring` hardware backends are enabled via the `[target.*]`
+# tables below (`tpm` on Linux, `ios`/`android` on mobile).
 secrets        = [ "classify", "ciris-crypto/aes-gcm", "ciris-crypto/kdf", "ciris-crypto/hmac", "ciris-crypto/random"]
 secrets-server = ["secrets", "server"]
 
@@ -445,14 +446,14 @@ tls = ["dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-native-certs"]
 # ciris-crypto invariant (FSD §7.5a) means persist takes ZERO direct
 # deps on AES-GCM/PBKDF2/HKDF/HMAC primitive crates ever — the
 # `src/secrets/crypto.rs` facade lands as a single import-site change.
-ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.5.0", version = "2", features = ["pqc-ml-dsa"] }
-ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.5.0", version = "2" }
+ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.6.1", version = "2", features = ["pqc-ml-dsa"] }
+ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.6.1", version = "2" }
 # v0.3.6 (CIRISPersist#14) — direct ciris-crypto dep for HybridVerifier
 # in `Engine.verify_hybrid`. Same git source / tag as ciris-keyring +
 # ciris-verify-core so versions are workspace-coherent. Features
 # `ed25519` + `pqc-ml-dsa` light up the concrete Ed25519Verifier +
 # MlDsa65Verifier impls used by HybridVerifier::verify.
-ciris-crypto      = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.5.0", version = "2", features = ["ed25519", "pqc-ml-dsa"] }
+ciris-crypto      = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.6.1", version = "2", features = ["ed25519", "pqc-ml-dsa"] }
 async-trait   = "0.1"
 # v0.1.14 — filesystem advisory locks for the cohabitation
 # bootstrap (docs/COHABITATION.md). POSIX flock cross-process,
@@ -620,13 +621,13 @@ rusqlite = { version = "0.31", features = ["bundled", "chrono", "serde_json"], o
 # master key). Placed AFTER every platform-independent dep — see the
 # v0.9.0 bug note on the rusqlite target table above.
 [target.'cfg(target_os = "linux")'.dependencies]
-ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.5.0", version = "2", features = ["pqc-ml-dsa", "tpm"] }
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.6.1", version = "2", features = ["pqc-ml-dsa", "tpm"] }
 
 [target.'cfg(target_os = "ios")'.dependencies]
-ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.5.0", version = "2", features = ["pqc-ml-dsa", "ios"] }
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.6.1", version = "2", features = ["pqc-ml-dsa", "ios"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
-ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.5.0", version = "2", features = ["pqc-ml-dsa", "android"] }
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.6.1", version = "2", features = ["pqc-ml-dsa", "android"] }
 
 [dev-dependencies]
 # Mission category §4: canonicalization parity. Used to validate our
@@ -692,6 +693,45 @@ harness = false
 name = "queue"
 harness = false
 required-features = ["postgres"]
+
+# v1.10.x bench-coverage cut — benches for the v1.7.x–v1.10.1 surface
+# that shipped with zero coverage. SQLite in-memory backed where a DB
+# is needed, so they need no service in `bench.yml`.
+
+# Atomic sequence-counter contention sweep (sequence/). The optional
+# Postgres path inside the bench is itself gated on the `postgres`
+# feature + `CIRIS_PERSIST_TEST_PG_URL`; the SQLite path needs only
+# `sqlite`, but `cirislens_sequence` gates the migration that creates
+# `cirislens_identity_sequences`.
+[[bench]]
+name = "sequence_contention"
+harness = false
+required-features = ["sqlite", "cirislens_sequence"]
+
+# Full V001–V0xx migration-chain cold-start cost on `:memory:`.
+[[bench]]
+name = "engine_cold_start"
+harness = false
+required-features = ["sqlite"]
+
+# ReadEngine analytical-query scaling over a seeded trace corpus.
+[[bench]]
+name = "read_engine_analytics"
+harness = false
+required-features = ["sqlite"]
+
+# Secrets crypto facade (AES-256-GCM) single-call latency. No DB.
+[[bench]]
+name = "secrets_crypto"
+harness = false
+required-features = ["secrets"]
+
+# Occurrence-registry substrate latency (occurrence/). `cirislens_occurrence`
+# gates the migration that creates `cirislens_occurrence_registry`.
+[[bench]]
+name = "occurrence_registry"
+harness = false
+required-features = ["sqlite", "cirislens_occurrence"]
 
 # v1.10.0 — keep `target/` from ballooning. The full debuginfo
 # (`debug = 2`, the default) is the dominant cost in dev/test builds,

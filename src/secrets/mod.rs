@@ -80,6 +80,16 @@ pub mod client;
 #[cfg(feature = "secrets")]
 pub use service::SecretsService;
 
+/// v1.10.1 (CIRISPersist#88 review, perf H2) — `reencrypt_all` row
+/// batch size. The CPU-bound decrypt/derive/encrypt (PBKDF2 is
+/// ~100 ms per secret) runs with no transaction open; only a chunk's
+/// `UPDATE` batch holds a write transaction, so the lock is released
+/// between chunks rather than held across the whole secrets table.
+/// 64 keeps each locked window short while amortizing transaction
+/// overhead.
+#[cfg(feature = "secrets")]
+pub(crate) const REENCRYPT_CHUNK_SIZE: usize = 64;
+
 #[cfg(feature = "secrets-client")]
 pub use client::FederatedSecretsClient;
 

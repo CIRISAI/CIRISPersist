@@ -47,10 +47,13 @@ jobs:
   bench:
     name: Criterion bench suite
     runs-on: ubuntu-latest
-    # Five benches × ~60s each + warmup + setup. Observed ~5 min
-    # locally; double that for the runner. Bump if we add more
-    # benches.
-    timeout-minutes: 25
+    # Ten benches. The original five are ~60s each; the v1.10.x
+    # bench-coverage cut (sequence_contention, engine_cold_start,
+    # read_engine_analytics, secrets_crypto, occurrence_registry) adds
+    # ~8-10 min — read_engine_analytics dominates (size-swept seeds up
+    # to 25k traces). Observed ~13 min locally; headroom for the
+    # runner. Bump if we add more benches.
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4
@@ -101,12 +104,23 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run criterion benches
+        # v1.10.x bench-coverage cut adds the bottom five. SQLite-backed
+        # benches (open_in_memory) need no service. `MALLOC_ARENA_MAX`
+        # caps glibc's per-thread arenas so the multi-threaded benches'
+        # virtual footprint stays sane on the runner.
+        env:
+          MALLOC_ARENA_MAX: "4"
         run: |
           cargo bench --features postgres --bench ingest_pipeline -- --output-format bencher | tee bench-output.txt
           cargo bench --bench canonicalize -- --output-format bencher | tee -a bench-output.txt
           cargo bench --bench sign -- --output-format bencher | tee -a bench-output.txt
           cargo bench --bench dedup_key -- --output-format bencher | tee -a bench-output.txt
           cargo bench --features postgres --bench queue -- --output-format bencher | tee -a bench-output.txt
+          cargo bench --features sqlite,cirislens_sequence --bench sequence_contention -- --output-format bencher | tee -a bench-output.txt
+          cargo bench --features sqlite --bench engine_cold_start -- --output-format bencher | tee -a bench-output.txt
+          cargo bench --features sqlite --bench read_engine_analytics -- --output-format bencher | tee -a bench-output.txt
+          cargo bench --features secrets --bench secrets_crypto -- --output-format bencher | tee -a bench-output.txt
+          cargo bench --features sqlite,cirislens_occurrence --bench occurrence_registry -- --output-format bencher | tee -a bench-output.txt
 
       - name: Top-line summary to GH step summary
         run: |

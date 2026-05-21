@@ -5,6 +5,45 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.10.2] — 2026-05-21
+
+**`reencrypt_all` chunked transaction (perf review H2), CIRISVerify
+pin → v2.6.1, and the benchmark-coverage cut.**
+
+### `reencrypt_all` — bounded-chunk re-encryption
+
+`reencrypt_all` (the master-key rotation / `migrate_to_hardware_key`
+re-encrypt pass) held one transaction across the *whole* secrets
+table — with PBKDF2 at ~100 ms/secret that is a multi-minute write
+lock on a large store. It now re-encrypts in 64-row chunks: the
+CPU-bound decrypt/derive/encrypt runs with no transaction open
+(SQLite: no connection lock held), and only each chunk's `UPDATE`
+batch takes a short transaction, so the write lock is released
+between chunks. The master-key activate/deactivate flip now happens
+only on a fully-clean pass — a partial failure can no longer strand
+secrets under a deactivated key (folds in #87-review H1 at the
+source). Each secret row is self-describing (`encryption_key_ref`
+per row), so a partially-migrated table stays fully decryptable.
+
+### CIRISVerify pin → v2.6.1
+
+`ciris-verify-core` / `ciris-keyring` / `ciris-crypto` bumped
+v2.5.0 → v2.6.1 (just shipped). No API breakage.
+
+### Benchmark-coverage cut
+
+The v1.7.x–v1.10.1 surface had zero criterion coverage. Five new
+benches: `sequence_contention` (fan-in on the atomic sequence
+UPSERT), `engine_cold_start` (open + full migration run),
+`read_engine_analytics` (the SQLite ReadEngine queries, size-swept
+1k/10k/25k), `secrets_crypto` (AES-GCM facade), `occurrence_registry`
+(register/heartbeat + size-swept `list_live_occurrences`). All
+size-swept benches use `SamplingMode::Flat` so the scaling curves
+are tight (±~1%) — a leak/regression baseline needs clean curves,
+not noisy ones (an early linear-sampling run manufactured a spurious
+"superlinear" reading that flat sampling showed was noise). Wired
+into `bench.yml`. Dev-only — no change to the shipped crate.
+
 ## [1.10.1] — 2026-05-21
 
 **`reset_engine()` — handle-free process-singleton reset

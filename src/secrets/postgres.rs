@@ -818,13 +818,11 @@ impl SecretsService for PostgresBackend {
             .get()
             .await
             .map_err(|e| SecretsError::Backend(format!("pool: {e}")))?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| SecretsError::Backend(format!("begin tx: {e}")))?;
 
-        // Load all secrets.
-        let rows = tx
+        // Load every secret up front — a plain read, no lock held.
+        // Each row is self-describing (`encryption_key_ref` per row),
+        // so a partially-migrated table stays fully decryptable.
+        let rows = client
             .query(
                 "SELECT secret_uuid, encrypted_value, encryption_key_ref, salt, nonce \
                  FROM cirislens_secrets.secrets",
@@ -833,78 +831,119 @@ impl SecretsService for PostgresBackend {
             .await
             .map_err(|e| SecretsError::Backend(format!("reencrypt_all load: {e}")))?;
 
+        // v1.10.1 (#88 review, perf H2) — re-encrypt in bounded
+        // chunks. The CPU-bound decrypt/derive/encrypt (PBKDF2,
+        // ~100 ms/secret) runs with NO transaction open; only a
+        // chunk's UPDATE batch runs in a short transaction, so the
+        // write lock is released between chunks instead of held
+        // across the whole table.
+        struct Prepared {
+            uuid: Uuid,
+            ct: Vec<u8>,
+            salt: Vec<u8>,
+            nonce: Vec<u8>,
+        }
         let mut reencrypted = 0u64;
         let mut failures: Vec<String> = Vec::new();
-        for row in rows {
-            let uuid: Uuid = row.get(0);
-            let ct: Vec<u8> = row.get(1);
-            let old_key_ref: String = row.get(2);
-            let old_salt: Vec<u8> = row.get(3);
-            let old_nonce: Vec<u8> = row.get(4);
-            let old_bytes = match software_keys_get(&old_key_ref) {
-                Some(b) => b,
-                None => {
-                    failures.push(uuid.to_string());
-                    continue;
-                }
-            };
-            let old_sk = match crypto::derive_secret_key(&old_bytes, &old_salt) {
-                Ok(k) => k,
-                Err(_) => {
-                    failures.push(uuid.to_string());
-                    continue;
-                }
-            };
-            let plaintext = match crypto::decrypt(&old_sk, &old_nonce, &ct) {
-                Ok(p) => p,
-                Err(_) => {
-                    failures.push(uuid.to_string());
-                    continue;
-                }
-            };
-            let new_salt = crypto::random_salt()?;
-            let new_nonce = crypto::random_nonce()?;
-            let new_sk = crypto::derive_secret_key(&new_master_bytes, &new_salt)?;
-            let new_ct = crypto::encrypt(&new_sk, &new_nonce, &plaintext)?;
-            tx.execute(
-                "UPDATE cirislens_secrets.secrets \
-                 SET encrypted_value = $1, encryption_key_ref = $2, \
-                     salt = $3, nonce = $4 \
-                 WHERE secret_uuid = $5",
-                &[
-                    &new_ct,
-                    &new_key_ref,
-                    &new_salt.to_vec(),
-                    &new_nonce.to_vec(),
-                    &uuid,
-                ],
-            )
-            .await
-            .map_err(|e| SecretsError::Backend(format!("reencrypt update: {e}")))?;
-            reencrypted += 1;
+
+        for chunk in rows.chunks(crate::secrets::REENCRYPT_CHUNK_SIZE) {
+            // Phase A — crypto, no transaction. A row whose old key /
+            // ciphertext won't decrypt is recorded + skipped.
+            let mut prepared: Vec<Prepared> = Vec::with_capacity(chunk.len());
+            for row in chunk {
+                let uuid: Uuid = row.get(0);
+                let ct: Vec<u8> = row.get(1);
+                let old_key_ref: String = row.get(2);
+                let old_salt: Vec<u8> = row.get(3);
+                let old_nonce: Vec<u8> = row.get(4);
+                let old_bytes = match software_keys_get(&old_key_ref) {
+                    Some(b) => b,
+                    None => {
+                        failures.push(uuid.to_string());
+                        continue;
+                    }
+                };
+                let old_sk = match crypto::derive_secret_key(&old_bytes, &old_salt) {
+                    Ok(k) => k,
+                    Err(_) => {
+                        failures.push(uuid.to_string());
+                        continue;
+                    }
+                };
+                let plaintext = match crypto::decrypt(&old_sk, &old_nonce, &ct) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        failures.push(uuid.to_string());
+                        continue;
+                    }
+                };
+                let new_salt = crypto::random_salt()?;
+                let new_nonce = crypto::random_nonce()?;
+                let new_sk = crypto::derive_secret_key(&new_master_bytes, &new_salt)?;
+                let new_ct = crypto::encrypt(&new_sk, &new_nonce, &plaintext)?;
+                prepared.push(Prepared {
+                    uuid,
+                    ct: new_ct,
+                    salt: new_salt.to_vec(),
+                    nonce: new_nonce.to_vec(),
+                });
+            }
+            if prepared.is_empty() {
+                continue;
+            }
+            // Phase B — short transaction, just the UPDATE batch.
+            let tx = client
+                .transaction()
+                .await
+                .map_err(|e| SecretsError::Backend(format!("begin chunk tx: {e}")))?;
+            for p in &prepared {
+                tx.execute(
+                    "UPDATE cirislens_secrets.secrets \
+                     SET encrypted_value = $1, encryption_key_ref = $2, \
+                         salt = $3, nonce = $4 \
+                     WHERE secret_uuid = $5",
+                    &[&p.ct, &new_key_ref, &p.salt, &p.nonce, &p.uuid],
+                )
+                .await
+                .map_err(|e| SecretsError::Backend(format!("reencrypt update: {e}")))?;
+            }
+            tx.commit()
+                .await
+                .map_err(|e| SecretsError::Backend(format!("commit chunk: {e}")))?;
+            reencrypted += prepared.len() as u64;
         }
 
-        // Deactivate the old master key + activate the new.
-        tx.execute(
-            "UPDATE cirislens_secrets.master_key_meta \
-             SET deactivated_at = NOW(), rotated_to = $1 \
-             WHERE deactivated_at IS NULL AND key_ref != $1",
-            &[&new_key_ref],
-        )
-        .await
-        .map_err(|e| SecretsError::Backend(format!("deactivate old key: {e}")))?;
-        tx.execute(
-            "UPDATE cirislens_secrets.master_key_meta \
-             SET activated_at = COALESCE(activated_at, NOW()) \
-             WHERE key_ref = $1",
-            &[&new_key_ref],
-        )
-        .await
-        .map_err(|e| SecretsError::Backend(format!("activate new key: {e}")))?;
-
-        tx.commit()
+        // Flip the active master key only on a fully-clean pass.
+        // v1.10.1 (#87 review H1) — a partial failure must NOT
+        // deactivate the old key: its un-migrated secrets are still
+        // encrypted under it. Old key stays active, the migrated rows
+        // remain readable (per-row `encryption_key_ref`), and a retry
+        // can complete the pass.
+        if failures.is_empty() {
+            let tx = client
+                .transaction()
+                .await
+                .map_err(|e| SecretsError::Backend(format!("begin key-flip tx: {e}")))?;
+            tx.execute(
+                "UPDATE cirislens_secrets.master_key_meta \
+                 SET deactivated_at = NOW(), rotated_to = $1 \
+                 WHERE deactivated_at IS NULL AND key_ref != $1",
+                &[&new_key_ref],
+            )
             .await
-            .map_err(|e| SecretsError::Backend(format!("commit reencrypt: {e}")))?;
+            .map_err(|e| SecretsError::Backend(format!("deactivate old key: {e}")))?;
+            tx.execute(
+                "UPDATE cirislens_secrets.master_key_meta \
+                 SET activated_at = COALESCE(activated_at, NOW()) \
+                 WHERE key_ref = $1",
+                &[&new_key_ref],
+            )
+            .await
+            .map_err(|e| SecretsError::Backend(format!("activate new key: {e}")))?;
+            tx.commit()
+                .await
+                .map_err(|e| SecretsError::Backend(format!("commit key-flip: {e}")))?;
+        }
 
         let failure_msg = if failures.is_empty() {
             None

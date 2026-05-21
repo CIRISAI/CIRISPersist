@@ -1179,16 +1179,13 @@ impl SecretsService for SqliteSecretsBackend {
         let now_for_tx = fmt_datetime(Utc::now());
         let (reencrypted, failures) =
             tokio::task::spawn_blocking(move || -> Result<(u64, Vec<String>), SecretsError> {
-                let mut guard = conn.blocking_lock();
-                let tx = guard
-                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                    .map_err(|e| map_sqlite_error(e, "reencrypt_all begin tx"))?;
-
-                // Load all rows up front (we then mutate inside the
-                // same tx — rusqlite doesn't allow active statements
-                // and mutating prepared statements to coexist).
+                // Read every secret up front under a brief lock, then
+                // release it. Each row is self-describing (per-row
+                // `encryption_key_ref`), so a partially-migrated table
+                // stays fully decryptable.
                 let rows: Vec<(String, Vec<u8>, String, Vec<u8>, Vec<u8>)> = {
-                    let mut stmt = tx
+                    let guard = conn.blocking_lock();
+                    let mut stmt = guard
                         .prepare(
                             "SELECT secret_uuid, encrypted_value, encryption_key_ref, \
                                     salt, nonce \
@@ -1213,69 +1210,109 @@ impl SecretsService for SqliteSecretsBackend {
                     acc
                 };
 
+                // v1.10.1 (#88 review, perf H2) — re-encrypt in
+                // bounded chunks. The CPU-bound decrypt/derive/encrypt
+                // (PBKDF2, ~100 ms/secret) runs with the connection
+                // lock released; only a chunk's UPDATE batch reclaims
+                // the lock + an `IMMEDIATE` transaction, so SQLite's
+                // single-writer lock — and the connection mutex every
+                // other persist op shares — is freed between chunks.
+                struct Prepared {
+                    uuid: String,
+                    ct: Vec<u8>,
+                    salt: Vec<u8>,
+                    nonce: Vec<u8>,
+                }
                 let mut reencrypted: u64 = 0;
                 let mut failures: Vec<String> = Vec::new();
-                for (uuid_str, ct, old_key_ref, old_salt, old_nonce) in rows {
-                    let old_bytes = match software_keys_get(&old_key_ref) {
-                        Some(b) => b,
-                        None => {
-                            failures.push(uuid_str);
-                            continue;
-                        }
-                    };
-                    let old_sk = match crypto::derive_secret_key(&old_bytes, &old_salt) {
-                        Ok(k) => k,
-                        Err(_) => {
-                            failures.push(uuid_str);
-                            continue;
-                        }
-                    };
-                    let plaintext = match crypto::decrypt(&old_sk, &old_nonce, &ct) {
-                        Ok(p) => p,
-                        Err(_) => {
-                            failures.push(uuid_str);
-                            continue;
-                        }
-                    };
-                    let new_salt = crypto::random_salt()?;
-                    let new_nonce = crypto::random_nonce()?;
-                    let new_sk = crypto::derive_secret_key(&new_master_bytes, &new_salt)?;
-                    let new_ct = crypto::encrypt(&new_sk, &new_nonce, &plaintext)?;
-                    tx.execute(
-                        "UPDATE cirislens_secrets_secrets \
-                         SET encrypted_value = ?1, encryption_key_ref = ?2, \
-                             salt = ?3, nonce = ?4 \
-                         WHERE secret_uuid = ?5",
-                        params![
-                            new_ct,
-                            new_key_ref_for_tx,
-                            new_salt.to_vec(),
-                            new_nonce.to_vec(),
-                            uuid_str,
-                        ],
-                    )
-                    .map_err(|e| map_sqlite_error(e, "reencrypt update"))?;
-                    reencrypted += 1;
+
+                for chunk in rows.chunks(crate::secrets::REENCRYPT_CHUNK_SIZE) {
+                    // Phase A — crypto, connection lock NOT held.
+                    let mut prepared: Vec<Prepared> = Vec::with_capacity(chunk.len());
+                    for (uuid_str, ct, old_key_ref, old_salt, old_nonce) in chunk {
+                        let old_bytes = match software_keys_get(old_key_ref) {
+                            Some(b) => b,
+                            None => {
+                                failures.push(uuid_str.clone());
+                                continue;
+                            }
+                        };
+                        let old_sk = match crypto::derive_secret_key(&old_bytes, old_salt) {
+                            Ok(k) => k,
+                            Err(_) => {
+                                failures.push(uuid_str.clone());
+                                continue;
+                            }
+                        };
+                        let plaintext = match crypto::decrypt(&old_sk, old_nonce, ct) {
+                            Ok(p) => p,
+                            Err(_) => {
+                                failures.push(uuid_str.clone());
+                                continue;
+                            }
+                        };
+                        let new_salt = crypto::random_salt()?;
+                        let new_nonce = crypto::random_nonce()?;
+                        let new_sk = crypto::derive_secret_key(&new_master_bytes, &new_salt)?;
+                        let new_ct = crypto::encrypt(&new_sk, &new_nonce, &plaintext)?;
+                        prepared.push(Prepared {
+                            uuid: uuid_str.clone(),
+                            ct: new_ct,
+                            salt: new_salt.to_vec(),
+                            nonce: new_nonce.to_vec(),
+                        });
+                    }
+                    if prepared.is_empty() {
+                        continue;
+                    }
+                    // Phase B — reclaim the lock for a short IMMEDIATE
+                    // transaction, just the chunk's UPDATE batch.
+                    let mut guard = conn.blocking_lock();
+                    let tx = guard
+                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                        .map_err(|e| map_sqlite_error(e, "reencrypt_all begin chunk tx"))?;
+                    for p in &prepared {
+                        tx.execute(
+                            "UPDATE cirislens_secrets_secrets \
+                             SET encrypted_value = ?1, encryption_key_ref = ?2, \
+                                 salt = ?3, nonce = ?4 \
+                             WHERE secret_uuid = ?5",
+                            params![p.ct, new_key_ref_for_tx, p.salt, p.nonce, p.uuid],
+                        )
+                        .map_err(|e| map_sqlite_error(e, "reencrypt update"))?;
+                    }
+                    tx.commit()
+                        .map_err(|e| map_sqlite_error(e, "commit chunk"))?;
+                    drop(guard);
+                    reencrypted += prepared.len() as u64;
                 }
 
-                // Deactivate the old master key + activate the new.
-                tx.execute(
-                    "UPDATE cirislens_secrets_master_key_meta \
-                     SET deactivated_at = ?1, rotated_to = ?2 \
-                     WHERE deactivated_at IS NULL AND key_ref != ?2",
-                    params![now_for_tx, new_key_ref_for_tx],
-                )
-                .map_err(|e| map_sqlite_error(e, "deactivate old key"))?;
-                tx.execute(
-                    "UPDATE cirislens_secrets_master_key_meta \
-                     SET activated_at = COALESCE(activated_at, ?1) \
-                     WHERE key_ref = ?2",
-                    params![now_for_tx, new_key_ref_for_tx],
-                )
-                .map_err(|e| map_sqlite_error(e, "activate new key"))?;
-
-                tx.commit()
-                    .map_err(|e| map_sqlite_error(e, "commit reencrypt"))?;
+                // Flip the active master key only on a fully-clean
+                // pass. v1.10.1 (#87 review H1) — a partial failure
+                // must NOT deactivate the old key: its un-migrated
+                // secrets are still under it, and a retry can finish.
+                if failures.is_empty() {
+                    let mut guard = conn.blocking_lock();
+                    let tx = guard
+                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                        .map_err(|e| map_sqlite_error(e, "reencrypt_all begin key-flip tx"))?;
+                    tx.execute(
+                        "UPDATE cirislens_secrets_master_key_meta \
+                         SET deactivated_at = ?1, rotated_to = ?2 \
+                         WHERE deactivated_at IS NULL AND key_ref != ?2",
+                        params![now_for_tx, new_key_ref_for_tx],
+                    )
+                    .map_err(|e| map_sqlite_error(e, "deactivate old key"))?;
+                    tx.execute(
+                        "UPDATE cirislens_secrets_master_key_meta \
+                         SET activated_at = COALESCE(activated_at, ?1) \
+                         WHERE key_ref = ?2",
+                        params![now_for_tx, new_key_ref_for_tx],
+                    )
+                    .map_err(|e| map_sqlite_error(e, "activate new key"))?;
+                    tx.commit()
+                        .map_err(|e| map_sqlite_error(e, "commit key-flip"))?;
+                }
                 Ok((reencrypted, failures))
             })
             .await
