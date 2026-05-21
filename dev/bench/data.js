@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779322858544,
+  "lastUpdate": 1779323531205,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -21203,6 +21203,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25848539,
             "range": "± 569987",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "b1ae590759d9383daef1f6b51912a8c1ac44051b",
+          "message": "1.7.6 — test_register_consumer_validation skips on postgres-only wheel\n\nThe v1.7.5 review-hardening release added a python behavior test\nthat constructs an in-memory SQLite Engine. The CI `full features`\njob builds the wheel postgres-only (the CI test wheel omits the\nsqlite feature), so the test failed `ValueError: ... sqlite feature\nwas not compiled in` and the tag-gated PyPI publish was skipped.\n\nThe test now pytest.skip()s when the wheel lacks the sqlite feature,\nmatching the surface-only convention of tests/python/. No code\nchange vs v1.7.5 — v1.7.6 is the version that actually publishes\nthe v1.7.5 review fixes.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-20T19:23:45-05:00",
+          "tree_id": "713610cff38e58be1863f6a3780e0a67db09ddcf",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/b1ae590759d9383daef1f6b51912a8c1ac44051b"
+        },
+        "date": 1779323529893,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 107396,
+            "range": "± 260",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 247101,
+            "range": "± 3613",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 526865,
+            "range": "± 7112",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1848417,
+            "range": "± 17137",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 351,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1460,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7516,
+            "range": "± 111",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21205,
+            "range": "± 208",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24239,
+            "range": "± 47",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83562,
+            "range": "± 187",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 361,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3056,
+            "range": "± 29",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9408,
+            "range": "± 26",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41546,
+            "range": "± 196",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 627,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2306672,
+            "range": "± 124753",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6682815,
+            "range": "± 347634",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 24169452,
+            "range": "± 150543",
             "unit": "ns/iter"
           }
         ]
