@@ -25,10 +25,10 @@ secrets under a deactivated key (folds in #87-review H1 at the
 source). Each secret row is self-describing (`encryption_key_ref`
 per row), so a partially-migrated table stays fully decryptable.
 
-### CIRISVerify pin → v2.6.1
+### CIRISVerify pin → v2.7.0
 
 `ciris-verify-core` / `ciris-keyring` / `ciris-crypto` bumped
-v2.5.0 → v2.6.1 (just shipped). No API breakage.
+v2.5.0 → v2.7.0 (just shipped). No API breakage.
 
 ### Benchmark-coverage cut
 
