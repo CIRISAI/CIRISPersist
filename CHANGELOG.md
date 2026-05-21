@@ -5,6 +5,66 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.8.0] — 2026-05-21
+
+**SQLite reaches full ReadEngine + DerivedSchema parity with Postgres.**
+
+Until now the SQLite backend implemented every *substrate* (audit,
+graph, telemetry, secrets, cirisnode, tasks, sequence, occurrence,
+…) but two FFI-exposed trait surfaces still returned
+`NotImplemented` on SQLite: the `ReadEngine` observability-analytics
+API (~21 methods) and the `DerivedSchema` write paths. A
+sovereign-mode deployment (Raspberry Pi / iOS, SQLite-backed) could
+not use the trace/LLM/federation read API or store lens-derived
+evidence at all. This release closes that gap — SQLite is now at
+100% parity with Postgres across both traits.
+
+### `ReadEngine` — 21 methods ported to SQLite
+
+`list_trace_summaries`, `get_trace_summary`, `get_trace_detail`,
+`list_tasks`, `list_llm_calls`, `aggregate_llm_costs`,
+`corpus_shape`, `aggregate_scrub_stats`, `list_federation_keys`,
+`list_attestations`, `list_revocations`, `cross_agent_divergence`,
+`temporal_drift`, `hash_chain_gaps`, `conscience_override_rates`,
+`aggregate_scoring_factors`, `aggregate_scoring_factors_batch`,
+`count_traces`, `count_overrides`, `count_identity_changes`,
+`aggregate_audit_chain` — every one now runs real SQL against the
+SQLite tables, with identical pagination/cursor semantics and the
+same `v1` cursor wire format as Postgres.
+
+The analytics methods that Postgres backs with TimescaleDB
+continuous aggregates are implemented as raw-window queries over
+`trace_events`. SQLite has no `STDDEV`/`VAR_SAMP`, so per-group
+means are computed in SQL and the variance / Welch-significance /
+z-score math is finished in Rust — results match the Postgres
+path.
+
+### `DerivedSchema` — `cirislens_derived` substrate on SQLite
+
+`put_detection_event`, `get_detection_events`,
+`put_calibration_bundle`, `get_current_calibration_bundle`,
+`get_calibration_bundle_by_version` now have real SQLite
+implementations. Same idempotency + conflict semantics as Postgres
+(PK collision is idempotent; collision with different
+`canonical_bytes` raises `Conflict`); the `is_current` calibration
+flip is a single transaction guarded by a partial-unique index.
+
+### V040 migration (SQLite only)
+
+`migrations/sqlite/lens/V040__cirislens_derived_tables.sql` adds
+`cirislens_derived_detection_events` +
+`cirislens_derived_calibration_bundles` — the SQLite-dialect
+equivalents of the Postgres `cirislens_derived` schema (Postgres
+already had these via V008). `TIMESTAMPTZ`→TEXT, `JSONB`→TEXT,
+`BYTEA`→BLOB, `BOOLEAN`→INTEGER; all CHECK constraints preserved.
+
+### Notes
+
+No public API change — these FFI methods already existed; they
+simply no longer fail on a SQLite engine. No Postgres-side change.
+18 new SQLite round-trip tests (13 `re_*` for ReadEngine, 5 `de_*`
+for DerivedSchema).
+
 ## [1.7.6] — 2026-05-21
 
 **CI fix — `test_register_consumer_validation` skips on a
