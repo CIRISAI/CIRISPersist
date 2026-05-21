@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779385775139,
+  "lastUpdate": 1779386338354,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -21863,6 +21863,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25691503,
             "range": "± 218329",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "2d38e35638895ca614a58d077a23f6498558e556",
+          "message": "fix(#87): durable hardware master key + partial-migration honesty\n\nSecurity review of the v1.10.0 secrets-hw work (caught before the\nv1.10.0 tag) found two data-integrity issues:\n\n- The derived hardware master key lived only in the in-process key\n  cache. After migrate_to_hardware_key flipped the active key to\n  `hardware`, a process restart left every secret encrypted under a\n  key whose bytes were gone — the store was unrecoverable.\n  active_master_key now re-derives a `hardware` key from its\n  TPM-sealed seed on a cache miss; the derivation is deterministic,\n  which is the whole point of the sealed seed. A `software` key has\n  no recovery path and stays fatal.\n- migrate_to_hardware_key ignored RotationResult.success and\n  returned Ok even when reencrypt_all left secrets stranded under\n  the deactivated old key. It now errors, naming the failed rows.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-21T12:50:39-05:00",
+          "tree_id": "645c5f0785bc07e2b3cdf185f9f97a6121547c16",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/2d38e35638895ca614a58d077a23f6498558e556"
+        },
+        "date": 1779386337720,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 108976,
+            "range": "± 2088",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 259170,
+            "range": "± 1972",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 561234,
+            "range": "± 20209",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1995873,
+            "range": "± 9177",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 347,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1498,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7362,
+            "range": "± 17",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23222,
+            "range": "± 517",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26448,
+            "range": "± 670",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91104,
+            "range": "± 206",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 351,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 2994,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9627,
+            "range": "± 37",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41885,
+            "range": "± 133",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 637,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2222737,
+            "range": "± 56749",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6984837,
+            "range": "± 140613",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25775917,
+            "range": "± 298565",
             "unit": "ns/iter"
           }
         ]
