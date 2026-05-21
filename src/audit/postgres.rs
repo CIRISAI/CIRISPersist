@@ -498,12 +498,19 @@ impl AuditService for PostgresBackend {
                     cur.version
                 )));
             }
-            let last_uuid = parse_entry_id(&cur.last_id)?;
-            params.push(Box::new(cur.last_ts));
-            let p_ts = params.len();
-            params.push(Box::new(last_uuid));
-            let p_id = params.len();
-            where_parts.push(format!("(recorded_at, entry_id) < (${p_ts}, ${p_id})"));
+            // An empty `last_id` is the documented "no cursor yet —
+            // return the first page" sentinel. Parse it as a UUID and
+            // apply the keyset predicate only for a real cursor;
+            // otherwise skip the predicate entirely. Matches
+            // `task_list` and the SQLite arm (CIRISPersist#86).
+            if !cur.last_id.is_empty() {
+                let last_uuid = parse_entry_id(&cur.last_id)?;
+                params.push(Box::new(cur.last_ts));
+                let p_ts = params.len();
+                params.push(Box::new(last_uuid));
+                let p_id = params.len();
+                where_parts.push(format!("(recorded_at, entry_id) < (${p_ts}, ${p_id})"));
+            }
         }
         params.push(Box::new(limit));
         let p_limit = params.len();
@@ -1721,6 +1728,59 @@ mod tests {
             }
             other => panic!("expected Break on tampered entry, got {other:?}"),
         }
+    }
+
+    /// CIRISPersist#86 — an `AuditCursor` with an empty `last_id` is
+    /// the "no cursor yet — first page" sentinel. Postgres used to
+    /// parse it unconditionally as a UUID and raise
+    /// (`entry_id parse: invalid length`); it must instead skip the
+    /// keyset predicate and return the first page, identical to
+    /// `task_list` and the SQLite arm.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn list_entries_empty_cursor_returns_first_page() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let key = SigningKey::from_bytes(&[0xB2; 32]);
+        let tenant = format!("audit-cursor-{}", Uuid::new_v4().simple());
+        let e1 = build_and_sign(
+            &key,
+            &tenant,
+            1,
+            GENESIS_PREV_HASH.to_vec(),
+            "handler_action_speak",
+        );
+        backend.record_entry(e1.clone()).await.unwrap();
+        let e2 = build_and_sign(&key, &tenant, 2, e1.entry_hash.clone(), "config_change");
+        backend.record_entry(e2.clone()).await.unwrap();
+
+        let filter = AuditFilter {
+            tenant_id: tenant.clone(),
+            action_type: None,
+            actor_id: None,
+            subject_kind: None,
+            subject_id: None,
+            recorded_after: None,
+            recorded_before: None,
+        };
+        let empty_cursor = AuditCursor {
+            version: "v1".to_owned(),
+            last_ts: chrono::DateTime::parse_from_rfc3339("9999-12-31T23:59:59Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            last_id: String::new(),
+        };
+        let page = backend
+            .list_entries(filter, Some(empty_cursor), 10)
+            .await
+            .expect("empty last_id must be accepted as the first-page sentinel");
+        assert_eq!(page.items.len(), 2, "first page returns all entries");
     }
 
     /// Build + sign an entry whose payload carries a `correlation_id`.

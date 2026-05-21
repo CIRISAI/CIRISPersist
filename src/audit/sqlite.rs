@@ -540,9 +540,16 @@ impl AuditService for SqliteAuditBackend {
                     cur.version
                 )));
             }
-            params.push(SqlValue::Text(fmt_datetime(cur.last_ts)));
-            params.push(SqlValue::Text(cur.last_id.clone()));
-            where_parts.push("(recorded_at, entry_id) < (?, ?)".to_string());
+            // An empty `last_id` is the "no cursor yet — first page"
+            // sentinel; skip the keyset predicate entirely rather
+            // than emitting a degenerate `< (ts, '')` compare. Keeps
+            // the two backends behaviourally identical
+            // (CIRISPersist#86).
+            if !cur.last_id.is_empty() {
+                params.push(SqlValue::Text(fmt_datetime(cur.last_ts)));
+                params.push(SqlValue::Text(cur.last_id.clone()));
+                where_parts.push("(recorded_at, entry_id) < (?, ?)".to_string());
+            }
         }
         params.push(SqlValue::Integer(limit));
         let where_sql = where_parts.join(" AND ");
@@ -1772,6 +1779,51 @@ mod tests {
             }
             other => panic!("expected Break, got {other:?}"),
         }
+    }
+
+    /// CIRISPersist#86 — an `AuditCursor` with an empty `last_id` is
+    /// the "no cursor yet — first page" sentinel (CIRISAgent's audit
+    /// service builds exactly this on the first write of a process
+    /// to read the chain head). It must return the first page, not
+    /// apply a degenerate keyset predicate or raise.
+    #[tokio::test]
+    async fn list_entries_empty_cursor_returns_first_page() {
+        let (_b, audit) = fresh_backend().await;
+        let key = SigningKey::from_bytes(&[0xB2; 32]);
+        let tenant = format!("audit-cursor-{}", Uuid::new_v4().simple());
+
+        let e1 = build_and_sign(
+            &key,
+            &tenant,
+            1,
+            GENESIS_PREV_HASH.to_vec(),
+            "handler_action_speak",
+        );
+        audit.record_entry(e1.clone()).await.unwrap();
+        let e2 = build_and_sign(&key, &tenant, 2, e1.entry_hash.clone(), "config_change");
+        audit.record_entry(e2.clone()).await.unwrap();
+
+        let filter = AuditFilter {
+            tenant_id: tenant.clone(),
+            action_type: None,
+            actor_id: None,
+            subject_kind: None,
+            subject_id: None,
+            recorded_after: None,
+            recorded_before: None,
+        };
+        let empty_cursor = AuditCursor {
+            version: "v1".to_owned(),
+            last_ts: chrono::DateTime::parse_from_rfc3339("9999-12-31T23:59:59Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            last_id: String::new(),
+        };
+        let page = audit
+            .list_entries(filter, Some(empty_cursor), 10)
+            .await
+            .expect("empty last_id must be accepted as the first-page sentinel");
+        assert_eq!(page.items.len(), 2, "first page returns all entries");
     }
 
     /// v1.0.0 (CIRISAgent#756 #2): two concurrent `try_claim_event`

@@ -5,6 +5,30 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.8.1] — 2026-05-21
+
+**Fix: `audit_list_entries` rejected an empty-`last_id` cursor on
+Postgres (CIRISPersist#86).**
+
+An `AuditCursor` whose `last_id` is the empty string is the
+documented "no cursor yet — return the first page" sentinel.
+CIRISAgent's audit service builds exactly this on the first write
+of a process to read the chain head. The Postgres `list_entries`
+parsed `last_id` as a UUID unconditionally and raised
+`invalid argument: entry_id parse: invalid length` — so on Postgres
+deployments the agent's audit hash chain failed to initialize on
+first write (non-fatal, but the chain did not start).
+
+`task_list` and the SQLite arm already treated an empty `last_id`
+as "first page", so this was both a SQLite-permissive /
+Postgres-strict divergence and an internal inconsistency between
+two substrates of the same engine.
+
+Both backends now skip the keyset predicate entirely when `last_id`
+is empty (Postgres parses it as a UUID only when non-empty; SQLite
+no longer emits a degenerate `< (ts, '')` compare). Behaviour is
+now identical across backends and consistent with `task_list`.
+
 ## [1.8.0] — 2026-05-21
 
 **SQLite reaches full ReadEngine + DerivedSchema parity with Postgres.**
