@@ -1364,11 +1364,48 @@ impl SecretsService for SqliteSecretsBackend {
 
     async fn migrate_to_hardware_key(
         &self,
-        _accessor: String,
+        accessor: String,
     ) -> Result<MasterKeyRef, SecretsError> {
-        Err(SecretsError::HardwareKeyUnavailable(
-            "v0.9.3 SQLite: same as v0.6.1 Postgres — waits on ciris-keyring/symmetric-derivation upstream".into(),
-        ))
+        // Derive the hardware-rooted master key — CIRISVerify owns the
+        // derivation (HKDF over a hardware-sealed seed). Blocking I/O
+        // (TPM + filesystem), so it runs on a blocking thread.
+        let (master, descriptor) =
+            tokio::task::spawn_blocking(crate::secrets::hardware::derive_hardware_master_key)
+                .await
+                .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))??;
+
+        let new_key_ref = Uuid::new_v4().to_string();
+        let conn = self.conn.clone();
+        let new_key_ref_for_db = new_key_ref.clone();
+        let descriptor_for_db = descriptor.clone();
+        let now = fmt_datetime(Utc::now());
+        // Record the new key as `hardware`, not yet active —
+        // `reencrypt_all` activates it once every secret is
+        // re-encrypted (same staging as `rotate_master_key`).
+        tokio::task::spawn_blocking(move || -> Result<(), SecretsError> {
+            let guard = conn.blocking_lock();
+            guard
+                .execute(
+                    "INSERT INTO cirislens_secrets_master_key_meta (\
+                        key_ref, key_kind, descriptor, created_at\
+                     ) VALUES (?1, 'hardware', ?2, ?3)",
+                    params![new_key_ref_for_db, descriptor_for_db, now],
+                )
+                .map_err(|e| map_sqlite_error(e, "migrate_to_hardware_key insert"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))??;
+        software_keys_put(new_key_ref.clone(), master)?;
+
+        let ref_out = MasterKeyRef::Hardware {
+            key_id: new_key_ref,
+            descriptor,
+        };
+        // Re-encrypt every secret under the hardware master key and
+        // flip the active key. `reencrypt_all` audits the pass.
+        self.reencrypt_all(ref_out.clone(), accessor).await?;
+        Ok(ref_out)
     }
 
     async fn try_claim_secret(
@@ -1914,12 +1951,16 @@ mod tests {
         assert!(!stats.hardware_key_active, "v0.9.3 hardware key deferred");
         assert!(secrets.is_healthy().await.unwrap());
 
-        // 12. migrate_to_hardware_key returns HardwareKeyUnavailable.
-        let err = secrets
-            .migrate_to_hardware_key("test".into())
-            .await
-            .unwrap_err();
-        assert!(matches!(err, SecretsError::HardwareKeyUnavailable(_)));
+        // 12. migrate_to_hardware_key (CIRISPersist#87). Environment-
+        // dependent: a usable TPM → `Ok(Hardware{..})`; none →
+        // `HardwareKeyUnavailable`. Both are correct; anything else
+        // (Backend / Crypto / panic) is a real bug.
+        match secrets.migrate_to_hardware_key("test".into()).await {
+            Ok(MasterKeyRef::Hardware { .. }) => {}
+            Ok(other) => panic!("migrate_to_hardware_key returned non-Hardware ref: {other:?}"),
+            Err(SecretsError::HardwareKeyUnavailable(_)) => {}
+            Err(other) => panic!("migrate_to_hardware_key failed unexpectedly: {other:?}"),
+        }
 
         // 13. Stubs return Internal (matches v0.6.1 PG behavior).
         let err = secrets

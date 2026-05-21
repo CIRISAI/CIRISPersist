@@ -5,6 +5,57 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.10.0] — 2026-05-21
+
+**Hardware-backed secrets-at-rest — `migrate_to_hardware_key` is now
+real (CIRISPersist#87).**
+
+`SecretsService::migrate_to_hardware_key` was an unconditional
+`HardwareKeyUnavailable` stub. It now derives the secrets-store
+master key from a **hardware-sealed seed** and re-encrypts every
+secret under it — closing the last gap in a CIRISAgent's
+crypto-at-rest story (identity key + wallet seed were already
+TPM-sealed; the secrets master was software-only).
+
+### Verify owns the crypto
+
+The master key is derived via
+`ciris_verify_core::derive_symmetric_key` (HKDF-SHA256 over a seed
+loaded from a hardware-backed `SecureBlobStorage`). Persist calls
+CIRISVerify for the derivation and never rolls its own KDF.
+
+v2.4.0 trapped that function behind the C-ABI-only
+`ciris-verify-ffi` crate (no `rlib` — not Rust-linkable);
+**CIRISVerify#25 / v2.5.0** promoted it into the `ciris-verify-core`
+rlib so persist can consume it. The CIRISVerify pins
+(`ciris-verify-core` / `ciris-keyring` / `ciris-crypto`) move
+v2.4.0 → v2.5.0.
+
+### Hardware-capable on every platform, auto-detected
+
+`ciris-keyring`'s hardware-storage backends are now enabled
+per-target via `[target.*]` dependency tables: `tpm` on Linux,
+`ios` on iOS, `android` on Android. `create_platform_storage`
+runtime-detects the hardware and falls back to software storage
+where there is none — so `migrate_to_hardware_key` does real
+hardware migration on a TPM/Keystore/Secure-Enclave host and
+returns `HardwareKeyUnavailable` (caller keeps the software master
+key) on a host without. The Linux `tpm` feature builds `tss-esapi`;
+the CI Linux jobs apt-install `libtss2-dev`.
+
+### Build hygiene
+
+`[profile.dev] debug = "line-tables-only"` — full debuginfo on this
+crate's dep graph (pyo3 + the CIRISVerify stack + rusqlite +
+timescale), compounded across every `--features` combination a
+dev/CI session builds, had let `target/debug` reach 122 GiB.
+`line-tables-only` keeps panic backtraces (file/line) while cutting
+the per-build footprint several-fold.
+
+No migration, no schema change — `migrate_to_hardware_key` records
+its key as `master_key_meta.key_kind = 'hardware'` in the existing
+V010 table.
+
 ## [1.9.0] — 2026-05-21
 
 **Change-feed / subscription API for cross-consumer notification

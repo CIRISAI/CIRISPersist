@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "1.9.0"
+version = "1.10.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -445,14 +445,14 @@ tls = ["dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-native-certs"]
 # ciris-crypto invariant (FSD §7.5a) means persist takes ZERO direct
 # deps on AES-GCM/PBKDF2/HKDF/HMAC primitive crates ever — the
 # `src/secrets/crypto.rs` facade lands as a single import-site change.
-ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.4.0", version = "2", features = ["pqc-ml-dsa"] }
-ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.4.0", version = "2" }
+ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.5.0", version = "2", features = ["pqc-ml-dsa"] }
+ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.5.0", version = "2" }
 # v0.3.6 (CIRISPersist#14) — direct ciris-crypto dep for HybridVerifier
 # in `Engine.verify_hybrid`. Same git source / tag as ciris-keyring +
 # ciris-verify-core so versions are workspace-coherent. Features
 # `ed25519` + `pqc-ml-dsa` light up the concrete Ed25519Verifier +
 # MlDsa65Verifier impls used by HybridVerifier::verify.
-ciris-crypto      = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.4.0", version = "2", features = ["ed25519", "pqc-ml-dsa"] }
+ciris-crypto      = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.5.0", version = "2", features = ["ed25519", "pqc-ml-dsa"] }
 async-trait   = "0.1"
 # v0.1.14 — filesystem advisory locks for the cohabitation
 # bootstrap (docs/COHABITATION.md). POSIX flock cross-process,
@@ -593,6 +593,36 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "signa
 [target.'cfg(not(target_os = "ios"))'.dependencies]
 rusqlite = { version = "0.31", features = ["bundled", "chrono", "serde_json"], optional = true }
 
+# v1.10.0 (CIRISPersist#87) — per-platform hardware-backed secure
+# storage for `secrets::migrate_to_hardware_key`. ciris-keyring's
+# hardware storage backends are feature-gated; cargo UNIONS the
+# features from `[dependencies]` (`pqc-ml-dsa`) with any matching
+# `[target.*]` table, so each build target picks up the right backend
+# automatically with no per-target maturin config:
+#   - Linux   → `tpm`     (TPM 2.0 via tss-esapi — needs libtss2 at
+#                          BUILD time; the CI Linux jobs apt-install
+#                          `libtss2-dev`)
+#   - iOS     → `ios`     (Secure Enclave / Keychain — pulls no extra
+#                          crates; `ios` is a cfg-only keyring feature)
+#   - Android → `android` (Keystore / StrongBox)
+# macOS desktop / Windows keep the base set (software + OS keyring) —
+# ciris-keyring exposes no hardware backend for them.
+#
+# `create_platform_storage` runtime-detects the hardware and falls
+# back to software storage where there is none, so a `tpm`-built
+# binary still runs on a no-TPM host (`migrate_to_hardware_key` then
+# returns `HardwareKeyUnavailable` and the caller keeps the software
+# master key). Placed AFTER every platform-independent dep — see the
+# v0.9.0 bug note on the rusqlite target table above.
+[target.'cfg(target_os = "linux")'.dependencies]
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.5.0", version = "2", features = ["pqc-ml-dsa", "tpm"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.5.0", version = "2", features = ["pqc-ml-dsa", "ios"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.5.0", version = "2", features = ["pqc-ml-dsa", "android"] }
+
 [dev-dependencies]
 # Mission category §4: canonicalization parity. Used to validate our
 # Python-compatible canonicalizer against the JCS reference. NOT a
@@ -657,6 +687,19 @@ harness = false
 name = "queue"
 harness = false
 required-features = ["postgres"]
+
+# v1.10.0 — keep `target/` from ballooning. The full debuginfo
+# (`debug = 2`, the default) is the dominant cost in dev/test builds,
+# and this crate's dep graph is large (pyo3 + the CIRISVerify stack +
+# rusqlite + timescale). Each distinct `--features` combination cargo
+# is asked to build keeps its own artifacts, so debuginfo bloat
+# compounds fast across a multi-feature dev/CI session — a full
+# `target/debug` had reached 122 GiB once. `line-tables-only` keeps
+# panic backtraces with file/line intact (the only debuginfo a
+# release-engineering workflow actually needs) while cutting the
+# per-build footprint several-fold. The `test` profile inherits this.
+[profile.dev]
+debug = "line-tables-only"
 
 [profile.release]
 lto = "thin"

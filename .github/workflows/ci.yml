@@ -36,6 +36,11 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@v4
+      # v1.10.0 (CIRISPersist#87) — ciris-keyring's `tpm` feature
+      # (auto-enabled for Linux targets, see Cargo.toml) builds
+      # `tss-esapi`, which links libtss2 at build time.
+      - name: install libtss2-dev (TPM build dep)
+        run: sudo apt-get update && sudo apt-get install -y libtss2-dev
       - uses: dtolnay/rust-toolchain@stable
       # v1.1.2 (CIRISVerify v2.1.1 hardening pattern):
       # `continue-on-error: true` on cache restore. A cache miss /
@@ -155,6 +160,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # v1.10.0 (CIRISPersist#87) — libtss2 for the `tpm` keyring
+      # feature (clippy compiles the full graph).
+      - name: install libtss2-dev (TPM build dep)
+        run: sudo apt-get update && sudo apt-get install -y libtss2-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -212,6 +221,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # v1.10.0 (CIRISPersist#87) — libtss2 for the `tpm` keyring
+      # feature on the Linux wheel builds. macOS wheels build the
+      # base keyring (no tss-esapi), so this step is Linux-only.
+      - name: install libtss2-dev (TPM build dep)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libtss2-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
@@ -395,6 +410,10 @@ jobs:
       actions: read
     steps:
       - uses: actions/checkout@v4
+      # v1.10.0 (CIRISPersist#87) — libtss2 for the `tpm` keyring
+      # feature; the emit_persist_extras step compiles the crate.
+      - name: install libtss2-dev (TPM build dep)
+        run: sudo apt-get update && sudo apt-get install -y libtss2-dev
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable

@@ -41,12 +41,20 @@
 //!   plus crypto facade. Implies `postgres` + ciris-crypto's aes-gcm
 //!   / kdf / hmac / random features.
 //! - `secrets-server` — HTTP API endpoints. Requires `server`.
-//! - `secrets-hw` — *deferred*. Hardware-key migration via
-//!   CIRISVerify TPM/Keystore. Waits on a `symmetric-derivation`
-//!   feature add upstream in `ciris-keyring`.
+//!
+//! Hardware-key migration (`migrate_to_hardware_key`) is **active**
+//! as of v1.10.0 (CIRISPersist#87) — no separate feature gate. It
+//! derives the secrets master key from a hardware-sealed seed via
+//! [`ciris_verify_core::derive_symmetric_key`] (CIRISVerify v2.5.0+);
+//! see [`hardware`]. On a host with no TPM / Keystore / Secure
+//! Enclave it returns [`SecretsError::HardwareKeyUnavailable`] and
+//! the caller stays on the software master key.
 
 #[cfg(feature = "secrets")]
 pub mod crypto;
+
+#[cfg(feature = "secrets")]
+pub(crate) mod hardware;
 
 #[cfg(feature = "secrets")]
 pub(crate) mod key_cache;
