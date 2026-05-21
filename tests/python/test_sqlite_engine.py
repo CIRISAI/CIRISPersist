@@ -85,10 +85,19 @@ def test_register_consumer_validation() -> None:
     """v1.7.4 (#82) + v1.7.5 (#82 review) — register_consumer rejects
     unknown substrate-family names and over-long consumer names, and
     substrate_owner reports the declared owner. In-memory SQLite needs
-    no keyring, so the behavior is exercisable here."""
+    no keyring, so the behavior is exercisable here.
+
+    Skips when the wheel was built without the `sqlite` feature — the
+    CI `full features` job builds postgres-only (per pyproject), so
+    this behavior test only runs against a sqlite-enabled build."""
     import pytest
 
-    eng = ciris_persist.Engine(dsn="sqlite://:memory:", signing_key_id="qa-key")
+    try:
+        eng = ciris_persist.Engine(dsn="sqlite://:memory:", signing_key_id="qa-key")
+    except ValueError as exc:
+        if "sqlite" in str(exc) and "feature" in str(exc):
+            pytest.skip("wheel built without the sqlite feature")
+        raise
     try:
         eng.register_consumer("nodecore", ["cirisnode"])
         assert eng.substrate_owner("cirisnode") == "nodecore"

@@ -5,6 +5,26 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.7.6] — 2026-05-21
+
+**CI fix — `test_register_consumer_validation` skips on a
+postgres-only wheel.**
+
+The v1.7.5 review-hardening release added a python behavior test
+that constructs an in-memory SQLite `Engine`. The CI `full
+features` job builds the wheel **postgres-only** (per the
+`pyproject.toml` note — release wheels carry sqlite, the CI test
+wheel does not), so the test failed `ValueError: ... the sqlite
+feature was not compiled in`, which skipped the tag-gated PyPI
+publish. The test now `pytest.skip`s when the wheel lacks the
+`sqlite` feature, matching the surface-only convention of the rest
+of `tests/python/`.
+
+No code change vs v1.7.5 — the v1.7.5 review fixes (error-kind
+classification, close()/register_consumer race, registry bounds,
+sequence overflow guard) are unchanged. v1.7.6 is the version that
+actually publishes them.
+
 ## [1.7.5] — 2026-05-20
 
 **Pre-pin review hardening — code-quality + security pass on the
