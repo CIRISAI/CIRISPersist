@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779325145933,
+  "lastUpdate": 1779330624838,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -21467,6 +21467,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23754167,
             "range": "± 1083190",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "5e67e8bdfd9fb9dc520df5b92a150656e74f6920",
+          "message": "1.8.1 — audit_list_entries accepts empty-last_id cursor (closes #86)\n\nAn AuditCursor with an empty last_id is the documented \"no cursor\nyet — first page\" sentinel. The Postgres list_entries parsed\nlast_id as a UUID unconditionally and raised on the empty string,\nso CIRISAgent 2.9.0's audit hash chain failed to initialize on the\nfirst write on Postgres deployments (non-fatal).\n\ntask_list and the SQLite arm already treated empty last_id as\n\"first page\" — this was a SQLite-permissive/Postgres-strict\ndivergence plus an internal inconsistency. Both backends now skip\nthe keyset predicate when last_id is empty.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-20T21:20:48-05:00",
+          "tree_id": "23bf1f539e2bd1c10d26299bdfe130eb7f01068e",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/5e67e8bdfd9fb9dc520df5b92a150656e74f6920"
+        },
+        "date": 1779330623615,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 84393,
+            "range": "± 171",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 200976,
+            "range": "± 534",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 433603,
+            "range": "± 1031",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1537718,
+            "range": "± 3863",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 267,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1088,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 5501,
+            "range": "± 67",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 18046,
+            "range": "± 33",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 20532,
+            "range": "± 42",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 70644,
+            "range": "± 116",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 274,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 2493,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 7533,
+            "range": "± 112",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 32989,
+            "range": "± 200",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 520,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2207557,
+            "range": "± 3774959",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 5847860,
+            "range": "± 654171",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 20644081,
+            "range": "± 7091174",
             "unit": "ns/iter"
           }
         ]
