@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779321593696,
+  "lastUpdate": 1779322858544,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -21071,6 +21071,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 23278899,
             "range": "± 183197",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "04aaffa95622128841ec7fc6f8113dd0ea8397fe",
+          "message": "1.7.5 — pre-pin review hardening (code-quality + security pass)\n\nFixes from a three-reviewer audit of the v1.6.7..v1.7.4 in-process-\ncohabitation sprint, run before the federation pins a 3.0-ready\nciris-persist:\n\n- CRITICAL: translate_error_kind had no sequence_*/occurrence_* arms,\n  so every error from those substrates was mislabeled Permanent —\n  transient backend failures surfaced as non-retryable. Now mapped\n  to NotFound/Conflict/Transient correctly.\n- close()/register_consumer attach-during-close race: close() now\n  holds the consumer-registry lock across the `closed` store and\n  register_consumer re-checks `closed` under it.\n- Consumer registry is now bounded (64 entries, 256-byte names,\n  deduped substrate lists) — a leaking consumer can no longer OOM\n  the shared process.\n- Sequence i64->u64 decode rejects a negative counter (tampering /\n  silent SQLite BIGINT overflow) instead of casting to a huge value.\n- register_occurrence gained an explicit #[pyo3(signature)]; close()\n  doc states it is not a quiescence barrier.\n\nNo API additions, no migration, no schema change.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-20T19:13:00-05:00",
+          "tree_id": "44bae7347f9beacbb086bdb7bc3b690f53346aa2",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/04aaffa95622128841ec7fc6f8113dd0ea8397fe"
+        },
+        "date": 1779322857923,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 108885,
+            "range": "± 463",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 259359,
+            "range": "± 4593",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 557710,
+            "range": "± 1587",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1985855,
+            "range": "± 2897",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 347,
+            "range": "± 26",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1416,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8599,
+            "range": "± 29",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23244,
+            "range": "± 126",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26456,
+            "range": "± 105",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91056,
+            "range": "± 702",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 367,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3069,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9649,
+            "range": "± 17",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41664,
+            "range": "± 187",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 637,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2265363,
+            "range": "± 40711",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7003442,
+            "range": "± 40604",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25848539,
+            "range": "± 569987",
             "unit": "ns/iter"
           }
         ]
