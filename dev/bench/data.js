@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779330624838,
+  "lastUpdate": 1779379705770,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -21599,6 +21599,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 20644081,
             "range": "± 7091174",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "597ac2f69f1bb4a9e29712c078e3a65ed308723b",
+          "message": "1.9.0 — change-feed / subscription API (closes #84)\n\nUnder the process-singleton engine, co-resident consumers (agent +\nNodeCore + LensCore) had no way to react to each other's writes\nexcept polling. v1.9.0 adds an in-process pub/sub bus keyed by\nsubstrate family — the last enabler of the #85 cohabitation EPIC.\n\nNew Engine methods: subscribe(substrate, callback) -> id,\nunsubscribe(id), publish_change(substrate, event_json) -> count,\nlist_subscriptions(), subscription_count.\n\nDispatch is synchronous and in-process: publish_change invokes\nevery matching callback in subscription-id order before returning;\na callback that raises is caught and logged without aborting the\npublish or the other callbacks. No persistence/replay — in-process\nnotification, not a durable log; the docs state this honest\nguarantee rather than claiming \"at-least-once\". Registry bounded at\n256 subscriptions; dispatch snapshots its target list so callbacks\nmay subscribe/unsubscribe/publish re-entrantly without deadlock.\n\nNo migration, no schema change.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-21T10:54:21-05:00",
+          "tree_id": "bf15ab6788876ae1be29e1b5b06e79d8510ecd66",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/597ac2f69f1bb4a9e29712c078e3a65ed308723b"
+        },
+        "date": 1779379705043,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 116236,
+            "range": "± 3658",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 266659,
+            "range": "± 3599",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 566580,
+            "range": "± 3836",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1990367,
+            "range": "± 9275",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 350,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1448,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7154,
+            "range": "± 38",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23133,
+            "range": "± 362",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26375,
+            "range": "± 43",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91022,
+            "range": "± 363",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 355,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3057,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9392,
+            "range": "± 141",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41614,
+            "range": "± 280",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 631,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2264531,
+            "range": "± 30094",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 7030563,
+            "range": "± 64404",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25940636,
+            "range": "± 519625",
             "unit": "ns/iter"
           }
         ]
