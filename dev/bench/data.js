@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779386338354,
+  "lastUpdate": 1779388464750,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -21995,6 +21995,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 25775917,
             "range": "± 298565",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "bc4cc596861052270f93a46c2a3da7b26c0f6252",
+          "message": "1.10.1 — reset_engine() + v1.10.0 hardening-review follow-ups\n\nNew: ciris_persist.reset_engine() (closes #88) — a module-level,\nhandle-free reset of the process-singleton engine. Engine.close()\nneeds a live handle; a test fixture that drops its Python reference\nwithout closing leaves the Rust singleton pinned and un-referenceable\n(\"orphan case\"), and the next Engine() raises EngineConfigMismatch\nforever — which made CIRISAgent 2.9.0's multi-fixture pytest suite\nun-greenable. reset_engine() clears the singleton slot synchronously\nand tears down the runtime; no-op when none pinned; correct under\nrepeated reset/construct cycles.\n\nHardening-review follow-ups on the v1.10.0 secrets-hw work:\n- H2: the software-key cache + the hardware seed are now Zeroizing —\n  freed master/seed bytes are scrubbed, not left in the heap.\n- M4: get_service_stats.hardware_key_active reflects the active\n  key's key_kind instead of a hard-coded false.\n- M2: migrate_to_hardware_key refuses (HardwareKeyUnavailable) when\n  CIRIS_DATA_DIR is unset rather than placing hardware-key storage\n  under a world-writable /tmp path. BEHAVIOUR CHANGE — a deployment\n  wanting hardware-backed secrets must set CIRIS_DATA_DIR.\n\nV041 migration (both backends): trace_events (agent_id_hash, ts) +\n(deployment_domain, ts) indexes — the ReadEngine analytics + count_*\nmethods filter <col> = ? AND ts range with no composite index to\ncover it; they were full-scanning per agent/domain.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-21T13:25:31-05:00",
+          "tree_id": "ac9833207cdf7d221643755c775125c7ff4dd062",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/bc4cc596861052270f93a46c2a3da7b26c0f6252"
+        },
+        "date": 1779388463453,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 84785,
+            "range": "± 225",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 201965,
+            "range": "± 2897",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 435356,
+            "range": "± 1593",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1542283,
+            "range": "± 13348",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 265,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1070,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 6293,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 18018,
+            "range": "± 43",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 20509,
+            "range": "± 326",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 70610,
+            "range": "± 197",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 276,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 2419,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 7696,
+            "range": "± 20",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 32382,
+            "range": "± 116",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 507,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2152646,
+            "range": "± 482756",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 5847489,
+            "range": "± 643728",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 20413329,
+            "range": "± 4582732",
             "unit": "ns/iter"
           }
         ]
