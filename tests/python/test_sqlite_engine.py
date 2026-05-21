@@ -76,5 +76,30 @@ def test_engine_has_cohabitation_surface() -> None:
         "deregister_consumer",
         "list_consumers",
         "consumer_count",
+        "substrate_owner",
     ):
         assert hasattr(ciris_persist.Engine, attr), f"Engine.{attr} missing"
+
+
+def test_register_consumer_validation() -> None:
+    """v1.7.4 (#82) + v1.7.5 (#82 review) — register_consumer rejects
+    unknown substrate-family names and over-long consumer names, and
+    substrate_owner reports the declared owner. In-memory SQLite needs
+    no keyring, so the behavior is exercisable here."""
+    import pytest
+
+    eng = ciris_persist.Engine(dsn="sqlite://:memory:", signing_key_id="qa-key")
+    try:
+        eng.register_consumer("nodecore", ["cirisnode"])
+        assert eng.substrate_owner("cirisnode") == "nodecore"
+        assert eng.substrate_owner("cirisgraph") is None
+
+        # v1.7.4 — typo in a substrate family is rejected.
+        with pytest.raises(ValueError):
+            eng.register_consumer("typo", ["cirsnode"])
+
+        # v1.7.5 — over-long consumer name is rejected.
+        with pytest.raises(ValueError):
+            eng.register_consumer("x" * 300, [])
+    finally:
+        eng.close(force=True)

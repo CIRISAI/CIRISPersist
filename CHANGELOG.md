@@ -5,6 +5,65 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.7.5] — 2026-05-20
+
+**Pre-pin review hardening — code-quality + security pass on the
+v1.6.7..v1.7.4 in-process-cohabitation sprint.**
+
+A three-reviewer audit ran before the federation pins a 3.0-ready
+`ciris-persist`. v1.7.5 fixes the blockers it found; no API
+additions, no migration, no schema change.
+
+### Fixed — CRITICAL: sequence/occurrence errors mislabeled `Permanent`
+
+`translate_error_kind` (the FFI error-classification table) had no
+arms for the `sequence_*` / `occurrence_*` `kind()` tokens shipped
+in v1.7.1 / v1.7.3, so **every** error from those two substrates
+fell through to `Permanent`. A transient backend failure (pool
+exhaustion, connection drop) surfaced as non-retryable, and a
+`Conflict` never reached `except Conflict`. Now mapped correctly:
+`*_not_found` → `NotFound`, `*_conflict` → `Conflict`, `*_backend`
+→ `Transient`; `*_invalid_argument` / `*_internal` stay `Permanent`.
+
+### Fixed — `close()` / `register_consumer` attach-during-close race
+
+`close()` checked the consumer registry empty, released the lock,
+then set the `closed` flag — a `register_consumer` could slip into
+that window and attach to an engine that was about to tear down.
+`close()` now holds the registry lock across the `closed` store,
+and `register_consumer` re-checks `closed` under the same lock, so
+attach and close are mutually exclusive.
+
+### Fixed — consumer registry is now bounded
+
+The process-global consumer registry had no size or name-length
+cap: a co-resident consumer that re-registered under fresh names
+without `deregister_consumer` could grow it without limit and OOM
+every cohabiting consumer. Now capped at 64 entries and 256-byte
+names; declared substrate lists are deduped. A new registration
+past the cap raises `RuntimeError` (leak guard); re-registering an
+existing name is always allowed.
+
+### Fixed — sequence counter `i64`→`u64` decode guard
+
+`next_value` is a signed DB column; a bare `as u64` cast on a
+negative value (row tampering, or a silent SQLite `BIGINT`
+overflow wrap) produced a huge non-monotonic number handed to a
+consumer that relies on monotonic ordering. The decode now rejects
+a negative counter with a loud `sequence_internal` error.
+
+### Other
+
+- `register_occurrence` gained an explicit `#[pyo3(signature=...)]`
+  for consistency with every other multi-optional-arg method.
+- `close()` doc now states plainly it is **not a quiescence
+  barrier** — it does not drain in-flight operations on other
+  threads; callers needing a hard drain quiesce their consumers
+  first. (Review HIGH, documented as a deliberate boundary.)
+- `docs/COHABITATION.md` substrate-ownership section unchanged;
+  the advisory (non-enforced) nature of `substrate_owner` was a
+  review finding and is already documented there.
+
 ## [1.7.4] — 2026-05-20
 
 **Per-consumer substrate ownership declaration (CIRISPersist#82).**

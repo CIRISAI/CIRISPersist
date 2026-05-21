@@ -70,7 +70,7 @@ impl SequenceService for PostgresBackend {
         let value: i64 = row
             .try_get("next_value")
             .map_err(|e| Error::Backend(format!("decode next_value: {e}")))?;
-        Ok(value as u64)
+        super::decode_sequence_value(value)
     }
 
     async fn peek_sequence(&self, identity: &str, stream: &str) -> Result<u64, Error> {
@@ -94,7 +94,7 @@ impl SequenceService for PostgresBackend {
                 let value: i64 = row
                     .try_get("next_value")
                     .map_err(|e| Error::Backend(format!("decode next_value: {e}")))?;
-                Ok(value as u64)
+                super::decode_sequence_value(value)
             }
         }
     }

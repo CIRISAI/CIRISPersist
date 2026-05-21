@@ -95,7 +95,7 @@ impl SequenceService for SqliteSequenceBackend {
                     |row| row.get(0),
                 )
                 .map_err(|e| map_sqlite_error(e, "next_sequence"))?;
-            Ok(value as u64)
+            super::decode_sequence_value(value)
         })
         .await
         .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
@@ -117,7 +117,7 @@ impl SequenceService for SqliteSequenceBackend {
                 )
                 .optional()
                 .map_err(|e| map_sqlite_error(e, "peek_sequence"))?;
-            Ok(value_opt.unwrap_or(0) as u64)
+            value_opt.map_or(Ok(0), super::decode_sequence_value)
         })
         .await
         .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?

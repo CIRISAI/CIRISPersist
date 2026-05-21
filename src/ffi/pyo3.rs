@@ -176,7 +176,9 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "feedback_mappings_not_found"
         | "wa_cert_not_found"
         | "service_token_revocation_not_found"
-        | "legacy_migration_not_found" => NotFound::new_err(msg),
+        | "legacy_migration_not_found"
+        | "sequence_not_found"
+        | "occurrence_not_found" => NotFound::new_err(msg),
 
         // Conflict family — uniqueness / version / state-transition
         // conflict; caller MUST NOT retry, MUST re-read.
@@ -197,7 +199,9 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "feedback_mappings_conflict"
         | "wa_cert_conflict"
         | "service_token_revocation_conflict"
-        | "legacy_migration_conflict" => Conflict::new_err(msg),
+        | "legacy_migration_conflict"
+        | "sequence_conflict"
+        | "occurrence_conflict" => Conflict::new_err(msg),
 
         // Transient family — backend connection / timeout / pool
         // exhaustion; caller MAY retry with backoff.
@@ -220,7 +224,9 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "feedback_mappings_backend"
         | "wa_cert_backend"
         | "service_token_revocation_backend"
-        | "legacy_migration_backend" => Transient::new_err(msg),
+        | "legacy_migration_backend"
+        | "sequence_backend"
+        | "occurrence_backend" => Transient::new_err(msg),
 
         // Default — Permanent. Covers invalid arguments, signature
         // failures, crypto errors, rotation conflicts, "not authorized,"
@@ -270,6 +276,19 @@ const KNOWN_SUBSTRATES: &[&str] = &[
     "cirisgraph",
     "cirisnode",
 ];
+
+/// v1.7.5 (#82 review, security M1) — bounds on the shared
+/// consumer registry. The registry is process-global; a buggy or
+/// hostile co-resident consumer that re-registers under fresh names
+/// without `deregister_consumer` would otherwise grow it without
+/// limit and OOM every cohabiting consumer. 64 entries is far above
+/// any real in-process deployment (agent + NodeCore + LensCore = 3).
+const MAX_CONSUMERS: usize = 64;
+
+/// v1.7.5 (#82 review, security M1) — max consumer-name length, in
+/// bytes. Names are caller-supplied diagnostic labels; 256 bytes is
+/// generous for `"<repo>-<adapter>"` while bounding map growth.
+const MAX_CONSUMER_NAME_LEN: usize = 256;
 
 /// v1.7.0 (CIRISPersist#80) — one attached consumer's registry
 /// record. The agent + NodeCore + LensCore each register on
@@ -897,24 +916,38 @@ impl PyEngine {
     /// The well-behaved path is: every adapter `deregister_consumer`
     /// on its own teardown, then the owner's `close()` finds the
     /// registry empty.
+    ///
+    /// **Not a quiescence barrier.** `close()` flips the `closed`
+    /// flag and clears the slot; it does NOT wait for in-flight
+    /// operations on other threads to drain. An operation that
+    /// already passed its `ensure_usable()` check still runs to
+    /// completion against the (Arc-kept-alive) runtime — its write
+    /// commits. `close()` guarantees that *subsequent* calls fail
+    /// fast with `EngineClosed`, not that no call is in progress.
+    /// Callers needing a hard drain must quiesce their own consumers
+    /// before calling `close()`.
     #[pyo3(signature = (force=false))]
     fn close(&self, force: bool) -> PyResult<()> {
-        if !force {
-            let registry = self.consumers.lock().unwrap_or_else(|e| e.into_inner());
-            if !registry.is_empty() {
-                let mut names: Vec<&str> = registry.keys().map(String::as_str).collect();
-                names.sort_unstable();
-                return Err(PyRuntimeError::new_err(format!(
-                    "close() refused — {} consumer(s) still registered: [{}]. \
-                     Each adapter must deregister_consumer() on teardown, or \
-                     pass force=True to close anyway.",
-                    names.len(),
-                    names.join(", ")
-                )));
-            }
+        // Hold the consumer-registry lock across the empty-check AND
+        // the `closed` store: `register_consumer` re-checks `closed`
+        // under this same lock, so the pair is mutually exclusive —
+        // no consumer can attach into the close() window (#82 review,
+        // concurrency H2 / M1).
+        let registry = self.consumers.lock().unwrap_or_else(|e| e.into_inner());
+        if !force && !registry.is_empty() {
+            let mut names: Vec<&str> = registry.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            return Err(PyRuntimeError::new_err(format!(
+                "close() refused — {} consumer(s) still registered: [{}]. \
+                 Each adapter must deregister_consumer() on teardown, or \
+                 pass force=True to close anyway.",
+                names.len(),
+                names.join(", ")
+            )));
         }
         self.closed
             .store(true, std::sync::atomic::Ordering::Release);
+        drop(registry);
         let mut slot = engine_slot();
         // Only clear the slot if it still points at *this* engine —
         // guard against clearing a fresh post-close rebuild.
@@ -987,7 +1020,16 @@ impl PyEngine {
         if name.is_empty() {
             return Err(PyValueError::new_err("consumer name must be non-empty"));
         }
-        let substrates = substrates.unwrap_or_default();
+        // v1.7.5 (#82 review, security M1) — the registry is shared
+        // across every co-resident consumer; cap name length so a
+        // buggy/hostile consumer can't bloat the shared map.
+        if name.len() > MAX_CONSUMER_NAME_LEN {
+            return Err(PyValueError::new_err(format!(
+                "consumer name too long ({} bytes, max {MAX_CONSUMER_NAME_LEN})",
+                name.len()
+            )));
+        }
+        let mut substrates = substrates.unwrap_or_default();
         // v1.7.4 (#82) — reject substrate-family typos at declaration
         // time. A consumer that mis-declares `cirsnode` would
         // otherwise silently own nothing.
@@ -998,7 +1040,30 @@ impl PyEngine {
                 )));
             }
         }
+        // v1.7.5 — dedupe so a repeated declaration can't grow the
+        // record unboundedly; order-stable, ≤ KNOWN_SUBSTRATES.len().
+        substrates.sort_unstable();
+        substrates.dedup();
         let mut registry = self.consumers.lock().unwrap_or_else(|e| e.into_inner());
+        // v1.7.5 (#82 review, concurrency M1) — re-check `closed`
+        // under the registry lock. `close()` flips `closed` while
+        // holding this same lock, so checking here makes attach and
+        // close mutually exclusive: no consumer slips into the
+        // close() window.
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(PyErr::new::<EngineClosed, _>(
+                "register_consumer on a closed engine",
+            ));
+        }
+        // v1.7.5 (#82 review, security M1) — cap registry size. A
+        // re-registration of an existing name is always allowed (it
+        // updates in place); only a brand-new name can hit the cap.
+        if !registry.contains_key(name) && registry.len() >= MAX_CONSUMERS {
+            return Err(PyRuntimeError::new_err(format!(
+                "consumer registry full ({MAX_CONSUMERS}) — a consumer is \
+                 likely leaking registrations without deregister_consumer()"
+            )));
+        }
         registry.insert(
             name.to_owned(),
             ConsumerRecord {
@@ -12355,6 +12420,7 @@ impl PyEngine {
     /// `ttl_seconds` must be > 0; `expires_at = now + ttl_seconds`.
     /// `metadata_json`, if provided, must be a JSON object/value.
     #[cfg(feature = "cirislens_occurrence")]
+    #[pyo3(signature = (occurrence_id, identity, ttl_seconds, metadata_json=None))]
     fn register_occurrence(
         &self,
         py: Python<'_>,

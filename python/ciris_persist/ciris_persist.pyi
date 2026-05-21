@@ -103,6 +103,11 @@ class Engine:
         (``cirislens``, ``cirislens_secrets``, ``cirislens_derived``,
         ``cirisgraph``, ``cirisnode``); an unknown name raises
         ``ValueError``.
+
+        v1.7.5 — ``name`` longer than 256 bytes raises ``ValueError``;
+        registering a new consumer when the shared registry already
+        holds 64 raises ``RuntimeError`` (a leak guard). Registering
+        on a closed engine raises ``EngineClosed``.
         """
 
     def substrate_owner(self, substrate: str) -> str | None:

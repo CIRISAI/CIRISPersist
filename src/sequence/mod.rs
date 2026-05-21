@@ -42,6 +42,24 @@ pub mod types;
 
 pub use service::SequenceService;
 
+/// v1.7.5 (#82 review, security H1) — guard the `i64` (DB column
+/// type) → `u64` (API type) decode.
+///
+/// `next_value` is a `BIGINT`/`INTEGER` column. A negative value is
+/// not a legal sequence count: it means the row was tampered with,
+/// or a `next_value + 1` bump overflowed `i64::MAX` — Postgres
+/// raises on overflow, but SQLite *wraps silently* to `i64::MIN`. A
+/// bare `as u64` cast would turn that into a huge non-monotonic
+/// number and hand it to a federation consumer that relies on
+/// monotonicity for signed-stream ordering. Fail loud instead.
+pub(crate) fn decode_sequence_value(raw: i64) -> Result<u64, Error> {
+    u64::try_from(raw).map_err(|_| {
+        Error::Internal(format!(
+            "sequence counter is negative ({raw}) — row corrupt or BIGINT-overflowed"
+        ))
+    })
+}
+
 /// sequence-layer errors.
 ///
 /// THREAT_MODEL.md AV-15: stable `kind()` tokens.
@@ -100,5 +118,21 @@ mod tests {
         assert_eq!(Error::Conflict("x".into()).kind(), "sequence_conflict");
         assert_eq!(Error::Backend("x".into()).kind(), "sequence_backend");
         assert_eq!(Error::Internal("x".into()).kind(), "sequence_internal");
+    }
+
+    #[test]
+    fn decode_sequence_value_accepts_nonnegative() {
+        assert_eq!(decode_sequence_value(0).unwrap(), 0);
+        assert_eq!(decode_sequence_value(1).unwrap(), 1);
+        assert_eq!(decode_sequence_value(i64::MAX).unwrap(), i64::MAX as u64);
+    }
+
+    #[test]
+    fn decode_sequence_value_rejects_negative() {
+        // A negative counter (tampering, or a silent SQLite BIGINT
+        // overflow wrap) must fail loud, not cast to a huge u64.
+        let err = decode_sequence_value(-1).unwrap_err();
+        assert_eq!(err.kind(), "sequence_internal");
+        assert!(decode_sequence_value(i64::MIN).is_err());
     }
 }
