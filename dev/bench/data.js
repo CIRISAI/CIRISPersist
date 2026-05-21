@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779323531205,
+  "lastUpdate": 1779325145933,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -21335,6 +21335,138 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 24169452,
             "range": "± 150543",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "6b3130e4f071c42f532548cc16d06c3d690af94e",
+          "message": "1.8.0 — SQLite reaches full ReadEngine + DerivedSchema parity\n\nThe SQLite backend implemented every substrate but two FFI-exposed\ntrait surfaces still returned NotImplemented on SQLite: the\nReadEngine observability-analytics API (21 methods) and the\nDerivedSchema write paths. Sovereign-mode (Pi/iOS, SQLite-backed)\ndeployments could not use the trace/LLM/federation read API or\nstore lens-derived evidence. This closes the gap — SQLite is now at\n100% parity with Postgres across both traits.\n\n- ReadEngine: all 21 methods ported, identical pagination/cursor\n  semantics. TimescaleDB-continuous-aggregate analytics reimplemented\n  as raw-window queries over trace_events; STDDEV/variance math\n  finished in Rust where SQLite lacks the aggregate.\n- DerivedSchema: detection-event + calibration-bundle put/get paths,\n  same idempotency/conflict semantics as Postgres; is_current flip\n  is one transaction under a partial-unique index.\n- V040 migration (SQLite only) adds cirislens_derived_detection_events\n  + cirislens_derived_calibration_bundles; Postgres already had these\n  via V008.\n\nNo public API change — these FFI methods existed and simply no\nlonger fail on a SQLite engine. 18 new SQLite round-trip tests.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-20T19:51:04-05:00",
+          "tree_id": "66a323cb7dada8829a0e42a8c0c7e661cfcb0c79",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/6b3130e4f071c42f532548cc16d06c3d690af94e"
+        },
+        "date": 1779325145206,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 102371,
+            "range": "± 949",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 242807,
+            "range": "± 6268",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 523967,
+            "range": "± 8900",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1849124,
+            "range": "± 25906",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 342,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1470,
+            "range": "± 17",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7503,
+            "range": "± 248",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21250,
+            "range": "± 122",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24275,
+            "range": "± 78",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83582,
+            "range": "± 188",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 361,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3207,
+            "range": "± 56",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9576,
+            "range": "± 29",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41826,
+            "range": "± 149",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2245171,
+            "range": "± 79625",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6627261,
+            "range": "± 146552",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23754167,
+            "range": "± 1083190",
             "unit": "ns/iter"
           }
         ]
