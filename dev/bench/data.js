@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779388464750,
+  "lastUpdate": 1779398588700,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -22127,6 +22127,252 @@ window.BENCHMARK_DATA = {
             "name": "queue_submit/128",
             "value": 20413329,
             "range": "± 4582732",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "6bae4475e34d334a2a5236f911ee1e4f8febc394",
+          "message": "1.10.2 — reencrypt_all chunking, verify v2.6.1, benchmark-coverage cut\n\n- reencrypt_all (perf review H2): re-encrypts in 64-row chunks\n  instead of one transaction across the whole secrets table. The\n  CPU-bound PBKDF2/AES work runs with no transaction (SQLite: no\n  connection lock) held; only each chunk's UPDATE batch takes a\n  short transaction. The master-key activate/deactivate flip now\n  happens only on a fully-clean pass — a partial failure can no\n  longer strand secrets under a deactivated key (#87-review H1 at\n  the source).\n- CIRISVerify pins bumped v2.5.0 -> v2.6.1 (no API breakage).\n- Benchmark-coverage cut: 5 new criterion benches for the v1.7-1.10\n  surface — sequence_contention, engine_cold_start,\n  read_engine_analytics, secrets_crypto, occurrence_registry —\n  wired into bench.yml.\n\nBench-quality fixes caught while validating the curves:\n- BatchSize::SmallInput with a heavy SqliteBackend setup output made\n  criterion pre-build thousands of in-memory DBs -> OOM -> OS wedge.\n  Changed to PerIteration (bounds memory to one backend at a time).\n- Size-swept benches use SamplingMode::Flat — linear sampling gave\n  noisy curves (a spurious \"superlinear\" reading that flat sampling\n  showed was noise); flat sampling tightens CIs to ~±1%.\n- sequence_contention's SQLite contended-vs-distinct split measured\n  identically (SQLite serializes all writes through one connection\n  mutex) — collapsed to one series; the split is Postgres-only.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-21T16:04:16-05:00",
+          "tree_id": "a26e31651406d011583d361574809901941b5918",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/6bae4475e34d334a2a5236f911ee1e4f8febc394"
+        },
+        "date": 1779398587734,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 104851,
+            "range": "± 340",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 242015,
+            "range": "± 2199",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 525786,
+            "range": "± 6626",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1849806,
+            "range": "± 12410",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 352,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1535,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8202,
+            "range": "± 21",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21242,
+            "range": "± 102",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24306,
+            "range": "± 64",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83619,
+            "range": "± 144",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 361,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3107,
+            "range": "± 29",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9486,
+            "range": "± 64",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41486,
+            "range": "± 200",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2298780,
+            "range": "± 102536",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6655645,
+            "range": "± 125139",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23894937,
+            "range": "± 243339",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 314715,
+            "range": "± 18253",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 372681,
+            "range": "± 23133",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 769361,
+            "range": "± 45133",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 2109344,
+            "range": "± 74081",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 22834774,
+            "range": "± 159464",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 12803588,
+            "range": "± 85001",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 712165,
+            "range": "± 31434",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 1959121,
+            "range": "± 66207",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 128425539,
+            "range": "± 553591",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 3835071,
+            "range": "± 619620",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 17835849,
+            "range": "± 392013",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 317543324,
+            "range": "± 2102457",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 9416140,
+            "range": "± 330377",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 43087400,
+            "range": "± 723532",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 212120,
+            "range": "± 14709",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 177728,
+            "range": "± 13558",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 63862,
+            "range": "± 5266",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 182353,
+            "range": "± 5237",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 1300625,
+            "range": "± 16306",
             "unit": "ns/iter"
           }
         ]
