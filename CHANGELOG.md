@@ -56,6 +56,25 @@ No migration, no schema change — `migrate_to_hardware_key` records
 its key as `master_key_meta.key_kind = 'hardware'` in the existing
 V010 table.
 
+### Pre-tag hardening (security review)
+
+A security/performance review of the above caught two data-integrity
+issues before v1.10.0 was tagged:
+
+- **Durability across restart.** The derived master key lived only
+  in the in-process key cache. After `migrate_to_hardware_key`
+  flipped the active key to `hardware`, a process restart left every
+  secret encrypted under a key whose bytes were gone — the store
+  would be unrecoverable. Fixed: `active_master_key` now re-derives
+  a `hardware` key from its TPM-sealed seed on a cache miss (the
+  derivation is deterministic — that is the point of the sealed
+  seed). A `software` key has no such recovery path and stays fatal.
+- **Partial-migration honesty.** `reencrypt_all` reports per-secret
+  failures via `RotationResult.success` rather than erroring;
+  `migrate_to_hardware_key` ignored it and returned `Ok` even when
+  secrets were stranded under the now-deactivated old key. It now
+  returns an error naming the failed rows.
+
 ## [1.9.0] — 2026-05-21
 
 **Change-feed / subscription API for cross-consumer notification

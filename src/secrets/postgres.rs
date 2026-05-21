@@ -191,13 +191,33 @@ impl PostgresBackend {
         let key_kind: String = row.get(1);
         let descriptor: Option<String> = row.get(2);
         // v0.6.1-α5 carries the software key bytes via the
-        // SOFTWARE_KEYS in-memory map below. Future v0.6.1.x can
-        // back this with the OS keyring via ciris-keyring.
-        let bytes = software_keys_get(&key_ref).ok_or_else(|| {
-            SecretsError::Crypto(format!(
-                "active master key {key_ref} has no in-memory bytes — restart cleared the in-process key store"
-            ))
-        })?;
+        // SOFTWARE_KEYS in-memory map below.
+        let bytes = match software_keys_get(&key_ref) {
+            Some(b) => b,
+            // v1.10.0 (#87) — a hardware-backed master key is
+            // deterministically re-derivable from its TPM-sealed seed
+            // (HKDF over a stable seed + context). After a process
+            // restart the in-process cache is empty; re-derive and
+            // repopulate it rather than failing — this is what makes
+            // the hardware migration durable across restarts. A
+            // *software* key has no such recovery path (its bytes
+            // lived only in memory), so that case stays fatal.
+            None if key_kind == "hardware" => {
+                let (master, _descriptor) = tokio::task::spawn_blocking(
+                    crate::secrets::hardware::derive_hardware_master_key,
+                )
+                .await
+                .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))??;
+                software_keys_put(key_ref.clone(), master.clone())?;
+                master
+            }
+            None => {
+                return Err(SecretsError::Crypto(format!(
+                    "active master key {key_ref} has no in-memory bytes — \
+                     restart cleared the in-process key store"
+                )))
+            }
+        };
         Ok(MasterKey {
             key_ref,
             kind: key_kind,
@@ -1017,7 +1037,20 @@ impl SecretsService for PostgresBackend {
         };
         // Re-encrypt every secret under the hardware master key and
         // flip the active key. `reencrypt_all` audits the pass.
-        self.reencrypt_all(ref_out.clone(), accessor).await?;
+        let rotation = self.reencrypt_all(ref_out.clone(), accessor).await?;
+        // v1.10.0 (#87 review H1) — `reencrypt_all` reports per-secret
+        // failures via `RotationResult.success` rather than erroring.
+        // A hardware migration must NOT silently return Ok while
+        // secrets remain stranded under the now-deactivated old key.
+        if !rotation.success {
+            return Err(SecretsError::Crypto(format!(
+                "hardware migration re-encrypted {} secret(s) but {} failed ({:?}) — \
+                 the secrets store is partially migrated; resolve the failed rows and retry",
+                rotation.secrets_reencrypted,
+                rotation.failures.len(),
+                rotation.failures
+            )));
+        }
         Ok(ref_out)
     }
 

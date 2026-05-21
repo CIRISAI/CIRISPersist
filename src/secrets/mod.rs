@@ -123,9 +123,11 @@ pub enum SecretsError {
     #[error("backend: {0}")]
     Backend(String),
 
-    /// Hardware-key path requested but `secrets-hw` feature isn't
-    /// available (today's default — pending upstream
-    /// `ciris-keyring/symmetric-derivation` feature add).
+    /// `migrate_to_hardware_key` could not reach hardware-backed
+    /// secure storage — the host has no TPM / Keystore / Secure
+    /// Enclave (or it is unusable), so there is no hardware root to
+    /// derive the master key from. Expected on a no-hardware host;
+    /// the caller keeps the software master key.
     #[error("hardware key path unavailable: {0}")]
     HardwareKeyUnavailable(String),
 
