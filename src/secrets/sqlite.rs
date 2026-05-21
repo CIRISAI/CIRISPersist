@@ -985,7 +985,14 @@ impl SecretsService for SqliteSecretsBackend {
         };
 
         // Encryption health: try active_master_key — Ok = enabled.
-        let encryption_enabled = self.active_master_key().await.is_ok();
+        // v1.10.1 (#87 review M4) — `hardware_key_active` reflects the
+        // active key's `key_kind` instead of a hard-coded false.
+        let active = self.active_master_key().await;
+        let encryption_enabled = active.is_ok();
+        let hardware_key_active = active
+            .as_ref()
+            .map(|k| k.kind == "hardware")
+            .unwrap_or(false);
 
         Ok(SecretsServiceStats {
             total_secrets: total as u64,
@@ -993,7 +1000,7 @@ impl SecretsService for SqliteSecretsBackend {
             filter_matches_today: matches as u64,
             last_filter_update,
             encryption_enabled,
-            hardware_key_active: false, // v0.9.3 deferred (same as v0.6.1 PG)
+            hardware_key_active,
             last_rotation,
             rotation_count: rotation_count as u64,
         })
@@ -1982,7 +1989,12 @@ mod tests {
             .await
             .expect("get_service_stats");
         assert!(stats.encryption_enabled, "encryption should be enabled");
-        assert!(!stats.hardware_key_active, "v0.9.3 hardware key deferred");
+        // No hardware migration has run at this point (step 12) — the
+        // active master key is still software.
+        assert!(
+            !stats.hardware_key_active,
+            "hardware_key_active should be false before migrate_to_hardware_key"
+        );
         assert!(secrets.is_healthy().await.unwrap());
 
         // 12. migrate_to_hardware_key (CIRISPersist#87). Environment-

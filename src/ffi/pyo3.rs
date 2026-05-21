@@ -14537,6 +14537,53 @@ fn encode_secret_claim_result(
     serde_json::to_string(&wire)
 }
 
+/// v1.10.1 (CIRISPersist#88) — handle-free reset of the
+/// process-singleton engine.
+///
+/// `Engine.close()` needs a live `Engine` handle. A consumer test
+/// fixture that drops its Python reference without calling `close()`
+/// leaves the Rust process-singleton pinned with nothing able to
+/// reference it (the "orphan case") — and the next `Engine(...)`,
+/// even with a correct different config, raises `EngineConfigMismatch`
+/// forever. `reset_engine()` operates on the process-global slot
+/// directly, so no handle is needed:
+///
+/// * flips the current engine's `closed` flag — any surviving handle
+///   then fails fast with `EngineClosed` rather than touching a
+///   torn-down runtime;
+/// * clears the singleton slot **synchronously** — an
+///   immediately-following `Engine(...)` with any config constructs
+///   cleanly;
+/// * drops the engine cell (tearing down its tokio runtime +
+///   connection pools) before returning, with the slot lock released
+///   first so the teardown cannot wedge a concurrent constructor;
+/// * is a no-op when no engine is pinned.
+///
+/// Idempotent and correct under repeated reset/construct cycles —
+/// the deterministic teardown door for consumer test suites, and for
+/// the in-process cohabitation epic (CIRISPersist#85), that
+/// `close()`-needing-a-handle cannot provide.
+#[pyfunction]
+fn reset_engine(py: Python<'_>) {
+    py.detach(|| {
+        // Take the cell out under the slot lock — set the slot to
+        // `None` and flip `closed` so a racing handle sees the
+        // shutdown — then release the lock before the teardown drop.
+        let taken = {
+            let mut slot = engine_slot();
+            if let Some(cell) = slot.as_ref() {
+                cell.closed
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            slot.take()
+        };
+        // Drop outside the lock: if this is the last `Arc<EngineCell>`
+        // (the orphan / clean-teardown case), the runtime + pools tear
+        // down here. Blocking is fine — Python thread, GIL released.
+        drop(taken);
+    });
+}
+
 /// (maturin) generates the C entry that Python imports.
 #[pymodule]
 fn ciris_persist(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -14571,6 +14618,10 @@ fn ciris_persist(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         "EngineUsedAcrossFork",
         py.get_type::<EngineUsedAcrossFork>(),
     )?;
+    // v1.10.1 (CIRISPersist#88) — handle-free process-singleton
+    // reset; the deterministic teardown door for consumer test
+    // suites and the cohabitation epic.
+    m.add_function(pyo3::wrap_pyfunction!(reset_engine, m)?)?;
     // v0.5.4 (CIRISPersist#29) — feature-gated panic injector for the
     // Python regression suite. Off in release wheels.
     #[cfg(feature = "test-panic")]

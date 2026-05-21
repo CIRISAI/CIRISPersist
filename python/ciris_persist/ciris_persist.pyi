@@ -1548,3 +1548,21 @@ class Engine:
         """Generate an RFC 6962 §2.1.2 consistency proof between two
         tree sizes for a tenant. Returns a JSON-encoded
         ``ConsistencyProof``."""
+
+
+def reset_engine() -> None:
+    """v1.10.1 (CIRISPersist#88) — handle-free reset of the
+    process-singleton engine.
+
+    Closes and un-pins whatever engine is the current process
+    singleton, freeing the slot synchronously so the next
+    ``Engine(...)`` constructs cleanly with any config. Unlike
+    :meth:`Engine.close` it needs no ``Engine`` handle, so it
+    recovers the "orphan" case — a fixture that dropped its Python
+    reference without closing. A no-op when no engine is pinned;
+    idempotent and safe under repeated reset/construct cycles.
+
+    Intended for consumer test-suite isolation (call it in fixture
+    teardown) and as a deterministic teardown door for in-process
+    cohabitation.
+    """

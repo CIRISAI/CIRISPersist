@@ -28,6 +28,7 @@
 //! stable wire constant.
 
 use ciris_keyring::create_platform_storage;
+use zeroize::Zeroizing;
 
 use super::crypto;
 use super::SecretsError;
@@ -47,12 +48,25 @@ const SECRETS_SEED_KEY_ID: &str = "cirislens-secrets-seed";
 const SECRETS_MASTER_CONTEXT: &str = "secrets-store-master-v1";
 
 /// Resolve the directory the platform secure storage keeps its
-/// wrapped-blob envelopes in. Mirrors persist's `CIRIS_DATA_DIR`
-/// convention (the same env var the keyring bootstrap lock honours).
-fn secrets_storage_dir() -> std::path::PathBuf {
+/// wrapped-blob envelopes in, under persist's `CIRIS_DATA_DIR`.
+///
+/// v1.10.1 (CIRISPersist#87 review M2) — refuses when `CIRIS_DATA_DIR`
+/// is unset rather than silently falling back to a world-writable,
+/// predictable `/tmp` path. On a TPM host the seed blob is sealed
+/// (confidentiality holds), but a `/tmp` fallback is squattable — a
+/// local user pre-creating the path as a symlink, or with hostile
+/// permissions, is an integrity / availability vector. A deployment
+/// that wants hardware-backed secrets must point `CIRIS_DATA_DIR` at
+/// a process-private directory.
+fn secrets_storage_dir() -> Result<std::path::PathBuf, SecretsError> {
     match std::env::var("CIRIS_DATA_DIR") {
-        Ok(d) if !d.is_empty() => std::path::PathBuf::from(d).join("keyring"),
-        _ => std::path::PathBuf::from("/tmp/ciris-persist-keyring"),
+        Ok(d) if !d.is_empty() => Ok(std::path::PathBuf::from(d).join("keyring")),
+        _ => Err(SecretsError::HardwareKeyUnavailable(
+            "CIRIS_DATA_DIR is not set — refusing to place hardware-key storage \
+             under a world-writable /tmp path; set CIRIS_DATA_DIR to a \
+             process-private directory to enable hardware-backed secrets"
+                .into(),
+        )),
     }
 }
 
@@ -67,10 +81,10 @@ fn secrets_storage_dir() -> std::path::PathBuf {
 /// agent) treats that as "stay on the software master key" — it is a
 /// clean, expected outcome on a no-TPM host, not an error to surface.
 pub(crate) fn derive_hardware_master_key() -> Result<(Vec<u8>, String), SecretsError> {
-    let storage =
-        create_platform_storage(SECRETS_STORAGE_ALIAS, secrets_storage_dir()).map_err(|e| {
-            SecretsError::HardwareKeyUnavailable(format!("secure storage init failed: {e}"))
-        })?;
+    let storage_dir = secrets_storage_dir()?;
+    let storage = create_platform_storage(SECRETS_STORAGE_ALIAS, storage_dir).map_err(|e| {
+        SecretsError::HardwareKeyUnavailable(format!("secure storage init failed: {e}"))
+    })?;
 
     // No TPM / Keystore / Secure Enclave → no hardware migration.
     // create_platform_storage would have fallen back to software file
@@ -88,7 +102,10 @@ pub(crate) fn derive_hardware_master_key() -> Result<(Vec<u8>, String), SecretsE
     // host generates + seals it; later calls re-derive the same master
     // from the same seed (idempotent).
     if !storage.exists(SECRETS_SEED_KEY_ID) {
-        let seed = crypto::random_bytes(crypto::KEY_LEN)?;
+        // v1.10.1 (#87 review H2) — `Zeroizing` scrubs the raw seed on
+        // drop. The seed is the hardware root: leaking it compromises
+        // every key ever derived from it.
+        let seed = Zeroizing::new(crypto::random_bytes(crypto::KEY_LEN)?);
         storage
             .store(SECRETS_SEED_KEY_ID, &seed)
             .map_err(|e| SecretsError::HardwareKeyUnavailable(format!("seal secrets seed: {e}")))?;

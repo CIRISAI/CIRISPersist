@@ -161,3 +161,44 @@ def test_change_feed_pubsub() -> None:
             eng.publish_change("bogus_substrate", "{}")
     finally:
         eng.close(force=True)
+
+
+def test_reset_engine_unpins_singleton() -> None:
+    """v1.10.1 (CIRISPersist#88) — reset_engine() un-pins the
+    process-singleton handle-free, recovering the orphan case (a
+    fixture that dropped its handle without close()) so a following
+    Engine() with a different config constructs cleanly. Skips on a
+    non-sqlite wheel."""
+    import pytest
+
+    # No-op when nothing is pinned (also clears any prior-test state).
+    ciris_persist.reset_engine()
+
+    try:
+        a = ciris_persist.Engine(dsn="sqlite://:memory:", signing_key_id="reset-a")
+    except ValueError as exc:
+        if "sqlite" in str(exc) and "feature" in str(exc):
+            pytest.skip("wheel built without the sqlite feature")
+        raise
+
+    # Orphan case: drop the only handle WITHOUT calling close(). The
+    # Rust process-singleton stays pinned with nothing referencing it.
+    del a
+    # reset_engine() un-pins it — without this, the next Engine() with
+    # a different signing_key_id would raise EngineConfigMismatch.
+    ciris_persist.reset_engine()
+    b = ciris_persist.Engine(dsn="sqlite://:memory:", signing_key_id="reset-b")
+    assert b.is_closed is False
+    del b
+
+    # Correct under repeated reset/construct cycles, each a distinct
+    # config (would all be EngineConfigMismatch without the reset).
+    for i in range(10):
+        ciris_persist.reset_engine()
+        eng = ciris_persist.Engine(
+            dsn="sqlite://:memory:", signing_key_id=f"reset-cycle-{i}"
+        )
+        del eng
+
+    # Leave a clean slate for any following test in this process.
+    ciris_persist.reset_engine()

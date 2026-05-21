@@ -38,6 +38,7 @@ from .ciris_persist import (
     SUPPORTED_SCHEMA_VERSIONS,
     Transient,
     __version__,
+    reset_engine,
 )
 
 __all__ = [
@@ -54,4 +55,6 @@ __all__ = [
     "SUPPORTED_SCHEMA_VERSIONS",
     "Transient",
     "__version__",
+    # v1.10.1 (CIRISPersist#88) — handle-free process-singleton reset.
+    "reset_engine",
 ]

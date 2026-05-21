@@ -12,10 +12,18 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
+use zeroize::Zeroizing;
+
 use super::SecretsError;
 
-fn cache() -> &'static Mutex<HashMap<String, Vec<u8>>> {
-    static CELL: OnceLock<Mutex<HashMap<String, Vec<u8>>>> = OnceLock::new();
+// v1.10.1 (CIRISPersist#87 review H2) — cache values are
+// `Zeroizing<Vec<u8>>`: a master key sits here for the whole process
+// lifetime, so when a rotation evicts it (or the process maps drop)
+// the bytes are scrubbed rather than left in freed heap. The public
+// API stays `Vec<u8>` — the transient copy a caller pulls out is
+// used for one encrypt/decrypt then dropped.
+fn cache() -> &'static Mutex<HashMap<String, Zeroizing<Vec<u8>>>> {
+    static CELL: OnceLock<Mutex<HashMap<String, Zeroizing<Vec<u8>>>>> = OnceLock::new();
     CELL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -23,7 +31,7 @@ fn cache() -> &'static Mutex<HashMap<String, Vec<u8>>> {
 /// the key isn't cached (caller falls back to the persisted row's
 /// descriptor or rejects with `SecretsError::Crypto` per active path).
 pub(crate) fn software_keys_get(key_ref: &str) -> Option<Vec<u8>> {
-    cache().lock().ok()?.get(key_ref).cloned()
+    cache().lock().ok()?.get(key_ref).map(|z| z.to_vec())
 }
 
 /// Insert raw master-key bytes for `key_ref`. Used by
@@ -34,6 +42,8 @@ pub(crate) fn software_keys_put(key_ref: String, bytes: Vec<u8>) -> Result<(), S
     let mut g = cache()
         .lock()
         .map_err(|_| SecretsError::Internal("software_keys mutex poisoned".into()))?;
-    g.insert(key_ref, bytes);
+    // The passed-in `bytes` allocation is moved into `Zeroizing`, so
+    // the caller's buffer is the one that gets scrubbed on eviction.
+    g.insert(key_ref, Zeroizing::new(bytes));
     Ok(())
 }

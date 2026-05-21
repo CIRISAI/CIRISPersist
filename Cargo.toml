@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "1.10.0"
+version = "1.10.1"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -478,6 +478,11 @@ serde         = { version = "1", features = ["derive"] }
 serde_json    = { version = "1", features = ["arbitrary_precision", "raw_value"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 sha2          = "0.10"
+# v1.10.1 (CIRISPersist#87 review H2) — scrub master-key material on
+# drop. The process-global software-key cache and the hardware seed
+# are wrapped in `Zeroizing` so freed key bytes don't linger in the
+# heap (swap / core-dump exposure).
+zeroize       = "1"
 chrono        = { version = "0.4", features = ["serde"] }
 thiserror     = "2"
 tracing       = "0.1"

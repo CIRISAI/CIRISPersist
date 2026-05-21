@@ -5,6 +5,54 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.10.1] — 2026-05-21
+
+**`reset_engine()` — handle-free process-singleton reset
+(CIRISPersist#88) — plus the v1.10.0 hardening-review follow-ups.**
+
+### New: `ciris_persist.reset_engine()` — CIRISAgent 2.9.0 blocker
+
+`Engine.close()` needs a live `Engine` handle. A consumer test
+fixture that drops its Python reference without calling `close()`
+leaves the Rust process-singleton pinned with nothing able to
+reference it — the "orphan case" — and the next `Engine(...)`, even
+with a correct different config, raises `EngineConfigMismatch`
+forever. This made CIRISAgent's multi-fixture pytest suite
+un-greenable against persist ≥1.6.8 (all 8 shards red).
+
+`reset_engine()` is a module-level function — no `Engine` instance
+required. It flips the current engine's `closed` flag, clears the
+singleton slot **synchronously** (an immediately-following
+`Engine(...)` with any config constructs cleanly), and drops the
+engine cell (tearing down its runtime + pools) before returning. A
+no-op when no engine is pinned; correct under repeated
+reset/construct cycles. It also gives the in-process cohabitation
+epic (#85) a deterministic teardown door.
+
+### Hardening-review follow-ups (v1.10.0 secrets-hw)
+
+- **Key-material zeroization** — the process-global software-key
+  cache and the hardware seed are now `Zeroizing`, so freed master
+  /seed bytes are scrubbed rather than left in the heap (swap /
+  core-dump exposure).
+- **`hardware_key_active` stat** — `get_service_stats` now derives
+  it from the active master key's `key_kind` instead of a
+  hard-coded `false`; ops can see whether `migrate_to_hardware_key`
+  took effect.
+- ⚠ **`migrate_to_hardware_key` now requires `CIRIS_DATA_DIR`** — it
+  refuses (`HardwareKeyUnavailable`) rather than silently placing
+  hardware-key storage under a world-writable, squattable `/tmp`
+  path. A deployment that wants hardware-backed secrets must point
+  `CIRIS_DATA_DIR` at a process-private directory.
+
+### V041 migration — analytics indexes (both backends)
+
+`trace_events (agent_id_hash, ts)` + `(deployment_domain, ts)`. The
+ReadEngine analytics + `count_*` methods filter `<col> = ? AND ts
+>= ? AND ts < ?`; no composite index covered the `(col, ts)` shape,
+so those queries scanned every row for the agent/domain. Now
+index-range scans.
+
 ## [1.10.0] — 2026-05-21
 
 **Hardware-backed secrets-at-rest — `migrate_to_hardware_key` is now
