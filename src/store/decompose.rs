@@ -143,6 +143,12 @@ pub fn decompose(trace: &CompleteTrace) -> Result<Decomposed, Error> {
             signature: trace.signature.clone(),
             signing_key_id: trace.signature_key_id.clone(),
             signature_verified: true,
+            // decompose's caller-invariant is a verified trace, so
+            // the signature IS valid. `verification_source` defaults
+            // to `Persist` here — the IngestPipeline overrides it to
+            // `Edge` under `VerifyMode::TrustPreVerified` (#91);
+            // pure-decompose callers (sovereign tools) keep `Persist`.
+            verification_source: crate::store::VerificationSource::Persist,
             schema_version: trace.trace_schema_version.as_str().to_owned(),
             pii_scrubbed: false,
             agent_role: agent_role.clone(),
@@ -473,6 +479,13 @@ mod tests {
         let trace = fixture_trace();
         let d = decompose(&trace).unwrap();
         assert!(d.events.iter().all(|e| e.signature_verified));
+        // CIRISPersist#91 — decompose defaults `verification_source`
+        // to `Persist`; the IngestPipeline overrides it to `Edge`
+        // under the skip-verify path.
+        assert!(d
+            .events
+            .iter()
+            .all(|e| e.verification_source == crate::store::VerificationSource::Persist));
     }
 
     #[test]

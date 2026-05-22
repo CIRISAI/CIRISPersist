@@ -322,6 +322,60 @@ impl Engine {
         bytes: &[u8],
         scrubber: &dyn Scrubber,
     ) -> Result<crate::ingest::BatchSummary, crate::ingest::IngestError> {
+        self.receive_and_persist_with(bytes, scrubber, crate::ingest::VerifyMode::Full)
+            .await
+    }
+
+    /// v2.0 (CIRISPersist#91) — relay ingest facade for batches that
+    /// arrived **already Edge-verified**.
+    ///
+    /// Identical to [`receive_and_persist`](Engine::receive_and_persist)
+    /// except it runs [`VerifyMode::TrustPreVerified`](crate::ingest::VerifyMode::TrustPreVerified):
+    /// the per-`CompleteTrace` signature verification (and its
+    /// federation-directory `lookup_public_key`) is skipped. Every
+    /// other pipeline step is unchanged.
+    ///
+    /// # Safety
+    ///
+    /// Opt-in, and legitimate **only** for a relay (CIRISLensCore#10)
+    /// that holds an Edge `verify_outcome` for this batch — AV-9
+    /// "never re-verify what Edge verified". The decision lives at
+    /// this call site, exactly like the caller-supplied `scrubber`
+    /// (#89): the deployer knows the federation topology. The lens
+    /// **direct-ingest** path (untrusted agent input) MUST keep using
+    /// [`receive_and_persist`](Engine::receive_and_persist) — its
+    /// `VerifyMode::Full` default is unchanged.
+    ///
+    /// Persisted rows land with `verification_source = 'edge'` —
+    /// an upstream Edge verifier, not persist, established
+    /// authenticity (`signature_verified` stays `true`; the trace is
+    /// authentic). See
+    /// [`IngestPipeline::receive_and_persist_with`](crate::ingest::IngestPipeline::receive_and_persist_with).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn receive_and_persist_pre_verified(
+        &self,
+        bytes: &[u8],
+        scrubber: &dyn Scrubber,
+    ) -> Result<crate::ingest::BatchSummary, crate::ingest::IngestError> {
+        self.receive_and_persist_with(bytes, scrubber, crate::ingest::VerifyMode::TrustPreVerified)
+            .await
+    }
+
+    /// v2.0 (CIRISPersist#91) — [`receive_and_persist`](Engine::receive_and_persist)
+    /// with an explicit [`VerifyMode`](crate::ingest::VerifyMode).
+    ///
+    /// `VerifyMode::Full` is byte-identical to `receive_and_persist`;
+    /// `VerifyMode::TrustPreVerified` is the relay skip-verify path
+    /// ([`receive_and_persist_pre_verified`](Engine::receive_and_persist_pre_verified)).
+    /// See [`VerifyMode`](crate::ingest::VerifyMode) for the safety
+    /// contract.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn receive_and_persist_with(
+        &self,
+        bytes: &[u8],
+        scrubber: &dyn Scrubber,
+        verify_mode: crate::ingest::VerifyMode,
+    ) -> Result<crate::ingest::BatchSummary, crate::ingest::IngestError> {
         let key_id = self.signer.current_alias().to_owned();
         match &self.backend {
             #[cfg(feature = "postgres")]
@@ -333,7 +387,7 @@ impl Engine {
                     signer: &*self.signer,
                     signer_key_id: &key_id,
                 };
-                pipeline.receive_and_persist(bytes).await
+                pipeline.receive_and_persist_with(bytes, verify_mode).await
             }
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(arc) => {
@@ -344,7 +398,7 @@ impl Engine {
                     signer: &*self.signer,
                     signer_key_id: &key_id,
                 };
-                pipeline.receive_and_persist(bytes).await
+                pipeline.receive_and_persist_with(bytes, verify_mode).await
             }
         }
     }
@@ -373,6 +427,60 @@ impl Engine {
             )),
         }
     }
+
+    /// v2.0 (CIRISPersist#93) — borrow a per-backend
+    /// [`AuditService`](crate::audit::AuditService) handle wrapping
+    /// the Engine's underlying storage backend.
+    ///
+    /// This is the [`audit`](crate::audit) analog of
+    /// [`Engine::node_core_service`] — see that accessor's doc-comment
+    /// for the issue-#90 Option B / RPITIT-not-object-safe rationale.
+    /// [`AuditService`](crate::audit::AuditService) likewise uses
+    /// RPITIT and is not object-safe, so `audit_service()` returns an
+    /// [`AuditDispatch`] enum mirroring the [`BackendDispatch`]
+    /// variants rather than an `Arc<dyn AuditService>`.
+    ///
+    /// NodeCore's trust-hierarchy resolution (`crate::trust::resolve_trust`
+    /// / `crate::routing::route_deferral` over the
+    /// `federation_trust_grants` projection) consumes this handle the
+    /// same way the cohabitation bootstrap consumes
+    /// [`node_core_service`](Engine::node_core_service).
+    ///
+    /// Cheap: each variant clones / wraps the inner backend handle
+    /// once.
+    #[cfg(all(feature = "cirisaudit", any(feature = "postgres", feature = "sqlite")))]
+    pub fn audit_service(&self) -> AuditDispatch {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => AuditDispatch::Postgres(b.clone()),
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => AuditDispatch::Sqlite(Arc::new(
+                crate::audit::sqlite::SqliteAuditBackend::new(b.conn_handle()),
+            )),
+        }
+    }
+}
+
+/// v2.0 (CIRISPersist#93) — per-backend
+/// [`AuditService`](crate::audit::AuditService) handle returned by
+/// [`Engine::audit_service`] /
+/// [`PyEngine::audit_service`](crate::ffi::pyo3::PyEngine::audit_service).
+///
+/// `AuditService` uses RPITIT and is therefore NOT object-safe — you
+/// cannot build `Arc<dyn AuditService>`. This enum is the object-safe
+/// dispatch form: callers `match` on the variant and call the trait
+/// methods on the concrete backend. Exact sibling of
+/// [`NodeCoreDispatch`].
+#[cfg(all(feature = "cirisaudit", any(feature = "postgres", feature = "sqlite")))]
+pub enum AuditDispatch {
+    /// Postgres-backed audit handle. `PostgresBackend` implements
+    /// [`AuditService`](crate::audit::AuditService) directly.
+    #[cfg(feature = "postgres")]
+    Postgres(Arc<PostgresBackend>),
+    /// SQLite-backed audit handle wrapping
+    /// [`SqliteAuditBackend`](crate::audit::sqlite::SqliteAuditBackend).
+    #[cfg(feature = "sqlite")]
+    Sqlite(Arc<crate::audit::sqlite::SqliteAuditBackend>),
 }
 
 /// v1.11.0 (CIRISPersist#90) — per-backend
@@ -748,6 +856,118 @@ mod tests {
         assert!(matches!(err, IngestError::Schema(_)), "got: {err:?}");
     }
 
+    /// v2.0 (CIRISPersist#91) — `Engine::receive_and_persist_pre_verified`
+    /// persists a signed batch whose signing key is NOT registered in
+    /// the federation directory — proving the relay skip-verify facade
+    /// bypasses the per-trace `lookup_public_key`. The same batch
+    /// through the default `receive_and_persist` is rejected
+    /// `UnknownKey`, and the persisted rows are recorded honestly as
+    /// not persist-verified.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn receive_and_persist_pre_verified_skips_directory_lookup() {
+        use crate::ingest::IngestError;
+        use crate::schema::{
+            CompleteTrace, ComponentType, ReasoningEventType, SchemaVersion, TraceComponent,
+            TraceLevel,
+        };
+        use crate::scrub::NullScrubber;
+        use crate::store::Backend as _;
+        use crate::verify::{
+            ed25519::canonical_payload_value, Canonicalizer, PythonJsonDumpsCanonicalizer,
+        };
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        use ed25519_dalek::{Signer as _, SigningKey};
+
+        let agent_sk = SigningKey::from_bytes(&[0x42; 32]);
+        let agent_key_id = "ciris-agent-key:engine-91";
+
+        let mut trace = CompleteTrace {
+            trace_id: "trace-engine-91".into(),
+            thought_id: "th-1".into(),
+            task_id: Some("task-1".into()),
+            agent_id_hash: "deadbeef".into(),
+            started_at: "2026-04-30T00:15:53.123456Z".parse().unwrap(),
+            completed_at: "2026-04-30T00:16:12.789012Z".parse().unwrap(),
+            trace_level: TraceLevel::Generic,
+            trace_schema_version: SchemaVersion::parse("2.7.0").unwrap(),
+            components: vec![TraceComponent {
+                component_type: ComponentType::Observation,
+                event_type: ReasoningEventType::ThoughtStart,
+                timestamp: "2026-04-30T00:15:53.123Z".parse().unwrap(),
+                data: {
+                    let mut m = serde_json::Map::new();
+                    m.insert("attempt_index".into(), 0.into());
+                    m
+                },
+                agent_id_hash: None,
+            }],
+            deployment_profile: None,
+            signature: String::new(),
+            signature_key_id: agent_key_id.into(),
+        };
+        let payload = canonical_payload_value(&trace);
+        let canonical = PythonJsonDumpsCanonicalizer
+            .canonicalize_value(&payload)
+            .unwrap();
+        trace.signature = B64.encode(agent_sk.sign(&canonical).to_bytes());
+        let trace_json = serde_json::to_value(&trace).unwrap();
+        let envelope = serde_json::json!({
+            "events": [{
+                "event_type": "complete_trace",
+                "trace_level": "generic",
+                "trace": trace_json,
+            }],
+            "batch_timestamp": "2026-04-30T15:00:00+00:00",
+            "consent_timestamp": "2025-01-01T00:00:00Z",
+            "trace_level": "generic",
+            "trace_schema_version": "2.7.0",
+        });
+        let bytes = envelope.to_string().into_bytes();
+
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("construct engine");
+
+        // Note: the agent's pubkey is intentionally NOT seeded into
+        // federation_keys — a `Full`-mode ingest would fail UnknownKey.
+        let summary = engine
+            .receive_and_persist_pre_verified(&bytes, &NullScrubber)
+            .await
+            .expect("pre-verified ingest persists without a registered key");
+        assert_eq!(summary.envelopes_processed, 1);
+        assert_eq!(summary.trace_events_inserted, 1, "one component → one row");
+        assert_eq!(summary.signatures_verified, 0, "persist verified nothing");
+
+        // Honest row state: the row round-trips `signature_verified =
+        // true` (the trace IS authentic) with `verification_source =
+        // Edge` (an upstream Edge verifier attested it, not persist).
+        let sq = engine.sqlite_backend().expect("sqlite backend");
+        let rows = sq
+            .fetch_trace_events_page(0, 100, None)
+            .await
+            .expect("fetch rows");
+        assert_eq!(rows.len(), 1, "the one component we ingested");
+        assert!(
+            rows[0].1.signature_verified,
+            "the trace is authentic — signature_verified stays true"
+        );
+        assert_eq!(
+            rows[0].1.verification_source,
+            crate::store::VerificationSource::Edge,
+            "skip-verify rows attribute authenticity to Edge"
+        );
+
+        // Control: the default facade (Full mode) rejects the same
+        // batch — proving skip-mode genuinely bypassed the lookup.
+        let err = engine
+            .receive_and_persist(&bytes, &NullScrubber)
+            .await
+            .expect_err("Full mode must reject the unregistered key");
+        assert!(matches!(err, IngestError::Verify(_)), "got: {err:?}");
+    }
+
     /// v1.11.0 (CIRISPersist#90) — `Engine::node_core_service` returns
     /// the SQLite dispatch variant and a `put_contribution` /
     /// `list_contributions` round-trips through it.
@@ -822,6 +1042,77 @@ mod tests {
         assert_eq!(page.items[0].contribution_id, env.contribution_id);
     }
 
+    /// v2.0 (CIRISPersist#93) — `Engine::audit_service` returns the
+    /// SQLite dispatch variant and a `record_entry` / `list_entries`
+    /// round-trips through it. Sibling of
+    /// `node_core_service_sqlite_round_trip`.
+    #[cfg(all(feature = "cirisaudit", feature = "sqlite"))]
+    #[tokio::test]
+    async fn audit_service_sqlite_round_trip() {
+        use crate::audit::verify::{compute_entry_hash, truncate_to_micros};
+        use crate::audit::{AuditEntry, AuditFilter, AuditService, GENESIS_PREV_HASH};
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        use ed25519_dalek::{Signer as _, SigningKey};
+        use uuid::Uuid;
+
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("construct engine");
+
+        let dispatch = engine.audit_service();
+        let backend = match dispatch {
+            AuditDispatch::Sqlite(b) => b,
+            #[cfg(feature = "postgres")]
+            AuditDispatch::Postgres(_) => panic!("expected sqlite audit variant"),
+        };
+
+        // Build + sign a genesis audit entry (actor_id IS the pubkey).
+        let key = SigningKey::from_bytes(&[0xA1; 32]);
+        let tenant = format!("engine93-{}", Uuid::new_v4().simple());
+        let mut entry = AuditEntry {
+            entry_id: Uuid::new_v4().to_string(),
+            sequence_number: 1,
+            tenant_id: tenant.clone(),
+            actor_id: B64.encode(key.verifying_key().to_bytes()),
+            action_type: "handler_action_task_complete".into(),
+            subject_kind: "task".into(),
+            subject_id: "subj-1".into(),
+            payload: serde_json::json!({"seq": 1}),
+            prev_hash: GENESIS_PREV_HASH.to_vec(),
+            entry_hash: vec![],
+            recorded_at: truncate_to_micros(chrono::Utc::now()),
+            signature: String::new(),
+        };
+        entry.entry_hash = compute_entry_hash(&entry).unwrap().to_vec();
+        let canonical = crate::audit::verify::canonical_bytes_for_entry(&entry).unwrap();
+        entry.signature = B64.encode(key.sign(&canonical).to_bytes());
+
+        backend
+            .record_entry(entry.clone())
+            .await
+            .expect("record_entry through AuditDispatch");
+
+        let page = backend
+            .list_entries(
+                AuditFilter {
+                    tenant_id: tenant.clone(),
+                    action_type: None,
+                    actor_id: None,
+                    subject_kind: None,
+                    subject_id: None,
+                    recorded_after: None,
+                    recorded_before: None,
+                },
+                None,
+                10,
+            )
+            .await
+            .expect("list_entries through AuditDispatch");
+        assert_eq!(page.items.len(), 1, "the entry we inserted");
+        assert_eq!(page.items[0].entry_id, entry.entry_id);
+    }
+
     #[tokio::test]
     async fn with_signer_rejects_unrecognized_dsn() {
         let signer = test_signer();
@@ -833,5 +1124,192 @@ mod tests {
             Err(EngineError::UnrecognizedDsn(_)) => {}
             Err(other) => panic!("unexpected error variant: {other:?}"),
         }
+    }
+
+    /// v2.0 (CIRISPersist#93) — Postgres parity for
+    /// `audit_service_sqlite_round_trip`. Skips when
+    /// `CIRIS_PERSIST_TEST_PG_URL` is unset.
+    #[cfg(all(feature = "cirisaudit", feature = "postgres"))]
+    #[tokio::test]
+    async fn audit_service_postgres_round_trip() {
+        use crate::audit::verify::{compute_entry_hash, truncate_to_micros};
+        use crate::audit::{AuditEntry, AuditFilter, AuditService, GENESIS_PREV_HASH};
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        use ed25519_dalek::{Signer as _, SigningKey};
+        use uuid::Uuid;
+
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let engine = Engine::with_signer(test_signer(), &dsn)
+            .await
+            .expect("construct postgres engine");
+
+        let backend = match engine.audit_service() {
+            AuditDispatch::Postgres(b) => b,
+            #[cfg(feature = "sqlite")]
+            AuditDispatch::Sqlite(_) => panic!("expected postgres audit variant"),
+        };
+
+        let key = SigningKey::from_bytes(&[0xB2; 32]);
+        let tenant = format!("engine93-pg-{}", Uuid::new_v4().simple());
+        let mut entry = AuditEntry {
+            entry_id: Uuid::new_v4().to_string(),
+            sequence_number: 1,
+            tenant_id: tenant.clone(),
+            actor_id: B64.encode(key.verifying_key().to_bytes()),
+            action_type: "handler_action_task_complete".into(),
+            subject_kind: "task".into(),
+            subject_id: "subj-1".into(),
+            payload: serde_json::json!({"seq": 1}),
+            prev_hash: GENESIS_PREV_HASH.to_vec(),
+            entry_hash: vec![],
+            recorded_at: truncate_to_micros(chrono::Utc::now()),
+            signature: String::new(),
+        };
+        entry.entry_hash = compute_entry_hash(&entry).unwrap().to_vec();
+        let canonical = crate::audit::verify::canonical_bytes_for_entry(&entry).unwrap();
+        entry.signature = B64.encode(key.sign(&canonical).to_bytes());
+
+        backend
+            .record_entry(entry.clone())
+            .await
+            .expect("record_entry through AuditDispatch");
+
+        let page = backend
+            .list_entries(
+                AuditFilter {
+                    tenant_id: tenant.clone(),
+                    action_type: None,
+                    actor_id: None,
+                    subject_kind: None,
+                    subject_id: None,
+                    recorded_after: None,
+                    recorded_before: None,
+                },
+                None,
+                10,
+            )
+            .await
+            .expect("list_entries through AuditDispatch");
+        assert_eq!(page.items.len(), 1, "the entry we inserted");
+        assert_eq!(page.items[0].entry_id, entry.entry_id);
+    }
+
+    /// v2.0 (CIRISPersist#91) — Postgres parity for
+    /// `receive_and_persist_pre_verified_skips_directory_lookup`.
+    /// Skips when `CIRIS_PERSIST_TEST_PG_URL` is unset.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn receive_and_persist_pre_verified_postgres() {
+        use crate::ingest::IngestError;
+        use crate::schema::{
+            CompleteTrace, ComponentType, ReasoningEventType, SchemaVersion, TraceComponent,
+            TraceLevel,
+        };
+        use crate::scrub::NullScrubber;
+        use crate::store::Backend as _;
+        use crate::verify::{
+            ed25519::canonical_payload_value, Canonicalizer, PythonJsonDumpsCanonicalizer,
+        };
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        use ed25519_dalek::{Signer as _, SigningKey};
+        use uuid::Uuid;
+
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+
+        let agent_sk = SigningKey::from_bytes(&[0x43; 32]);
+        // Unique key_id so this row is isolated from any prior run.
+        let agent_key_id = format!("ciris-agent-key:engine-91-pg-{}", Uuid::new_v4().simple());
+        let trace_id = format!("trace-engine-91-pg-{}", Uuid::new_v4().simple());
+
+        let mut trace = CompleteTrace {
+            trace_id: trace_id.clone(),
+            thought_id: "th-1".into(),
+            task_id: Some("task-1".into()),
+            agent_id_hash: format!("hash-{}", Uuid::new_v4().simple()),
+            started_at: "2026-04-30T00:15:53.123456Z".parse().unwrap(),
+            completed_at: "2026-04-30T00:16:12.789012Z".parse().unwrap(),
+            trace_level: TraceLevel::Generic,
+            trace_schema_version: SchemaVersion::parse("2.7.0").unwrap(),
+            components: vec![TraceComponent {
+                component_type: ComponentType::Observation,
+                event_type: ReasoningEventType::ThoughtStart,
+                timestamp: "2026-04-30T00:15:53.123Z".parse().unwrap(),
+                data: {
+                    let mut m = serde_json::Map::new();
+                    m.insert("attempt_index".into(), 0.into());
+                    m
+                },
+                agent_id_hash: None,
+            }],
+            deployment_profile: None,
+            signature: String::new(),
+            signature_key_id: agent_key_id.clone(),
+        };
+        let payload = canonical_payload_value(&trace);
+        let canonical = PythonJsonDumpsCanonicalizer
+            .canonicalize_value(&payload)
+            .unwrap();
+        trace.signature = B64.encode(agent_sk.sign(&canonical).to_bytes());
+        let trace_json = serde_json::to_value(&trace).unwrap();
+        let envelope = serde_json::json!({
+            "events": [{
+                "event_type": "complete_trace",
+                "trace_level": "generic",
+                "trace": trace_json,
+            }],
+            "batch_timestamp": "2026-04-30T15:00:00+00:00",
+            "consent_timestamp": "2025-01-01T00:00:00Z",
+            "trace_level": "generic",
+            "trace_schema_version": "2.7.0",
+        });
+        let bytes = envelope.to_string().into_bytes();
+
+        let engine = Engine::with_signer(test_signer(), &dsn)
+            .await
+            .expect("construct postgres engine");
+
+        // Agent pubkey intentionally NOT seeded — Full mode would
+        // fail UnknownKey.
+        let summary = engine
+            .receive_and_persist_pre_verified(&bytes, &NullScrubber)
+            .await
+            .expect("pre-verified ingest persists without a registered key");
+        assert_eq!(summary.trace_events_inserted, 1);
+        assert_eq!(summary.signatures_verified, 0);
+
+        let pg = engine.postgres_backend().expect("postgres backend");
+        let rows = pg
+            .fetch_trace_events_page(0, 1000, Some(&trace.agent_id_hash))
+            .await
+            .expect("fetch rows");
+        let mine: Vec<_> = rows
+            .iter()
+            .filter(|(_, r)| r.trace_id == trace_id)
+            .collect();
+        assert_eq!(mine.len(), 1, "the one component we ingested");
+        assert!(
+            mine[0].1.signature_verified,
+            "the trace is authentic — signature_verified stays true"
+        );
+        assert_eq!(
+            mine[0].1.verification_source,
+            crate::store::VerificationSource::Edge,
+            "skip-verify rows attribute authenticity to Edge"
+        );
+
+        // Control: Full mode rejects the unregistered key.
+        let err = engine
+            .receive_and_persist(&bytes, &NullScrubber)
+            .await
+            .expect_err("Full mode must reject the unregistered key");
+        assert!(matches!(err, IngestError::Verify(_)), "got: {err:?}");
     }
 }

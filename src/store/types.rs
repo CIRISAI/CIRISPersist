@@ -15,6 +15,52 @@ use serde::{Deserialize, Serialize};
 
 use crate::schema::{LlmCallStatus, ReasoningEventType, TraceLevel};
 
+/// v2.0 (CIRISPersist#91) — who established a trace's authenticity,
+/// stored in the `trace_events.verification_source` TEXT column.
+///
+/// Closed set, typed the same way as the other discriminators on
+/// [`TraceEventRow`] (e.g. [`TraceLevel`]) — a Rust enum mapped to a
+/// constant-set TEXT column via [`as_wire_str`](Self::as_wire_str) /
+/// [`from_wire_str`](Self::from_wire_str). The DB CHECK constraint
+/// `verification_source IN ('persist','edge')` mirrors this set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationSource {
+    /// Persist ran [`crate::verify::verify_trace`] itself during
+    /// ingest — [`VerifyMode::Full`](crate::ingest::VerifyMode::Full).
+    /// The default: every pre-V044 row, and every direct-ingest row.
+    #[default]
+    Persist,
+    /// Verification was delegated upstream to an Edge verifier; the
+    /// relay carried the `verify_outcome` and persist skipped its own
+    /// `verify_trace` — the
+    /// [`VerifyMode::TrustPreVerified`](crate::ingest::VerifyMode::TrustPreVerified)
+    /// relay skip-verify path (CIRISPersist#91).
+    Edge,
+}
+
+impl VerificationSource {
+    /// The TEXT-column wire form (`'persist'` / `'edge'`). Matches
+    /// the V044 CHECK-constraint value set.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            VerificationSource::Persist => "persist",
+            VerificationSource::Edge => "edge",
+        }
+    }
+
+    /// Parse the TEXT-column wire form. `None` for any value outside
+    /// the closed set — the caller surfaces it as a backend decode
+    /// error (the DB CHECK constraint should make this unreachable).
+    pub fn from_wire_str(s: &str) -> Option<Self> {
+        match s {
+            "persist" => Some(VerificationSource::Persist),
+            "edge" => Some(VerificationSource::Edge),
+            _ => None,
+        }
+    }
+}
+
 /// A row landing on `cirislens.trace_events`
 /// (`context/lens_027_trace_events.sql` lines 13-38).
 ///
@@ -76,11 +122,39 @@ pub struct TraceEventRow {
     /// Identifier for the agent's signing key (looked up against
     /// `accord_public_keys`).
     pub signing_key_id: String,
-    /// True after [`crate::verify::verify_trace`] returned `Ok` for
-    /// this row's parent CompleteTrace; never persisted as `false`
-    /// for unverified bytes (MISSION.md §3 anti-pattern #2 —
-    /// "store first, verify later" is rejected).
+    /// True iff this row's parent CompleteTrace signature is valid —
+    /// the authenticity gate passed. Never persisted as `false` for
+    /// unverified bytes (MISSION.md §3 anti-pattern #2 — "store
+    /// first, verify later" is rejected).
+    ///
+    /// Who established that the signature is valid is recorded
+    /// separately in [`verification_source`](Self::verification_source):
+    /// persist's own `verify_trace`, or an upstream Edge verifier
+    /// (CIRISPersist#91 relay skip-verify). `signature_verified` is
+    /// `true` in both cases — the signature is valid either way.
     pub signature_verified: bool,
+
+    /// v2.0 (CIRISPersist#91) — who established this trace's
+    /// authenticity.
+    ///
+    /// [`VerificationSource::Persist`] — persist ran
+    /// [`crate::verify::verify_trace`] itself during ingest
+    /// ([`VerifyMode::Full`](crate::ingest::VerifyMode::Full), the
+    /// default and the only mode for untrusted direct-ingest input).
+    ///
+    /// [`VerificationSource::Edge`] — verification was delegated
+    /// upstream: an Edge verifier attested the batch and the relay
+    /// carried the `verify_outcome`, so persist skipped its own
+    /// `verify_trace` (and the redundant federation-directory lookup)
+    /// — the [`VerifyMode::TrustPreVerified`](crate::ingest::VerifyMode::TrustPreVerified)
+    /// relay skip-verify path. The trace is still authentic
+    /// (`signature_verified = true`); Edge attested it.
+    ///
+    /// A consumer that needs persist-attested verification
+    /// specifically filters `verification_source = 'persist'`. The
+    /// TEXT column defaults to `'persist'` — every pre-V044 row was
+    /// ingested through persist's own `verify_trace`.
+    pub verification_source: VerificationSource,
 
     /// Wire-format schema version the trace was emitted under.
     pub schema_version: String,

@@ -74,6 +74,7 @@ fn bench_event(
         signature: "sig".to_owned(),
         signing_key_id: "key-1".to_owned(),
         signature_verified: true,
+        verification_source: ciris_persist::store::types::VerificationSource::Persist,
         schema_version: "2.7.0".to_owned(),
         pii_scrubbed: true,
         agent_role: Some("ally".to_owned()),

@@ -174,6 +174,51 @@ pub struct ScrubEnvelope {
     pub scrub_timestamp: chrono::DateTime<chrono::Utc>,
 }
 
+/// Whether [`IngestPipeline::receive_and_persist`] runs its own
+/// per-trace signature verification (step 2).
+///
+/// # Safety contract (CIRISPersist#91)
+///
+/// This is an **opt-in** knob and the decision lives at the call site
+/// — the deployer knows the federation topology (same principle as
+/// CIRISPersist#89's caller-supplied scrubber). Picking the wrong
+/// variant is a security misconfiguration the type system cannot
+/// catch, so the constraints below are non-negotiable:
+///
+/// - The lens **direct-ingest** path (untrusted agent input) MUST
+///   stay [`VerifyMode::Full`] — that is the default and must never
+///   be changed for that path.
+/// - [`VerifyMode::TrustPreVerified`] is legitimate **only** for a
+///   relay that already holds an Edge `verify_outcome` for the batch
+///   (CIRISLensCore#10 / AV-9: "never re-verify what Edge verified").
+///   It does not weaken authenticity — it asserts the gate already
+///   passed upstream and persist should not redundantly re-do the
+///   federation-directory `lookup_public_key` on the relay hot path.
+///
+/// Persisted rows record WHO established authenticity in
+/// [`TraceEventRow::verification_source`](crate::store::TraceEventRow::verification_source):
+/// `Full` → [`VerificationSource::Persist`](crate::store::VerificationSource::Persist),
+/// `TrustPreVerified` → [`VerificationSource::Edge`](crate::store::VerificationSource::Edge).
+/// `signature_verified` stays `true` in both modes — the trace is
+/// authentic either way (Edge attested the skip-verify path).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VerifyMode {
+    /// Verify every `CompleteTrace` signature against the federation
+    /// key directory (today's behavior; the only safe mode for
+    /// untrusted direct-ingest input). The default. Persisted rows
+    /// carry `verification_source = 'persist'`.
+    #[default]
+    Full,
+    /// Skip per-trace signature verification: the caller attests the
+    /// batch arrived already Edge-verified (it holds the Edge
+    /// `verify_outcome`). Every other pipeline step — schema parse,
+    /// scrub, decompose, store, ordering — is unchanged. Persisted
+    /// rows carry `verification_source = 'edge'`, honestly recording
+    /// that an upstream Edge verifier — not persist — established
+    /// authenticity.
+    TrustPreVerified,
+}
+
 /// Composition of dependencies for one ingest call.
 ///
 /// Mission constraint (MISSION.md §2 — `store/`, `verify/`, `scrub/`):
@@ -224,7 +269,53 @@ where
     /// authenticity gate), scrub third (verify is over the
     /// agent-shipped bytes; scrub mutates after), decompose fourth,
     /// store last.
+    ///
+    /// Always runs [`VerifyMode::Full`] — the only safe mode for
+    /// untrusted direct-ingest input (the lens direct-ingest path).
+    /// A relay that holds an Edge `verify_outcome` and wants to skip
+    /// the redundant per-trace federation-directory lookup calls
+    /// [`receive_and_persist_with`](Self::receive_and_persist_with)
+    /// with [`VerifyMode::TrustPreVerified`] instead — see that
+    /// method and [`VerifyMode`] for the CIRISPersist#91 safety
+    /// contract.
     pub async fn receive_and_persist(&self, bytes: &[u8]) -> Result<BatchSummary, IngestError> {
+        self.receive_and_persist_with(bytes, VerifyMode::Full).await
+    }
+
+    /// v2.0 (CIRISPersist#91) — [`receive_and_persist`](Self::receive_and_persist)
+    /// with an explicit [`VerifyMode`].
+    ///
+    /// `VerifyMode::Full` is byte-identical to `receive_and_persist`.
+    /// `VerifyMode::TrustPreVerified` skips **only** step 2 (the
+    /// per-`CompleteTrace` signature verification + its federation-
+    /// directory `lookup_public_key`); every other step — schema
+    /// parse, pre-scrub hashing, scrub, scrub-envelope signing,
+    /// decompose, insert, and the ordering between them — is
+    /// unchanged.
+    ///
+    /// # Safety
+    ///
+    /// `VerifyMode::TrustPreVerified` is opt-in and legitimate **only**
+    /// for a relay holding an Edge `verify_outcome` for the batch
+    /// (CIRISLensCore#10 / AV-9). The decision lives at the call site;
+    /// the lens direct-ingest path MUST NOT use it. See [`VerifyMode`].
+    ///
+    /// # Honest row state under skip-verify
+    ///
+    /// In `TrustPreVerified` mode persist does **not** run
+    /// `verify_trace` itself, so the persisted rows carry
+    /// [`verification_source = Edge`](crate::store::VerificationSource::Edge)
+    /// — honestly recording that an upstream Edge verifier, not
+    /// persist, established authenticity. `signature_verified` stays
+    /// `true`: the trace IS authentic (Edge attested it). A consumer
+    /// that needs persist-attested verification specifically filters
+    /// `verification_source = 'persist'`. `BatchSummary::signatures_verified`
+    /// is `0` — persist itself verified zero signatures.
+    pub async fn receive_and_persist_with(
+        &self,
+        bytes: &[u8],
+        verify_mode: VerifyMode,
+    ) -> Result<BatchSummary, IngestError> {
         // v0.1.18 — wire-body sha256 for the SignatureMismatch
         // breadcrumb, computed once per call so the lens-side
         // body_sha256_prefix in their POST-receipt log joins
@@ -240,14 +331,26 @@ where
         // 2. Verify each CompleteTrace signature. Mission constraint
         //    (MISSION.md §3 anti-pattern #2): verify before any
         //    mutation; verification is over the agent-shipped bytes.
+        //
+        //    CIRISPersist#91: in `VerifyMode::TrustPreVerified` the
+        //    caller (a relay) attests the batch arrived already
+        //    Edge-verified, so persist skips this step entirely —
+        //    no per-trace `lookup_public_key`. `signatures_verified`
+        //    stays 0 because *persist* verified nothing; the
+        //    persisted rows are flagged accordingly (see step 6).
         let mut signatures_verified = 0usize;
-        for event in &env.events {
-            match event {
-                BatchEvent::CompleteTrace { trace, .. } => {
-                    self.verify_complete_trace(trace, &body_sha256).await?;
-                    signatures_verified += 1;
+        match verify_mode {
+            VerifyMode::Full => {
+                for event in &env.events {
+                    match event {
+                        BatchEvent::CompleteTrace { trace, .. } => {
+                            self.verify_complete_trace(trace, &body_sha256).await?;
+                            signatures_verified += 1;
+                        }
+                    }
                 }
             }
+            VerifyMode::TrustPreVerified => {}
         }
 
         // 3. Capture pre-scrub canonical bytes for every component.
@@ -298,6 +401,19 @@ where
                         row.scrub_signature = Some(env_for_row.scrub_signature.clone());
                         row.scrub_key_id = Some(env_for_row.scrub_key_id.clone());
                         row.scrub_timestamp = Some(env_for_row.scrub_timestamp);
+                        // CIRISPersist#91 — record WHO established
+                        // authenticity. `signature_verified` keeps its
+                        // plain meaning ("the signature is valid") and
+                        // stays `true` for both modes — the trace IS
+                        // authentic either way. `verification_source`
+                        // records the attestor: `Full` mode = persist
+                        // ran `verify_trace`; `TrustPreVerified` =
+                        // delegated upstream to an Edge verifier (the
+                        // relay carried the `verify_outcome`).
+                        row.verification_source = match verify_mode {
+                            VerifyMode::Full => crate::store::VerificationSource::Persist,
+                            VerifyMode::TrustPreVerified => crate::store::VerificationSource::Edge,
+                        };
                         env_idx += 1;
                     }
                     events_to_insert.extend(d.events);
@@ -690,6 +806,14 @@ mod tests {
                 "scrub_key_id matches the signer's id"
             );
             assert!(row.scrub_timestamp.is_some(), "scrub_timestamp populated");
+            // CIRISPersist#91 — Full-mode rows attribute authenticity
+            // to persist's own `verify_trace`.
+            assert!(row.signature_verified, "Full-mode row is verified");
+            assert_eq!(
+                row.verification_source,
+                crate::store::VerificationSource::Persist,
+                "Full-mode rows attribute authenticity to persist"
+            );
         }
 
         // THREAT_MODEL.md AV-24 verification: ed25519_verify the
@@ -843,6 +967,120 @@ mod tests {
         assert!(
             backend.snapshot_events().is_empty(),
             "rejected traces must produce zero rows"
+        );
+    }
+
+    /// v2.0 (CIRISPersist#91) — `VerifyMode::TrustPreVerified` skips
+    /// step 2's signature verification (and its directory lookup):
+    /// the batch persists even though NO public key is registered for
+    /// the trace's `signature_key_id`. In `Full` mode that same batch
+    /// is rejected `UnknownKey` (asserted at the end), so a clean
+    /// persist here proves the `lookup_public_key` was bypassed.
+    #[tokio::test]
+    async fn skip_verify_persists_without_directory_lookup() {
+        let (bytes, key_id, _vkey) = make_signed_batch_bytes();
+        let backend = MemoryBackend::new();
+        // Intentionally register NO public key: a `Full`-mode ingest
+        // would fail at step 2 with `UnknownKey`.
+
+        let (signer, signer_key_id) = make_test_signer().await;
+        let pipeline = IngestPipeline {
+            backend: &backend,
+            canonicalizer: &PythonJsonDumpsCanonicalizer,
+            scrubber: &NullScrubber,
+            signer: &*signer,
+            signer_key_id: &signer_key_id,
+        };
+
+        let summary = pipeline
+            .receive_and_persist_with(&bytes, VerifyMode::TrustPreVerified)
+            .await
+            .expect("skip-verify ingest persists without a registered key");
+
+        // Every non-verify step still ran: schema parse → scrub →
+        // decompose → store, same row counts as the happy path.
+        assert_eq!(summary.envelopes_processed, 1);
+        assert_eq!(
+            summary.trace_events_inserted, 2,
+            "two components → two rows"
+        );
+        assert_eq!(summary.trace_events_conflicted, 0);
+        // Persist verified zero signatures itself.
+        assert_eq!(summary.signatures_verified, 0);
+
+        // Honest row state (CIRISPersist#91): the trace IS authentic
+        // (`signature_verified == true`), and `verification_source`
+        // records that an upstream Edge verifier — not persist —
+        // established that authenticity.
+        let snap = backend.snapshot_events();
+        assert_eq!(snap.len(), 2);
+        for row in &snap {
+            assert!(
+                row.signature_verified,
+                "the trace is authentic — signature_verified stays true"
+            );
+            assert_eq!(
+                row.verification_source,
+                crate::store::VerificationSource::Edge,
+                "skip-verify rows attribute authenticity to Edge"
+            );
+            // Other steps unchanged — scrub envelope still populated.
+            assert!(row.original_content_hash.is_some());
+            assert!(row.scrub_signature.is_some());
+        }
+
+        // Control: the SAME batch in `Full` mode is rejected because
+        // no key is registered — proving skip-mode genuinely bypassed
+        // the directory lookup rather than the key being optional.
+        let err = pipeline
+            .receive_and_persist_with(&bytes, VerifyMode::Full)
+            .await
+            .unwrap_err();
+        match err {
+            IngestError::Verify(VerifyError::UnknownKey(id)) => assert_eq!(id, key_id),
+            other => panic!("expected UnknownKey in Full mode, got {other:?}"),
+        }
+    }
+
+    /// v2.0 (CIRISPersist#91) — `VerifyMode::Full` (and the
+    /// `receive_and_persist` default) is unchanged: it still verifies
+    /// every trace and still rejects a bad signature with zero writes.
+    #[tokio::test]
+    async fn full_mode_unchanged_still_rejects_bad_signature() {
+        let (bytes, key_id, _vkey) = make_signed_batch_bytes();
+        // Register a *different* key for the same key_id → mismatch.
+        let other_sk = SigningKey::from_bytes(&[0x99; 32]);
+        let backend = MemoryBackend::new();
+        backend.add_public_key(&key_id, other_sk.verifying_key());
+
+        let (signer, signer_key_id) = make_test_signer().await;
+        let pipeline = IngestPipeline {
+            backend: &backend,
+            canonicalizer: &PythonJsonDumpsCanonicalizer,
+            scrubber: &NullScrubber,
+            signer: &*signer,
+            signer_key_id: &signer_key_id,
+        };
+
+        // Explicit `Full` mode rejects the bad signature.
+        let err = pipeline
+            .receive_and_persist_with(&bytes, VerifyMode::Full)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            IngestError::Verify(VerifyError::SignatureMismatch)
+        ));
+        // The `receive_and_persist` convenience (Full-by-default)
+        // behaves identically.
+        let err2 = pipeline.receive_and_persist(&bytes).await.unwrap_err();
+        assert!(matches!(
+            err2,
+            IngestError::Verify(VerifyError::SignatureMismatch)
+        ));
+        assert!(
+            backend.snapshot_events().is_empty(),
+            "Full mode still writes zero rows for a bad signature"
         );
     }
 

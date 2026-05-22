@@ -559,6 +559,32 @@ impl PyEngine {
         }
     }
 
+    /// v2.0 (CIRISPersist#93) — borrow a per-backend
+    /// [`AuditService`](crate::audit::AuditService) handle for the
+    /// Engine's underlying storage backend.
+    ///
+    /// Exact sibling of [`PyEngine::node_core_service`] — see that
+    /// accessor's doc-comment for the issue-#90 Option B rationale
+    /// (plain `pub fn`, not a `#[pymethod]`, because NodeCore's PyO3
+    /// bindings call this via `PyRef<PyEngine>` on the Rust side and
+    /// it never crosses the Python boundary) and for why an enum is
+    /// returned rather than `Arc<dyn AuditService>` (RPITIT — not
+    /// object-safe).
+    ///
+    /// Cheap: each variant clones / wraps the inner backend handle
+    /// once.
+    #[cfg(all(feature = "cirisaudit", any(feature = "postgres", feature = "sqlite")))]
+    pub fn audit_service(&self) -> crate::engine::AuditDispatch {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => crate::engine::AuditDispatch::Postgres(b.clone()),
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => crate::engine::AuditDispatch::Sqlite(Arc::new(
+                crate::audit::sqlite::SqliteAuditBackend::new(b.conn_handle()),
+            )),
+        }
+    }
+
     /// v1.6.8 — guard run at the top of every method that touches
     /// the runtime / pool. `EngineClosed` after `close()`;
     /// `EngineUsedAcrossFork` when the process forked since
@@ -1931,10 +1957,30 @@ impl PyEngine {
     /// `ValueError` for schema/verify/scrub rejections (lens
     /// translates to 4xx) and `RuntimeError` for backend issues
     /// (lens translates to 5xx).
+    ///
+    /// # `pre_verified` (CIRISPersist#91)
+    ///
+    /// `pre_verified=False` (the default) runs
+    /// [`VerifyMode::Full`](crate::ingest::VerifyMode) — every
+    /// `CompleteTrace` signature is verified. This is the only safe
+    /// setting for untrusted direct-ingest input and the lens
+    /// direct-ingest path MUST leave it defaulted.
+    ///
+    /// `pre_verified=True` runs
+    /// [`VerifyMode::TrustPreVerified`](crate::ingest::VerifyMode):
+    /// per-trace signature verification (and its federation-directory
+    /// lookup) is skipped. Opt-in, and legitimate **only** for a relay
+    /// that already holds an Edge `verify_outcome` for the batch
+    /// (AV-9). The decision lives at this call site. Rows persisted
+    /// this way land with `verification_source = 'edge'` — an upstream
+    /// Edge verifier, not persist, established authenticity
+    /// (`signature_verified` stays `true`; the trace is authentic).
+    #[pyo3(signature = (body, pre_verified = false))]
     fn receive_and_persist<'py>(
         &self,
         py: Python<'py>,
         body: &Bound<'py, PyBytes>,
+        pre_verified: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -1943,6 +1989,11 @@ impl PyEngine {
             let signer = self.signer.clone();
             let signer_key_id = self.signer_key_id.clone();
             let runtime = self.runtime.clone();
+            let verify_mode = if pre_verified {
+                crate::ingest::VerifyMode::TrustPreVerified
+            } else {
+                crate::ingest::VerifyMode::Full
+            };
 
             let summary = py.detach(|| match &self.backend {
                 BackendDispatch::Postgres(pg) => {
@@ -1955,7 +2006,7 @@ impl PyEngine {
                             signer: &*signer,
                             signer_key_id: &signer_key_id,
                         };
-                        pipeline.receive_and_persist(&bytes).await
+                        pipeline.receive_and_persist_with(&bytes, verify_mode).await
                     })
                 }
                 #[cfg(feature = "sqlite")]
@@ -1969,7 +2020,7 @@ impl PyEngine {
                             signer: &*signer,
                             signer_key_id: &signer_key_id,
                         };
-                        pipeline.receive_and_persist(&bytes).await
+                        pipeline.receive_and_persist_with(&bytes, verify_mode).await
                     })
                 }
             });

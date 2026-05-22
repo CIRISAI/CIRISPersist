@@ -1566,6 +1566,7 @@ mod tests {
             signature: "AAAA".into(),
             signing_key_id: "test-key".into(),
             signature_verified: true,
+            verification_source: crate::store::VerificationSource::Persist,
             schema_version: "2.7.0".into(),
             pii_scrubbed: false,
             // FSD §3.7 envelope columns: tests for the in-memory
@@ -2292,6 +2293,7 @@ mod tests {
             signature: "AAAA".into(),
             signing_key_id: signing_key_id.to_owned(),
             signature_verified: true,
+            verification_source: crate::store::VerificationSource::Persist,
             schema_version: "2.7.0".into(),
             pii_scrubbed: false,
             original_content_hash: None,
@@ -2443,6 +2445,7 @@ mod tests {
                 signature: "AAAA".into(),
                 signing_key_id: "k".into(),
                 signature_verified: true,
+                verification_source: crate::store::VerificationSource::Persist,
                 schema_version: "2.7.0".into(),
                 pii_scrubbed: false,
                 original_content_hash: None,

@@ -101,6 +101,8 @@ pub mod verify;
 #[cfg(feature = "cirislens_wa_cert")]
 pub mod wa_cert;
 
+#[cfg(all(feature = "cirisaudit", any(feature = "postgres", feature = "sqlite")))]
+pub use engine::AuditDispatch;
 #[cfg(all(feature = "cirisnode", any(feature = "postgres", feature = "sqlite")))]
 pub use engine::NodeCoreDispatch;
 pub use engine::{BackendDispatch, Engine, EngineError};

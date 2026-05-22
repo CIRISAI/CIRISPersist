@@ -26,6 +26,7 @@ pub use postgres::PostgresBackend;
 pub use sqlite::SqliteBackend;
 pub use types::{
     AuditEntry, ClaimParams, GraphNode, ServiceCorrelation, Task, TraceEventRow, TraceLlmCallRow,
+    VerificationSource,
 };
 
 /// Store-layer errors.

@@ -5,6 +5,71 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [2.0.0] — 2026-05-22
+
+**CIRISPersist 2.0 — Federation Ready.** The release that consolidates
+persist onto the CIRIS 3.0 federation line: the federation surface
+shipped and stable, every substrate concurrency-hardened and
+CI-tested.
+
+### CIRISVerify v3.0.1 — the federation major
+
+`ciris-verify-core` / `ciris-keyring` / `ciris-crypto` pinned to the
+CIRISVerify 3.0 line (v2.8.0 → v3.0.1; major `2` → `3`). Persist
+tracks the federation-wide major; no breakage on persist's consumed
+crypto / keyring / transparency surface.
+
+### The federation surface (shipped v1.12–v1.13, stable at 2.0)
+
+`root_binding` — cold-start binding rooting against `federation_keys`:
+confirms a first-contact `key_id` by walking its recursive provenance
+to a steward bootstrap, instead of trust-on-first-use.
+`provenance_chain` — the verify-consumable recursive-provenance read.
+`current_rust_engine()` — the co-resident `Arc<Engine>` bridge. The
+persist side of the CIRIS 3.0 critical path (`CIRISVerify#28`).
+
+### Concurrency hardening
+
+- **Master-key bootstrap race** (production bug): `rotate_master_key`
+  first-use activation was a check-then-act with no DB invariant —
+  concurrent bootstraps on Postgres yielded multiple active master
+  keys and `encrypt()` failed. **V043** adds a partial unique index
+  DB-enforcing one active master key; `rotate_master_key` is now a
+  single transaction with the index as backstop and a typed
+  loser-converges path.
+- **Telemetry rollup**: a flaky daily-tier test exposed a real bug —
+  Postgres rounds a nanosecond timestamp on the `::timestamptz` cast
+  while `tokio-postgres` truncates the bind parameter; at the day
+  boundary the rollup silently dropped a window. Fixed (summary
+  timestamps truncated to microseconds before serialization).
+- Audit chain confirmed concurrency-safe (`SELECT … FOR UPDATE` +
+  `UNIQUE(tenant_id, sequence_number)`).
+
+### #91 — relay skip-verify
+
+`IngestPipeline` gains an opt-in `VerifyMode` (`Full` default;
+`TrustPreVerified`) so a relay ingesting already-Edge-verified batches
+skips the redundant per-trace federation-directory lookup. A new
+`verification_source` column (**V044** — `persist` / `edge`) records
+*who* attested authenticity, so `signature_verified = true` stays
+honest and a relay-ingested trace is distinguishable from a
+persist-verified one rather than conflated. Reached via
+`Engine::receive_and_persist_pre_verified`. The lens direct-ingest
+path is unchanged.
+
+### #93 — `audit_service()`
+
+`Engine` / `PyEngine` gain `audit_service() -> AuditDispatch` — the
+dispatch-enum accessor for the audit substrate, twin of
+`node_core_service()`.
+
+### Every substrate CI-tested
+
+`cirisaudit`, `secrets`, `cirisnode`, `cirisgraph`, `telemetry` added
+to the CI test + clippy matrix — those substrates' Postgres backends
+were previously unexercised in CI. Full suite (566 lib + 22
+integration) green on both backends.
+
 ## [1.13.0] — 2026-05-22
 
 **`current_rust_engine()` — the process-singleton `Arc<Engine>` bridge

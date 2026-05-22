@@ -165,11 +165,12 @@ impl Backend for SqliteBackend {
                 pii_scrubbed, audit_sequence_number, audit_entry_hash, audit_signature, \
                 original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
                 agent_role, agent_template, deployment_domain, \
-                deployment_type, deployment_region, deployment_trust_mode\
+                deployment_type, deployment_region, deployment_trust_mode, \
+                verification_source\
                 ) VALUES (\
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, \
-                ?28, ?29, ?30, ?31, ?32, ?33\
+                ?28, ?29, ?30, ?31, ?32, ?33, ?34\
                 ) ON CONFLICT (agent_id_hash, trace_id, thought_id, event_type, \
                 attempt_index, ts) DO NOTHING";
 
@@ -210,7 +211,7 @@ impl Backend for SqliteBackend {
 
                     let attempt_index_i64 = i64::from(row.attempt_index);
 
-                    let params: [SqlValue; 33] = [
+                    let params: [SqlValue; 34] = [
                         SqlValue::Text(row.trace_id.clone()),
                         SqlValue::Text(row.thought_id.clone()),
                         opt_text(row.task_id.as_deref()),
@@ -250,6 +251,8 @@ impl Backend for SqliteBackend {
                         opt_text(row.deployment_type.as_deref()),
                         opt_text(row.deployment_region.as_deref()),
                         opt_text(row.deployment_trust_mode.as_deref()),
+                        // v2.0 verification_source (V044, #91).
+                        SqlValue::Text(row.verification_source.as_wire_str().to_owned()),
                     ];
 
                     let n = stmt.execute(params_from_iter(params.iter()))?;
@@ -561,7 +564,7 @@ impl Backend for SqliteBackend {
                         audit_signature, original_content_hash, scrub_signature, \
                         scrub_key_id, scrub_timestamp, agent_role, agent_template, \
                         deployment_domain, deployment_type, deployment_region, \
-                        deployment_trust_mode";
+                        deployment_trust_mode, verification_source";
             let (sql, rows) = match agent {
                 Some(h) => {
                     let sql = format!(
@@ -2588,6 +2591,19 @@ fn sqlite_row_to_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, Tr
     let scrub_timestamp = scrub_ts.as_deref().map(parse_rfc3339);
     let signature_verified_i: i64 = row.get("signature_verified")?;
     let pii_scrubbed_i: i64 = row.get("pii_scrubbed")?;
+    let verification_source_str: String = row.get("verification_source")?;
+    let verification_source = crate::store::VerificationSource::from_wire_str(
+        &verification_source_str,
+    )
+    .ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::other(format!(
+                "unknown verification_source: {verification_source_str}"
+            ))),
+        )
+    })?;
     Ok((
         event_id,
         TraceEventRow {
@@ -2609,6 +2625,7 @@ fn sqlite_row_to_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, Tr
             signature: row.get("signature")?,
             signing_key_id: row.get("signing_key_id")?,
             signature_verified: signature_verified_i != 0,
+            verification_source,
             schema_version: row.get("schema_version")?,
             pii_scrubbed: pii_scrubbed_i != 0,
             original_content_hash: row.get("original_content_hash")?,
@@ -3244,7 +3261,7 @@ impl crate::read::ReadEngine for SqliteBackend {
                             original_content_hash, scrub_signature, scrub_key_id, \
                             scrub_timestamp, agent_role, agent_template, \
                             deployment_domain, deployment_type, deployment_region, \
-                            deployment_trust_mode";
+                            deployment_trust_mode, verification_source";
                 let event_rows: Vec<(i64, TraceEventRow)> = {
                     let sql = format!(
                         "SELECT {cols} FROM trace_events \
@@ -5666,6 +5683,7 @@ mod tests {
             signature: "sig-test".to_owned(),
             signing_key_id: "key-test".to_owned(),
             signature_verified: true,
+            verification_source: crate::store::VerificationSource::Persist,
             schema_version: "2.7.0".to_owned(),
             pii_scrubbed: true,
             original_content_hash: Some("aabbcc".to_owned()),
@@ -6703,6 +6721,7 @@ mod tests {
             signature: "sig".to_owned(),
             signing_key_id: "key-1".to_owned(),
             signature_verified: true,
+            verification_source: crate::store::VerificationSource::Persist,
             schema_version: "2.7.0".to_owned(),
             pii_scrubbed: true,
             original_content_hash: Some("hash".to_owned()),

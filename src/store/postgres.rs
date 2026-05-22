@@ -332,8 +332,9 @@ impl Backend for PostgresBackend {
                             pii_scrubbed, audit_sequence_number, audit_entry_hash, audit_signature, \
                             original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
                             agent_role, agent_template, deployment_domain, \
-                            deployment_type, deployment_region, deployment_trust_mode";
-        const N_COLS: usize = 33;
+                            deployment_type, deployment_region, deployment_trust_mode, \
+                            verification_source";
+        const N_COLS: usize = 34;
 
         let mut sql = String::with_capacity(2048);
         sql.push_str("INSERT INTO cirislens.trace_events (");
@@ -424,6 +425,8 @@ impl Backend for PostgresBackend {
             params.push(Box::new(row.deployment_type.clone()));
             params.push(Box::new(row.deployment_region.clone()));
             params.push(Box::new(row.deployment_trust_mode.clone()));
+            // v2.0 verification_source column (V044, #91).
+            params.push(Box::new(row.verification_source.as_wire_str().to_owned()));
         }
         // THREAT_MODEL.md AV-9: dedup-key target now includes
         // agent_id_hash so a malicious agent reusing another agent's
@@ -888,7 +891,7 @@ impl Backend for PostgresBackend {
                             audit_signature, original_content_hash, scrub_signature, \
                             scrub_key_id, scrub_timestamp, agent_role, agent_template, \
                             deployment_domain, deployment_type, deployment_region, \
-                            deployment_trust_mode \
+                            deployment_trust_mode, verification_source \
                      FROM cirislens.trace_events \
                      WHERE event_id > $1 AND agent_id_hash = $2 \
                      ORDER BY event_id ASC LIMIT $3",
@@ -906,7 +909,7 @@ impl Backend for PostgresBackend {
                             audit_signature, original_content_hash, scrub_signature, \
                             scrub_key_id, scrub_timestamp, agent_role, agent_template, \
                             deployment_domain, deployment_type, deployment_region, \
-                            deployment_trust_mode \
+                            deployment_trust_mode, verification_source \
                      FROM cirislens.trace_events \
                      WHERE event_id > $1 \
                      ORDER BY event_id ASC LIMIT $2",
@@ -2740,6 +2743,16 @@ fn pg_row_to_event_row(row: tokio_postgres::Row) -> Result<(i64, TraceEventRow),
             return Err(Error::Backend(format!("unknown trace_level: {other}")));
         }
     };
+    let verification_source_str: String =
+        row.safe_get_with("verification_source", Error::Backend)?;
+    let verification_source = crate::store::VerificationSource::from_wire_str(
+        &verification_source_str,
+    )
+    .ok_or_else(|| {
+        Error::Backend(format!(
+            "unknown verification_source in trace_events row: {verification_source_str}"
+        ))
+    })?;
     let attempt_index_i32: i32 = row.safe_get_with("attempt_index", Error::Backend)?;
     let attempt_index = u32::try_from(attempt_index_i32).map_err(|_| {
         Error::Backend(format!(
@@ -2774,6 +2787,7 @@ fn pg_row_to_event_row(row: tokio_postgres::Row) -> Result<(i64, TraceEventRow),
             signature: row.safe_get_with("signature", Error::Backend)?,
             signing_key_id: row.safe_get_with("signing_key_id", Error::Backend)?,
             signature_verified: row.safe_get_with("signature_verified", Error::Backend)?,
+            verification_source,
             schema_version: row.safe_get_with("schema_version", Error::Backend)?,
             pii_scrubbed: row.safe_get_with("pii_scrubbed", Error::Backend)?,
             original_content_hash: row.safe_get_with("original_content_hash", Error::Backend)?,
@@ -3314,7 +3328,7 @@ impl crate::read::ReadEngine for PostgresBackend {
                         audit_signature, original_content_hash, scrub_signature, \
                         scrub_key_id, scrub_timestamp, agent_role, agent_template, \
                         deployment_domain, deployment_type, deployment_region, \
-                        deployment_trust_mode \
+                        deployment_trust_mode, verification_source \
                  FROM cirislens.trace_events \
                  WHERE trace_id = $1 \
                  ORDER BY ts ASC",
@@ -5841,6 +5855,7 @@ mod tests {
             signature: "AAAA".into(),
             signing_key_id: "test-key".into(),
             signature_verified: true,
+            verification_source: crate::store::VerificationSource::Persist,
             schema_version: "2.7.0".into(),
             pii_scrubbed: false,
             original_content_hash: None,
@@ -6147,6 +6162,7 @@ mod tests {
                 signature: "AAAA".into(),
                 signing_key_id: "test-key".into(),
                 signature_verified: true,
+                verification_source: crate::store::VerificationSource::Persist,
                 schema_version: "2.7.0".into(),
                 pii_scrubbed: false,
                 original_content_hash: None,
@@ -6736,6 +6752,7 @@ mod tests {
                 signature: "AAAA".into(),
                 signing_key_id: "test-key".into(),
                 signature_verified: true,
+                verification_source: crate::store::VerificationSource::Persist,
                 schema_version: "2.7.0".into(),
                 pii_scrubbed: false,
                 original_content_hash: None,
@@ -7693,6 +7710,7 @@ mod tests {
             signature: "AAAA".into(),
             signing_key_id: "test-key".into(),
             signature_verified: true,
+            verification_source: crate::store::VerificationSource::Persist,
             schema_version: "2.7.0".into(),
             pii_scrubbed,
             original_content_hash: None,
@@ -8330,6 +8348,7 @@ mod tests {
             signature: "AAAA".into(),
             signing_key_id: "test-key".into(),
             signature_verified: true,
+            verification_source: crate::store::VerificationSource::Persist,
             schema_version: "2.7.0".into(),
             pii_scrubbed: false,
             original_content_hash: None,
