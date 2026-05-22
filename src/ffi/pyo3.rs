@@ -2369,6 +2369,104 @@ impl PyEngine {
         })
     }
 
+    /// Cold-start binding-rooting primitive (CIRISPersist#94).
+    ///
+    /// Confirm a claimed `(key_id, pubkey)` binding against the
+    /// `federation_keys` directory and verify the row's recursive-
+    /// provenance chain up to a steward bootstrap. Replaces
+    /// trust-on-first-use.
+    ///
+    /// Returns the [`RootingVerdict`](crate::federation::RootingVerdict)
+    /// as a JSON string — `{"verdict":"confirmed", ...}` or
+    /// `{"verdict":"rejected","reason":...}`. A `Rejected` verdict is
+    /// NOT a Python exception: rooting always produces a typed verdict
+    /// (MISSION.md §1.6 — fail-honest), so the caller branches on the
+    /// `verdict` field rather than catching.
+    ///
+    /// CIRISEdge's resolver is Rust and calls
+    /// `crate::federation::root_binding` directly; this PyO3 wrapper
+    /// mirrors the `lookup_public_key` surface for the lens FastAPI
+    /// integration. **One implementation, both surfaces.**
+    fn root_binding(
+        &self,
+        py: Python<'_>,
+        key_id: &str,
+        claimed_pubkey_ed25519_base64: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key_id = key_id.to_owned();
+            let claimed = claimed_pubkey_ed25519_base64.to_owned();
+            py.detach(move || {
+                let verdict = match &self.backend {
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::root_binding(&*backend, &key_id, &claimed).await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::root_binding(&*backend, &key_id, &claimed).await
+                        })
+                    }
+                };
+                serde_json::to_string(&verdict).map_err(|e| {
+                    PyRuntimeError::new_err(format!("RootingVerdict JSON encode: {e}"))
+                })
+            })
+        })
+    }
+
+    /// Verify-consumable provenance read (CIRISVerify WS-4).
+    ///
+    /// Returns the `federation_keys` row for `key_id` plus its full
+    /// recursive-provenance four-tuple chain as a JSON string
+    /// (`ProvenanceChain`), so CIRISVerify can verify the chain
+    /// verify-side off its registry-local `trusted_primitive_keys`.
+    ///
+    /// Raises `LensQueryError` if the chain cannot be assembled
+    /// (unknown `key_id`, broken link, cycle, over-depth, backend
+    /// error) — the typed
+    /// [`RootingRejection`](crate::federation::RootingRejection)
+    /// `kind()` token is the error message. (The verifying primitive
+    /// `root_binding` folds these into a `Rejected` verdict instead;
+    /// this raw read surfaces them as an error since there is no
+    /// chain to return.)
+    fn provenance_chain(&self, py: Python<'_>, key_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key_id = key_id.to_owned();
+            py.detach(move || {
+                let result = match &self.backend {
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::provenance_chain(&*backend, &key_id).await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::provenance_chain(&*backend, &key_id).await
+                        })
+                    }
+                };
+                let chain = result.map_err(|rej| {
+                    PyErr::new::<LensQueryError, _>(format!("provenance_chain: {}", rej.kind()))
+                })?;
+                serde_json::to_string(&chain).map_err(|e| {
+                    PyRuntimeError::new_err(format!("ProvenanceChain JSON encode: {e}"))
+                })
+            })
+        })
+    }
+
     /// Federation directory: lookup all public keys for an identity_ref.
     /// Returns a JSON array string of `KeyRecord` objects.
     fn lookup_keys_for_identity(&self, py: Python<'_>, identity_ref: &str) -> PyResult<String> {

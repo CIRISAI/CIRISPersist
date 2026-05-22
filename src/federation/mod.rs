@@ -40,6 +40,7 @@ pub mod backfill;
 pub mod emit;
 #[cfg(feature = "cirisaudit")]
 pub mod read;
+pub mod rooting;
 #[cfg(feature = "sqlite")]
 pub mod sqlite_open;
 pub mod trust_grant;
@@ -67,6 +68,10 @@ pub(crate) mod serde_bytes_b64 {
     }
 }
 
+pub use rooting::{
+    provenance_chain, root_binding, ProvenanceChain, ProvenanceLink, RootingRejection,
+    RootingVerdict, MAX_PROVENANCE_DEPTH,
+};
 #[cfg(feature = "sqlite")]
 pub use sqlite_open::FederationDirectorySqlite;
 pub use types::{

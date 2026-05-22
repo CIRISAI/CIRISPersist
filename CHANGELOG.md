@@ -5,6 +5,51 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.12.0] — 2026-05-22
+
+**Cold-start binding rooting — the CIRIS 3.0 critical-path node
+(closes #94; CIRISVerify#28 Phase 2 / #29 WS-4).**
+
+The 3.0 critical path is `CIRISVerify#27 → CIRISPersist rooting →
+CIRISEdge resolver → fleet enforcement`. CIRISVerify#27 shipped at
+v2.9.0; this release ships the next node — nothing downstream of
+persist moved until it landed.
+
+### `root_binding` — cold-start binding rooting
+
+`federation::root_binding(directory, key_id, claimed_pubkey)` confirms
+a first-contact federation `key_id` binding against the
+`federation_keys` directory **instead of trust-on-first-use**: it
+resolves the directory row, checks the claimed Ed25519 pubkey against
+it, and walks the row's recursive provenance chain — each link's
+scrub-signature verified through CIRISVerify — to a self-signed steward
+bootstrap. Returns a typed `RootingVerdict`: `Confirmed { chain }` or
+`Rejected { reason }` over eight typed rejection reasons (unknown key,
+pubkey mismatch, broken / unsigned provenance link, not rooted at a
+steward, cycle, over-depth, directory error). No third state; the walk
+is depth-capped (64) and cycle-detected. CIRISEdge's `PeerResolver`
+calls this on cold start.
+
+### `provenance_chain` — verify-consumable read (WS-4)
+
+`federation::provenance_chain(directory, key_id)` returns the
+`federation_keys` row plus its full recursive-provenance four-tuple
+(`original_content_hash` · `scrub_signature_classical`/`_pqc` ·
+`scrub_key_id` parent pointer · `scrub_timestamp`), leaf→root, so
+CIRISVerify can verify the chain verify-side and migrate off
+registry-local `trusted_primitive_keys`.
+
+Both surfaces are Rust-public and PyO3-exposed, work identically on
+Postgres and SQLite (16-test conformance suite on both), and add **no
+migration** — the four-tuple is the existing v0.1.3 scrub-signing
+envelope on every directory row. Per finding G, transport identities
+stay routing-only — never rooted, never in the provenance chain. A
+hybrid-pending link (cold-path ML-DSA-65 not yet attached) is verified
+on Ed25519 alone; a caller wanting PQC-strictness walks
+`provenance_chain` and applies its own policy. The `RootingVerdict` /
+`ProvenanceChain` types are the cross-repo contract for CIRISVerify
+WS-4 and CIRISEdge #28 Phase 3 to ratify.
+
 ## [1.11.1] — 2026-05-22
 
 **V042 — data-aware analytics indexes ("covering indexes as a
