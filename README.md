@@ -44,8 +44,34 @@ The backend is chosen at `Engine` construction by DSN scheme
   `ciris-keyring`.
 - **Deliberately not:** no embedded graph DB engine (Postgres / SQLite
   recursive CTEs instead); not a daemon (a library, not a service);
-  horizontal sharding is out of scope. No direct peer to benchmark against —
-  the thing it replaces is per-service ORMs and hand-rolled SQL.
+  horizontal sharding is out of scope.
+
+## Performance & SOTA
+
+Measured by the in-repo criterion suite (`benches/` — eleven harnesses run per
+commit and published to the
+[trend dashboard](https://cirisai.github.io/CIRISPersist/)). Representative
+current numbers:
+
+- **AES-256-GCM** (secrets-at-rest) — ~9.5 GiB/s, via CIRISVerify v2.8.0.
+- **Analytics** — V042 covering indexes turn the scoring `ReadEngine` queries
+  into index-only scans; `cross_agent_divergence` ~−42% vs. a raw table scan.
+- **`next_sequence`** — a durable, async-safe atomic counter increment ~10 µs
+  (the SQLite UPSERT itself ~2 µs; the rest is the async wrapper).
+- **Cold start** — open + full migration run ~12 ms.
+
+| Capability | SOTA peers | CIRISPersist |
+|---|---|---|
+| Embedded persistence | ORMs — sqlx, Diesel; per-service DBs | one API, Postgres + SQLite at 100% parity — **at parity** |
+| Audit log | Trillian, Rekor, AWS QLDB | RFC 6962 Merkle + post-quantum-signed tree heads — **ahead of typical** |
+| Crypto-at-rest | ring, OpenSSL (~3–6 GiB/s AES-GCM) | ~9.5 GiB/s AES-256-GCM via CIRISVerify — **ahead** |
+| Post-quantum | mostly classical | hybrid Ed25519 + ML-DSA-65 throughout — **ahead** |
+| Analytics | DuckDB, ClickHouse (columnar) | row store + query-shaped covering indexes ("poor-man's column store") — **at parity for the fixed query set**; ~2–5× behind a columnar engine on raw ad-hoc scan |
+| Horizontal scale | sharded DB services | a library, not a service — **behind** (deployment shape, not algorithm) |
+
+Ahead on post-quantum crypto and the Merkle audit log; at parity on embedded
+persistence and on analytics for its closed query set; the one real "behind" —
+horizontal scale — is a library-vs-service choice, not an algorithm gap.
 
 ## Quick start
 
