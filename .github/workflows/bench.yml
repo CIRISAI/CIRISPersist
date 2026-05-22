@@ -136,9 +136,10 @@ jobs:
         # Only on push to main (no PR pushes — the action's perm
         # check handles this but skipping early avoids noise).
         # benchmark-action writes per-bench history to gh-pages
-        # branch; the resulting site at
-        # https://cirisai.github.io/CIRISPersist/ shows trend
-        # charts per bench function.
+        # branch under dev/bench/; the resulting site at
+        # https://cirisai.github.io/CIRISPersist/dev/bench/ shows
+        # trend charts per bench function. (The gh-pages root has no
+        # index.html — the bare Pages URL 404s by design.)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: benchmark-action/github-action-benchmark@v1
         with:

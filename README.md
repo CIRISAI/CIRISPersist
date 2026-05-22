@@ -50,7 +50,8 @@ The backend is chosen at `Engine` construction by DSN scheme
 
 Measured by the in-repo criterion suite (`benches/` — eleven harnesses run per
 commit and published to the
-[trend dashboard](https://cirisai.github.io/CIRISPersist/)). Representative
+[trend dashboard](https://cirisai.github.io/CIRISPersist/dev/bench/)).
+Representative
 current numbers:
 
 - **AES-256-GCM** (secrets-at-rest) — ~9.5 GiB/s, via CIRISVerify v2.8.0.
