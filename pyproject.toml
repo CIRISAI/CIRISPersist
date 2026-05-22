@@ -89,6 +89,12 @@ Issues = "https://github.com/CIRISAI/CIRISPersist/issues"
 # `pip install`, every backend + every module, zero source-build.
 features = [
     "pyo3",
+    # v1.13.0 (CIRISPersist#92) — `extension-module` is its own crate
+    # feature (not folded into `pyo3`) so `cargo test --features pyo3`
+    # links libpython normally. The WHEEL still needs it: it tells PyO3
+    # not to link libpython (the host interpreter provides the symbols
+    # at import). maturin enabling it here preserves the wheel shape.
+    "extension-module",
     "sqlite",
     "cirisgraph",
     "cirisaudit",

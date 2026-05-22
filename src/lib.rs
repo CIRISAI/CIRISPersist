@@ -104,8 +104,14 @@ pub mod wa_cert;
 #[cfg(all(feature = "cirisnode", any(feature = "postgres", feature = "sqlite")))]
 pub use engine::NodeCoreDispatch;
 pub use engine::{BackendDispatch, Engine, EngineError};
+// v1.13.0 (CIRISPersist#92) — process-singleton accessors for
+// co-resident Rust consumers (CIRISEdge resolver, CIRISLensCore
+// `LensCore::relay`). Built only when the PyO3 surface — which owns
+// the `ENGINE_SINGLETON` — is compiled in.
 #[cfg(feature = "sqlite")]
 pub use federation::FederationDirectorySqlite;
+#[cfg(feature = "pyo3")]
+pub use ffi::pyo3::{current_runtime_handle, current_rust_engine};
 pub use ingest::{BatchSummary, IngestError, IngestPipeline};
 pub use journal::{Journal, JournalError};
 #[cfg(feature = "sqlite")]

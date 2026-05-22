@@ -5,6 +5,51 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.13.0] — 2026-05-22
+
+**`current_rust_engine()` — the process-singleton `Arc<Engine>` bridge
+for co-resident Rust consumers (closes #92).**
+
+The CIRIS 3.0 cohabitation model puts the agent + NodeCore + LensCore +
+Edge in one process sharing one `Engine`. A co-resident Rust extension
+(CIRISLensCore's `init_edge_runtime` relay path; CIRISEdge's resolver)
+needs the Rust `Arc<Engine>` for the singleton the Python host built —
+but `PyEngine` is a *sibling* of the Rust `Engine`, not a wrapper, with
+no `Arc<Engine>` inside it.
+
+### New surface
+
+- `current_rust_engine() -> Option<Arc<Engine>>` — a free accessor over
+  the process-singleton: builds (once, cached on the `EngineCell`) and
+  returns the Rust `Arc<Engine>` view of the same engine `PyEngine`
+  dispatches to — shared backend pool, shared signer, **no second
+  `Engine` / runtime / connection pool**.
+- `current_runtime_handle() -> Option<tokio::runtime::Handle>` — the
+  singleton's long-lived runtime handle, so a co-resident consumer's
+  `block_on` keeps the Postgres pool's connection-driver tasks on the
+  process-lifetime runtime.
+- `Engine::from_shared(backend, signer)` — construct an `Engine` from
+  already-live parts; no new connection, no migration run.
+
+### Breaking — `Engine::signer()` return type
+
+`Engine` now holds `Arc<dyn ciris_keyring::HardwareSigner>` (was
+`Arc<LocalSigner>`); `Engine::signer()` returns
+`&Arc<dyn HardwareSigner>`. This makes `Engine` signer-compatible with
+the process singleton and correct on hardware-attested deployments.
+The constructors (`with_signer`, `with_signer_arcs`) are unchanged —
+they still accept `Arc<LocalSigner>` and wrap it in the
+`LocalSignerHardwareAdapter`. `Engine::signer()` had no known
+consumers; flagged per the clean-break convention.
+
+### Build — `extension-module` is now its own feature
+
+`pyo3/extension-module` is split out of the always-on `pyo3` cargo
+feature into a dedicated `extension-module` feature (maturin enables it
+for the wheel via `pyproject.toml [tool.maturin] features`). The wheel
+is unchanged; `cargo test --features pyo3` now links libpython the
+normal way instead of failing on `undefined symbol: _Py_DecRef`.
+
 ## [1.12.0] — 2026-05-22
 
 **Cold-start binding rooting — the CIRIS 3.0 critical-path node

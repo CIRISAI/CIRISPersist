@@ -42,8 +42,10 @@
 //! let signer = Arc::new(LocalSigner::from_config(/* … */)?);
 //! let engine = Engine::with_signer(signer.clone(), "sqlite:///agent.db").await?;
 //!
-//! // Sign a canonical envelope with the local identity.
-//! let sig = engine.signer().sign_ed25519(canonical_bytes)?;
+//! // Sign a canonical envelope with the composed federation signer.
+//! // `Engine::signer()` returns `&Arc<dyn HardwareSigner>` (v1.13.0):
+//! use ciris_keyring::HardwareSigner;
+//! let sig = engine.signer().sign(canonical_bytes).await?;
 //!
 //! // Dispatch on the backend to use the federation directory.
 //! match engine.backend() {
@@ -61,7 +63,9 @@
 
 use std::sync::Arc;
 
-use crate::signing::LocalSigner;
+use ciris_keyring::HardwareSigner;
+
+use crate::signing::{LocalSigner, LocalSignerHardwareAdapter};
 // Re-exported so `Engine::receive_and_persist`'s signature resolves
 // for consumers that `use ciris_persist::Engine` without separately
 // importing the scrub module.
@@ -100,14 +104,29 @@ pub enum BackendDispatch {
 }
 
 /// v1.1.0 (CIRISPersist#43) — Rust-side substrate handle composing
-/// a storage backend plus a pre-loaded
-/// [`LocalSigner`](crate::signing::LocalSigner) `Arc`.
+/// a storage backend plus a federation signer.
+///
+/// v1.13.0 (CIRISPersist#92): the signer is held as
+/// `Arc<dyn HardwareSigner>` — the federation signer abstraction —
+/// rather than the concrete `Arc<LocalSigner>` it carried through
+/// v1.12.x. This makes `Engine` and the PyO3 process-singleton's
+/// `EngineCell` signer-compatible (the singleton already holds an
+/// `Arc<dyn HardwareSigner>`), so the singleton can hand a co-resident
+/// Rust consumer an `Arc<Engine>` view via
+/// [`current_rust_engine`](crate::current_rust_engine), and makes
+/// `Engine` correct on hardware-attested deployments — not just
+/// software [`LocalSigner`](crate::signing::LocalSigner) ones.
+///
+/// The `with_signer*` constructors stay source-compatible: they still
+/// accept an `Arc<LocalSigner>` and wrap it in
+/// [`LocalSignerHardwareAdapter`](crate::signing::LocalSignerHardwareAdapter)
+/// before storing.
 ///
 /// See module-level documentation for usage.
 #[derive(Clone)]
 pub struct Engine {
     backend: BackendDispatch,
-    signer: Arc<LocalSigner>,
+    signer: Arc<dyn HardwareSigner>,
 }
 
 impl Engine {
@@ -128,6 +147,10 @@ impl Engine {
     /// the returned Engine is ready to read/write immediately.
     pub async fn with_signer(signer: Arc<LocalSigner>, dsn: &str) -> Result<Self, EngineError> {
         let backend = build_backend(dsn).await?;
+        // v1.13.0 (#92): the stored field is `Arc<dyn HardwareSigner>`;
+        // wrap the caller's `Arc<LocalSigner>` so the constructor stays
+        // source-compatible.
+        let signer: Arc<dyn HardwareSigner> = Arc::new(LocalSignerHardwareAdapter::new(signer));
         Ok(Engine { backend, signer })
     }
 
@@ -167,9 +190,38 @@ impl Engine {
         &self.backend
     }
 
-    /// Accessor for the composed local signer `Arc`.
-    pub fn signer(&self) -> &Arc<LocalSigner> {
+    /// Accessor for the composed federation signer `Arc`.
+    ///
+    /// v1.13.0 (CIRISPersist#92): returns `&Arc<dyn HardwareSigner>`
+    /// (previously `&Arc<LocalSigner>`). The federation signer
+    /// abstraction is the right type — a hardware-attested deployment
+    /// composes a real [`HardwareSigner`]; a software deployment
+    /// composes a [`LocalSigner`](crate::signing::LocalSigner) wrapped
+    /// in [`LocalSignerHardwareAdapter`](crate::signing::LocalSignerHardwareAdapter).
+    /// The signing-identity alias is reachable via
+    /// [`HardwareSigner::current_alias`].
+    pub fn signer(&self) -> &Arc<dyn HardwareSigner> {
         &self.signer
+    }
+
+    /// v1.13.0 (CIRISPersist#92) — construct an `Engine` from
+    /// **already-live** parts: a connected + migrated backend and a
+    /// federation signer.
+    ///
+    /// Unlike [`Engine::with_signer`], this opens **no** connection and
+    /// runs **no** migrations — the caller's `backend` is presumed
+    /// already connected and migrated. It is the constructor the
+    /// process-singleton accessor
+    /// [`current_rust_engine`](crate::current_rust_engine) uses to hand
+    /// a co-resident Rust consumer an `Arc<Engine>` view onto the
+    /// singleton's backend + signer, with no second connection pool,
+    /// runtime, or migration run.
+    ///
+    /// `backend` is this module's [`BackendDispatch`]; cloning it (or
+    /// re-wrapping the singleton's own `BackendDispatch` by cloning the
+    /// inner `Arc<…Backend>`) shares the same connection pool.
+    pub fn from_shared(backend: BackendDispatch, signer: Arc<dyn HardwareSigner>) -> Engine {
+        Engine { backend, signer }
     }
 
     /// Borrow the SQLite backend Arc, if this Engine was constructed
@@ -255,12 +307,12 @@ impl Engine {
     /// - **Canonicalizer**: persist's default
     ///   [`PythonJsonDumpsCanonicalizer`](crate::verify::PythonJsonDumpsCanonicalizer)
     ///   — a stateless unit struct; no `Engine` state.
-    /// - **Signer**: the `Engine`'s composed `Arc<LocalSigner>`,
-    ///   wrapped in
-    ///   [`LocalSignerHardwareAdapter`](crate::signing::LocalSignerHardwareAdapter)
-    ///   so it satisfies `IngestPipeline`'s `&dyn HardwareSigner`
-    ///   bound. The scrub-envelope `scrub_key_id` is the
-    ///   `LocalSigner`'s `key_id`.
+    /// - **Signer**: the `Engine`'s composed `Arc<dyn HardwareSigner>`
+    ///   — the federation signer abstraction `IngestPipeline`'s
+    ///   `&dyn HardwareSigner` bound wants directly (v1.13.0 / #92: no
+    ///   `LocalSignerHardwareAdapter` wrap is built here any more — the
+    ///   field is already the right type). The scrub-envelope
+    ///   `scrub_key_id` is the signer's [`current_alias`](ciris_keyring::HardwareSigner::current_alias).
     ///
     /// Adds zero new `Engine` fields — every dependency is either
     /// already composed (`signer`) or facade-internal.
@@ -270,8 +322,7 @@ impl Engine {
         bytes: &[u8],
         scrubber: &dyn Scrubber,
     ) -> Result<crate::ingest::BatchSummary, crate::ingest::IngestError> {
-        let adapter = crate::signing::LocalSignerHardwareAdapter::new(self.signer.clone());
-        let key_id = self.signer.key_id().to_owned();
+        let key_id = self.signer.current_alias().to_owned();
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
@@ -279,7 +330,7 @@ impl Engine {
                     backend: &**arc,
                     canonicalizer: &crate::verify::PythonJsonDumpsCanonicalizer,
                     scrubber,
-                    signer: &adapter,
+                    signer: &*self.signer,
                     signer_key_id: &key_id,
                 };
                 pipeline.receive_and_persist(bytes).await
@@ -290,7 +341,7 @@ impl Engine {
                     backend: &**arc,
                     canonicalizer: &crate::verify::PythonJsonDumpsCanonicalizer,
                     scrubber,
-                    signer: &adapter,
+                    signer: &*self.signer,
                     signer_key_id: &key_id,
                 };
                 pipeline.receive_and_persist(bytes).await
@@ -483,10 +534,13 @@ mod tests {
         // Holding the Arc independently doesn't disturb the engine.
         let _held: Arc<SqliteBackend> = sq.clone();
 
-        // Signer is reachable through the Arc accessor.
+        // Signer is reachable through the Arc accessor — v1.13.0 (#92)
+        // returns `&Arc<dyn HardwareSigner>`, so sign via the trait
+        // (`HardwareSigner` is in module scope via the file-top `use`).
         let sig = engine
             .signer()
-            .sign_ed25519(b"engine-handle-roundtrip")
+            .sign(b"engine-handle-roundtrip")
+            .await
             .expect("sign");
         assert_eq!(sig.len(), 64);
     }
@@ -506,7 +560,10 @@ mod tests {
         .await
         .expect("construct engine via raw arcs");
 
-        assert_eq!(engine.signer().key_id(), "test-arcs-steward");
+        // v1.13.0 (#92): `signer()` is `&Arc<dyn HardwareSigner>`; the
+        // signing-identity alias is exposed via `current_alias()`
+        // (`HardwareSigner` is in module scope via the file-top `use`).
+        assert_eq!(engine.signer().current_alias(), "test-arcs-steward");
         assert!(engine.sqlite_backend().is_some());
     }
 

@@ -370,6 +370,19 @@ struct EngineCell {
     /// Shared with every `PyEngine` handle. `close()` sets it; every
     /// method checks it.
     closed: Arc<std::sync::atomic::AtomicBool>,
+    /// v1.13.0 (CIRISPersist#92) — lazily-built, cached
+    /// [`Engine`](crate::Engine) view onto this cell's backend +
+    /// signer, handed to co-resident Rust consumers (CIRISEdge's
+    /// resolver, CIRISLensCore's `LensCore::relay`) by
+    /// [`current_rust_engine`](crate::current_rust_engine).
+    ///
+    /// Built **once** via [`OnceLock`] so repeated calls return the
+    /// SAME `Arc<Engine>` — and that `Engine` shares this cell's
+    /// connection pool (the inner backend `Arc` is cloned, not
+    /// reconnected) and `Arc<dyn HardwareSigner>`. No second runtime,
+    /// pool, or migration run is created: the cohabitation invariant
+    /// (one process, one singleton) holds.
+    rust_engine: std::sync::OnceLock<Arc<crate::Engine>>,
 }
 
 /// The one global slot. `OnceLock` initializes the `Mutex` once;
@@ -965,6 +978,7 @@ impl PyEngine {
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             consumers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             subscriptions: Arc::new(std::sync::Mutex::new(SubscriptionState::default())),
+            rust_engine: std::sync::OnceLock::new(),
         });
         let handle = PyEngine::from_cell(&cell);
         *slot = Some(cell);
@@ -14569,6 +14583,233 @@ mod tests {
             "in_memory"
         );
     }
+
+    // ── v1.13.0 (CIRISPersist#92) — current_rust_engine tests ───────
+    //
+    // These build an `EngineCell` directly and install it into the
+    // process-global `ENGINE_SINGLETON`, then exercise the public
+    // `current_rust_engine` / `current_runtime_handle` accessors.
+    // They share the global slot, so `serial(engine_singleton)`
+    // keeps them from racing each other and any other singleton test.
+
+    /// Build a minimal `EngineCell` over an in-memory SQLite backend
+    /// for the `current_rust_engine` tests, and install it into the
+    /// process singleton. Returns the backend `Arc` so a test can
+    /// assert pointer-identity with the one `current_rust_engine`
+    /// yields.
+    #[cfg(feature = "sqlite")]
+    fn install_test_sqlite_cell() -> Arc<SqliteBackend> {
+        use crate::store::Backend;
+
+        let runtime = Arc::new(Runtime::new().expect("tokio runtime"));
+        let sq = runtime.block_on(async {
+            let sq = SqliteBackend::open_in_memory()
+                .await
+                .expect("open in-memory sqlite");
+            sq.run_migrations().await.expect("migrations");
+            Arc::new(sq)
+        });
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x92; 32]);
+        let local = Arc::new(crate::signing::LocalSigner::from_parts(
+            signing_key,
+            "test-rust-engine-steward".to_string(),
+            None,
+            None,
+        ));
+        let signer: Arc<dyn HardwareSigner> =
+            Arc::new(crate::signing::LocalSignerHardwareAdapter::new(local));
+        let cell = Arc::new(EngineCell {
+            backend: BackendDispatch::Sqlite(sq.clone()),
+            runtime,
+            scrubber: Arc::new(crate::scrub::NullScrubber),
+            signer: signer.clone(),
+            signer_key_id: "test-rust-engine-steward".to_string(),
+            local_signer: None,
+            #[cfg(all(feature = "sqlite", feature = "cirisaudit"))]
+            sqlite_audit: None,
+            consumers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            subscriptions: Arc::new(std::sync::Mutex::new(SubscriptionState::default())),
+            config_fingerprint: "test-rust-engine".to_string(),
+            construction_pid: std::process::id(),
+            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rust_engine: std::sync::OnceLock::new(),
+        });
+        *engine_slot() = Some(cell);
+        sq
+    }
+
+    /// Clear the singleton slot — the deterministic teardown for the
+    /// `serial(engine_singleton)` tests so a leaked cell doesn't
+    /// pollute a peer.
+    fn clear_singleton_slot() {
+        if let Some(cell) = engine_slot().as_ref() {
+            cell.closed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        *engine_slot() = None;
+    }
+
+    /// v1.13.0 (#92) — with no engine constructed, `current_rust_engine`
+    /// yields `None` (and so does `current_runtime_handle`).
+    #[test]
+    #[serial_test::serial(engine_singleton)]
+    fn current_rust_engine_none_when_no_engine() {
+        clear_singleton_slot();
+        assert!(super::current_rust_engine().is_none());
+        assert!(super::current_runtime_handle().is_none());
+    }
+
+    /// v1.13.0 (#92) — after a (SQLite) engine is installed,
+    /// `current_rust_engine` yields `Some`, repeated calls return the
+    /// SAME cached `Arc<Engine>`, and the yielded engine's backend Arc
+    /// is pointer-identical to the singleton's — the cohabitation
+    /// invariant: one process, one pool.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    #[serial_test::serial(engine_singleton)]
+    fn current_rust_engine_shares_singleton_backend() {
+        let cell_backend = install_test_sqlite_cell();
+
+        let e1 = super::current_rust_engine().expect("engine after install");
+        let e2 = super::current_rust_engine().expect("engine on second call");
+        // OnceLock cache → same `Arc<Engine>` allocation.
+        assert!(
+            Arc::ptr_eq(&e1, &e2),
+            "repeated calls must return the cached Arc<Engine>"
+        );
+
+        // The engine's backend Arc is the SAME allocation the cell
+        // holds — no second connection pool.
+        let engine_sq = e1.sqlite_backend().expect("sqlite backend on engine");
+        assert!(
+            Arc::ptr_eq(engine_sq, &cell_backend),
+            "Engine must share the singleton's backend Arc"
+        );
+
+        // The runtime handle is exposed for consumers that drive the
+        // engine's async.
+        assert!(super::current_runtime_handle().is_some());
+
+        clear_singleton_slot();
+    }
+
+    /// v1.13.0 (#92) — a write through the singleton's backend is
+    /// visible through the `current_rust_engine` view: same engine,
+    /// same data. Drives async on the singleton's runtime handle (the
+    /// `current_runtime_handle` contract).
+    #[cfg(feature = "sqlite")]
+    #[test]
+    #[serial_test::serial(engine_singleton)]
+    fn current_rust_engine_write_is_visible_through_view() {
+        use crate::federation::FederationDirectory;
+
+        let cell_backend = install_test_sqlite_cell();
+        let handle = super::current_runtime_handle().expect("runtime handle");
+        let engine = super::current_rust_engine().expect("engine");
+
+        // A read against an empty federation directory through the
+        // Engine view returns Ok(None) — confirms the view is live.
+        let engine_sq = engine.sqlite_backend().expect("sqlite backend").clone();
+        let before = handle.block_on(async {
+            FederationDirectory::lookup_public_key(&*engine_sq, "rust-engine-92")
+                .await
+                .expect("lookup")
+        });
+        assert!(before.is_none(), "fresh directory has no key");
+
+        // Pointer-identity already proves shared state; assert it once
+        // more here so this test is self-contained.
+        assert!(Arc::ptr_eq(&engine_sq, &cell_backend));
+
+        // After close(), the accessor must yield None.
+        clear_singleton_slot();
+        assert!(super::current_rust_engine().is_none());
+    }
+
+    /// v1.13.0 (#92) — backend conformance: `current_rust_engine`
+    /// yields a Postgres-backed `Engine` view when the singleton was
+    /// built on Postgres, sharing the singleton's connection pool
+    /// (`Arc` pointer-identity). Skips when `CIRIS_PERSIST_TEST_PG_URL`
+    /// is unset.
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[serial_test::serial(engine_singleton)]
+    fn current_rust_engine_shares_singleton_backend_postgres() {
+        use crate::store::Backend;
+
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+
+        let runtime = Arc::new(Runtime::new().expect("tokio runtime"));
+        let pg = runtime.block_on(async {
+            let pg = PostgresBackend::connect(&dsn)
+                .await
+                .expect("connect postgres");
+            pg.run_migrations().await.expect("migrations");
+            Arc::new(pg)
+        });
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x93; 32]);
+        let local = Arc::new(crate::signing::LocalSigner::from_parts(
+            signing_key,
+            "test-rust-engine-pg-steward".to_string(),
+            None,
+            None,
+        ));
+        let signer: Arc<dyn HardwareSigner> =
+            Arc::new(crate::signing::LocalSignerHardwareAdapter::new(local));
+        let cell = Arc::new(EngineCell {
+            backend: BackendDispatch::Postgres(pg.clone()),
+            runtime,
+            scrubber: Arc::new(crate::scrub::NullScrubber),
+            signer: signer.clone(),
+            signer_key_id: "test-rust-engine-pg-steward".to_string(),
+            local_signer: None,
+            #[cfg(all(feature = "sqlite", feature = "cirisaudit"))]
+            sqlite_audit: None,
+            consumers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            subscriptions: Arc::new(std::sync::Mutex::new(SubscriptionState::default())),
+            config_fingerprint: "test-rust-engine-pg".to_string(),
+            construction_pid: std::process::id(),
+            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rust_engine: std::sync::OnceLock::new(),
+        });
+        *engine_slot() = Some(cell);
+
+        let e1 = super::current_rust_engine().expect("engine after install");
+        let e2 = super::current_rust_engine().expect("engine on second call");
+        assert!(Arc::ptr_eq(&e1, &e2), "cached Arc<Engine>");
+
+        let engine_pg = e1.postgres_backend().expect("postgres backend on engine");
+        assert!(
+            Arc::ptr_eq(engine_pg, &pg),
+            "Engine must share the singleton's Postgres backend Arc"
+        );
+
+        clear_singleton_slot();
+    }
+
+    /// v1.13.0 (#92) — `current_rust_engine` yields `None` once the
+    /// engine is closed, even though the cell is still in the slot.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    #[serial_test::serial(engine_singleton)]
+    fn current_rust_engine_none_after_close() {
+        install_test_sqlite_cell();
+        assert!(super::current_rust_engine().is_some());
+        // Flip the closed flag without clearing the slot.
+        if let Some(cell) = engine_slot().as_ref() {
+            cell.closed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        assert!(
+            super::current_rust_engine().is_none(),
+            "closed engine must not be handed out"
+        );
+        assert!(super::current_runtime_handle().is_none());
+        clear_singleton_slot();
+    }
 }
 
 /// v0.5.3 (CIRISPersist#27) — typed Python exception that PyO3's
@@ -14719,6 +14960,108 @@ fn reset_engine(py: Python<'_>) {
         // down here. Blocking is fine — Python thread, GIL released.
         drop(taken);
     });
+}
+
+impl EngineCell {
+    /// v1.13.0 (CIRISPersist#92) — re-wrap this cell's
+    /// `pyo3::BackendDispatch` into the public
+    /// [`engine::BackendDispatch`](crate::engine::BackendDispatch) by
+    /// cloning the inner `Arc<…Backend>`.
+    ///
+    /// The two same-named enums (`pyo3.rs`'s `pub(crate)` one and
+    /// `engine.rs`'s `pub` one) wrap byte-identical inner types; this
+    /// is a cheap `match` + `Arc::clone` — the same connection pool,
+    /// **no second pool**.
+    fn engine_backend_dispatch(&self) -> crate::engine::BackendDispatch {
+        match &self.backend {
+            BackendDispatch::Postgres(pg) => crate::engine::BackendDispatch::Postgres(pg.clone()),
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(sq) => crate::engine::BackendDispatch::Sqlite(sq.clone()),
+        }
+    }
+}
+
+/// v1.13.0 (CIRISPersist#92) — hand a co-resident Rust consumer the
+/// process-singleton's [`Engine`](crate::Engine).
+///
+/// `PyEngine` (the PyO3 wheel surface) and the Rust
+/// [`Engine`](crate::Engine) are **siblings**, not wrapper/wrapped: a
+/// co-resident Rust extension that holds the host's `PyEngine` has no
+/// route to an `Arc<Engine>`. This accessor closes that gap. It is the
+/// piece CIRISEdge's resolver and CIRISLensCore's
+/// `LensCore::relay(engine: Arc<Engine>, …)` were blocked on — both
+/// shipped their halves and wait on persist to hand out the
+/// singleton's Rust `Arc<Engine>`.
+///
+/// # Cohabitation invariant
+///
+/// The returned `Arc<Engine>` is the **same** engine `PyEngine`
+/// dispatches to:
+///
+/// * the backend is the singleton's own backend `Arc`, re-wrapped from
+///   `pyo3::BackendDispatch` into [`engine::BackendDispatch`](crate::engine::BackendDispatch)
+///   by cloning the inner `Arc<PostgresBackend>` / `Arc<SqliteBackend>`
+///   — the same connection pool, **no second pool**;
+/// * the signer is the singleton's `Arc<dyn HardwareSigner>`, passed
+///   straight through.
+///
+/// No second `Engine`, tokio runtime, or connection pool is created.
+/// The `Arc<Engine>` is built **once** and cached on the `EngineCell`
+/// (an `OnceLock`), so repeated calls return the same `Arc`.
+///
+/// # Runtime
+///
+/// `Engine`'s methods are plain `async fn` and embed no runtime; the
+/// `Engine` itself needs no runtime handle. The consumer drives the
+/// async — `LensCore::init_edge_runtime` `block_on`s `LensCore::relay`.
+/// One subtlety: the singleton's Postgres pool spawns its connection
+/// driver tasks via `tokio::spawn` onto whatever runtime is current
+/// when a pooled connection is first acquired. A consumer that
+/// `block_on`s `Engine` work on a *throwaway* runtime would strand
+/// those driver tasks when that runtime is dropped. To remove the
+/// ambiguity, [`current_runtime_handle`] exposes the singleton's
+/// long-lived [`tokio::runtime::Handle`]; a co-resident consumer
+/// should `handle.block_on(...)` (or `handle.enter()` then drive its
+/// own loop) so backend driver tasks land on the runtime that lives
+/// for the whole process. SQLite (`spawn_blocking`) is runtime-
+/// agnostic and unaffected either way.
+///
+/// Returns `None` when no engine is constructed yet, or after
+/// `close()` / `reset_engine()` cleared the slot.
+pub fn current_rust_engine() -> Option<Arc<crate::Engine>> {
+    let slot = engine_slot();
+    let cell = slot.as_ref()?;
+    if cell.closed.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    let engine = cell.rust_engine.get_or_init(|| {
+        Arc::new(crate::Engine::from_shared(
+            cell.engine_backend_dispatch(),
+            cell.signer.clone(),
+        ))
+    });
+    Some(engine.clone())
+}
+
+/// v1.13.0 (CIRISPersist#92) — the process-singleton's long-lived
+/// [`tokio::runtime::Handle`].
+///
+/// A co-resident Rust consumer that drives the
+/// [`Engine`](crate::Engine) returned by [`current_rust_engine`]
+/// should run its `block_on` on this handle (or `enter()` it), so
+/// backend connection-driver tasks spawned by the Postgres pool land
+/// on the runtime that lives for the whole process rather than a
+/// throwaway one. See [`current_rust_engine`]'s *Runtime* section.
+///
+/// Returns `None` when no engine is constructed yet, or after
+/// `close()` / `reset_engine()` cleared the slot.
+pub fn current_runtime_handle() -> Option<tokio::runtime::Handle> {
+    let slot = engine_slot();
+    let cell = slot.as_ref()?;
+    if cell.closed.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    Some(cell.runtime.handle().clone())
 }
 
 /// (maturin) generates the C entry that Python imports.

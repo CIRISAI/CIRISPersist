@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "1.12.0"
+version = "1.13.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -23,6 +23,21 @@ server   = ["dep:axum", "dep:tower", "dep:http-body-util"]
 # pyo3 implies postgres — the lens FastAPI integration shape (FSD §3.5)
 # needs the Postgres backend to be available.
 pyo3     = ["dep:pyo3", "postgres"]
+# v1.13.0 (CIRISPersist#92) — `extension-module` is its OWN feature,
+# enabled by maturin (see `pyproject.toml [tool.maturin] features`),
+# NOT folded into `pyo3`.
+#
+# Why: `pyo3/extension-module` tells PyO3 not to link libpython — correct
+# for the `cdylib` wheel (the host interpreter provides the symbols at
+# import time), but it also strips libpython from the `cargo test --lib`
+# binary, which is a plain executable that has no host interpreter. With
+# `extension-module` unconditionally on, any `#[test]` that reaches
+# PyO3-C-API drop glue (e.g. constructing an `EngineCell`, which
+# transitively owns a `Py<PyAny>` via the change-feed `Subscription`)
+# fails to link with `undefined symbol: _Py_DecRef`. Splitting it out
+# lets `cargo test --features pyo3` link libpython the normal PyO3 way
+# (no RUSTFLAGS), while the wheel build still gets `extension-module`.
+extension-module = ["pyo3?/extension-module"]
 
 # v0.1.21 — SQLite backend Phase 1 parity (sovereign-mode + Pi-class
 # deployments per FSD §7 #7). Opens `dep:rusqlite` plus the rusqlite
@@ -529,7 +544,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 url     = { version = "2.5", optional = true }
 
 # Phase 1 — pyo3 feature
-pyo3 = { version = "0.28", features = ["extension-module", "abi3-py311"], optional = true }
+# v1.13.0 (CIRISPersist#92): `extension-module` is NOT enabled here —
+# it is a separate top-level crate feature (`extension-module`) that
+# maturin turns on for the wheel build. See the `[features]` section.
+# This keeps `cargo test --features pyo3` linking libpython normally.
+pyo3 = { version = "0.28", features = ["abi3-py311"], optional = true }
 
 # v0.6.0 (CIRISPersist#19) — post-ingest filter pipeline deps.
 # Light deps (regex) gate `scrub` + `extract`; heavy ML deps below
