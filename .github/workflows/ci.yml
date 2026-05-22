@@ -18,8 +18,30 @@ jobs:
   # the linux-x86_64 path that runs the full feature set with a
   # real Postgres backing the integration tests.
   linux-x86_64-test:
-    name: linux-x86_64 (full features)
+    # v2.0.1 (CIRISPersist#95-track) — substrate-axis matrix. The 2.0
+    # feature-gap fix turned every substrate on (audit/secrets/nodecore/
+    # graph/telemetry) and the single test job ballooned to ~12 min.
+    # Each substrate's `cfg` gates are independent, so splitting the
+    # one widened invocation into a parallel matrix — one entry per
+    # substrate — drops the test job's wall-clock to whichever entry
+    # is slowest (~3-5 min) instead of the sum. The "core" entry
+    # additionally runs the fixture suite + the pytest catch_panic
+    # regression (kept on a single entry to avoid duplicating the
+    # ~5-min release maturin-develop build). The wheel job already
+    # exercises the full-features compile so a "all-substrates"
+    # backstop entry isn't necessary here.
+    name: linux-x86_64 (${{ matrix.substrate.name }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        substrate:
+          - { name: core,       features: "postgres server pyo3 sqlite" }
+          - { name: cirisaudit, features: "postgres server pyo3 sqlite cirisaudit" }
+          - { name: secrets,    features: "postgres server pyo3 sqlite secrets" }
+          - { name: cirisnode,  features: "postgres server pyo3 sqlite cirisnode" }
+          - { name: cirisgraph, features: "postgres server pyo3 sqlite cirisgraph" }
+          - { name: telemetry,  features: "postgres server pyo3 sqlite telemetry" }
     services:
       postgres:
         image: timescale/timescaledb:latest-pg16
@@ -48,25 +70,20 @@ jobs:
       # is slower but correct. Same on every Swatinem/rust-cache site
       # in this workflow.
       - uses: Swatinem/rust-cache@v2
+        with:
+          # v2.0.1 — per-substrate cache key so matrix entries don't
+          # thrash each other's caches (each compiles a different
+          # feature set).
+          key: ${{ matrix.substrate.name }}
         continue-on-error: true
-      # v2.0 — the substrate features (cirisaudit, secrets, cirisnode,
-      # cirisgraph) are pure `cfg` gates with NO extra dependencies, so
-      # folding them into the one widened test invocation costs only
-      # the substrate test modules' compile + run — no extra crate
-      # builds. Before v2.0 this job ran only "postgres server pyo3",
-      # so the cirisaudit + secrets Postgres backends (and their
-      # concurrency tests) were NEVER exercised in CI. They are now.
-      # `sqlite` is included so the SQLite substrate backends + the
-      # SQLite concurrency tests run too. `telemetry` is included so
-      # the telemetry backends + the daily/weekly/monthly tier-rollup
-      # tests run on both backends.
-      - name: cargo test (postgres + server + pyo3 + substrates)
+      - name: cargo test (postgres + server + pyo3 + ${{ matrix.substrate.name }})
         env:
           CIRIS_PERSIST_TEST_PG_URL: postgres://ciris:ciris@localhost:5432/ciris_persist_test
         run: >-
           cargo test --all-targets --features
-          "postgres server pyo3 sqlite cirisaudit secrets cirisnode cirisgraph telemetry"
+          "${{ matrix.substrate.features }}"
       - name: cargo test (default — fixture suite)
+        if: matrix.substrate.name == 'core'
         run: cargo test --test wire_format_fixtures
       # v0.5.4 (CIRISPersist#29) — Python regression test for the FFI
       # catch_panic layer. Builds the wheel with the `test-panic`
@@ -75,10 +92,18 @@ jobs:
       # `LensQueryError` (Exception) and NOT `PanicException`
       # (BaseException) — the v0.5.3+v0.5.4 invariant. Closes the
       # CIRISPersist#24 failure class regression-test gap.
+      # v2.0.1 — pytest catch_panic regression runs on the "core"
+      # matrix entry only. The `--release maturin develop` step is
+      # ~5 min by itself; duplicating it per substrate matrix entry
+      # would defeat the matrix parallelization. The substrate
+      # feature axis doesn't change what this test exercises (the
+      # FFI panic-catch layer), so a single execution suffices.
       - uses: actions/setup-python@v5
+        if: matrix.substrate.name == 'core'
         with:
           python-version: "3.11"
       - name: install maturin + pytest
+        if: matrix.substrate.name == 'core'
         # v1.1.2 (CIRISVerify v2.1.1 hardening): retry pip install
         # against PyPI transient blips. 3 attempts with backoff.
         run: |
@@ -89,6 +114,7 @@ jobs:
             [ "$attempt" = "3" ] && { echo "::error::pip install failed 3x"; exit 1; }
           done
       - name: maturin develop (test-panic feature)
+        if: matrix.substrate.name == 'core'
         run: |
           python -m venv .venv
           source .venv/bin/activate
@@ -101,6 +127,7 @@ jobs:
           done
           maturin develop --features test-panic,pyo3 --release
       - name: pytest tests/python/
+        if: matrix.substrate.name == 'core'
         run: |
           source .venv/bin/activate
           pytest tests/python/ -v
