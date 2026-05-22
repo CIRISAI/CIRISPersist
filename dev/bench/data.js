@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779400505678,
+  "lastUpdate": 1779409110256,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -22865,6 +22865,276 @@ window.BENCHMARK_DATA = {
             "name": "occurrence_registry/list_live_occurrences/1000",
             "value": 1189942,
             "range": "± 10738",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "6813e2ac669be416d8dc535e1dfd563e9c971e58",
+          "message": "bench: add storage_floor — decompose the SQLite async-wrapper tax\n\nThe substrate benches (sequence_contention etc.) measure storage +\nasync wrapper together, and on a loaded box the wrapper reading\nswamps the storage one — sequence_contention/next_sequence/1 read\n~419µs and was mis-attributed to a \"150-400µs wrapper floor.\"\n\nstorage_floor isolates the layers (reused in-memory backend, no\nper-iter setup):\n  block_on_noop        49 ns\n  spawn_blocking_noop  3.95 µs\n  raw_sqlite_write     1.92 µs   (synchronous SQLite UPSERT — the floor)\n  next_sequence_full   10.2 µs\n\nSo the real per-call async tax is ~8µs (~4µs of it spawn_blocking),\nnot 150µs+ — the earlier figure was sequence_contention's per-task\ntokio::spawn hop plus a contended box. sequence_contention's doc now\npoints at storage_floor for the true un-spawned single-call number.\n\nWired into bench.yml; dev tooling only — no crate change.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-21T19:02:51-05:00",
+          "tree_id": "897c9fa5445a14d74af12284db978f76bbaf430f",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/6813e2ac669be416d8dc535e1dfd563e9c971e58"
+        },
+        "date": 1779409109317,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101684,
+            "range": "± 936",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 239842,
+            "range": "± 1776",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 525888,
+            "range": "± 12048",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1858967,
+            "range": "± 110974",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 375,
+            "range": "± 19",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1454,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8234,
+            "range": "± 33",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21197,
+            "range": "± 640",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24265,
+            "range": "± 42",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83577,
+            "range": "± 2408",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 362,
+            "range": "± 36",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3006,
+            "range": "± 56",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9196,
+            "range": "± 162",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41616,
+            "range": "± 137",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 621,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2249147,
+            "range": "± 81519",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6587260,
+            "range": "± 165795",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23598676,
+            "range": "± 337364",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 278537,
+            "range": "± 13277",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 321515,
+            "range": "± 24965",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 679642,
+            "range": "± 25579",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 1933991,
+            "range": "± 50376",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 22860464,
+            "range": "± 106284",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 12097892,
+            "range": "± 45666",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 456625,
+            "range": "± 12630",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 1580400,
+            "range": "± 21035",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 123283249,
+            "range": "± 1249044",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 3362889,
+            "range": "± 208798",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 16400739,
+            "range": "± 244262",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 312111769,
+            "range": "± 2753095",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 11006567,
+            "range": "± 1241432",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 42346361,
+            "range": "± 299571",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 200767,
+            "range": "± 13269",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 178890,
+            "range": "± 12600",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 59070,
+            "range": "± 4840",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 169875,
+            "range": "± 3667",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 1236969,
+            "range": "± 14910",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 43,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 27661,
+            "range": "± 2239",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 3914,
+            "range": "± 145",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 51358,
+            "range": "± 5187",
             "unit": "ns/iter"
           }
         ]
