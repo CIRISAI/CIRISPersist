@@ -15,29 +15,36 @@
 --                payload ? '<field>'` → physically holds only the
 --                rows the query actually wants (row elimination — a
 --                column-store segment skipping irrelevant rows).
---   * COMPOSITE — keyed (deployment_domain, ts) so the equality +
---                `ts` range predicate become index seek bounds.
---   * COVERING (INCLUDE) — INCLUDEs every other column the query
---                reads (agent_id_hash, agent_name) AND the EXPRESSION
---                `(payload->>'<field>')::float8` that materializes the
---                scalar at index-build time. The planner then runs an
---                Index Only Scan: no heap fetch, no JSONB re-parse.
+--   * COMPOSITE — keyed leading (deployment_domain, ts) so the
+--                equality + `ts` range predicate become index seek
+--                bounds.
+--   * COVERING — every other column the query reads
+--                (agent_id_hash, agent_name) AND the EXPRESSION
+--                `(payload->>'<field>')::float8` that materializes
+--                the scalar are trailing KEY columns, so the planner
+--                runs an Index Only Scan: no heap fetch, no JSONB
+--                re-parse.
 --
 -- # Why domain-led, ts second (NOT agent_id_hash second)
 --
 -- cross_agent_divergence filters `deployment_domain = $1 AND ts >= $2
 -- AND ts < $3` with NO agent_id_hash equality (it GROUPs BY it). For
 -- the `ts` range to be a seek bound it must sit immediately after the
--- equality column — so the key is (deployment_domain, ts). agent_id_hash
--- and agent_name go in INCLUDE (projection-only, never sorted).
+-- equality column — so the key LEADS with (deployment_domain, ts).
+-- agent_id_hash, agent_name and the scalar follow as trailing key
+-- columns (projection-only — read during the scan, never seeked).
 --
--- # INCLUDE the extracted scalar, never the raw payload
+-- # Trailing KEY columns, not INCLUDE — and never the raw payload
 --
--- The INCLUDE list carries `(payload->>'<field>')::float8` — the
+-- The scalar is carried as `(payload->>'<field>')::float8` — the
 -- *extracted scalar*, an 8-byte float in the leaf — NOT the raw
--- `payload` JSONB blob (INCLUDE-ing payload would ~double the index
--- size; explicitly avoided). `(payload->>'field')::float8` is
--- immutable, so it is valid as an index expression.
+-- `payload` JSONB blob (covering `payload` would ~double the index
+-- size; explicitly avoided). It is a trailing **key** column, not an
+-- `INCLUDE` column: Postgres `INCLUDE` accepts only plain table
+-- columns, never expressions — so an expression that must be covered
+-- has to live in the key. `(payload->>'<field>')::float8` is
+-- immutable, hence valid as an index key expression. (Group B below,
+-- which covers only plain columns, does use `INCLUDE`.)
 --
 -- # Exact-expression-match constraint
 --
@@ -79,32 +86,36 @@
 -- One partial+covering index per concrete (field, event_type) pair.
 -- Partial on BOTH `event_type = '<EVENT>'` AND `payload ? '<field>'`
 -- — the exact residual filter the query applies, so the index holds
--- only rows the query wants. Keyed (deployment_domain, ts) for the
--- seek; INCLUDE (agent_id_hash, agent_name, extracted scalar) so the
--- whole scan is an Index Only Scan.
+-- only rows the query wants. Key leads with (deployment_domain, ts)
+-- for the seek, then carries (agent_id_hash, agent_name, extracted
+-- scalar) as trailing key columns so the whole scan is Index Only.
 
 -- csdma_plausibility_score — DMA_RESULTS
 CREATE INDEX IF NOT EXISTS trace_events_an_csdma
-    ON cirislens.trace_events (deployment_domain, ts)
-    INCLUDE (agent_id_hash, agent_name, (payload->>'csdma_plausibility_score')::float8)
+    ON cirislens.trace_events
+       (deployment_domain, ts, agent_id_hash, agent_name,
+        ((payload->>'csdma_plausibility_score')::float8))
     WHERE event_type = 'DMA_RESULTS' AND payload ? 'csdma_plausibility_score';
 
 -- dsdma_domain_alignment — DMA_RESULTS
 CREATE INDEX IF NOT EXISTS trace_events_an_dsdma
-    ON cirislens.trace_events (deployment_domain, ts)
-    INCLUDE (agent_id_hash, agent_name, (payload->>'dsdma_domain_alignment')::float8)
+    ON cirislens.trace_events
+       (deployment_domain, ts, agent_id_hash, agent_name,
+        ((payload->>'dsdma_domain_alignment')::float8))
     WHERE event_type = 'DMA_RESULTS' AND payload ? 'dsdma_domain_alignment';
 
 -- idma_k_eff — IDMA_RESULT
 CREATE INDEX IF NOT EXISTS trace_events_an_idma_keff
-    ON cirislens.trace_events (deployment_domain, ts)
-    INCLUDE (agent_id_hash, agent_name, (payload->>'idma_k_eff')::float8)
+    ON cirislens.trace_events
+       (deployment_domain, ts, agent_id_hash, agent_name,
+        ((payload->>'idma_k_eff')::float8))
     WHERE event_type = 'IDMA_RESULT' AND payload ? 'idma_k_eff';
 
 -- idma_correlation_risk — IDMA_RESULT
 CREATE INDEX IF NOT EXISTS trace_events_an_idma_corr
-    ON cirislens.trace_events (deployment_domain, ts)
-    INCLUDE (agent_id_hash, agent_name, (payload->>'idma_correlation_risk')::float8)
+    ON cirislens.trace_events
+       (deployment_domain, ts, agent_id_hash, agent_name,
+        ((payload->>'idma_correlation_risk')::float8))
     WHERE event_type = 'IDMA_RESULT' AND payload ? 'idma_correlation_risk';
 
 -- ── Group B: list_trace_summaries cheap-column covering index ──────
