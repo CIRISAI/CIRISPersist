@@ -507,6 +507,45 @@ impl PyEngine {
         }
     }
 
+    /// v1.11.0 (CIRISPersist#90) — borrow a per-backend
+    /// [`NodeCoreService`](crate::cirisnode::NodeCoreService) handle
+    /// for the Engine's underlying storage backend.
+    ///
+    /// # Why a plain `pub fn`, not a `#[pymethod]`
+    ///
+    /// This is issue-#90 **Option B**: NodeCore's PyO3 bindings live
+    /// in a *sibling cdylib* that receives an injected persist
+    /// `PyEngine` and calls this method via `PyRef<PyEngine>` on the
+    /// Rust side — it never crosses the Python boundary. A
+    /// `#[pymethod]` would force the return type to be `IntoPy`;
+    /// `NodeCoreDispatch` is a pure-Rust dispatch enum, so this stays
+    /// a plain `pub fn`.
+    ///
+    /// # Why an enum, not `Arc<dyn NodeCoreService>`
+    ///
+    /// [`NodeCoreService`](crate::cirisnode::NodeCoreService) uses
+    /// RPITIT (`fn put_contribution(...) -> impl Future + Send`) and
+    /// is therefore NOT object-safe — `Arc<dyn NodeCoreService>` will
+    /// not compile. The object-safe form is a dispatch enum: the
+    /// returned [`NodeCoreDispatch`] mirrors the
+    /// [`BackendDispatch`](crate::BackendDispatch) variants, exactly
+    /// like [`Engine::maintenance`](crate::Engine::maintenance)
+    /// returns [`EngineMaintenance`](crate::engine::EngineMaintenance).
+    ///
+    /// Cheap: each variant clones / wraps the inner backend handle
+    /// once.
+    #[cfg(all(feature = "cirisnode", any(feature = "postgres", feature = "sqlite")))]
+    pub fn node_core_service(&self) -> crate::engine::NodeCoreDispatch {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => crate::engine::NodeCoreDispatch::Postgres(b.clone()),
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => crate::engine::NodeCoreDispatch::Sqlite(Arc::new(
+                crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(b.conn_handle()),
+            )),
+        }
+    }
+
     /// v1.6.8 — guard run at the top of every method that touches
     /// the runtime / pool. `EngineClosed` after `close()`;
     /// `EngineUsedAcrossFork` when the process forked since

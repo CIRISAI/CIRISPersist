@@ -62,6 +62,10 @@
 use std::sync::Arc;
 
 use crate::signing::LocalSigner;
+// Re-exported so `Engine::receive_and_persist`'s signature resolves
+// for consumers that `use ciris_persist::Engine` without separately
+// importing the scrub module.
+pub use crate::scrub::Scrubber;
 #[cfg(feature = "postgres")]
 use crate::store::PostgresBackend;
 #[cfg(feature = "sqlite")]
@@ -228,6 +232,119 @@ impl Engine {
             ),
         }
     }
+
+    /// v1.11.0 (CIRISPersist#89) — Rust-public ingest facade: run the
+    /// FSD §3.3 pipeline (`schema → verify → scrub → decompose →
+    /// backend insert`) over a raw wire body.
+    ///
+    /// This is the Rust-side sibling of the PyO3
+    /// `Engine.receive_and_persist`: relay consumers (CIRISLensCore,
+    /// sovereign-mode CIRISEdge) that hold an [`Engine`] can ingest
+    /// without going through the Python wheel.
+    ///
+    /// # Caller-supplied scrubber
+    ///
+    /// The `scrubber` is NOT owned by the `Engine` and is NOT
+    /// defaulted. A relay consumer (already-scrubbed upstream) passes
+    /// `&NullScrubber`; a first-hop deployment passes its real
+    /// PII-scrubber. `Scrubber` is object-safe, so `&dyn Scrubber`
+    /// works for any impl.
+    ///
+    /// # Facade-internal dependencies
+    ///
+    /// - **Canonicalizer**: persist's default
+    ///   [`PythonJsonDumpsCanonicalizer`](crate::verify::PythonJsonDumpsCanonicalizer)
+    ///   — a stateless unit struct; no `Engine` state.
+    /// - **Signer**: the `Engine`'s composed `Arc<LocalSigner>`,
+    ///   wrapped in
+    ///   [`LocalSignerHardwareAdapter`](crate::signing::LocalSignerHardwareAdapter)
+    ///   so it satisfies `IngestPipeline`'s `&dyn HardwareSigner`
+    ///   bound. The scrub-envelope `scrub_key_id` is the
+    ///   `LocalSigner`'s `key_id`.
+    ///
+    /// Adds zero new `Engine` fields — every dependency is either
+    /// already composed (`signer`) or facade-internal.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn receive_and_persist(
+        &self,
+        bytes: &[u8],
+        scrubber: &dyn Scrubber,
+    ) -> Result<crate::ingest::BatchSummary, crate::ingest::IngestError> {
+        let adapter = crate::signing::LocalSignerHardwareAdapter::new(self.signer.clone());
+        let key_id = self.signer.key_id().to_owned();
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                let pipeline = crate::ingest::IngestPipeline {
+                    backend: &**arc,
+                    canonicalizer: &crate::verify::PythonJsonDumpsCanonicalizer,
+                    scrubber,
+                    signer: &adapter,
+                    signer_key_id: &key_id,
+                };
+                pipeline.receive_and_persist(bytes).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                let pipeline = crate::ingest::IngestPipeline {
+                    backend: &**arc,
+                    canonicalizer: &crate::verify::PythonJsonDumpsCanonicalizer,
+                    scrubber,
+                    signer: &adapter,
+                    signer_key_id: &key_id,
+                };
+                pipeline.receive_and_persist(bytes).await
+            }
+        }
+    }
+
+    /// v1.11.0 (CIRISPersist#90) — borrow a per-backend
+    /// [`NodeCoreService`](crate::cirisnode::NodeCoreService) handle
+    /// wrapping the Engine's underlying backend Arc.
+    ///
+    /// This is the [`Engine`]-side sibling of
+    /// [`PyEngine::node_core_service`](crate::ffi::pyo3::PyEngine::node_core_service);
+    /// see that accessor's doc-comment for the issue-#90 Option B
+    /// rationale. Returns a [`NodeCoreDispatch`] enum mirroring the
+    /// [`BackendDispatch`] variants — `NodeCoreService` uses RPITIT
+    /// and is not object-safe, so an enum is the object-safe form.
+    ///
+    /// Cheap: each variant clones / wraps the inner backend handle
+    /// once.
+    #[cfg(all(feature = "cirisnode", any(feature = "postgres", feature = "sqlite")))]
+    pub fn node_core_service(&self) -> NodeCoreDispatch {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => NodeCoreDispatch::Postgres(b.clone()),
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => NodeCoreDispatch::Sqlite(Arc::new(
+                crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(b.conn_handle()),
+            )),
+        }
+    }
+}
+
+/// v1.11.0 (CIRISPersist#90) — per-backend
+/// [`NodeCoreService`](crate::cirisnode::NodeCoreService) handle
+/// returned by [`Engine::node_core_service`] /
+/// [`PyEngine::node_core_service`](crate::ffi::pyo3::PyEngine::node_core_service).
+///
+/// `NodeCoreService` uses RPITIT (`fn put_contribution(...) -> impl
+/// Future + Send`) and is therefore NOT object-safe — you cannot
+/// build `Arc<dyn NodeCoreService>`. This enum is the object-safe
+/// dispatch form: callers `match` on the variant and call the trait
+/// methods on the concrete backend. Mirrors [`EngineMaintenance`].
+#[cfg(all(feature = "cirisnode", any(feature = "postgres", feature = "sqlite")))]
+pub enum NodeCoreDispatch {
+    /// Postgres-backed NodeCore handle. `PostgresBackend` implements
+    /// [`NodeCoreService`](crate::cirisnode::NodeCoreService)
+    /// directly.
+    #[cfg(feature = "postgres")]
+    Postgres(Arc<PostgresBackend>),
+    /// SQLite-backed NodeCore handle wrapping
+    /// [`SqliteNodeCoreBackend`](crate::cirisnode::sqlite::SqliteNodeCoreBackend).
+    #[cfg(feature = "sqlite")]
+    Sqlite(Arc<crate::cirisnode::sqlite::SqliteNodeCoreBackend>),
 }
 
 /// v1.2.0 (CIRISPersist#48) — per-backend
@@ -424,6 +541,228 @@ mod tests {
             .await
             .expect("outbound list");
         assert!(rows.is_empty());
+    }
+
+    /// v1.11.0 (CIRISPersist#89) — `receive_and_persist` round-trip on
+    /// an in-memory SQLite Engine: a real signed batch + `NullScrubber`
+    /// must land rows and report a populated `BatchSummary`.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn receive_and_persist_round_trips_signed_batch() {
+        use crate::schema::{
+            CompleteTrace, ComponentType, ReasoningEventType, SchemaVersion, TraceComponent,
+            TraceLevel,
+        };
+        use crate::scrub::NullScrubber;
+        use crate::verify::{
+            ed25519::canonical_payload_value, Canonicalizer, PythonJsonDumpsCanonicalizer,
+        };
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        use ed25519_dalek::{Signer as _, SigningKey};
+
+        // Agent identity that signs the trace (distinct from the
+        // Engine's local scrub-signer identity).
+        let agent_sk = SigningKey::from_bytes(&[0x42; 32]);
+        let agent_key_id = "ciris-agent-key:engine-89";
+
+        let mut trace = CompleteTrace {
+            trace_id: "trace-engine-89".into(),
+            thought_id: "th-1".into(),
+            task_id: Some("task-1".into()),
+            agent_id_hash: "deadbeef".into(),
+            started_at: "2026-04-30T00:15:53.123456Z".parse().unwrap(),
+            completed_at: "2026-04-30T00:16:12.789012Z".parse().unwrap(),
+            trace_level: TraceLevel::Generic,
+            trace_schema_version: SchemaVersion::parse("2.7.0").unwrap(),
+            components: vec![TraceComponent {
+                component_type: ComponentType::Observation,
+                event_type: ReasoningEventType::ThoughtStart,
+                timestamp: "2026-04-30T00:15:53.123Z".parse().unwrap(),
+                data: {
+                    let mut m = serde_json::Map::new();
+                    m.insert("attempt_index".into(), 0.into());
+                    m
+                },
+                agent_id_hash: None,
+            }],
+            deployment_profile: None,
+            signature: String::new(),
+            signature_key_id: agent_key_id.into(),
+        };
+        let payload = canonical_payload_value(&trace);
+        let canonical = PythonJsonDumpsCanonicalizer
+            .canonicalize_value(&payload)
+            .unwrap();
+        trace.signature = B64.encode(agent_sk.sign(&canonical).to_bytes());
+
+        let trace_json = serde_json::to_value(&trace).unwrap();
+        let envelope = serde_json::json!({
+            "events": [{
+                "event_type": "complete_trace",
+                "trace_level": "generic",
+                "trace": trace_json,
+            }],
+            "batch_timestamp": "2026-04-30T15:00:00+00:00",
+            "consent_timestamp": "2025-01-01T00:00:00Z",
+            "trace_level": "generic",
+            "trace_schema_version": "2.7.0",
+        });
+        let bytes = envelope.to_string().into_bytes();
+
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("construct engine");
+
+        // Register the agent's pubkey in the SQLite federation_keys
+        // directory so the verify step can resolve it. The federation
+        // ingest path is exercised elsewhere; here we seed the row
+        // directly through the public connection handle.
+        let sq = engine.sqlite_backend().expect("sqlite backend");
+        let conn = sq.conn_handle();
+        let agent_pk_b64 = B64.encode(agent_sk.verifying_key().to_bytes());
+        let key_id_owned = agent_key_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO federation_keys (\
+                    key_id, pubkey_ed25519_base64, algorithm, \
+                    identity_type, identity_ref, valid_from, \
+                    registration_envelope, original_content_hash, \
+                    scrub_signature_classical, scrub_key_id, \
+                    scrub_timestamp, persist_row_hash\
+                 ) VALUES (?1, ?2, 'hybrid', 'agent', ?1, ?3, '{}', \
+                          x'00', '', ?1, ?3, '0')",
+                rusqlite::params![key_id_owned, agent_pk_b64, "2026-04-30T00:00:00+00:00"],
+            )
+            .expect("seed federation key");
+        })
+        .await
+        .expect("spawn_blocking join");
+
+        let summary = engine
+            .receive_and_persist(&bytes, &NullScrubber)
+            .await
+            .expect("receive_and_persist succeeds");
+
+        assert_eq!(summary.envelopes_processed, 1);
+        assert_eq!(summary.signatures_verified, 1);
+        assert_eq!(summary.trace_events_inserted, 1, "one component → one row");
+        assert_eq!(summary.trace_events_conflicted, 0);
+        assert_eq!(summary.scrubbed_fields, 0, "NullScrubber modifies nothing");
+
+        // Idempotency: replaying the same bytes conflicts, inserts 0.
+        let replay = engine
+            .receive_and_persist(&bytes, &NullScrubber)
+            .await
+            .expect("replay succeeds");
+        assert_eq!(replay.trace_events_inserted, 0);
+        assert_eq!(replay.trace_events_conflicted, 1);
+    }
+
+    /// v1.11.0 (CIRISPersist#89) — `receive_and_persist` rejects an
+    /// unverifiable batch (unknown signing key) with a typed
+    /// `IngestError::Verify` and writes nothing.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn receive_and_persist_rejects_unknown_key() {
+        use crate::ingest::IngestError;
+        use crate::scrub::NullScrubber;
+
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("construct engine");
+
+        // A syntactically valid envelope whose signing key was never
+        // registered. `from_json` parses, verify rejects.
+        let body = serde_json::json!({
+            "events": [],
+            "batch_timestamp": "2026-04-30T15:00:00+00:00",
+            "consent_timestamp": "2025-01-01T00:00:00Z",
+            "trace_level": "generic",
+            "trace_schema_version": "2.7.0"
+        });
+        let err = engine
+            .receive_and_persist(body.to_string().as_bytes(), &NullScrubber)
+            .await
+            .expect_err("empty events array must be rejected");
+        // Empty events[] is a schema reject — confirms the facade
+        // surfaces typed IngestError variants unchanged.
+        assert!(matches!(err, IngestError::Schema(_)), "got: {err:?}");
+    }
+
+    /// v1.11.0 (CIRISPersist#90) — `Engine::node_core_service` returns
+    /// the SQLite dispatch variant and a `put_contribution` /
+    /// `list_contributions` round-trips through it.
+    #[cfg(all(feature = "cirisnode", feature = "sqlite"))]
+    #[tokio::test]
+    async fn node_core_service_sqlite_round_trip() {
+        use crate::cirisnode::{
+            Cell, ContributionEnvelope, ContributionType, ContributionsFilter, HybridSignature,
+            NodeCoreService,
+        };
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        use chrono::Utc;
+        use ed25519_dalek::{Signer as _, SigningKey};
+        use uuid::Uuid;
+
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("construct engine");
+
+        let dispatch = engine.node_core_service();
+        let backend = match dispatch {
+            NodeCoreDispatch::Sqlite(b) => b,
+            #[cfg(feature = "postgres")]
+            NodeCoreDispatch::Postgres(_) => panic!("expected sqlite NodeCore variant"),
+        };
+
+        // Build + sign a Contribution envelope (the contributor's
+        // pubkey IS the author_id, per SCHEMA.md §2.2).
+        let author_key = SigningKey::from_bytes(&[0xA1; 32]);
+        let author = B64.encode(author_key.verifying_key().to_bytes());
+        let domain = format!("engine90-dom-{}", Uuid::new_v4());
+        let mut env = ContributionEnvelope {
+            contribution_id: Uuid::new_v4().to_string(),
+            contribution_type: ContributionType::Proposal,
+            author_id: author.clone(),
+            subject: Cell {
+                domain: domain.clone(),
+                language: "en".into(),
+                subject: Some("arc_question".into()),
+            },
+            payload: serde_json::json!({"question_id": "engine90_q01"}),
+            witness_set: None,
+            signature: HybridSignature {
+                ed25519: String::new(),
+                ml_dsa_65: None,
+                signed_at: Utc::now(),
+            },
+            submitted_at: Utc::now(),
+        };
+        let canonical =
+            crate::cirisnode::verify::canonical_bytes_for_envelope(&env).expect("canonical bytes");
+        env.signature.ed25519 = B64.encode(author_key.sign(&canonical).to_bytes());
+
+        backend
+            .put_contribution(env.clone())
+            .await
+            .expect("put_contribution through NodeCoreDispatch");
+
+        let page = backend
+            .list_contributions(
+                ContributionsFilter {
+                    domain: Some(domain.clone()),
+                    ..Default::default()
+                },
+                None,
+                10,
+            )
+            .await
+            .expect("list_contributions through NodeCoreDispatch");
+        assert_eq!(page.items.len(), 1, "the contribution we inserted");
+        assert_eq!(page.items[0].contribution_id, env.contribution_id);
     }
 
     #[tokio::test]

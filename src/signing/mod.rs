@@ -374,6 +374,114 @@ impl LocalSigner {
     }
 }
 
+/// v1.11.0 (CIRISPersist#89) — adapts an [`Arc<LocalSigner>`] to the
+/// [`ciris_keyring::HardwareSigner`] trait so it can drive
+/// [`IngestPipeline`](crate::ingest::IngestPipeline)'s scrub-signing
+/// step.
+///
+/// # Why an adapter
+///
+/// `IngestPipeline.signer` is typed `&dyn HardwareSigner` (the
+/// production deployment passes a hardware-backed signer from
+/// `ciris_keyring::get_platform_signer`). The Rust-side
+/// [`Engine`](crate::Engine) composes an `Arc<LocalSigner>` instead —
+/// a software Ed25519 identity loaded from a seed file. `LocalSigner`
+/// is NOT a `HardwareSigner`, so [`Engine::receive_and_persist`]
+/// wraps it in this adapter.
+///
+/// # Sign-only
+///
+/// `IngestPipeline` calls exactly one `HardwareSigner` method during
+/// ingest — `sign` (the per-component scrub-envelope signature, step
+/// 3.5). This adapter implements `sign` / `public_key` /
+/// `current_alias` / `algorithm` / `hardware_type` /
+/// `storage_descriptor` honestly. The key-management methods
+/// (`generate_key`, `key_exists`, `delete_key`, `attestation`,
+/// `attestation_with_nonce`) are not on the ingest path; they return
+/// [`KeyringError::NotSupported`] rather than panicking — a
+/// `LocalSigner` is constructed from an already-loaded seed and has
+/// no key-lifecycle surface of its own.
+pub struct LocalSignerHardwareAdapter {
+    inner: Arc<LocalSigner>,
+}
+
+impl LocalSignerHardwareAdapter {
+    /// Wrap an `Arc<LocalSigner>` in the `HardwareSigner` adapter.
+    pub fn new(inner: Arc<LocalSigner>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait::async_trait]
+impl ciris_keyring::HardwareSigner for LocalSignerHardwareAdapter {
+    fn algorithm(&self) -> ciris_keyring::ClassicalAlgorithm {
+        // LocalSigner's hot-path signature is Ed25519.
+        ciris_keyring::ClassicalAlgorithm::Ed25519
+    }
+
+    fn hardware_type(&self) -> ciris_keyring::HardwareType {
+        // A LocalSigner is a software identity loaded from a seed
+        // file — no HSM binding.
+        ciris_keyring::HardwareType::SoftwareOnly
+    }
+
+    async fn public_key(&self) -> Result<Vec<u8>, ciris_keyring::KeyringError> {
+        Ok(self.inner.signing_key().verifying_key().to_bytes().to_vec())
+    }
+
+    async fn sign(&self, data: &[u8]) -> Result<Vec<u8>, ciris_keyring::KeyringError> {
+        // The only HardwareSigner method IngestPipeline exercises.
+        self.inner
+            .sign_ed25519(data)
+            .map(|sig| sig.to_vec())
+            .map_err(|e| ciris_keyring::KeyringError::SigningFailed {
+                reason: format!("local-signer adapter: {e}"),
+            })
+    }
+
+    async fn attestation(
+        &self,
+    ) -> Result<ciris_keyring::PlatformAttestation, ciris_keyring::KeyringError> {
+        Err(ciris_keyring::KeyringError::NotSupported {
+            operation: "attestation (not supported by the local-signer adapter)".to_string(),
+        })
+    }
+
+    async fn generate_key(
+        &self,
+        _config: &ciris_keyring::KeyGenConfig,
+    ) -> Result<(), ciris_keyring::KeyringError> {
+        Err(ciris_keyring::KeyringError::NotSupported {
+            operation: "generate_key (not supported by the local-signer adapter)".to_string(),
+        })
+    }
+
+    async fn key_exists(&self, _alias: &str) -> Result<bool, ciris_keyring::KeyringError> {
+        Err(ciris_keyring::KeyringError::NotSupported {
+            operation: "key_exists (not supported by the local-signer adapter)".to_string(),
+        })
+    }
+
+    async fn delete_key(&self, _alias: &str) -> Result<(), ciris_keyring::KeyringError> {
+        Err(ciris_keyring::KeyringError::NotSupported {
+            operation: "delete_key (not supported by the local-signer adapter)".to_string(),
+        })
+    }
+
+    fn current_alias(&self) -> &str {
+        self.inner.key_id()
+    }
+
+    fn storage_descriptor(&self) -> ciris_keyring::StorageDescriptor {
+        // LocalSigner holds the Ed25519 SigningKey in process memory
+        // after `from_config` reads the seed once; it keeps no
+        // on-disk file of its own (the seed path is owned by the
+        // construction config, not the live signer). InMemory is the
+        // honest descriptor — same as `Ed25519SoftwareSigner`.
+        ciris_keyring::StorageDescriptor::InMemory
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,5 +563,80 @@ mod tests {
             .block_on(async { signer.sign_ml_dsa_65(b"hello").await })
             .unwrap_err();
         assert!(matches!(err, LocalSignerError::PqcNotConfigured));
+    }
+
+    /// v1.11.0 (CIRISPersist#89) — the `HardwareSigner` adapter's
+    /// `sign` delegates to `LocalSigner`'s Ed25519 sign, and the
+    /// metadata methods report the software-signer truth.
+    #[tokio::test]
+    async fn hardware_adapter_sign_delegates_to_local_signer() {
+        use ciris_keyring::{ClassicalAlgorithm, HardwareSigner, HardwareType, StorageDescriptor};
+        use ed25519_dalek::{SigningKey, Verifier as _};
+
+        let seed = [0x33u8; 32];
+        let signer = Arc::new(LocalSigner::from_parts(
+            SigningKey::from_bytes(&seed),
+            "adapter-key".into(),
+            None,
+            None,
+        ));
+        let adapter = LocalSignerHardwareAdapter::new(signer.clone());
+
+        // Metadata reflects a software Ed25519 identity.
+        assert_eq!(adapter.algorithm(), ClassicalAlgorithm::Ed25519);
+        assert_eq!(adapter.hardware_type(), HardwareType::SoftwareOnly);
+        assert_eq!(adapter.current_alias(), "adapter-key");
+        assert!(matches!(
+            adapter.storage_descriptor(),
+            StorageDescriptor::InMemory
+        ));
+
+        // sign() produces a 64-byte Ed25519 signature that verifies
+        // against the LocalSigner's public key.
+        let msg = b"adapter-sign-roundtrip";
+        let sig = adapter.sign(msg).await.expect("adapter sign");
+        assert_eq!(sig.len(), 64);
+        let pk = adapter.public_key().await.expect("adapter public_key");
+        let vk = SigningKey::from_bytes(&seed).verifying_key();
+        assert_eq!(pk, vk.to_bytes().to_vec());
+        let sig_arr: [u8; 64] = sig.as_slice().try_into().unwrap();
+        vk.verify(msg, &ed25519_dalek::Signature::from_bytes(&sig_arr))
+            .expect("adapter signature verifies");
+    }
+
+    /// v1.11.0 (CIRISPersist#89) — the adapter's key-lifecycle methods
+    /// are off the ingest path and return a clear `NotSupported`
+    /// error rather than panicking.
+    #[tokio::test]
+    async fn hardware_adapter_lifecycle_methods_return_not_supported() {
+        use ciris_keyring::{HardwareSigner, KeyringError};
+        use ed25519_dalek::SigningKey;
+
+        let signer = Arc::new(LocalSigner::from_parts(
+            SigningKey::from_bytes(&[0x44u8; 32]),
+            "adapter-key".into(),
+            None,
+            None,
+        ));
+        let adapter = LocalSignerHardwareAdapter::new(signer);
+
+        assert!(matches!(
+            adapter.key_exists("adapter-key").await,
+            Err(KeyringError::NotSupported { .. })
+        ));
+        assert!(matches!(
+            adapter.delete_key("adapter-key").await,
+            Err(KeyringError::NotSupported { .. })
+        ));
+        assert!(matches!(
+            adapter.attestation().await,
+            Err(KeyringError::NotSupported { .. })
+        ));
+        // attestation_with_nonce defaults to attestation() — also
+        // surfaces NotSupported rather than panicking.
+        assert!(matches!(
+            adapter.attestation_with_nonce(Some(b"nonce")).await,
+            Err(KeyringError::NotSupported { .. })
+        ));
     }
 }

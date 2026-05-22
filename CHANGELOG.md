@@ -5,6 +5,52 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.11.0] — 2026-05-22
+
+**Consumer-facing facades — `Engine::receive_and_persist` (#89) and
+`node_core_service()` (#90).**
+
+Two Rust-public surfaces that close "compose around the substrate"
+gaps for in-process consumers — CIRISLensCore relay mode and
+CIRISNodeCore phases 2–3.
+
+### `Engine::receive_and_persist` (CIRISPersist#89)
+
+```rust
+pub async fn Engine::receive_and_persist(
+    &self, bytes: &[u8], scrubber: &dyn Scrubber,
+) -> Result<BatchSummary, IngestError>
+```
+
+The Rust-side sibling of the PyO3 `receive_and_persist` — lens-core's
+v0.2 relay handler is Rust and holds `Arc<Engine>`, so it needs a
+Rust-public ingest facade rather than reaching into `Engine`'s parts
+to reassemble `IngestPipeline` itself.
+
+The scrubber is **caller-supplied** — not owned by `Engine`, not
+baked into the facade. The privacy boundary is the originating node's
+egress filter: federation-transit relay ingest passes `&NullScrubber`
+(re-scrubbing at a relay would drift the stored bytes vs. what Edge
+verified, and demand NER models relays aren't provisioned with),
+while a first-hop deployment passes its real scrubber — the topology
+decision lives at the call site. The canonicalizer is
+facade-internal; the signer is the `Engine`'s existing `LocalSigner`,
+adapted to `HardwareSigner` via a new `LocalSignerHardwareAdapter`.
+Zero new `Engine` fields.
+
+### `node_core_service()` (CIRISPersist#90)
+
+`Engine::node_core_service()` / `PyEngine::node_core_service()` return
+a `NodeCoreDispatch` enum (`Postgres` / `Sqlite` variants) — the
+object-safe form of the issue's Option B. `NodeCoreService` is RPITIT
+and cannot be `dyn`-ed, so this mirrors the existing
+`Engine::maintenance() -> EngineMaintenance` dispatch-enum pattern.
+CIRISNodeCore's PyO3 bindings match on it to drive their `NodeCore<E>`
+logic through an injected persist engine.
+
+Follow-up tracked: CIRISPersist#91 — a skip-verify path for relay
+ingest of batches that arrived already Edge-verified.
+
 ## [1.10.3] — 2026-05-22
 
 **CIRISVerify pin → v2.8.0 — ~9× faster secrets-at-rest crypto.**
