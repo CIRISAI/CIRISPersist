@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779458333400,
+  "lastUpdate": 1779458671635,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -24485,6 +24485,276 @@ window.BENCHMARK_DATA = {
             "name": "storage_floor/next_sequence_full",
             "value": 38489,
             "range": "± 2814",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "47f618d0bfe82c872fffc58388d66a2f3e81250b",
+          "message": "docs: fix bench dashboard URL — /dev/bench/, not the gh-pages root\n\nbenchmark-action publishes to gh-pages under dev/bench/; the root has\nno index.html, so the bare Pages URL 404s. README link + bench.yml\ncomment corrected to https://cirisai.github.io/CIRISPersist/dev/bench/\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-22T08:45:18-05:00",
+          "tree_id": "4578995775458b619297bce48edd66bfb9ccf73a",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/47f618d0bfe82c872fffc58388d66a2f3e81250b"
+        },
+        "date": 1779458670236,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101612,
+            "range": "± 1359",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 239591,
+            "range": "± 1006",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 524267,
+            "range": "± 9364",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1851744,
+            "range": "± 6900",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 376,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1552,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8661,
+            "range": "± 287",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21157,
+            "range": "± 91",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24238,
+            "range": "± 81",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83656,
+            "range": "± 484",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 361,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3168,
+            "range": "± 20",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9589,
+            "range": "± 89",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41408,
+            "range": "± 205",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2269368,
+            "range": "± 128406",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6670162,
+            "range": "± 485437",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23664820,
+            "range": "± 725253",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 289292,
+            "range": "± 14452",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 313541,
+            "range": "± 17704",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 668955,
+            "range": "± 23456",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 1884257,
+            "range": "± 40868",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 23087860,
+            "range": "± 350879",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 10995315,
+            "range": "± 76847",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 535504,
+            "range": "± 23615",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 1720205,
+            "range": "± 15914",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 107828340,
+            "range": "± 1119572",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 3731719,
+            "range": "± 236953",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 17431882,
+            "range": "± 344318",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 271493119,
+            "range": "± 1181721",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 9893504,
+            "range": "± 593596",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 46202591,
+            "range": "± 481743",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 206601,
+            "range": "± 25457",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 194700,
+            "range": "± 14324",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 60360,
+            "range": "± 4731",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 183636,
+            "range": "± 4628",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 1252100,
+            "range": "± 33557",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 44,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 28175,
+            "range": "± 2585",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 4019,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 51221,
+            "range": "± 4770",
             "unit": "ns/iter"
           }
         ]
