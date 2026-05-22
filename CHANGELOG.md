@@ -5,6 +5,27 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.10.3] — 2026-05-22
+
+**CIRISVerify pin → v2.8.0 — ~9× faster secrets-at-rest crypto.**
+
+v2.8.0 ships the AES-256-GCM AEAD optimisation that closes
+CIRISVerify#26 — an issue filed straight off CIRISPersist's
+`secrets_crypto` bench (v1.10.2 measured ~1 GiB/s, ~3–5× below the
+ring/OpenSSL SOTA band). Re-running that same bench against v2.8.0:
+
+| AES-256-GCM, 16 KiB | v2.7.0 | v2.8.0 |
+|---|---|---|
+| encrypt | 15.1 µs (~1.0 GiB/s) | 1.60 µs (~9.5 GiB/s) |
+| decrypt | 15.4 µs (~1.0 GiB/s) | 1.51 µs (~10.1 GiB/s) |
+
+A ~9.4× throughput gain on the secrets-at-rest crypto path
+(`store_secret` / `recall_secret`, and `reencrypt_all` which runs it
+per row), now ahead of the ring/OpenSSL band. `ciris-verify-core` /
+`ciris-keyring` / `ciris-crypto` pins bumped v2.7.0 → v2.8.0; no API
+breakage. The bench-coverage loop did its job end to end — measure,
+file, fix upstream, confirm.
+
 ## [1.10.2] — 2026-05-21
 
 **`reencrypt_all` chunked transaction (perf review H2), CIRISVerify
