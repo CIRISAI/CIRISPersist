@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779413740978,
+  "lastUpdate": 1779420813968,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -23675,6 +23675,276 @@ window.BENCHMARK_DATA = {
             "name": "storage_floor/next_sequence_full",
             "value": 37952,
             "range": "± 1116",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "d126fb360bb881ba8e799d25f55bbeca001e95ea",
+          "message": "1.11.1 — V042 data-aware analytics indexes (covering-index column store)\n\nThe ReadEngine scoring analytics scanned raw trace_events and\nheap-fetched payload per row. V042 adds partial + expression +\ncomposite indexes — one per (scored-scalar x event_type) — turning\nthe scoring queries into index-only scans: column projection, row\nelimination (partial WHERE event_type excludes ~2/3 of rows), sorted\nruns. Pure CREATE INDEX, no schema change, both backends (parity\npreserved — no TimescaleDB-only path).\n\nEXPLAIN QUERY PLAN confirms it: cross_agent_divergence goes\nSCAN trace_events -> SEARCH ... USING INDEX (index-only, no heap\nfetch, no JSON re-parse). Controlled realistic-corpus before/after:\ncross_agent_divergence ~-42%, aggregate_llm_costs ~-30%.\n\nconscience_override_rates / aggregate_scoring_factors test event_type\ninside a MAX(CASE..) aggregate not in WHERE, and list_trace_summaries\nhas multi-field FILTER aggregates — neither is index-only-able with a\nnarrow index; they keep the V041 range-scan (honest data-shape limit).\n\nread_engine_analytics bench seed widened 2 -> 24 agents — the 2-agent\ncorpus was degenerate (planner chose a skip-scan over the covering\nindex, so the bench couldn't observe the win). Dashboard baseline\nresets to realistic-corpus numbers.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-21T22:16:45-05:00",
+          "tree_id": "b081d73f2d5f54fa5c61e390cc47ef298fbb1476",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/d126fb360bb881ba8e799d25f55bbeca001e95ea"
+        },
+        "date": 1779420813334,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 108280,
+            "range": "± 239",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 256151,
+            "range": "± 671",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 558424,
+            "range": "± 1874",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1984211,
+            "range": "± 17665",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 335,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1395,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 6619,
+            "range": "± 36",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23137,
+            "range": "± 331",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26368,
+            "range": "± 661",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 90976,
+            "range": "± 193",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 358,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3024,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9448,
+            "range": "± 27",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41552,
+            "range": "± 154",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 632,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2289785,
+            "range": "± 144883",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6983051,
+            "range": "± 965486",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25795958,
+            "range": "± 173386",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 253139,
+            "range": "± 20007",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 312547,
+            "range": "± 21556",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 647271,
+            "range": "± 37749",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 1630801,
+            "range": "± 157971",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 21555542,
+            "range": "± 66279",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 11661237,
+            "range": "± 237561",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 682443,
+            "range": "± 54995",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 1986917,
+            "range": "± 54551",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 108702849,
+            "range": "± 971416",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 3958775,
+            "range": "± 392688",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 17041571,
+            "range": "± 347238",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 274349672,
+            "range": "± 3565474",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 11220662,
+            "range": "± 489063",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 46671581,
+            "range": "± 524662",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 216532,
+            "range": "± 15626",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 174973,
+            "range": "± 10560",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 47324,
+            "range": "± 1471",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 156708,
+            "range": "± 1494",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 1190485,
+            "range": "± 12056",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 48,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 23433,
+            "range": "± 662",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 3780,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 37471,
+            "range": "± 1530",
             "unit": "ns/iter"
           }
         ]
