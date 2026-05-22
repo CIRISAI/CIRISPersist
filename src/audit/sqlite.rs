@@ -1664,7 +1664,13 @@ mod tests {
         let tenant = format!("audit-test-{}", Uuid::new_v4().simple());
 
         // 1. Genesis insert.
-        let e1 = build_and_sign(&key, &tenant, 1, GENESIS_PREV_HASH.to_vec(), "task_signed");
+        let e1 = build_and_sign(
+            &key,
+            &tenant,
+            1,
+            GENESIS_PREV_HASH.to_vec(),
+            "handler_action_task_complete",
+        );
         audit.record_entry(e1.clone()).await.unwrap();
 
         // 2. Replay → rejected (ChainIntegrity OR Conflict).
@@ -1675,19 +1681,37 @@ mod tests {
         );
 
         // 3. Sequence gap.
-        let bad_gap = build_and_sign(&key, &tenant, 3, e1.entry_hash.clone(), "task_signed");
+        let bad_gap = build_and_sign(
+            &key,
+            &tenant,
+            3,
+            e1.entry_hash.clone(),
+            "handler_action_task_complete",
+        );
         let gap_err = audit.record_entry(bad_gap).await.unwrap_err();
         assert!(matches!(gap_err, Error::ChainIntegrity(_)));
 
         // 4. Wrong prev_hash.
-        let bad_prev = build_and_sign(&key, &tenant, 2, vec![0xff; 32], "task_signed");
+        let bad_prev = build_and_sign(
+            &key,
+            &tenant,
+            2,
+            vec![0xff; 32],
+            "handler_action_task_complete",
+        );
         let prev_err = audit.record_entry(bad_prev).await.unwrap_err();
         assert!(matches!(prev_err, Error::ChainIntegrity(_)));
 
         // 5. Correct continuation.
-        let e2 = build_and_sign(&key, &tenant, 2, e1.entry_hash.clone(), "config_changed");
+        let e2 = build_and_sign(&key, &tenant, 2, e1.entry_hash.clone(), "config_change");
         audit.record_entry(e2.clone()).await.unwrap();
-        let e3 = build_and_sign(&key, &tenant, 3, e2.entry_hash.clone(), "task_signed");
+        let e3 = build_and_sign(
+            &key,
+            &tenant,
+            3,
+            e2.entry_hash.clone(),
+            "handler_action_task_complete",
+        );
         audit.record_entry(e3.clone()).await.unwrap();
 
         // 6. verify_chain → Ok.
@@ -1848,7 +1872,13 @@ mod tests {
         // the race. The agent's pattern is: deterministic envelope
         // canonicalization → same hash → same entry_id and
         // signature on both sides.
-        let entry = build_and_sign(&key, &tenant, 1, GENESIS_PREV_HASH.to_vec(), "task_signed");
+        let entry = build_and_sign(
+            &key,
+            &tenant,
+            1,
+            GENESIS_PREV_HASH.to_vec(),
+            "handler_action_task_complete",
+        );
         // content_hash is caller-computed (sha256 of canonical
         // envelope bytes). For this test we just hash a stable
         // string — the value doesn't matter beyond being identical
@@ -1930,7 +1960,7 @@ mod tests {
             sequence_number,
             tenant_id: tenant_id.to_owned(),
             actor_id: pubkey_b64(key),
-            action_type: "task_signed".into(),
+            action_type: "handler_action_task_complete".into(),
             subject_kind: "task".into(),
             subject_id: format!("subj-{sequence_number}"),
             payload: serde_json::json!({"correlation_id": correlation_id}),
@@ -2073,9 +2103,21 @@ mod tests {
         let key = SigningKey::from_bytes(&[0xC0; 32]);
         let tenant = format!("audit-merk-off-{}", Uuid::new_v4().simple());
 
-        let e1 = build_and_sign(&key, &tenant, 1, GENESIS_PREV_HASH.to_vec(), "task_signed");
+        let e1 = build_and_sign(
+            &key,
+            &tenant,
+            1,
+            GENESIS_PREV_HASH.to_vec(),
+            "handler_action_task_complete",
+        );
         audit.record_entry(e1.clone()).await.unwrap();
-        let e2 = build_and_sign(&key, &tenant, 2, e1.entry_hash.clone(), "task_signed");
+        let e2 = build_and_sign(
+            &key,
+            &tenant,
+            2,
+            e1.entry_hash.clone(),
+            "handler_action_task_complete",
+        );
         audit.record_entry(e2.clone()).await.unwrap();
 
         let (leaves, sth) = count_merkle_rows(&audit, &tenant).await;
@@ -2094,19 +2136,37 @@ mod tests {
         let key = SigningKey::from_bytes(&[0xD1; 32]);
         let tenant = format!("audit-merk-on-{}", Uuid::new_v4().simple());
 
-        let e1 = build_and_sign(&key, &tenant, 1, GENESIS_PREV_HASH.to_vec(), "task_signed");
+        let e1 = build_and_sign(
+            &key,
+            &tenant,
+            1,
+            GENESIS_PREV_HASH.to_vec(),
+            "handler_action_task_complete",
+        );
         audit.record_entry(e1.clone()).await.unwrap();
         let (l1, s1) = count_merkle_rows(&audit, &tenant).await;
         assert_eq!(l1, 1);
         assert_eq!(s1, 1);
 
-        let e2 = build_and_sign(&key, &tenant, 2, e1.entry_hash.clone(), "task_signed");
+        let e2 = build_and_sign(
+            &key,
+            &tenant,
+            2,
+            e1.entry_hash.clone(),
+            "handler_action_task_complete",
+        );
         audit.record_entry(e2.clone()).await.unwrap();
         let (l2, s2) = count_merkle_rows(&audit, &tenant).await;
         assert_eq!(l2, 2);
         assert_eq!(s2, 2);
 
-        let e3 = build_and_sign(&key, &tenant, 3, e2.entry_hash.clone(), "task_signed");
+        let e3 = build_and_sign(
+            &key,
+            &tenant,
+            3,
+            e2.entry_hash.clone(),
+            "handler_action_task_complete",
+        );
         audit.record_entry(e3.clone()).await.unwrap();
         let (l3, s3) = count_merkle_rows(&audit, &tenant).await;
         assert_eq!(l3, 3);
@@ -2150,10 +2210,16 @@ mod tests {
             &tenant_a,
             1,
             GENESIS_PREV_HASH.to_vec(),
-            "task_signed",
+            "handler_action_task_complete",
         );
         audit.record_entry(a1.clone()).await.unwrap();
-        let a2 = build_and_sign(&key_a, &tenant_a, 2, a1.entry_hash.clone(), "task_signed");
+        let a2 = build_and_sign(
+            &key_a,
+            &tenant_a,
+            2,
+            a1.entry_hash.clone(),
+            "handler_action_task_complete",
+        );
         audit.record_entry(a2.clone()).await.unwrap();
         // One leaf under tenant_b.
         let b1 = build_and_sign(
@@ -2161,7 +2227,7 @@ mod tests {
             &tenant_b,
             1,
             GENESIS_PREV_HASH.to_vec(),
-            "task_signed",
+            "handler_action_task_complete",
         );
         audit.record_entry(b1.clone()).await.unwrap();
 
@@ -2182,9 +2248,21 @@ mod tests {
         let tenant = format!("audit-merk-mid-{}", Uuid::new_v4().simple());
 
         // 2 entries with signer OFF.
-        let e1 = build_and_sign(&key, &tenant, 1, GENESIS_PREV_HASH.to_vec(), "task_signed");
+        let e1 = build_and_sign(
+            &key,
+            &tenant,
+            1,
+            GENESIS_PREV_HASH.to_vec(),
+            "handler_action_task_complete",
+        );
         audit.record_entry(e1.clone()).await.unwrap();
-        let e2 = build_and_sign(&key, &tenant, 2, e1.entry_hash.clone(), "task_signed");
+        let e2 = build_and_sign(
+            &key,
+            &tenant,
+            2,
+            e1.entry_hash.clone(),
+            "handler_action_task_complete",
+        );
         audit.record_entry(e2.clone()).await.unwrap();
         let (l_before, _) = count_merkle_rows(&audit, &tenant).await;
         assert_eq!(l_before, 0);
@@ -2193,9 +2271,21 @@ mod tests {
         audit.set_merkle_signer(Some(merkle_test_signer(0xF3)));
 
         // 2 more entries — only these should land in merkle_leaves.
-        let e3 = build_and_sign(&key, &tenant, 3, e2.entry_hash.clone(), "task_signed");
+        let e3 = build_and_sign(
+            &key,
+            &tenant,
+            3,
+            e2.entry_hash.clone(),
+            "handler_action_task_complete",
+        );
         audit.record_entry(e3.clone()).await.unwrap();
-        let e4 = build_and_sign(&key, &tenant, 4, e3.entry_hash.clone(), "task_signed");
+        let e4 = build_and_sign(
+            &key,
+            &tenant,
+            4,
+            e3.entry_hash.clone(),
+            "handler_action_task_complete",
+        );
         audit.record_entry(e4.clone()).await.unwrap();
         let (l_after, s_after) = count_merkle_rows(&audit, &tenant).await;
         assert_eq!(l_after, 2, "only post-enable entries appear as leaves");
@@ -2217,7 +2307,13 @@ mod tests {
         let key = SigningKey::from_bytes(&[0xA9; 32]);
         let tenant = format!("audit-merk-int-{}", Uuid::new_v4().simple());
 
-        let e1 = build_and_sign(&key, &tenant, 1, GENESIS_PREV_HASH.to_vec(), "task_signed");
+        let e1 = build_and_sign(
+            &key,
+            &tenant,
+            1,
+            GENESIS_PREV_HASH.to_vec(),
+            "handler_action_task_complete",
+        );
         audit.record_entry(e1.clone()).await.unwrap();
         // Replay → ChainIntegrity (sequence gap) OR Conflict. Either
         // way the chain rejects it BEFORE the Merkle hook runs, so
@@ -2393,9 +2489,15 @@ mod tests {
         let key = SigningKey::from_bytes(&[0x10; 32]);
         let tenant = format!("audit-pd-skip-{}", Uuid::new_v4().simple());
 
-        let e1 = build_and_sign(&key, &tenant, 1, GENESIS_PREV_HASH.to_vec(), "task_signed");
+        let e1 = build_and_sign(
+            &key,
+            &tenant,
+            1,
+            GENESIS_PREV_HASH.to_vec(),
+            "handler_action_task_complete",
+        );
         audit.record_entry(e1.clone()).await.unwrap();
-        let e2 = build_and_sign(&key, &tenant, 2, e1.entry_hash.clone(), "config_changed");
+        let e2 = build_and_sign(&key, &tenant, 2, e1.entry_hash.clone(), "config_change");
         audit.record_entry(e2.clone()).await.unwrap();
 
         assert_eq!(count_grants(&audit, &tenant).await, 0);

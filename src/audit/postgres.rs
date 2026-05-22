@@ -1604,7 +1604,13 @@ mod tests {
         let tenant = format!("audit-test-{}", Uuid::new_v4().simple());
 
         // 1. Genesis insert (seq=1, prev_hash=zeros).
-        let e1 = build_and_sign(&key, &tenant, 1, GENESIS_PREV_HASH.to_vec(), "task_signed");
+        let e1 = build_and_sign(
+            &key,
+            &tenant,
+            1,
+            GENESIS_PREV_HASH.to_vec(),
+            "handler_action_task_complete",
+        );
         backend.record_entry(e1.clone()).await.unwrap();
 
         // 2. Replay genesis → rejected. The chain-integrity gate
@@ -1619,7 +1625,13 @@ mod tests {
         );
 
         // 3. Sequence gap → ChainIntegrity (try seq=3 with prev=e1.entry_hash).
-        let bad_gap = build_and_sign(&key, &tenant, 3, e1.entry_hash.clone(), "task_signed");
+        let bad_gap = build_and_sign(
+            &key,
+            &tenant,
+            3,
+            e1.entry_hash.clone(),
+            "handler_action_task_complete",
+        );
         let gap_err = backend.record_entry(bad_gap).await.unwrap_err();
         assert!(
             matches!(gap_err, Error::ChainIntegrity(_)),
@@ -1627,7 +1639,13 @@ mod tests {
         );
 
         // 4. Wrong prev_hash → ChainIntegrity (seq=2 with wrong prev).
-        let bad_prev = build_and_sign(&key, &tenant, 2, vec![0xff; 32], "task_signed");
+        let bad_prev = build_and_sign(
+            &key,
+            &tenant,
+            2,
+            vec![0xff; 32],
+            "handler_action_task_complete",
+        );
         let prev_err = backend.record_entry(bad_prev).await.unwrap_err();
         assert!(
             matches!(prev_err, Error::ChainIntegrity(_)),
@@ -1635,11 +1653,17 @@ mod tests {
         );
 
         // 5. Correct continuation: seq=2 with prev = e1.entry_hash.
-        let e2 = build_and_sign(&key, &tenant, 2, e1.entry_hash.clone(), "config_changed");
+        let e2 = build_and_sign(&key, &tenant, 2, e1.entry_hash.clone(), "config_change");
         backend.record_entry(e2.clone()).await.unwrap();
 
         // 6. Extend to seq=3.
-        let e3 = build_and_sign(&key, &tenant, 3, e2.entry_hash.clone(), "task_signed");
+        let e3 = build_and_sign(
+            &key,
+            &tenant,
+            3,
+            e2.entry_hash.clone(),
+            "handler_action_task_complete",
+        );
         backend.record_entry(e3.clone()).await.unwrap();
 
         // 7. verify_chain over full range → Ok.
@@ -1797,7 +1821,7 @@ mod tests {
             sequence_number,
             tenant_id: tenant_id.to_owned(),
             actor_id: pubkey_b64(key),
-            action_type: "task_signed".into(),
+            action_type: "handler_action_task_complete".into(),
             subject_kind: "task".into(),
             subject_id: format!("subj-{sequence_number}"),
             payload: serde_json::json!({"correlation_id": correlation_id}),

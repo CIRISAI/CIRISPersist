@@ -47,3 +47,16 @@ pub(crate) fn software_keys_put(key_ref: String, bytes: Vec<u8>) -> Result<(), S
     g.insert(key_ref, Zeroizing::new(bytes));
     Ok(())
 }
+
+/// Drop the cached bytes for `key_ref` (scrubbing them via
+/// `Zeroizing`). v2.0 concurrency hardening: `rotate_master_key`
+/// caches the new key bytes *before* committing so the row is never
+/// visible without its bytes; if that commit then loses a concurrent
+/// first-use bootstrap race the staged row is rolled back, and this
+/// evicts the now-orphaned bytes rather than leaking them for the
+/// process lifetime. Idempotent — a missing key is a no-op.
+pub(crate) fn software_keys_remove(key_ref: &str) {
+    if let Ok(mut g) = cache().lock() {
+        g.remove(key_ref);
+    }
+}

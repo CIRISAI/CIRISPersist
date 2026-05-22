@@ -50,6 +50,29 @@ fn resolve_expires_at(obs: &MetricObservation) -> DateTime<Utc> {
         .unwrap_or_else(|| obs.observed_at + Duration::hours(24))
 }
 
+/// Truncate to microsecond precision.
+///
+/// Summary `period_start`/`period_end` are persisted into the
+/// `attributes` JSONB blob via chrono's default serde, which keeps
+/// the full sub-second precision of the source `DateTime` (up to
+/// nanoseconds from `Utc::now()`). The higher-tier rollup probe casts
+/// that text back with `::timestamptz`, and Postgres *rounds* a
+/// nanosecond literal to its microsecond `timestamptz` resolution —
+/// whereas the `period_start`/`period_end` bind parameters are
+/// chrono values that `tokio-postgres` *truncates* to microseconds.
+/// That round-vs-truncate asymmetry can shift a stored boundary
+/// timestamp one microsecond past an inclusive `<=`/`>=` window
+/// bound, silently dropping a boundary-aligned source summary from
+/// the rollup. Truncating to microseconds before serialization makes
+/// the stored value byte-identical to the bind parameter, so the
+/// boundary comparison is exact on both sides. Mirrors the SQLite
+/// backend, which already truncates for the same reason.
+fn truncate_to_micros(dt: DateTime<Utc>) -> DateTime<Utc> {
+    use chrono::Timelike as _;
+    let micros = dt.nanosecond() / 1000;
+    dt.with_nanosecond(micros * 1000).unwrap_or(dt)
+}
+
 fn resolve_metric_id(obs: &MetricObservation) -> Result<uuid::Uuid, Error> {
     match &obs.metric_id {
         Some(s) => uuid::Uuid::parse_str(s)
@@ -444,7 +467,12 @@ impl TelemetryService for PostgresBackend {
         period_start: chrono::DateTime<chrono::Utc>,
     ) -> Result<Option<MetricSummary>, Error> {
         // Build the deterministic key the rollup write path uses
-        // (mirrors `summary_node_id` below).
+        // (mirrors `summary_node_id` below). The write path truncates
+        // `period_start` to microseconds before keying the node, so
+        // truncate here too — a caller can pass an unmodified
+        // `chrono::Utc::now()` derivative (which may carry nanoseconds)
+        // and still hit the row. Mirrors the SQLite backend.
+        let period_start = truncate_to_micros(period_start);
         let key = format!(
             "tsdb:{}:{}:{}:{}",
             level.as_str(),
@@ -640,8 +668,8 @@ impl TelemetryService for PostgresBackend {
 
         let summary = TaskSummary {
             tenant_id: req.tenant_id.clone(),
-            period_start: req.period_start,
-            period_end: req.period_end,
+            period_start: truncate_to_micros(req.period_start),
+            period_end: truncate_to_micros(req.period_end),
             total_tasks,
             by_status,
             mean_thought_depth: mean_depth,
@@ -698,8 +726,8 @@ impl TelemetryService for PostgresBackend {
 
         let summary = ConversationSummary {
             tenant_id: req.tenant_id.clone(),
-            period_start: req.period_start,
-            period_end: req.period_end,
+            period_start: truncate_to_micros(req.period_start),
+            period_end: truncate_to_micros(req.period_end),
             total_messages,
             unique_actors,
             consolidation_level: req.level,
@@ -761,8 +789,8 @@ impl TelemetryService for PostgresBackend {
 
         let summary = TraceSummary {
             tenant_id: req.tenant_id.clone(),
-            period_start: req.period_start,
-            period_end: req.period_end,
+            period_start: truncate_to_micros(req.period_start),
+            period_end: truncate_to_micros(req.period_end),
             total_traces,
             by_action_type,
             consolidation_level: req.level,
@@ -840,8 +868,8 @@ impl TelemetryService for PostgresBackend {
 
         let summary = AuditSummary {
             tenant_id: req.tenant_id.clone(),
-            period_start: req.period_start,
-            period_end: req.period_end,
+            period_start: truncate_to_micros(req.period_start),
+            period_end: truncate_to_micros(req.period_end),
             total_events,
             by_action_type,
             unique_actors,
@@ -1165,8 +1193,8 @@ async fn run_rollup(
         let summary = MetricSummary {
             metric_name: metric_name.clone(),
             tenant_id: req.tenant_id.clone(),
-            period_start: req.period_start,
-            period_end: req.period_end,
+            period_start: truncate_to_micros(req.period_start),
+            period_end: truncate_to_micros(req.period_end),
             sum: row.sum_v,
             min: row.min_v,
             max: row.max_v,

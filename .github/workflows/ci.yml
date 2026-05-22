@@ -49,10 +49,23 @@ jobs:
       # in this workflow.
       - uses: Swatinem/rust-cache@v2
         continue-on-error: true
-      - name: cargo test (postgres + server + pyo3)
+      # v2.0 — the substrate features (cirisaudit, secrets, cirisnode,
+      # cirisgraph) are pure `cfg` gates with NO extra dependencies, so
+      # folding them into the one widened test invocation costs only
+      # the substrate test modules' compile + run — no extra crate
+      # builds. Before v2.0 this job ran only "postgres server pyo3",
+      # so the cirisaudit + secrets Postgres backends (and their
+      # concurrency tests) were NEVER exercised in CI. They are now.
+      # `sqlite` is included so the SQLite substrate backends + the
+      # SQLite concurrency tests run too. `telemetry` is included so
+      # the telemetry backends + the daily/weekly/monthly tier-rollup
+      # tests run on both backends.
+      - name: cargo test (postgres + server + pyo3 + substrates)
         env:
           CIRIS_PERSIST_TEST_PG_URL: postgres://ciris:ciris@localhost:5432/ciris_persist_test
-        run: cargo test --features "postgres server pyo3" --all-targets
+        run: >-
+          cargo test --all-targets --features
+          "postgres server pyo3 sqlite cirisaudit secrets cirisnode cirisgraph telemetry"
       - name: cargo test (default — fixture suite)
         run: cargo test --test wire_format_fixtures
       # v0.5.4 (CIRISPersist#29) — Python regression test for the FFI
@@ -172,8 +185,14 @@ jobs:
         continue-on-error: true
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
+      # v2.0 — clippy over the same widened feature set as the test
+      # job, so the substrate backends (cirisaudit, secrets, …) are
+      # lint-gated, not just compiled.
       - name: cargo clippy
-        run: cargo clippy --all-targets --features "postgres server pyo3" -- -D warnings
+        run: >-
+          cargo clippy --all-targets --features
+          "postgres server pyo3 sqlite cirisaudit secrets cirisnode cirisgraph telemetry"
+          -- -D warnings
 
   # Mission category §4 "Mission rejection": the clippy + fmt gate
   # plus a license-deny pass per CRATE_RECOMMENDATIONS §6.

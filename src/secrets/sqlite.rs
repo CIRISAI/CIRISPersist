@@ -48,7 +48,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::crypto;
-use super::key_cache::{software_keys_get, software_keys_put};
+use super::key_cache::{software_keys_get, software_keys_put, software_keys_remove};
 use super::service::SecretsService;
 use super::types::{
     AccessLogEntry, AccessOp, DecapsulationContext, FilterConfig, FilterUpdateRequest,
@@ -120,6 +120,40 @@ fn access_op_from_str(s: &str) -> Result<AccessOp, SecretsError> {
 /// constraint detail, matching Postgres impl behavior).
 fn map_sqlite_error(e: rusqlite::Error, op: &str) -> SecretsError {
     SecretsError::Backend(format!("{op}: {e}"))
+}
+
+/// Outcome of a `rotate_master_key` transaction — `Won` if this call
+/// committed its master key, `LostRace` if a concurrent first-use
+/// bootstrap won and this call's activation was rejected by the V043
+/// `master_key_one_active` partial unique index.
+enum RotateOutcome {
+    Won,
+    LostRace,
+}
+
+/// True if `e` is a SQLite unique/primary-key constraint violation.
+/// v2.0 `rotate_master_key` uses this to identify the loser of a
+/// concurrent first-use bootstrap race (the V043 partial unique index
+/// rejects the second activation).
+fn is_unique_violation(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::ConstraintViolation,
+                extended_code: rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                    | rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY,
+            },
+            _,
+        )
+    )
+}
+
+/// `Connection::transaction().commit()` surfaces a deferred
+/// constraint failure as a generic `rusqlite::Error`; inspect it the
+/// same way as `is_unique_violation` but tolerate the non-FFI shape.
+fn commit_is_unique_violation(e: &rusqlite::Error) -> bool {
+    is_unique_violation(e)
 }
 
 /// Parse an RFC 3339 TEXT timestamp (with or without 'T'). Mirrors
@@ -265,10 +299,16 @@ impl SqliteSecretsBackend {
         .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))?
     }
 
-    /// Look up the current active master key. There MUST be at most
-    /// one row in `master_key_meta` with `deactivated_at IS NULL`.
-    /// Zero = uninitialized (caller invokes rotate_master_key first);
-    /// >1 = invariant violation, surfaces as Internal.
+    /// Look up the current active master key. "active" means
+    /// `activated_at IS NOT NULL AND deactivated_at IS NULL` — a key
+    /// that has been activated and not since retired. A row with
+    /// `activated_at IS NULL` is *staged* (rotate_master_key /
+    /// migrate_to_hardware_key inserted it; not yet operative) and is
+    /// NOT active. This predicate is reconciled with
+    /// `rotate_master_key`'s COUNT and the V043 `master_key_one_active`
+    /// partial unique index. Zero = uninitialized (caller invokes
+    /// rotate_master_key first); >1 = invariant violation (V043 makes
+    /// this DB-unrepresentable), surfaces as Internal.
     async fn active_master_key(&self) -> Result<MasterKey, SecretsError> {
         let conn = self.conn.clone();
         let (key_ref, key_kind, descriptor) = tokio::task::spawn_blocking(
@@ -278,8 +318,8 @@ impl SqliteSecretsBackend {
                     .prepare(
                         "SELECT key_ref, key_kind, descriptor \
                          FROM cirislens_secrets_master_key_meta \
-                         WHERE deactivated_at IS NULL \
-                         ORDER BY activated_at IS NULL, activated_at DESC \
+                         WHERE activated_at IS NOT NULL AND deactivated_at IS NULL \
+                         ORDER BY activated_at DESC \
                          LIMIT 2",
                     )
                     .map_err(|e| map_sqlite_error(e, "active_master_key prepare"))?;
@@ -1360,64 +1400,104 @@ impl SecretsService for SqliteSecretsBackend {
         };
         let new_key_ref = Uuid::new_v4().to_string();
 
+        // 2.0 concurrency hardening — INSERT the staged row + the
+        // conditional first-use activation in ONE transaction (one
+        // lock acquisition), not two. "active" means
+        // `activated_at IS NOT NULL AND deactivated_at IS NULL`
+        // (reconciled across active_master_key, this COUNT, and the
+        // V043 `master_key_one_active` partial unique index). SQLite's
+        // connection-mutex serializes writers, but the V043 index is
+        // the same backstop the Postgres backend relies on — a
+        // first-use activation that races a concurrent winner trips
+        // the unique violation, and the loser converges on the
+        // winner's key.
         let conn = self.conn.clone();
         let new_key_ref_for_db = new_key_ref.clone();
         let now = fmt_datetime(Utc::now());
-        let now_clone = now.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), SecretsError> {
-            let guard = conn.blocking_lock();
-            guard
-                .execute(
+        // Cache the bytes BEFORE the commit so the row is never
+        // visible to a concurrent `active_master_key()` without its
+        // bytes. The loser path evicts them on rollback.
+        software_keys_put(new_key_ref.clone(), key_bytes)?;
+        let outcome =
+            tokio::task::spawn_blocking(move || -> Result<RotateOutcome, SecretsError> {
+                let mut guard = conn.blocking_lock();
+                let tx = guard
+                    .transaction()
+                    .map_err(|e| map_sqlite_error(e, "begin rotate tx"))?;
+                tx.execute(
                     "INSERT INTO cirislens_secrets_master_key_meta (\
-                        key_ref, key_kind, descriptor, created_at\
-                     ) VALUES (?1, 'software', NULL, ?2)",
-                    params![new_key_ref_for_db, now_clone],
+                    key_ref, key_kind, descriptor, created_at\
+                 ) VALUES (?1, 'software', NULL, ?2)",
+                    params![new_key_ref_for_db, now],
                 )
                 .map_err(|e| map_sqlite_error(e, "rotate_master_key insert"))?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))??;
-        software_keys_put(new_key_ref.clone(), key_bytes)?;
 
-        let ref_out = MasterKeyRef::Software {
-            handle: new_key_ref.clone(),
-        };
-
-        // If no current active key, activate immediately (first-use
-        // path). Otherwise leave inactive so the caller can stage
-        // reencrypt_all.
-        let conn2 = self.conn.clone();
-        let new_key_ref_check = new_key_ref.clone();
-        let now_for_activate = now.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), SecretsError> {
-            let guard = conn2.blocking_lock();
-            let n: i64 = guard
-                .query_row(
-                    "SELECT COUNT(*) FROM cirislens_secrets_master_key_meta \
-                     WHERE deactivated_at IS NULL AND key_ref != ?1",
-                    params![new_key_ref_check],
-                    |row| row.get(0),
-                )
-                .map_err(|e| map_sqlite_error(e, "rotate count"))?;
-            if n == 0 {
-                guard
-                    .execute(
-                        "UPDATE cirislens_secrets_master_key_meta \
-                         SET activated_at = ?1 WHERE key_ref = ?2",
-                        params![now_for_activate, new_key_ref_check],
+                // If there is no current ACTIVE key, activate this one
+                // (first-use path). Otherwise leave it staged.
+                let n: i64 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM cirislens_secrets_master_key_meta \
+                     WHERE activated_at IS NOT NULL AND deactivated_at IS NULL \
+                       AND key_ref != ?1",
+                        params![new_key_ref_for_db],
+                        |row| row.get(0),
                     )
-                    .map_err(|e| map_sqlite_error(e, "rotate activate"))?;
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))??;
+                    .map_err(|e| map_sqlite_error(e, "rotate count"))?;
+                let first_use = n == 0;
+                if first_use {
+                    match tx.execute(
+                        "UPDATE cirislens_secrets_master_key_meta \
+                     SET activated_at = ?1 WHERE key_ref = ?2",
+                        params![now, new_key_ref_for_db],
+                    ) {
+                        Ok(_) => {}
+                        Err(e) if is_unique_violation(&e) => {
+                            // Lost the concurrent first-use bootstrap
+                            // race — V043 rejected the activation.
+                            drop(tx);
+                            return Ok(RotateOutcome::LostRace);
+                        }
+                        Err(e) => return Err(map_sqlite_error(e, "rotate activate")),
+                    }
+                }
+                match tx.commit() {
+                    Ok(()) => Ok(RotateOutcome::Won),
+                    Err(e) if first_use && commit_is_unique_violation(&e) => {
+                        Ok(RotateOutcome::LostRace)
+                    }
+                    Err(e) => Err(map_sqlite_error(e, "rotate commit")),
+                }
+            })
+            .await
+            .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))??;
 
-        let _ = self
-            .secrets_audit(AuditRecord::new(AccessOp::Rotate, accessor), true, None)
-            .await;
-        Ok(ref_out)
+        match outcome {
+            RotateOutcome::Won => {
+                let _ = self
+                    .secrets_audit(AuditRecord::new(AccessOp::Rotate, accessor), true, None)
+                    .await;
+                Ok(MasterKeyRef::Software {
+                    handle: new_key_ref,
+                })
+            }
+            RotateOutcome::LostRace => {
+                // The staged row + UPDATE were rolled back; evict the
+                // now-orphaned cached bytes and converge on the
+                // winner's key (first-use bootstraps converge).
+                software_keys_remove(&new_key_ref);
+                tracing::info!(
+                    "rotate_master_key: concurrent first-use bootstrap — \
+                     converging on the winning master key"
+                );
+                let winner = self.active_master_key().await?;
+                let _ = self
+                    .secrets_audit(AuditRecord::new(AccessOp::Rotate, accessor), true, None)
+                    .await;
+                Ok(MasterKeyRef::Software {
+                    handle: winner.key_ref,
+                })
+            }
+        }
     }
 
     async fn test_encryption(&self) -> Result<bool, SecretsError> {
@@ -2503,5 +2583,72 @@ mod tests {
             .expect("process_incoming_text");
         assert_eq!(filtered, text);
         assert!(refs.is_empty());
+    }
+
+    /// v2.0 secrets-concurrency hardening: from an EMPTY store, N
+    /// concurrent `rotate_master_key` bootstrap calls must leave
+    /// EXACTLY ONE active master key. SQLite serializes writers via
+    /// the shared `Arc<Mutex<Connection>>`, but the invariant — and
+    /// the V043 `master_key_one_active` partial unique index that
+    /// enforces it — must hold on both backends (parity). Runs under
+    /// the parallel suite (no `#[serial]`): it passes because the
+    /// code is correct and the DB enforces the invariant.
+    ///
+    /// Note "exactly one ACTIVE key", not "all calls return the same
+    /// handle": only the FIRST-use winner (and any concurrent
+    /// first-use loser that converges on it) ends up active. A
+    /// rotation that runs after a key is already active is a normal
+    /// staged rotation — it returns its own staged key_ref for the
+    /// caller to drive `reencrypt_all`. The invariant under test is
+    /// the active-key count.
+    #[tokio::test]
+    async fn rotate_master_key_concurrent_bootstrap_converges_to_one_active() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let conn_handle = backend.conn_handle();
+
+        // N independent SecretsBackend handles over the SAME database
+        // — the production cohabitation sharing model.
+        const N: usize = 12;
+        let mut tasks = Vec::with_capacity(N);
+        for i in 0..N {
+            let secrets = SqliteSecretsBackend::new(conn_handle.clone());
+            tasks.push(tokio::spawn(async move {
+                secrets
+                    .rotate_master_key(None, format!("bootstrap-{i}"))
+                    .await
+            }));
+        }
+        for t in tasks {
+            match t.await.expect("join").expect("rotate_master_key") {
+                MasterKeyRef::Software { handle } => assert!(!handle.is_empty()),
+                other => panic!("expected Software ref, got {other:?}"),
+            }
+        }
+
+        // The DB holds EXACTLY ONE active row (active :=
+        // activated_at IS NOT NULL AND deactivated_at IS NULL) — the
+        // V043 partial unique index guarantees it; this confirms the
+        // rows agree with the index.
+        let conn = conn_handle.clone();
+        let active: i64 = tokio::task::spawn_blocking(move || {
+            conn.blocking_lock()
+                .query_row(
+                    "SELECT COUNT(*) FROM cirislens_secrets_master_key_meta \
+                     WHERE activated_at IS NOT NULL AND deactivated_at IS NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(active, 1, "exactly one active master key expected");
+
+        // encrypt/decrypt round-trips under the active key.
+        let secrets = SqliteSecretsBackend::new(conn_handle.clone());
+        let ct = secrets.encrypt("ciris-concurrency-probe").await.unwrap();
+        let pt = secrets.decrypt(&ct).await.unwrap();
+        assert_eq!(pt, "ciris-concurrency-probe");
     }
 }

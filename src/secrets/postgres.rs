@@ -60,6 +60,17 @@ fn access_op_str(op: AccessOp) -> &'static str {
     }
 }
 
+/// True if `e` is a Postgres unique-constraint violation (SQLSTATE
+/// 23505). v2.0 `rotate_master_key` uses this to identify the loser
+/// of a concurrent first-use bootstrap race — its activating UPDATE
+/// commit is rejected by the V043 `master_key_one_active` partial
+/// unique index.
+fn is_unique_violation(e: &tokio_postgres::Error) -> bool {
+    e.as_db_error()
+        .map(|d| d.code() == &tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
+        .unwrap_or(false)
+}
+
 fn access_op_from_str(s: &str) -> Result<AccessOp, SecretsError> {
     match s {
         "store" => Ok(AccessOp::Store),
@@ -152,10 +163,16 @@ impl PostgresBackend {
         Ok(())
     }
 
-    /// Look up the current active master key. There MUST be exactly
-    /// one row in `master_key_meta` with `deactivated_at IS NULL`.
-    /// Zero = uninitialized (the impl auto-generates a software key
-    /// on first use); >1 = invariant violation, surfaces as Internal.
+    /// Look up the current active master key. "active" means
+    /// `activated_at IS NOT NULL AND deactivated_at IS NULL` — a key
+    /// that has been activated and not since retired. A row with
+    /// `activated_at IS NULL` is *staged* (rotate_master_key /
+    /// migrate_to_hardware_key inserted it; not yet operative) and
+    /// is NOT active. This predicate is reconciled with
+    /// `rotate_master_key`'s COUNT and the V043 `master_key_one_active`
+    /// partial unique index. Zero = uninitialized (caller invokes
+    /// rotate_master_key first); >1 = invariant violation (V043 makes
+    /// this DB-unrepresentable), surfaces as Internal.
     async fn active_master_key(&self) -> Result<MasterKey, SecretsError> {
         let client = self
             .pool()
@@ -166,7 +183,7 @@ impl PostgresBackend {
             .query(
                 "SELECT key_ref, key_kind, descriptor \
                  FROM cirislens_secrets.master_key_meta \
-                 WHERE deactivated_at IS NULL",
+                 WHERE activated_at IS NOT NULL AND deactivated_at IS NULL",
                 &[],
             )
             .await
@@ -225,13 +242,38 @@ impl PostgresBackend {
             bytes,
         })
     }
+
+    /// Loser branch of the concurrent first-use bootstrap race: the
+    /// V043 unique index rejected this transaction's activating
+    /// UPDATE because a concurrent rotation already activated its key.
+    /// The caller has already rolled the aborted tx back; this evicts
+    /// the orphaned cached bytes and re-reads the winner's now-active
+    /// master key.
+    async fn converge_on_bootstrap_winner(
+        &self,
+        loser_key_ref: &str,
+        accessor: String,
+    ) -> Result<MasterKeyRef, SecretsError> {
+        software_keys_remove(loser_key_ref);
+        tracing::info!(
+            "rotate_master_key: concurrent first-use bootstrap — \
+             converging on the winning master key"
+        );
+        let winner = self.active_master_key().await?;
+        let _ = self
+            .secrets_audit(AuditRecord::new(AccessOp::Rotate, accessor), true, None)
+            .await;
+        Ok(MasterKeyRef::Software {
+            handle: winner.key_ref,
+        })
+    }
 }
 
 // v0.9.3: software-key cache extracted to `secrets::key_cache` so
 // both the Postgres + SQLite backends share the same in-memory
 // store. Wired in via `use super::key_cache::{software_keys_get,
 // software_keys_put}`.
-use super::key_cache::{software_keys_get, software_keys_put};
+use super::key_cache::{software_keys_get, software_keys_put, software_keys_remove};
 
 struct MasterKey {
     key_ref: String,
@@ -987,55 +1029,117 @@ impl SecretsService for PostgresBackend {
         };
         let new_key_ref = Uuid::new_v4().to_string();
 
-        // INSERT the new key row (not yet active — reencrypt_all
-        // activates).
-        let client = self
+        // 2.0 concurrency hardening — INSERT the staged row + the
+        // conditional first-use activation in ONE transaction, not
+        // two separate pool checkouts. "active" means
+        // `activated_at IS NOT NULL AND deactivated_at IS NULL`
+        // (reconciled across active_master_key, this COUNT, and the
+        // V043 partial unique index). The V043 index is the backstop:
+        // if two concurrent first-use rotations both observe COUNT=0
+        // and both activate, the second tx to commit hits the unique
+        // violation — the loser then re-reads and converges on the
+        // winner's key (first-use bootstraps converge, by design).
+        let mut client = self
             .pool()
             .get()
             .await
             .map_err(|e| SecretsError::Backend(format!("pool: {e}")))?;
-        client
-            .execute(
-                "INSERT INTO cirislens_secrets.master_key_meta (\
-                    key_ref, key_kind, descriptor, created_at\
-                 ) VALUES ($1, 'software', NULL, NOW())",
-                &[&new_key_ref],
-            )
+        let tx = client
+            .transaction()
             .await
-            .map_err(|e| SecretsError::Backend(format!("rotate_master_key insert: {e}")))?;
+            .map_err(|e| SecretsError::Backend(format!("begin rotate tx: {e}")))?;
+        tx.execute(
+            "INSERT INTO cirislens_secrets.master_key_meta (\
+                key_ref, key_kind, descriptor, created_at\
+             ) VALUES ($1, 'software', NULL, NOW())",
+            &[&new_key_ref],
+        )
+        .await
+        .map_err(|e| SecretsError::Backend(format!("rotate_master_key insert: {e}")))?;
+        // Cache the bytes BEFORE commit so the row is never visible
+        // to a concurrent `active_master_key()` without its bytes.
+        // The loser path below evicts them if the commit is rolled
+        // back.
         software_keys_put(new_key_ref.clone(), key_bytes)?;
 
-        let ref_out = MasterKeyRef::Software {
-            handle: new_key_ref.clone(),
-        };
-
-        // If no current active key, activate immediately (first-use
-        // path). Otherwise leave inactive so the caller can stage
-        // reencrypt_all.
-        let existing = client
+        // If there is no current ACTIVE key, activate this one
+        // immediately (first-use path). Otherwise leave it staged so
+        // the caller can drive reencrypt_all.
+        let existing = tx
             .query_one(
                 "SELECT COUNT(*) FROM cirislens_secrets.master_key_meta \
-                 WHERE deactivated_at IS NULL AND key_ref != $1",
+                 WHERE activated_at IS NOT NULL AND deactivated_at IS NULL \
+                   AND key_ref != $1",
                 &[&new_key_ref],
             )
             .await
             .map_err(|e| SecretsError::Backend(format!("rotate count: {e}")))?;
         let n: i64 = existing.get(0);
-        if n == 0 {
-            client
+        let first_use = n == 0;
+
+        // The activating UPDATE is where a concurrent first-use loser
+        // trips the V043 `master_key_one_active` partial unique index:
+        // two first-use transactions both reach this UPDATE; the
+        // second blocks on the first's index entry, and when the
+        // first commits the second's UPDATE fails with 23505 (the tx
+        // is then aborted). A 23505 here is therefore a deliberate,
+        // typed "lost the bootstrap race" signal — not a swallowed
+        // error.
+        if first_use {
+            match tx
                 .execute(
                     "UPDATE cirislens_secrets.master_key_meta \
                      SET activated_at = NOW() WHERE key_ref = $1",
                     &[&new_key_ref],
                 )
                 .await
-                .map_err(|e| SecretsError::Backend(format!("rotate activate: {e}")))?;
+            {
+                Ok(_) => {}
+                Err(e) if is_unique_violation(&e) => {
+                    let _ = tx.rollback().await;
+                    return self
+                        .converge_on_bootstrap_winner(&new_key_ref, accessor)
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx.rollback().await;
+                    software_keys_remove(&new_key_ref);
+                    return Err(SecretsError::Backend(format!("rotate activate: {e}")));
+                }
+            }
         }
 
-        let _ = self
-            .secrets_audit(AuditRecord::new(AccessOp::Rotate, accessor), true, None)
-            .await;
-        Ok(ref_out)
+        // Commit. A first-use loser may also surface the V043
+        // violation here (deferred-visibility timing) — handled the
+        // same way.
+        match tx.commit().await {
+            Ok(()) => {
+                let _ = self
+                    .secrets_audit(AuditRecord::new(AccessOp::Rotate, accessor), true, None)
+                    .await;
+                Ok(MasterKeyRef::Software {
+                    handle: new_key_ref,
+                })
+            }
+            Err(e) if first_use && is_unique_violation(&e) => {
+                software_keys_remove(&new_key_ref);
+                tracing::info!(
+                    "rotate_master_key: concurrent first-use bootstrap — \
+                     converging on the winning master key"
+                );
+                let winner = self.active_master_key().await?;
+                let _ = self
+                    .secrets_audit(AuditRecord::new(AccessOp::Rotate, accessor), true, None)
+                    .await;
+                Ok(MasterKeyRef::Software {
+                    handle: winner.key_ref,
+                })
+            }
+            Err(e) => {
+                software_keys_remove(&new_key_ref);
+                Err(SecretsError::Backend(format!("rotate commit: {e}")))
+            }
+        }
     }
 
     async fn test_encryption(&self) -> Result<bool, SecretsError> {
@@ -1603,13 +1707,18 @@ mod tests {
             Err(other) => panic!("migrate_to_hardware_key failed unexpectedly: {other:?}"),
         }
 
-        // 13. Stubs (v0.6.2 will impl).
-        let err = backend
+        // 13. process_incoming_text — v1.5.7 default-trait impl. With
+        // the default (empty) filter catalog there are no patterns to
+        // match, so the text passes through unchanged with no refs.
+        let (filtered, refs) = backend
             .process_incoming_text("x", "y", "test".into())
             .await
-            .unwrap_err();
-        assert!(matches!(err, SecretsError::Internal(_)));
+            .expect("process_incoming_text");
+        assert_eq!(filtered, "x");
+        assert!(refs.is_empty());
 
+        // 14. decapsulate_secrets_in_parameters — still a v0.6.2
+        // pipeline-orchestration stub; surfaces Internal.
         let err = backend
             .decapsulate_secrets_in_parameters(
                 "tool",
@@ -1773,5 +1882,79 @@ mod tests {
             matches!(err, SecretsError::InvalidArgument(_)),
             "expected InvalidArgument, got {err:?}"
         );
+    }
+
+    /// v2.0 secrets-concurrency hardening — the master-key bootstrap
+    /// race fix (CIRISPersist 2.0).
+    ///
+    /// From an EMPTY `master_key_meta`, N concurrent first-use
+    /// `rotate_master_key` calls run against the REAL connection pool
+    /// (true parallelism — this is the pre-fix bug's live path:
+    /// `current_rust_engine()` hands one shared engine to multiple
+    /// co-resident consumers). Before the fix, the check-then-act
+    /// `COUNT ... WHERE deactivated_at IS NULL` / conditional UPDATE
+    /// let several rotations all observe COUNT=0 and all activate →
+    /// `active_master_key()` errored "N active master keys".
+    ///
+    /// After the fix: each rotation does INSERT + conditional activate
+    /// in ONE transaction; the V043 `master_key_one_active` partial
+    /// unique index caps active rows at one; first-use losers catch
+    /// the unique violation, re-read, and converge on the winner. The
+    /// assertion is EXACTLY ONE active master key + a clean
+    /// encrypt/decrypt round-trip — not "all calls return the same
+    /// handle", since a rotation that runs after a key is already
+    /// active is a normal staged rotation returning its own staged
+    /// key_ref.
+    ///
+    /// `#[serial(postgres)]` isolates the shared `master_key_meta`
+    /// table from other PG tests — it does NOT serialize the N
+    /// internal rotations, which genuinely race the pool.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn rotate_master_key_concurrent_bootstrap_converges_to_one_active() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        reset_secrets_state(&backend).await;
+
+        // N concurrent first-use bootstraps over the real pool.
+        const N: usize = 12;
+        let backend = std::sync::Arc::new(backend);
+        let mut tasks = Vec::with_capacity(N);
+        for i in 0..N {
+            let b = backend.clone();
+            tasks.push(tokio::spawn(async move {
+                b.rotate_master_key(None, format!("bootstrap-{i}")).await
+            }));
+        }
+        for t in tasks {
+            match t.await.expect("join").expect("rotate_master_key") {
+                MasterKeyRef::Software { handle } => assert!(!handle.is_empty()),
+                other => panic!("expected Software ref, got {other:?}"),
+            }
+        }
+
+        // DB holds EXACTLY ONE active row — the V043 index guarantees
+        // it; this confirms the rows agree with the index.
+        let client = backend.pool().get().await.unwrap();
+        let active: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM cirislens_secrets.master_key_meta \
+                 WHERE activated_at IS NOT NULL AND deactivated_at IS NULL",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(active, 1, "exactly one active master key expected");
+
+        // encrypt/decrypt round-trips under the converged key.
+        let ct = backend.encrypt("ciris-concurrency-probe").await.unwrap();
+        let pt = backend.decrypt(&ct).await.unwrap();
+        assert_eq!(pt, "ciris-concurrency-probe");
     }
 }
