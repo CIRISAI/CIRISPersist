@@ -239,17 +239,24 @@ attribute-predicate-heavy — so (a) is likely acceptable, but it is a
 | `recorded_at` | P | Time axis. |
 | `signature`, `signing_key_id`, `signature_verified`, `persist_row_hash` | P | Integrity envelope. |
 
-**Fit — the load-bearing subtlety.** `V014`'s header states the
-canonical bytes used for `prev_hash`/`entry_hash` "include this payload
-byte-for-byte." The hash chain therefore commits to the *plaintext*
-payload. The spec mandates: **the hash chain commits to plaintext
-content; the ciphertext column is a confidentiality wrapper over already
-hash-chained bytes.** Encrypt-on-write encrypts `canonical(payload)`;
-the chain hash is computed over that *same plaintext* `canonical(payload)`
-*before* encryption. Decrypt-on-read recovers the plaintext, and chain
-verification runs against it exactly as today. The encryption layer is
-strictly *outside* the integrity layer. This must be a tested invariant
-(§6). Same principle applies to `merkle_leaves.canonical_bytes` /
+**Fit — RESOLVED: the chain commits to ciphertext (§8.1).** `V014`'s
+header notes the canonical bytes for `prev_hash`/`entry_hash` "include
+this payload byte-for-byte." Under content encryption that payload is
+the stored ciphertext: **the hash chain commits to the encrypted form.**
+Encrypt-on-write runs first — `ct = AES-GCM(canonical(payload))` — then
+`prev_hash`/`entry_hash` are computed over the canonical entry carrying
+`ct`. The chain therefore commits to exactly what is stored and
+replicated, so any peer holding the (encrypted) corpus re-hashes and
+verifies the chain **without the decryption key** — the audit log stays
+a federation transparency substrate (MISSION.md §9) even when its
+content is encrypted. Content authenticity for a key-holder is a
+*separate* layer: the actor's self-signature (`actor_id` IS the pubkey)
+is computed over *plaintext* before encryption and travels inside the
+blob — the actor never holds persist's content key, never signs
+ciphertext. Three orthogonal layers: confidentiality (AES-GCM),
+content-authenticity (actor signature over plaintext), transparency
+(chain/Merkle over ciphertext). This must be a tested invariant (§6).
+The same form applies to `merkle_leaves.canonical_bytes` /
 `leaf_serialized` (§3.7).
 
 ### 3.5 `cirisgraph.telemetry_metrics` — `V015`
@@ -305,19 +312,15 @@ stolen federation directory reveals the trust graph, and that is
 | `signature_blob`, `signer_key_id`, `witness_signatures` | P | Signed-tree-head signatures. |
 | `appended_at`, `signed_at` | P | Time axes. |
 
-**Fit — projection-only by construction.** The Merkle layer is a
-*transparency* layer (RFC 6962). `canonical_bytes` and `leaf_serialized`
-embed a copy of the audit entry — but the audit entry's *content*
-(`audit_log.payload`) is already encrypted at its source row (§3.4). The
-`merkle_leaves` copy is the **hashing-form bytes**; the tree commits to
-them and they must be byte-identical to what was hashed. The spec
-mandates: **the Merkle layer stores the same already-content-encrypted
-form** — i.e. `leaf_serialized` is built from the *encrypted* `payload`,
-so the tree commits to ciphertext and the transparency proofs work
-without ever exposing plaintext. This is internally consistent with
-§3.4's invariant *only if* the audit leaf's canonical/hashed form is
-defined over the encrypted payload; **this ordering is the single
-hardest open question — see §8.**
+**Fit — projection-only by construction; commits to ciphertext.** The
+Merkle layer is a *transparency* layer (RFC 6962). `canonical_bytes` and
+`leaf_serialized` embed the audit entry — and per §3.4 (RESOLVED) the
+entry's `payload` is the stored ciphertext. `leaf_serialized` is built
+from the *encrypted* `payload`, so the tree commits to ciphertext: the
+transparency proofs verify against the bytes every peer already holds —
+RFC 6962 auditability is preserved without ever exposing plaintext.
+§3.4 and §3.7 are therefore one consistent rule: **the hash chain and
+the Merkle tree both commit to the encrypted form.**
 
 ### 3.8 `cirislens_secrets.*` — `V010`
 
@@ -689,24 +692,26 @@ persist.
 The skeleton/content cleavage is real and most substrates fit it
 cleanly. The genuinely hard parts:
 
-1. **Audit-leaf canonical form vs. encryption ordering (§3.4 + §3.7) —
-   the single hardest open question.** The audit hash chain commits to
-   `canonical(payload)`; the Merkle tree commits to `AuditLeaf` hashing-
-   form bytes that *embed* the payload. For the transparency proofs to
-   remain verifiable by a peer, the leaf must commit to a *stable,
-   reproducible* byte form. Two self-consistent designs exist and the
-   FSD does **not** pick one — it must be decided before §9.4:
-   (a) the chain/tree commit to **plaintext** `canonical(payload)`, and
-   encryption is a pure confidentiality wrapper applied *after* hashing
-   (clean integrity story; but a peer verifying a proof would need the
-   plaintext, so cross-peer Merkle audit of *encrypted* corpora cannot
-   verify leaf contents — only structure); or
-   (b) the chain/tree commit to the **ciphertext**, so proofs verify
-   against ciphertext and a peer can audit structure without plaintext
-   (clean transparency-of-encrypted-corpus story; but then "the chain
-   commits to what the agent signed" needs the agent's signature to also
-   be over the ciphertext, which fights §1.1c's orthogonality). This is
-   a real architectural fork. **Flagged for decision.**
+1. **Audit-leaf canonical form — RESOLVED (2026-05-22): the chain and
+   Merkle tree both commit to ciphertext (§3.4, §3.7).** The open
+   question was whether the audit hash chain and Merkle tree commit to
+   plaintext `canonical(payload)` or to the encrypted form. Resolved
+   against **MISSION.md §9**: the audit log is a *federation
+   transparency substrate*, and a transparency log's defining property
+   (RFC 6962) is **key-independent auditability**. If the tree committed
+   to plaintext, a peer holding an *encrypted* corpus could verify only
+   tree structure, not leaf contents — the log would silently stop being
+   a transparency log the moment its content was encrypted. Committing
+   to ciphertext keeps it one: every peer holds the ciphertext, so every
+   peer can re-hash and fully audit the chain/tree **without the key**.
+   This does *not* weaken content-authenticity — the worry that "the
+   agent would have to sign ciphertext" was incorrect: the actor's
+   self-signature is over *plaintext*, computed before encryption, a
+   separate layer inside the blob; the actor never holds persist's
+   content key. Three orthogonal layers, cleanly (§3.4). Plaintext-
+   commitment would additionally have been *redundant* — the actor
+   signature already gives a key-holder content integrity — and a
+   marginal known-plaintext oracle. No longer open.
 
 2. **`trace_llm_calls` has no per-row signature (§3.2).** Its integrity
    rides on the parent `trace_events` row. Encrypting `prompt` /
