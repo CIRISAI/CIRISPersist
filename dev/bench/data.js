@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779471303737,
+  "lastUpdate": 1779488906551,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -26105,6 +26105,276 @@ window.BENCHMARK_DATA = {
             "name": "storage_floor/next_sequence_full",
             "value": 37581,
             "range": "± 1668",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "0626ce96b977d540daa44cb344c1ccbe1983c5ca",
+          "message": "verify v3.0.1 pin + secrets/audit/telemetry hardening (2.0 prep)\n\nCIRISVerify pin bumped to the 3.0 federation line: ciris-verify-core /\nciris-keyring / ciris-crypto v2.8.0 -> v3.0.1 (version \"2\" -> \"3\").\n\nMaster-key bootstrap concurrency hardening — a confirmed production\nrace: rotate_master_key's first-use activation was a check-then-act\nwith no DB invariant; on Postgres (real pool) concurrent bootstraps\nrace to multiple active master keys -> encrypt() fails. The\ncohabitation model (current_rust_engine shares the engine across\nco-resident consumers) makes concurrent bootstrap a live path.\n  - V043 (both dialects): partial UNIQUE index — at most one active\n    master key, DB-enforced. \"active\" reconciled to\n    activated_at IS NOT NULL AND deactivated_at IS NULL.\n  - rotate_master_key: insert + activate in one transaction; the index\n    is the backstop; a concurrent loser converges to the winner's key.\n  - 12-way concurrent-bootstrap test, both backends, parallel-safe.\n\nTelemetry daily-tier rollup — a real bug behind a flaky test (~60%\nfail). Postgres rounds a nanosecond timestamp literal to microsecond\non ::timestamptz cast; tokio-postgres truncates the bind parameter.\nAt the day-boundary window the stored value rounds up and the param\ntruncates down, so the inclusive period_end <= $4 predicate drops the\n4th basic summary (9 vs 12). Fixed: truncate summary timestamps to\nmicroseconds before serialization (PG path now matches the SQLite\npath, which already did this).\n\nAudit chain assessed concurrency-safe (SELECT FOR UPDATE +\nUNIQUE(tenant_id,sequence_number) + typed Conflict). Audit action_type\ntest value was stale (fixed). qa_harness migration-count bound -> 40.\n\nCI feature gap CLOSED: cirisaudit, secrets, cirisnode, cirisgraph,\ntelemetry all added to the test + clippy jobs — every substrate's PG\nbackend was previously untested in CI. Full suite (560 lib + 22\nintegration) green on both backends.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-22T17:09:59-05:00",
+          "tree_id": "34478380bf665e41dc8f8bcd9d0487b8d5750661",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/0626ce96b977d540daa44cb344c1ccbe1983c5ca"
+        },
+        "date": 1779488905570,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 102564,
+            "range": "± 1103",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 239674,
+            "range": "± 1338",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 514866,
+            "range": "± 2943",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1848630,
+            "range": "± 17973",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 360,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1436,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7563,
+            "range": "± 119",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21392,
+            "range": "± 314",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24300,
+            "range": "± 66",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83595,
+            "range": "± 272",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 381,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3060,
+            "range": "± 24",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9472,
+            "range": "± 59",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41707,
+            "range": "± 219",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2270454,
+            "range": "± 80347",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6649607,
+            "range": "± 138997",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23727620,
+            "range": "± 674666",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 272234,
+            "range": "± 20675",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 362049,
+            "range": "± 27740",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 721043,
+            "range": "± 41852",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 2146907,
+            "range": "± 75999",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 23404030,
+            "range": "± 105206",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 11845372,
+            "range": "± 135664",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 687943,
+            "range": "± 38234",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 2040849,
+            "range": "± 60774",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 108468838,
+            "range": "± 893380",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 4066766,
+            "range": "± 255402",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 18204582,
+            "range": "± 463522",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 268910038,
+            "range": "± 1414986",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 10627031,
+            "range": "± 387757",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 47111382,
+            "range": "± 888446",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 212017,
+            "range": "± 49714",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 183530,
+            "range": "± 14327",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 60257,
+            "range": "± 5042",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 172933,
+            "range": "± 5666",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 1235141,
+            "range": "± 16446",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 44,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 28328,
+            "range": "± 2513",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 3921,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 50828,
+            "range": "± 4930",
             "unit": "ns/iter"
           }
         ]
