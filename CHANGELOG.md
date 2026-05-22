@@ -5,6 +5,48 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [1.11.1] — 2026-05-22
+
+**V042 — data-aware analytics indexes ("covering indexes as a
+poor-man's column store").**
+
+The `ReadEngine` scoring analytics scanned raw `trace_events` and
+heap-fetched `payload` per row. V042 adds partial + expression +
+composite indexes — one per (scored-scalar × event_type) — that turn
+the scoring queries into **index-only scans**: column projection
+(the index holds only the columns the query touches), row
+elimination (the `WHERE event_type = '…'` partial predicate
+physically excludes the ~2/3 of rows whose event-type doesn't carry
+that scalar), and sorted runs (the composite key). Pure
+`CREATE INDEX` — no schema change — and **both backends** (SQLite +
+Postgres; backend parity preserved, no TimescaleDB-only path).
+
+`EXPLAIN QUERY PLAN` confirms the structural change:
+`cross_agent_divergence` goes from `SCAN trace_events` to
+`SEARCH … USING INDEX trace_events_an_csdma` — index-only, no heap
+fetch, no JSON re-parse. Controlled before/after on a realistic
+federation corpus: `cross_agent_divergence` ~−42%,
+`aggregate_llm_costs` ~−30%.
+
+Two query families V042 deliberately leaves on the V041 range-scan —
+honest data-shape limits: `conscience_override_rates` /
+`aggregate_scoring_factors` test `event_type` *inside* a `MAX(CASE…)`
+aggregate, not in `WHERE`, so they must scan every event-type of a
+trace; and `list_trace_summaries`' multi-field FILTER aggregates
+have no narrow covering index.
+
+The `read_engine_analytics` bench seed was widened 2 → 24 agents —
+the 2-agent corpus was degenerate (the SQLite planner chose a
+skip-scan over the covering index, so the bench could not observe
+the optimisation). The dashboard baseline resets to realistic-corpus
+numbers from this release.
+
+The residual gap to a true columnar engine after V042 — vectorized
+SIMD execution + column compression, ~2–5× on the heaviest scans —
+is the genuine architectural floor. The earlier "10–50× behind"
+figure measured the *absence of targeted indexes*, not the
+row-store architecture.
+
 ## [1.11.0] — 2026-05-22
 
 **Consumer-facing facades — `Engine::receive_and_persist` (#89) and

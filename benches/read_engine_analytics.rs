@@ -91,10 +91,18 @@ fn bench_event(
 
 /// Seed a fresh migrated in-memory backend with `n_traces` traces, each
 /// a 3-event trace (THOUGHT_START + DMA_RESULTS + CONSCIENCE_RESULT) so
-/// every read primitive under bench has real shape to scan. Rows are
-/// spread across two agents in one `deployment_domain` so
-/// `cross_agent_divergence` sees a population.
+/// every read primitive under bench has real shape to scan.
+///
+/// Rows spread across **24 agents in one `deployment_domain`**. The
+/// agent cardinality is load-bearing for `cross_agent_divergence`: an
+/// earlier 2-agent seed was degenerate — with only 2 groups the SQLite
+/// planner picked a tiny skip-scan over the V042 covering index (the
+/// `GROUP BY` temp B-tree was effectively free), so the bench could
+/// not observe the covering-index optimisation at all. 24 agents is a
+/// realistic per-domain federation population and makes the bench
+/// measure the query shape V042 actually targets.
 async fn seed_backend(n_traces: usize) -> SqliteBackend {
+    const N_AGENTS: usize = 24;
     let backend = SqliteBackend::open_in_memory().await.unwrap();
     backend.run_migrations().await.unwrap();
     let base = Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap();
@@ -106,9 +114,9 @@ async fn seed_backend(n_traces: usize) -> SqliteBackend {
         let trace_id = format!("trace-{i:06}");
         let thought_id = format!("{trace_id}-th");
         let ts = base + chrono::Duration::seconds(i as i64);
-        let agent_idx = i % 2;
-        let agent_hash = format!("agenthash-{agent_idx}");
-        let agent_name = format!("agent-{agent_idx}");
+        let agent_idx = i % N_AGENTS;
+        let agent_hash = format!("agenthash-{agent_idx:02}");
+        let agent_name = format!("agent-{agent_idx:02}");
         let domain = "research";
 
         batch.push(bench_event(
