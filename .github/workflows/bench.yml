@@ -47,12 +47,12 @@ jobs:
   bench:
     name: Criterion bench suite
     runs-on: ubuntu-latest
-    # Ten benches. The original five are ~60s each; the v1.10.x
+    # Eleven benches. The original five are ~60s each; the v1.10.x
     # bench-coverage cut (sequence_contention, engine_cold_start,
-    # read_engine_analytics, secrets_crypto, occurrence_registry) adds
-    # ~8-10 min — read_engine_analytics dominates (size-swept seeds up
-    # to 25k traces). Observed ~13 min locally; headroom for the
-    # runner. Bump if we add more benches.
+    # read_engine_analytics, secrets_crypto, occurrence_registry,
+    # storage_floor) adds ~9-11 min — read_engine_analytics dominates
+    # (size-swept seeds up to 25k traces). Observed ~14 min locally;
+    # headroom for the runner. Bump if we add more benches.
     timeout-minutes: 45
 
     steps:
@@ -121,6 +121,7 @@ jobs:
           cargo bench --features sqlite --bench read_engine_analytics -- --output-format bencher | tee -a bench-output.txt
           cargo bench --features secrets --bench secrets_crypto -- --output-format bencher | tee -a bench-output.txt
           cargo bench --features sqlite,cirislens_occurrence --bench occurrence_registry -- --output-format bencher | tee -a bench-output.txt
+          cargo bench --features sqlite,cirislens_sequence --bench storage_floor -- --output-format bencher | tee -a bench-output.txt
 
       - name: Top-line summary to GH step summary
         run: |

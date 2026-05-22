@@ -733,6 +733,13 @@ name = "occurrence_registry"
 harness = false
 required-features = ["sqlite", "cirislens_occurrence"]
 
+# Decomposes the SQLite-backend async-wrapper tax (block_on +
+# spawn_blocking) from the storage cost — see benches/storage_floor.rs.
+[[bench]]
+name = "storage_floor"
+harness = false
+required-features = ["sqlite", "cirislens_sequence"]
+
 # v1.10.0 — keep `target/` from ballooning. The full debuginfo
 # (`debug = 2`, the default) is the dominant cost in dev/test builds,
 # and this crate's dep graph is large (pyo3 + the CIRISVerify stack +

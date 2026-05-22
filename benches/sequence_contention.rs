@@ -21,6 +21,12 @@
 //! the mutex is saturated. A regression shows as the whole curve
 //! shifting up.
 //!
+//! Note this measures *fan-in* — each task is a `tokio::spawn`, so
+//! even the `N=1` point includes a task-spawn hop and is **not** the
+//! single-call latency. For the un-spawned, decomposed per-call cost
+//! (`block_on` + `spawn_blocking` + UPSERT ≈ 10 µs) see
+//! `benches/storage_floor.rs`.
+//!
 //! The contended-vs-distinct distinction is real only on **Postgres**
 //! (true row-level locks inside `ON CONFLICT DO UPDATE`, not a process
 //! mutex) — `sequence_contention_postgres` is the meaningful
