@@ -481,6 +481,122 @@ jobs:
           name: ciris-persist-android
           path: dist/ciris-persist-v*-android.tar.gz
 
+      # v2.0.5 — Chaquopy-shaped Android wheels (issue #96).
+      # Separate build pass with pyo3 + extension-module features.
+      # PYO3_CROSS=1 tells PyO3 to cross-compile; extension-module
+      # means no libpython linkage (Chaquopy's CPython provides
+      # symbols at import time). cp310 tag because Chaquopy ships
+      # Python 3.10.
+      - name: cargo ndk build (aarch64 — PyO3 Chaquopy)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          PYO3_CROSS: "1"
+          PYO3_CROSS_PYTHON_VERSION: "3.10"
+        run: >-
+          cargo ndk -t arm64-v8a build --release
+          --features "pyo3 extension-module $MOBILE_FEATURES"
+      - name: cargo ndk build (x86_64 — PyO3 Chaquopy)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          OPENSSL_NO_VENDOR: "1"
+          X86_64_LINUX_ANDROID_OPENSSL_DIR: ${{ runner.temp }}/openssl-x86_64-android
+          X86_64_LINUX_ANDROID_OPENSSL_STATIC: "1"
+          PYO3_CROSS: "1"
+          PYO3_CROSS_PYTHON_VERSION: "3.10"
+        run: >-
+          cargo ndk -t x86_64 build --release
+          --features "pyo3 extension-module $MOBILE_FEATURES"
+      - name: package Chaquopy wheels
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          STRIP="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+
+          build_wheel() {
+            local TARGET="$1"    # e.g. aarch64-linux-android
+            local ABI="$2"       # e.g. arm64_v8a (underscore for wheel tag)
+            local SO_TAG="$3"    # e.g. aarch64
+
+            local WHEEL_TAG="cp310-cp310-android_24_${ABI}"
+            local WHEEL_NAME="ciris_persist-${VERSION}-${WHEEL_TAG}.whl"
+            local WORK="dist/wheel-work/${ABI}"
+
+            mkdir -p "${WORK}/ciris_persist" "${WORK}/ciris_persist-${VERSION}.dist-info"
+
+            # Native extension — rename lib prefix, strip
+            cp "target/${TARGET}/release/libciris_persist.so" \
+               "${WORK}/ciris_persist/ciris_persist.so"
+            if [ -x "$STRIP" ]; then
+              "$STRIP" "${WORK}/ciris_persist/ciris_persist.so"
+            fi
+
+            # Python source + stubs
+            cp python/ciris_persist/__init__.py "${WORK}/ciris_persist/"
+            cp python/ciris_persist/ciris_persist.pyi "${WORK}/ciris_persist/"
+
+            # METADATA
+            cat > "${WORK}/ciris_persist-${VERSION}.dist-info/METADATA" <<METAEOF
+          Metadata-Version: 2.1
+          Name: ciris-persist
+          Version: ${VERSION}
+          Summary: Unified Rust persistence for the CIRIS federation
+          License: AGPL-3.0-or-later
+          Requires-Python: >=3.10
+          METAEOF
+
+            # WHEEL
+            cat > "${WORK}/ciris_persist-${VERSION}.dist-info/WHEEL" <<WHEELEOF
+          Wheel-Version: 1.0
+          Generator: ciris-persist-ci
+          Root-Is-Purelib: false
+          Tag: ${WHEEL_TAG}
+          WHEELEOF
+
+            # top_level.txt
+            echo "ciris_persist" > "${WORK}/ciris_persist-${VERSION}.dist-info/top_level.txt"
+
+            # RECORD (hash every file, RECORD itself has no hash)
+            cd "${WORK}"
+            local RECORD="ciris_persist-${VERSION}.dist-info/RECORD"
+            : > "${RECORD}"
+            find ciris_persist ciris_persist-${VERSION}.dist-info \
+              -type f ! -name RECORD | sort | while read -r f; do
+              local HASH
+              HASH=$(python3 -c "
+          import hashlib, base64
+          with open('${f}', 'rb') as fh:
+              d = hashlib.sha256(fh.read()).digest()
+          print('sha256=' + base64.urlsafe_b64encode(d).rstrip(b'=').decode())
+          ")
+              local SIZE
+              SIZE=$(stat -c%s "${f}")
+              echo "${f},${HASH},${SIZE}" >> "${RECORD}"
+            done
+            echo "${RECORD},," >> "${RECORD}"
+            cd - > /dev/null
+
+            # Zip into .whl
+            (cd "${WORK}" && zip -r "../../${WHEEL_NAME}" ciris_persist ciris_persist-${VERSION}.dist-info)
+            echo "✓ ${WHEEL_NAME} ($(stat -c%s "dist/${WHEEL_NAME}") bytes)"
+          }
+
+          build_wheel aarch64-linux-android arm64_v8a aarch64
+          build_wheel x86_64-linux-android x86_64 x86_64
+
+          # Bundle into a tarball for the release asset
+          tar -czf "dist/ciris-persist-v${VERSION}-android-wheels.tar.gz" \
+            -C dist \
+            "ciris_persist-${VERSION}-cp310-cp310-android_24_arm64_v8a.whl" \
+            "ciris_persist-${VERSION}-cp310-cp310-android_24_x86_64.whl"
+
+          echo "✓ packaged ciris-persist-v${VERSION}-android-wheels.tar.gz"
+          ls -la dist/ciris-persist-v${VERSION}-android-wheels.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ciris-persist-android-wheels
+          path: dist/ciris-persist-v*-android-wheels.tar.gz
+
   # Mission category §4 "Mission rejection" + audit/lint.
   lint:
     name: clippy + fmt + audit
@@ -1212,13 +1328,33 @@ jobs:
             echo "::warning::Android download attempt $attempt failed; retrying in $((attempt * 10))s"
             sleep $((attempt * 10))
           done
+      - name: download Android wheels artifact (with retry)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if gh run download "$GITHUB_RUN_ID" \
+                --repo "$GITHUB_REPOSITORY" \
+                --name ciris-persist-android-wheels \
+                --dir dist; then
+              echo "✓ Android wheels download succeeded on attempt $attempt"
+              break
+            fi
+            if [ "$attempt" = "5" ]; then
+              echo "::error::Android wheels download failed 5 times"
+              exit 1
+            fi
+            echo "::warning::Android wheels download attempt $attempt failed; retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
       - name: verify artifacts
         run: |
           echo "=== dist/ ==="
           ls -la dist/
           VERSION="${{ steps.version.outputs.version }}"
           for ASSET in "ciris-persist-v${VERSION}-ios.tar.gz" \
-                       "ciris-persist-v${VERSION}-android.tar.gz"; do
+                       "ciris-persist-v${VERSION}-android.tar.gz" \
+                       "ciris-persist-v${VERSION}-android-wheels.tar.gz"; do
             if [ ! -f "dist/${ASSET}" ]; then
               echo "::error::Missing expected asset: ${ASSET}"
               exit 1
@@ -1255,6 +1391,7 @@ jobs:
             --clobber \
             "dist/ciris-persist-v${VERSION}-ios.tar.gz" \
             "dist/ciris-persist-v${VERSION}-android.tar.gz" \
+            "dist/ciris-persist-v${VERSION}-android-wheels.tar.gz" \
             "dist/SHA256SUMS"
 
           echo "✓ uploaded iOS + Android assets to ${TAG}"
@@ -1263,5 +1400,6 @@ jobs:
             echo ""
             echo "- \`ciris-persist-v${VERSION}-ios.tar.gz\`"
             echo "- \`ciris-persist-v${VERSION}-android.tar.gz\`"
+            echo "- \`ciris-persist-v${VERSION}-android-wheels.tar.gz\` (Chaquopy cp310 wheels)"
             echo "- \`SHA256SUMS\`"
           } >> "$GITHUB_STEP_SUMMARY"
