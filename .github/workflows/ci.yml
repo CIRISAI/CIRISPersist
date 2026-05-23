@@ -350,9 +350,15 @@ jobs:
           cd "openssl-${OPENSSL_VERSION}"
 
           TOOLCHAIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64"
-          export CC="${TOOLCHAIN}/bin/x86_64-linux-android24-clang"
-          export AR="${TOOLCHAIN}/bin/llvm-ar"
-          export RANLIB="${TOOLCHAIN}/bin/llvm-ranlib"
+          # NDK uses clang, not gcc. Add toolchain bin to PATH so
+          # OpenSSL's Configure can discover the compiler wrappers,
+          # and set CC/AR/RANLIB explicitly for the android-x86_64
+          # target.
+          export PATH="${TOOLCHAIN}/bin:${PATH}"
+          export CC="x86_64-linux-android24-clang"
+          export AR="llvm-ar"
+          export RANLIB="llvm-ranlib"
+          export ANDROID_NDK_ROOT="${ANDROID_NDK_HOME}"
 
           INSTALL_DIR="${RUNNER_TEMP}/openssl-x86_64-android"
           ./Configure android-x86_64 \
