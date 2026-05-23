@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779503919086,
+  "lastUpdate": 1779507263949,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -28265,6 +28265,276 @@ window.BENCHMARK_DATA = {
             "name": "storage_floor/next_sequence_full",
             "value": 38062,
             "range": "± 1601",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "6e749d482fa9f2e82298223eb0833a8d306d06cc",
+          "message": "2.0.3 — iOS + Android mobile build artifacts in CI\n\nAdd cross-compilation CI jobs so both mobile platforms produce\nrelease-mode native libraries uploaded to GitHub Releases on tag\npush. The agent team (CIRISAgent 2.9.0+) can now pull pre-built\nartifacts instead of building from source.\n\n- ios-build: upgraded from debug compile-check to --release with\n  full mobile feature set (sqlite + all substrates + pipeline);\n  packages device + simulator libs as ciris-persist-v*-ios.tar.gz\n- android-build: new job — NDK r26b via cargo-ndk, builds arm64-v8a\n  + x86_64, strips with llvm-strip, packages as\n  ciris-persist-v*-android.tar.gz\n- mobile-release: new tag-gated job — creates GitHub Release and\n  uploads both tar.gz archives + SHA256SUMS\n- .cargo/config.toml: Android NDK linker config with 16KB page size\n  for Android 15+ compat (PLATFORM_ARCHITECTURE.md §3.2)\n- publish-pypi now gates on android-build (both mobile platforms\n  must build green before wheels reach PyPI)\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-05-22T22:18:24-05:00",
+          "tree_id": "f4d25185b44554f16dee9d74b167c2cf4fb58ff4",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/6e749d482fa9f2e82298223eb0833a8d306d06cc"
+        },
+        "date": 1779507262612,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 111978,
+            "range": "± 701",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 260750,
+            "range": "± 767",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 565511,
+            "range": "± 49889",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1996802,
+            "range": "± 57455",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 320,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1379,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 6695,
+            "range": "± 128",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23119,
+            "range": "± 154",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26379,
+            "range": "± 70",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91020,
+            "range": "± 217",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 360,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 2994,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9439,
+            "range": "± 41",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41541,
+            "range": "± 130",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 632,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2257069,
+            "range": "± 129611",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6860194,
+            "range": "± 194455",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25352480,
+            "range": "± 350885",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 257383,
+            "range": "± 19834",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 318216,
+            "range": "± 32962",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 625667,
+            "range": "± 32685",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 1542931,
+            "range": "± 51398",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 22925456,
+            "range": "± 822097",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 11539128,
+            "range": "± 167840",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 605308,
+            "range": "± 13106",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 1738495,
+            "range": "± 42744",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 111387232,
+            "range": "± 894217",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 3942446,
+            "range": "± 120818",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 16964269,
+            "range": "± 253496",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 278482140,
+            "range": "± 2952660",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 9983102,
+            "range": "± 424805",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 45340535,
+            "range": "± 912442",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 191423,
+            "range": "± 54977",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 173076,
+            "range": "± 12177",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 48344,
+            "range": "± 1166",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 157743,
+            "range": "± 1805",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 1191895,
+            "range": "± 43815",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 48,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 23394,
+            "range": "± 636",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 3851,
+            "range": "± 49",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 38019,
+            "range": "± 2026",
             "unit": "ns/iter"
           }
         ]
