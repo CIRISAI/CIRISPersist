@@ -891,11 +891,44 @@ impl PyEngine {
         let signer = py.detach(|| -> PyResult<Box<dyn HardwareSigner>> {
             let _bootstrap_lock = acquire_bootstrap_lock()
                 .map_err(|e| PyRuntimeError::new_err(format!("bootstrap lock: {e}")))?;
-            let s = get_platform_signer(&signer_key_id_owned)
-                .map_err(|e| PyRuntimeError::new_err(format!("ciris-keyring: {e}")))?;
-            // _bootstrap_lock drops at end of scope; FD closes;
-            // flock releases. Other waiting workers proceed.
-            Ok(s)
+            // v2.0.5 — retry with backoff for iOS Secure Enclave
+            // cold-start. The enclave may not be ready on the first
+            // attempt after app launch; a brief retry window avoids
+            // the orphaned-hardware-marker failure path where the DB
+            // has key_kind='hardware' but the signer can't load.
+            const SIGNER_RETRIES: &[std::time::Duration] = &[
+                std::time::Duration::from_millis(200),
+                std::time::Duration::from_millis(500),
+                std::time::Duration::from_millis(1000),
+            ];
+            let mut last_err = None;
+            for attempt in 0..=SIGNER_RETRIES.len() {
+                match get_platform_signer(&signer_key_id_owned) {
+                    Ok(s) => {
+                        if attempt > 0 {
+                            tracing::info!(
+                                attempt = attempt + 1,
+                                "ciris-persist: signer recovered after retry"
+                            );
+                        }
+                        return Ok(s);
+                    }
+                    Err(e) => {
+                        if attempt < SIGNER_RETRIES.len() {
+                            tracing::warn!(
+                                attempt = attempt + 1,
+                                error = %e,
+                                "ciris-persist: signer init transient failure, retrying"
+                            );
+                            std::thread::sleep(SIGNER_RETRIES[attempt]);
+                        }
+                        last_err = Some(e);
+                    }
+                }
+            }
+            Err(PyRuntimeError::new_err(format!(
+                "ciris-keyring: {}", last_err.unwrap()
+            )))
         })?;
         tracing::info!(
             signing_key_id = signer_key_id_owned.as_str(),
@@ -1044,6 +1077,48 @@ impl PyEngine {
             if let Some(signer) = local_signer.as_ref() {
                 pg.set_merkle_signer(Some(signer.clone()));
             }
+        }
+
+        // v2.0.5 — boot-time audit chain self-verification. Runs
+        // independently of any external registry: even if the build
+        // registry 404s (version not yet published), persist validates
+        // its own audit chain integrity on startup.
+        #[cfg(feature = "cirisaudit")]
+        {
+            let boot_backend = backend.clone();
+            runtime.spawn(async move {
+                match boot_audit_self_verify(&boot_backend).await {
+                    Ok(summary) => {
+                        if summary.all_ok {
+                            tracing::info!(
+                                tenants = summary.tenants_checked,
+                                entries_walked = summary.total_entries_walked,
+                                "ciris-persist: boot audit self-check passed"
+                            );
+                        } else {
+                            tracing::warn!(
+                                tenants = summary.tenants_checked,
+                                breaks = summary.breaks.len(),
+                                "ciris-persist: boot audit self-check found chain breaks"
+                            );
+                            for b in &summary.breaks {
+                                tracing::warn!(
+                                    tenant_id = b.tenant_id.as_str(),
+                                    at_sequence = b.at_sequence,
+                                    reason = b.reason.as_str(),
+                                    "ciris-persist: audit chain break"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "ciris-persist: boot audit self-check failed"
+                        );
+                    }
+                }
+            });
         }
 
         // v1.6.8 — install the canonical cell into the process
@@ -8592,6 +8667,47 @@ impl PyEngine {
         })
     }
 
+    /// v2.0.5 — verify ALL tenants' audit chains in one call.
+    /// Independent of any external registry — persist validates its
+    /// own chain integrity. Returns JSON summary:
+    /// `{"tenants_checked": N, "total_entries_walked": N,
+    ///   "all_ok": bool, "breaks": [...]}`
+    #[cfg(feature = "cirisaudit")]
+    fn audit_verify_all_chains(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let backend = self.backend.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    let summary = boot_audit_self_verify(&backend)
+                        .await
+                        .map_err(|e| PyRuntimeError::new_err(format!("audit self-verify: {e}")))?;
+                    let breaks_json: Vec<serde_json::Value> = summary
+                        .breaks
+                        .iter()
+                        .map(|b| {
+                            serde_json::json!({
+                                "tenant_id": b.tenant_id,
+                                "at_sequence": b.at_sequence,
+                                "reason": b.reason,
+                            })
+                        })
+                        .collect();
+                    let result = serde_json::json!({
+                        "tenants_checked": summary.tenants_checked,
+                        "total_entries_walked": summary.total_entries_walked,
+                        "all_ok": summary.all_ok,
+                        "breaks": breaks_json,
+                    });
+                    serde_json::to_string(&result).map_err(|e| {
+                        PyRuntimeError::new_err(format!("audit summary encode: {e}"))
+                    })
+                })
+            })
+        })
+    }
+
     // ── v1.5.0 Phase H: trust-grant + Merkle transparency PyO3 surface ──
     //
     // 8 methods wrapping `federation::emit` (grant_trust /
@@ -14468,6 +14584,112 @@ fn storage_kind_token(descriptor: &StorageDescriptor) -> &'static str {
         },
         StorageDescriptor::InMemory => "in_memory",
     }
+}
+
+/// v2.0.5 — boot-time audit self-verification summary.
+#[cfg(feature = "cirisaudit")]
+struct BootAuditSummary {
+    tenants_checked: usize,
+    total_entries_walked: usize,
+    all_ok: bool,
+    breaks: Vec<BootAuditBreak>,
+}
+
+#[cfg(feature = "cirisaudit")]
+struct BootAuditBreak {
+    tenant_id: String,
+    at_sequence: i64,
+    reason: String,
+}
+
+/// v2.0.5 — walk every tenant's audit chain. Independent of any
+/// external registry: persist validates its own chain integrity.
+#[cfg(feature = "cirisaudit")]
+async fn boot_audit_self_verify(backend: &BackendDispatch) -> Result<BootAuditSummary, String> {
+    use crate::audit::AuditService;
+    let tenant_ids: Vec<String> = match backend {
+        BackendDispatch::Postgres(pg) => {
+            pg.pool()
+                .get()
+                .await
+                .map_err(|e| format!("pool: {e}"))?
+                .query(
+                    "SELECT DISTINCT tenant_id FROM cirislens_audit_log",
+                    &[],
+                )
+                .await
+                .map_err(|e| format!("list tenants: {e}"))?
+                .iter()
+                .map(|r| r.get::<_, String>(0))
+                .collect()
+        }
+        #[cfg(feature = "sqlite")]
+        BackendDispatch::Sqlite(sq) => {
+            let conn = sq.conn_handle();
+            tokio::task::spawn_blocking(move || {
+                let guard = conn.blocking_lock();
+                let mut stmt = guard
+                    .prepare("SELECT DISTINCT tenant_id FROM cirislens_audit_log")
+                    .map_err(|e| format!("list tenants: {e}"))?;
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .map_err(|e| format!("list tenants query: {e}"))?;
+                let mut ids = Vec::new();
+                for r in rows {
+                    ids.push(r.map_err(|e| format!("tenant row: {e}"))?);
+                }
+                Ok::<_, String>(ids)
+            })
+            .await
+            .map_err(|e| format!("spawn_blocking: {e}"))??
+        }
+    };
+
+    let mut summary = BootAuditSummary {
+        tenants_checked: tenant_ids.len(),
+        total_entries_walked: 0,
+        all_ok: true,
+        breaks: Vec::new(),
+    };
+
+    for tid in &tenant_ids {
+        let verif = match backend {
+            BackendDispatch::Postgres(pg) => pg.verify_chain(tid, 1, None).await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(sq) => {
+                let audit = crate::audit::sqlite::SqliteAuditBackend::new(sq.conn_handle());
+                audit.verify_chain(tid, 1, None).await
+            }
+        };
+        match verif {
+            Ok(v) => {
+                summary.total_entries_walked += v.entries_walked;
+                if let crate::audit::types::ChainVerifyOutcome::Break {
+                    at_sequence,
+                    reason,
+                    detail,
+                } = v.outcome
+                {
+                    summary.all_ok = false;
+                    summary.breaks.push(BootAuditBreak {
+                        tenant_id: tid.clone(),
+                        at_sequence,
+                        reason: format!("{reason:?}: {detail}"),
+                    });
+                }
+            }
+            Err(e) => {
+                summary.all_ok = false;
+                summary.breaks.push(BootAuditBreak {
+                    tenant_id: tid.clone(),
+                    at_sequence: 0,
+                    reason: format!("verify_chain error: {e}"),
+                });
+            }
+        }
+    }
+
+    Ok(summary)
 }
 
 #[cfg(test)]
