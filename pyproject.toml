@@ -26,17 +26,20 @@ classifiers = [
 # whole verify+persist stack — no separate `pip install ciris-verify`
 # step needed for the build-manifest signing CLIs.
 #
-# v0.9.1 — bumped to v2.0.5 floor to match the Rust-side git pin
-# (Cargo.toml). v2.0.4 brought the iOS-reinstall hardware-marker
-# self-heal (CIRISVerify#?, relevant to CIRISAgent 2.9.0 on iOS);
-# v2.0.5 brought the Mach-O `__TEXT` hash single-source-of-truth
-# (CIRISVerify#19) fixing sign/runtime parity on macOS + iOS.
-# Both fixes are inherited transitively by every persist consumer.
-#
-# Pin to <3 to follow semver-major. Bump to >=3 when v0.10.x
-# persist coordinates with v3.x verify.
+# v2.0.2 (post-2.0.1 hotfix) — bumped to v3.0.1 floor for the
+# CIRIS 3.0 federation-line consolidation. The Rust-side Cargo.toml
+# pin moved to ciris-verify-core/keyring/crypto v3.0.1 in the 2.0
+# cut (0626ce96), but THIS line — the Python wheel's
+# Requires-Dist for the transitive `ciris-verify` PyPI package —
+# stayed at `<3`. 2.0.1 published with that mismatch:
+# `Requires-Dist: ciris-verify<3,>=2.1.5` while every persist
+# consumer needs `ciris-verify>=3.0.1`, so pip resolved the pair
+# as an irreconcilable conflict and refused to install. 2.0.2
+# fixes that metadata. The Python `ciris-verify` package on PATH
+# is now the v3.x major (build-sign / build-verify CLIs); pin to
+# `<4` to follow semver-major.
 dependencies = [
-    "ciris-verify>=2.1.5,<3",
+    "ciris-verify>=3.0.1,<4",
 ]
 dynamic = ["version"]
 

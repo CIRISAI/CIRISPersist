@@ -5,6 +5,19 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [2.0.2] — 2026-05-22
+
+**Hotfix:** `pyproject.toml` `Requires-Dist` for the transitive
+`ciris-verify` PyPI package was still pinned `>=2.1.5,<3` in 2.0.1
+— even though the Rust-side `Cargo.toml` had moved to verify v3.0.1
+in the 2.0-prep cut. Consumers running
+`pip install ciris-persist>=2.0.1 ciris-verify>=3.0.1` hit an
+irreconcilable resolver conflict; the install failed before any
+code ran. 2.0.2 fixes the Python metadata to
+`ciris-verify>=3.0.1,<4` so the Python wheel agrees with the Rust
+crate about which verify major it's on. **Yank 2.0.1 from PyPI**
+so new installs don't pick it up by default.
+
 ## [2.0.1] — 2026-05-22
 
 **`#95` — Rust-level accessors for the cohabitation surface.**
