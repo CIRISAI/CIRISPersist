@@ -9,6 +9,10 @@ on:
     tags: ['v*']
   pull_request:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
