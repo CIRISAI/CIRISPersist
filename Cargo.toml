@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "2.0.3"
+version = "2.0.4"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -644,6 +644,11 @@ ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v3.0.1"
 
 [target.'cfg(target_os = "ios")'.dependencies]
 ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v3.0.1", version = "3", features = ["pqc-ml-dsa", "ios"] }
+# v2.0.4 — vendored openssl for iOS PyO3 cross-compilation. The `pyo3`
+# feature implies `postgres` which depends on `openssl`. On iOS there is
+# no system libssl; vendored build-from-source handles it (ARM64 has no
+# SM4-NI issue unlike Android x86_64). Same pattern as the Android entry.
+openssl = { version = "0.10", features = ["vendored"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v3.0.1", version = "3", features = ["pqc-ml-dsa", "android"] }
