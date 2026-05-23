@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779500085675,
+  "lastUpdate": 1779501989940,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -27725,6 +27725,276 @@ window.BENCHMARK_DATA = {
             "name": "storage_floor/next_sequence_full",
             "value": 35871,
             "range": "± 1368",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "63c0e862ca81fe9d6c42c3c09710da159557f510",
+          "message": "fix(2.0.1): reduce rotate_master_key_concurrent_bootstrap N 12 -> 4\n\nThe 12-way concurrent bootstrap test passed locally at j=2/j=4 but\nhit nextest's 6-min terminate on the GH-hosted runner: deadpool-\npostgres's default max_size = num_cpus = 2 on the 2-vCPU runner, and\n12 tasks contending for 2 connections plus the V043 unique-violation\nloser path itself needing a fresh connection to re-read created a\nnear-deadlock under tight pool. The V043 invariant doesn't scale with\nN — 4 still exercises the winner/loser split (one task wins the\nactivate, the others catch unique violation and re-read) without\nstrangling a 2-core runner. SQLite sibling reduced to N=4 for parity.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-22T20:50:12-05:00",
+          "tree_id": "ab47e6f517bd530d4328908a0cc32506eeb11e7d",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/63c0e862ca81fe9d6c42c3c09710da159557f510"
+        },
+        "date": 1779501989029,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 106677,
+            "range": "± 931",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 244389,
+            "range": "± 681",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 528917,
+            "range": "± 2765",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1856857,
+            "range": "± 11927",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 346,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1471,
+            "range": "± 16",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7392,
+            "range": "± 98",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21186,
+            "range": "± 92",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24235,
+            "range": "± 73",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83566,
+            "range": "± 1184",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 365,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 2993,
+            "range": "± 30",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9314,
+            "range": "± 70",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41747,
+            "range": "± 162",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 626,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2261724,
+            "range": "± 73516",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6548297,
+            "range": "± 142662",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23362266,
+            "range": "± 217910",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 272825,
+            "range": "± 20649",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 352679,
+            "range": "± 34177",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 689799,
+            "range": "± 38131",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 1911015,
+            "range": "± 120706",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 24539079,
+            "range": "± 178070",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 11073065,
+            "range": "± 154435",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 536857,
+            "range": "± 42858",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 1713831,
+            "range": "± 73563",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 106459898,
+            "range": "± 1523258",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 3636735,
+            "range": "± 165858",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 17447084,
+            "range": "± 307814",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 265785812,
+            "range": "± 1792938",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 10832977,
+            "range": "± 1167434",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 47565070,
+            "range": "± 921971",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 192848,
+            "range": "± 18311",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 179666,
+            "range": "± 14946",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 58237,
+            "range": "± 4151",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 177940,
+            "range": "± 4811",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 1245328,
+            "range": "± 31614",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 44,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 28077,
+            "range": "± 2605",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 4009,
+            "range": "± 49",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 52319,
+            "range": "± 5270",
             "unit": "ns/iter"
           }
         ]
