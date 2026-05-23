@@ -330,9 +330,50 @@ jobs:
         run: >-
           cargo ndk -t arm64-v8a build --release
           --features "$MOBILE_FEATURES"
+      # OpenSSL 3.6.x's sm4-x86_64.S uses vsm4rnds4 (SM4-NI ISA
+      # extension) that NDK r26b's clang assembler doesn't support.
+      # The vendored openssl-src crate doesn't expose a way to pass
+      # `no-sm4` to OpenSSL's Configure, so we pre-build OpenSSL for
+      # x86_64-android with `no-sm4` and point openssl-sys at it via
+      # OPENSSL_DIR + OPENSSL_NO_VENDOR. aarch64 is unaffected (ARM
+      # assembly doesn't use SM4-NI) and keeps the vendored path.
+      # Same pattern as Oscar Franco's Android OpenSSL guide and the
+      # Tauri/Dioxus workaround (cargo-mobile2#144, dioxus#3514).
+      - name: pre-build OpenSSL for x86_64-android (SM4-NI workaround)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          OPENSSL_VERSION="3.4.1"
+          curl -sL "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" \
+            -o openssl-src.tar.gz
+          tar xzf openssl-src.tar.gz
+          cd "openssl-${OPENSSL_VERSION}"
+
+          TOOLCHAIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64"
+          export CC="${TOOLCHAIN}/bin/x86_64-linux-android24-clang"
+          export AR="${TOOLCHAIN}/bin/llvm-ar"
+          export RANLIB="${TOOLCHAIN}/bin/llvm-ranlib"
+
+          INSTALL_DIR="${RUNNER_TEMP}/openssl-x86_64-android"
+          ./Configure android-x86_64 \
+            no-sm4 no-shared no-stdio no-tests \
+            -D__ANDROID_API__=24 \
+            --prefix="${INSTALL_DIR}" \
+            --openssldir="${INSTALL_DIR}/ssl"
+
+          make -j"$(nproc)" build_libs
+          make install_dev
+
+          echo "✓ OpenSSL ${OPENSSL_VERSION} built for x86_64-android (no-sm4)"
+          ls -la "${INSTALL_DIR}/lib/"
       - name: cargo ndk build (x86_64)
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          # Skip vendored openssl-src for x86_64; use the pre-built
+          # one from the step above.
+          OPENSSL_NO_VENDOR: "1"
+          X86_64_LINUX_ANDROID_OPENSSL_DIR: ${{ runner.temp }}/openssl-x86_64-android
+          X86_64_LINUX_ANDROID_OPENSSL_STATIC: "1"
         run: >-
           cargo ndk -t x86_64 build --release
           --features "$MOBILE_FEATURES"
