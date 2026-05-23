@@ -483,44 +483,34 @@ jobs:
 
       # v2.0.5 — Chaquopy-shaped Android wheels (issue #96).
       # Separate build pass with pyo3 + extension-module features.
-      # PYO3_CROSS=1 tells PyO3 to cross-compile; extension-module
-      # means no libpython linkage (Chaquopy's CPython provides
-      # symbols at import time). cp310 tag because Chaquopy ships
-      # Python 3.10.
-      #
-      # PyO3 cross-compilation needs PYO3_CROSS_LIB_DIR with a
-      # _sysconfigdata module so it doesn't fall back to host Python
-      # config (which would try to link -lpython3.10). The
-      # sysconfigdata tells PyO3 the target ABI shape; the actual
-      # libpython is NOT linked (extension-module skips it).
-      - name: create Android cross-compilation sysconfigdata for PyO3
+      # PYO3_CONFIG_FILE bypasses host Python detection entirely and
+      # tells PyO3 exactly what it needs: CPython 3.10, abi3 mode,
+      # suppress link lines (extension-module — Chaquopy's CPython
+      # provides symbols at import time). cp310 tag because Chaquopy
+      # ships Python 3.10.
+      - name: create PyO3 cross-compilation config for Android
         run: |
-          CROSS_DIR="${RUNNER_TEMP}/pyo3-android-cross"
-          mkdir -p "${CROSS_DIR}"
-          cat > "${CROSS_DIR}/_sysconfigdata__linux_aarch64-linux-android.py" <<'PYEOF'
-          build_time_vars = {
-              'SOABI': 'cpython-310-aarch64-linux-android',
-              'EXT_SUFFIX': '.cpython-310-aarch64-linux-android.so',
-              'MULTIARCH': 'aarch64-linux-android',
-              'Py_ENABLE_SHARED': 0,
-              'LIBDIR': '',
-              'LDLIBRARY': '',
-              'ABIFLAGS': '',
-              'VERSION': '3.10',
-          }
-          PYEOF
-          cp "${CROSS_DIR}/_sysconfigdata__linux_aarch64-linux-android.py" \
-             "${CROSS_DIR}/_sysconfigdata__linux_x86_64-linux-android.py"
-          sed -i 's/aarch64/x86_64/g' \
-             "${CROSS_DIR}/_sysconfigdata__linux_x86_64-linux-android.py"
-          echo "PYO3_CROSS_LIB_DIR=${CROSS_DIR}" >> "$GITHUB_ENV"
-          echo "✓ sysconfigdata created at ${CROSS_DIR}"
-          ls -la "${CROSS_DIR}/"
+          CFG="${RUNNER_TEMP}/pyo3-android.config"
+          cat > "${CFG}" <<'CFGEOF'
+          implementation=CPython
+          version=3.10
+          shared=false
+          abi3=true
+          lib_name=python3.10
+          lib_dir=
+          executable=
+          pointer_width=64
+          build_flags=
+          suppress_build_script_link_lines=true
+          CFGEOF
+          # Strip leading whitespace from heredoc (YAML indentation)
+          sed -i 's/^[[:space:]]*//' "${CFG}"
+          echo "PYO3_CONFIG_FILE=${CFG}" >> "$GITHUB_ENV"
+          echo "✓ PyO3 config:"
+          cat "${CFG}"
       - name: cargo ndk build (aarch64 — PyO3 Chaquopy)
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-          PYO3_CROSS: "1"
-          PYO3_CROSS_PYTHON_VERSION: "3.10"
         run: >-
           cargo ndk -t arm64-v8a build --release
           --features "pyo3 extension-module $MOBILE_FEATURES"
@@ -530,8 +520,6 @@ jobs:
           OPENSSL_NO_VENDOR: "1"
           X86_64_LINUX_ANDROID_OPENSSL_DIR: ${{ runner.temp }}/openssl-x86_64-android
           X86_64_LINUX_ANDROID_OPENSSL_STATIC: "1"
-          PYO3_CROSS: "1"
-          PYO3_CROSS_PYTHON_VERSION: "3.10"
         run: >-
           cargo ndk -t x86_64 build --release
           --features "pyo3 extension-module $MOBILE_FEATURES"
