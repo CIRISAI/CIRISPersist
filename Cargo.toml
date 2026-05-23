@@ -647,6 +647,15 @@ ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v3.0.1"
 
 [target.'cfg(target_os = "android")'.dependencies]
 ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v3.0.1", version = "3", features = ["pqc-ml-dsa", "android"] }
+# v2.0.3 — vendored openssl for Android cross-compilation. refinery-core
+# unconditionally pulls postgres-native-tls → native-tls → openssl-sys
+# regardless of which backend feature is active. On desktop builds the
+# system libssl satisfies it; on Android there's no system openssl, so
+# we force vendored build-from-source. This dep merges with the
+# optional `openssl` in `[dependencies]` (cargo unions features across
+# target tables); on non-Android targets the vendored feature is only
+# active when the `postgres` feature explicitly enables `dep:openssl`.
+openssl = { version = "0.10", features = ["vendored"] }
 
 [dev-dependencies]
 # Mission category §4: canonicalization parity. Used to validate our
