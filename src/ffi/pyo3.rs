@@ -896,40 +896,38 @@ impl PyEngine {
             // attempt after app launch; a brief retry window avoids
             // the orphaned-hardware-marker failure path where the DB
             // has key_kind='hardware' but the signer can't load.
-            const SIGNER_RETRIES: &[std::time::Duration] = &[
+            const SIGNER_BACKOFFS: &[std::time::Duration] = &[
                 std::time::Duration::from_millis(200),
                 std::time::Duration::from_millis(500),
                 std::time::Duration::from_millis(1000),
             ];
-            let mut last_err = None;
-            for attempt in 0..=SIGNER_RETRIES.len() {
-                match get_platform_signer(&signer_key_id_owned) {
-                    Ok(s) => {
-                        if attempt > 0 {
-                            tracing::info!(
-                                attempt = attempt + 1,
-                                "ciris-persist: signer recovered after retry"
-                            );
+            match get_platform_signer(&signer_key_id_owned) {
+                Ok(s) => Ok(s),
+                Err(first_err) => {
+                    let mut last_err = first_err;
+                    for (i, delay) in SIGNER_BACKOFFS.iter().enumerate() {
+                        tracing::warn!(
+                            attempt = i + 1,
+                            error = %last_err,
+                            "ciris-persist: signer init transient failure, retrying"
+                        );
+                        std::thread::sleep(*delay);
+                        match get_platform_signer(&signer_key_id_owned) {
+                            Ok(s) => {
+                                tracing::info!(
+                                    attempt = i + 2,
+                                    "ciris-persist: signer recovered after retry"
+                                );
+                                return Ok(s);
+                            }
+                            Err(e) => last_err = e,
                         }
-                        return Ok(s);
                     }
-                    Err(e) => {
-                        if attempt < SIGNER_RETRIES.len() {
-                            tracing::warn!(
-                                attempt = attempt + 1,
-                                error = %e,
-                                "ciris-persist: signer init transient failure, retrying"
-                            );
-                            std::thread::sleep(SIGNER_RETRIES[attempt]);
-                        }
-                        last_err = Some(e);
-                    }
+                    Err(PyRuntimeError::new_err(format!(
+                        "ciris-keyring: {last_err}"
+                    )))
                 }
             }
-            Err(PyRuntimeError::new_err(format!(
-                "ciris-keyring: {}",
-                last_err.unwrap()
-            )))
         })?;
         tracing::info!(
             signing_key_id = signer_key_id_owned.as_str(),
