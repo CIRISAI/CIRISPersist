@@ -1,0 +1,20 @@
+# Cross-compilation linker settings for mobile targets.
+# Mirrors CIRISVerify's .cargo/config.toml pattern.
+
+# ── Android ─────────────────────────────────────────────────────
+# NDK API level 24 (Android 7.0) — matches CIRISVerify's baseline.
+# -z,max-page-size=16384 enables Android 15+ 16KB page-size compat
+# (PLATFORM_ARCHITECTURE.md §3.2).
+[target.aarch64-linux-android]
+linker = "aarch64-linux-android24-clang"
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.x86_64-linux-android]
+linker = "x86_64-linux-android24-clang"
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+# ── iOS ─────────────────────────────────────────────────────────
+# Uses default Xcode toolchain; no custom linker needed.
+[target.aarch64-apple-ios]
+
+[target.aarch64-apple-ios-sim]

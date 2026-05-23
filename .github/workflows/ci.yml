@@ -199,11 +199,31 @@ jobs:
       - name: cargo test (no postgres feature)
         run: cargo test --features server
 
-  # Mission category §4 + PLATFORM_ARCHITECTURE.md §3.1: iOS device
-  # build path. Runs on macOS with the iOS targets.
+  # Mission category §4 + PLATFORM_ARCHITECTURE.md §3.1: iOS device +
+  # simulator build path. Runs on macOS with the iOS targets.
+  #
+  # v2.0.3 — upgraded from debug compile-check to release builds with
+  # full mobile feature set. Produces tar.gz artifacts for the agent
+  # team to consume via GitHub Releases (CIRISAgent 2.9.0 iOS blocker).
+  # Feature set mirrors the PyPI wheel minus pyo3/postgres/server —
+  # sqlite backend + all substrates + pipeline.
   ios-build:
-    name: ios-aarch64 (device build)
+    name: ios (device + simulator)
     runs-on: macos-14
+    env:
+      # Mobile feature set: everything the agent needs, minus
+      # pyo3/extension-module/postgres/server/tls (no Python or PG on
+      # mobile). Shared with android-build below.
+      MOBILE_FEATURES: >-
+        sqlite secrets cirisnode cirisgraph cirisaudit telemetry
+        cirisincident classify scrub extract
+        cirislens_tasks cirislens_thoughts cirislens_correlations
+        cirislens_scheduled_tasks cirislens_tickets
+        cirislens_deferral_reports cirislens_maintenance_locks
+        cirislens_creation_ceremonies cirislens_continuity_awareness
+        cirislens_feedback_mappings cirislens_wa_cert
+        cirislens_service_token_revocation cirislens_sequence
+        cirislens_occurrence cirislens_legacy_migration
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -218,10 +238,141 @@ jobs:
         run: |
           which cargo
           cargo --version
-      - name: cargo build (ios device)
-        run: cargo build --target aarch64-apple-ios --no-default-features
-      - name: cargo build (ios simulator)
-        run: cargo build --target aarch64-apple-ios-sim --no-default-features
+      - name: extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: cargo build --release (ios device)
+        run: >-
+          cargo build --release
+          --target aarch64-apple-ios
+          --features "$MOBILE_FEATURES"
+      - name: cargo build --release (ios simulator)
+        run: >-
+          cargo build --release
+          --target aarch64-apple-ios-sim
+          --features "$MOBILE_FEATURES"
+      - name: package ios artifacts
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          mkdir -p dist/ios-device dist/ios-simulator
+
+          # Device (aarch64-apple-ios)
+          cp target/aarch64-apple-ios/release/libciris_persist.dylib \
+             dist/ios-device/ 2>/dev/null || true
+          cp target/aarch64-apple-ios/release/libciris_persist.a \
+             dist/ios-device/ 2>/dev/null || true
+
+          # Simulator (aarch64-apple-ios-sim)
+          cp target/aarch64-apple-ios-sim/release/libciris_persist.dylib \
+             dist/ios-simulator/ 2>/dev/null || true
+          cp target/aarch64-apple-ios-sim/release/libciris_persist.a \
+             dist/ios-simulator/ 2>/dev/null || true
+
+          echo "=== ios-device ==="
+          ls -la dist/ios-device/
+          echo "=== ios-simulator ==="
+          ls -la dist/ios-simulator/
+
+          tar -czf "dist/ciris-persist-v${VERSION}-ios.tar.gz" \
+            -C dist ios-device ios-simulator
+
+          echo "✓ packaged ciris-persist-v${VERSION}-ios.tar.gz"
+          ls -la dist/ciris-persist-v${VERSION}-ios.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ciris-persist-ios
+          path: dist/ciris-persist-v*-ios.tar.gz
+
+  # v2.0.3 — Android cross-compilation. Produces shared libraries for
+  # aarch64 (device, arm64-v8a) and x86_64 (emulator) via cargo-ndk.
+  # Mirrors CIRISVerify's release.yml Android build pattern.
+  # PLATFORM_ARCHITECTURE.md §3.2: NDK version pinning, 16KB page size
+  # for Android 15+, AAR-ready .so artifacts.
+  android-build:
+    name: android (aarch64 + x86_64)
+    runs-on: ubuntu-latest
+    env:
+      MOBILE_FEATURES: >-
+        sqlite secrets cirisnode cirisgraph cirisaudit telemetry
+        cirisincident classify scrub extract
+        cirislens_tasks cirislens_thoughts cirislens_correlations
+        cirislens_scheduled_tasks cirislens_tickets
+        cirislens_deferral_reports cirislens_maintenance_locks
+        cirislens_creation_ceremonies cirislens_continuity_awareness
+        cirislens_feedback_mappings cirislens_wa_cert
+        cirislens_service_token_revocation cirislens_sequence
+        cirislens_occurrence cirislens_legacy_migration
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        continue-on-error: true
+      - name: setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26b
+          add-to-path: true
+      - name: install cargo-ndk
+        run: cargo install cargo-ndk
+      - name: extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: cargo ndk build (aarch64 — arm64-v8a)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: >-
+          cargo ndk -t arm64-v8a build --release
+          --features "$MOBILE_FEATURES"
+      - name: cargo ndk build (x86_64)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: >-
+          cargo ndk -t x86_64 build --release
+          --features "$MOBILE_FEATURES"
+      - name: strip + package android artifacts
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          mkdir -p dist/android/arm64-v8a dist/android/x86_64
+
+          # Copy .so files
+          cp target/aarch64-linux-android/release/libciris_persist.so \
+             dist/android/arm64-v8a/
+          cp target/x86_64-linux-android/release/libciris_persist.so \
+             dist/android/x86_64/
+
+          # Strip with NDK's llvm-strip
+          STRIP="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          if [ -x "$STRIP" ]; then
+            "$STRIP" dist/android/arm64-v8a/libciris_persist.so
+            "$STRIP" dist/android/x86_64/libciris_persist.so
+            echo "✓ stripped with NDK llvm-strip"
+          else
+            echo "::warning::llvm-strip not found at expected path; shipping unstripped"
+          fi
+
+          echo "=== arm64-v8a ==="
+          ls -la dist/android/arm64-v8a/
+          echo "=== x86_64 ==="
+          ls -la dist/android/x86_64/
+
+          tar -czf "dist/ciris-persist-v${VERSION}-android.tar.gz" \
+            -C dist android
+
+          echo "✓ packaged ciris-persist-v${VERSION}-android.tar.gz"
+          ls -la dist/ciris-persist-v${VERSION}-android.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ciris-persist-android
+          path: dist/ciris-persist-v*-android.tar.gz
 
   # Mission category §4 "Mission rejection" + audit/lint.
   lint:
@@ -378,6 +529,7 @@ jobs:
       - linux-x86_64-test
       - darwin-aarch64-test
       - ios-build
+      - android-build
     if: startsWith(github.ref, 'refs/tags/v')
     environment:
       name: pypi
@@ -880,3 +1032,129 @@ jobs:
             dist/steward-key.json
             dist/round-trip-*.json
             dist/signed-binary-targets.txt
+
+  # v2.0.3 — Mobile release assets on GitHub Releases. Tag-gated.
+  # Uploads iOS and Android tar.gz archives so the agent team
+  # (CIRISAgent 2.9.0+) can pull pre-built native libraries without
+  # building from source. Asset naming follows CIRISVerify's pattern:
+  #   ciris-persist-v<version>-ios.tar.gz
+  #   ciris-persist-v<version>-android.tar.gz
+  #
+  # iOS archive layout:
+  #   ios-device/libciris_persist.{dylib,a}
+  #   ios-simulator/libciris_persist.{dylib,a}
+  #
+  # Android archive layout:
+  #   android/arm64-v8a/libciris_persist.so
+  #   android/x86_64/libciris_persist.so
+  mobile-release:
+    name: Upload mobile artifacts to GitHub Release (tag-gated)
+    runs-on: ubuntu-latest
+    needs:
+      - ios-build
+      - android-build
+      - lint
+      - license-audit
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: download iOS artifact (with retry)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist
+          for attempt in 1 2 3 4 5; do
+            if gh run download "$GITHUB_RUN_ID" \
+                --repo "$GITHUB_REPOSITORY" \
+                --name ciris-persist-ios \
+                --dir dist; then
+              echo "✓ iOS artifact download succeeded on attempt $attempt"
+              break
+            fi
+            if [ "$attempt" = "5" ]; then
+              echo "::error::iOS artifact download failed 5 times"
+              exit 1
+            fi
+            echo "::warning::iOS download attempt $attempt failed; retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+      - name: download Android artifact (with retry)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if gh run download "$GITHUB_RUN_ID" \
+                --repo "$GITHUB_REPOSITORY" \
+                --name ciris-persist-android \
+                --dir dist; then
+              echo "✓ Android artifact download succeeded on attempt $attempt"
+              break
+            fi
+            if [ "$attempt" = "5" ]; then
+              echo "::error::Android artifact download failed 5 times"
+              exit 1
+            fi
+            echo "::warning::Android download attempt $attempt failed; retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+      - name: verify artifacts
+        run: |
+          echo "=== dist/ ==="
+          ls -la dist/
+          VERSION="${{ steps.version.outputs.version }}"
+          for ASSET in "ciris-persist-v${VERSION}-ios.tar.gz" \
+                       "ciris-persist-v${VERSION}-android.tar.gz"; do
+            if [ ! -f "dist/${ASSET}" ]; then
+              echo "::error::Missing expected asset: ${ASSET}"
+              exit 1
+            fi
+            echo "✓ ${ASSET} ($(stat -c%s "dist/${ASSET}" 2>/dev/null || stat -f%z "dist/${ASSET}") bytes)"
+          done
+      - name: generate SHA256SUMS
+        run: |
+          cd dist
+          sha256sum ciris-persist-v*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - name: create GitHub Release + upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${{ steps.version.outputs.version }}"
+
+          # Create release if it doesn't exist yet (PyPI publish may
+          # have already created it in a future iteration).
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "ciris-persist ${TAG}" \
+              --generate-notes \
+              --verify-tag
+            echo "✓ created release ${TAG}"
+          else
+            echo "✓ release ${TAG} already exists — uploading assets"
+          fi
+
+          gh release upload "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber \
+            "dist/ciris-persist-v${VERSION}-ios.tar.gz" \
+            "dist/ciris-persist-v${VERSION}-android.tar.gz" \
+            "dist/SHA256SUMS"
+
+          echo "✓ uploaded iOS + Android assets to ${TAG}"
+          {
+            echo "## Mobile release assets"
+            echo ""
+            echo "- \`ciris-persist-v${VERSION}-ios.tar.gz\`"
+            echo "- \`ciris-persist-v${VERSION}-android.tar.gz\`"
+            echo "- \`SHA256SUMS\`"
+          } >> "$GITHUB_STEP_SUMMARY"
