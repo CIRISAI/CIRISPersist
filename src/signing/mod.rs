@@ -66,7 +66,7 @@ use ciris_crypto::{
     ClassicalAlgorithm, HybridSignature, PqcAlgorithm, SignatureMode, TaggedClassicalSignature,
     TaggedPqcSignature, CRYPTO_KIND_CIRIS_V1,
 };
-use ciris_keyring::{MlDsa65SoftwareSigner, PqcSigner};
+use ciris_keyring::{HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
 use ed25519_dalek::{Signer as _, SigningKey};
 
 /// Configuration for [`LocalSigner::from_config`]. Matches the
@@ -356,18 +356,19 @@ impl LocalSigner {
         Ok(Some(B64.encode(&pk)))
     }
 
-    /// Internal accessor for PyO3 wrapper — exposes the underlying
-    /// `Arc<dyn PqcSigner>` so `Engine.local_pqc_sign` and the
-    /// cold-path PQC fill-in can call it without re-implementing
-    /// the seed loading. Wired by the PyO3 Engine refactor in a
-    /// follow-up release; lives `pub(crate)` for now.
-    #[allow(dead_code)]
-    pub(crate) fn pqc_signer_arc(&self) -> Option<Arc<dyn PqcSigner>> {
+    /// v2.0.1 (CIRISPersist#95) — borrow the optional PQC signer `Arc`
+    /// (cloned). `None` when no PQC identity is configured. Promoted
+    /// from `pub(crate) pqc_signer_arc` once the PyO3 Engine refactor
+    /// (#95 — the cohabitation accessor surface) wired its consumer:
+    /// `PyEngine::keyring_signer()` hands this Arc to a co-resident
+    /// Rust extension (CIRISEdge) so the host's PQC identity is reused
+    /// rather than re-bootstrapped (`docs/COHABITATION.md` rule 1).
+    pub fn pqc_signer(&self) -> Option<Arc<dyn PqcSigner>> {
         self.pqc_signer.clone()
     }
 
     /// Internal accessor for PyO3 wrapper. Same forward-wiring note
-    /// as `pqc_signer_arc`.
+    /// as `pqc_signer`.
     #[allow(dead_code)]
     pub(crate) fn signing_key(&self) -> &SigningKey {
         &self.signing_key
@@ -480,6 +481,30 @@ impl ciris_keyring::HardwareSigner for LocalSignerHardwareAdapter {
         // honest descriptor — same as `Ed25519SoftwareSigner`.
         ciris_keyring::StorageDescriptor::InMemory
     }
+}
+
+/// v2.0.1 (CIRISPersist#95) — federation keyring signer parts handed
+/// to a co-resident Rust extension (CIRISEdge#16) from the shared
+/// `PyEngine`. The cohabitation invariant (`docs/COHABITATION.md`
+/// rule 1) is "one keyring identity per host": the consumer reuses
+/// the host's already-loaded signer rather than re-bootstrapping the
+/// keyring. Edge wraps these Arcs in its own `LocalSigner`.
+///
+/// `signer` is always present (the singleton always has a signer);
+/// `pqc_signer` is `Some` only when the host's local identity is
+/// PQC-configured.
+pub struct KeyringSignerHandle {
+    /// Federation Ed25519 (and hybrid-binding) signer — the same Arc
+    /// the host's `PyEngine` dispatches to. Implements
+    /// [`ciris_keyring::HardwareSigner`].
+    pub signer: Arc<dyn HardwareSigner>,
+    /// Optional ML-DSA-65 PQC signer — present when the host loaded a
+    /// PQC local identity. Implements
+    /// [`ciris_keyring::PqcSigner`].
+    pub pqc_signer: Option<Arc<dyn PqcSigner>>,
+    /// Stable identifier for the signer (matches `signer_key_id` on
+    /// the host engine; the `scrub_key_id` that lands on rows).
+    pub key_id: String,
 }
 
 #[cfg(test)]

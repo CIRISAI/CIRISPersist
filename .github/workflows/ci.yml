@@ -76,15 +76,29 @@ jobs:
           # feature set).
           key: ${{ matrix.substrate.name }}
         continue-on-error: true
-      - name: cargo test (postgres + server + pyo3 + ${{ matrix.substrate.name }})
+      # v2.0.1 — nextest, not cargo test: streams per-test PASS/FAIL/
+      # SLOW lines so a hung test surfaces in the live log as "the
+      # last RUN with no follow-up" instead of disappearing into a
+      # buffered cargo-test silence. `.config/nextest.toml` carries
+      # `slow-timeout` + `terminate-after` so a hung test is killed
+      # at a bounded time with its name in the log — pre-2.0.1 the
+      # whole CI sat for >1h before I cancelled by hand.
+      - name: install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: cargo nextest (postgres + server + pyo3 + ${{ matrix.substrate.name }})
+        # v2.0.1 — workflow-level kill switch independent of nextest:
+        # if nextest itself stalls (or the runner does), GA aborts at
+        # 25 min instead of waiting an hour.
+        timeout-minutes: 25
         env:
           CIRIS_PERSIST_TEST_PG_URL: postgres://ciris:ciris@localhost:5432/ciris_persist_test
         run: >-
-          cargo test --all-targets --features
+          cargo nextest run --all-targets --no-fail-fast --features
           "${{ matrix.substrate.features }}"
-      - name: cargo test (default — fixture suite)
+      - name: cargo nextest (default — fixture suite)
         if: matrix.substrate.name == 'core'
-        run: cargo test --test wire_format_fixtures
+        timeout-minutes: 5
+        run: cargo nextest run --test wire_format_fixtures
       # v0.5.4 (CIRISPersist#29) — Python regression test for the FFI
       # catch_panic layer. Builds the wheel with the `test-panic`
       # feature gate enabled (release wheels don't), then pytest

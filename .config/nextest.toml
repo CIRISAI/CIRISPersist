@@ -1,0 +1,29 @@
+# v2.0.1 (CIRISPersist#95 cut) — nextest configuration.
+#
+# Why this file exists: pre-2.0.1, the CI test job ran `cargo test`
+# whose output buffers per-test. When a test hung against the CI PG
+# container (the 2.0 widened substrate test suite did, twice — both
+# 0626ce9 and 7d1831c sat >1h before manual cancel), the log just
+# went silent — no way to tell which test was running. Switching to
+# nextest gives us per-test streaming AND a bounded kill on hangs:
+#
+#   slow-timeout.period = "60s"        — print a "SLOW" line with the
+#                                        test name after 60s, and again
+#                                        every 60s thereafter.
+#   slow-timeout.terminate-after = 6   — after 6 such warnings (= 6
+#                                        minutes), SIGKILL the test
+#                                        and mark it timed out. A
+#                                        legitimate heavy bench-smoke
+#                                        completes in ≤2 min on CI;
+#                                        6 min is honest headroom.
+#
+# Combined with the workflow-step `timeout-minutes: 25` in
+# `.github/workflows/ci.yml`, a real hang now surfaces in <6 min with
+# the test name in the log, and the whole step is bounded at 25 min
+# regardless. No more silent hour-long waits.
+
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 6 }
+# Keep going after a failure so all failing tests surface in one run,
+# not just the first. Mirrors the `--no-fail-fast` we pass on the CLI.
+fail-fast = false

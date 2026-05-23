@@ -585,6 +585,65 @@ impl PyEngine {
         }
     }
 
+    /// v2.0.1 (CIRISPersist#95) — Rust-level accessor for the
+    /// federation directory substrate. Returns the public
+    /// [`BackendDispatch`](crate::engine::BackendDispatch) the
+    /// singleton holds (cloned `Arc`s — same backend pool, no second
+    /// connection); a co-resident Rust extension (CIRISEdge#16)
+    /// matches the variant and calls
+    /// [`FederationDirectory`](crate::federation::FederationDirectory)
+    /// trait methods on the concrete backend.
+    ///
+    /// Plain `pub fn` (not a `#[pymethod]`) — Option-B for sibling
+    /// cdylibs, same pattern as
+    /// [`node_core_service`](Self::node_core_service). The
+    /// [`FederationDirectory`] trait uses RPITIT and is NOT
+    /// object-safe (no `Arc<dyn FederationDirectory>`), so the
+    /// dispatch enum is the established shape.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub fn federation_directory(&self) -> crate::engine::BackendDispatch {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+        }
+    }
+
+    /// v2.0.1 (CIRISPersist#95) — Rust-level accessor for the
+    /// outbound-queue substrate. Returns the public
+    /// [`BackendDispatch`](crate::engine::BackendDispatch) the
+    /// singleton holds; the consumer matches the variant and calls
+    /// [`OutboundQueue`](crate::outbound::OutboundQueue) trait methods
+    /// on the concrete backend. Returns the same backend `Arc` as
+    /// [`federation_directory`](Self::federation_directory) — both
+    /// traits are implemented on the same concrete type — named
+    /// distinctly so the call site documents which trait surface the
+    /// consumer is using.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub fn outbound_queue(&self) -> crate::engine::BackendDispatch {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+        }
+    }
+
+    /// v2.0.1 (CIRISPersist#95) — Rust-level accessor for the
+    /// federation keyring signer. Returns the shared signer parts the
+    /// singleton holds — Edge wraps these in its own `LocalSigner`
+    /// without re-bootstrapping the keyring (the cohabitation
+    /// invariant: one keyring identity per host;
+    /// `docs/COHABITATION.md` rule 1).
+    pub fn keyring_signer(&self) -> crate::signing::KeyringSignerHandle {
+        crate::signing::KeyringSignerHandle {
+            signer: self.signer.clone(),
+            pqc_signer: self.local_signer.as_ref().and_then(|ls| ls.pqc_signer()),
+            key_id: self.signer_key_id.clone(),
+        }
+    }
+
     /// v1.6.8 — guard run at the top of every method that touches
     /// the runtime / pool. `EngineClosed` after `close()`;
     /// `EngineUsedAcrossFork` when the process forked since
@@ -940,7 +999,7 @@ impl PyEngine {
         // `pqc_sweep_on_init=false`.
         if pqc_sweep_on_init {
             if let (Some(pqc_signer), Some(backend_for_sweep)) = (
-                local_signer.as_ref().and_then(|s| s.pqc_signer_arc()),
+                local_signer.as_ref().and_then(|s| s.pqc_signer()),
                 pg_backend_for_sweep.as_ref().cloned(),
             ) {
                 runtime.spawn(async move {
@@ -2124,18 +2183,18 @@ impl PyEngine {
             // configured; row stays hybrid-pending and consumers can fill
             // via the attach_*_pqc_signature escape hatch on their own
             // schedule.
-            let cold_path_inputs = self
-                .local_signer
-                .as_ref()
-                .and_then(|s| s.pqc_signer_arc())
-                .map(|signer| {
-                    (
-                        signer,
-                        record.record.key_id.clone(),
-                        record.record.registration_envelope.clone(),
-                        record.record.scrub_signature_classical.clone(),
-                    )
-                });
+            let cold_path_inputs =
+                self.local_signer
+                    .as_ref()
+                    .and_then(|s| s.pqc_signer())
+                    .map(|signer| {
+                        (
+                            signer,
+                            record.record.key_id.clone(),
+                            record.record.registration_envelope.clone(),
+                            record.record.scrub_signature_classical.clone(),
+                        )
+                    });
 
             py.detach(move || match &self.backend {
                 BackendDispatch::Postgres(pg) => {
@@ -2582,18 +2641,18 @@ impl PyEngine {
                 })?;
 
             // v0.3.1 — cold-path PQC fill-in (CIRISPersist#10).
-            let cold_path_inputs = self
-                .local_signer
-                .as_ref()
-                .and_then(|s| s.pqc_signer_arc())
-                .map(|signer| {
-                    (
-                        signer,
-                        att.attestation.attestation_id.clone(),
-                        att.attestation.attestation_envelope.clone(),
-                        att.attestation.scrub_signature_classical.clone(),
-                    )
-                });
+            let cold_path_inputs =
+                self.local_signer
+                    .as_ref()
+                    .and_then(|s| s.pqc_signer())
+                    .map(|signer| {
+                        (
+                            signer,
+                            att.attestation.attestation_id.clone(),
+                            att.attestation.attestation_envelope.clone(),
+                            att.attestation.scrub_signature_classical.clone(),
+                        )
+                    });
 
             py.detach(|| match &self.backend {
                 BackendDispatch::Postgres(pg) => {
@@ -2784,18 +2843,18 @@ impl PyEngine {
                 })?;
 
             // v0.3.1 — cold-path PQC fill-in (CIRISPersist#10).
-            let cold_path_inputs = self
-                .local_signer
-                .as_ref()
-                .and_then(|s| s.pqc_signer_arc())
-                .map(|signer| {
-                    (
-                        signer,
-                        rev.revocation.revocation_id.clone(),
-                        rev.revocation.revocation_envelope.clone(),
-                        rev.revocation.scrub_signature_classical.clone(),
-                    )
-                });
+            let cold_path_inputs =
+                self.local_signer
+                    .as_ref()
+                    .and_then(|s| s.pqc_signer())
+                    .map(|signer| {
+                        (
+                            signer,
+                            rev.revocation.revocation_id.clone(),
+                            rev.revocation.revocation_envelope.clone(),
+                            rev.revocation.scrub_signature_classical.clone(),
+                        )
+                    });
 
             py.detach(|| match &self.backend {
                 BackendDispatch::Postgres(pg) => {
@@ -3313,7 +3372,7 @@ impl PyEngine {
             let signer = self
                 .local_signer
                 .as_ref()
-                .and_then(|s| s.pqc_signer_arc())
+                .and_then(|s| s.pqc_signer())
                 .ok_or_else(|| {
                     PyValueError::new_err(
                         "no local PQC key configured (pass local_pqc_key_id and \
@@ -14860,6 +14919,112 @@ mod tests {
         );
         assert!(super::current_runtime_handle().is_none());
         clear_singleton_slot();
+    }
+
+    // ── v2.0.1 (CIRISPersist#95) — cohabitation accessor tests ──────
+    //
+    // `federation_directory` / `outbound_queue` / `keyring_signer` on
+    // `PyEngine`. These don't touch the process-singleton slot —
+    // they build a cell and construct `PyEngine` via `from_cell`
+    // directly — so they don't need `#[serial(engine_singleton)]`.
+
+    #[cfg(feature = "sqlite")]
+    fn build_cell_for_cohab_test() -> (Arc<EngineCell>, Arc<SqliteBackend>) {
+        use crate::store::Backend;
+        let runtime = Arc::new(Runtime::new().expect("tokio runtime"));
+        let sq = runtime.block_on(async {
+            let sq = SqliteBackend::open_in_memory()
+                .await
+                .expect("open in-memory sqlite");
+            sq.run_migrations().await.expect("migrations");
+            Arc::new(sq)
+        });
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x95; 32]);
+        let local = Arc::new(crate::signing::LocalSigner::from_parts(
+            signing_key,
+            "test-cohab-steward".to_string(),
+            None,
+            None,
+        ));
+        let signer: Arc<dyn HardwareSigner> = Arc::new(
+            crate::signing::LocalSignerHardwareAdapter::new(local.clone()),
+        );
+        let cell = Arc::new(EngineCell {
+            backend: BackendDispatch::Sqlite(sq.clone()),
+            runtime,
+            scrubber: Arc::new(crate::scrub::NullScrubber),
+            signer,
+            signer_key_id: "test-cohab-steward".to_string(),
+            local_signer: Some(local),
+            #[cfg(all(feature = "sqlite", feature = "cirisaudit"))]
+            sqlite_audit: None,
+            consumers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            subscriptions: Arc::new(std::sync::Mutex::new(SubscriptionState::default())),
+            config_fingerprint: "test-cohab".to_string(),
+            construction_pid: std::process::id(),
+            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rust_engine: std::sync::OnceLock::new(),
+        });
+        (cell, sq)
+    }
+
+    /// #95 — `federation_directory()` yields the singleton's backend
+    /// Arc (pointer-identical), wrapped in `engine::BackendDispatch`.
+    /// No second pool, no second connection.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn federation_directory_yields_singleton_backend_sqlite() {
+        let (cell, sq) = build_cell_for_cohab_test();
+        let py = super::PyEngine::from_cell(&cell);
+        match py.federation_directory() {
+            crate::engine::BackendDispatch::Sqlite(b) => {
+                assert!(
+                    Arc::ptr_eq(&b, &sq),
+                    "federation_directory must return the singleton's backend Arc"
+                );
+            }
+            #[cfg(feature = "postgres")]
+            crate::engine::BackendDispatch::Postgres(_) => panic!("expected sqlite arm"),
+        }
+    }
+
+    /// #95 — `outbound_queue()` yields the same singleton backend Arc
+    /// as `federation_directory` — both traits live on the same
+    /// concrete backend type.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn outbound_queue_yields_singleton_backend_sqlite() {
+        let (cell, sq) = build_cell_for_cohab_test();
+        let py = super::PyEngine::from_cell(&cell);
+        match py.outbound_queue() {
+            crate::engine::BackendDispatch::Sqlite(b) => {
+                assert!(Arc::ptr_eq(&b, &sq));
+            }
+            #[cfg(feature = "postgres")]
+            crate::engine::BackendDispatch::Postgres(_) => panic!("expected sqlite arm"),
+        }
+    }
+
+    /// #95 — `keyring_signer()` returns the singleton's signer Arc +
+    /// key_id; `pqc_signer` is `None` for a non-PQC `LocalSigner`. The
+    /// returned signer is pointer-identical to the cell's — no
+    /// keyring re-bootstrap (cohabitation rule 1).
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn keyring_signer_handle_carries_singleton_parts() {
+        let (cell, _sq) = build_cell_for_cohab_test();
+        let py = super::PyEngine::from_cell(&cell);
+        let h = py.keyring_signer();
+        assert_eq!(h.key_id, "test-cohab-steward");
+        assert!(
+            Arc::ptr_eq(&h.signer, &cell.signer),
+            "keyring_signer must return the singleton's signer Arc — \
+             no keyring re-bootstrap"
+        );
+        assert!(
+            h.pqc_signer.is_none(),
+            "non-PQC LocalSigner — pqc_signer must be None"
+        );
     }
 }
 

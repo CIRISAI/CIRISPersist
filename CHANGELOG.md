@@ -5,6 +5,45 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [2.0.1] — 2026-05-22
+
+**`#95` — Rust-level accessors for the cohabitation surface.**
+
+Three plain `pub fn` accessors on `PyEngine` so a sibling cdylib
+(CIRISEdge#16) can build a `ciris_edge::Edge` from the *shared*
+engine, mirroring the Option-B pattern `node_core_service()` already
+established:
+
+- `federation_directory() -> BackendDispatch` — the federation
+  directory substrate; the consumer matches the variant and calls
+  `FederationDirectory` trait methods on the concrete backend.
+- `outbound_queue() -> BackendDispatch` — the outbound-queue
+  substrate; same shape, named distinctly so the call site documents
+  which trait surface the consumer is using.
+- `keyring_signer() -> KeyringSignerHandle` — the federation keyring
+  signer parts (`Arc<dyn HardwareSigner>` + `Option<Arc<dyn PqcSigner>>`
+  + `key_id`); Edge wraps these in its own `LocalSigner` without
+  re-bootstrapping the keyring (`docs/COHABITATION.md` rule 1).
+
+`LocalSigner::pqc_signer()` promoted from `pub(crate) pqc_signer_arc()`
+— its doc-comment literally said "wired by the PyO3 Engine refactor in
+a follow-up release"; this is that release. Unblocks CIRISEdge#16.
+
+### CI — nextest + bounded hang-detection
+
+The 2.0 substrate-widening (every substrate's PG backend now tested
+in CI) exposed a CI-specific hang in the secrets test suite that sat
+silently for >1 hour twice before manual cancel — `cargo test` buffers
+its output per-test, so a hung test prints nothing. Switching the
+matrix test job to `cargo nextest run --no-fail-fast --all-targets`
+gives per-test streaming PASS/FAIL/SLOW lines (you always know which
+test is currently running) and the `.config/nextest.toml`
+`slow-timeout = { period = "60s", terminate-after = 6 }` setting kills
+any test that runs >6 minutes with its name in the log. Plus a
+workflow-step `timeout-minutes: 25` as a backstop if nextest itself
+stalls. Together: any future hang surfaces in <6 min with the test
+name, and the step is bounded at 25 min regardless.
+
 ## [2.0.0] — 2026-05-22
 
 **CIRISPersist 2.0 — Federation Ready.** The release that consolidates
