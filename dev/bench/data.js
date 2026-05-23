@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779512251984,
+  "lastUpdate": 1779543220021,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -29885,6 +29885,276 @@ window.BENCHMARK_DATA = {
             "name": "storage_floor/next_sequence_full",
             "value": 37093,
             "range": "± 1863",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "c43cecc71c9939be86bf6894d55d7c9c68e5bdac",
+          "message": "fix(2.0.4): abi3-py310 + install_name for BeeWare iOS Python 3.10\n\nTwo fixes from agent team feedback:\n\n1. Install name: cargo embedded the CI runner's absolute path\n   (/Users/runner/work/...). Fixed with install_name_tool to set\n   @rpath/ciris_persist.ciris_persist.framework/ciris_persist.ciris_persist\n   (BeeWare Briefcase framework convention).\n\n2. Python version: built against Python-Apple-support 3.13 but the\n   iOS app embeds Python 3.10. Lowered to:\n   - PyO3 abi3-py311 → abi3-py310 (Cargo.toml)\n   - Python-Apple-support 3.13-b13 → 3.10-b13 (CI)\n   - PYO3_CROSS_PYTHON_VERSION 3.13 → 3.10\n   - requires-python >=3.11 → >=3.10 (pyproject.toml)\n   - Wheel shape checks cp311-abi3 → cp310-abi3\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+          "timestamp": "2026-05-23T08:17:53-05:00",
+          "tree_id": "a1aede68af0ae8cb18ea0e8446580d18581f24bc",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/c43cecc71c9939be86bf6894d55d7c9c68e5bdac"
+        },
+        "date": 1779543219342,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 101913,
+            "range": "± 738",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 239688,
+            "range": "± 805",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 516469,
+            "range": "± 3444",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1851172,
+            "range": "± 20614",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 341,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1467,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7361,
+            "range": "± 32",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 21255,
+            "range": "± 82",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 24334,
+            "range": "± 50",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 83614,
+            "range": "± 386",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 372,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 2989,
+            "range": "± 36",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9444,
+            "range": "± 379",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41642,
+            "range": "± 623",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 625,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2246922,
+            "range": "± 90359",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6534063,
+            "range": "± 155483",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 23351201,
+            "range": "± 240214",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 275350,
+            "range": "± 24870",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 355775,
+            "range": "± 25433",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 765959,
+            "range": "± 62632",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 2042046,
+            "range": "± 69222",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 24442485,
+            "range": "± 390531",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 11266848,
+            "range": "± 180334",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 525668,
+            "range": "± 42587",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 1921973,
+            "range": "± 104371",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 107413391,
+            "range": "± 679752",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 3616439,
+            "range": "± 189050",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 18021230,
+            "range": "± 409370",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 269178010,
+            "range": "± 1255824",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 9515237,
+            "range": "± 344333",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 45404853,
+            "range": "± 466729",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 204174,
+            "range": "± 15136",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 182903,
+            "range": "± 13560",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 61403,
+            "range": "± 4528",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 179083,
+            "range": "± 6406",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 1238223,
+            "range": "± 11473",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 43,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 28932,
+            "range": "± 2470",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 3983,
+            "range": "± 21",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 50890,
+            "range": "± 5120",
             "unit": "ns/iter"
           }
         ]
