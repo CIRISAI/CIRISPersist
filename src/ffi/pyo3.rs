@@ -927,7 +927,8 @@ impl PyEngine {
                 }
             }
             Err(PyRuntimeError::new_err(format!(
-                "ciris-keyring: {}", last_err.unwrap()
+                "ciris-keyring: {}",
+                last_err.unwrap()
             )))
         })?;
         tracing::info!(
@@ -8700,9 +8701,8 @@ impl PyEngine {
                         "all_ok": summary.all_ok,
                         "breaks": breaks_json,
                     });
-                    serde_json::to_string(&result).map_err(|e| {
-                        PyRuntimeError::new_err(format!("audit summary encode: {e}"))
-                    })
+                    serde_json::to_string(&result)
+                        .map_err(|e| PyRuntimeError::new_err(format!("audit summary encode: {e}")))
                 })
             })
         })
@@ -14608,21 +14608,17 @@ struct BootAuditBreak {
 async fn boot_audit_self_verify(backend: &BackendDispatch) -> Result<BootAuditSummary, String> {
     use crate::audit::AuditService;
     let tenant_ids: Vec<String> = match backend {
-        BackendDispatch::Postgres(pg) => {
-            pg.pool()
-                .get()
-                .await
-                .map_err(|e| format!("pool: {e}"))?
-                .query(
-                    "SELECT DISTINCT tenant_id FROM cirislens_audit_log",
-                    &[],
-                )
-                .await
-                .map_err(|e| format!("list tenants: {e}"))?
-                .iter()
-                .map(|r| r.get::<_, String>(0))
-                .collect()
-        }
+        BackendDispatch::Postgres(pg) => pg
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("pool: {e}"))?
+            .query("SELECT DISTINCT tenant_id FROM cirislens_audit_log", &[])
+            .await
+            .map_err(|e| format!("list tenants: {e}"))?
+            .iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect(),
         #[cfg(feature = "sqlite")]
         BackendDispatch::Sqlite(sq) => {
             let conn = sq.conn_handle();
