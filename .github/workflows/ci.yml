@@ -202,19 +202,32 @@ jobs:
   # Mission category §4 + PLATFORM_ARCHITECTURE.md §3.1: iOS device +
   # simulator build path. Runs on macOS with the iOS targets.
   #
-  # v2.0.4 — iOS PyO3 cross-compilation. Builds the ciris_persist.abi3.so
-  # extension module for aarch64-apple-ios (device) and
-  # aarch64-apple-ios-sim (simulator) via maturin. The agent team loads
-  # this .so into BeeWare's embedded CPython — it is NOT the 82KB C FFI
-  # dylib from v2.0.3. Uses BeeWare's Python-Apple-support for the
-  # target libpython + _sysconfigdata (PyO3 PR #5605 requires libpython
-  # linking on iOS).
+  # v2.0.4 — iOS PyO3 cross-compilation. Builds ciris_persist.abi3.so
+  # for aarch64-apple-ios (device) and aarch64-apple-ios-sim (simulator).
+  # Uses cargo build (not maturin — maturin 1.13's platform check rejects
+  # darwin→iOS cross-compile) with PyO3 cross-compilation env vars and
+  # BeeWare's Python-Apple-support for the target libpython + _sysconfigdata
+  # (PyO3 PR #5605 requires libpython linking on iOS).
   ios-build:
     name: ios PyO3 abi3 (device + simulator)
     runs-on: macos-14
     env:
       PYTHON_IOS_VER: "3.13"
       PYTHON_IOS_BUILD: "b13"
+      # Full PyO3 feature set — mirrors pyproject.toml [tool.maturin] features.
+      # pyo3 implies postgres (which pulls openssl; vendored via Cargo.toml
+      # cfg(target_os = "ios") entry).
+      IOS_PYO3_FEATURES: >-
+        pyo3 extension-module
+        sqlite secrets cirisnode cirisgraph cirisaudit telemetry
+        cirisincident classify scrub extract
+        cirislens_tasks cirislens_thoughts cirislens_correlations
+        cirislens_scheduled_tasks cirislens_tickets
+        cirislens_deferral_reports cirislens_maintenance_locks
+        cirislens_creation_ceremonies cirislens_continuity_awareness
+        cirislens_feedback_mappings cirislens_wa_cert
+        cirislens_service_token_revocation cirislens_sequence
+        cirislens_occurrence cirislens_legacy_migration
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -227,15 +240,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - name: install maturin
-        shell: bash
-        run: |
-          for attempt in 1 2 3; do
-            if pip install maturin; then break; fi
-            echo "::warning::pip install attempt $attempt failed; retrying in $((attempt * 5))s"
-            sleep $((attempt * 5))
-            [ "$attempt" = "3" ] && { echo "::error::pip install failed 3x"; exit 1; }
-          done
       - name: extract version from Cargo.toml
         id: version
         run: |
@@ -271,51 +275,56 @@ jobs:
 
           echo "✓ Python-Apple-support ${PYTHON_IOS_VER}-${PYTHON_IOS_BUILD} staged"
           ls -la "$DEVICE_DIR/" "$SIM_DIR/"
-      - name: maturin build (ios device — aarch64-apple-ios)
+      - name: cargo build (ios device — aarch64-apple-ios)
         env:
+          PYO3_CROSS: "1"
           PYO3_CROSS_PYTHON_VERSION: "3.13"
           PYO3_CROSS_LIB_DIR: ${{ steps.python-ios.outputs.device_lib_dir }}
-        run: maturin build --release --strip --target aarch64-apple-ios
-      - name: maturin build (ios simulator — aarch64-apple-ios-sim)
+        run: >-
+          cargo build --release
+          --target aarch64-apple-ios
+          --features "$IOS_PYO3_FEATURES"
+      - name: cargo build (ios simulator — aarch64-apple-ios-sim)
         env:
+          PYO3_CROSS: "1"
           PYO3_CROSS_PYTHON_VERSION: "3.13"
           PYO3_CROSS_LIB_DIR: ${{ steps.python-ios.outputs.sim_lib_dir }}
-        run: maturin build --release --strip --target aarch64-apple-ios-sim
-      - name: confirm wheel shape
-        run: |
-          echo "=== all wheels ==="
-          ls -la target/wheels/
-          if ! ls target/wheels/*.whl >/dev/null 2>&1; then
-            echo "::error::No iOS wheels produced"
-            exit 1
-          fi
-      - name: package ios artifacts
+        run: >-
+          cargo build --release
+          --target aarch64-apple-ios-sim
+          --features "$IOS_PYO3_FEATURES"
+      - name: strip + package ios artifacts
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           mkdir -p dist/ios-device dist/ios-simulator
 
-          # Ship both the wheel and the extracted .abi3.so.
-          # Wheel: complete Python package for pip/Briefcase.
-          # .abi3.so: raw extension module for direct embedding.
-          for pair in "ios-device:iphoneos" "ios-simulator:iphonesimulator"; do
-            dir="${pair%%:*}"
-            tag="${pair##*:}"
-            WHL=$(ls target/wheels/*${tag}*.whl 2>/dev/null | head -1)
-            if [ -n "$WHL" ]; then
-              cp "$WHL" "dist/${dir}/"
-              TMPDIR=$(mktemp -d)
-              python3 -m zipfile -e "$WHL" "$TMPDIR"
-              find "$TMPDIR" -name "*.abi3.so" -exec cp {} "dist/${dir}/" \;
-              rm -rf "$TMPDIR"
+          # The cdylib output is libciris_persist.dylib; rename to
+          # ciris_persist.abi3.so (Python extension naming convention).
+          # strip -x removes debug symbols.
+          for pair in \
+            "aarch64-apple-ios:ios-device" \
+            "aarch64-apple-ios-sim:ios-simulator"; do
+            target="${pair%%:*}"
+            dir="${pair##*:}"
+            SRC="target/${target}/release/libciris_persist.dylib"
+            DST="dist/${dir}/ciris_persist.abi3.so"
+            if [ -f "$SRC" ]; then
+              strip -x "$SRC"
+              cp "$SRC" "$DST"
+              echo "✓ ${dir}: $(ls -la "$DST" | awk '{print $5}') bytes"
             else
-              echo "::warning::No wheel found matching *${tag}*"
+              echo "::error::${SRC} not found"
+              ls -la "target/${target}/release/" | grep ciris
+              exit 1
             fi
           done
 
           echo "=== ios-device ==="
           ls -la dist/ios-device/
+          file dist/ios-device/ciris_persist.abi3.so
           echo "=== ios-simulator ==="
           ls -la dist/ios-simulator/
+          file dist/ios-simulator/ciris_persist.abi3.so
 
           tar -czf "dist/ciris-persist-v${VERSION}-ios.tar.gz" \
             -C dist ios-device ios-simulator
