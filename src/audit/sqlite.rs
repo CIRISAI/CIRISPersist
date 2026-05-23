@@ -1141,17 +1141,24 @@ impl AuditService for SqliteAuditBackend {
 
     async fn lookup_grant_id_by_chain_event(
         &self,
+        tenant_id: &str,
         chain_event_id: i64,
     ) -> Result<Option<uuid::Uuid>, Error> {
+        // Lookup is tenant-scoped — matches the Postgres impl. SQLite
+        // tests historically passed because each test gets a fresh
+        // in-memory DB; cross-tenant collisions are still possible in
+        // production once multiple tenants share a SQLite file. The
+        // V045 SQLite migration mirrors the PG UNIQUE constraint.
         let conn = self.conn_handle();
+        let tenant_owned = tenant_id.to_owned();
         let jh: tokio::task::JoinHandle<Result<Option<String>, rusqlite::Error>> =
             tokio::task::spawn_blocking(move || {
                 let guard = conn.blocking_lock();
                 guard
                     .query_row(
                         "SELECT grant_id FROM federation_trust_grants \
-                         WHERE chain_event_id = ?1",
-                        rusqlite::params![chain_event_id],
+                         WHERE tenant_id = ?1 AND chain_event_id = ?2",
+                        rusqlite::params![tenant_owned, chain_event_id],
                         |row| row.get::<_, String>(0),
                     )
                     .map(Some)

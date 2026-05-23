@@ -29,6 +29,36 @@ established:
 — its doc-comment literally said "wired by the PyO3 Engine refactor in
 a follow-up release"; this is that release. Unblocks CIRISEdge#16.
 
+### `lookup_grant_id_by_chain_event` is now tenant-aware
+
+The schema-API mismatch surfaced the moment cirisaudit tests finally
+ran in CI (3 of the v2.0.1 matrix entries' first failures): the PG
+impl queried `WHERE chain_event_id = $1` via `query_opt`, but
+`audit_log.sequence_number` is `UNIQUE(tenant_id, sequence_number)`
+— per-tenant — so two grants in different tenants share a
+`chain_event_id` and the lookup blew up "unexpected number of rows."
+Trait signature gains `tenant_id`, PG + SQLite SQL filters on
+`(tenant_id, chain_event_id)`. **V045** adds the matching
+`UNIQUE(tenant_id, chain_event_id)` index — the schema and the
+query now agree (mirrors V021's `merkle_leaves` shape).
+
+### Secrets PG tests are cross-process-safe under nextest
+
+Nextest runs each test in its own process, so the pre-existing
+`#[serial_test::serial(postgres)]` (in-process serialization) no
+longer covers them. The PG secrets tests share
+`cirislens_secrets.{master_key_meta,secrets,…}` plus a per-process
+`SOFTWARE_KEYS` cache — two processes racing TRUNCATEs of the same
+table left one process pointing at a master-key row whose bytes
+lived in *another* process's cache → "active master key has no
+in-memory bytes" panics, plus a deadpool-pool starvation that
+nextest's 6-min terminate killed (the formerly-mystery timeout).
+Switched the affected tests to a session-scoped PG advisory lock
+(`PG_SECRETS_TEST_LOCK_ID = 'cirsscrt'` on a dedicated non-pooled
+connection) — the same primitive `run_migrations` uses for its own
+cross-process serialization. 5 PG secrets tests fixed; one was also
+missing its `reset_secrets_state` call entirely.
+
 ### CI — nextest + bounded hang-detection
 
 The 2.0 substrate-widening (every substrate's PG backend now tested

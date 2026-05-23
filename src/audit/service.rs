@@ -221,18 +221,29 @@ pub trait AuditService: Send + Sync {
     /// re-issuance where the UPSERT keeps the original `grant_id`
     /// stable).
     ///
+    /// Lookups are tenant-scoped: `audit_log.sequence_number` is
+    /// `UNIQUE(tenant_id, sequence_number)` (per-tenant, not global),
+    /// so a `chain_event_id` alone may match multiple
+    /// `federation_trust_grants` rows across tenants. Phase E's
+    /// `grant_trust` always knows the tenant it just emitted into; the
+    /// migration `V045__federation_trust_grants_unique_tenant_chain`
+    /// adds `UNIQUE(tenant_id, chain_event_id)` to make the schema
+    /// enforce the invariant the API now relies on.
+    ///
     /// Returns `Ok(None)` if no projection row exists for the chain
-    /// event (caller wasn't a `trust_grant` subject_kind, or the
-    /// projection failed and Phase I backfill hasn't caught up).
+    /// event in the given tenant (caller wasn't a `trust_grant`
+    /// subject_kind, or the projection failed and Phase I backfill
+    /// hasn't caught up).
     ///
     /// # Default impl
     ///
     /// Returns [`Error::NotImplemented`].
     fn lookup_grant_id_by_chain_event(
         &self,
+        tenant_id: &str,
         chain_event_id: i64,
     ) -> impl Future<Output = Result<Option<uuid::Uuid>, Error>> + Send {
-        let _ = chain_event_id;
+        let _ = (tenant_id, chain_event_id);
         async { Err(Error::NotImplemented("lookup_grant_id_by_chain_event")) }
     }
 

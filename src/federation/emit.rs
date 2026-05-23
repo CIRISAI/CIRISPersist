@@ -267,7 +267,7 @@ where
     //       original grant_id stable, so the row's PK is the
     //       authoritative identifier — not a fresh UUID. ───────────
     let grant_id = audit_service
-        .lookup_grant_id_by_chain_event(chain_event_id)
+        .lookup_grant_id_by_chain_event(tenant_id, chain_event_id)
         .await
         .map_err(EmitError::Audit)?
         .ok_or(EmitError::PostEmitProjectionMissing { chain_event_id })?;

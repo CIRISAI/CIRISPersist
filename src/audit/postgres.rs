@@ -1125,6 +1125,7 @@ impl AuditService for PostgresBackend {
 
     async fn lookup_grant_id_by_chain_event(
         &self,
+        tenant_id: &str,
         chain_event_id: i64,
     ) -> Result<Option<uuid::Uuid>, Error> {
         let client = self
@@ -1132,11 +1133,17 @@ impl AuditService for PostgresBackend {
             .get()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        // Lookup is tenant-scoped: audit_log.sequence_number is
+        // UNIQUE(tenant_id, sequence_number), so chain_event_id alone
+        // is NOT unique across tenants. V045 adds
+        // UNIQUE(tenant_id, chain_event_id) on
+        // federation_trust_grants so the schema enforces the
+        // invariant query_opt depends on.
         let row = client
             .query_opt(
                 "SELECT grant_id FROM cirislens.federation_trust_grants \
-                 WHERE chain_event_id = $1",
-                &[&chain_event_id],
+                 WHERE tenant_id = $1 AND chain_event_id = $2",
+                &[&tenant_id, &chain_event_id],
             )
             .await
             .map_err(|e| Error::Backend(format!("lookup_grant_id: {e}")))?;

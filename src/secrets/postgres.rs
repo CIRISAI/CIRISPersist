@@ -1592,6 +1592,14 @@ mod tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
+        // 2.0.1 cross-process isolation: see acquire_pg_secrets_test_lock
+        // doc. `#[serial(postgres)]` only serializes within a process;
+        // nextest runs each test in its own process, so we need a PG
+        // advisory lock to genuinely serialize PG secrets tests.
+        let _lock = acquire_pg_secrets_test_lock(&backend).await;
+        // Now safe to TRUNCATE: no other test process is reading or
+        // writing master_key_meta concurrently.
+        reset_secrets_state(&backend).await;
 
         // 1. No active master key initially — rotate to generate one.
         let key_ref = backend
@@ -1741,6 +1749,12 @@ mod tests {
     /// Reset the secrets-table family so per-test rotate_master_key
     /// satisfies `active_master_key()`'s "exactly 1 row" invariant.
     /// CI starts with a fresh DB; local PG leftovers compound.
+    ///
+    /// Also clears the process-global SOFTWARE_KEYS cache — without
+    /// this, a key_ref that survived in the cache from an earlier
+    /// invocation (only possible inside the same test process when
+    /// multiple tests share a binary; unlikely under nextest but
+    /// cheap insurance) would shadow a freshly-rotated key.
     async fn reset_secrets_state(backend: &PostgresBackend) {
         let client = backend.pool().get().await.unwrap();
         client
@@ -1752,6 +1766,73 @@ mod tests {
             )
             .await
             .ok();
+    }
+
+    // ── v2.0.1 PG-test cross-process isolation ──────────────────────
+    //
+    // nextest runs each test in its own process. `#[serial(postgres)]`
+    // is `serial_test`'s in-process serializer; it does NOT
+    // synchronize across nextest's worker processes. The secrets PG
+    // tests all hit the same `cirislens_secrets.master_key_meta` row
+    // family, so two nextest workers racing on the same DB collide:
+    // worker A's rotate inserts key X and caches bytes in A's
+    // process-global SOFTWARE_KEYS; worker B's `reset_secrets_state`
+    // then TRUNCATEs the DB and inserts key Y → worker A's subsequent
+    // encrypt observes Y in `master_key_meta` but has no bytes for Y
+    // in its own SOFTWARE_KEYS, panicking with "no in-memory bytes".
+    //
+    // Fix: a session-scoped Postgres advisory lock on a dedicated
+    // connection, held for the duration of each PG secrets test. PG
+    // advisory locks are cross-process — a second worker calling
+    // `pg_advisory_lock($1)` blocks until the first worker's
+    // connection closes (which happens when the guard drops at the
+    // end of the test). This is the same primitive `run_migrations`
+    // uses (MIGRATION_LOCK_ID) — known-good in this codebase.
+    //
+    // Lock ID is a magic constant unrelated to MIGRATION_LOCK_ID so
+    // a test holding this lock doesn't block a migration that also
+    // happens to be running.
+    const PG_SECRETS_TEST_LOCK_ID: i64 = 0x6369_7273_7363_7274_i64; // 'cirsscrt'
+
+    /// RAII guard that holds a session-scoped PG advisory lock on a
+    /// dedicated (non-pooled) connection. Drop the guard (let it go
+    /// out of scope at the end of the test) to release the lock —
+    /// the connection's tokio task observes EOF and the session
+    /// ends, auto-releasing the lock. This is the same pattern
+    /// `run_migrations` uses for MIGRATION_LOCK_ID.
+    ///
+    /// Why dedicated and not pooled: pg_advisory_lock at SESSION
+    /// scope persists across the connection's lifetime, so a pooled
+    /// connection returned to the pool would still hold the lock —
+    /// either we'd have to explicit-unlock (fragile, won't run on
+    /// panic), or the next pool user would inherit the lock until
+    /// the connection finally cycles out. A dedicated connection
+    /// avoids both pitfalls.
+    struct PgSecretsTestGuard {
+        // Keep the client alive to keep the session alive. Drop ⇒
+        // session ends ⇒ lock auto-releases. Tolerates test panic.
+        _client: tokio_postgres::Client,
+    }
+
+    async fn acquire_pg_secrets_test_lock(_backend: &PostgresBackend) -> PgSecretsTestGuard {
+        // Open a dedicated tokio_postgres connection — the same
+        // recipe `PostgresBackend::dedicated_connect` uses, but the
+        // dsn is private so we re-derive it from the env var the
+        // test would have used to construct the backend.
+        let dsn = pg_dsn().expect("pg_dsn for test lock");
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("dedicated connect for test lock");
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::warn!(error = %e, "pg secrets test-lock connection terminated");
+            }
+        });
+        client
+            .execute("SELECT pg_advisory_lock($1)", &[&PG_SECRETS_TEST_LOCK_ID])
+            .await
+            .expect("pg_advisory_lock");
+        PgSecretsTestGuard { _client: client }
     }
 
     fn mk_detected_payload(value: &str, pattern: &str) -> super::super::DetectedSecret {
@@ -1778,6 +1859,7 @@ mod tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
+        let _lock = acquire_pg_secrets_test_lock(&backend).await;
         reset_secrets_state(&backend).await;
         backend
             .rotate_master_key(None, "test".into())
@@ -1815,6 +1897,7 @@ mod tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
+        let _lock = acquire_pg_secrets_test_lock(&backend).await;
         reset_secrets_state(&backend).await;
         backend
             .rotate_master_key(None, "test".into())
@@ -1853,6 +1936,7 @@ mod tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
+        let _lock = acquire_pg_secrets_test_lock(&backend).await;
         reset_secrets_state(&backend).await;
         backend
             .rotate_master_key(None, "test".into())
@@ -1919,6 +2003,7 @@ mod tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
+        let _lock = acquire_pg_secrets_test_lock(&backend).await;
         reset_secrets_state(&backend).await;
 
         // N concurrent first-use bootstraps over the real pool.
