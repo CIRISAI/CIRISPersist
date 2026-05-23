@@ -92,8 +92,23 @@ jobs:
         timeout-minutes: 25
         env:
           CIRIS_PERSIST_TEST_PG_URL: postgres://ciris:ciris@localhost:5432/ciris_persist_test
+        # --test-threads=1 — nextest spawns each test in its own
+        # PROCESS. The substrate PG tests share schema state in
+        # cirislens_secrets/cirislens.federation_*/cirislens.audit_log
+        # and use process-local caches (SOFTWARE_KEYS); two concurrent
+        # processes racing TRUNCATEs leave caches+rows mismatched.
+        # `#[serial_test::serial(postgres)]` only serializes within a
+        # process. The CI gap-closure (every substrate now actually
+        # tested in CI) made this visible across cirisaudit + secrets
+        # + cirisnode entries. Per-test PG advisory locks fix it
+        # cleanly for individual tests, but extending them everywhere
+        # is a death-by-1000-cuts; --test-threads=1 kills the entire
+        # class in one line at the cost of slightly higher per-entry
+        # wall time (still bounded by `timeout-minutes: 25` below,
+        # and the matrix axis still parallelizes across substrates).
         run: >-
-          cargo nextest run --all-targets --no-fail-fast --features
+          cargo nextest run --all-targets --no-fail-fast
+          --test-threads=1 --features
           "${{ matrix.substrate.features }}"
       - name: cargo nextest (default — fixture suite)
         if: matrix.substrate.name == 'core'
