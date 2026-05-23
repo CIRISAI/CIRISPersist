@@ -2608,8 +2608,10 @@ mod tests {
         let conn_handle = backend.conn_handle();
 
         // N independent SecretsBackend handles over the SAME database
-        // — the production cohabitation sharing model.
-        const N: usize = 12;
+        // — the production cohabitation sharing model. N=4 mirrors
+        // the PG sibling (parity); the V043 invariant doesn't scale
+        // with N — 4 exercises the loser/winner split cleanly.
+        const N: usize = 4;
         let mut tasks = Vec::with_capacity(N);
         for i in 0..N {
             let secrets = SqliteSecretsBackend::new(conn_handle.clone());

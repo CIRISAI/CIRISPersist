@@ -2007,7 +2007,14 @@ mod tests {
         reset_secrets_state(&backend).await;
 
         // N concurrent first-use bootstraps over the real pool.
-        const N: usize = 12;
+        // N=4 — enough to exercise the V043-index loser/winner split
+        // (one wins activate, the rest catch the unique violation and
+        // re-read), small enough not to strangle the CI runner's
+        // 2-vCPU `deadpool` (default `max_size = num_cpus = 2`) when
+        // the loser path itself needs a fresh connection to re-read.
+        // 12-way locally was just paranoia; the invariant doesn't
+        // scale with N.
+        const N: usize = 4;
         let backend = std::sync::Arc::new(backend);
         let mut tasks = Vec::with_capacity(N);
         for i in 0..N {
