@@ -8,10 +8,11 @@ description = "Unified Rust persistence for the CIRIS federation — signed even
 readme = "README.md"
 license = { text = "AGPL-3.0-or-later" }
 authors = [{ name = "CIRIS AI", email = "hello@ciris.ai" }]
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -125,8 +126,8 @@ features = [
     "scrub",
 ]
 module-name = "ciris_persist"
-# abi3-py311: one wheel covers Python 3.11+ per
-# PLATFORM_ARCHITECTURE.md §3.5.
+# abi3-py310: one wheel covers Python 3.10+ (lowered from 3.11 for
+# BeeWare iOS compatibility). PLATFORM_ARCHITECTURE.md §3.5.
 python-source = "python"
 strip = true
 

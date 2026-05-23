@@ -212,7 +212,7 @@ jobs:
     name: ios PyO3 abi3 (device + simulator)
     runs-on: macos-14
     env:
-      PYTHON_IOS_VER: "3.13"
+      PYTHON_IOS_VER: "3.10"
       PYTHON_IOS_BUILD: "b13"
       # Full PyO3 feature set — mirrors pyproject.toml [tool.maturin] features.
       # pyo3 implies postgres (which pulls openssl; vendored via Cargo.toml
@@ -278,7 +278,7 @@ jobs:
       - name: cargo build (ios device — aarch64-apple-ios)
         env:
           PYO3_CROSS: "1"
-          PYO3_CROSS_PYTHON_VERSION: "3.13"
+          PYO3_CROSS_PYTHON_VERSION: "3.10"
           PYO3_CROSS_LIB_DIR: ${{ steps.python-ios.outputs.device_lib_dir }}
         run: >-
           cargo build --release
@@ -287,7 +287,7 @@ jobs:
       - name: cargo build (ios simulator — aarch64-apple-ios-sim)
         env:
           PYO3_CROSS: "1"
-          PYO3_CROSS_PYTHON_VERSION: "3.13"
+          PYO3_CROSS_PYTHON_VERSION: "3.10"
           PYO3_CROSS_LIB_DIR: ${{ steps.python-ios.outputs.sim_lib_dir }}
         run: >-
           cargo build --release
@@ -300,7 +300,8 @@ jobs:
 
           # The cdylib output is libciris_persist.dylib; rename to
           # ciris_persist.abi3.so (Python extension naming convention).
-          # strip -x removes debug symbols.
+          # Fix install name: cargo embeds the CI runner's absolute path;
+          # BeeWare Briefcase needs @rpath-relative framework name.
           for pair in \
             "aarch64-apple-ios:ios-device" \
             "aarch64-apple-ios-sim:ios-simulator"; do
@@ -310,8 +311,12 @@ jobs:
             DST="dist/${dir}/ciris_persist.abi3.so"
             if [ -f "$SRC" ]; then
               strip -x "$SRC"
+              install_name_tool -id \
+                "@rpath/ciris_persist.ciris_persist.framework/ciris_persist.ciris_persist" \
+                "$SRC"
               cp "$SRC" "$DST"
               echo "✓ ${dir}: $(ls -la "$DST" | awk '{print $5}') bytes"
+              otool -D "$DST"
             else
               echo "::error::${SRC} not found"
               ls -la "target/${target}/release/" | grep ciris
@@ -569,14 +574,14 @@ jobs:
       - name: maturin build
         run: maturin build --release --strip
       - name: confirm wheel shape
-        # Reject anything that isn't cp311-abi3 — the v0.1.10 regression
+        # Reject anything that isn't cp310-abi3 — the v0.1.10 regression
         # showed mixed-mode maturin can silently emit cp31N-cp31N
         # wheels which break consumer install on other minors. Catching
         # at build time, before the wheel reaches PyPI.
         run: |
           ls -la target/wheels/
-          if ! ls target/wheels/*-cp311-abi3-*.whl >/dev/null 2>&1; then
-            echo "::error::Expected cp311-abi3 wheel for ${{ matrix.label }}; got:"
+          if ! ls target/wheels/*-cp310-abi3-*.whl >/dev/null 2>&1; then
+            echo "::error::Expected cp310-abi3 wheel for ${{ matrix.label }}; got:"
             ls target/wheels/*.whl 2>/dev/null || echo "  (no wheels)"
             exit 1
           fi
@@ -675,7 +680,7 @@ jobs:
           find dist -mindepth 2 -name '*.whl' -exec mv {} dist/ \;
           find dist -mindepth 1 -type d -empty -delete
       - name: sanity-check wheel shapes before publish
-        # Reject anything that isn't cp311-abi3 — the v0.1.10
+        # Reject anything that isn't cp310-abi3 — the v0.1.10
         # regression showed mixed-mode maturin can silently emit
         # cp31N-cp31N wheels which break consumer install. Catch
         # at publish time too (also caught at build time per
@@ -689,13 +694,13 @@ jobs:
             exit 1
           fi
           for wheel in dist/*.whl; do
-            if ! [[ "${wheel}" =~ -cp311-abi3- ]]; then
+            if ! [[ "${wheel}" =~ -cp310-abi3- ]]; then
               echo "::error::Non-abi3 wheel detected: ${wheel}"
               exit 1
             fi
             echo "✓ ${wheel}"
           done
-          echo "✓ All ${COUNT} wheels conform to cp311-abi3."
+          echo "✓ All ${COUNT} wheels conform to cp310-abi3."
       - name: publish to PyPI via OIDC trusted publishing
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
