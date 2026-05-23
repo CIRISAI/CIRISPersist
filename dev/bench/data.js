@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779501989940,
+  "lastUpdate": 1779503919086,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -27995,6 +27995,276 @@ window.BENCHMARK_DATA = {
             "name": "storage_floor/next_sequence_full",
             "value": 52319,
             "range": "± 5270",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "6de8a1df86612511e817a30a30025a5cf854eb5c",
+          "message": "2.0.2 — pyproject Requires-Dist hotfix: ciris-verify>=3.0.1,<4\n\n2.0.1's pyproject.toml still pinned ciris-verify>=2.1.5,<3 — the\nPython wheel's Requires-Dist for the transitive ciris-verify PyPI\npackage never got bumped when the Rust-side Cargo.toml moved to\nverify v3.0.1 in the 2.0-prep cut. Consumers running\n  pip install ciris-persist>=2.0.1 ciris-verify>=3.0.1\nhit an irreconcilable resolver conflict and the install failed\nbefore any code ran. 2.0.2 fixes the Python metadata so the wheel\nagrees with the Rust crate about which verify major it's on.\n\nYank 2.0.1 from PyPI so new installs don't pick it up by default.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-22T21:22:19-05:00",
+          "tree_id": "74dddf81c12fcdab16325654fecb4ffacfb5a25c",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/6de8a1df86612511e817a30a30025a5cf854eb5c"
+        },
+        "date": 1779503917716,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 109085,
+            "range": "± 633",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 257888,
+            "range": "± 9564",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 555032,
+            "range": "± 3599",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1996667,
+            "range": "± 5082",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 325,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1408,
+            "range": "± 36",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 6578,
+            "range": "± 82",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23985,
+            "range": "± 195",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 27200,
+            "range": "± 1696",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 91823,
+            "range": "± 1589",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 358,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3045,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9394,
+            "range": "± 125",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41185,
+            "range": "± 223",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 631,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2235813,
+            "range": "± 83453",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6870591,
+            "range": "± 144859",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25086210,
+            "range": "± 401641",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 259116,
+            "range": "± 21214",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 304992,
+            "range": "± 16737",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 611685,
+            "range": "± 32380",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 1513859,
+            "range": "± 37719",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 22682892,
+            "range": "± 220373",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 11664412,
+            "range": "± 199854",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 582703,
+            "range": "± 22957",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 1747082,
+            "range": "± 56936",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 111377161,
+            "range": "± 870866",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 4010545,
+            "range": "± 662629",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 17599571,
+            "range": "± 516433",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 276863770,
+            "range": "± 1970157",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 11070380,
+            "range": "± 347220",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 46292524,
+            "range": "± 1563822",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 201836,
+            "range": "± 19587",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 167511,
+            "range": "± 12891",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 47424,
+            "range": "± 1821",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 159855,
+            "range": "± 5451",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 1212749,
+            "range": "± 4719",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 48,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 24322,
+            "range": "± 1872",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 3780,
+            "range": "± 32",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 38062,
+            "range": "± 1601",
             "unit": "ns/iter"
           }
         ]
