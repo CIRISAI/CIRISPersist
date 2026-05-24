@@ -345,14 +345,19 @@ jobs:
           name: ciris-persist-ios
           path: dist/ciris-persist-v*-ios.tar.gz
 
-  # v2.0.3 — Android cross-compilation. Produces shared libraries for
-  # aarch64 (device, arm64-v8a) and x86_64 (emulator) via cargo-ndk.
-  # Mirrors CIRISVerify's release.yml Android build pattern.
-  # PLATFORM_ARCHITECTURE.md §3.2: NDK version pinning, 16KB page size
-  # for Android 15+, AAR-ready .so artifacts.
-  android-build:
-    name: android (aarch64 + x86_64 + armeabi-v7a)
+  # v2.0.7 — per-ABI matrix Android builds (#99). Each runner builds
+  # both the plain .so and the PyO3 Chaquopy abi3 .so for one ABI.
+  # Downstream android-package job collects artifacts into tarballs.
+  android-ndk:
+    name: android ${{ matrix.abi }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { abi: arm64-v8a,    target: aarch64-linux-android,  clang_prefix: aarch64-linux-android24, pointer_width: 64 }
+          - { abi: x86_64,       target: x86_64-linux-android,   clang_prefix: x86_64-linux-android24,  pointer_width: 64, needs_openssl: true }
+          - { abi: armeabi-v7a,  target: armv7-linux-androideabi, clang_prefix: armv7a-linux-androideabi24, pointer_width: 32 }
     env:
       MOBILE_FEATURES: >-
         sqlite secrets cirisnode cirisgraph cirisaudit telemetry
@@ -368,8 +373,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android,x86_64-linux-android,armv7-linux-androideabi
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-${{ matrix.abi }}
         continue-on-error: true
       - name: setup Android NDK
         uses: nttld/setup-ndk@v1
@@ -384,28 +391,10 @@ jobs:
         run: |
           VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-      - name: cargo ndk build (aarch64 — arm64-v8a)
-        env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-        run: >-
-          cargo ndk -t arm64-v8a build --release
-          --features "$MOBILE_FEATURES"
-      - name: cargo ndk build (armeabi-v7a — ARM32)
-        env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-        run: >-
-          cargo ndk -t armeabi-v7a build --release
-          --features "$MOBILE_FEATURES"
-      # OpenSSL 3.6.x's sm4-x86_64.S uses vsm4rnds4 (SM4-NI ISA
-      # extension) that NDK r26b's clang assembler doesn't support.
-      # The vendored openssl-src crate doesn't expose a way to pass
-      # `no-sm4` to OpenSSL's Configure, so we pre-build OpenSSL for
-      # x86_64-android with `no-sm4` and point openssl-sys at it via
-      # OPENSSL_DIR + OPENSSL_NO_VENDOR. aarch64 is unaffected (ARM
-      # assembly doesn't use SM4-NI) and keeps the vendored path.
-      # Same pattern as Oscar Franco's Android OpenSSL guide and the
-      # Tauri/Dioxus workaround (cargo-mobile2#144, dioxus#3514).
+
+      # x86_64 only: OpenSSL 3.6.x SM4-NI workaround
       - name: pre-build OpenSSL for x86_64-android (SM4-NI workaround)
+        if: matrix.needs_openssl
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
@@ -414,160 +403,146 @@ jobs:
             -o openssl-src.tar.gz
           tar xzf openssl-src.tar.gz
           cd "openssl-${OPENSSL_VERSION}"
-
           TOOLCHAIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64"
-          # NDK uses clang, not gcc. Add toolchain bin to PATH so
-          # OpenSSL's Configure can discover the compiler wrappers,
-          # and set CC/AR/RANLIB explicitly for the android-x86_64
-          # target.
           export PATH="${TOOLCHAIN}/bin:${PATH}"
           export CC="x86_64-linux-android24-clang"
           export AR="llvm-ar"
           export RANLIB="llvm-ranlib"
           export ANDROID_NDK_ROOT="${ANDROID_NDK_HOME}"
-
           INSTALL_DIR="${RUNNER_TEMP}/openssl-x86_64-android"
           ./Configure android-x86_64 \
             no-sm4 no-shared no-stdio no-tests \
             -D__ANDROID_API__=24 \
             --prefix="${INSTALL_DIR}" \
             --openssldir="${INSTALL_DIR}/ssl"
-
           make -j"$(nproc)" build_libs
           make install_dev
-
           echo "✓ OpenSSL ${OPENSSL_VERSION} built for x86_64-android (no-sm4)"
-          ls -la "${INSTALL_DIR}/lib/"
-      - name: cargo ndk build (x86_64)
+
+      # Plain .so (no PyO3) — save before PyO3 build overwrites it
+      - name: cargo ndk build (${{ matrix.abi }})
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-          # Skip vendored openssl-src for x86_64; use the pre-built
-          # one from the step above.
-          OPENSSL_NO_VENDOR: "1"
-          X86_64_LINUX_ANDROID_OPENSSL_DIR: ${{ runner.temp }}/openssl-x86_64-android
-          X86_64_LINUX_ANDROID_OPENSSL_STATIC: "1"
+          OPENSSL_NO_VENDOR: ${{ matrix.needs_openssl && '1' || '' }}
+          X86_64_LINUX_ANDROID_OPENSSL_DIR: ${{ matrix.needs_openssl && format('{0}/openssl-x86_64-android', runner.temp) || '' }}
+          X86_64_LINUX_ANDROID_OPENSSL_STATIC: ${{ matrix.needs_openssl && '1' || '' }}
         run: >-
-          cargo ndk -t x86_64 build --release
+          cargo ndk -t ${{ matrix.abi }} build --release
           --features "$MOBILE_FEATURES"
-      - name: strip + package android artifacts
+      - name: save plain .so
+        run: |
+          mkdir -p dist/${{ matrix.abi }}
+          cp "target/${{ matrix.target }}/release/libciris_persist.so" \
+             "dist/${{ matrix.abi }}/libciris_persist.so"
+
+      # PyO3 Chaquopy abi3 .so — with explicit libpython3.10 DT_NEEDED
+      # (#98). Chaquopy loads libpython with RTLD_LOCAL so extensions
+      # must DT_NEED it explicitly. We build a stub .so for the linker
+      # and add -lpython3.10 via RUSTFLAGS. Chaquopy's real libpython
+      # provides the symbols at runtime.
+      - name: create PyO3 config + libpython stub
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          CFG="${RUNNER_TEMP}/pyo3-android.config"
+          cat > "${CFG}" <<CFGEOF
+          implementation=CPython
+          version=3.10
+          shared=false
+          abi3=true
+          lib_name=python3.10
+          lib_dir=
+          executable=
+          pointer_width=${{ matrix.pointer_width }}
+          build_flags=
+          suppress_build_script_link_lines=true
+          CFGEOF
+          sed -i 's/^[[:space:]]*//' "${CFG}"
+          echo "PYO3_CONFIG_FILE=${CFG}" >> "$GITHUB_ENV"
+
+          STUB_DIR="${RUNNER_TEMP}/python-stub"
+          mkdir -p "${STUB_DIR}"
+          TOOLCHAIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64"
+          echo 'void __pystub(void){}' | \
+            "${TOOLCHAIN}/bin/${{ matrix.clang_prefix }}-clang" \
+              -shared -Wl,-soname,libpython3.10.so \
+              -o "${STUB_DIR}/libpython3.10.so" -x c -
+          echo "✓ PyO3 config (pointer_width=${{ matrix.pointer_width }}):"
+          cat "${CFG}"
+          echo "✓ stub libpython3.10.so:"
+          file "${STUB_DIR}/libpython3.10.so"
+
+      - name: cargo ndk build (${{ matrix.abi }} — PyO3 Chaquopy abi3)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          OPENSSL_NO_VENDOR: ${{ matrix.needs_openssl && '1' || '' }}
+          X86_64_LINUX_ANDROID_OPENSSL_DIR: ${{ matrix.needs_openssl && format('{0}/openssl-x86_64-android', runner.temp) || '' }}
+          X86_64_LINUX_ANDROID_OPENSSL_STATIC: ${{ matrix.needs_openssl && '1' || '' }}
+          RUSTFLAGS: "-L ${{ runner.temp }}/python-stub -C link-arg=-lpython3.10"
+        run: >-
+          cargo ndk -t ${{ matrix.abi }} build --release
+          --features "pyo3 extension-module $MOBILE_FEATURES"
+
+      - name: verify DT_NEEDED includes libpython3.10.so
+        run: |
+          readelf -d "target/${{ matrix.target }}/release/libciris_persist.so" \
+            | grep -q 'libpython3.10.so' \
+            && echo "✓ DT_NEEDED: libpython3.10.so present" \
+            || { echo "::error::libpython3.10.so missing from DT_NEEDED"; exit 1; }
+
+      - name: strip + collect artifacts
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          STRIP="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          # PyO3 .so (for Chaquopy wheels)
+          cp "target/${{ matrix.target }}/release/libciris_persist.so" \
+             "dist/${{ matrix.abi }}/libciris_persist_pyo3.so"
+          if [ -x "$STRIP" ]; then
+            "$STRIP" "dist/${{ matrix.abi }}/libciris_persist.so"
+            "$STRIP" "dist/${{ matrix.abi }}/libciris_persist_pyo3.so"
+          fi
+          echo "=== ${{ matrix.abi }} ==="
+          ls -la dist/${{ matrix.abi }}/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ciris-persist-android-${{ matrix.abi }}
+          path: dist/${{ matrix.abi }}/
+
+  # Downstream job: collect per-ABI artifacts into tarballs + wheels.
+  android-package:
+    name: package android artifacts
+    runs-on: ubuntu-latest
+    needs: [android-ndk]
+    steps:
+      - uses: actions/checkout@v4
+      - name: extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: download all ABI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ciris-persist-android-*
+          path: artifacts/
+      - name: package raw android .so tarball
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           mkdir -p dist/android/arm64-v8a dist/android/x86_64 dist/android/armeabi-v7a
-
-          # Copy .so files
-          cp target/aarch64-linux-android/release/libciris_persist.so \
-             dist/android/arm64-v8a/
-          cp target/x86_64-linux-android/release/libciris_persist.so \
-             dist/android/x86_64/
-          cp target/armv7-linux-androideabi/release/libciris_persist.so \
-             dist/android/armeabi-v7a/
-
-          # Strip with NDK's llvm-strip
-          STRIP="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
-          if [ -x "$STRIP" ]; then
-            "$STRIP" dist/android/arm64-v8a/libciris_persist.so
-            "$STRIP" dist/android/x86_64/libciris_persist.so
-            "$STRIP" dist/android/armeabi-v7a/libciris_persist.so
-            echo "✓ stripped with NDK llvm-strip"
-          else
-            echo "::warning::llvm-strip not found at expected path; shipping unstripped"
-          fi
-
-          echo "=== arm64-v8a ==="
-          ls -la dist/android/arm64-v8a/
-          echo "=== x86_64 ==="
-          ls -la dist/android/x86_64/
-          echo "=== armeabi-v7a ==="
-          ls -la dist/android/armeabi-v7a/
-
-          tar -czf "dist/ciris-persist-v${VERSION}-android.tar.gz" \
-            -C dist android
-
-          echo "✓ packaged ciris-persist-v${VERSION}-android.tar.gz"
-          ls -la dist/ciris-persist-v${VERSION}-android.tar.gz
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ciris-persist-android
-          path: dist/ciris-persist-v*-android.tar.gz
-
-      # v2.0.6 — Chaquopy abi3 Android wheels (issues #96, #97, #98).
-      # PYO3_CONFIG_FILE bypasses host Python detection entirely.
-      # abi3=true produces stable-ABI .so (no _Py_IncRef etc.) and
-      # wheels are tagged cp310-abi3 so Chaquopy accepts them.
-      # Separate 64-bit and 32-bit configs for pointer_width.
-      - name: create PyO3 cross-compilation configs for Android
-        run: |
-          CFG64="${RUNNER_TEMP}/pyo3-android-64.config"
-          cat > "${CFG64}" <<'CFGEOF'
-          implementation=CPython
-          version=3.10
-          shared=false
-          abi3=true
-          lib_name=python3.10
-          lib_dir=
-          executable=
-          pointer_width=64
-          build_flags=
-          suppress_build_script_link_lines=true
-          CFGEOF
-          sed -i 's/^[[:space:]]*//' "${CFG64}"
-
-          CFG32="${RUNNER_TEMP}/pyo3-android-32.config"
-          cat > "${CFG32}" <<'CFGEOF'
-          implementation=CPython
-          version=3.10
-          shared=false
-          abi3=true
-          lib_name=python3.10
-          lib_dir=
-          executable=
-          pointer_width=32
-          build_flags=
-          suppress_build_script_link_lines=true
-          CFGEOF
-          sed -i 's/^[[:space:]]*//' "${CFG32}"
-
-          echo "PYO3_CONFIG_FILE_64=${CFG64}" >> "$GITHUB_ENV"
-          echo "PYO3_CONFIG_FILE_32=${CFG32}" >> "$GITHUB_ENV"
-          echo "✓ PyO3 configs (64-bit + 32-bit):"
-          echo "--- 64-bit ---"; cat "${CFG64}"
-          echo "--- 32-bit ---"; cat "${CFG32}"
-      - name: cargo ndk build (aarch64 — PyO3 Chaquopy abi3)
-        env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-          PYO3_CONFIG_FILE: ${{ runner.temp }}/pyo3-android-64.config
-        run: >-
-          cargo ndk -t arm64-v8a build --release
-          --features "pyo3 extension-module $MOBILE_FEATURES"
-      - name: cargo ndk build (x86_64 — PyO3 Chaquopy abi3)
-        env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-          OPENSSL_NO_VENDOR: "1"
-          X86_64_LINUX_ANDROID_OPENSSL_DIR: ${{ runner.temp }}/openssl-x86_64-android
-          X86_64_LINUX_ANDROID_OPENSSL_STATIC: "1"
-          PYO3_CONFIG_FILE: ${{ runner.temp }}/pyo3-android-64.config
-        run: >-
-          cargo ndk -t x86_64 build --release
-          --features "pyo3 extension-module $MOBILE_FEATURES"
-      - name: cargo ndk build (armeabi-v7a — PyO3 Chaquopy abi3)
-        env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-          PYO3_CONFIG_FILE: ${{ runner.temp }}/pyo3-android-32.config
-        run: >-
-          cargo ndk -t armeabi-v7a build --release
-          --features "pyo3 extension-module $MOBILE_FEATURES"
+          cp artifacts/ciris-persist-android-arm64-v8a/libciris_persist.so    dist/android/arm64-v8a/
+          cp artifacts/ciris-persist-android-x86_64/libciris_persist.so       dist/android/x86_64/
+          cp artifacts/ciris-persist-android-armeabi-v7a/libciris_persist.so  dist/android/armeabi-v7a/
+          tar -czf "dist/ciris-persist-v${VERSION}-android.tar.gz" -C dist android
+          echo "✓ ciris-persist-v${VERSION}-android.tar.gz"
       - name: package Chaquopy abi3 wheels
-        env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          STRIP="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
 
           build_wheel() {
-            local TARGET="$1"    # e.g. aarch64-linux-android
-            local ABI="$2"       # e.g. arm64_v8a (underscore for wheel tag)
+            local ABI="$1"         # e.g. arm64_v8a (underscore for wheel tag)
+            local ABI_DIR="$2"     # e.g. arm64-v8a (hyphen for artifact dir)
 
             local WHEEL_TAG="cp310-abi3-android_24_${ABI}"
             local WHEEL_NAME="ciris_persist-${VERSION}-${WHEEL_TAG}.whl"
@@ -575,18 +550,11 @@ jobs:
 
             mkdir -p "${WORK}/ciris_persist" "${WORK}/ciris_persist-${VERSION}.dist-info"
 
-            # Native extension — rename lib prefix, strip
-            cp "target/${TARGET}/release/libciris_persist.so" \
+            cp "artifacts/ciris-persist-android-${ABI_DIR}/libciris_persist_pyo3.so" \
                "${WORK}/ciris_persist/ciris_persist.so"
-            if [ -x "$STRIP" ]; then
-              "$STRIP" "${WORK}/ciris_persist/ciris_persist.so"
-            fi
-
-            # Python source + stubs
             cp python/ciris_persist/__init__.py "${WORK}/ciris_persist/"
             cp python/ciris_persist/ciris_persist.pyi "${WORK}/ciris_persist/"
 
-            # METADATA
             cat > "${WORK}/ciris_persist-${VERSION}.dist-info/METADATA" <<METAEOF
           Metadata-Version: 2.1
           Name: ciris-persist
@@ -596,7 +564,6 @@ jobs:
           Requires-Python: >=3.10
           METAEOF
 
-            # WHEEL
             cat > "${WORK}/ciris_persist-${VERSION}.dist-info/WHEEL" <<WHEELEOF
           Wheel-Version: 1.0
           Generator: ciris-persist-ci
@@ -604,10 +571,8 @@ jobs:
           Tag: ${WHEEL_TAG}
           WHEELEOF
 
-            # top_level.txt
             echo "ciris_persist" > "${WORK}/ciris_persist-${VERSION}.dist-info/top_level.txt"
 
-            # RECORD (hash every file, RECORD itself has no hash)
             cd "${WORK}"
             local RECORD="ciris_persist-${VERSION}.dist-info/RECORD"
             : > "${RECORD}"
@@ -627,24 +592,25 @@ jobs:
             echo "${RECORD},," >> "${RECORD}"
             cd - > /dev/null
 
-            # Zip into .whl
             (cd "${WORK}" && zip -r "../../${WHEEL_NAME}" ciris_persist ciris_persist-${VERSION}.dist-info)
             echo "✓ ${WHEEL_NAME} ($(stat -c%s "dist/${WHEEL_NAME}") bytes)"
           }
 
-          build_wheel aarch64-linux-android arm64_v8a
-          build_wheel x86_64-linux-android x86_64
-          build_wheel armv7-linux-androideabi armeabi_v7a
+          build_wheel arm64_v8a    arm64-v8a
+          build_wheel x86_64      x86_64
+          build_wheel armeabi_v7a armeabi-v7a
 
-          # Bundle into a tarball for the release asset
           tar -czf "dist/ciris-persist-v${VERSION}-android-wheels.tar.gz" \
             -C dist \
             "ciris_persist-${VERSION}-cp310-abi3-android_24_arm64_v8a.whl" \
             "ciris_persist-${VERSION}-cp310-abi3-android_24_x86_64.whl" \
             "ciris_persist-${VERSION}-cp310-abi3-android_24_armeabi_v7a.whl"
 
-          echo "✓ packaged ciris-persist-v${VERSION}-android-wheels.tar.gz"
-          ls -la dist/ciris-persist-v${VERSION}-android-wheels.tar.gz
+          echo "✓ ciris-persist-v${VERSION}-android-wheels.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ciris-persist-android
+          path: dist/ciris-persist-v*-android.tar.gz
       - uses: actions/upload-artifact@v4
         with:
           name: ciris-persist-android-wheels
@@ -805,7 +771,7 @@ jobs:
       - linux-x86_64-test
       - darwin-aarch64-test
       - ios-build
-      - android-build
+      - android-package
     if: startsWith(github.ref, 'refs/tags/v')
     environment:
       name: pypi
@@ -1328,7 +1294,7 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - ios-build
-      - android-build
+      - android-package
       - lint
       - license-audit
     if: startsWith(github.ref, 'refs/tags/v')
