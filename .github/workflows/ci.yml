@@ -419,13 +419,17 @@ jobs:
           make install_dev
           echo "✓ OpenSSL ${OPENSSL_VERSION} built for x86_64-android (no-sm4)"
 
+      - name: export pre-built OpenSSL env vars
+        if: matrix.needs_openssl
+        run: |
+          echo "OPENSSL_NO_VENDOR=1" >> "$GITHUB_ENV"
+          echo "X86_64_LINUX_ANDROID_OPENSSL_DIR=${{ runner.temp }}/openssl-x86_64-android" >> "$GITHUB_ENV"
+          echo "X86_64_LINUX_ANDROID_OPENSSL_STATIC=1" >> "$GITHUB_ENV"
+
       # Plain .so (no PyO3) — save before PyO3 build overwrites it
       - name: cargo ndk build (${{ matrix.abi }})
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-          OPENSSL_NO_VENDOR: ${{ matrix.needs_openssl && '1' || '' }}
-          X86_64_LINUX_ANDROID_OPENSSL_DIR: ${{ matrix.needs_openssl && format('{0}/openssl-x86_64-android', runner.temp) || '' }}
-          X86_64_LINUX_ANDROID_OPENSSL_STATIC: ${{ matrix.needs_openssl && '1' || '' }}
         run: >-
           cargo ndk -t ${{ matrix.abi }} build --release
           --features "$MOBILE_FEATURES"
@@ -475,9 +479,6 @@ jobs:
       - name: cargo ndk build (${{ matrix.abi }} — PyO3 Chaquopy abi3)
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-          OPENSSL_NO_VENDOR: ${{ matrix.needs_openssl && '1' || '' }}
-          X86_64_LINUX_ANDROID_OPENSSL_DIR: ${{ matrix.needs_openssl && format('{0}/openssl-x86_64-android', runner.temp) || '' }}
-          X86_64_LINUX_ANDROID_OPENSSL_STATIC: ${{ matrix.needs_openssl && '1' || '' }}
           RUSTFLAGS: "-L ${{ runner.temp }}/python-stub -C link-arg=-lpython3.10"
         run: >-
           cargo ndk -t ${{ matrix.abi }} build --release
