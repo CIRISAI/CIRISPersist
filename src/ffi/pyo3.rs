@@ -14430,24 +14430,43 @@ fn bootstrap_lock_path() -> std::path::PathBuf {
 /// Blocks until the lock is acquired. Workers 2..N on a multi-
 /// worker deployment briefly wait here while worker 1 bootstraps;
 /// typical wait is <1s on cold-start, <50ms warm.
-fn acquire_bootstrap_lock() -> std::io::Result<std::fs::File> {
+fn acquire_bootstrap_lock() -> std::io::Result<Option<std::fs::File>> {
     use fs4::fs_std::FileExt;
     let path = bootstrap_lock_path();
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!(
+                lock_path = %path.display(),
+                error = %e,
+                "bootstrap lock dir creation failed — proceeding without advisory lock"
+            );
+            return Ok(None);
+        }
     }
-    let file = std::fs::OpenOptions::new()
+    let file = match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(&path)?;
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(
+                lock_path = %path.display(),
+                error = %e,
+                "bootstrap lock file open failed — proceeding without advisory lock"
+            );
+            return Ok(None);
+        }
+    };
     match file.lock_exclusive() {
         Ok(()) => {
             tracing::debug!(
                 lock_path = %path.display(),
                 "ciris-persist: bootstrap flock acquired"
             );
+            Ok(Some(file))
         }
         Err(e)
             if matches!(
@@ -14455,19 +14474,15 @@ fn acquire_bootstrap_lock() -> std::io::Result<std::fs::File> {
                 Some(libc::EPERM) | Some(libc::ENOTSUP) | Some(libc::ENOSYS)
             ) =>
         {
-            // iOS sandbox returns EPERM for flock(); some filesystems
-            // return ENOTSUP/ENOSYS. SQLite's own WAL locking still
-            // protects concurrent writes — the advisory lock is an
-            // extra coordination layer that degrades gracefully.
             tracing::warn!(
                 lock_path = %path.display(),
                 os_error = e.raw_os_error(),
                 "bootstrap flock unsupported on this platform — proceeding without advisory lock"
             );
+            Ok(Some(file))
         }
-        Err(e) => return Err(e),
+        Err(e) => Err(e),
     }
-    Ok(file)
 }
 
 /// Heuristic: does a `SoftwareFile` seed path look ephemeral?
@@ -14863,16 +14878,11 @@ mod tests {
         let _g = EnvGuard::set("CIRIS_DATA_DIR", dir.path());
 
         let f1 = acquire_bootstrap_lock().expect("first acquire");
-        // Path exists; lock is held.
+        assert!(f1.is_some(), "lock should be acquired on writable tempdir");
         assert!(dir.path().join(".persist-bootstrap.lock").exists());
-        // Drop releases the lock; subsequent acquire from this
-        // process succeeds. (Same-process flock semantics on Linux:
-        // a process holds at most one flock per file regardless of
-        // FD count, so re-acquiring is a no-op; on macOS it's the
-        // same. Cross-process contention requires an integration
-        // test which we don't do here.)
         drop(f1);
         let f2 = acquire_bootstrap_lock().expect("second acquire");
+        assert!(f2.is_some());
         drop(f2);
         // _g (EnvGuard) drops at end of scope; CIRIS_DATA_DIR
         // restored to its prior value (None or whatever the
