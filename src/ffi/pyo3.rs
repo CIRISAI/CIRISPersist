@@ -14434,9 +14434,6 @@ fn acquire_bootstrap_lock() -> std::io::Result<std::fs::File> {
     use fs4::fs_std::FileExt;
     let path = bootstrap_lock_path();
     if let Some(parent) = path.parent() {
-        // Best-effort create_dir_all; if the parent already exists
-        // (the common case once CIRIS_DATA_DIR is mounted) this is
-        // a no-op. Failures here propagate to the caller.
         std::fs::create_dir_all(parent)?;
     }
     let file = std::fs::OpenOptions::new()
@@ -14445,11 +14442,31 @@ fn acquire_bootstrap_lock() -> std::io::Result<std::fs::File> {
         .create(true)
         .truncate(false)
         .open(&path)?;
-    file.lock_exclusive()?;
-    tracing::debug!(
-        lock_path = %path.display(),
-        "ciris-persist: bootstrap flock acquired"
-    );
+    match file.lock_exclusive() {
+        Ok(()) => {
+            tracing::debug!(
+                lock_path = %path.display(),
+                "ciris-persist: bootstrap flock acquired"
+            );
+        }
+        Err(e)
+            if matches!(
+                e.raw_os_error(),
+                Some(libc::EPERM) | Some(libc::ENOTSUP) | Some(libc::ENOSYS)
+            ) =>
+        {
+            // iOS sandbox returns EPERM for flock(); some filesystems
+            // return ENOTSUP/ENOSYS. SQLite's own WAL locking still
+            // protects concurrent writes — the advisory lock is an
+            // extra coordination layer that degrades gracefully.
+            tracing::warn!(
+                lock_path = %path.display(),
+                os_error = e.raw_os_error(),
+                "bootstrap flock unsupported on this platform — proceeding without advisory lock"
+            );
+        }
+        Err(e) => return Err(e),
+    }
     Ok(file)
 }
 

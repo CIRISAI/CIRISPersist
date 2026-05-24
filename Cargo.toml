@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "2.0.7"
+version = "2.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -477,6 +477,7 @@ async-trait   = "0.1"
 # coexist on one host. fs4 is the maintained fork of fs2; pinned
 # to 0.x because the API is stable but pre-1.0.
 fs4           = "0.13"
+libc          = "0.2"
 serde         = { version = "1", features = ["derive"] }
 # v0.1.20 — `arbitrary_precision` preserves the agent's wire number
 # tokens verbatim through deserialize → serialize. Closes
