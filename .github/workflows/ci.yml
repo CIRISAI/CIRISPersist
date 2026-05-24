@@ -351,7 +351,7 @@ jobs:
   # PLATFORM_ARCHITECTURE.md §3.2: NDK version pinning, 16KB page size
   # for Android 15+, AAR-ready .so artifacts.
   android-build:
-    name: android (aarch64 + x86_64)
+    name: android (aarch64 + x86_64 + armeabi-v7a)
     runs-on: ubuntu-latest
     env:
       MOBILE_FEATURES: >-
@@ -368,7 +368,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android,x86_64-linux-android
+          targets: aarch64-linux-android,x86_64-linux-android,armv7-linux-androideabi
       - uses: Swatinem/rust-cache@v2
         continue-on-error: true
       - name: setup Android NDK
@@ -389,6 +389,12 @@ jobs:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: >-
           cargo ndk -t arm64-v8a build --release
+          --features "$MOBILE_FEATURES"
+      - name: cargo ndk build (armeabi-v7a — ARM32)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: >-
+          cargo ndk -t armeabi-v7a build --release
           --features "$MOBILE_FEATURES"
       # OpenSSL 3.6.x's sm4-x86_64.S uses vsm4rnds4 (SM4-NI ISA
       # extension) that NDK r26b's clang assembler doesn't support.
@@ -448,19 +454,22 @@ jobs:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          mkdir -p dist/android/arm64-v8a dist/android/x86_64
+          mkdir -p dist/android/arm64-v8a dist/android/x86_64 dist/android/armeabi-v7a
 
           # Copy .so files
           cp target/aarch64-linux-android/release/libciris_persist.so \
              dist/android/arm64-v8a/
           cp target/x86_64-linux-android/release/libciris_persist.so \
              dist/android/x86_64/
+          cp target/armv7-linux-androideabi/release/libciris_persist.so \
+             dist/android/armeabi-v7a/
 
           # Strip with NDK's llvm-strip
           STRIP="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
           if [ -x "$STRIP" ]; then
             "$STRIP" dist/android/arm64-v8a/libciris_persist.so
             "$STRIP" dist/android/x86_64/libciris_persist.so
+            "$STRIP" dist/android/armeabi-v7a/libciris_persist.so
             echo "✓ stripped with NDK llvm-strip"
           else
             echo "::warning::llvm-strip not found at expected path; shipping unstripped"
@@ -470,6 +479,8 @@ jobs:
           ls -la dist/android/arm64-v8a/
           echo "=== x86_64 ==="
           ls -la dist/android/x86_64/
+          echo "=== armeabi-v7a ==="
+          ls -la dist/android/armeabi-v7a/
 
           tar -czf "dist/ciris-persist-v${VERSION}-android.tar.gz" \
             -C dist android
@@ -481,17 +492,15 @@ jobs:
           name: ciris-persist-android
           path: dist/ciris-persist-v*-android.tar.gz
 
-      # v2.0.5 — Chaquopy-shaped Android wheels (issue #96).
-      # Separate build pass with pyo3 + extension-module features.
-      # PYO3_CONFIG_FILE bypasses host Python detection entirely and
-      # tells PyO3 exactly what it needs: CPython 3.10, abi3 mode,
-      # suppress link lines (extension-module — Chaquopy's CPython
-      # provides symbols at import time). cp310 tag because Chaquopy
-      # ships Python 3.10.
-      - name: create PyO3 cross-compilation config for Android
+      # v2.0.6 — Chaquopy abi3 Android wheels (issues #96, #97, #98).
+      # PYO3_CONFIG_FILE bypasses host Python detection entirely.
+      # abi3=true produces stable-ABI .so (no _Py_IncRef etc.) and
+      # wheels are tagged cp310-abi3 so Chaquopy accepts them.
+      # Separate 64-bit and 32-bit configs for pointer_width.
+      - name: create PyO3 cross-compilation configs for Android
         run: |
-          CFG="${RUNNER_TEMP}/pyo3-android.config"
-          cat > "${CFG}" <<'CFGEOF'
+          CFG64="${RUNNER_TEMP}/pyo3-android-64.config"
+          cat > "${CFG64}" <<'CFGEOF'
           implementation=CPython
           version=3.10
           shared=false
@@ -503,27 +512,53 @@ jobs:
           build_flags=
           suppress_build_script_link_lines=true
           CFGEOF
-          # Strip leading whitespace from heredoc (YAML indentation)
-          sed -i 's/^[[:space:]]*//' "${CFG}"
-          echo "PYO3_CONFIG_FILE=${CFG}" >> "$GITHUB_ENV"
-          echo "✓ PyO3 config:"
-          cat "${CFG}"
-      - name: cargo ndk build (aarch64 — PyO3 Chaquopy)
+          sed -i 's/^[[:space:]]*//' "${CFG64}"
+
+          CFG32="${RUNNER_TEMP}/pyo3-android-32.config"
+          cat > "${CFG32}" <<'CFGEOF'
+          implementation=CPython
+          version=3.10
+          shared=false
+          abi3=true
+          lib_name=python3.10
+          lib_dir=
+          executable=
+          pointer_width=32
+          build_flags=
+          suppress_build_script_link_lines=true
+          CFGEOF
+          sed -i 's/^[[:space:]]*//' "${CFG32}"
+
+          echo "PYO3_CONFIG_FILE_64=${CFG64}" >> "$GITHUB_ENV"
+          echo "PYO3_CONFIG_FILE_32=${CFG32}" >> "$GITHUB_ENV"
+          echo "✓ PyO3 configs (64-bit + 32-bit):"
+          echo "--- 64-bit ---"; cat "${CFG64}"
+          echo "--- 32-bit ---"; cat "${CFG32}"
+      - name: cargo ndk build (aarch64 — PyO3 Chaquopy abi3)
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          PYO3_CONFIG_FILE: ${{ runner.temp }}/pyo3-android-64.config
         run: >-
           cargo ndk -t arm64-v8a build --release
           --features "pyo3 extension-module $MOBILE_FEATURES"
-      - name: cargo ndk build (x86_64 — PyO3 Chaquopy)
+      - name: cargo ndk build (x86_64 — PyO3 Chaquopy abi3)
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           OPENSSL_NO_VENDOR: "1"
           X86_64_LINUX_ANDROID_OPENSSL_DIR: ${{ runner.temp }}/openssl-x86_64-android
           X86_64_LINUX_ANDROID_OPENSSL_STATIC: "1"
+          PYO3_CONFIG_FILE: ${{ runner.temp }}/pyo3-android-64.config
         run: >-
           cargo ndk -t x86_64 build --release
           --features "pyo3 extension-module $MOBILE_FEATURES"
-      - name: package Chaquopy wheels
+      - name: cargo ndk build (armeabi-v7a — PyO3 Chaquopy abi3)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          PYO3_CONFIG_FILE: ${{ runner.temp }}/pyo3-android-32.config
+        run: >-
+          cargo ndk -t armeabi-v7a build --release
+          --features "pyo3 extension-module $MOBILE_FEATURES"
+      - name: package Chaquopy abi3 wheels
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
@@ -533,9 +568,8 @@ jobs:
           build_wheel() {
             local TARGET="$1"    # e.g. aarch64-linux-android
             local ABI="$2"       # e.g. arm64_v8a (underscore for wheel tag)
-            local SO_TAG="$3"    # e.g. aarch64
 
-            local WHEEL_TAG="cp310-cp310-android_24_${ABI}"
+            local WHEEL_TAG="cp310-abi3-android_24_${ABI}"
             local WHEEL_NAME="ciris_persist-${VERSION}-${WHEEL_TAG}.whl"
             local WORK="dist/wheel-work/${ABI}"
 
@@ -598,14 +632,16 @@ jobs:
             echo "✓ ${WHEEL_NAME} ($(stat -c%s "dist/${WHEEL_NAME}") bytes)"
           }
 
-          build_wheel aarch64-linux-android arm64_v8a aarch64
-          build_wheel x86_64-linux-android x86_64 x86_64
+          build_wheel aarch64-linux-android arm64_v8a
+          build_wheel x86_64-linux-android x86_64
+          build_wheel armv7-linux-androideabi armeabi_v7a
 
           # Bundle into a tarball for the release asset
           tar -czf "dist/ciris-persist-v${VERSION}-android-wheels.tar.gz" \
             -C dist \
-            "ciris_persist-${VERSION}-cp310-cp310-android_24_arm64_v8a.whl" \
-            "ciris_persist-${VERSION}-cp310-cp310-android_24_x86_64.whl"
+            "ciris_persist-${VERSION}-cp310-abi3-android_24_arm64_v8a.whl" \
+            "ciris_persist-${VERSION}-cp310-abi3-android_24_x86_64.whl" \
+            "ciris_persist-${VERSION}-cp310-abi3-android_24_armeabi_v7a.whl"
 
           echo "✓ packaged ciris-persist-v${VERSION}-android-wheels.tar.gz"
           ls -la dist/ciris-persist-v${VERSION}-android-wheels.tar.gz
@@ -1417,6 +1453,6 @@ jobs:
             echo ""
             echo "- \`ciris-persist-v${VERSION}-ios.tar.gz\`"
             echo "- \`ciris-persist-v${VERSION}-android.tar.gz\`"
-            echo "- \`ciris-persist-v${VERSION}-android-wheels.tar.gz\` (Chaquopy cp310 wheels)"
+            echo "- \`ciris-persist-v${VERSION}-android-wheels.tar.gz\` (Chaquopy abi3 wheels: arm64, x86_64, armeabi-v7a)"
             echo "- \`SHA256SUMS\`"
           } >> "$GITHUB_STEP_SUMMARY"
