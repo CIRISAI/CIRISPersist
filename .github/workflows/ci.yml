@@ -469,7 +469,7 @@ jobs:
           TOOLCHAIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64"
           echo 'void __pystub(void){}' | \
             "${TOOLCHAIN}/bin/${{ matrix.clang_prefix }}-clang" \
-              -shared -Wl,-soname,libpython3.10.so \
+              -shared -nostdlib -Wl,-soname,libpython3.10.so \
               -o "${STUB_DIR}/libpython3.10.so" -x c -
           echo "✓ PyO3 config (pointer_width=${{ matrix.pointer_width }}):"
           cat "${CFG}"
@@ -481,7 +481,7 @@ jobs:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           RUSTFLAGS: "-L ${{ runner.temp }}/python-stub -C link-arg=-lpython3.10"
         run: >-
-          cargo ndk -t ${{ matrix.abi }} build --release
+          cargo ndk -t ${{ matrix.abi }} build --release --lib
           --features "pyo3 extension-module $MOBILE_FEATURES"
 
       - name: verify DT_NEEDED includes libpython3.10.so
