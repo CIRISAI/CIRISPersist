@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779920920179,
+  "lastUpdate": 1779925269031,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -32855,6 +32855,210 @@ window.BENCHMARK_DATA = {
             "name": "storage_floor/next_sequence_full",
             "value": 53055,
             "range": "± 6049",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "4a76f9d32ab3803323801049dbd813358eaa80cf",
+          "message": "2.3.0 — #103 federation_blobs content-addressable storage substrate\n\ncloses #103. The companion to CIRISEdge#21 (ContentFetch transport)\nand the planned NodeCore node-mode serving — where the SHA-256\nhashes in federation_attestations.evidence_refs resolve to bytes.\n\n- V047 federation_blobs table (both dialects): sha256 PK (32-byte\n  CHECK), storage_kind enum CHECK in (inline / s3 / external_url),\n  bytes_inline + external_ref with a named CHECK enforcing the\n  inline ↔ external split, size_bytes, media_type, first_seen_at,\n  regions_held TEXT[].\n\n- BlobStorage trait (sibling, not FederationDirectory extension —\n  directory is identity+trust, blobs are content-addressable bytes,\n  distinct concerns). put_blob / get_blob / has_blob / list_holders.\n  BlobBody { Inline(Vec<u8>) | External(ExternalRef) } — persist\n  stores bytes or URI metadata; never fetches from S3 (caller's job).\n\n- Hash-on-write via sha2: Inline body verifies bytes match SHA; typed\n  BlobError::HashMismatch on mismatch. External trusts the caller-\n  supplied SHA (documented invariant).\n\n- Inline-size cap configurable via with_inline_bytes_cap(cap) builder;\n  default 1 MiB. Prevents accidental multi-GB inlines.\n\n- holds_bytes:sha256:<first-8-hex> attestation auto-emission into the\n  existing federation_attestations table. Full SHA in evidence_refs\n  for collision resolution. list_holders queries the prefix index\n  server-side then filters by full-SHA client-side. 8-hex prefix =\n  32 bits = birthday collision at ~65k blobs.\n\n- Conflicting-storage_kind policy: first-write-wins (silent accept) —\n  the blob is content-addressed, the SHA IS the identity. The SHA PK\n  collapses via INSERT ... ON CONFLICT DO NOTHING. holder attestation\n  lands per call so list_holders returns every writer.\n\n- PyO3 surface: put_blob_json / get_blob_json / has_blob_json /\n  list_holders_json. Base64-standard strings on the JSON wire for\n  inline bytes (mirrors v2.2.0 delivery_attestation surface).\n\nDeferred to follow-up: GC (no delete_blob in v0.1; blobs persist as\nlong as attestations cite them) and server-side evidence_refs[]\ncontainment lookup (today's full-SHA filter is client-side after the\nprefix query).\n\nPG read path uses PgRowExt::safe_get_with per persist convention (the\nhook caught bare row.get on the first commit attempt — fixed before\npush).\n\nVerified: clippy --all-targets clean; 678/678 nextest tests pass on\nboth backends, fresh DB, full feature set, --test-threads=1.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-27T18:28:19-05:00",
+          "tree_id": "1a6c0bbcc912a688859a27c9a167aee89e2b7999",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/4a76f9d32ab3803323801049dbd813358eaa80cf"
+        },
+        "date": 1779925268225,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 108661,
+            "range": "± 755",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 257285,
+            "range": "± 997",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 561522,
+            "range": "± 6181",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1995110,
+            "range": "± 5569",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2221166,
+            "range": "± 41251",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6910195,
+            "range": "± 47572",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25408680,
+            "range": "± 122643",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 304377,
+            "range": "± 22071",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 333093,
+            "range": "± 19810",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 699172,
+            "range": "± 78824",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 1636702,
+            "range": "± 206732",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 26280147,
+            "range": "± 773120",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 11318178,
+            "range": "± 151648",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 652539,
+            "range": "± 44141",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 1805786,
+            "range": "± 37276",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 106000175,
+            "range": "± 568330",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 4235256,
+            "range": "± 135611",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 17883508,
+            "range": "± 303551",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 263458529,
+            "range": "± 8598248",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 10891741,
+            "range": "± 634671",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 45781317,
+            "range": "± 540089",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 230709,
+            "range": "± 20360",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 183550,
+            "range": "± 14164",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 47679,
+            "range": "± 1421",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 154866,
+            "range": "± 1600",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 1199495,
+            "range": "± 11530",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 48,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 23574,
+            "range": "± 819",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 3738,
+            "range": "± 18",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 38209,
+            "range": "± 1563",
             "unit": "ns/iter"
           }
         ]
