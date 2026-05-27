@@ -12,6 +12,7 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+use super::federation_announcement::{DeliveryAttestation, TransportMedium};
 use super::service::NodeCoreService;
 use super::types::{
     Cell, ContributionEnvelope, ContributionListPage, ContributionType, ContributionsFilter,
@@ -108,6 +109,24 @@ impl NodeCoreService for PostgresBackend {
                 "subject.subject (subject_kind) required for contributions".into(),
             )
         })?;
+
+        // v2.1 (CIRISPersist#101) — federation_announcement extracts
+        // priority + authority_class from the payload and writes them
+        // to the dedicated columns. The admission helper applies the
+        // constitutional asymmetry (FSD §4.5) BEFORE the DB CHECK
+        // fires, so callers get the more specific typed error.
+        let announcement = super::federation_announcement::extract_announcement_payload(
+            subject_kind,
+            &env.payload,
+        )?;
+        let (announcement_priority, announcement_authority_class): (
+            Option<&'static str>,
+            Option<&'static str>,
+        ) = match announcement.as_ref() {
+            Some(p) => (Some(p.priority.as_str()), Some(p.authority_class.as_str())),
+            None => (None, None),
+        };
+
         let client = self
             .pool()
             .get()
@@ -122,8 +141,9 @@ impl NodeCoreService for PostgresBackend {
                 "INSERT INTO cirisnode.contributions (\
                     contribution_id, contribution_type, domain, language, subject_kind, \
                     author_id, payload, witness_set, submitted_at, \
-                    signature, signing_key_id, signature_verified, persist_row_hash\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, TRUE, $12)",
+                    signature, signing_key_id, signature_verified, persist_row_hash, \
+                    announcement_priority, announcement_authority_class\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, TRUE, $12, $13, $14)",
                 &[
                     &id,
                     &contribution_type_str(env.contribution_type),
@@ -137,6 +157,8 @@ impl NodeCoreService for PostgresBackend {
                     &env.signature.ed25519,
                     &env.author_id, // signing_key_id = author for self-signed contributions
                     &env.signature.ed25519, // persist_row_hash placeholder; canonical hash lands in v0.7.0.x
+                    &announcement_priority,
+                    &announcement_authority_class,
                 ],
             )
             .await
@@ -604,6 +626,29 @@ impl NodeCoreService for PostgresBackend {
             params.push(Box::new(c));
             where_parts.push(format!("is_canonical = ${}", params.len()));
         }
+        // v2.1 (CIRISPersist#101) — federation_announcement filters.
+        // priority / authority_class are indexed columns added in
+        // V046 (non-announcement rows have NULL in both); `kind`
+        // lives inside the payload JSONB and is matched via
+        // `payload->'kind'` equality. All three compose AND-style.
+        if let Some(p) = filter.priority {
+            params.push(Box::new(p.as_str().to_owned()));
+            where_parts.push(format!("announcement_priority = ${}", params.len()));
+        }
+        if let Some(a) = filter.authority_class {
+            params.push(Box::new(a.as_str().to_owned()));
+            where_parts.push(format!("announcement_authority_class = ${}", params.len()));
+        }
+        if let Some(k) = filter.kind {
+            // `serde_json::to_value` of the enum produces either a
+            // bare string ("policy_update") or an object
+            // (`{"custom": "..."}`). Either shape compares via the
+            // `payload->'kind'` JSONB path.
+            let value = serde_json::to_value(&k)
+                .map_err(|e| Error::Internal(format!("AnnouncementKind serialize: {e}")))?;
+            params.push(Box::new(value));
+            where_parts.push(format!("payload->'kind' = ${}::jsonb", params.len()));
+        }
         if let Some(cur) = &cursor {
             if cur.version != "v1" {
                 return Err(Error::InvalidArgument(format!(
@@ -862,6 +907,162 @@ impl NodeCoreService for PostgresBackend {
             last_update_contribution: row.get(6),
             created_at: row.get(7),
         }))
+    }
+
+    // ── Federation delivery attestations (v2.1, CIRISPersist#101) ──
+
+    async fn put_delivery_attestation(
+        &self,
+        attestation: DeliveryAttestation,
+    ) -> Result<(), Error> {
+        // Validate the FSD §3.2.1 byte-length invariants up-front. The
+        // DB has matching CHECKs, but admission catches the error with
+        // a typed shape before consuming a pool connection.
+        let canonical_hash = attestation.canonical_hash_bytes()?;
+        let _ = attestation.signature_classical_bytes()?;
+        let pqc_bytes = attestation.signature_pqc_bytes()?;
+        let announcement_uuid = parse_id(&attestation.announcement_id)?;
+
+        // Hybrid signature verify against federation_keys[peer_key_id]
+        // via persist's existing directory path. The peer is the
+        // signer; the canonical-bytes encoding is the FSD §3.2.1
+        // domain-prefixed layout produced by
+        // `DeliveryAttestation::canonical_bytes`.
+        let canonical = attestation
+            .canonical_bytes()
+            .map_err(|e| Error::Signature(format!("canonical_bytes: {e}")))?;
+        let outcome = crate::verify::verify_hybrid_via_directory(
+            self,
+            &canonical,
+            &attestation.peer_key_id,
+            &attestation.signature_classical_base64,
+            attestation.signature_pqc_base64.as_deref(),
+            // Ed25519Fallback mirrors the cirisnode envelope verify
+            // policy (`super::verify::verify_envelope_signed`): PQC
+            // accepted when present, classical-only accepted while
+            // the per-peer PQC rollout runs.
+            crate::verify::hybrid::HybridPolicy::Ed25519Fallback,
+            None,
+        )
+        .await
+        .map_err(|e| {
+            // Translate the verify error tokens through the cirisnode
+            // Error::Signature variant — the kind() token is preserved
+            // for downstream callers via the verify_kind taxonomy.
+            Error::Signature(format!("delivery_attestation verify: {e}"))
+        })?;
+        let _ = outcome;
+
+        let persist_row_hash = crate::federation::types::compute_persist_row_hash(&attestation)
+            .map_err(|e| Error::Internal(format!("persist_row_hash: {e}")))?;
+
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+
+        let result = client
+            .execute(
+                "INSERT INTO cirisnode.federation_delivery_attestations (\
+                    announcement_id, announcement_canonical_hash, peer_key_id, \
+                    peer_pubkey_ed25519_base64, received_at, transport_id, \
+                    signature_classical, signature_pqc, signature_verified, persist_row_hash\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE, $9) \
+                 ON CONFLICT (announcement_id, peer_key_id) DO NOTHING",
+                &[
+                    &announcement_uuid,
+                    &canonical_hash.as_slice(),
+                    &attestation.peer_key_id,
+                    &attestation.peer_pubkey_ed25519_base64,
+                    &attestation.received_at,
+                    &attestation.transport_id.as_str(),
+                    &attestation.signature_classical_bytes()?.as_slice(),
+                    &pqc_bytes,
+                    &persist_row_hash,
+                ],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "put_delivery_attestation"))?;
+        // ON CONFLICT DO NOTHING returns 0 affected rows when the row
+        // already exists — that's the idempotent replay path per
+        // FSD §3.2.1. Both 0 and 1 are success.
+        let _ = result;
+        Ok(())
+    }
+
+    async fn list_delivery_attestations(
+        &self,
+        announcement_id: &str,
+    ) -> Result<Vec<DeliveryAttestation>, Error> {
+        let announcement_uuid = parse_id(announcement_id)?;
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let rows = client
+            .query(
+                "SELECT announcement_id::text, announcement_canonical_hash, peer_key_id, \
+                        peer_pubkey_ed25519_base64, received_at, transport_id, \
+                        signature_classical, signature_pqc \
+                 FROM cirisnode.federation_delivery_attestations \
+                 WHERE announcement_id = $1 \
+                 ORDER BY received_at DESC",
+                &[&announcement_uuid],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "list_delivery_attestations"))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let hash_bytes: Vec<u8> = row.get(1);
+            let sig_classical: Vec<u8> = row.get(6);
+            let sig_pqc_opt: Option<Vec<u8>> = row.get(7);
+            let transport_str: &str = row.get(5);
+            let transport_id = TransportMedium::from_wire_str(transport_str).ok_or_else(|| {
+                Error::Backend(format!("unknown transport_id from DB: {transport_str}"))
+            })?;
+            out.push(DeliveryAttestation {
+                announcement_id: row.get(0),
+                announcement_canonical_hash_base64:
+                    super::federation_announcement::encode_canonical_hash_base64(
+                        &<[u8; 32]>::try_from(hash_bytes.as_slice()).map_err(|_| {
+                            Error::Backend("stored canonical_hash not 32 bytes".to_string())
+                        })?,
+                    ),
+                peer_key_id: row.get(2),
+                peer_pubkey_ed25519_base64: row.get(3),
+                received_at: row.get(4),
+                transport_id,
+                signature_classical_base64: super::federation_announcement::encode_signature_base64(
+                    &sig_classical,
+                ),
+                signature_pqc_base64: sig_pqc_opt
+                    .map(|b| super::federation_announcement::encode_signature_base64(&b)),
+            });
+        }
+        Ok(out)
+    }
+
+    async fn count_delivery_attestations(&self, announcement_id: &str) -> Result<u64, Error> {
+        let announcement_uuid = parse_id(announcement_id)?;
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let row = client
+            .query_one(
+                "SELECT COUNT(*) FROM cirisnode.federation_delivery_attestations \
+                 WHERE announcement_id = $1",
+                &[&announcement_uuid],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "count_delivery_attestations"))?;
+        let n: i64 = row.get(0);
+        // COUNT(*) is non-negative; the cast is lossless within real-
+        // world deployment sizes (PG counts are i64 max 2^63-1).
+        Ok(u64::try_from(n).unwrap_or(0))
     }
 }
 
@@ -1280,5 +1481,605 @@ mod tests {
             .put_promotion_attestation(recovery_att)
             .await
             .expect("attestation row was rolled back, so re-use must succeed");
+    }
+
+    // ─── Federation Announcement (v2.1, CIRISPersist#101) ───────────
+
+    /// Build an envelope carrying a `FederationAnnouncementPayload`
+    /// and sign it. The contribution_type is `Proposal` — the broad
+    /// envelope class for subject-kind-routed payloads per SCHEMA.md
+    /// section 4; subject.subject = `federation_announcement` is the
+    /// discriminator the row-table CHECK + announcement columns pivot
+    /// on.
+    fn build_announcement(
+        author_key: &ed25519_dalek::SigningKey,
+        priority: crate::cirisnode::AnnouncementPriority,
+        authority_class: crate::cirisnode::AuthorityClass,
+        kind: crate::cirisnode::AnnouncementKind,
+        accord_payload: Option<crate::cirisnode::AccordCarrier>,
+        supersedes: Option<String>,
+    ) -> ContributionEnvelope {
+        let author = pubkey_b64(author_key);
+        let payload = crate::cirisnode::FederationAnnouncementPayload {
+            priority,
+            kind,
+            title: "test announcement".into(),
+            body: "test body".into(),
+            authority_class,
+            accord_payload,
+            supersedes,
+            expires_at: chrono::Utc::now() + chrono::Duration::days(1),
+            evidence_refs: vec![],
+        };
+        let mut env = ContributionEnvelope {
+            contribution_id: Uuid::new_v4().to_string(),
+            contribution_type: ContributionType::Proposal,
+            author_id: author,
+            subject: Cell {
+                domain: "federation".into(),
+                language: "en".into(),
+                subject: Some(crate::cirisnode::SUBJECT_KIND.into()),
+            },
+            payload: serde_json::to_value(&payload).unwrap(),
+            witness_set: None,
+            signature: HybridSignature {
+                ed25519: String::new(),
+                ml_dsa_65: None,
+                signed_at: Utc::now(),
+            },
+            submitted_at: Utc::now(),
+        };
+        env.signature = sign_envelope(&env, author_key);
+        env
+    }
+
+    /// Round-trip a federation_announcement per AuthorityClass +
+    /// representative AnnouncementKind. Covers the four authority
+    /// classes (BootstrapSeed, RootWa, WaQuorum, HumanityAccord) and
+    /// confirms the indexed columns + JSONB payload survive a
+    /// list_contributions read.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn federation_announcement_round_trip_each_authority_class() {
+        use crate::cirisnode::{AnnouncementKind, AnnouncementPriority, AuthorityClass};
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xC1; 32]);
+
+        let fixtures: Vec<(AnnouncementPriority, AuthorityClass, AnnouncementKind)> = vec![
+            (
+                AnnouncementPriority::Informational,
+                AuthorityClass::BootstrapSeed,
+                AnnouncementKind::PolicyUpdate,
+            ),
+            (
+                AnnouncementPriority::Advisory,
+                AuthorityClass::RootWa,
+                AnnouncementKind::ThreatAdvisory,
+            ),
+            (
+                AnnouncementPriority::Urgent,
+                AuthorityClass::WaQuorum,
+                AnnouncementKind::KeyRotation,
+            ),
+            (
+                AnnouncementPriority::AccordCarrier,
+                AuthorityClass::HumanityAccord,
+                AnnouncementKind::AccordCarrier,
+            ),
+        ];
+
+        let mut written_ids: Vec<String> = Vec::new();
+        for (priority, authority, kind) in fixtures {
+            let accord_payload = if matches!(priority, AnnouncementPriority::AccordCarrier) {
+                Some(crate::cirisnode::AccordCarrier {
+                    payload_bytes: (0u8..77).collect(),
+                    rationale: Some("drill".into()),
+                })
+            } else {
+                None
+            };
+            let env =
+                build_announcement(&author_key, priority, authority, kind, accord_payload, None);
+            written_ids.push(env.contribution_id.clone());
+            backend.put_contribution(env).await.unwrap();
+        }
+
+        // 77-byte accord payload round-trip — read the AccordCarrier
+        // row back and confirm payload_bytes is byte-equal.
+        let accord_id = &written_ids[3];
+        let page = backend
+            .list_contributions(
+                ContributionsFilter {
+                    subject_kind: Some(crate::cirisnode::SUBJECT_KIND.into()),
+                    priority: Some(AnnouncementPriority::AccordCarrier),
+                    ..Default::default()
+                },
+                None,
+                1000,
+            )
+            .await
+            .unwrap();
+        let accord_item = page
+            .items
+            .iter()
+            .find(|i| &i.contribution_id == accord_id)
+            .expect("accord carrier row read back");
+        let payload: crate::cirisnode::FederationAnnouncementPayload =
+            serde_json::from_value(accord_item.payload.clone()).unwrap();
+        let accord = payload.accord_payload.expect("accord_payload present");
+        assert_eq!(accord.payload_bytes.len(), 77);
+        assert_eq!(accord.payload_bytes, (0u8..77).collect::<Vec<u8>>());
+    }
+
+    /// FSD §4.5: a federation_announcement claiming AccordCarrier
+    /// priority under a non-HumanityAccord authority class is
+    /// rejected at write admission with the typed error variant.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn federation_announcement_rejects_constitutional_asymmetry_violation() {
+        use crate::cirisnode::{AnnouncementKind, AnnouncementPriority, AuthorityClass};
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xC2; 32]);
+        // AccordCarrier priority signed by RootWa — wire-format violation.
+        let env = build_announcement(
+            &author_key,
+            AnnouncementPriority::AccordCarrier,
+            AuthorityClass::RootWa,
+            AnnouncementKind::AccordCarrier,
+            Some(crate::cirisnode::AccordCarrier {
+                payload_bytes: vec![0u8; 77],
+                rationale: None,
+            }),
+            None,
+        );
+        let err = backend.put_contribution(env).await.unwrap_err();
+        assert!(
+            matches!(err, Error::FederationAnnouncementAuthorityMismatch(_)),
+            "expected FederationAnnouncementAuthorityMismatch, got: {err:?}"
+        );
+
+        // Conversely: HumanityAccord signing Urgent is also rejected.
+        let env2 = build_announcement(
+            &author_key,
+            AnnouncementPriority::Urgent,
+            AuthorityClass::HumanityAccord,
+            AnnouncementKind::PolicyUpdate,
+            None,
+            None,
+        );
+        let err2 = backend.put_contribution(env2).await.unwrap_err();
+        assert!(matches!(
+            err2,
+            Error::FederationAnnouncementAuthorityMismatch(_)
+        ));
+    }
+
+    /// Supersedes chain — write announcement A, then announcement B
+    /// with `supersedes = Some(A.id)`. list_contributions returns
+    /// both rows; the payload on B carries the back-reference.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn federation_announcement_supersedes_chain_round_trip() {
+        use crate::cirisnode::{AnnouncementKind, AnnouncementPriority, AuthorityClass};
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xC3; 32]);
+
+        let env_a = build_announcement(
+            &author_key,
+            AnnouncementPriority::Advisory,
+            AuthorityClass::RootWa,
+            AnnouncementKind::PolicyUpdate,
+            None,
+            None,
+        );
+        let a_id = env_a.contribution_id.clone();
+        backend.put_contribution(env_a).await.unwrap();
+
+        let env_b = build_announcement(
+            &author_key,
+            AnnouncementPriority::Advisory,
+            AuthorityClass::RootWa,
+            AnnouncementKind::PolicyUpdate,
+            None,
+            Some(a_id.clone()),
+        );
+        let b_id = env_b.contribution_id.clone();
+        backend.put_contribution(env_b).await.unwrap();
+
+        // Both rows surface; B carries the back-reference.
+        let page = backend
+            .list_contributions(
+                ContributionsFilter {
+                    subject_kind: Some(crate::cirisnode::SUBJECT_KIND.into()),
+                    author_id: Some(pubkey_b64(&author_key)),
+                    priority: Some(AnnouncementPriority::Advisory),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        let ids: std::collections::HashSet<_> = page
+            .items
+            .iter()
+            .map(|i| i.contribution_id.clone())
+            .collect();
+        assert!(ids.contains(&a_id));
+        assert!(ids.contains(&b_id));
+        let b_row = page
+            .items
+            .iter()
+            .find(|i| i.contribution_id == b_id)
+            .unwrap();
+        let p: crate::cirisnode::FederationAnnouncementPayload =
+            serde_json::from_value(b_row.payload.clone()).unwrap();
+        assert_eq!(p.supersedes.as_deref(), Some(a_id.as_str()));
+    }
+
+    /// list_contributions filter extension — 6+ announcements, query
+    /// by various filter combinations. Confirms priority,
+    /// authority_class, and kind compose AND-style with each other
+    /// and the existing subject_kind / author_id filters.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn list_contributions_filter_extension() {
+        use crate::cirisnode::{AnnouncementKind, AnnouncementPriority, AuthorityClass};
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xC4; 32]);
+        let author = pubkey_b64(&author_key);
+
+        let fixtures: Vec<(AnnouncementPriority, AuthorityClass, AnnouncementKind)> = vec![
+            (
+                AnnouncementPriority::Informational,
+                AuthorityClass::BootstrapSeed,
+                AnnouncementKind::PolicyUpdate,
+            ),
+            (
+                AnnouncementPriority::Informational,
+                AuthorityClass::RootWa,
+                AnnouncementKind::Deprecation,
+            ),
+            (
+                AnnouncementPriority::Advisory,
+                AuthorityClass::RootWa,
+                AnnouncementKind::ThreatAdvisory,
+            ),
+            (
+                AnnouncementPriority::Advisory,
+                AuthorityClass::WaQuorum,
+                AnnouncementKind::MissionUpdate,
+            ),
+            (
+                AnnouncementPriority::Urgent,
+                AuthorityClass::WaQuorum,
+                AnnouncementKind::KeyRotation,
+            ),
+            (
+                AnnouncementPriority::AccordCarrier,
+                AuthorityClass::HumanityAccord,
+                AnnouncementKind::AccordCarrier,
+            ),
+        ];
+
+        let mut written_ids: Vec<String> = Vec::new();
+        for (pri, aut, kind) in &fixtures {
+            let accord_payload = if matches!(pri, AnnouncementPriority::AccordCarrier) {
+                Some(crate::cirisnode::AccordCarrier {
+                    payload_bytes: vec![0u8; 77],
+                    rationale: None,
+                })
+            } else {
+                None
+            };
+            let env =
+                build_announcement(&author_key, *pri, *aut, kind.clone(), accord_payload, None);
+            written_ids.push(env.contribution_id.clone());
+            backend.put_contribution(env).await.unwrap();
+        }
+
+        // priority = informational → 2 rows.
+        let page = backend
+            .list_contributions(
+                ContributionsFilter {
+                    author_id: Some(author.clone()),
+                    subject_kind: Some(crate::cirisnode::SUBJECT_KIND.into()),
+                    priority: Some(AnnouncementPriority::Informational),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 2, "priority=informational");
+
+        // authority_class = root_wa → 2 rows.
+        let page = backend
+            .list_contributions(
+                ContributionsFilter {
+                    author_id: Some(author.clone()),
+                    subject_kind: Some(crate::cirisnode::SUBJECT_KIND.into()),
+                    authority_class: Some(AuthorityClass::RootWa),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 2, "authority_class=root_wa");
+
+        // priority = advisory AND authority_class = wa_quorum → 1 row.
+        let page = backend
+            .list_contributions(
+                ContributionsFilter {
+                    author_id: Some(author.clone()),
+                    subject_kind: Some(crate::cirisnode::SUBJECT_KIND.into()),
+                    priority: Some(AnnouncementPriority::Advisory),
+                    authority_class: Some(AuthorityClass::WaQuorum),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+
+        // kind = key_rotation → 1 row.
+        let page = backend
+            .list_contributions(
+                ContributionsFilter {
+                    author_id: Some(author.clone()),
+                    subject_kind: Some(crate::cirisnode::SUBJECT_KIND.into()),
+                    kind: Some(AnnouncementKind::KeyRotation),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1, "kind=key_rotation");
+
+        // No filter → all 6 announcement rows for this author.
+        let page = backend
+            .list_contributions(
+                ContributionsFilter {
+                    author_id: Some(author.clone()),
+                    subject_kind: Some(crate::cirisnode::SUBJECT_KIND.into()),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 6);
+    }
+
+    // ─── Federation Delivery Attestations (FSD §3.2.1) ──────────────
+
+    /// Build a federation key + sign it on the directory. Returns the
+    /// (key_id, signing_key, base64 pubkey) tuple ready to use as the
+    /// peer that emits an attestation.
+    async fn put_peer_federation_key(
+        backend: &PostgresBackend,
+        seed: u8,
+    ) -> (String, ed25519_dalek::SigningKey, String) {
+        use crate::federation::FederationDirectory;
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let pubkey_b64 = B64.encode(signing_key.verifying_key().to_bytes());
+        let key_id = format!("test-peer-{seed:02x}-{}", Uuid::new_v4());
+        let record = crate::federation::KeyRecord {
+            key_id: key_id.clone(),
+            pubkey_ed25519_base64: pubkey_b64.clone(),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: crate::federation::types::algorithm::HYBRID.into(),
+            identity_type: crate::federation::types::identity_type::AGENT.into(),
+            identity_ref: format!("agent-{seed:02x}"),
+            valid_from: Utc::now() - chrono::Duration::hours(1),
+            valid_until: None,
+            registration_envelope: serde_json::json!({"id": key_id}),
+            original_content_hash: "deadbeef".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: key_id.clone(),
+            scrub_timestamp: Utc::now(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+        };
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord { record })
+            .await
+            .unwrap();
+        (key_id, signing_key, pubkey_b64)
+    }
+
+    /// Build a signed DeliveryAttestation. The peer signs the
+    /// canonical-bytes of the attestation with the federation key
+    /// referenced by `peer_key_id`.
+    fn build_signed_attestation(
+        announcement_id: &str,
+        canonical_hash: &[u8; 32],
+        peer_key_id: &str,
+        peer_pubkey_b64: &str,
+        peer_signing_key: &ed25519_dalek::SigningKey,
+    ) -> crate::cirisnode::DeliveryAttestation {
+        use ed25519_dalek::Signer as _;
+        // Build the attestation with a placeholder signature, then
+        // re-sign the canonical bytes and stamp the real signature.
+        let mut att = crate::cirisnode::DeliveryAttestation {
+            announcement_id: announcement_id.to_owned(),
+            announcement_canonical_hash_base64: crate::cirisnode::encode_canonical_hash_base64(
+                canonical_hash,
+            ),
+            peer_key_id: peer_key_id.to_owned(),
+            peer_pubkey_ed25519_base64: peer_pubkey_b64.to_owned(),
+            received_at: Utc::now(),
+            transport_id: crate::cirisnode::TransportMedium::Reticulum,
+            signature_classical_base64: crate::cirisnode::encode_signature_base64(&[0u8; 64]),
+            signature_pqc_base64: None,
+        };
+        let canonical = att.canonical_bytes().unwrap();
+        let sig = peer_signing_key.sign(&canonical);
+        att.signature_classical_base64 = crate::cirisnode::encode_signature_base64(&sig.to_bytes());
+        att
+    }
+
+    /// Round-trip N delivery attestations for one announcement:
+    /// `put_delivery_attestation` × N → `list` × 1 returns N rows,
+    /// `count` × 1 returns N. Also covers idempotent replay
+    /// (duplicate (announcement_id, peer_key_id) is a no-op).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn delivery_attestation_round_trip_idempotent() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        // First write a federation_announcement to serve as the FK
+        // target — attestations reference an existing announcement.
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xC5; 32]);
+        let env = build_announcement(
+            &author_key,
+            crate::cirisnode::AnnouncementPriority::Advisory,
+            crate::cirisnode::AuthorityClass::RootWa,
+            crate::cirisnode::AnnouncementKind::ThreatAdvisory,
+            None,
+            None,
+        );
+        let announcement_id = env.contribution_id.clone();
+        backend.put_contribution(env).await.unwrap();
+
+        // Construct 3 peer federation keys + their attestations.
+        let canonical_hash: [u8; 32] = [0x42; 32];
+        let mut peers = Vec::new();
+        for seed in [0xD1u8, 0xD2u8, 0xD3u8] {
+            peers.push(put_peer_federation_key(&backend, seed).await);
+        }
+
+        for (key_id, signing_key, pubkey_b64) in &peers {
+            let att = build_signed_attestation(
+                &announcement_id,
+                &canonical_hash,
+                key_id,
+                pubkey_b64,
+                signing_key,
+            );
+            backend.put_delivery_attestation(att.clone()).await.unwrap();
+            // Idempotent replay — second call is no-op.
+            backend.put_delivery_attestation(att).await.unwrap();
+        }
+
+        // list_delivery_attestations returns all 3, newest-first.
+        let rows = backend
+            .list_delivery_attestations(&announcement_id)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        let peer_ids: std::collections::HashSet<&str> =
+            rows.iter().map(|r| r.peer_key_id.as_str()).collect();
+        for (kid, _, _) in &peers {
+            assert!(peer_ids.contains(kid.as_str()));
+        }
+
+        // count_delivery_attestations returns 3.
+        let n = backend
+            .count_delivery_attestations(&announcement_id)
+            .await
+            .unwrap();
+        assert_eq!(n, 3);
+
+        // Canonical hash + transport_id survive round trip byte-equal.
+        let first = &rows[0];
+        let back_hash = first.canonical_hash_bytes().unwrap();
+        assert_eq!(back_hash, canonical_hash);
+        assert_eq!(
+            first.transport_id,
+            crate::cirisnode::TransportMedium::Reticulum
+        );
+    }
+
+    /// FSD §3.2.1 threat model: a forged attestation (signature
+    /// produced by a DIFFERENT key than `peer_key_id` claims) is
+    /// rejected at admission with [`Error::Signature`].
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn delivery_attestation_rejects_forged_signature() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        // Set up the FK target.
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xC6; 32]);
+        let env = build_announcement(
+            &author_key,
+            crate::cirisnode::AnnouncementPriority::Informational,
+            crate::cirisnode::AuthorityClass::BootstrapSeed,
+            crate::cirisnode::AnnouncementKind::PolicyUpdate,
+            None,
+            None,
+        );
+        let announcement_id = env.contribution_id.clone();
+        backend.put_contribution(env).await.unwrap();
+
+        let (legit_key_id, _legit_signer, legit_pubkey_b64) =
+            put_peer_federation_key(&backend, 0xE1).await;
+        let attacker_signer = ed25519_dalek::SigningKey::from_bytes(&[0xFE; 32]);
+
+        // Build an attestation CLAIMING to be from the legit peer but
+        // sign with the attacker's key. The directory pubkey is
+        // legit_pubkey_b64 → verify must fail.
+        let att = build_signed_attestation(
+            &announcement_id,
+            &[0u8; 32],
+            &legit_key_id,
+            &legit_pubkey_b64,
+            &attacker_signer,
+        );
+        let err = backend.put_delivery_attestation(att).await.unwrap_err();
+        assert!(matches!(err, Error::Signature(_)), "got: {err:?}");
     }
 }

@@ -55,6 +55,7 @@
 //! - **v0.7.0-α5**: Engine PyO3 wraps.
 //! - **v0.7.0**: release tag.
 
+pub mod federation_announcement;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod service;
@@ -63,6 +64,12 @@ pub mod sqlite;
 pub mod types;
 pub mod verify;
 
+pub use federation_announcement::{
+    encode_canonical_hash_base64, encode_signature_base64, enforce_constitutional_asymmetry,
+    extract_announcement_payload, AccordCarrier, AnnouncementKind, AnnouncementPriority,
+    AuthorityClass, DeliveryAttestation, FederationAnnouncementPayload, TransportMedium,
+    DELIVERY_ATTESTATION_DOMAIN, SUBJECT_KIND,
+};
 pub use service::NodeCoreService;
 // v1.3.0 (CIRISPersist#47): convenience re-export of the
 // FederationDirectory trait so NodeCore consumers can use either
@@ -132,6 +139,20 @@ pub enum Error {
     /// persist bug; operators should file an issue.
     #[error("internal: {0}")]
     Internal(String),
+
+    /// v2.1 (CIRISPersist#101) — the constitutional asymmetry
+    /// (FSD §4.5) was violated: either `AccordCarrier` priority was
+    /// claimed under a non-HumanityAccord authority class, or a
+    /// HumanityAccord authority signed something other than
+    /// `AccordCarrier`, or `AccordCarrier` priority and kind were
+    /// mismatched. Wire-isolation between the humanity-accord
+    /// hierarchy and the federation-governance hierarchy is enforced
+    /// at admission; the schema's CHECK / trigger is the same rule
+    /// applied at storage. Distinguished from `InvalidArgument` so
+    /// callers can detect the constitutional violation specifically
+    /// (audit-chain framing, telemetry per-kind counters).
+    #[error("federation announcement authority mismatch: {0}")]
+    FederationAnnouncementAuthorityMismatch(String),
 }
 
 impl Error {
@@ -148,6 +169,9 @@ impl Error {
             Error::Backend(_) => "cirisnode_backend",
             Error::NotImplemented(_) => "cirisnode_not_implemented",
             Error::Internal(_) => "cirisnode_internal",
+            Error::FederationAnnouncementAuthorityMismatch(_) => {
+                "cirisnode_federation_announcement_authority_mismatch"
+            }
         }
     }
 }

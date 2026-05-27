@@ -76,6 +76,17 @@ impl SqliteBackend {
         self.conn.clone()
     }
 
+    /// v2.1 (CIRISPersist#101) — construct a `SqliteBackend` from an
+    /// existing connection handle (e.g. one shared with the cirisnode
+    /// substrate). Used internally by `cirisnode::sqlite` to compose
+    /// a `FederationDirectory` view over the same connection without
+    /// reopening the file. NO pragmas are applied — the caller has
+    /// already initialized the connection via
+    /// [`SqliteBackend::open`] / [`SqliteBackend::open_in_memory`].
+    pub fn from_conn_handle(conn: std::sync::Arc<tokio::sync::Mutex<Connection>>) -> Self {
+        Self { conn }
+    }
+
     /// Open (or create) a file-backed SQLite database.
     ///
     /// Path is passed verbatim to `rusqlite::Connection::open`. Use

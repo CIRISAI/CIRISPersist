@@ -24,6 +24,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::federation_announcement::{AnnouncementKind, AnnouncementPriority, AuthorityClass};
+
 // ─── envelope-level shared types ────────────────────────────────────
 
 /// `(domain, language, subject?)` tuple — the
@@ -396,6 +398,35 @@ pub struct ContributionsFilter {
     /// returns only canonical-chain rows; `Some(false)` returns
     /// only pending; `None` returns both.
     pub is_canonical: Option<bool>,
+    /// v2.1 (CIRISPersist#101) — narrow `federation_announcement`
+    /// rows by AnnouncementPriority. Applies only when
+    /// `subject_kind = "federation_announcement"`; the SQL composes
+    /// AND-style with the other filters, so passing this without
+    /// `subject_kind = Some("federation_announcement")` returns rows
+    /// whose `announcement_priority` matches (non-announcement rows
+    /// always have NULL here and are excluded by the column filter).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<AnnouncementPriority>,
+    /// v2.1 (CIRISPersist#101) — narrow `federation_announcement`
+    /// rows by AuthorityClass. Same composition semantics as
+    /// `priority`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_class: Option<AuthorityClass>,
+    /// v2.1 (CIRISPersist#101) — narrow `federation_announcement`
+    /// rows by [`AnnouncementKind`]. The kind is carried in the
+    /// payload JSONB (not a dedicated column — kind is
+    /// presentation-tier routing data, not a write-time CHECK
+    /// constraint surface). Filter runs against
+    /// `payload->>'kind'`. Applies only to rows where
+    /// `subject_kind = 'federation_announcement'`; non-announcement
+    /// rows lack a `payload.kind` field and are excluded.
+    ///
+    /// `AnnouncementKind::Custom(s)` filters against the serde-
+    /// wire shape (`{"custom": "..."}`) — not a useful filter
+    /// surface for v0.1; v0.1 callers will typically pass
+    /// `KeyRotation` / `PolicyUpdate` / `ThreatAdvisory` / etc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<AnnouncementKind>,
 }
 
 /// Filter for `list_votes`.

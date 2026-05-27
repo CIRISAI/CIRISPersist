@@ -7970,6 +7970,141 @@ impl PyEngine {
         })
     }
 
+    // ── v2.1 (CIRISPersist#101) — Federation Delivery Attestation
+    //    PyO3 surface. Three methods mirroring the NodeCoreService
+    //    additions for the FSD §3.2.1 ratified wire shape.
+    //    JSON-in / JSON-out, dispatching across Postgres + SQLite
+    //    via the same translate_error_kind taxonomy the other
+    //    cirisnode methods use.
+
+    /// v2.1 (CIRISPersist#101) — Verify-and-insert a
+    /// [`DeliveryAttestation`](crate::cirisnode::DeliveryAttestation).
+    /// Idempotent on `(announcement_id, peer_key_id)`. Hybrid
+    /// signature verified against `federation_keys[peer_key_id]`
+    /// before INSERT.
+    #[cfg(feature = "cirisnode")]
+    fn cirisnode_put_delivery_attestation(
+        &self,
+        py: Python<'_>,
+        attestation_json: &str,
+    ) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let att: crate::cirisnode::DeliveryAttestation = serde_json::from_str(attestation_json)
+                .map_err(|e| PyValueError::new_err(format!("DeliveryAttestation decode: {e}")))?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        backend
+                            .put_delivery_attestation(att)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        backend
+                            .put_delivery_attestation(att)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    /// v2.1 (CIRISPersist#101) — List all delivery attestations for
+    /// a federation_announcement, newest-first. Returns a JSON array
+    /// of [`DeliveryAttestation`](crate::cirisnode::DeliveryAttestation).
+    #[cfg(feature = "cirisnode")]
+    fn cirisnode_list_delivery_attestations(
+        &self,
+        py: Python<'_>,
+        announcement_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let announcement_id = announcement_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        let rows = backend
+                            .list_delivery_attestations(&announcement_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&rows).map_err(|e| {
+                            PyRuntimeError::new_err(format!("DeliveryAttestation list encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        let rows = backend
+                            .list_delivery_attestations(&announcement_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&rows).map_err(|e| {
+                            PyRuntimeError::new_err(format!("DeliveryAttestation list encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v2.1 (CIRISPersist#101) — Count delivery attestations for a
+    /// federation_announcement.
+    #[cfg(feature = "cirisnode")]
+    fn cirisnode_count_delivery_attestations(
+        &self,
+        py: Python<'_>,
+        announcement_id: &str,
+    ) -> PyResult<u64> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let announcement_id = announcement_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        backend
+                            .count_delivery_attestations(&announcement_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        backend
+                            .count_delivery_attestations(&announcement_id)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
     // ── v0.8.0-α5: cirisgraph PyO3 surface (CIRISPersist#34) ──────────
     //
     // 7 methods wrapping GraphService. JSON-in / JSON-out across the
@@ -13745,7 +13880,10 @@ fn cirisnode_err_to_py(e: crate::cirisnode::Error) -> PyErr {
         | crate::cirisnode::Error::NotAuthorized(_)
         | crate::cirisnode::Error::Signature(_)
         | crate::cirisnode::Error::Conflict(_)
-        | crate::cirisnode::Error::NotFound(_) => PyValueError::new_err(kind),
+        | crate::cirisnode::Error::NotFound(_)
+        | crate::cirisnode::Error::FederationAnnouncementAuthorityMismatch(_) => {
+            PyValueError::new_err(kind)
+        }
         crate::cirisnode::Error::Backend(_)
         | crate::cirisnode::Error::NotImplemented(_)
         | crate::cirisnode::Error::Internal(_) => PyRuntimeError::new_err(kind),

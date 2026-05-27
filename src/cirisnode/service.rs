@@ -8,6 +8,7 @@
 
 use std::future::Future;
 
+use super::federation_announcement::DeliveryAttestation;
 use super::types::{
     ContributionEnvelope, ContributionListPage, ContributionsFilter, CreditsLedgerEntry,
     CreditsUpdate, ExpertiseLedgerEntry, ExpertiseUpdate, ListCursor, ModerationEvent,
@@ -183,4 +184,53 @@ pub trait NodeCoreService: Send + Sync {
     // (Read cluster 5 — pending-vs-canonical split — is folded into
     // list_contributions + list_votes via their `is_canonical` filter
     // field. No separate methods.)
+
+    // ── Federation delivery attestations (v2.1, CIRISPersist#101) ──
+    //
+    // Per-peer attestation that the federation_announcement reached
+    // the application layer. Persist stores the FSD §3.2.1 wire shape
+    // one-to-one, gates the row's hybrid signature against
+    // federation_keys[peer_key_id], and surfaces reach-verification
+    // reads. Surface mirrors the cirisnode write/list pattern —
+    // not `FederationDirectory` even though they share the
+    // `peer_key_id → federation_keys` lookup, because the row's
+    // canonical-chain FK targets `cirisnode.contributions` and the
+    // surface belongs alongside the announcement that owns it.
+
+    /// Verify-and-insert a [`DeliveryAttestation`]. INSERTs idempotently
+    /// on `(announcement_id, peer_key_id)` — a duplicate write returns
+    /// `Ok(())` (replay-safe per FSD §3.2.1 "AV: replayed attestation").
+    ///
+    /// Pre-insert verification:
+    /// 1. `enforce` shape: 32-byte canonical hash, 64-byte Ed25519
+    ///    signature, optional 3309-byte PQC signature (admission
+    ///    error → [`Error::InvalidArgument`]).
+    /// 2. Directory lookup: `peer_key_id` MUST exist in
+    ///    `federation_keys`; absence → [`Error::Signature`].
+    /// 3. Hybrid signature verify via
+    ///    [`crate::verify::verify_hybrid_via_directory`] over
+    ///    [`DeliveryAttestation::canonical_bytes`]; mismatch →
+    ///    [`Error::Signature`].
+    fn put_delivery_attestation(
+        &self,
+        attestation: DeliveryAttestation,
+    ) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// List all attestations for `announcement_id`, ordered by
+    /// `received_at DESC`. The primary reach-verification read path
+    /// per FSD §3.2 — RATCHET / steward dashboards consume this to
+    /// detect delivery gaps.
+    fn list_delivery_attestations(
+        &self,
+        announcement_id: &str,
+    ) -> impl Future<Output = Result<Vec<DeliveryAttestation>, Error>> + Send;
+
+    /// Count attestations for `announcement_id`. Cheap convenience
+    /// for reach-aggregate queries (returns `u64`; non-empty
+    /// announcements with >2^63 attestations are not a real-world
+    /// concern).
+    fn count_delivery_attestations(
+        &self,
+        announcement_id: &str,
+    ) -> impl Future<Output = Result<u64, Error>> + Send;
 }

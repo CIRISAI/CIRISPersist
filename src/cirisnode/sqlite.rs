@@ -45,6 +45,7 @@ use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, O
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use super::federation_announcement::{DeliveryAttestation, TransportMedium};
 use super::service::NodeCoreService;
 use super::types::{
     Cell, ContributionEnvelope, ContributionListPage, ContributionType, ContributionsFilter,
@@ -195,6 +196,20 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                 "subject.subject (subject_kind) required for contributions".into(),
             )
         })?;
+
+        // v2.1 (CIRISPersist#101) — federation_announcement extracts
+        // priority + authority_class. Same admission semantics as PG.
+        let announcement = super::federation_announcement::extract_announcement_payload(
+            &subject_kind,
+            &env.payload,
+        )?;
+        let announcement_priority: Option<String> = announcement
+            .as_ref()
+            .map(|p| p.priority.as_str().to_owned());
+        let announcement_authority_class: Option<String> = announcement
+            .as_ref()
+            .map(|p| p.authority_class.as_str().to_owned());
+
         let id_str = id.to_string();
         let ct_str = contribution_type_str(env.contribution_type).to_owned();
         let domain = env.subject.domain.clone();
@@ -219,8 +234,9 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                     "INSERT INTO cirisnode_contributions (\
                         contribution_id, contribution_type, domain, language, subject_kind, \
                         author_id, payload, witness_set, submitted_at, \
-                        signature, signing_key_id, signature_verified, persist_row_hash\
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12)",
+                        signature, signing_key_id, signature_verified, persist_row_hash, \
+                        announcement_priority, announcement_authority_class\
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?13, ?14)",
                     params![
                         id_str,
                         ct_str,
@@ -234,6 +250,8 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                         sig_b64,
                         author_id,
                         sig_b64,
+                        announcement_priority,
+                        announcement_authority_class,
                     ],
                 )
                 .map_err(|e| map_sqlite_error(e, "put_contribution"))?;
@@ -765,6 +783,49 @@ impl NodeCoreService for SqliteNodeCoreBackend {
             params.push(SqlValue::Integer(if c { 1 } else { 0 }));
             where_parts.push(format!("is_canonical = ?{}", params.len()));
         }
+        // v2.1 (CIRISPersist#101) — federation_announcement filters.
+        // priority / authority_class are indexed columns added in
+        // V046 (non-announcement rows have NULL in both); `kind`
+        // lives inside the payload JSON and is matched via
+        // `json_extract(payload, '$.kind')`. SQLite's json1 extension
+        // is built in and persist uses it elsewhere (lens audit).
+        if let Some(p) = filter.priority {
+            params.push(SqlValue::Text(p.as_str().to_owned()));
+            where_parts.push(format!("announcement_priority = ?{}", params.len()));
+        }
+        if let Some(a) = filter.authority_class {
+            params.push(SqlValue::Text(a.as_str().to_owned()));
+            where_parts.push(format!("announcement_authority_class = ?{}", params.len()));
+        }
+        if let Some(k) = filter.kind {
+            // For variants other than `Custom(s)` the serde wire shape
+            // is a bare snake_case string ("policy_update"); for
+            // `Custom(s)` it's an object `{"custom": "<value>"}`.
+            // SQLite's `json_extract(payload, '$.kind')` returns the
+            // scalar as TEXT and the object as a JSON string — so
+            // the filter compares string-equal for the scalar case
+            // and JSON-equal for the object case. To uniformly
+            // handle both, we extract the kind to text and compare
+            // against the wire string form.
+            let value = serde_json::to_value(&k)
+                .map_err(|e| Error::Internal(format!("AnnouncementKind serialize: {e}")))?;
+            // Scalar string → strip quotes to match
+            // `json_extract` TEXT output. Object → JSON-encode for
+            // structural compare.
+            let wire = match &value {
+                serde_json::Value::String(s) => s.clone(),
+                other => serde_json::to_string(other)
+                    .map_err(|e| Error::Internal(format!("kind json: {e}")))?,
+            };
+            params.push(SqlValue::Text(wire));
+            // `json_extract` returns TEXT for both scalar and
+            // structural matches (the latter as a serialized JSON
+            // string); equality compares both cases correctly.
+            where_parts.push(format!(
+                "CAST(json_extract(payload, '$.kind') AS TEXT) = ?{}",
+                params.len()
+            ));
+        }
         if let Some(cur) = &cursor {
             if cur.version != "v1" {
                 return Err(Error::InvalidArgument(format!(
@@ -1158,6 +1219,200 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                 created_at: parse_datetime(&created_at_str)?,
             })),
         }
+    }
+
+    // ── Federation delivery attestations (v2.1, CIRISPersist#101) ──
+    //
+    // The SQLite impl mirrors the Postgres impl one-to-one. The
+    // hybrid-signature verify path goes through the shared
+    // `verify_hybrid_via_directory` against a `FederationDirectory`
+    // — for SQLite that directory is `SqliteBackend`, which the
+    // caller wires when they ship in a `SqliteNodeCoreBackend`. We
+    // resolve the directory through a borrowed handle so a single
+    // `SqliteBackend` Mutex-guarded `Connection` services both the
+    // directory lookup and the attestation INSERT.
+
+    async fn put_delivery_attestation(
+        &self,
+        attestation: DeliveryAttestation,
+    ) -> Result<(), Error> {
+        // Length-invariants up-front (typed error).
+        let canonical_hash = attestation.canonical_hash_bytes()?;
+        let sig_classical = attestation.signature_classical_bytes()?;
+        let pqc_bytes = attestation.signature_pqc_bytes()?;
+        let announcement_uuid = parse_id(&attestation.announcement_id)?;
+
+        // Hybrid verify against federation_keys[peer_key_id]. The
+        // directory lookup runs against a `FederationDirectory` impl
+        // wrapping the shared SQLite connection; we use the same
+        // SqliteBackend façade the public API does.
+        let canonical = attestation
+            .canonical_bytes()
+            .map_err(|e| Error::Signature(format!("canonical_bytes: {e}")))?;
+        let directory = crate::store::sqlite::SqliteBackend::from_conn_handle(self.conn.clone());
+        crate::verify::verify_hybrid_via_directory(
+            &directory,
+            &canonical,
+            &attestation.peer_key_id,
+            &attestation.signature_classical_base64,
+            attestation.signature_pqc_base64.as_deref(),
+            crate::verify::hybrid::HybridPolicy::Ed25519Fallback,
+            None,
+        )
+        .await
+        .map_err(|e| Error::Signature(format!("delivery_attestation verify: {e}")))?;
+
+        let persist_row_hash = crate::federation::types::compute_persist_row_hash(&attestation)
+            .map_err(|e| Error::Internal(format!("persist_row_hash: {e}")))?;
+
+        let announcement_id_str = announcement_uuid.to_string();
+        let peer_key_id = attestation.peer_key_id.clone();
+        let peer_pubkey = attestation.peer_pubkey_ed25519_base64.clone();
+        let received_at = fmt_datetime(attestation.received_at);
+        let transport = attestation.transport_id.as_str().to_owned();
+        let conn = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<(), Error> {
+            let guard = conn.blocking_lock();
+            // `INSERT OR IGNORE` collapses the (announcement_id,
+            // peer_key_id) PK conflict to a no-op — the idempotent
+            // replay path per FSD §3.2.1.
+            guard
+                .execute(
+                    "INSERT OR IGNORE INTO cirisnode_federation_delivery_attestations (\
+                        announcement_id, announcement_canonical_hash, peer_key_id, \
+                        peer_pubkey_ed25519_base64, received_at, transport_id, \
+                        signature_classical, signature_pqc, signature_verified, persist_row_hash\
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9)",
+                    params![
+                        announcement_id_str,
+                        canonical_hash.as_slice(),
+                        peer_key_id,
+                        peer_pubkey,
+                        received_at,
+                        transport,
+                        sig_classical.as_slice(),
+                        pqc_bytes,
+                        persist_row_hash,
+                    ],
+                )
+                .map_err(|e| {
+                    // The PG impl maps PK conflict to no-op via
+                    // ON CONFLICT DO NOTHING; SQLite's INSERT OR
+                    // IGNORE does the same. A constraint violation
+                    // here is FK / CHECK — surface as InvalidArgument
+                    // to match the PG taxonomy.
+                    if let rusqlite::Error::SqliteFailure(err, _) = &e {
+                        if matches!(err.code, rusqlite::ErrorCode::ConstraintViolation) {
+                            return Error::InvalidArgument(format!(
+                                "put_delivery_attestation: {e}"
+                            ));
+                        }
+                    }
+                    Error::Backend(format!("put_delivery_attestation: {e}"))
+                })?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+    }
+
+    async fn list_delivery_attestations(
+        &self,
+        announcement_id: &str,
+    ) -> Result<Vec<DeliveryAttestation>, Error> {
+        let announcement_uuid = parse_id(announcement_id)?;
+        let id_str = announcement_uuid.to_string();
+        let conn = self.conn.clone();
+
+        let rows = tokio::task::spawn_blocking(
+            move || -> Result<Vec<(String, Vec<u8>, String, String, String, String, Vec<u8>, Option<Vec<u8>>)>, Error> {
+                let guard = conn.blocking_lock();
+                let mut stmt = guard
+                    .prepare(
+                        "SELECT announcement_id, announcement_canonical_hash, peer_key_id, \
+                                peer_pubkey_ed25519_base64, received_at, transport_id, \
+                                signature_classical, signature_pqc \
+                         FROM cirisnode_federation_delivery_attestations \
+                         WHERE announcement_id = ?1 \
+                         ORDER BY received_at DESC",
+                    )
+                    .map_err(|e| map_sqlite_error(e, "list_delivery_attestations prepare"))?;
+                let rows = stmt
+                    .query_map([id_str], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, Vec<u8>>(6)?,
+                            row.get::<_, Option<Vec<u8>>>(7)?,
+                        ))
+                    })
+                    .map_err(|e| map_sqlite_error(e, "list_delivery_attestations query"))?;
+                let out: Result<Vec<_>, _> = rows.collect();
+                out.map_err(|e| map_sqlite_error(e, "list_delivery_attestations collect"))
+            },
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))??;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (
+            announcement_id,
+            hash_bytes,
+            peer_key_id,
+            peer_pubkey,
+            received_at_str,
+            transport_str,
+            sig_classical,
+            sig_pqc_opt,
+        ) in rows
+        {
+            let canonical_hash: [u8; 32] = <[u8; 32]>::try_from(hash_bytes.as_slice())
+                .map_err(|_| Error::Backend("stored canonical_hash not 32 bytes".to_string()))?;
+            let transport_id = TransportMedium::from_wire_str(&transport_str).ok_or_else(|| {
+                Error::Backend(format!("unknown transport_id from DB: {transport_str}"))
+            })?;
+            out.push(DeliveryAttestation {
+                announcement_id,
+                announcement_canonical_hash_base64:
+                    super::federation_announcement::encode_canonical_hash_base64(&canonical_hash),
+                peer_key_id,
+                peer_pubkey_ed25519_base64: peer_pubkey,
+                received_at: parse_datetime(&received_at_str)?,
+                transport_id,
+                signature_classical_base64: super::federation_announcement::encode_signature_base64(
+                    &sig_classical,
+                ),
+                signature_pqc_base64: sig_pqc_opt
+                    .map(|b| super::federation_announcement::encode_signature_base64(&b)),
+            });
+        }
+        Ok(out)
+    }
+
+    async fn count_delivery_attestations(&self, announcement_id: &str) -> Result<u64, Error> {
+        let announcement_uuid = parse_id(announcement_id)?;
+        let id_str = announcement_uuid.to_string();
+        let conn = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<u64, Error> {
+            let guard = conn.blocking_lock();
+            let n: i64 = guard
+                .query_row(
+                    "SELECT COUNT(*) FROM cirisnode_federation_delivery_attestations \
+                     WHERE announcement_id = ?1",
+                    [id_str],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|e| map_sqlite_error(e, "count_delivery_attestations"))?;
+            Ok(u64::try_from(n).unwrap_or(0))
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
     }
 }
 
@@ -1623,5 +1878,486 @@ mod tests {
             .put_promotion_attestation(recovery_att)
             .await
             .expect("attestation row was rolled back; re-use must succeed");
+    }
+
+    // ─── Federation Announcement (v2.1, CIRISPersist#101) ───────────
+
+    fn build_announcement_sqlite(
+        author_key: &ed25519_dalek::SigningKey,
+        priority: crate::cirisnode::AnnouncementPriority,
+        authority_class: crate::cirisnode::AuthorityClass,
+        kind: crate::cirisnode::AnnouncementKind,
+        accord_payload: Option<crate::cirisnode::AccordCarrier>,
+        supersedes: Option<String>,
+    ) -> ContributionEnvelope {
+        let author = pubkey_b64(author_key);
+        let payload = crate::cirisnode::FederationAnnouncementPayload {
+            priority,
+            kind,
+            title: "test announcement".into(),
+            body: "test body".into(),
+            authority_class,
+            accord_payload,
+            supersedes,
+            expires_at: chrono::Utc::now() + chrono::Duration::days(1),
+            evidence_refs: vec![],
+        };
+        let mut env = ContributionEnvelope {
+            contribution_id: Uuid::new_v4().to_string(),
+            contribution_type: ContributionType::Proposal,
+            author_id: author,
+            subject: Cell {
+                domain: "federation".into(),
+                language: "en".into(),
+                subject: Some(crate::cirisnode::SUBJECT_KIND.into()),
+            },
+            payload: serde_json::to_value(&payload).unwrap(),
+            witness_set: None,
+            signature: HybridSignature {
+                ed25519: String::new(),
+                ml_dsa_65: None,
+                signed_at: Utc::now(),
+            },
+            submitted_at: Utc::now(),
+        };
+        env.signature = sign_envelope(&env, author_key);
+        env
+    }
+
+    #[tokio::test]
+    async fn sqlite_federation_announcement_round_trip_each_authority_class() {
+        use crate::cirisnode::{AnnouncementKind, AnnouncementPriority, AuthorityClass};
+        let (_b, backend) = fresh_backend().await;
+
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xC1; 32]);
+
+        let fixtures: Vec<(AnnouncementPriority, AuthorityClass, AnnouncementKind)> = vec![
+            (
+                AnnouncementPriority::Informational,
+                AuthorityClass::BootstrapSeed,
+                AnnouncementKind::PolicyUpdate,
+            ),
+            (
+                AnnouncementPriority::Advisory,
+                AuthorityClass::RootWa,
+                AnnouncementKind::ThreatAdvisory,
+            ),
+            (
+                AnnouncementPriority::Urgent,
+                AuthorityClass::WaQuorum,
+                AnnouncementKind::KeyRotation,
+            ),
+            (
+                AnnouncementPriority::AccordCarrier,
+                AuthorityClass::HumanityAccord,
+                AnnouncementKind::AccordCarrier,
+            ),
+        ];
+
+        let mut accord_id: Option<String> = None;
+        for (priority, authority, kind) in fixtures {
+            let accord_payload = if matches!(priority, AnnouncementPriority::AccordCarrier) {
+                Some(crate::cirisnode::AccordCarrier {
+                    payload_bytes: (0u8..77).collect(),
+                    rationale: Some("drill".into()),
+                })
+            } else {
+                None
+            };
+            let env = build_announcement_sqlite(
+                &author_key,
+                priority,
+                authority,
+                kind,
+                accord_payload,
+                None,
+            );
+            if matches!(priority, AnnouncementPriority::AccordCarrier) {
+                accord_id = Some(env.contribution_id.clone());
+            }
+            backend.put_contribution(env).await.unwrap();
+        }
+
+        // 77-byte accord round-trip via list_contributions.
+        let page = backend
+            .list_contributions(
+                ContributionsFilter {
+                    subject_kind: Some(crate::cirisnode::SUBJECT_KIND.into()),
+                    priority: Some(AnnouncementPriority::AccordCarrier),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        let accord_id = accord_id.unwrap();
+        let item = page
+            .items
+            .iter()
+            .find(|i| i.contribution_id == accord_id)
+            .unwrap();
+        let payload: crate::cirisnode::FederationAnnouncementPayload =
+            serde_json::from_value(item.payload.clone()).unwrap();
+        let accord = payload.accord_payload.expect("accord_payload present");
+        assert_eq!(accord.payload_bytes.len(), 77);
+        assert_eq!(accord.payload_bytes, (0u8..77).collect::<Vec<u8>>());
+    }
+
+    #[tokio::test]
+    async fn sqlite_federation_announcement_rejects_constitutional_asymmetry_violation() {
+        use crate::cirisnode::{AnnouncementKind, AnnouncementPriority, AuthorityClass};
+        let (_b, backend) = fresh_backend().await;
+
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xC2; 32]);
+        let env = build_announcement_sqlite(
+            &author_key,
+            AnnouncementPriority::AccordCarrier,
+            AuthorityClass::BootstrapSeed,
+            AnnouncementKind::AccordCarrier,
+            Some(crate::cirisnode::AccordCarrier {
+                payload_bytes: vec![0u8; 77],
+                rationale: None,
+            }),
+            None,
+        );
+        let err = backend.put_contribution(env).await.unwrap_err();
+        assert!(
+            matches!(err, Error::FederationAnnouncementAuthorityMismatch(_)),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_federation_announcement_supersedes_chain_round_trip() {
+        use crate::cirisnode::{AnnouncementKind, AnnouncementPriority, AuthorityClass};
+        let (_b, backend) = fresh_backend().await;
+
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xC3; 32]);
+        let env_a = build_announcement_sqlite(
+            &author_key,
+            AnnouncementPriority::Advisory,
+            AuthorityClass::RootWa,
+            AnnouncementKind::PolicyUpdate,
+            None,
+            None,
+        );
+        let a_id = env_a.contribution_id.clone();
+        backend.put_contribution(env_a).await.unwrap();
+
+        let env_b = build_announcement_sqlite(
+            &author_key,
+            AnnouncementPriority::Advisory,
+            AuthorityClass::RootWa,
+            AnnouncementKind::PolicyUpdate,
+            None,
+            Some(a_id.clone()),
+        );
+        let b_id = env_b.contribution_id.clone();
+        backend.put_contribution(env_b).await.unwrap();
+
+        let page = backend
+            .list_contributions(
+                ContributionsFilter {
+                    subject_kind: Some(crate::cirisnode::SUBJECT_KIND.into()),
+                    author_id: Some(pubkey_b64(&author_key)),
+                    priority: Some(AnnouncementPriority::Advisory),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        let ids: std::collections::HashSet<_> = page
+            .items
+            .iter()
+            .map(|i| i.contribution_id.clone())
+            .collect();
+        assert!(ids.contains(&a_id));
+        assert!(ids.contains(&b_id));
+    }
+
+    #[tokio::test]
+    async fn sqlite_list_contributions_filter_extension() {
+        use crate::cirisnode::{AnnouncementKind, AnnouncementPriority, AuthorityClass};
+        let (_b, backend) = fresh_backend().await;
+
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xC4; 32]);
+        let author = pubkey_b64(&author_key);
+
+        let fixtures: Vec<(AnnouncementPriority, AuthorityClass, AnnouncementKind)> = vec![
+            (
+                AnnouncementPriority::Informational,
+                AuthorityClass::BootstrapSeed,
+                AnnouncementKind::PolicyUpdate,
+            ),
+            (
+                AnnouncementPriority::Informational,
+                AuthorityClass::RootWa,
+                AnnouncementKind::Deprecation,
+            ),
+            (
+                AnnouncementPriority::Advisory,
+                AuthorityClass::RootWa,
+                AnnouncementKind::ThreatAdvisory,
+            ),
+            (
+                AnnouncementPriority::Advisory,
+                AuthorityClass::WaQuorum,
+                AnnouncementKind::MissionUpdate,
+            ),
+            (
+                AnnouncementPriority::Urgent,
+                AuthorityClass::WaQuorum,
+                AnnouncementKind::KeyRotation,
+            ),
+            (
+                AnnouncementPriority::AccordCarrier,
+                AuthorityClass::HumanityAccord,
+                AnnouncementKind::AccordCarrier,
+            ),
+        ];
+        for (pri, aut, kind) in &fixtures {
+            let accord_payload = if matches!(pri, AnnouncementPriority::AccordCarrier) {
+                Some(crate::cirisnode::AccordCarrier {
+                    payload_bytes: vec![0u8; 77],
+                    rationale: None,
+                })
+            } else {
+                None
+            };
+            let env = build_announcement_sqlite(
+                &author_key,
+                *pri,
+                *aut,
+                kind.clone(),
+                accord_payload,
+                None,
+            );
+            backend.put_contribution(env).await.unwrap();
+        }
+
+        // priority filter
+        let page = backend
+            .list_contributions(
+                ContributionsFilter {
+                    subject_kind: Some(crate::cirisnode::SUBJECT_KIND.into()),
+                    author_id: Some(author.clone()),
+                    priority: Some(AnnouncementPriority::Informational),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 2);
+
+        // authority_class filter
+        let page = backend
+            .list_contributions(
+                ContributionsFilter {
+                    subject_kind: Some(crate::cirisnode::SUBJECT_KIND.into()),
+                    author_id: Some(author.clone()),
+                    authority_class: Some(AuthorityClass::RootWa),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 2);
+
+        // priority + authority_class composed
+        let page = backend
+            .list_contributions(
+                ContributionsFilter {
+                    subject_kind: Some(crate::cirisnode::SUBJECT_KIND.into()),
+                    author_id: Some(author.clone()),
+                    priority: Some(AnnouncementPriority::Advisory),
+                    authority_class: Some(AuthorityClass::WaQuorum),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+
+        // kind filter
+        let page = backend
+            .list_contributions(
+                ContributionsFilter {
+                    subject_kind: Some(crate::cirisnode::SUBJECT_KIND.into()),
+                    author_id: Some(author.clone()),
+                    kind: Some(AnnouncementKind::KeyRotation),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+    }
+
+    // ─── Federation Delivery Attestations (FSD §3.2.1) ──────────────
+
+    async fn put_peer_federation_key_sqlite(
+        backend: &SqliteBackend,
+        seed: u8,
+    ) -> (String, ed25519_dalek::SigningKey, String) {
+        use crate::federation::FederationDirectory;
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let pubkey_b64 = B64.encode(signing_key.verifying_key().to_bytes());
+        let key_id = format!("test-peer-{seed:02x}-{}", Uuid::new_v4());
+        let record = crate::federation::KeyRecord {
+            key_id: key_id.clone(),
+            pubkey_ed25519_base64: pubkey_b64.clone(),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: crate::federation::types::algorithm::HYBRID.into(),
+            identity_type: crate::federation::types::identity_type::AGENT.into(),
+            identity_ref: format!("agent-{seed:02x}"),
+            valid_from: Utc::now() - chrono::Duration::hours(1),
+            valid_until: None,
+            registration_envelope: serde_json::json!({"id": key_id}),
+            original_content_hash: "deadbeef".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: key_id.clone(),
+            scrub_timestamp: Utc::now(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+        };
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord { record })
+            .await
+            .unwrap();
+        (key_id, signing_key, pubkey_b64)
+    }
+
+    fn build_signed_attestation_sqlite(
+        announcement_id: &str,
+        canonical_hash: &[u8; 32],
+        peer_key_id: &str,
+        peer_pubkey_b64: &str,
+        peer_signing_key: &ed25519_dalek::SigningKey,
+    ) -> crate::cirisnode::DeliveryAttestation {
+        use ed25519_dalek::Signer as _;
+        let mut att = crate::cirisnode::DeliveryAttestation {
+            announcement_id: announcement_id.to_owned(),
+            announcement_canonical_hash_base64: crate::cirisnode::encode_canonical_hash_base64(
+                canonical_hash,
+            ),
+            peer_key_id: peer_key_id.to_owned(),
+            peer_pubkey_ed25519_base64: peer_pubkey_b64.to_owned(),
+            received_at: Utc::now(),
+            transport_id: crate::cirisnode::TransportMedium::HttpOverTls,
+            signature_classical_base64: crate::cirisnode::encode_signature_base64(&[0u8; 64]),
+            signature_pqc_base64: None,
+        };
+        let canonical = att.canonical_bytes().unwrap();
+        let sig = peer_signing_key.sign(&canonical);
+        att.signature_classical_base64 = crate::cirisnode::encode_signature_base64(&sig.to_bytes());
+        att
+    }
+
+    #[tokio::test]
+    async fn sqlite_delivery_attestation_round_trip_idempotent() {
+        let (b, backend) = fresh_backend().await;
+
+        // Write the announcement (FK target).
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xC5; 32]);
+        let env = build_announcement_sqlite(
+            &author_key,
+            crate::cirisnode::AnnouncementPriority::Advisory,
+            crate::cirisnode::AuthorityClass::RootWa,
+            crate::cirisnode::AnnouncementKind::ThreatAdvisory,
+            None,
+            None,
+        );
+        let announcement_id = env.contribution_id.clone();
+        backend.put_contribution(env).await.unwrap();
+
+        let canonical_hash: [u8; 32] = [0x42; 32];
+        let mut peers = Vec::new();
+        for seed in [0xD1u8, 0xD2u8, 0xD3u8] {
+            peers.push(put_peer_federation_key_sqlite(&b, seed).await);
+        }
+
+        for (key_id, signing_key, pubkey_b64) in &peers {
+            let att = build_signed_attestation_sqlite(
+                &announcement_id,
+                &canonical_hash,
+                key_id,
+                pubkey_b64,
+                signing_key,
+            );
+            backend.put_delivery_attestation(att.clone()).await.unwrap();
+            // Idempotent replay.
+            backend.put_delivery_attestation(att).await.unwrap();
+        }
+
+        let rows = backend
+            .list_delivery_attestations(&announcement_id)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        let peer_ids: std::collections::HashSet<&str> =
+            rows.iter().map(|r| r.peer_key_id.as_str()).collect();
+        for (kid, _, _) in &peers {
+            assert!(peer_ids.contains(kid.as_str()));
+        }
+
+        let n = backend
+            .count_delivery_attestations(&announcement_id)
+            .await
+            .unwrap();
+        assert_eq!(n, 3);
+
+        let first = &rows[0];
+        let back_hash = first.canonical_hash_bytes().unwrap();
+        assert_eq!(back_hash, canonical_hash);
+        assert_eq!(
+            first.transport_id,
+            crate::cirisnode::TransportMedium::HttpOverTls
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_delivery_attestation_rejects_forged_signature() {
+        let (b, backend) = fresh_backend().await;
+
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xC6; 32]);
+        let env = build_announcement_sqlite(
+            &author_key,
+            crate::cirisnode::AnnouncementPriority::Informational,
+            crate::cirisnode::AuthorityClass::BootstrapSeed,
+            crate::cirisnode::AnnouncementKind::PolicyUpdate,
+            None,
+            None,
+        );
+        let announcement_id = env.contribution_id.clone();
+        backend.put_contribution(env).await.unwrap();
+
+        let (legit_key_id, _legit_signer, legit_pubkey_b64) =
+            put_peer_federation_key_sqlite(&b, 0xE1).await;
+        let attacker_signer = ed25519_dalek::SigningKey::from_bytes(&[0xFE; 32]);
+
+        let att = build_signed_attestation_sqlite(
+            &announcement_id,
+            &[0u8; 32],
+            &legit_key_id,
+            &legit_pubkey_b64,
+            &attacker_signer,
+        );
+        let err = backend.put_delivery_attestation(att).await.unwrap_err();
+        assert!(matches!(err, Error::Signature(_)), "got: {err:?}");
     }
 }

@@ -5,6 +5,85 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [2.2.0] — 2026-05-27
+
+**`#101` — `federation_announcement` subject_kind + `federation_delivery_attestations` table.**
+
+Persist now carries the federation-tier governance primitive — the
+durable, tamper-evident record of multi-party bootstrap rotations,
+threshold raises, key rotations, kill-switch invocations, and accord
+carriers — that CIRISNodeCore emits and every peer must be able to
+audit.
+
+### `federation_announcement` subject_kind
+
+- Rust types `FederationAnnouncementPayload`, `AnnouncementPriority`,
+  `AnnouncementKind`, `AuthorityClass`, `AccordCarrier` mirror
+  CIRISNodeCore `FSD/FEDERATION_ANNOUNCEMENT.md` §2.1 byte-exact (same
+  field names, same serde rename rules, same enum variants — the
+  cross-repo wire contract).
+- Persist's canonical-chain row reused (the announcement is a
+  Contribution; subject_kind is the new discriminator). Two indexed
+  projection columns `announcement_priority` /
+  `announcement_authority_class` so the constitutional CHECK and the
+  filter API don't dig into JSONB per-row.
+- **Constitutional asymmetry enforced at write admission** (per FSD
+  §4.5 + Registry FSD-002 v1.4 §7.1): only
+  `AuthorityClass::HumanityAccord` may sign a `priority == AccordCarrier`
+  or `kind == AccordCarrier` announcement. Rejection is a typed
+  `Error::FederationAnnouncementAuthorityMismatch`; the DB CHECK /
+  SQLite trigger enforces the same rule independently — defense in
+  depth. The first wire-format asymmetry that joins the existing
+  trust-gate values (Open / Trust-gated / Witness-set-gated /
+  Author-only) as **Authority-class-gated**.
+
+### `federation_delivery_attestations` table (FSD §3.2.1 ratified)
+
+The per-peer attestation that an announcement reached an edge's
+application layer — the substrate observable RATCHET reads to detect
+adversarial suppression. Wire contract was open question #3 of FSD
+§7; ratified 2026-05-27 at FSD §3.2.1 by NodeCore (author),
+CIRISEdge#18 (producer), and persist (this issue).
+
+- One-to-one with the wire `DeliveryAttestation` struct:
+  `announcement_id` (Contribution::id), `announcement_canonical_hash`
+  (32-byte SHA-256 of canonicalized envelope including authority
+  signature), `peer_key_id` + `peer_pubkey_ed25519_base64`,
+  `received_at`, `transport_id` enum (`reticulum` / `tcp_tls` /
+  `http_over_tls` / `other`), `signature_classical`,
+  `signature_pqc` (optional ML-DSA-65).
+- PK `(announcement_id, peer_key_id)` — idempotent on replay.
+- Canonical-bytes encoder with domain string
+  `ciris-edge-delivery-attestation-v1`, length-prefixed injective,
+  mirrors CIRISEdge's `AttestationPayload::canonical_bytes` exactly
+  (cross-repo wire contract — golden-vector test guards against
+  drift). Hybrid signature follows persist's AV-33 bound-signature
+  convention (PQC over `canonical_bytes || classical_sig`).
+- Trait surface: `put_delivery_attestation`,
+  `list_delivery_attestations(announcement_id)`,
+  `count_delivery_attestations(announcement_id)`. Verifies the
+  hybrid signature against `federation_keys[peer_key_id]` via
+  persist's existing directory-lookup path; idempotent on duplicate
+  `(announcement_id, peer_key_id)` (the FSD's replay-no-op contract).
+
+### `list_contributions` filter extension
+
+`ContributionsFilter` gains three optional fields — `priority`,
+`authority_class`, `kind` — applied only when
+`subject_kind == federation_announcement`. Backward-compatible
+(serde defaults to `None`; existing call sites unchanged).
+RATCHET + LensCore consume this for governance-history scans.
+
+### PyO3 surface
+
+`cirisnode_put_delivery_attestation` / `cirisnode_list_delivery_attestations`
+/ `cirisnode_count_delivery_attestations`; existing
+`cirisnode_list_contributions` routes the new filter fields through
+serde defaults.
+
+V046 migration (both dialects) is single — the announcement row
+extensions + the delivery-attestations table ship atomically (the
+FSD §3.2 substrate contract is atomic across them). qa_harness
 ## [2.0.2] — 2026-05-22
 
 **Hotfix:** `pyproject.toml` `Requires-Dist` for the transitive
