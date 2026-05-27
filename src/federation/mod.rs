@@ -36,6 +36,7 @@ use std::future::Future;
 
 #[cfg(feature = "cirisaudit")]
 pub mod backfill;
+pub mod blobs;
 #[cfg(feature = "cirisaudit")]
 pub mod emit;
 #[cfg(feature = "cirisaudit")]
@@ -68,6 +69,11 @@ pub(crate) mod serde_bytes_b64 {
     }
 }
 
+pub use blobs::{
+    holds_bytes_attestation_envelope, holds_bytes_attestation_type, BlobBody, BlobError,
+    BlobStorage, ExternalRef, PutBlobAttestation, DEFAULT_INLINE_BYTES_CAP,
+    HOLDS_BYTES_ATTESTATION_TYPE_PREFIX, HOLDS_BYTES_PREFIX_HEX_LEN,
+};
 pub use rooting::{
     provenance_chain, root_binding, ProvenanceChain, ProvenanceLink, RootingRejection,
     RootingVerdict, MAX_PROVENANCE_DEPTH,

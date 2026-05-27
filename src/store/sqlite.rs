@@ -66,6 +66,11 @@ pub struct SqliteBackend {
     /// Owning handle. `Arc<Mutex<…>>` so spawn_blocking closures can
     /// take ownership of a clone without moving `&self`.
     conn: Arc<Mutex<Connection>>,
+    /// v2.3 (CIRISPersist#103) — inline-byte cap for the BlobStorage
+    /// trait's `put_blob`. Defaults to
+    /// [`crate::federation::DEFAULT_INLINE_BYTES_CAP`]; an Engine
+    /// builder may override via [`SqliteBackend::with_inline_bytes_cap`].
+    inline_bytes_cap: std::sync::atomic::AtomicUsize,
 }
 
 impl SqliteBackend {
@@ -84,7 +89,22 @@ impl SqliteBackend {
     /// already initialized the connection via
     /// [`SqliteBackend::open`] / [`SqliteBackend::open_in_memory`].
     pub fn from_conn_handle(conn: std::sync::Arc<tokio::sync::Mutex<Connection>>) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            inline_bytes_cap: std::sync::atomic::AtomicUsize::new(
+                crate::federation::DEFAULT_INLINE_BYTES_CAP,
+            ),
+        }
+    }
+
+    /// v2.3 (CIRISPersist#103) — override the default inline-byte cap
+    /// for the [`crate::federation::BlobStorage`] trait's `put_blob`.
+    /// Callers larger than the cap on the `Inline` arm receive
+    /// [`crate::federation::BlobError::InlineSizeExceeded`].
+    pub fn with_inline_bytes_cap(self, cap: usize) -> Self {
+        self.inline_bytes_cap
+            .store(cap, std::sync::atomic::Ordering::Relaxed);
+        self
     }
 
     /// Open (or create) a file-backed SQLite database.
@@ -140,6 +160,9 @@ impl SqliteBackend {
         .map_err(|e| Error::Backend(format!("sqlite pragmas: {e}")))?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            inline_bytes_cap: std::sync::atomic::AtomicUsize::new(
+                crate::federation::DEFAULT_INLINE_BYTES_CAP,
+            ),
         })
     }
 }
@@ -1741,6 +1764,278 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             None => rows,
         };
         Ok(filtered)
+    }
+}
+
+// ─── BlobStorage impl (v2.3, CIRISPersist#103) ─────────────────────
+//
+// Content-addressable byte storage. See `crate::federation::blobs` for
+// the trait + types. SQLite uses BLOB for sha256/bytes_inline and TEXT
+// JSON-string for the attestation envelope. The holder attestation is
+// emitted inside the same transaction as the blob INSERT so a holder-
+// attestation FK violation rolls back the blob row too (atomic
+// put_blob semantic).
+
+impl crate::federation::BlobStorage for SqliteBackend {
+    fn inline_bytes_cap(&self) -> usize {
+        self.inline_bytes_cap
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    async fn put_blob(
+        &self,
+        sha256: &[u8; 32],
+        body: crate::federation::BlobBody,
+        media_type: Option<&str>,
+        attestation: crate::federation::PutBlobAttestation,
+    ) -> Result<(), crate::federation::BlobError> {
+        // 1. API-side validation.
+        let cap = self.inline_bytes_cap();
+        if let crate::federation::BlobBody::Inline(ref bytes) = body {
+            if bytes.len() > cap {
+                return Err(crate::federation::BlobError::InlineSizeExceeded {
+                    size: bytes.len(),
+                    cap,
+                });
+            }
+            crate::federation::blobs::verify_inline_hash(sha256, bytes)?;
+        }
+
+        if attestation.attesting_key_id.is_empty() {
+            return Err(crate::federation::BlobError::InvalidArgument(
+                "attesting_key_id is empty".into(),
+            ));
+        }
+
+        let original_content_hash =
+            hex::decode(&attestation.original_content_hash_hex).map_err(|e| {
+                crate::federation::BlobError::InvalidArgument(format!(
+                    "original_content_hash hex decode: {e}"
+                ))
+            })?;
+
+        let storage_kind = body.storage_kind().to_owned();
+        let size_bytes_i64 = i64::try_from(body.size_bytes()).map_err(|_| {
+            crate::federation::BlobError::InvalidArgument(
+                "size_bytes exceeds i64 — federation_blobs.size_bytes is INTEGER".into(),
+            )
+        })?;
+        let (bytes_inline_opt, external_ref_opt) = match &body {
+            crate::federation::BlobBody::Inline(b) => (Some(b.clone()), None),
+            crate::federation::BlobBody::External(e) => (None, Some(e.uri.clone())),
+        };
+
+        // 2. Compose the holder attestation envelope.
+        let attestation_type = crate::federation::holds_bytes_attestation_type(sha256);
+        let attestation_envelope_value =
+            crate::federation::holds_bytes_attestation_envelope(sha256);
+        let attestation_row = crate::federation::Attestation {
+            attestation_id: attestation.attestation_id.clone(),
+            attesting_key_id: attestation.attesting_key_id.clone(),
+            attested_key_id: attestation.attesting_key_id.clone(),
+            attestation_type: attestation_type.clone(),
+            weight: None,
+            asserted_at: attestation.scrub_timestamp,
+            expires_at: None,
+            attestation_envelope: attestation_envelope_value.clone(),
+            original_content_hash: attestation.original_content_hash_hex.clone(),
+            scrub_signature_classical: attestation.scrub_signature_classical.clone(),
+            scrub_signature_pqc: attestation.scrub_signature_pqc.clone(),
+            scrub_key_id: attestation.scrub_key_id.clone(),
+            scrub_timestamp: attestation.scrub_timestamp,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+        };
+        let persist_row_hash = crate::federation::types::compute_persist_row_hash(&attestation_row)
+            .map_err(|e| crate::federation::BlobError::Backend(format!("persist_row_hash: {e}")))?;
+        let attestation_envelope_text = serde_json::to_string(&attestation_envelope_value)
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("envelope serialize: {e}"))
+            })?;
+
+        let sha_vec = sha256.to_vec();
+        let conn = self.conn.clone();
+        let asserted_at_str = attestation.scrub_timestamp.to_rfc3339();
+        let scrub_timestamp_str = attestation.scrub_timestamp.to_rfc3339();
+        let attestation_id_owned = attestation.attestation_id.clone();
+        let attesting_key_id_owned = attestation.attesting_key_id.clone();
+        let scrub_signature_classical_owned = attestation.scrub_signature_classical.clone();
+        let scrub_signature_pqc_owned = attestation.scrub_signature_pqc.clone();
+        let scrub_key_id_owned = attestation.scrub_key_id.clone();
+        let media_type_owned = media_type.map(str::to_owned);
+
+        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
+            let mut conn = conn.blocking_lock();
+            let tx = conn.transaction()?;
+            tx.execute(
+                "INSERT INTO federation_blobs (\
+                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT (sha256) DO NOTHING",
+                rusqlite::params![
+                    sha_vec,
+                    storage_kind,
+                    bytes_inline_opt,
+                    external_ref_opt,
+                    size_bytes_i64,
+                    media_type_owned,
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO federation_attestations (\
+                    attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                    weight, asserted_at, expires_at, attestation_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                rusqlite::params![
+                    attestation_id_owned,
+                    attesting_key_id_owned,
+                    attesting_key_id_owned,
+                    attestation_type,
+                    Option::<f64>::None,
+                    asserted_at_str,
+                    Option::<String>::None,
+                    attestation_envelope_text,
+                    original_content_hash,
+                    scrub_signature_classical_owned,
+                    scrub_signature_pqc_owned,
+                    scrub_key_id_owned,
+                    scrub_timestamp_str,
+                    Option::<String>::None,
+                    persist_row_hash,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("FOREIGN KEY") {
+                crate::federation::BlobError::AttestationEmissionFailed(format!(
+                    "FK violation on holds_bytes attestation: {msg}"
+                ))
+            } else if msg.contains("UNIQUE constraint failed") {
+                crate::federation::BlobError::AttestationEmissionFailed(format!(
+                    "attestation_id collision: {msg}"
+                ))
+            } else {
+                crate::federation::BlobError::Backend(format!("put_blob tx: {msg}"))
+            }
+        })?;
+
+        Ok(())
+    }
+
+    async fn get_blob(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Option<crate::federation::BlobBody>, crate::federation::BlobError> {
+        let sha_vec = sha256.to_vec();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(
+            move || -> Result<Option<crate::federation::BlobBody>, rusqlite::Error> {
+                let conn = conn.blocking_lock();
+                let row_opt = conn
+                    .query_row(
+                        "SELECT storage_kind, bytes_inline, external_ref, size_bytes, media_type \
+                         FROM federation_blobs WHERE sha256 = ?1",
+                        rusqlite::params![sha_vec],
+                        |row| {
+                            let storage_kind: String = row.get("storage_kind")?;
+                            let bytes_inline: Option<Vec<u8>> = row.get("bytes_inline")?;
+                            let external_ref: Option<String> = row.get("external_ref")?;
+                            let size_bytes: i64 = row.get("size_bytes")?;
+                            let media_type: Option<String> = row.get("media_type")?;
+                            Ok((
+                                storage_kind,
+                                bytes_inline,
+                                external_ref,
+                                size_bytes,
+                                media_type,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                Ok(
+                    row_opt.map(|(kind, inline, ext, size, mt)| match kind.as_str() {
+                        "inline" => crate::federation::BlobBody::Inline(inline.unwrap_or_default()),
+                        _ => {
+                            crate::federation::BlobBody::External(crate::federation::ExternalRef {
+                                uri: ext.unwrap_or_default(),
+                                size_bytes: size.max(0) as u64,
+                                media_type: mt,
+                            })
+                        }
+                    }),
+                )
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| crate::federation::BlobError::Backend(format!("get_blob: {e}")))
+    }
+
+    async fn has_blob(&self, sha256: &[u8; 32]) -> Result<bool, crate::federation::BlobError> {
+        let sha_vec = sha256.to_vec();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<bool, rusqlite::Error> {
+            let conn = conn.blocking_lock();
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM federation_blobs WHERE sha256 = ?1",
+                rusqlite::params![sha_vec],
+                |row| row.get(0),
+            )?;
+            Ok(count > 0)
+        })
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| crate::federation::BlobError::Backend(format!("has_blob: {e}")))
+    }
+
+    async fn list_holders(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Vec<String>, crate::federation::BlobError> {
+        let attestation_type = crate::federation::holds_bytes_attestation_type(sha256);
+        let full_hex = hex::encode(sha256);
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<String>, rusqlite::Error> {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn.prepare(
+                "SELECT attesting_key_id, attestation_envelope \
+                 FROM federation_attestations \
+                 WHERE attestation_type = ?1",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![attestation_type], |row| {
+                let key_id: String = row.get("attesting_key_id")?;
+                let env_text: String = row.get("attestation_envelope")?;
+                Ok((key_id, env_text))
+            })?;
+            let mut holders: Vec<String> = Vec::new();
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for r in rows {
+                let (key_id, env_text) = r?;
+                let env: serde_json::Value = match serde_json::from_str(&env_text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let matches = env
+                    .get("evidence_refs")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().any(|v| v.as_str() == Some(full_hex.as_str())))
+                    .unwrap_or(false);
+                if matches && seen.insert(key_id.clone()) {
+                    holders.push(key_id);
+                }
+            }
+            Ok(holders)
+        })
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| crate::federation::BlobError::Backend(format!("list_holders: {e}")))
     }
 }
 
@@ -6193,6 +6488,340 @@ mod tests {
         assert_eq!(revs.len(), 1);
         assert_eq!(revs[0].revocation_id, "rev-1");
         assert_eq!(revs[0].persist_row_hash.len(), 64);
+    }
+
+    // ─── BlobStorage tests (v2.3, CIRISPersist#103) ────────────────
+
+    use crate::federation::{BlobBody, BlobError, BlobStorage, ExternalRef, PutBlobAttestation};
+
+    fn blob_attestation(
+        attesting_key_id: &str,
+        scrub_key_id: &str,
+        attestation_id: &str,
+    ) -> PutBlobAttestation {
+        PutBlobAttestation {
+            attesting_key_id: attesting_key_id.into(),
+            attestation_id: attestation_id.into(),
+            original_content_hash_hex: "abcdef01".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: scrub_key_id.into(),
+            scrub_timestamp: "2026-05-27T00:00:00Z".parse().unwrap(),
+        }
+    }
+
+    async fn blob_test_backend() -> SqliteBackend {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        // Bootstrap a federation key so the FK on holds_bytes
+        // attestation's attesting_key_id is satisfied.
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("host-a", "primitive-a", "host-a"),
+            })
+            .await
+            .unwrap();
+        backend
+    }
+
+    fn sha256_of(bytes: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let d = Sha256::digest(bytes);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&d);
+        out
+    }
+
+    #[tokio::test]
+    async fn blob_inline_round_trip() {
+        let backend = blob_test_backend().await;
+        let bytes = b"hello blob world".to_vec();
+        let sha = sha256_of(&bytes);
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes.clone()),
+                Some("application/octet-stream"),
+                blob_attestation(
+                    "host-a",
+                    "host-a",
+                    uuid::Uuid::new_v4().to_string().as_str(),
+                ),
+            )
+            .await
+            .expect("put inline");
+        let got = backend.get_blob(&sha).await.expect("get").expect("present");
+        assert_eq!(got, BlobBody::Inline(bytes));
+    }
+
+    #[tokio::test]
+    async fn blob_external_round_trip() {
+        let backend = blob_test_backend().await;
+        let ext = ExternalRef {
+            uri: "s3://my-bucket/path/to/object".into(),
+            size_bytes: 12_345_678,
+            media_type: Some("video/mp4".into()),
+        };
+        let sha = [0x55u8; 32];
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::External(ext.clone()),
+                Some("video/mp4"),
+                blob_attestation(
+                    "host-a",
+                    "host-a",
+                    uuid::Uuid::new_v4().to_string().as_str(),
+                ),
+            )
+            .await
+            .expect("put external");
+        let got = backend.get_blob(&sha).await.expect("get").expect("present");
+        assert_eq!(got, BlobBody::External(ext));
+    }
+
+    #[tokio::test]
+    async fn blob_hash_mismatch_rejected() {
+        let backend = blob_test_backend().await;
+        let bytes = b"the bytes".to_vec();
+        let wrong_sha = [0x00u8; 32]; // not the sha of `bytes`
+        let err = backend
+            .put_blob(
+                &wrong_sha,
+                BlobBody::Inline(bytes),
+                None,
+                blob_attestation(
+                    "host-a",
+                    "host-a",
+                    uuid::Uuid::new_v4().to_string().as_str(),
+                ),
+            )
+            .await
+            .expect_err("must reject");
+        assert!(matches!(err, BlobError::HashMismatch { .. }));
+        assert_eq!(err.kind(), "blob_hash_mismatch");
+    }
+
+    #[tokio::test]
+    async fn blob_inline_size_cap_rejected() {
+        // 2 MiB Inline against the default 1 MiB cap.
+        let backend = blob_test_backend().await;
+        let bytes = vec![0u8; 2 * 1024 * 1024];
+        let sha = sha256_of(&bytes);
+        let err = backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                blob_attestation(
+                    "host-a",
+                    "host-a",
+                    uuid::Uuid::new_v4().to_string().as_str(),
+                ),
+            )
+            .await
+            .expect_err("must reject");
+        match err {
+            BlobError::InlineSizeExceeded { size, cap } => {
+                assert_eq!(size, 2 * 1024 * 1024);
+                assert_eq!(cap, 1024 * 1024);
+            }
+            other => panic!("expected InlineSizeExceeded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn blob_has_blob_existence_check() {
+        let backend = blob_test_backend().await;
+        let bytes = b"ping".to_vec();
+        let sha = sha256_of(&bytes);
+        assert!(!backend.has_blob(&sha).await.unwrap());
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                blob_attestation(
+                    "host-a",
+                    "host-a",
+                    uuid::Uuid::new_v4().to_string().as_str(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(backend.has_blob(&sha).await.unwrap());
+
+        let missing = [0xEEu8; 32];
+        assert!(!backend.has_blob(&missing).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn blob_list_holders_single_writer() {
+        let backend = blob_test_backend().await;
+        let bytes = b"a payload".to_vec();
+        let sha = sha256_of(&bytes);
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                blob_attestation(
+                    "host-a",
+                    "host-a",
+                    uuid::Uuid::new_v4().to_string().as_str(),
+                ),
+            )
+            .await
+            .unwrap();
+        let holders = backend.list_holders(&sha).await.unwrap();
+        assert_eq!(holders, vec!["host-a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn blob_list_holders_two_writers() {
+        // Bootstrap a second host key.
+        let backend = blob_test_backend().await;
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("host-b", "primitive-b", "host-b"),
+            })
+            .await
+            .unwrap();
+
+        let bytes = b"shared payload".to_vec();
+        let sha = sha256_of(&bytes);
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes.clone()),
+                None,
+                blob_attestation(
+                    "host-a",
+                    "host-a",
+                    uuid::Uuid::new_v4().to_string().as_str(),
+                ),
+            )
+            .await
+            .unwrap();
+        // Host B writes the SAME sha (same bytes) — second insert
+        // collapses on PK but holder attestation lands.
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                blob_attestation(
+                    "host-b",
+                    "host-b",
+                    uuid::Uuid::new_v4().to_string().as_str(),
+                ),
+            )
+            .await
+            .unwrap();
+        let mut holders = backend.list_holders(&sha).await.unwrap();
+        holders.sort();
+        assert_eq!(holders, vec!["host-a".to_string(), "host-b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn blob_idempotent_put_same_writer() {
+        let backend = blob_test_backend().await;
+        let bytes = b"same bytes twice".to_vec();
+        let sha = sha256_of(&bytes);
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes.clone()),
+                None,
+                blob_attestation(
+                    "host-a",
+                    "host-a",
+                    uuid::Uuid::new_v4().to_string().as_str(),
+                ),
+            )
+            .await
+            .unwrap();
+        // Same blob, same writer, fresh attestation_id. No error; the
+        // blob row PK collapses, the attestation row lands.
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                blob_attestation(
+                    "host-a",
+                    "host-a",
+                    uuid::Uuid::new_v4().to_string().as_str(),
+                ),
+            )
+            .await
+            .unwrap();
+        // list_holders dedups by attesting_key_id.
+        let holders = backend.list_holders(&sha).await.unwrap();
+        assert_eq!(holders, vec!["host-a".to_string()]);
+
+        // get_blob returns the (idempotent) row exactly once.
+        let got = backend.get_blob(&sha).await.unwrap().unwrap();
+        assert_eq!(got.size_bytes(), 16);
+    }
+
+    #[tokio::test]
+    async fn blob_conflicting_storage_kind_first_write_wins() {
+        // Per the trait contract: first write's storage_kind wins on
+        // SHA collision. This test pins the policy: Inline-first then
+        // External-second leaves the row as Inline.
+        let backend = blob_test_backend().await;
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("host-b", "primitive-b", "host-b"),
+            })
+            .await
+            .unwrap();
+        let bytes = b"will-be-inlined".to_vec();
+        let sha = sha256_of(&bytes);
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes.clone()),
+                None,
+                blob_attestation(
+                    "host-a",
+                    "host-a",
+                    uuid::Uuid::new_v4().to_string().as_str(),
+                ),
+            )
+            .await
+            .unwrap();
+        // Second writer claims the same SHA via External — trait
+        // contract: silently keep the first row. Persist trusts the
+        // caller-supplied SHA for External, so this does not error
+        // and lands the holder attestation for host-b.
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::External(ExternalRef {
+                    uri: "s3://mirror/key".into(),
+                    size_bytes: bytes.len() as u64,
+                    media_type: None,
+                }),
+                None,
+                blob_attestation(
+                    "host-b",
+                    "host-b",
+                    uuid::Uuid::new_v4().to_string().as_str(),
+                ),
+            )
+            .await
+            .unwrap();
+        let got = backend.get_blob(&sha).await.unwrap().unwrap();
+        // First-write-wins: inline body preserved.
+        match got {
+            BlobBody::Inline(b) => assert_eq!(b, bytes),
+            other => panic!("expected Inline, got {other:?}"),
+        }
+        let mut holders = backend.list_holders(&sha).await.unwrap();
+        holders.sort();
+        assert_eq!(holders, vec!["host-a".to_string(), "host-b".to_string()]);
     }
 
     // ─── Trust hierarchy tests (v1.3.0, CIRISPersist#46+#47) ───────

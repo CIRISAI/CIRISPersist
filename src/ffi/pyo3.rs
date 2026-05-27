@@ -3187,6 +3187,177 @@ impl PyEngine {
         })
     }
 
+    // ── v2.3 (CIRISPersist#103) — BlobStorage PyO3 surface ─────────
+    //
+    // JSON in / JSON out. Inline bytes ride the wire as base64
+    // standard-alphabet strings (mirrors the V046 delivery_attestation
+    // surface and the existing scrub envelope pattern). Errors go
+    // through `blob_err_to_py` — a sibling to `federation_err_to_py`
+    // that maps the blob-error kind() vocabulary to typed PyErr.
+
+    /// Federation blob storage: write a blob with hash-on-write +
+    /// holder-attestation emission.
+    ///
+    /// `payload_json` shape:
+    ///
+    /// ```json
+    /// {
+    ///   "sha256": "<64-hex>",
+    ///   "body": {"inline": "<base64>"} | {"external": {"uri": "...",
+    ///     "size_bytes": N, "media_type": "...|null"}},
+    ///   "media_type": "...|null",
+    ///   "attestation": {
+    ///     "attesting_key_id": "...",
+    ///     "attestation_id": "<uuid-v4>",
+    ///     "original_content_hash_hex": "<hex>",
+    ///     "scrub_signature_classical": "<base64>",
+    ///     "scrub_signature_pqc": "<base64>|null",
+    ///     "scrub_key_id": "...",
+    ///     "scrub_timestamp": "RFC3339"
+    ///   }
+    /// }
+    /// ```
+    fn put_blob_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let payload = parse_put_blob_payload(payload_json)?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .put_blob(
+                                &payload.sha256,
+                                payload.body,
+                                payload.media_type.as_deref(),
+                                payload.attestation,
+                            )
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .put_blob(
+                                &payload.sha256,
+                                payload.body,
+                                payload.media_type.as_deref(),
+                                payload.attestation,
+                            )
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
+    /// Federation blob storage: read a blob by SHA-256 (hex).
+    ///
+    /// Returns `None` when no row exists; otherwise a JSON string of
+    /// `BlobBody`:
+    ///
+    /// - Inline: `{"inline": "<base64-bytes>"}`
+    /// - External: `{"external": {"uri": "...", "size_bytes": N,
+    ///   "media_type": "...|null"}}`
+    fn get_blob_json(&self, py: Python<'_>, sha256_hex: &str) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let sha = parse_sha256_hex(sha256_hex)?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        let body_opt = backend.get_blob(&sha).await.map_err(blob_err_to_py)?;
+                        match body_opt {
+                            None => Ok(None),
+                            Some(body) => encode_blob_body_json(&body).map(Some),
+                        }
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        let body_opt = backend.get_blob(&sha).await.map_err(blob_err_to_py)?;
+                        match body_opt {
+                            None => Ok(None),
+                            Some(body) => encode_blob_body_json(&body).map(Some),
+                        }
+                    })
+                }
+            })
+        })
+    }
+
+    /// Federation blob storage: existence check by SHA-256 (hex).
+    fn has_blob_json(&self, py: Python<'_>, sha256_hex: &str) -> PyResult<bool> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let sha = parse_sha256_hex(sha256_hex)?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend.has_blob(&sha).await.map_err(blob_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend.has_blob(&sha).await.map_err(blob_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
+    /// Federation blob storage: list holders of a blob by SHA-256
+    /// (hex). Returns a JSON array of attesting_key_id strings.
+    fn list_holders_json(&self, py: Python<'_>, sha256_hex: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let sha = parse_sha256_hex(sha256_hex)?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        let holders = backend.list_holders(&sha).await.map_err(blob_err_to_py)?;
+                        serde_json::to_string(&holders).map_err(|e| {
+                            PyRuntimeError::new_err(format!("list_holders JSON encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        let holders = backend.list_holders(&sha).await.map_err(blob_err_to_py)?;
+                        serde_json::to_string(&holders).map_err(|e| {
+                            PyRuntimeError::new_err(format!("list_holders JSON encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
     // ── v1.3.0 (CIRISPersist#46 + #47) — Trust hierarchy wraps ─────
     //
     // Wire shape mirrors the existing FederationDirectory PyO3
@@ -14187,6 +14358,135 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // Server-fault → RuntimeError (5xx).
         crate::federation::Error::Backend(_) => PyRuntimeError::new_err(kind),
     }
+}
+
+/// v2.3 (CIRISPersist#103) — translate a [`crate::federation::BlobError`]
+/// into the right typed Python exception. Mirrors the
+/// [`federation_err_to_py`] discipline: caller-fault → ValueError;
+/// server-fault → RuntimeError. The `kind()` string travels in the
+/// message for `translate_error_kind`-style retry-policy routing if
+/// the consumer wants it.
+fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
+    let kind = e.kind();
+    tracing::warn!(error = %e, kind = kind, "blob storage error");
+    match e {
+        crate::federation::BlobError::HashMismatch { .. }
+        | crate::federation::BlobError::InlineSizeExceeded { .. }
+        | crate::federation::BlobError::InvalidArgument(_)
+        | crate::federation::BlobError::AttestationEmissionFailed(_) => PyValueError::new_err(kind),
+        crate::federation::BlobError::Backend(_) => PyRuntimeError::new_err(kind),
+    }
+}
+
+/// v2.3 (CIRISPersist#103) — decoded `put_blob_json` payload (Rust-side
+/// representation). The PyO3 wrapper deserializes the wire shape into
+/// this struct and hands it to the backend's `put_blob`.
+struct PutBlobPayload {
+    sha256: [u8; 32],
+    body: crate::federation::BlobBody,
+    media_type: Option<String>,
+    attestation: crate::federation::PutBlobAttestation,
+}
+
+/// v2.3 (CIRISPersist#103) — Wire-shape representation for `put_blob_json`.
+/// Inline bytes ride as base64 standard-alphabet strings.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PutBlobWireBody {
+    /// `{"inline": "<base64>"}` — base64-decoded into the inline byte
+    /// payload.
+    Inline(String),
+    /// `{"external": {"uri": ..., "size_bytes": N, "media_type": ...}}`
+    External(crate::federation::ExternalRef),
+}
+
+#[derive(serde::Deserialize)]
+struct PutBlobAttestationWire {
+    attesting_key_id: String,
+    attestation_id: String,
+    original_content_hash_hex: String,
+    scrub_signature_classical: String,
+    #[serde(default)]
+    scrub_signature_pqc: Option<String>,
+    scrub_key_id: String,
+    scrub_timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(serde::Deserialize)]
+struct PutBlobJsonWire {
+    sha256: String,
+    body: PutBlobWireBody,
+    #[serde(default)]
+    media_type: Option<String>,
+    attestation: PutBlobAttestationWire,
+}
+
+/// v2.3 (CIRISPersist#103) — Decode the `put_blob_json` payload into
+/// the trait-call argument shape.
+fn parse_put_blob_payload(json: &str) -> PyResult<PutBlobPayload> {
+    let wire: PutBlobJsonWire = serde_json::from_str(json)
+        .map_err(|e| PyValueError::new_err(format!("put_blob_json decode: {e}")))?;
+    let sha = parse_sha256_hex(&wire.sha256)?;
+    let body = match wire.body {
+        PutBlobWireBody::Inline(b64) => {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            let bytes = B64.decode(&b64).map_err(|e| {
+                PyValueError::new_err(format!("put_blob_json inline base64 decode: {e}"))
+            })?;
+            crate::federation::BlobBody::Inline(bytes)
+        }
+        PutBlobWireBody::External(e) => crate::federation::BlobBody::External(e),
+    };
+    let attestation = crate::federation::PutBlobAttestation {
+        attesting_key_id: wire.attestation.attesting_key_id,
+        attestation_id: wire.attestation.attestation_id,
+        original_content_hash_hex: wire.attestation.original_content_hash_hex,
+        scrub_signature_classical: wire.attestation.scrub_signature_classical,
+        scrub_signature_pqc: wire.attestation.scrub_signature_pqc,
+        scrub_key_id: wire.attestation.scrub_key_id,
+        scrub_timestamp: wire.attestation.scrub_timestamp,
+    };
+    Ok(PutBlobPayload {
+        sha256: sha,
+        body,
+        media_type: wire.media_type,
+        attestation,
+    })
+}
+
+/// v2.3 (CIRISPersist#103) — parse a 64-char hex string into a
+/// `[u8; 32]` SHA-256.
+fn parse_sha256_hex(hex_str: &str) -> PyResult<[u8; 32]> {
+    let v = hex::decode(hex_str)
+        .map_err(|e| PyValueError::new_err(format!("sha256 hex decode: {e}")))?;
+    if v.len() != 32 {
+        return Err(PyValueError::new_err(format!(
+            "sha256 must be 32 bytes ({} hex chars), got {} bytes",
+            64,
+            v.len()
+        )));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&v);
+    Ok(out)
+}
+
+/// v2.3 (CIRISPersist#103) — encode a [`crate::federation::BlobBody`]
+/// back onto the JSON wire shape (with inline bytes as base64).
+fn encode_blob_body_json(body: &crate::federation::BlobBody) -> PyResult<String> {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    let value = match body {
+        crate::federation::BlobBody::Inline(bytes) => {
+            serde_json::json!({ "inline": B64.encode(bytes) })
+        }
+        crate::federation::BlobBody::External(ext) => serde_json::json!({
+            "external": ext,
+        }),
+    };
+    serde_json::to_string(&value)
+        .map_err(|e| PyRuntimeError::new_err(format!("BlobBody JSON encode: {e}")))
 }
 
 /// v0.3.1 — Cold-path PQC sign helper for the auto-fire flow after

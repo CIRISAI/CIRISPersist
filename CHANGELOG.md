@@ -5,6 +5,87 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [2.3.0] — 2026-05-27
+
+**`#103` — content-addressable `federation_blobs` storage substrate.**
+
+Where the SHA-256 hashes in `federation_attestations.evidence_refs`
+actually resolve to bytes. The federation directory names what
+exists; v2.3.0 adds the storage layer those SHAs point at — the
+companion to CIRISEdge#21 (ContentFetch transport) and the planned
+NodeCore node-mode serving.
+
+### `federation_blobs` table (V047, both dialects)
+
+- `sha256 BYTEA/BLOB PRIMARY KEY` (32-byte content hash); `storage_kind`
+  CHECK `IN ('inline','s3','external_url')`; `bytes_inline` /
+  `external_ref` columns with a named CHECK enforcing the inline ↔
+  external split; `size_bytes`, `media_type`, `first_seen_at`,
+  `regions_held TEXT[]` for per-region replication tracking.
+- SQLite uses a table-level CHECK (no triggers needed at CREATE TABLE
+  time) for cross-column constraint enforcement.
+
+### `BlobStorage` trait — sibling, not a `FederationDirectory` extension
+
+`put_blob` / `get_blob` / `has_blob` / `list_holders`. The federation
+directory's surface is identity + trust statements; blobs are
+content-addressable bytes — distinct concern, clean siblings, both
+implemented by the same backends.
+
+- `BlobBody { Inline(Vec<u8>) | External(ExternalRef) }` — the API
+  takes whichever the caller supplies; persist stores the inline
+  bytes or the external URI metadata. Persist never fetches from S3
+  — that's the caller's responsibility.
+- **Hash-on-write**: `put_blob(sha256, Inline(bytes), …)` hashes the
+  bytes (via `sha2`) and rejects mismatch with typed
+  `BlobError::HashMismatch { expected_hex, got_hex }`. External case
+  trusts the caller-supplied SHA (documented invariant — same
+  posture as the caller-supplied scrubber path).
+- **Inline-size cap**: configurable per backend via
+  `with_inline_bytes_cap(cap)` builder; default 1 MiB. Prevents a
+  misbehaving caller from inlining a multi-GB blob; rejected with
+  typed `BlobError::InlineSizeExceeded`.
+- **Conflicting-storage_kind policy**: first-write-wins (silent
+  accept). The blob is content-addressed; the SHA is the identity;
+  `storage_kind` is a per-host hint, not a wire property. The SHA
+  PK collapses replays via `INSERT … ON CONFLICT DO NOTHING`. The
+  holder attestation lands per call regardless, so `list_holders`
+  returns every writer.
+- **Idempotent `put_blob`**: same SHA, same bytes — no error, no
+  duplicate row.
+
+### `holds_bytes:sha256:*` attestation auto-emission
+
+Every successful `put_blob` writes an attestation into the existing
+`federation_attestations` table with
+`attestation_type = "holds_bytes:sha256:<first-8-hex-of-hash>"`. The
+full 64-hex SHA lives in the attestation envelope's `evidence_refs`
+array — collision resolution for the rare prefix collision. 8 hex
+chars = 32 bits = birthday collision at ~65k blobs, well within
+federation scale. `list_holders(sha256)` queries the prefix index
+server-side then filters by `evidence_refs` client-side.
+
+### PyO3 surface
+
+`put_blob_json` / `get_blob_json` / `has_blob_json` /
+`list_holders_json`. Inline bytes are base64-standard strings on the
+JSON wire, raw bytes server-side — mirrors v2.2.0's
+`delivery_attestation` PyO3 surface.
+
+### Out of scope for v0.1 (deferred)
+
+- **GC**. Blobs persist forever in v2.3.0; trait deliberately
+  exposes no `delete_blob`. A future migration adds
+  reference-counting + a `prune_blobs(min_age)` API.
+- **Server-side `evidence_refs[]` containment lookup**. Today the
+  full-SHA filter is client-side after the prefix query; a future
+  migration could add an indexed `evidence_refs TEXT[]` projection
+  column for server-side lookup.
+
+V047 migration (both dialects, single). qa_harness migration-count
+bound `1..=47`. Full nextest: **678 tests pass on both backends**
+(`postgres,server,pyo3,sqlite,cirisaudit,secrets,cirisnode,cirisgraph,telemetry`).
+
 ## [2.2.0] — 2026-05-27
 
 **`#101` — `federation_announcement` subject_kind + `federation_delivery_attestations` table.**

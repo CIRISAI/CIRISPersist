@@ -80,6 +80,11 @@ pub struct PostgresBackend {
     /// C only adds the field + setter.
     #[cfg(feature = "cirisaudit")]
     merkle_signer: std::sync::RwLock<Option<std::sync::Arc<crate::signing::LocalSigner>>>,
+    /// v2.3 (CIRISPersist#103) — inline-byte cap for the BlobStorage
+    /// trait's `put_blob`. Defaults to
+    /// [`crate::federation::DEFAULT_INLINE_BYTES_CAP`]; an Engine
+    /// builder may override via [`PostgresBackend::with_inline_bytes_cap`].
+    inline_bytes_cap: std::sync::atomic::AtomicUsize,
 }
 
 impl PostgresBackend {
@@ -151,7 +156,20 @@ impl PostgresBackend {
             dsn: dsn.to_owned(),
             #[cfg(feature = "cirisaudit")]
             merkle_signer: std::sync::RwLock::new(None),
+            inline_bytes_cap: std::sync::atomic::AtomicUsize::new(
+                crate::federation::DEFAULT_INLINE_BYTES_CAP,
+            ),
         })
+    }
+
+    /// v2.3 (CIRISPersist#103) — override the default inline-byte cap
+    /// for the [`crate::federation::BlobStorage`] trait's `put_blob`.
+    /// Callers larger than the cap on the `Inline` arm receive
+    /// [`crate::federation::BlobError::InlineSizeExceeded`].
+    pub fn with_inline_bytes_cap(self, cap: usize) -> Self {
+        self.inline_bytes_cap
+            .store(cap, std::sync::atomic::Ordering::Relaxed);
+        self
     }
 
     /// Construct from an already-built deadpool. For tests / advanced
@@ -168,6 +186,9 @@ impl PostgresBackend {
             dsn: dsn.into(),
             #[cfg(feature = "cirisaudit")]
             merkle_signer: std::sync::RwLock::new(None),
+            inline_bytes_cap: std::sync::atomic::AtomicUsize::new(
+                crate::federation::DEFAULT_INLINE_BYTES_CAP,
+            ),
         }
     }
 
@@ -1903,6 +1924,329 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("list_trusted_keys: {e}")))?;
         rows.into_iter().map(pg_row_to_trust_row).collect()
+    }
+}
+
+// ─── BlobStorage impl (v2.3, CIRISPersist#103) ─────────────────────
+//
+// Content-addressable byte storage. See `crate::federation::blobs` for
+// the trait + types. Postgres uses BYTEA for the sha256 PK + the
+// optional bytes_inline column; the holder attestation is emitted via
+// the existing `cirislens.federation_attestations` write path inside
+// the same transaction so a holder-attestation FK violation rolls back
+// the blob row too (atomic put_blob semantic).
+
+impl crate::federation::BlobStorage for PostgresBackend {
+    fn inline_bytes_cap(&self) -> usize {
+        self.inline_bytes_cap
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    async fn put_blob(
+        &self,
+        sha256: &[u8; 32],
+        body: crate::federation::BlobBody,
+        media_type: Option<&str>,
+        attestation: crate::federation::PutBlobAttestation,
+    ) -> Result<(), crate::federation::BlobError> {
+        // 1. API-side validation: inline-cap + hash-on-write. The DB
+        //    CHECK constraints catch direct-DB drift; this catches the
+        //    library-call drift before we reach the network.
+        let cap = self.inline_bytes_cap();
+        if let crate::federation::BlobBody::Inline(ref bytes) = body {
+            if bytes.len() > cap {
+                return Err(crate::federation::BlobError::InlineSizeExceeded {
+                    size: bytes.len(),
+                    cap,
+                });
+            }
+            crate::federation::blobs::verify_inline_hash(sha256, bytes)?;
+        }
+
+        // 2. Validate the attestation envelope shape.
+        if attestation.attesting_key_id.is_empty() {
+            return Err(crate::federation::BlobError::InvalidArgument(
+                "attesting_key_id is empty".into(),
+            ));
+        }
+        let attestation_uuid = uuid::Uuid::parse_str(&attestation.attestation_id).map_err(|e| {
+            crate::federation::BlobError::InvalidArgument(format!(
+                "attestation_id is not a valid UUID: {e}"
+            ))
+        })?;
+        let original_content_hash =
+            hex::decode(&attestation.original_content_hash_hex).map_err(|e| {
+                crate::federation::BlobError::InvalidArgument(format!(
+                    "original_content_hash hex decode: {e}"
+                ))
+            })?;
+
+        let storage_kind = body.storage_kind();
+        let size_bytes_i64 = i64::try_from(body.size_bytes()).map_err(|_| {
+            crate::federation::BlobError::InvalidArgument(
+                "size_bytes exceeds i64 — federation_blobs.size_bytes is BIGINT".into(),
+            )
+        })?;
+        let (bytes_inline_opt, external_ref_opt) = match &body {
+            crate::federation::BlobBody::Inline(b) => (Some(b.clone()), None),
+            crate::federation::BlobBody::External(e) => (None, Some(e.uri.clone())),
+        };
+
+        // 3. Compose the holder attestation envelope. Attestation type
+        //    + envelope shape are centralized in
+        //    crate::federation::blobs so list_holders can recompose
+        //    the same prefix string.
+        let attestation_type = crate::federation::holds_bytes_attestation_type(sha256);
+        let attestation_envelope = crate::federation::holds_bytes_attestation_envelope(sha256);
+        let attestation_row = crate::federation::Attestation {
+            attestation_id: attestation.attestation_id.clone(),
+            attesting_key_id: attestation.attesting_key_id.clone(),
+            // A holder attestation attests the *holder itself* — the
+            // attester says "I (key_id=X) hold the bytes." No second
+            // key is involved.
+            attested_key_id: attestation.attesting_key_id.clone(),
+            attestation_type: attestation_type.clone(),
+            weight: None,
+            asserted_at: attestation.scrub_timestamp,
+            expires_at: None,
+            attestation_envelope,
+            original_content_hash: attestation.original_content_hash_hex.clone(),
+            scrub_signature_classical: attestation.scrub_signature_classical.clone(),
+            scrub_signature_pqc: attestation.scrub_signature_pqc.clone(),
+            scrub_key_id: attestation.scrub_key_id.clone(),
+            scrub_timestamp: attestation.scrub_timestamp,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+        };
+        let attestation_envelope_jsonb = attestation_row.attestation_envelope.clone();
+        let persist_row_hash = crate::federation::types::compute_persist_row_hash(&attestation_row)
+            .map_err(|e| crate::federation::BlobError::Backend(format!("persist_row_hash: {e}")))?;
+
+        // 4. Atomic transaction: insert blob row (idempotent on PK)
+        //    THEN insert holder attestation. If the attestation FK
+        //    fails, the blob row is rolled back too — caller sees no
+        //    half-written state.
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
+
+        let sha_vec = sha256.to_vec();
+        tx.execute(
+            "INSERT INTO cirislens.federation_blobs (\
+                sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type\
+             ) VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (sha256) DO NOTHING",
+            &[
+                &sha_vec,
+                &storage_kind,
+                &bytes_inline_opt,
+                &external_ref_opt,
+                &size_bytes_i64,
+                &media_type,
+            ],
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("insert federation_blobs: {e}"))
+        })?;
+
+        // Holder attestation. Insert is idempotent at the
+        // (attestation_id) PK; the caller supplies a fresh UUID per
+        // call so the same host re-attesting the same blob lands as
+        // a new row (audit chain — every put_blob leaves a trace).
+        //
+        // weight + expires_at + pqc_completed_at are omitted from the
+        // INSERT column list — the holder attestation has no weight /
+        // expiry / pqc_completed_at semantics, and omitting them lets
+        // Postgres apply the column NULL default (which is unambiguous
+        // without forcing postgres-types to resolve the NULL bind type
+        // — there's no f64→NUMERIC built-in, so `&None::<f64>` against
+        // weight NUMERIC errors with "error serializing parameter").
+        let expires_at_null: Option<chrono::DateTime<chrono::Utc>> = None;
+        let pqc_completed_at_null: Option<chrono::DateTime<chrono::Utc>> = None;
+        tx.execute(
+            "INSERT INTO cirislens.federation_attestations (\
+                attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                asserted_at, expires_at, attestation_envelope, \
+                original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+            &[
+                &attestation_uuid,
+                &attestation.attesting_key_id,
+                &attestation.attesting_key_id,
+                &attestation_type,
+                &attestation.scrub_timestamp,
+                &expires_at_null,
+                &attestation_envelope_jsonb,
+                &original_content_hash,
+                &attestation.scrub_signature_classical,
+                &attestation.scrub_signature_pqc,
+                &attestation.scrub_key_id,
+                &attestation.scrub_timestamp,
+                &pqc_completed_at_null,
+                &persist_row_hash,
+            ],
+        )
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("foreign key") {
+                crate::federation::BlobError::AttestationEmissionFailed(format!(
+                    "FK violation on holds_bytes attestation: {msg}"
+                ))
+            } else if msg.contains("duplicate key") {
+                // attestation_id PK collision — caller reused a UUID.
+                crate::federation::BlobError::AttestationEmissionFailed(format!(
+                    "attestation_id collision: {msg}"
+                ))
+            } else {
+                crate::federation::BlobError::Backend(format!(
+                    "insert holds_bytes attestation: {msg}"
+                ))
+            }
+        })?;
+
+        tx.commit().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("commit blob+attestation: {e}"))
+        })?;
+
+        Ok(())
+    }
+
+    async fn get_blob(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Option<crate::federation::BlobBody>, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let sha_vec = sha256.to_vec();
+        let row_opt = client
+            .query_opt(
+                "SELECT storage_kind, bytes_inline, external_ref, size_bytes, media_type \
+                 FROM cirislens.federation_blobs WHERE sha256 = $1",
+                &[&sha_vec],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("select federation_blobs: {e}"))
+            })?;
+        let Some(row) = row_opt else {
+            return Ok(None);
+        };
+        let storage_kind: String =
+            row.safe_get_with("storage_kind", crate::federation::BlobError::Backend)?;
+        match storage_kind.as_str() {
+            "inline" => {
+                let bytes: Vec<u8> =
+                    row.safe_get_with("bytes_inline", crate::federation::BlobError::Backend)?;
+                Ok(Some(crate::federation::BlobBody::Inline(bytes)))
+            }
+            "s3" | "external_url" => {
+                let uri: String =
+                    row.safe_get_with("external_ref", crate::federation::BlobError::Backend)?;
+                let size_bytes_i64: i64 =
+                    row.safe_get_with("size_bytes", crate::federation::BlobError::Backend)?;
+                let size_bytes = u64::try_from(size_bytes_i64).map_err(|_| {
+                    crate::federation::BlobError::Backend(
+                        "size_bytes column went negative — schema CHECK violated".into(),
+                    )
+                })?;
+                let media_type: Option<String> =
+                    row.safe_get_with("media_type", crate::federation::BlobError::Backend)?;
+                Ok(Some(crate::federation::BlobBody::External(
+                    crate::federation::ExternalRef {
+                        uri,
+                        size_bytes,
+                        media_type,
+                    },
+                )))
+            }
+            other => Err(crate::federation::BlobError::Backend(format!(
+                "unknown storage_kind: {other}"
+            ))),
+        }
+    }
+
+    async fn has_blob(&self, sha256: &[u8; 32]) -> Result<bool, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let sha_vec = sha256.to_vec();
+        let row_opt = client
+            .query_opt(
+                "SELECT 1 AS one FROM cirislens.federation_blobs WHERE sha256 = $1",
+                &[&sha_vec],
+            )
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("has_blob query: {e}")))?;
+        Ok(row_opt.is_some())
+    }
+
+    async fn list_holders(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Vec<String>, crate::federation::BlobError> {
+        // Query strategy:
+        //   1. server-side prefix filter on attestation_type
+        //      ("holds_bytes:sha256:<8-hex>") — uses sequential scan or
+        //      a future btree index on attestation_type prefix
+        //   2. client-side full-SHA filter against
+        //      attestation_envelope->'evidence_refs' — discriminates
+        //      prefix collisions
+        // Server-side JSONB containment would be marginally faster
+        // for a populated index, but the prefix already narrows the
+        // candidate set well below O(table). Future work: an index
+        // on `(attestation_type)` lights up the prefix scan.
+        let attestation_type = crate::federation::holds_bytes_attestation_type(sha256);
+        let full_hex = hex::encode(sha256);
+
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT attesting_key_id, attestation_envelope \
+                 FROM cirislens.federation_attestations \
+                 WHERE attestation_type = $1",
+                &[&attestation_type],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("list_holders query: {e}"))
+            })?;
+
+        let mut holders: Vec<String> = Vec::with_capacity(rows.len());
+        let mut seen = std::collections::HashSet::new();
+        for row in rows {
+            let envelope: serde_json::Value = row.safe_get_with(
+                "attestation_envelope",
+                crate::federation::BlobError::Backend,
+            )?;
+            let matches = envelope
+                .get("evidence_refs")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().any(|v| v.as_str() == Some(full_hex.as_str())))
+                .unwrap_or(false);
+            if !matches {
+                continue;
+            }
+            let key_id: String =
+                row.safe_get_with("attesting_key_id", crate::federation::BlobError::Backend)?;
+            if seen.insert(key_id.clone()) {
+                holders.push(key_id);
+            }
+        }
+        Ok(holders)
     }
 }
 
@@ -9415,5 +9759,334 @@ mod tests {
             .await
             .unwrap();
         assert!(in_domain.iter().any(|r| r.key == k_registry));
+    }
+
+    // ─── BlobStorage tests (v2.3, CIRISPersist#103) ────────────────
+    //
+    // PG parity for the SQLite tests in store/sqlite.rs. Each test is
+    // serialized via `serial_test::serial(postgres)` because the
+    // shared test DB doesn't isolate writes per-test; rows from one
+    // test would otherwise leak into another's `list_holders`. The
+    // SHA prefix is randomized via `uuid_like()` so leaked attestation
+    // rows still can't accidentally match.
+
+    fn pg_sha256_of(bytes: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let d = Sha256::digest(bytes);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&d);
+        out
+    }
+
+    /// Mix a per-test random suffix into the byte payload so the
+    /// derived SHA differs from any other test's blob. Avoids
+    /// cross-test interference on the shared PG test DB.
+    fn pg_blob_payload(prefix: &str) -> Vec<u8> {
+        format!("{prefix}-{}", uuid_like()).into_bytes()
+    }
+
+    async fn pg_blob_bootstrap_host(backend: &PostgresBackend, host_key_id: &str) {
+        use crate::federation::FederationDirectory;
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: fix_section_i_key(host_key_id, host_key_id, chrono::Utc::now(), false),
+            })
+            .await
+            .unwrap();
+    }
+
+    fn pg_blob_attestation(
+        attesting_key_id: &str,
+        scrub_key_id: &str,
+    ) -> crate::federation::PutBlobAttestation {
+        crate::federation::PutBlobAttestation {
+            attesting_key_id: attesting_key_id.into(),
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            original_content_hash_hex: "deadbeef".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: scrub_key_id.into(),
+            scrub_timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn blob_pg_inline_round_trip() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::{BlobBody, BlobStorage};
+        let host = format!("blob-host-inline-{}", uuid_like());
+        pg_blob_bootstrap_host(&backend, &host).await;
+        let bytes = pg_blob_payload("inline");
+        let sha = pg_sha256_of(&bytes);
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes.clone()),
+                Some("application/octet-stream"),
+                pg_blob_attestation(&host, &host),
+            )
+            .await
+            .expect("put inline");
+        let got = backend.get_blob(&sha).await.expect("get").expect("present");
+        assert_eq!(got, BlobBody::Inline(bytes));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn blob_pg_external_round_trip() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::{BlobBody, BlobStorage, ExternalRef};
+        let host = format!("blob-host-ext-{}", uuid_like());
+        pg_blob_bootstrap_host(&backend, &host).await;
+        // Random SHA for the external case (we trust the caller's
+        // SHA; no bytes to verify against).
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut sha = [0u8; 32];
+        sha[..16].copy_from_slice(&nanos.to_be_bytes());
+        sha[16..].copy_from_slice(&nanos.to_be_bytes());
+        let ext = ExternalRef {
+            uri: format!("s3://bucket/{}", uuid_like()),
+            size_bytes: 99_999_999,
+            media_type: Some("video/mp4".into()),
+        };
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::External(ext.clone()),
+                Some("video/mp4"),
+                pg_blob_attestation(&host, &host),
+            )
+            .await
+            .unwrap();
+        let got = backend.get_blob(&sha).await.unwrap().unwrap();
+        assert_eq!(got, BlobBody::External(ext));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn blob_pg_hash_mismatch_rejected() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::{BlobBody, BlobError, BlobStorage};
+        let host = format!("blob-host-mm-{}", uuid_like());
+        pg_blob_bootstrap_host(&backend, &host).await;
+        let bytes = pg_blob_payload("mismatch");
+        let mut wrong = pg_sha256_of(&bytes);
+        wrong[0] ^= 0xff;
+        let err = backend
+            .put_blob(
+                &wrong,
+                BlobBody::Inline(bytes),
+                None,
+                pg_blob_attestation(&host, &host),
+            )
+            .await
+            .expect_err("must reject");
+        assert!(matches!(err, BlobError::HashMismatch { .. }));
+        assert_eq!(err.kind(), "blob_hash_mismatch");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn blob_pg_inline_size_cap_rejected() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::{BlobBody, BlobError, BlobStorage};
+        let host = format!("blob-host-cap-{}", uuid_like());
+        pg_blob_bootstrap_host(&backend, &host).await;
+        let bytes = vec![0u8; 2 * 1024 * 1024];
+        let sha = pg_sha256_of(&bytes);
+        let err = backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                pg_blob_attestation(&host, &host),
+            )
+            .await
+            .expect_err("must reject");
+        match err {
+            BlobError::InlineSizeExceeded { size, cap } => {
+                assert_eq!(size, 2 * 1024 * 1024);
+                assert_eq!(cap, 1024 * 1024);
+            }
+            other => panic!("expected InlineSizeExceeded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn blob_pg_has_blob_existence_check() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::{BlobBody, BlobStorage};
+        let host = format!("blob-host-has-{}", uuid_like());
+        pg_blob_bootstrap_host(&backend, &host).await;
+        let bytes = pg_blob_payload("has");
+        let sha = pg_sha256_of(&bytes);
+        assert!(!backend.has_blob(&sha).await.unwrap());
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                pg_blob_attestation(&host, &host),
+            )
+            .await
+            .unwrap();
+        assert!(backend.has_blob(&sha).await.unwrap());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn blob_pg_list_holders_two_writers() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::{BlobBody, BlobStorage};
+        let host_a = format!("blob-host-a-{}", uuid_like());
+        let host_b = format!("blob-host-b-{}", uuid_like());
+        pg_blob_bootstrap_host(&backend, &host_a).await;
+        pg_blob_bootstrap_host(&backend, &host_b).await;
+        let bytes = pg_blob_payload("two-writers");
+        let sha = pg_sha256_of(&bytes);
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes.clone()),
+                None,
+                pg_blob_attestation(&host_a, &host_a),
+            )
+            .await
+            .unwrap();
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                pg_blob_attestation(&host_b, &host_b),
+            )
+            .await
+            .unwrap();
+        let mut holders = backend.list_holders(&sha).await.unwrap();
+        holders.sort();
+        let mut expected = vec![host_a, host_b];
+        expected.sort();
+        assert_eq!(holders, expected);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn blob_pg_idempotent_put_same_writer() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::{BlobBody, BlobStorage};
+        let host = format!("blob-host-idem-{}", uuid_like());
+        pg_blob_bootstrap_host(&backend, &host).await;
+        let bytes = pg_blob_payload("idem");
+        let sha = pg_sha256_of(&bytes);
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes.clone()),
+                None,
+                pg_blob_attestation(&host, &host),
+            )
+            .await
+            .unwrap();
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                pg_blob_attestation(&host, &host),
+            )
+            .await
+            .unwrap();
+        let holders = backend.list_holders(&sha).await.unwrap();
+        assert_eq!(holders, vec![host]);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn blob_pg_conflicting_storage_kind_first_write_wins() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::{BlobBody, BlobStorage, ExternalRef};
+        let host_a = format!("blob-host-cf-a-{}", uuid_like());
+        let host_b = format!("blob-host-cf-b-{}", uuid_like());
+        pg_blob_bootstrap_host(&backend, &host_a).await;
+        pg_blob_bootstrap_host(&backend, &host_b).await;
+        let bytes = pg_blob_payload("conflict");
+        let sha = pg_sha256_of(&bytes);
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes.clone()),
+                None,
+                pg_blob_attestation(&host_a, &host_a),
+            )
+            .await
+            .unwrap();
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::External(ExternalRef {
+                    uri: "s3://mirror/key".into(),
+                    size_bytes: bytes.len() as u64,
+                    media_type: None,
+                }),
+                None,
+                pg_blob_attestation(&host_b, &host_b),
+            )
+            .await
+            .unwrap();
+        let got = backend.get_blob(&sha).await.unwrap().unwrap();
+        match got {
+            BlobBody::Inline(b) => assert_eq!(b, bytes),
+            other => panic!("expected Inline (first-write-wins), got {other:?}"),
+        }
+        let mut holders = backend.list_holders(&sha).await.unwrap();
+        holders.sort();
+        let mut expected = vec![host_a, host_b];
+        expected.sort();
+        assert_eq!(holders, expected);
     }
 }
