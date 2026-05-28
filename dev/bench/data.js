@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779979442808,
+  "lastUpdate": 1779988158851,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -34409,6 +34409,276 @@ window.BENCHMARK_DATA = {
             "name": "storage_floor/next_sequence_full",
             "value": 29325,
             "range": "± 1119",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "0d35f0255d328b00f526169bd9c9d62511cb91ce",
+          "message": "2.8.0 — #111 runtime_handle_capsule (cross-cdylib statics fix)\n\ncloses #111. Extends #109's cross-cdylib capsule pattern from type\nidentity to statics duplication.\n\nWhen persist is linked into both ciris_persist.abi3.so AND a consumer\nwheel (e.g. ciris_edge.abi3.so pulling persist as a Cargo rlib via\n[dependencies]), each .so gets its own copy of persist's static\nENGINE_SINGLETON. The consumer's copy is never populated, so\ncurrent_runtime_handle() always returns None in cross-wheel\ndeployments. CIRISConformance v0.10.0's cohabitation gate caught this\non all 6 cells (3 platforms × 2 backends).\n\nFix mirrors v2.7.0's three capsule accessors: new runtime_handle_capsule\n#[pymethod] on PyEngine wrapping tokio::runtime::Handle in a PyCapsule\nwith name tag \"ciris_persist::runtime_handle\". Handle sourced from\nself.runtime.handle().clone() — `self` already IS the singleton holder\nin this extension module's view, so the static lookup is sidestepped\nentirely.\n\nConsumer pattern: engine.call_method0(\"runtime_handle_capsule\")? +\nunsafe { cap.pointer_checked(name)?.cast().as_ref() } + handle.enter().\n\nPattern now generalizes to any persist static-rooted accessor; the\nrecipe for future cross-wheel singletons is the same.\n\nVerified: clippy --all-targets clean on default AND full feature sets.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-28T11:49:29-05:00",
+          "tree_id": "0ee5e47a1629b580af13257556b68d4568b5dd82",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/0d35f0255d328b00f526169bd9c9d62511cb91ce"
+        },
+        "date": 1779988157665,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 97025,
+            "range": "± 1528",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 240078,
+            "range": "± 1080",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 533381,
+            "range": "± 1277",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 2006574,
+            "range": "± 28000",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 325,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1235,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 7352,
+            "range": "± 28",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 20546,
+            "range": "± 34",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 23959,
+            "range": "± 60",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 88566,
+            "range": "± 304",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 317,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 3069,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9615,
+            "range": "± 22",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 44452,
+            "range": "± 245",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 545,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2032307,
+            "range": "± 129758",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6193379,
+            "range": "± 52626",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 22861366,
+            "range": "± 231129",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 317130,
+            "range": "± 55659",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 581100,
+            "range": "± 117491",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 908289,
+            "range": "± 138775",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 1939547,
+            "range": "± 143901",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 27503004,
+            "range": "± 196105",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 9874162,
+            "range": "± 97441",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 692308,
+            "range": "± 24215",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 1831719,
+            "range": "± 29361",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 89660412,
+            "range": "± 480666",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 4218978,
+            "range": "± 189283",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 16195350,
+            "range": "± 311214",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 219616667,
+            "range": "± 1037563",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 11434321,
+            "range": "± 360270",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 42010019,
+            "range": "± 498776",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 269783,
+            "range": "± 57738",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 235346,
+            "range": "± 46183",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 49298,
+            "range": "± 3257",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 144234,
+            "range": "± 3095",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 1097084,
+            "range": "± 12663",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 82,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 22880,
+            "range": "± 1620",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 3541,
+            "range": "± 19",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 38460,
+            "range": "± 3402",
             "unit": "ns/iter"
           }
         ]
