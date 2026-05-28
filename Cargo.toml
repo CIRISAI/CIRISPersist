@@ -724,6 +724,17 @@ name = "ingest_pipeline"
 harness = false
 required-features = ["postgres"]
 
+# v2.12.0 (CIRISPersist#116) — calibration anchor for runner-noise
+# normalization. Pure-compute, no deps beyond criterion. The bench
+# workflow extracts this bench's `ns/iter` first and uses it to
+# divide every other bench's value, producing runner-independent
+# "calibration units" the trend chart + alert threshold can compare
+# meaningfully across shared-runner-load variation. See
+# `benches/calibration.rs` and `.github/workflows/bench.yml`.
+[[bench]]
+name = "calibration"
+harness = false
+
 [[bench]]
 name = "canonicalize"
 harness = false

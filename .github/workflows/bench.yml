@@ -108,20 +108,108 @@ jobs:
         # benches (open_in_memory) need no service. `MALLOC_ARENA_MAX`
         # caps glibc's per-thread arenas so the multi-threaded benches'
         # virtual footprint stays sane on the runner.
+        #
+        # v2.12.0 (CIRISPersist#116) — runs FIRST as the calibration
+        # anchor. Pure-compute SplitMix64 microbench produces an
+        # `ns/iter` that captures THIS runner's wall-time-per-CPU-op
+        # rate. The normalization step further down divides every
+        # other bench's value by this calibration, so published
+        # metrics are runner-independent.
+        #
+        # Why this exists: 2.11.0 vs 2.10.0 (a 15-line PyCapsule + a
+        # verify pin bump that touches NO benched hot path) tripped
+        # 40 performance alerts purely from neighbor-tenant runner
+        # load. Absolute ns/iter on shared runners is too noisy for
+        # the 1.1× alert threshold; normalization against a pure-CPU
+        # calibration anchor solves it.
         env:
           MALLOC_ARENA_MAX: "4"
         run: |
-          cargo bench --features postgres --bench ingest_pipeline -- --output-format bencher | tee bench-output.txt
-          cargo bench --bench canonicalize -- --output-format bencher | tee -a bench-output.txt
-          cargo bench --bench sign -- --output-format bencher | tee -a bench-output.txt
-          cargo bench --bench dedup_key -- --output-format bencher | tee -a bench-output.txt
-          cargo bench --features postgres --bench queue -- --output-format bencher | tee -a bench-output.txt
-          cargo bench --features sqlite,cirislens_sequence --bench sequence_contention -- --output-format bencher | tee -a bench-output.txt
-          cargo bench --features sqlite --bench engine_cold_start -- --output-format bencher | tee -a bench-output.txt
-          cargo bench --features sqlite --bench read_engine_analytics -- --output-format bencher | tee -a bench-output.txt
-          cargo bench --features secrets --bench secrets_crypto -- --output-format bencher | tee -a bench-output.txt
-          cargo bench --features sqlite,cirislens_occurrence --bench occurrence_registry -- --output-format bencher | tee -a bench-output.txt
-          cargo bench --features sqlite,cirislens_sequence --bench storage_floor -- --output-format bencher | tee -a bench-output.txt
+          cargo bench --bench calibration -- --output-format bencher | tee calibration-output.txt
+          CAL_NS=$(grep -E '^test calibration/splitmix64_10m' calibration-output.txt \
+            | sed -E 's/.*bench:[[:space:]]+([0-9]+) ns\/iter.*/\1/' \
+            | head -1)
+          if [ -z "$CAL_NS" ] || [ "$CAL_NS" = "0" ]; then
+            echo "::error::failed to extract calibration ns/iter from calibration-output.txt"
+            cat calibration-output.txt
+            exit 1
+          fi
+          echo "CALIBRATION_NS=$CAL_NS" >> "$GITHUB_ENV"
+          echo "Runner calibration: $CAL_NS ns/iter for 10M splitmix64 iterations"
+          {
+            echo "## Runner calibration"
+            echo '```'
+            echo "splitmix64_10m: $CAL_NS ns/iter"
+            echo "(higher = slower runner; every bench below is normalized against this so absolute ns/iter swings from neighbor-tenant load cancel)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Now run the rest into bench-output-raw.txt; the next step
+          # normalizes raw→bench-output.txt which benchmark-action
+          # consumes.
+          cargo bench --features postgres --bench ingest_pipeline -- --output-format bencher | tee bench-output-raw.txt
+          cargo bench --bench canonicalize -- --output-format bencher | tee -a bench-output-raw.txt
+          cargo bench --bench sign -- --output-format bencher | tee -a bench-output-raw.txt
+          cargo bench --bench dedup_key -- --output-format bencher | tee -a bench-output-raw.txt
+          cargo bench --features postgres --bench queue -- --output-format bencher | tee -a bench-output-raw.txt
+          cargo bench --features sqlite,cirislens_sequence --bench sequence_contention -- --output-format bencher | tee -a bench-output-raw.txt
+          cargo bench --features sqlite --bench engine_cold_start -- --output-format bencher | tee -a bench-output-raw.txt
+          cargo bench --features sqlite --bench read_engine_analytics -- --output-format bencher | tee -a bench-output-raw.txt
+          cargo bench --features secrets --bench secrets_crypto -- --output-format bencher | tee -a bench-output-raw.txt
+          cargo bench --features sqlite,cirislens_occurrence --bench occurrence_registry -- --output-format bencher | tee -a bench-output-raw.txt
+          cargo bench --features sqlite,cirislens_sequence --bench storage_floor -- --output-format bencher | tee -a bench-output-raw.txt
+
+      # v2.12.0 (CIRISPersist#116) — normalize every ns/iter against
+      # the calibration anchor. Output value is scaled so 1
+      # calibration tick = 1,000,000 normalized units; keeps numbers
+      # readable AND a 2× bench change still shows as a 2× chart
+      # change (the scaling is uniform). The calibration line itself
+      # is preserved at the top with its raw value so the trend chart
+      # tracks runner-noise drift over time as its own series.
+      #
+      # Geomean cross-check (sanity diagnostic, logs only): if the
+      # geomean of all normalized values shifts dramatically run-over-
+      # run while the calibration also shifts, normalization is doing
+      # its job. If they diverge, a real per-bench regression is
+      # buried in there.
+      - name: Normalize bench output against calibration anchor
+        run: |
+          SCALE=1000000
+          # Bash-native — small bench output (~50 lines) so loop cost
+          # is irrelevant. Avoids YAML-heredoc indentation pitfalls
+          # that broke an earlier awk/python attempt.
+          # The bench line shape is:
+          #   test BENCH_NAME ... bench:        VAL ns/iter (+/- DEV)
+          : > bench-output-normalized.txt
+          n_normalized=0
+          sum_log=0
+          while IFS= read -r line; do
+            if [[ "$line" =~ ^test\ .+\.\.\.\ bench:[[:space:]]+([0-9]+)\ ns/iter[[:space:]]+\(\+/-[[:space:]]+([0-9]+)\) ]]; then
+              val_ns="${BASH_REMATCH[1]}"
+              dev_ns="${BASH_REMATCH[2]}"
+              val_norm=$(( val_ns * SCALE / CALIBRATION_NS ))
+              dev_norm=$(( dev_ns * SCALE / CALIBRATION_NS ))
+              prefix="${line%bench:*}bench:"
+              printf '%s %d ns/iter (+/- %d)\n' "$prefix" "$val_norm" "$dev_norm" >> bench-output-normalized.txt
+              if [ "$val_norm" -gt 0 ]; then
+                # Accumulate log for the geomean cross-check (uses bc-arbitrary-precision).
+                sum_log=$(echo "scale=8; $sum_log + l($val_norm)" | bc -l)
+                n_normalized=$(( n_normalized + 1 ))
+              fi
+            else
+              printf '%s\n' "$line" >> bench-output-normalized.txt
+            fi
+          done < bench-output-raw.txt
+          # Geomean cross-check, diagnostic log only.
+          if [ "$n_normalized" -gt 0 ]; then
+            geomean=$(echo "scale=2; e($sum_log / $n_normalized)" | bc -l)
+            echo "calibration_ns=$CALIBRATION_NS  n_normalized=$n_normalized  geomean(normalized ns/iter)=$geomean"
+          else
+            echo "warning: no bench lines normalized; check the bench-output-raw.txt format"
+          fi
+          # Final output: calibration line (raw) first, then normalized rest.
+          cat calibration-output.txt bench-output-normalized.txt > bench-output.txt
+          echo "First 20 normalized test lines:"
+          grep -E '^test ' bench-output.txt | head -20
 
       - name: Top-line summary to GH step summary
         run: |
@@ -171,7 +259,17 @@ jobs:
         if: always()
         with:
           name: criterion-${{ github.run_id }}
+          # v2.12.0 (CIRISPersist#116) — keep raw + calibration
+          # alongside the normalized output. The normalized file
+          # is what benchmark-action consumes; the raw + calibration
+          # are ground truth for post-hoc analysis (e.g. "did the
+          # runner shift uniformly or was there a real per-bench
+          # regression"). target/criterion/** is criterion's own
+          # rich snapshot tree, kept for the same reason.
           path: |
             target/criterion/**
             bench-output.txt
+            bench-output-raw.txt
+            bench-output-normalized.txt
+            calibration-output.txt
           retention-days: 90
