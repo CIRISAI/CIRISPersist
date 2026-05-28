@@ -374,6 +374,7 @@ impl Backend for MemoryBackend {
 // architectural contract — consumers see the canonical hash even
 // against the in-memory backend.
 
+#[async_trait::async_trait]
 impl crate::federation::FederationDirectory for MemoryBackend {
     async fn put_public_key(
         &self,
@@ -416,6 +417,24 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .filter(|k| k.identity_ref == identity_ref)
             .cloned()
             .collect())
+    }
+
+    /// v2.6.0 (CIRISPersist#105) — enumerate by `identity_type`.
+    /// Stable lex-sort order by `key_id` so callers can
+    /// deterministically pick subsets.
+    async fn list_keys_by_identity_type(
+        &self,
+        identity_type: &str,
+    ) -> Result<Vec<crate::federation::KeyRecord>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_keys
+            .values()
+            .filter(|k| k.identity_type == identity_type)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.key_id.cmp(&b.key_id));
+        Ok(rows)
     }
 
     async fn put_attestation(
@@ -1990,6 +2009,133 @@ mod tests {
         assert_eq!(lens_keys.len(), 1);
         let none = backend.lookup_keys_for_identity("missing").await.unwrap();
         assert!(none.is_empty());
+    }
+
+    /// v2.6.0 (CIRISPersist#105) — class-based enumeration via
+    /// `list_keys_by_identity_type`. Two `steward` rows + one
+    /// `primitive` row; the steward query returns the two in
+    /// `key_id` lex order, the primitive query returns the one row,
+    /// and an unknown identity_type returns the empty Vec.
+    ///
+    /// Mirrors the sibling `federation_list_keys_by_identity_type_round_trip`
+    /// in `store::sqlite::tests` (uses non-accord identity_types so
+    /// the memory + sqlite + postgres impls can run the same scenario
+    /// without V048's hardware-attestation surface friction).
+    #[tokio::test]
+    async fn list_keys_by_identity_type_class_lookup() {
+        let backend = MemoryBackend::new();
+        // Insert in reverse lex order to confirm ORDER BY key_id sort.
+        let mut steward_b = fix_key("steward-bravo", "steward-bravo", "steward-bravo");
+        steward_b.identity_type = crate::federation::types::identity_type::STEWARD.into();
+        let mut steward_a = fix_key("steward-alpha", "steward-alpha", "steward-alpha");
+        steward_a.identity_type = crate::federation::types::identity_type::STEWARD.into();
+        let prim = fix_key("prim-1", "prim-1", "prim-1"); // PRIMITIVE by default
+
+        backend
+            .put_public_key(SignedKeyRecord { record: steward_b })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord { record: steward_a })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord { record: prim })
+            .await
+            .unwrap();
+
+        let steward_rows = backend
+            .list_keys_by_identity_type(crate::federation::types::identity_type::STEWARD)
+            .await
+            .unwrap();
+        assert_eq!(steward_rows.len(), 2);
+        assert_eq!(steward_rows[0].key_id, "steward-alpha");
+        assert_eq!(steward_rows[1].key_id, "steward-bravo");
+
+        let prim_rows = backend
+            .list_keys_by_identity_type(crate::federation::types::identity_type::PRIMITIVE)
+            .await
+            .unwrap();
+        assert_eq!(prim_rows.len(), 1);
+        assert_eq!(prim_rows[0].key_id, "prim-1");
+
+        let empty = backend
+            .list_keys_by_identity_type("unknown_type")
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
+    }
+
+    /// v2.6.0 (CIRISPersist#108) — confirm `persist_row_hash` is
+    /// surfaced on every federation row-read path. Verify will pass
+    /// the hex value into `FederationProvenance::persist_row_hash`
+    /// (Option<String>) so a downstream consumer can correlate the
+    /// attestation back to persist's storage. Two reads of the same
+    /// row return the same hash (idempotency) and the hash is
+    /// non-empty (the server computed it on the put).
+    #[tokio::test]
+    async fn persist_row_hash_surfaces_on_federation_reads() {
+        use crate::federation::FederationDirectory;
+        let backend = MemoryBackend::new();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("steward-1", "steward-1", "steward-1"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("k-target", "primitive-a", "steward-1"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_attestation("att-1", "steward-1", "k-target", "steward-1"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_revocation(SignedRevocation {
+                revocation: fix_revocation("rev-1", "k-target", "steward-1", "steward-1"),
+            })
+            .await
+            .unwrap();
+
+        // Keys.
+        let key1 = FederationDirectory::lookup_public_key(&backend, "k-target")
+            .await
+            .unwrap()
+            .expect("row exists");
+        assert!(!key1.persist_row_hash.is_empty(), "key row_hash empty");
+        let key2 = FederationDirectory::lookup_public_key(&backend, "k-target")
+            .await
+            .unwrap()
+            .expect("row exists");
+        assert_eq!(
+            key1.persist_row_hash, key2.persist_row_hash,
+            "key persist_row_hash differs between reads"
+        );
+
+        // Attestations.
+        let att1 = backend.list_attestations_for("k-target").await.unwrap();
+        assert_eq!(att1.len(), 1);
+        assert!(
+            !att1[0].persist_row_hash.is_empty(),
+            "attestation row_hash empty"
+        );
+        let att2 = backend.list_attestations_for("k-target").await.unwrap();
+        assert_eq!(att1[0].persist_row_hash, att2[0].persist_row_hash);
+
+        // Revocations.
+        let rev1 = backend.revocations_for("k-target").await.unwrap();
+        assert_eq!(rev1.len(), 1);
+        assert!(
+            !rev1[0].persist_row_hash.is_empty(),
+            "revocation row_hash empty"
+        );
+        let rev2 = backend.revocations_for("k-target").await.unwrap();
+        assert_eq!(rev1[0].persist_row_hash, rev2[0].persist_row_hash);
     }
 
     #[tokio::test]

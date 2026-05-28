@@ -596,10 +596,23 @@ impl PyEngine {
     ///
     /// Plain `pub fn` (not a `#[pymethod]`) — Option-B for sibling
     /// cdylibs, same pattern as
-    /// [`node_core_service`](Self::node_core_service). The
-    /// [`FederationDirectory`] trait uses RPITIT and is NOT
-    /// object-safe (no `Arc<dyn FederationDirectory>`), so the
-    /// dispatch enum is the established shape.
+    /// [`node_core_service`](Self::node_core_service).
+    ///
+    /// # Why this still returns the dispatch enum (and not
+    /// `Arc<dyn FederationDirectory>`)
+    ///
+    /// v2.6.0 (CIRISPersist#106) made the
+    /// [`FederationDirectory`](crate::federation::FederationDirectory)
+    /// trait object-safe via `#[async_trait]`, and
+    /// [`Engine::federation_directory`](crate::engine::Engine::federation_directory)
+    /// now returns `Arc<dyn FederationDirectory>` directly. This
+    /// [`PyEngine`] accessor keeps the established
+    /// [`BackendDispatch`](crate::engine::BackendDispatch) shape for
+    /// wire-stability — co-resident sibling cdylibs already match on
+    /// the enum, and the consumers that want the dyn handle hold an
+    /// [`Engine`](crate::engine::Engine) (via
+    /// [`current_rust_engine`](crate::current_rust_engine)) rather
+    /// than the PyEngine directly.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub fn federation_directory(&self) -> crate::engine::BackendDispatch {
         match &self.backend {

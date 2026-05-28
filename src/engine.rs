@@ -23,10 +23,14 @@
 //!
 //! # Trait-object note
 //!
-//! `FederationDirectory` and `OutboundQueue` use Rust 1.75+
-//! `impl Future + Send` return-position syntax — these traits are NOT
-//! object-safe (you cannot construct `Arc<dyn FederationDirectory>`).
-//! Consumers either:
+//! v2.6.0 (CIRISPersist#106): [`FederationDirectory`](crate::federation::FederationDirectory)
+//! is annotated with `#[async_trait]` and IS object-safe —
+//! [`Engine::federation_directory`] returns `Arc<dyn FederationDirectory>`
+//! directly, the symmetric read-side accessor for
+//! [`Engine::node_core_service`] (#90).
+//!
+//! `OutboundQueue` still uses Rust 1.75+ `impl Future + Send`
+//! return-position syntax and is NOT object-safe. Consumers either:
 //!
 //! 1. Match on [`Engine::backend()`] to dispatch per concrete backend
 //!    (`Arc<PostgresBackend>` / `Arc<SqliteBackend>`), or
@@ -459,6 +463,193 @@ impl Engine {
             )),
         }
     }
+
+    /// v2.6.0 (CIRISPersist#106) — Rust-tier accessor returning an
+    /// `Arc<dyn FederationDirectory>` over the Engine's underlying
+    /// backend.
+    ///
+    /// Symmetric with the existing [`node_core_service`](Self::node_core_service)
+    /// (write-side, CIRISPersist#90) — this is the read-side
+    /// equivalent for the federation directory. Lets co-resident
+    /// crates (NodeCore, LensCore, registry-core) call persist's
+    /// federation directory in Rust without PyO3 method dispatch,
+    /// the structural unlock for the Rust-native end-state per the
+    /// CIRISAgent#800 cohabitation trajectory.
+    ///
+    /// # Why this returns `Arc<dyn FederationDirectory>` (and the
+    /// `node_core_service`/`audit_service` accessors return enums)
+    ///
+    /// As of v2.6.0 the [`FederationDirectory`](crate::federation::FederationDirectory)
+    /// trait is annotated with `#[async_trait]` — every method returns
+    /// `Pin<Box<dyn Future<Output = …> + Send + '_>>` rather than a
+    /// per-method RPITIT — so the trait is object-safe.
+    /// `NodeCoreService` and `AuditService` still use RPITIT and
+    /// therefore stay on the dispatch-enum shape.
+    ///
+    /// Cheap: clones the inner backend `Arc` once and coerces.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub fn federation_directory(&self) -> Arc<dyn crate::federation::FederationDirectory> {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.clone(),
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.clone(),
+        }
+    }
+
+    /// v2.7.0 (CIRISPersist#107) — read-only snapshot of disk + row +
+    /// age across the cohabitation store.
+    ///
+    /// One [`crate::retention::TableUsage`] per substrate table
+    /// (`trace_events`, `trace_llm_calls`, `detection_events`,
+    /// `audit_log`, `edge_outbound_queue`, `federation_keys`) plus
+    /// the whole-database byte total. Used by lens-core's v0.4
+    /// retention scheduler (CIRISLensCore#13) to decide whether to
+    /// evict and how much.
+    ///
+    /// Per-table timestamp column choices:
+    /// - `trace_events.ts` (broadcast wall-clock)
+    /// - `trace_llm_calls.ts` (call wall-clock; linked to parent
+    ///   trace event)
+    /// - `cirislens_derived.detection_events.ts` (detection wall-clock)
+    /// - `audit_log.recorded_at` (signing wall-clock)
+    /// - `edge_outbound_queue.enqueued_at` (row birth)
+    /// - `federation_keys.valid_from` (key validity-window start)
+    ///
+    /// # SQLite per-table-bytes limitation
+    ///
+    /// On SQLite each `TableUsage.bytes` field is `0` — stock rusqlite
+    /// builds don't enable `SQLITE_ENABLE_DBSTAT_VTAB`. Consult
+    /// [`StorageSummary::total_disk_bytes`](crate::retention::StorageSummary::total_disk_bytes)
+    /// for whole-DB byte counts on SQLite. Postgres reports
+    /// `pg_relation_size` per table.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn storage_summary(
+        &self,
+    ) -> Result<crate::retention::StorageSummary, crate::retention::RetentionError> {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => crate::retention::postgres::storage_summary_pg(b).await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => crate::retention::sqlite::storage_summary_sqlite(b).await,
+        }
+    }
+
+    /// v2.7.0 (CIRISPersist#107) — bounded-batch DELETE on
+    /// `trace_events` for rows whose `ts < threshold`, capped at
+    /// `max_rows`. Returns the actual rows deleted.
+    ///
+    /// Lets the caller drive bounded-eviction loops with predictable
+    /// transaction sizes: "delete 1000, sleep, delete 1000" until
+    /// the returned count is less than `max_rows` (no more rows
+    /// older than the threshold).
+    ///
+    /// # SQL
+    ///
+    /// PG: `DELETE FROM cirislens.trace_events WHERE (event_id, ts)
+    /// IN (SELECT … ORDER BY ts LIMIT $2)` — PG doesn't honor
+    /// `ORDER BY ... LIMIT` on DELETE directly; the CTE subquery
+    /// pattern is the idiomatic workaround.
+    ///
+    /// SQLite: `DELETE FROM trace_events WHERE rowid IN (SELECT
+    /// rowid … ORDER BY ts LIMIT ?2)`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn delete_traces_older_than(
+        &self,
+        ts: chrono::DateTime<chrono::Utc>,
+        max_rows: usize,
+    ) -> Result<usize, crate::retention::RetentionError> {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => {
+                crate::retention::postgres::delete_traces_older_than_pg(b, ts, max_rows).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => {
+                crate::retention::sqlite::delete_traces_older_than_sqlite(b, ts, max_rows).await
+            }
+        }
+    }
+
+    /// v2.7.0 (CIRISPersist#107) — "archive + truncate" the
+    /// `audit_log` over `[from_ts, to_ts)`, preserving the
+    /// per-tenant hash chain via a chain-anchored archive blob.
+    ///
+    /// The audit chain (V014; `prev_hash` linking adjacent rows by
+    /// `entry_hash`) cannot tolerate a plain DELETE: the live row
+    /// after the archived range would point to a now-absent
+    /// predecessor. The primitive preserves the chain by writing
+    /// the archived rows to `audit_archives` (canonical JSON,
+    /// SHA-256 keyed) with the LAST archived row's `entry_hash`
+    /// captured as `ArchiveHandle.chain_anchor`. The live row
+    /// after the archived range KEEPS its original `prev_hash` —
+    /// which equals `chain_anchor` — so verifiers walk seq[k+1] →
+    /// archive[seq_k] without breaking the chain.
+    ///
+    /// # Multi-tenant handling
+    ///
+    /// The audit chain is per-tenant (V014 `UNIQUE(tenant_id,
+    /// sequence_number)`). `archive_audit_range` rejects ranges
+    /// that span more than one `tenant_id` with
+    /// [`RetentionError::MultiTenant`](crate::retention::RetentionError::MultiTenant).
+    /// Callers archiving across multiple tenants issue one call
+    /// per tenant.
+    ///
+    /// # Empty range
+    ///
+    /// When the range captures zero rows the returned handle has
+    /// `rows_archived = 0`, `archive_id = Uuid::nil()`,
+    /// `chain_anchor = [0; 32]` — no archive blob row is written.
+    /// The call is a no-op.
+    ///
+    /// # Atomicity
+    ///
+    /// All steps (SELECT archived rows → INSERT archive row →
+    /// DELETE archived rows from `audit_log`) run in one
+    /// transaction. A failure at any step rolls back the entire
+    /// archive — the live chain is unchanged.
+    #[cfg(all(feature = "cirisaudit", any(feature = "postgres", feature = "sqlite")))]
+    pub async fn archive_audit_range(
+        &self,
+        from_ts: chrono::DateTime<chrono::Utc>,
+        to_ts: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::retention::ArchiveHandle, crate::retention::RetentionError> {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => {
+                crate::retention::postgres::archive_audit_range_pg(b, from_ts, to_ts).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => {
+                crate::retention::sqlite::archive_audit_range_sqlite(b, from_ts, to_ts).await
+            }
+        }
+    }
+
+    /// v2.7.0 (CIRISPersist#107) — fetch a previously-written audit
+    /// archive blob by `archive_id`. Returns the canonical JSON
+    /// bytes — `Vec<AuditEntry>` — or `Ok(None)` when no archive
+    /// with that id exists. Used by offline verifiers walking the
+    /// chain across an archive and by tests asserting archive
+    /// content.
+    ///
+    /// Decode with [`crate::retention::decode_archive_bytes`].
+    #[cfg(all(feature = "cirisaudit", any(feature = "postgres", feature = "sqlite")))]
+    pub async fn lookup_audit_archive(
+        &self,
+        archive_id: uuid::Uuid,
+    ) -> Result<Option<Vec<u8>>, crate::retention::RetentionError> {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => {
+                crate::retention::postgres::lookup_audit_archive_pg(b, archive_id).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => {
+                crate::retention::sqlite::lookup_audit_archive_sqlite(b, archive_id).await
+            }
+        }
+    }
 }
 
 /// v2.0 (CIRISPersist#93) — per-backend
@@ -823,6 +1014,32 @@ mod tests {
             .expect("replay succeeds");
         assert_eq!(replay.trace_events_inserted, 0);
         assert_eq!(replay.trace_events_conflicted, 1);
+    }
+
+    /// v2.6.0 (CIRISPersist#106) — `Engine::federation_directory()`
+    /// returns an `Arc<dyn FederationDirectory>` because the trait
+    /// is now object-safe (async-trait refactor). Confirm the dyn
+    /// handle dispatches to the underlying SQLite backend's read
+    /// paths — both the existing `lookup_public_key` surface and
+    /// the new (#105) `list_keys_by_identity_type` surface.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn federation_directory_dyn_dispatch_sqlite() {
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        let directory: Arc<dyn crate::FederationDirectory> = engine.federation_directory();
+        // Lookup against an empty directory — returns Ok(None), not
+        // an error. Exercises the dyn vtable + spawn_blocking path.
+        let none = directory.lookup_public_key("not-there").await.unwrap();
+        assert!(none.is_none());
+        // Class-based enumeration (#105) reachable through the dyn
+        // handle (the #105 method on a #106 surface).
+        let rows = directory
+            .list_keys_by_identity_type(crate::federation::types::identity_type::STEWARD)
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
     }
 
     /// v1.11.0 (CIRISPersist#89) — `receive_and_persist` rejects an

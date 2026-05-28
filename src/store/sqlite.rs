@@ -962,6 +962,7 @@ fn llm_status_str(s: crate::schema::LlmCallStatus) -> &'static str {
 //     the persist boundary.
 //   - UUID columns are TEXT — rusqlite passes UUID strings as TEXT.
 
+#[async_trait::async_trait]
 impl crate::federation::FederationDirectory for SqliteBackend {
     async fn put_public_key(
         &self,
@@ -1136,6 +1137,39 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .await
         .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
         .map_err(|e| crate::federation::Error::Backend(format!("lookup_keys_for_identity: {e}")))
+    }
+
+    /// v2.6.0 (CIRISPersist#105) — enumerate `federation_keys` rows
+    /// by `identity_type` column. `ORDER BY key_id` for stable lex
+    /// order; V004's composite index `(identity_type, identity_ref)`
+    /// already covers the `WHERE identity_type = ?` lookup.
+    async fn list_keys_by_identity_type(
+        &self,
+        identity_type: &str,
+    ) -> Result<Vec<crate::federation::KeyRecord>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let identity_type = identity_type.to_owned();
+        tokio::task::spawn_blocking(
+            move || -> Result<Vec<crate::federation::KeyRecord>, rusqlite::Error> {
+                let conn = conn.blocking_lock();
+                let mut stmt = conn.prepare(
+                    "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
+                        identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
+                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
+                        attestation_evidence \
+                     FROM federation_keys WHERE identity_type = ?1 \
+                     ORDER BY key_id",
+                )?;
+                let rows = stmt.query_map([&identity_type], sqlite_row_to_key_record)?;
+                rows.collect()
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("list_keys_by_identity_type: {e}"))
+        })
     }
 
     async fn put_attestation(
@@ -6586,6 +6620,132 @@ mod tests {
         assert_eq!(persist_keys.len(), 2);
         let lens_keys = backend.lookup_keys_for_identity("lens").await.unwrap();
         assert_eq!(lens_keys.len(), 1);
+    }
+
+    /// v2.6.0 (CIRISPersist#105) — class-based enumeration via
+    /// `list_keys_by_identity_type` on SQLite. Two `steward` rows +
+    /// one `primitive` row; verify ORDER BY key_id sort, the
+    /// primitive singleton lookup, and the unknown-type empty case.
+    /// Composite index `(identity_type, identity_ref)` from V004
+    /// covers the WHERE predicate — no new migration required.
+    ///
+    /// Note: avoids `accord_holder` because V048's hardware-
+    /// attestation admission hook + CHECK constraint require a
+    /// non-software `PlatformAttestation` that ciris-keyring does
+    /// not expose constructor surface for in tests (the existing
+    /// trust-grant tests in this file likewise sidestep the
+    /// accord-holder identity_type for the same reason). The
+    /// contract being tested is class-filtering by the
+    /// `identity_type` column; the specific identity_type strings
+    /// don't affect the SQL path.
+    #[tokio::test]
+    async fn federation_list_keys_by_identity_type_round_trip() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        // Insert in reverse lex order to confirm ORDER BY key_id sort.
+        let mut steward_b = fed_key("steward-bravo", "steward-bravo", "steward-bravo");
+        steward_b.identity_type = crate::federation::types::identity_type::STEWARD.into();
+        let mut steward_a = fed_key("steward-alpha", "steward-alpha", "steward-alpha");
+        steward_a.identity_type = crate::federation::types::identity_type::STEWARD.into();
+        let prim = fed_key("prim-1", "prim-1", "prim-1"); // PRIMITIVE by default
+
+        backend
+            .put_public_key(SignedKeyRecord { record: steward_b })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord { record: steward_a })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord { record: prim })
+            .await
+            .unwrap();
+
+        let steward_rows = backend
+            .list_keys_by_identity_type(crate::federation::types::identity_type::STEWARD)
+            .await
+            .unwrap();
+        assert_eq!(steward_rows.len(), 2);
+        assert_eq!(steward_rows[0].key_id, "steward-alpha");
+        assert_eq!(steward_rows[1].key_id, "steward-bravo");
+
+        let prim_rows = backend
+            .list_keys_by_identity_type(crate::federation::types::identity_type::PRIMITIVE)
+            .await
+            .unwrap();
+        assert_eq!(prim_rows.len(), 1);
+        assert_eq!(prim_rows[0].key_id, "prim-1");
+
+        let empty = backend
+            .list_keys_by_identity_type("unknown_type")
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
+    }
+
+    /// v2.6.0 (CIRISPersist#108) — confirm `persist_row_hash` is
+    /// surfaced on the federation read paths so CIRISVerify v3.2.0+
+    /// can populate `FederationProvenance::persist_row_hash`. The
+    /// column exists from V001+; this test asserts the row-type
+    /// field is non-empty (server-computed on insert) and stable
+    /// across reads (idempotency).
+    #[tokio::test]
+    async fn federation_persist_row_hash_surfaces_on_reads() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("steward-1", "steward-1", "steward-1"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-target", "primitive-a", "steward-1"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fed_attestation("att-1", "steward-1", "k-target", "steward-1"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_revocation(SignedRevocation {
+                revocation: fed_revocation(
+                    "11111111-1111-1111-1111-111111111111",
+                    "k-target",
+                    "steward-1",
+                    "steward-1",
+                ),
+            })
+            .await
+            .unwrap();
+
+        let key1 = FederationDirectory::lookup_public_key(&backend, "k-target")
+            .await
+            .unwrap()
+            .expect("row exists");
+        assert_eq!(key1.persist_row_hash.len(), 64, "row hash is 64 hex chars");
+        let key2 = FederationDirectory::lookup_public_key(&backend, "k-target")
+            .await
+            .unwrap()
+            .expect("row exists");
+        assert_eq!(key1.persist_row_hash, key2.persist_row_hash);
+
+        let att1 = backend.list_attestations_for("k-target").await.unwrap();
+        assert_eq!(att1.len(), 1);
+        assert_eq!(att1[0].persist_row_hash.len(), 64);
+        let att2 = backend.list_attestations_for("k-target").await.unwrap();
+        assert_eq!(att1[0].persist_row_hash, att2[0].persist_row_hash);
+
+        let rev1 = backend.revocations_for("k-target").await.unwrap();
+        assert_eq!(rev1.len(), 1);
+        assert_eq!(rev1[0].persist_row_hash.len(), 64);
+        let rev2 = backend.revocations_for("k-target").await.unwrap();
+        assert_eq!(rev1[0].persist_row_hash, rev2[0].persist_row_hash);
     }
 
     #[tokio::test]

@@ -75,6 +75,8 @@ pub mod pipeline;
 pub mod prelude;
 pub mod queue;
 pub mod read;
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub mod retention;
 #[cfg(feature = "cirislens_scheduled_tasks")]
 pub mod scheduled_tasks;
 pub mod schema;
@@ -110,6 +112,12 @@ pub use engine::{BackendDispatch, Engine, EngineError};
 // co-resident Rust consumers (CIRISEdge resolver, CIRISLensCore
 // `LensCore::relay`). Built only when the PyO3 surface — which owns
 // the `ENGINE_SINGLETON` — is compiled in.
+// v2.6.0 (CIRISPersist#106) — re-export the FederationDirectory trait
+// from the crate root so consumers can `use ciris_persist::FederationDirectory;`
+// alongside `use ciris_persist::Engine;` without two imports. Pairs with
+// the new object-safe `Engine::federation_directory() -> Arc<dyn
+// FederationDirectory>` accessor.
+pub use federation::FederationDirectory;
 #[cfg(feature = "sqlite")]
 pub use federation::FederationDirectorySqlite;
 #[cfg(feature = "pyo3")]
@@ -122,6 +130,13 @@ pub use queue::{
     shutdown_signal, spawn_persister, IngestHandle, PersisterHandle, QueueError,
     DEFAULT_QUEUE_DEPTH,
 };
+// v2.7.0 (CIRISPersist#107) — retention primitive types. The three
+// Engine methods (`storage_summary`, `delete_traces_older_than`,
+// `archive_audit_range`) consume these; re-export at the crate root
+// so callers can `use ciris_persist::{StorageSummary, TableUsage,
+// ArchiveHandle}` alongside the Engine type.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub use retention::{ArchiveHandle, RetentionError, StorageSummary, TableUsage};
 
 // Phase 1 surfaces still pending implementation:
 //   #[cfg(feature = "server")] pub mod server;

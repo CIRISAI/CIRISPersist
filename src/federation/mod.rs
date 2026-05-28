@@ -32,8 +32,6 @@
 //! and the registry-side `docs/FEDERATION_CLIENT.md` for the consumer
 //! complement.
 
-use std::future::Future;
-
 pub mod admission;
 #[cfg(feature = "cirisaudit")]
 pub mod backfill;
@@ -98,86 +96,93 @@ pub use types::{
 /// Federation directory trait — the registry/lens/agent's read+write
 /// surface over persist's three federation tables.
 ///
-/// **Async surface uses Rust 1.75+ `async fn in trait` directly**;
-/// futures are constrained `Send` so backends can be used from
-/// `tokio::spawn`-style multi-threaded contexts (matches
-/// [`crate::store::Backend`] convention).
+/// # Object-safety (v2.6.0, CIRISPersist#106)
+///
+/// The trait is annotated with [`#[async_trait]`](async_trait::async_trait)
+/// so it is **object-safe** — consumers can build
+/// `Arc<dyn FederationDirectory>` (the shape
+/// [`Engine::federation_directory`](crate::Engine::federation_directory)
+/// returns). The macro rewrites each `async fn` to a `Pin<Box<dyn
+/// Future<Output = …> + Send + '_>>` return — one heap allocation per
+/// call. For the federation directory's call frequency (admission paths,
+/// directory lookups, attestation enumeration) the per-call alloc is
+/// not a hot-path concern.
 ///
 /// # Wire-format note
 ///
 /// Read methods return [`KeyRecord`] / [`Attestation`] / [`Revocation`]
 /// with `persist_row_hash` populated server-side (see
 /// [`types::KeyRecord::persist_row_hash`] for the canonicalization
-/// contract).
+/// contract). CIRISVerify v3.2.0+ binds the field into
+/// `FederationProvenance::persist_row_hash` so a downstream consumer
+/// can trace an attestation back to its underlying persist row
+/// (CIRISPersist#108).
 ///
 /// Write methods take [`SignedKeyRecord`] / [`SignedAttestation`] /
 /// [`SignedRevocation`] — wrappers carrying a record the caller has
 /// signed but persist has not yet stored. Persist verifies the
 /// scrub-signature on receipt before writing.
+#[async_trait::async_trait]
 pub trait FederationDirectory: Send + Sync {
     // ── Public keys ────────────────────────────────────────────────
 
     /// Insert a new pubkey row. Idempotent on `key_id` collision with
     /// matching content (no-op); errors on `key_id` collision with
     /// differing content.
-    fn put_public_key(
-        &self,
-        record: SignedKeyRecord,
-    ) -> impl Future<Output = Result<(), Error>> + Send;
+    async fn put_public_key(&self, record: SignedKeyRecord) -> Result<(), Error>;
 
     /// Fetch a single pubkey row by `key_id`. Returns `None` if absent.
-    fn lookup_public_key(
-        &self,
-        key_id: &str,
-    ) -> impl Future<Output = Result<Option<KeyRecord>, Error>> + Send;
+    async fn lookup_public_key(&self, key_id: &str) -> Result<Option<KeyRecord>, Error>;
 
     /// Fetch all pubkey rows for a given identity. Used by the
     /// "all keys for primitive X" lookup the v0.2.x verify subsumption
     /// proxy will call.
-    fn lookup_keys_for_identity(
+    async fn lookup_keys_for_identity(&self, identity_ref: &str) -> Result<Vec<KeyRecord>, Error>;
+
+    /// v2.6.0 (CIRISPersist#105) — enumerate `federation_keys` rows
+    /// by `identity_type` (e.g. [`types::identity_type::ACCORD_HOLDER`],
+    /// [`types::identity_type::STEWARD`]).
+    ///
+    /// Used by CIRISEdge for class-based directory queries:
+    /// - `identity_type::ACCORD_HOLDER` → 2-of-3 constitutional
+    ///   verification set (CIRISEdge#19).
+    /// - `identity_type::STEWARD` → high-priority recipient class for
+    ///   gossip topology (CIRISEdge#20).
+    ///
+    /// Rows are returned in stable lex order by `key_id` so callers
+    /// can deterministically pick a subset (e.g. "first N by key_id"
+    /// for rotation phasing). Empty `Vec` if no rows match.
+    async fn list_keys_by_identity_type(
         &self,
-        identity_ref: &str,
-    ) -> impl Future<Output = Result<Vec<KeyRecord>, Error>> + Send;
+        identity_type: &str,
+    ) -> Result<Vec<KeyRecord>, Error>;
 
     // ── Attestations ───────────────────────────────────────────────
 
     /// Insert a new attestation row.
-    fn put_attestation(
-        &self,
-        attestation: SignedAttestation,
-    ) -> impl Future<Output = Result<(), Error>> + Send;
+    async fn put_attestation(&self, attestation: SignedAttestation) -> Result<(), Error>;
 
     /// All attestations targeting `attested_key_id` (consumer asks
     /// "who vouches for K?"). Ordered by `asserted_at` DESC.
-    fn list_attestations_for(
-        &self,
-        attested_key_id: &str,
-    ) -> impl Future<Output = Result<Vec<Attestation>, Error>> + Send;
+    async fn list_attestations_for(&self, attested_key_id: &str)
+        -> Result<Vec<Attestation>, Error>;
 
     /// All attestations issued by `attesting_key_id` (consumer asks
     /// "which keys does K vouch for?"). Ordered by `asserted_at` DESC.
-    fn list_attestations_by(
-        &self,
-        attesting_key_id: &str,
-    ) -> impl Future<Output = Result<Vec<Attestation>, Error>> + Send;
+    async fn list_attestations_by(&self, attesting_key_id: &str)
+        -> Result<Vec<Attestation>, Error>;
 
     // ── Revocations ────────────────────────────────────────────────
 
     /// Insert a new revocation row. Append-only — revocations of an
     /// already-revoked key are accepted (the latest-effective-at one
     /// wins under most consumer policies).
-    fn put_revocation(
-        &self,
-        revocation: SignedRevocation,
-    ) -> impl Future<Output = Result<(), Error>> + Send;
+    async fn put_revocation(&self, revocation: SignedRevocation) -> Result<(), Error>;
 
     /// All revocations targeting `revoked_key_id`. Ordered by
     /// `effective_at` DESC. Consumers walk this list and apply their
     /// policy ("is K revoked at time T?").
-    fn revocations_for(
-        &self,
-        revoked_key_id: &str,
-    ) -> impl Future<Output = Result<Vec<Revocation>, Error>> + Send;
+    async fn revocations_for(&self, revoked_key_id: &str) -> Result<Vec<Revocation>, Error>;
 
     // ── Cold-path PQC fill-in (writer contract step 4) ─────────────
     //
@@ -202,30 +207,30 @@ pub trait FederationDirectory: Send + Sync {
     /// Attach the PQC components to a hybrid-pending federation_keys row.
     /// Updates pubkey_ml_dsa_65_base64 + scrub_signature_pqc + pqc_completed_at.
     /// Errors if the row is already PQC-complete.
-    fn attach_key_pqc_signature(
+    async fn attach_key_pqc_signature(
         &self,
         key_id: &str,
         pubkey_ml_dsa_65_base64: &str,
         scrub_signature_pqc: &str,
-    ) -> impl Future<Output = Result<(), Error>> + Send;
+    ) -> Result<(), Error>;
 
     /// Attach the PQC signature to a hybrid-pending
     /// `federation_attestations` row. Attestations don't have their
     /// own pubkey — they reference the existing
     /// `federation_keys.scrub_key_id`'s pubkey for verification.
-    fn attach_attestation_pqc_signature(
+    async fn attach_attestation_pqc_signature(
         &self,
         attestation_id: &str,
         scrub_signature_pqc: &str,
-    ) -> impl Future<Output = Result<(), Error>> + Send;
+    ) -> Result<(), Error>;
 
     /// Attach the PQC signature to a hybrid-pending
     /// `federation_revocations` row. Same shape as attestations.
-    fn attach_revocation_pqc_signature(
+    async fn attach_revocation_pqc_signature(
         &self,
         revocation_id: &str,
         scrub_signature_pqc: &str,
-    ) -> impl Future<Output = Result<(), Error>> + Send;
+    ) -> Result<(), Error>;
 
     // ── Hybrid-pending sweep (CIRISPersist#11, v0.3.2) ─────────────
     //
@@ -245,26 +250,23 @@ pub trait FederationDirectory: Send + Sync {
     /// `valid_from`. Returns `(key_id, registration_envelope,
     /// scrub_signature_classical)` triples sufficient to reconstruct
     /// the cold-path bound-signature input.
-    fn list_hybrid_pending_keys(
-        &self,
-        limit: i64,
-    ) -> impl Future<Output = Result<Vec<HybridPendingRow>, Error>> + Send;
+    async fn list_hybrid_pending_keys(&self, limit: i64) -> Result<Vec<HybridPendingRow>, Error>;
 
     /// Return up to `limit` `federation_attestations` rows where
     /// `pqc_completed_at IS NULL`, ordered oldest first by
     /// `asserted_at`.
-    fn list_hybrid_pending_attestations(
+    async fn list_hybrid_pending_attestations(
         &self,
         limit: i64,
-    ) -> impl Future<Output = Result<Vec<HybridPendingRow>, Error>> + Send;
+    ) -> Result<Vec<HybridPendingRow>, Error>;
 
     /// Return up to `limit` `federation_revocations` rows where
     /// `pqc_completed_at IS NULL`, ordered oldest first by
     /// `revoked_at`.
-    fn list_hybrid_pending_revocations(
+    async fn list_hybrid_pending_revocations(
         &self,
         limit: i64,
-    ) -> impl Future<Output = Result<Vec<HybridPendingRow>, Error>> + Send;
+    ) -> Result<Vec<HybridPendingRow>, Error>;
 
     // ── Trust grants (v1.3.0, CIRISPersist#46 + #47) ───────────────
     //
@@ -300,44 +302,31 @@ pub trait FederationDirectory: Send + Sync {
     ///   3. UPSERT on `key_id` — preserves the pubkey + signature
     ///      envelope written by the prior `put_public_key`, overwrites
     ///      the trust columns. `trusted_at` is set to `NOW()`.
-    fn grant_trust(&self, grant: TrustGrant) -> impl Future<Output = Result<(), Error>> + Send {
+    async fn grant_trust(&self, grant: TrustGrant) -> Result<(), Error> {
         let _ = grant;
-        async {
-            Err(Error::Backend(
-                "grant_trust not implemented for this backend".into(),
-            ))
-        }
+        Err(Error::Backend(
+            "grant_trust not implemented for this backend".into(),
+        ))
     }
 
     /// Soft-delete a trust row by setting `expires_at = NOW()`.
     /// Idempotent — revoking an already-expired row is a no-op.
-    fn revoke_trust(
-        &self,
-        key: &str,
-        revoked_by: &str,
-    ) -> impl Future<Output = Result<(), Error>> + Send {
+    async fn revoke_trust(&self, key: &str, revoked_by: &str) -> Result<(), Error> {
         let _ = (key, revoked_by);
-        async {
-            Err(Error::Backend(
-                "revoke_trust not implemented for this backend".into(),
-            ))
-        }
+        Err(Error::Backend(
+            "revoke_trust not implemented for this backend".into(),
+        ))
     }
 
     /// Point lookup — the raw trust row, no transitive resolution.
     /// `None` if no trust row exists for `key` (i.e., the row
     /// exists in `federation_keys` but `trusted_by` is NULL — a
     /// pre-V020 row, or a key registered without a trust grant).
-    fn lookup_trust(
-        &self,
-        key: &str,
-    ) -> impl Future<Output = Result<Option<TrustRow>, Error>> + Send {
+    async fn lookup_trust(&self, key: &str) -> Result<Option<TrustRow>, Error> {
         let _ = key;
-        async {
-            Err(Error::Backend(
-                "lookup_trust not implemented for this backend".into(),
-            ))
-        }
+        Err(Error::Backend(
+            "lookup_trust not implemented for this backend".into(),
+        ))
     }
 
     /// All currently-trusted keys matching `filter`. Server-side
@@ -345,16 +334,11 @@ pub trait FederationDirectory: Send + Sync {
     /// unless `filter.include_expired = true`. Pre-V020 rows
     /// (`trusted_by IS NULL`) are excluded — the surface returns
     /// only rows with an explicit trust grant.
-    fn list_trusted_keys(
-        &self,
-        filter: TrustFilter,
-    ) -> impl Future<Output = Result<Vec<TrustRow>, Error>> + Send {
+    async fn list_trusted_keys(&self, filter: TrustFilter) -> Result<Vec<TrustRow>, Error> {
         let _ = filter;
-        async {
-            Err(Error::Backend(
-                "list_trusted_keys not implemented for this backend".into(),
-            ))
-        }
+        Err(Error::Backend(
+            "list_trusted_keys not implemented for this backend".into(),
+        ))
     }
 }
 

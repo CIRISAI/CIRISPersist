@@ -1188,6 +1188,7 @@ impl PostgresBackend {
 //     hex-decoded raw bytes; the wire shape uses hex/base64 strings,
 //     decoded at the persist boundary.
 
+#[async_trait::async_trait]
 impl crate::federation::FederationDirectory for PostgresBackend {
     async fn put_public_key(
         &self,
@@ -1345,6 +1346,37 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .await
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("lookup_keys_for_identity: {e}"))
+            })?;
+        rows.into_iter().map(pg_row_to_key_record).collect()
+    }
+
+    /// v2.6.0 (CIRISPersist#105) — enumerate `federation_keys` rows
+    /// by `identity_type` column. `ORDER BY key_id` for stable lex
+    /// order; V004's composite index
+    /// `idx_federation_keys_identity_type_identity_ref` already
+    /// covers the leftmost `WHERE identity_type = $1` predicate.
+    async fn list_keys_by_identity_type(
+        &self,
+        identity_type: &str,
+    ) -> Result<Vec<crate::federation::KeyRecord>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
+                    identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
+                    attestation_evidence \
+                 FROM cirislens.federation_keys WHERE identity_type = $1 \
+                 ORDER BY key_id",
+                &[&identity_type],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_keys_by_identity_type: {e}"))
             })?;
         rows.into_iter().map(pg_row_to_key_record).collect()
     }
@@ -11043,5 +11075,202 @@ mod tests {
             constraint, "federation_keys_accord_holder_requires_attestation",
             "expected CHECK fire (sqlstate={sqlstate}), got err={err:?}"
         );
+    }
+
+    /// v2.6.0 (CIRISPersist#105) — class-based enumeration via
+    /// `list_keys_by_identity_type` on Postgres. Two `steward` rows +
+    /// one `primitive` row scoped under a unique identity_ref token
+    /// (so concurrent CI runs don't see each other's fixtures), then
+    /// filter by identity_ref to isolate. ORDER BY key_id stable
+    /// lex sort holds across both class predicates. Composite index
+    /// `idx_federation_keys_identity_type_identity_ref` from V004
+    /// covers the WHERE predicate — no new migration required.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_list_keys_by_identity_type_round_trip() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+
+        // Unique token to isolate this test's rows from any concurrent
+        // fixture on the shared CI schema. `identity_type` is shared
+        // global vocabulary, so we filter the assertion set by checking
+        // each fixture row by `key_id`.
+        let tok = uuid_like();
+        let s_alpha = format!("§105-s-alpha-{tok}");
+        let s_bravo = format!("§105-s-bravo-{tok}");
+        let prim_1 = format!("§105-p-{tok}");
+        // Insert in reverse lex order to confirm ORDER BY key_id sort.
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &s_bravo,
+                    &s_bravo,
+                    crate::federation::types::identity_type::STEWARD,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &s_alpha,
+                    &s_alpha,
+                    crate::federation::types::identity_type::STEWARD,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &prim_1,
+                    &prim_1,
+                    crate::federation::types::identity_type::PRIMITIVE,
+                ),
+            })
+            .await
+            .unwrap();
+
+        // Filter to the test-scoped rows (the shared schema may carry
+        // other steward rows from prior fixtures). Pick exact key_ids.
+        let stewards = backend
+            .list_keys_by_identity_type(crate::federation::types::identity_type::STEWARD)
+            .await
+            .unwrap();
+        let mut ours: Vec<&str> = stewards
+            .iter()
+            .map(|k| k.key_id.as_str())
+            .filter(|k| k == &s_alpha.as_str() || k == &s_bravo.as_str())
+            .collect();
+        // Already in ORDER BY key_id sort from the SQL; preserve as
+        // returned to assert the lex order.
+        assert_eq!(ours.len(), 2, "expected both fixture stewards");
+        // Both are in s_*-tok namespace; alpha < bravo lex.
+        assert!(ours[0] < ours[1], "ORDER BY key_id holds: {ours:?}");
+        assert_eq!(ours.remove(0), s_alpha);
+        assert_eq!(ours.remove(0), s_bravo);
+
+        let prims = backend
+            .list_keys_by_identity_type(crate::federation::types::identity_type::PRIMITIVE)
+            .await
+            .unwrap();
+        let prim_hits: Vec<_> = prims.iter().filter(|k| k.key_id == prim_1).collect();
+        assert_eq!(prim_hits.len(), 1);
+
+        // Unknown identity_type returns empty Vec.
+        let none = backend
+            .list_keys_by_identity_type("nonexistent_identity_type_§105")
+            .await
+            .unwrap();
+        assert!(none.is_empty());
+    }
+
+    /// v2.6.0 (CIRISPersist#108) — confirm `persist_row_hash` is
+    /// surfaced on the Postgres federation read paths. The column
+    /// has existed since V001+; this test asserts that the row-type
+    /// field is populated (server-computed on insert) and stable
+    /// across reads so CIRISVerify v3.2.0+ can bind it into
+    /// `FederationProvenance::persist_row_hash`.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_persist_row_hash_surfaces_on_federation_reads() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+
+        let tok = uuid_like();
+        let steward = format!("§108-stw-{tok}");
+        let target = format!("§108-tgt-{tok}");
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &steward,
+                    &steward,
+                    crate::federation::types::identity_type::STEWARD,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &target,
+                    &target,
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: pg_scores_attestation(
+                    &steward,
+                    &target,
+                    &steward,
+                    "identity_binding:v1",
+                ),
+            })
+            .await
+            .unwrap();
+        // Revocation row — exercise the third row-type's row_hash
+        // surface. `revocation_id` is ::uuid-cast per the project
+        // test-fixtures memory: must be a real UUID.
+        let rev_id = uuid::Uuid::new_v4().to_string();
+        backend
+            .put_revocation(crate::federation::SignedRevocation {
+                revocation: crate::federation::Revocation {
+                    revocation_id: rev_id.clone(),
+                    revoked_key_id: target.clone(),
+                    revoking_key_id: steward.clone(),
+                    reason: Some("test".into()),
+                    revoked_at: chrono::Utc::now(),
+                    effective_at: chrono::Utc::now(),
+                    revocation_envelope: serde_json::json!({"id": rev_id}),
+                    original_content_hash: "abc123".into(),
+                    scrub_signature_classical: "c2ln".into(),
+                    scrub_signature_pqc: None,
+                    scrub_key_id: steward.clone(),
+                    scrub_timestamp: chrono::Utc::now(),
+                    pqc_completed_at: None,
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .unwrap();
+
+        // Keys.
+        let k1 = FederationDirectory::lookup_public_key(&backend, &target)
+            .await
+            .unwrap()
+            .expect("row exists");
+        assert_eq!(k1.persist_row_hash.len(), 64, "row hash is 64 hex chars");
+        let k2 = FederationDirectory::lookup_public_key(&backend, &target)
+            .await
+            .unwrap()
+            .expect("row exists");
+        assert_eq!(k1.persist_row_hash, k2.persist_row_hash);
+
+        // Attestations.
+        let att1 = backend.list_attestations_for(&target).await.unwrap();
+        assert_eq!(att1.len(), 1);
+        assert_eq!(att1[0].persist_row_hash.len(), 64);
+        let att2 = backend.list_attestations_for(&target).await.unwrap();
+        assert_eq!(att1[0].persist_row_hash, att2[0].persist_row_hash);
+
+        // Revocations.
+        let rev1 = backend.revocations_for(&target).await.unwrap();
+        assert_eq!(rev1.len(), 1);
+        assert_eq!(rev1[0].persist_row_hash.len(), 64);
+        let rev2 = backend.revocations_for(&target).await.unwrap();
+        assert_eq!(rev1[0].persist_row_hash, rev2[0].persist_row_hash);
     }
 }

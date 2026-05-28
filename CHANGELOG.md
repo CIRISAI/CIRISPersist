@@ -5,6 +5,81 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [2.6.0] — 2026-05-28
+
+**Federation-directory cohabitation unlock (#105 + #106 + #108) + retention primitives (#107).**
+
+Bundled — both tracks landed together in the working tree (target-dir
+recovery after a parallel-agent disk-fill mid-cut), all verified
+together, shipping as one release. 761/761 nextest tests pass on both
+backends; clippy `--all-targets -- -D warnings` clean.
+
+### `#105` — `FederationDirectory::list_keys_by_identity_type`
+
+New trait method enumerating `federation_keys` rows by `identity_type`,
+stable `key_id` lex-sort order. Unblocks CIRISEdge#19 (2-of-3
+accord-holder constitutional verification set) and CIRISEdge#20
+(steward gossip topology — class-based recipient derivation +
+dynamic rotation phasing).
+
+### `#106` — `Engine::federation_directory() -> Arc<dyn FederationDirectory>`
+
+The Rust-tier cohabitation accessor symmetric with
+`node_core_service()`. **Prerequisite refactor:** `FederationDirectory`
+was previously RPITIT (`impl Future + Send` returns) and therefore
+not object-safe. Migrated to `async-trait` so the trait is now
+object-safe and `Arc<dyn FederationDirectory>` compiles. Cost is one
+heap allocation per call (the boxed future); negligible for the
+directory's call frequency (admission paths, lookups). Documented in
+the trait doc-comment.
+
+Lets co-resident Rust crates (NodeCore, LensCore, registry-core) call
+persist's federation-directory methods directly in Rust during
+cohabitation, without PyO3 method dispatch. The PyO3 layer can shrink
+to a one-line marshalling shim — deletable when the host process goes
+Rust-native.
+
+### `#108` — `persist_row_hash` surfaced on federation row reads
+
+The `persist_row_hash` column already exists on `federation_keys` /
+`federation_attestations` / `federation_revocations` (computed on
+insert since V001+). 2.6.0 exposes it on the row types returned by
+`FederationDirectory` reads. CIRISVerify v3.2.0's
+`FederationProvenance::persist_row_hash: Option<String>` field now
+populates from production reads (was always `None` before).
+
+### `#107` — Engine retention primitives
+
+Three Rust-public methods on `Engine` that CIRISLensCore#13 composes
+against for v0.4 `RetentionPolicy` enforcement (CIRISLensCore owns
+policy; persist owns the deletion primitives — the same split as the
+#89 ingest facade):
+
+- `storage_summary() -> StorageSummary` — read-only disk/row/age
+  snapshot per table (`trace_events`, `trace_llm_calls`,
+  `detection_events`, `audit_log`, `edge_outbound_queue`,
+  `federation_keys`, total disk). Eviction-scheduler input.
+- `delete_traces_older_than(ts, max_rows) -> usize` — batch-capped
+  trace eviction (CTE-bounded DELETE on PG; `rowid IN (SELECT … LIMIT)`
+  on SQLite). Bounded transaction size for Pi-class + Postgres-class
+  alike.
+- `archive_audit_range(from_ts, to_ts) -> ArchiveHandle` —
+  **chain-preserving** audit archive. The audit hash chain
+  (V014+: `UNIQUE(tenant_id, sequence_number)` + `prev_hash`) cannot
+  tolerate a plain DELETE. Persist writes a chain-anchored archive
+  blob (V049 `audit_archives` migration, both dialects) holding the
+  canonical-bytes archive of the range; the live `audit_log` retains
+  the row immediately after the archived range, whose `prev_hash`
+  still points at the archived range's last row — verifiers walk the
+  chain across the archive via the `chain_anchor` exposed on
+  `ArchiveHandle`.
+
+Public types: `StorageSummary`, `TableUsage`, `ArchiveHandle`. New
+`src/retention/` module with `pub mod` re-export from `lib.rs`.
+
+V049 (both dialects) — `audit_archives` table for the chain-anchored
+blobs. qa_harness migration-count bound bumped to `1..=49`.
+
 ## [2.5.0] — 2026-05-27
 
 **`#102` complete (final 2 of 8 asks) — envelope-schema validation hook (Ask 4) + hardware-attestation evidence (Ask 8).**
