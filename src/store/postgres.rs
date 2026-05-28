@@ -6451,6 +6451,85 @@ impl crate::derived::DerivedSchema for PostgresBackend {
         Ok(out)
     }
 
+    // v2.13.0 (CIRISPersist#113) — read facade over
+    // `cirislens.edge_detection_events` (V020). Stable ORDER BY
+    // `(tenant_id ASC, observed_at ASC, detection_id ASC)` — the
+    // change-feed polling cursor in
+    // [`crate::Engine::subscribe_detection_events`] depends on
+    // monotone ASC ordering to advance without re-yielding rows.
+    async fn get_edge_detection_events(
+        &self,
+        filter: crate::derived::EdgeEventFilter,
+    ) -> Result<Vec<crate::derived::EdgeDetectionEvent>, crate::derived::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::derived::Error::Backend(e.to_string()))?;
+
+        let mut query = String::from(
+            "SELECT detection_id, tenant_id, detector_kind, subject_key_id, \
+                observed_at, evidence, severity, signature, signing_key_id, \
+                signature_verified, persist_row_hash \
+             FROM cirislens.edge_detection_events WHERE 1 = 1",
+        );
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        if let Some(t) = filter.tenant_id {
+            params.push(Box::new(t));
+            query.push_str(&format!(" AND tenant_id = ${}", params.len()));
+        }
+        if let Some(p) = filter.peer_key_id {
+            params.push(Box::new(p));
+            query.push_str(&format!(" AND subject_key_id = ${}", params.len()));
+        }
+        if let Some(k) = filter.event_type {
+            params.push(Box::new(k));
+            query.push_str(&format!(" AND detector_kind = ${}", params.len()));
+        }
+        if let Some(after) = filter.recorded_after {
+            // Strict `>` for the change-feed polling cursor — a re-poll
+            // at the same cursor must NOT yield the row that advanced
+            // the cursor.
+            params.push(Box::new(after));
+            query.push_str(&format!(" AND observed_at > ${}", params.len()));
+        }
+        let limit: i64 = filter
+            .limit
+            .map(|n| i64::try_from(n).unwrap_or(i64::MAX))
+            .unwrap_or(1000);
+        query.push_str(&format!(
+            " ORDER BY tenant_id ASC, observed_at ASC, detection_id ASC LIMIT {limit}"
+        ));
+
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let rows = client.query(&query, &params_ref[..]).await.map_err(|e| {
+            crate::derived::Error::Backend(format!("select edge_detection_events: {e}"))
+        })?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let mk_err = crate::derived::Error::Backend;
+            // detection_id is UUID in PG; surface as TEXT to match
+            // the public type (which has to bridge SQLite's TEXT id
+            // anyway).
+            let detection_id_uuid: uuid::Uuid = r.safe_get_with("detection_id", mk_err)?;
+            out.push(crate::derived::EdgeDetectionEvent {
+                detection_id: detection_id_uuid.to_string(),
+                tenant_id: r.safe_get_with("tenant_id", mk_err)?,
+                detector_kind: r.safe_get_with("detector_kind", mk_err)?,
+                subject_key_id: r.safe_get_with("subject_key_id", mk_err)?,
+                observed_at: r.safe_get_with("observed_at", mk_err)?,
+                evidence: r.safe_get_with("evidence", mk_err)?,
+                severity: r.safe_get_with("severity", mk_err)?,
+                signature: r.safe_get_with("signature", mk_err)?,
+                signing_key_id: r.safe_get_with("signing_key_id", mk_err)?,
+                signature_verified: r.safe_get_with("signature_verified", mk_err)?,
+                persist_row_hash: r.safe_get_with("persist_row_hash", mk_err)?,
+            });
+        }
+        Ok(out)
+    }
+
     async fn put_calibration_bundle(
         &self,
         bundle: crate::derived::CalibrationBundle,

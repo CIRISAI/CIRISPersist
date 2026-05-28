@@ -1663,6 +1663,18 @@ impl crate::derived::DerivedSchema for MemoryBackend {
         Ok(Vec::new())
     }
 
+    // v2.13.0 (CIRISPersist#113) — memory backend has no
+    // `edge_detection_events` substrate (sovereign-mode Pi-class
+    // deployments without LensCore don't need it). Returns empty so
+    // probing callers get a clean "no rows" rather than an error,
+    // matching the existing `get_detection_events` shape.
+    async fn get_edge_detection_events(
+        &self,
+        _filter: crate::derived::EdgeEventFilter,
+    ) -> Result<Vec<crate::derived::EdgeDetectionEvent>, crate::derived::Error> {
+        Ok(Vec::new())
+    }
+
     async fn put_calibration_bundle(
         &self,
         _bundle: crate::derived::CalibrationBundle,

@@ -165,6 +165,95 @@ pub struct EventFilter {
     pub since: Option<DateTime<Utc>>,
 }
 
+/// v2.13.0 (CIRISPersist#113) — one row of
+/// `cirislens.edge_detection_events` (V020).
+///
+/// LensCore's detector signals — `UnconsentedExternalProbe`,
+/// `ExcessiveRecursion`, `ConsentGateLeak` — land here. Persist owns
+/// storage + the read-side facade; LensCore composes the detection
+/// policy. The Counter-RII joint-correlation path
+/// (CIRISLensCore#21) reads via [`crate::Engine::get_edge_detection_events`]
+/// for evidence joins across detection events + the wider audit chain.
+///
+/// # Column → field mapping (V020)
+///
+/// | Column                 | Field                      | Notes                          |
+/// |------------------------|----------------------------|--------------------------------|
+/// | `detection_id`         | `detection_id`             | UUID (TEXT on SQLite)          |
+/// | `tenant_id`            | `tenant_id`                | tenant scope                   |
+/// | `detector_kind`        | `detector_kind`            | CHECK'd vocabulary             |
+/// | `subject_key_id`       | `subject_key_id`           | FK → federation_keys.key_id    |
+/// | `observed_at`          | `observed_at`              | TIMESTAMPTZ / RFC3339 TEXT     |
+/// | `evidence`             | `evidence`                 | JSONB / JSON-as-TEXT           |
+/// | `severity`             | `severity`                 | `info` / `warn` / `block`      |
+/// | `signature`            | `signature`                | signed-envelope payload        |
+/// | `signing_key_id`       | `signing_key_id`           | detector identity              |
+/// | `signature_verified`   | `signature_verified`       | bool / 0\|1                    |
+/// | `persist_row_hash`     | `persist_row_hash`         | row-hash anchor                |
+///
+/// The persist write-side (the INSERT call site lives in CIRISLensCore;
+/// the v1.3.0 V020 cut is a smoke-tested table in persist itself, see
+/// `src/store/sqlite.rs::edge_detection_events_insert_and_select`)
+/// preceded a service-level wrapper — this is the public read-side
+/// the v2.13.0 facade exposes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeDetectionEvent {
+    /// Detection identifier (UUID). Caller-generated; PRIMARY KEY.
+    pub detection_id: String,
+    /// Tenant scope — matches `cirislens.audit_log.tenant_id` per AV-51.
+    pub tenant_id: String,
+    /// Detector token. V020 vocabulary:
+    /// `"unconsented_external_probe"`, `"excessive_recursion"`,
+    /// `"consent_gate_leak"`. Additive (CHECK rewrites add kinds).
+    pub detector_kind: String,
+    /// `federation_keys.key_id` the detection is about — the suspect
+    /// principal, not the detector. FK-enforced on PG; PRAGMA-enforced
+    /// on SQLite.
+    pub subject_key_id: String,
+    /// Wall-clock when the detector observed the signal.
+    pub observed_at: DateTime<Utc>,
+    /// Detector evidence — consumer-typed JSONB. Persist stores it
+    /// opaquely.
+    pub evidence: serde_json::Value,
+    /// Triage bucket. V020 vocabulary: `"info"`, `"warn"`, `"block"`.
+    pub severity: String,
+    /// Detector signature over the canonical row (signed-envelope
+    /// pattern — opaque to persist's read path).
+    pub signature: String,
+    /// Detector identity (`federation_keys.key_id`).
+    pub signing_key_id: String,
+    /// `true` iff the substrate verified the signature at write time.
+    /// The read facade returns the column as-is; consumers MAY filter
+    /// on this in the typed filter.
+    pub signature_verified: bool,
+    /// Row-hash anchor for the persist envelope (V020 standard).
+    pub persist_row_hash: String,
+}
+
+/// v2.13.0 (CIRISPersist#113) — filter struct for
+/// [`crate::Engine::get_edge_detection_events`].
+///
+/// All fields optional; set fields are AND'ed. Empty filter returns
+/// all rows up to the backend's default LIMIT (1000).
+///
+/// Stable ORDER BY: `(tenant_id, observed_at, detection_id)` ASC.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EdgeEventFilter {
+    /// Filter by `tenant_id`. `None` returns all tenants.
+    pub tenant_id: Option<String>,
+    /// Filter by `subject_key_id` — the federation_keys.key_id the
+    /// detection is about. `None` returns all subjects.
+    pub peer_key_id: Option<String>,
+    /// Filter by `detector_kind`. `None` returns all detectors.
+    pub event_type: Option<String>,
+    /// Filter to `observed_at > recorded_after` (strict — used by the
+    /// change-feed polling cursor to avoid re-yielding rows at the
+    /// cursor boundary). `None` returns all timestamps.
+    pub recorded_after: Option<DateTime<Utc>>,
+    /// Maximum rows returned. `None` → backend default (1000).
+    pub limit: Option<usize>,
+}
+
 /// Projection metadata captured at calibration time. Lens-core needs
 /// these three things to deterministically reproduce RATCHET's
 /// transformation at score time:

@@ -6332,6 +6332,132 @@ impl crate::derived::DerivedSchema for SqliteBackend {
         .map_err(|e| crate::derived::Error::Backend(format!("spawn_blocking join: {e}")))?
     }
 
+    // v2.13.0 (CIRISPersist#113) — read facade over
+    // `edge_detection_events` (V020). Stable ORDER BY
+    // `(tenant_id ASC, observed_at ASC, detection_id ASC)` — the
+    // change-feed polling cursor in
+    // [`crate::Engine::subscribe_detection_events`] depends on
+    // monotone ASC ordering to advance without re-yielding rows.
+    async fn get_edge_detection_events(
+        &self,
+        filter: crate::derived::EdgeEventFilter,
+    ) -> Result<Vec<crate::derived::EdgeDetectionEvent>, crate::derived::Error> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(
+            move || -> Result<Vec<crate::derived::EdgeDetectionEvent>, crate::derived::Error> {
+                let conn = conn.blocking_lock();
+                let mut sql = String::from(
+                    "SELECT detection_id, tenant_id, detector_kind, subject_key_id, \
+                        observed_at, evidence, severity, signature, signing_key_id, \
+                        signature_verified, persist_row_hash \
+                     FROM edge_detection_events WHERE 1 = 1",
+                );
+                let mut binds: Vec<String> = Vec::new();
+                if let Some(t) = filter.tenant_id {
+                    binds.push(t);
+                    sql.push_str(&format!(" AND tenant_id = ?{}", binds.len()));
+                }
+                if let Some(p) = filter.peer_key_id {
+                    binds.push(p);
+                    sql.push_str(&format!(" AND subject_key_id = ?{}", binds.len()));
+                }
+                if let Some(k) = filter.event_type {
+                    binds.push(k);
+                    sql.push_str(&format!(" AND detector_kind = ?{}", binds.len()));
+                }
+                if let Some(after) = filter.recorded_after {
+                    // Strict `>` for the change-feed polling cursor — a
+                    // re-poll at the same cursor must NOT yield the row
+                    // that advanced the cursor.
+                    binds.push(after.to_rfc3339());
+                    sql.push_str(&format!(" AND observed_at > ?{}", binds.len()));
+                }
+                let limit = filter.limit.unwrap_or(1000);
+                sql.push_str(&format!(
+                    " ORDER BY tenant_id ASC, observed_at ASC, detection_id ASC LIMIT {limit}"
+                ));
+
+                let mut stmt = conn
+                    .prepare(&sql)
+                    .map_err(sqlite_derived_err("get_edge_detection_events prepare"))?;
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
+                        let detection_id: String = row.get(0)?;
+                        let tenant_id: String = row.get(1)?;
+                        let detector_kind: String = row.get(2)?;
+                        let subject_key_id: String = row.get(3)?;
+                        let observed_at_s: String = row.get(4)?;
+                        let evidence_s: String = row.get(5)?;
+                        let severity: String = row.get(6)?;
+                        let signature: String = row.get(7)?;
+                        let signing_key_id: String = row.get(8)?;
+                        let signature_verified_i: i64 = row.get(9)?;
+                        let persist_row_hash: String = row.get(10)?;
+                        Ok((
+                            detection_id,
+                            tenant_id,
+                            detector_kind,
+                            subject_key_id,
+                            observed_at_s,
+                            evidence_s,
+                            severity,
+                            signature,
+                            signing_key_id,
+                            signature_verified_i,
+                            persist_row_hash,
+                        ))
+                    })
+                    .map_err(sqlite_derived_err("get_edge_detection_events query"))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(sqlite_derived_err("get_edge_detection_events row"))?;
+
+                let mut out = Vec::with_capacity(rows.len());
+                for (
+                    detection_id,
+                    tenant_id,
+                    detector_kind,
+                    subject_key_id,
+                    observed_at_s,
+                    evidence_s,
+                    severity,
+                    signature,
+                    signing_key_id,
+                    signature_verified_i,
+                    persist_row_hash,
+                ) in rows
+                {
+                    let observed_at = chrono::DateTime::parse_from_rfc3339(&observed_at_s)
+                        .map_err(|e| {
+                            crate::derived::Error::Backend(format!("edge observed_at parse: {e}"))
+                        })?
+                        .with_timezone(&chrono::Utc);
+                    let evidence: serde_json::Value =
+                        serde_json::from_str(&evidence_s).map_err(|e| {
+                            crate::derived::Error::Backend(format!(
+                                "edge evidence JSON decode: {e}"
+                            ))
+                        })?;
+                    out.push(crate::derived::EdgeDetectionEvent {
+                        detection_id,
+                        tenant_id,
+                        detector_kind,
+                        subject_key_id,
+                        observed_at,
+                        evidence,
+                        severity,
+                        signature,
+                        signing_key_id,
+                        signature_verified: signature_verified_i != 0,
+                        persist_row_hash,
+                    });
+                }
+                Ok(out)
+            },
+        )
+        .await
+        .map_err(|e| crate::derived::Error::Backend(format!("spawn_blocking join: {e}")))?
+    }
+
     async fn put_calibration_bundle(
         &self,
         bundle: crate::derived::CalibrationBundle,

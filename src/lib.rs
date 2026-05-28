@@ -108,6 +108,14 @@ pub use engine::AuditDispatch;
 #[cfg(all(feature = "cirisnode", any(feature = "postgres", feature = "sqlite")))]
 pub use engine::NodeCoreDispatch;
 pub use engine::{BackendDispatch, Engine, EngineError};
+// v2.13.0 (CIRISPersist#113) — Engine detection-events read + subscribe
+// facade. Re-export the filter / row types + the derived Error at the
+// crate root so consumers can `use ciris_persist::{Engine,
+// EventFilter, EdgeEventFilter, DetectionEvent, EdgeDetectionEvent}`
+// alongside the existing surface.
+pub use derived::{
+    DetectionEvent, EdgeDetectionEvent, EdgeEventFilter, Error as DerivedError, EventFilter,
+};
 // v1.13.0 (CIRISPersist#92) — process-singleton accessors for
 // co-resident Rust consumers (CIRISEdge resolver, CIRISLensCore
 // `LensCore::relay`). Built only when the PyO3 surface — which owns

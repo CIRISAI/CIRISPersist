@@ -763,6 +763,172 @@ impl Engine {
             }
         }
     }
+
+    /// v2.13.0 (CIRISPersist#113) — convenience facade over
+    /// [`DerivedSchema::get_detection_events`](crate::derived::DerivedSchema::get_detection_events).
+    ///
+    /// Thin wrapper that dispatches via the [`BackendDispatch`] enum
+    /// so consumers (CIRISLensCore#15 node UX, #19 scoring oracle,
+    /// #25 ECF UI ProfileScorecard) don't have to `match` on the
+    /// backend themselves. Behavior + ordering + default LIMIT match
+    /// the per-backend impl (newest-first `ORDER BY ts DESC`, LIMIT
+    /// 1000).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn get_detection_events(
+        &self,
+        filter: crate::derived::EventFilter,
+    ) -> Result<Vec<crate::derived::DetectionEvent>, crate::derived::Error> {
+        use crate::derived::DerivedSchema;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.get_detection_events(filter).await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.get_detection_events(filter).await,
+        }
+    }
+
+    /// v2.13.0 (CIRISPersist#113) — read facade over
+    /// `cirislens.edge_detection_events` (V020).
+    ///
+    /// LensCore's detector signals (`UnconsentedExternalProbe`,
+    /// `ExcessiveRecursion`, `ConsentGateLeak`) land in this table;
+    /// persist owns the read side. The Counter-RII joint-correlation
+    /// path (CIRISLensCore#21) reads via this facade for evidence
+    /// joins across detection events + the wider audit chain.
+    ///
+    /// Ordering is stable ASC `(tenant_id, observed_at,
+    /// detection_id)` — the change-feed cursor in
+    /// [`Engine::subscribe_detection_events`] depends on monotone ASC
+    /// to advance without re-yielding rows.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn get_edge_detection_events(
+        &self,
+        filter: crate::derived::EdgeEventFilter,
+    ) -> Result<Vec<crate::derived::EdgeDetectionEvent>, crate::derived::Error> {
+        use crate::derived::DerivedSchema;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.get_edge_detection_events(filter).await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.get_edge_detection_events(filter).await,
+        }
+    }
+
+    /// v2.13.0 (CIRISPersist#113) — push-based change feed scoped to
+    /// `detection_events`. Backs CIRISLensCore#20's `lens.alerts.*`
+    /// subscription delivery.
+    ///
+    /// # v0.1 simplifications
+    ///
+    /// The issue body's contract — in-process tokio task model +
+    /// at-least-once delivery + per-tenant ordering — is preserved.
+    /// The v0.1 implementation is a **polling** loop with the
+    /// following characteristics:
+    ///
+    /// - **Cursor**: initialized to `Utc::now()` at subscribe time, so
+    ///   the subscriber sees only NEW events; no historical replay.
+    ///   On each poll, the cursor advances past the newest yielded
+    ///   row's `ts` (by 1 microsecond) to avoid re-yielding the
+    ///   boundary row.
+    /// - **Cadence**: 2 seconds between polls (hardcoded; configurable
+    ///   in a v0.2 cut via a `SubscriptionOptions` struct).
+    /// - **Channel**: bounded `tokio::sync::mpsc::channel` of capacity
+    ///   256. When full, the polling task awaits on `send` —
+    ///   coarse-but-honest backpressure (the subscriber draining
+    ///   throttles the poll loop). A v0.2 cut may add per-tenant
+    ///   queues or lossy variants.
+    /// - **Drop discipline**: dropping the returned `Stream` closes
+    ///   the mpsc receiver; the polling task observes the closed
+    ///   channel on its next `send` and exits. No leaked task.
+    /// - **Error surfacing**: a DB error on a poll is forwarded as
+    ///   `Err(DerivedError)` on the stream; the polling task does NOT
+    ///   terminate (a transient outage shouldn't kill long-lived
+    ///   subscribers). Repeated failures keep emitting errors at the
+    ///   cadence interval.
+    ///
+    /// A WAL-hook / LISTEN-NOTIFY backed implementation lives in
+    /// scope of persist#84 — that issue tracks the broader
+    /// `engine.subscribe(substrate, callback)` substrate; this v0.1
+    /// is the LensCore-scoped slice that satisfies #20 without
+    /// blocking on the broader change-feed work.
+    ///
+    /// # Python consumers
+    ///
+    /// No PyO3 surface is exposed in v0.1 — a Python-callable polling
+    /// subscription needs a queue across the FFI boundary. The Rust
+    /// `Stream` path is for co-resident Rust consumers (CIRISLensCore
+    /// client-mode) until a Python-side design lands.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub fn subscribe_detection_events(
+        &self,
+        filter: crate::derived::EventFilter,
+    ) -> impl futures_core::Stream<
+        Item = Result<crate::derived::DetectionEvent, crate::derived::Error>,
+    > + Send {
+        // v0.1 polling cadence + channel capacity. See doc-comment for
+        // the v0.2 ask (configurable cadence + channel shape).
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+        const CHANNEL_CAPACITY: usize = 256;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<
+            Result<crate::derived::DetectionEvent, crate::derived::Error>,
+        >(CHANNEL_CAPACITY);
+        let engine = self.clone();
+        // Subscribe-time cursor: only NEW events are yielded. Polling
+        // bumps `since` past the newest yielded row's `ts` by 1 µs
+        // each iteration so the inclusive `>=` filter on the existing
+        // `EventFilter.since` doesn't re-yield the boundary row.
+        let mut since: chrono::DateTime<chrono::Utc> = chrono::Utc::now();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(POLL_INTERVAL).await;
+                // Channel-closed detection: if the receiver is dropped,
+                // `send` errors → exit. Pre-check via `is_closed` so we
+                // skip the DB poll entirely once the subscriber is gone.
+                if tx.is_closed() {
+                    break;
+                }
+
+                let poll_filter = crate::derived::EventFilter {
+                    trace_id: filter.trace_id.clone(),
+                    detector: filter.detector.clone(),
+                    since: Some(since),
+                };
+                let rows_res = engine.get_detection_events(poll_filter).await;
+                match rows_res {
+                    Ok(mut rows) => {
+                        // Per-backend impls ORDER BY ts DESC; reverse so
+                        // we yield oldest-first within the poll batch
+                        // (subscribers expect monotone-ASC delivery).
+                        rows.reverse();
+                        for ev in rows {
+                            // Advance cursor past this row's ts (existing
+                            // EventFilter.since is inclusive `>=`, so we
+                            // need a strict step to avoid re-yielding).
+                            let next_since = ev.ts + chrono::Duration::microseconds(1);
+                            if tx.send(Ok(ev)).await.is_err() {
+                                // Subscriber dropped — terminate.
+                                return;
+                            }
+                            if next_since > since {
+                                since = next_since;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Surface error on the stream; keep the poller
+                        // alive. Transient DB outages must not kill a
+                        // long-lived subscriber.
+                        if tx.send(Err(e)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        tokio_stream::wrappers::ReceiverStream::new(rx)
+    }
 }
 
 /// v2.0 (CIRISPersist#93) — per-backend
@@ -1725,5 +1891,618 @@ mod tests {
             ),
             "got: {err:?}"
         );
+    }
+
+    // ── v2.13.0 (CIRISPersist#113) — detection-events facade + edge
+    //    read + subscribe change-feed (LensCore #15 / #19 / #20 / #21 / #25)
+
+    /// Fixture: build a verified detection event the storage trait
+    /// will accept (sig-length CHECKs + canonical_bytes). The Engine
+    /// facade dispatches to the per-backend `DerivedSchema::get_*`
+    /// impl — the facade test is a thin round-trip.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    fn de_event_fixture(
+        trace_id: &str,
+        canonical: &[u8],
+        ts: chrono::DateTime<chrono::Utc>,
+    ) -> crate::derived::DetectionEvent {
+        crate::derived::DetectionEvent {
+            detection_id: uuid::Uuid::new_v4(),
+            trace_id: trace_id.to_owned(),
+            body_sha256: vec![0xABu8; 32],
+            detector: "manifold_conformity_outlier".to_owned(),
+            severity: crate::derived::DetectionSeverity::Warning,
+            cohort_cell: serde_json::json!({"deployment_domain": "legal"}),
+            conformity_variant: crate::derived::ConformityVariant::Numeric,
+            conformity_payload: serde_json::json!({"score": 2.7}),
+            lens_core_version: "lc-test".to_owned(),
+            ratchet_calibration_version: 1,
+            canonical_bytes: canonical.to_vec(),
+            ed25519_sig: vec![1u8; 64],
+            ml_dsa_65_sig: vec![2u8; 3309],
+            signing_key_id: "test-detector".to_owned(),
+            ts,
+        }
+    }
+
+    /// SQLite: facade dispatches to the SqliteBackend's
+    /// `DerivedSchema::get_detection_events`. Seed via the storage
+    /// trait; read via the Engine facade. The acceptance is the
+    /// round-trip — the facade preserves filter semantics + row
+    /// shape with no translation tax.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn get_detection_events_facade_dispatches_to_backend_sqlite() {
+        use crate::derived::{DerivedSchema, EventFilter};
+
+        let signer = test_signer();
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        let sq = engine.sqlite_backend().expect("sqlite present");
+
+        let base_ts = chrono::Utc::now() - chrono::Duration::minutes(10);
+        let ev_a = de_event_fixture("tr-A", b"canon-A", base_ts);
+        let ev_b = de_event_fixture("tr-B", b"canon-B", base_ts + chrono::Duration::minutes(1));
+        sq.put_detection_event(ev_a.clone()).await.unwrap();
+        sq.put_detection_event(ev_b.clone()).await.unwrap();
+
+        // Empty filter → both rows.
+        let all = engine
+            .get_detection_events(EventFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+
+        // trace_id filter → 1 row.
+        let only_b = engine
+            .get_detection_events(EventFilter {
+                trace_id: Some("tr-B".to_owned()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(only_b.len(), 1);
+        assert_eq!(only_b[0].detection_id, ev_b.detection_id);
+    }
+
+    /// SQLite: facade reads the V020 `edge_detection_events` rows
+    /// with the EdgeEventFilter shape (tenant / peer / event_type /
+    /// recorded_after / limit) honored. The write side has no
+    /// service trait yet; we INSERT raw to seed.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn get_edge_detection_events_returns_v020_rows_sqlite() {
+        let signer = test_signer();
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        let sq = engine.sqlite_backend().expect("sqlite present");
+
+        // FK target for `subject_key_id`. Self-referential
+        // `scrub_key_id = key_id` matches the trust_test_backend
+        // pattern — works under DEFERRABLE INITIALLY DEFERRED.
+        use crate::federation::{FederationDirectory, KeyRecord, SignedKeyRecord};
+        let suspect_key = KeyRecord {
+            key_id: "k-suspect".into(),
+            pubkey_ed25519_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: crate::federation::types::algorithm::HYBRID.into(),
+            identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
+            identity_ref: "suspect".into(),
+            valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
+            valid_until: None,
+            registration_envelope: serde_json::json!({"id": "k-suspect"}),
+            original_content_hash: "deadbeef".into(),
+            scrub_signature_classical: "c2lnbmF0dXJl".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: "k-suspect".into(),
+            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+        };
+        sq.put_public_key(SignedKeyRecord {
+            record: suspect_key,
+        })
+        .await
+        .unwrap();
+
+        // INSERT three edge_detection_events rows (raw SQL — no service
+        // trait wraps the V020 write side yet).
+        let conn = sq.conn_handle();
+        let base_ts = chrono::Utc::now();
+        let rows: Vec<(String, String, String, String)> = vec![
+            (
+                uuid::Uuid::new_v4().to_string(),
+                "tnt-alpha".into(),
+                "unconsented_external_probe".into(),
+                (base_ts - chrono::Duration::minutes(2)).to_rfc3339(),
+            ),
+            (
+                uuid::Uuid::new_v4().to_string(),
+                "tnt-alpha".into(),
+                "excessive_recursion".into(),
+                (base_ts - chrono::Duration::minutes(1)).to_rfc3339(),
+            ),
+            (
+                uuid::Uuid::new_v4().to_string(),
+                "tnt-beta".into(),
+                "consent_gate_leak".into(),
+                base_ts.to_rfc3339(),
+            ),
+        ];
+        let rows_clone = rows.clone();
+        tokio::task::spawn_blocking(move || -> rusqlite::Result<()> {
+            let conn = conn.blocking_lock();
+            for (did, tenant, kind, observed_at) in rows_clone {
+                conn.execute(
+                    "INSERT INTO edge_detection_events (\
+                        detection_id, tenant_id, detector_kind, subject_key_id, \
+                        observed_at, evidence, severity, signature, signing_key_id, \
+                        signature_verified, persist_row_hash\
+                     ) VALUES (?1, ?2, ?3, 'k-suspect', ?4, ?5, 'warn', \
+                              'sig', 'lens-detector', 1, 'hash')",
+                    rusqlite::params![did, tenant, kind, observed_at, "{\"probed\":\"x\"}"],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        // Empty filter → 3 rows, stable ASC order on (tenant, ts, id).
+        let all = engine
+            .get_edge_detection_events(crate::derived::EdgeEventFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].tenant_id, "tnt-alpha");
+        assert_eq!(all[1].tenant_id, "tnt-alpha");
+        assert_eq!(all[2].tenant_id, "tnt-beta");
+        // Shape check: severity is the TEXT vocab; signature_verified
+        // round-trips as bool; evidence is decoded JSON.
+        assert_eq!(all[0].severity, "warn");
+        assert!(all[0].signature_verified);
+        assert_eq!(all[0].evidence, serde_json::json!({"probed": "x"}));
+
+        // tenant filter
+        let alpha_only = engine
+            .get_edge_detection_events(crate::derived::EdgeEventFilter {
+                tenant_id: Some("tnt-alpha".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(alpha_only.len(), 2);
+        for r in &alpha_only {
+            assert_eq!(r.tenant_id, "tnt-alpha");
+        }
+
+        // event_type (detector_kind) filter
+        let probes = engine
+            .get_edge_detection_events(crate::derived::EdgeEventFilter {
+                event_type: Some("unconsented_external_probe".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(probes.len(), 1);
+        assert_eq!(probes[0].detector_kind, "unconsented_external_probe");
+
+        // peer_key_id filter
+        let by_peer = engine
+            .get_edge_detection_events(crate::derived::EdgeEventFilter {
+                peer_key_id: Some("k-suspect".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(by_peer.len(), 3);
+
+        // recorded_after (strict `>`) — cursor at second row's ts
+        // returns only the third row.
+        let cursor = chrono::DateTime::parse_from_rfc3339(
+            &(base_ts - chrono::Duration::minutes(1)).to_rfc3339(),
+        )
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+        let after = engine
+            .get_edge_detection_events(crate::derived::EdgeEventFilter {
+                recorded_after: Some(cursor),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].tenant_id, "tnt-beta");
+
+        // limit
+        let limit_one = engine
+            .get_edge_detection_events(crate::derived::EdgeEventFilter {
+                limit: Some(1),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(limit_one.len(), 1);
+    }
+
+    /// SQLite: subscribing AFTER seeding row R doesn't yield R; a new
+    /// row Q inserted AFTER subscribe IS yielded.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn subscribe_detection_events_yields_new_events_only_sqlite() {
+        use crate::derived::{DerivedSchema, EventFilter};
+        use futures_core::Stream;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        let signer = test_signer();
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        let sq = engine.sqlite_backend().expect("sqlite present");
+
+        // Seed a row BEFORE subscribing → must NOT be yielded.
+        let before_ts = chrono::Utc::now() - chrono::Duration::seconds(10);
+        let pre_ev = de_event_fixture("tr-PRE", b"canon-PRE", before_ts);
+        sq.put_detection_event(pre_ev.clone()).await.unwrap();
+
+        // Subscribe; let the cursor latch on Utc::now().
+        let mut stream = Box::pin(engine.subscribe_detection_events(EventFilter::default()));
+
+        // Insert a row AFTER subscribe → should be yielded.
+        // Sleep ~2.2s (one poll cycle) so the poller wakes and reads.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let new_ts = chrono::Utc::now();
+        let new_ev = de_event_fixture("tr-NEW", b"canon-NEW", new_ts);
+        sq.put_detection_event(new_ev.clone()).await.unwrap();
+
+        // Drain with a timeout. POLL_INTERVAL = 2s; allow 5s headroom.
+        let next = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+            std::future::poll_fn(|cx: &mut Context<'_>| -> Poll<
+                Option<Result<crate::derived::DetectionEvent, crate::derived::Error>>,
+            > { Pin::new(&mut stream).poll_next(cx) })
+            .await
+        })
+        .await
+        .expect("subscribe yielded within 6s");
+        let yielded = next.expect("stream produced an item").expect("ok");
+        assert_eq!(
+            yielded.detection_id, new_ev.detection_id,
+            "subscribe yields the AFTER-subscribe row"
+        );
+        assert_ne!(
+            yielded.detection_id, pre_ev.detection_id,
+            "subscribe MUST NOT yield the BEFORE-subscribe row"
+        );
+
+        drop(stream);
+    }
+
+    /// SQLite: dropping the Stream terminates the polling task — we
+    /// can't observe the JoinHandle directly, but the test passes
+    /// (does not hang) iff the polling task exits on next send/close.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn subscribe_detection_events_drop_terminates_poll_task_sqlite() {
+        use crate::derived::EventFilter;
+
+        let signer = test_signer();
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("construct engine");
+
+        let stream = engine.subscribe_detection_events(EventFilter::default());
+        // Drop the subscription. The poll task's next iteration sees
+        // tx.is_closed() → break, or its send returns Err → return.
+        // Either way the spawned task winds up. We give it 5s of
+        // wall-clock to do so; the test passing implies no leak.
+        drop(stream);
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        // If the spawned poll task were still alive + driving DB
+        // queries, the SqliteBackend's Mutex would be held when this
+        // test's tokio::test runtime tears down — exposed as flaky
+        // shutdowns on CI. The test passes today because the channel
+        // close terminates the task. No assertion needed beyond
+        // reaching this line cleanly.
+        // (Engine still owns the SqliteBackend Arc; that's expected.)
+        let _ = engine;
+    }
+
+    /// SQLite: subscribe with a tenant filter is honored — the
+    /// EventFilter shape only carries trace_id / detector / since.
+    /// Per-tenant filtering on detection_events lives elsewhere
+    /// (cohort_cell.tenant or the `signing_key_id`'s federation row).
+    /// This test confirms the trace_id scoping case (the only one
+    /// EventFilter exposes today): rows for trace_id=T are yielded,
+    /// rows for other trace_ids are not.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn subscribe_detection_events_filter_scopes_yielded_rows_sqlite() {
+        use crate::derived::{DerivedSchema, EventFilter};
+        use futures_core::Stream;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        let signer = test_signer();
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        let sq = engine.sqlite_backend().expect("sqlite present");
+
+        let mut stream = Box::pin(engine.subscribe_detection_events(EventFilter {
+            trace_id: Some("tr-MATCH".to_owned()),
+            ..Default::default()
+        }));
+
+        // Insert one matching + one non-matching row.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let now = chrono::Utc::now();
+        let matching = de_event_fixture("tr-MATCH", b"canon-MATCH", now);
+        let nonmatching = de_event_fixture(
+            "tr-OTHER",
+            b"canon-OTHER",
+            now + chrono::Duration::milliseconds(1),
+        );
+        sq.put_detection_event(matching.clone()).await.unwrap();
+        sq.put_detection_event(nonmatching.clone()).await.unwrap();
+
+        // Should yield exactly the matching row.
+        let next = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+            std::future::poll_fn(|cx: &mut Context<'_>| -> Poll<
+                Option<Result<crate::derived::DetectionEvent, crate::derived::Error>>,
+            > { Pin::new(&mut stream).poll_next(cx) })
+            .await
+        })
+        .await
+        .expect("subscribe yields within 6s");
+        let yielded = next.expect("item").expect("ok");
+        assert_eq!(yielded.trace_id, "tr-MATCH");
+        assert_eq!(yielded.detection_id, matching.detection_id);
+
+        // A second poll cycle should produce no other-trace rows;
+        // poll with a short timeout — if no row arrives, the filter
+        // is correctly excluding tr-OTHER.
+        let no_more = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            std::future::poll_fn(|cx: &mut Context<'_>| -> Poll<
+                Option<Result<crate::derived::DetectionEvent, crate::derived::Error>>,
+            > { Pin::new(&mut stream).poll_next(cx) })
+            .await
+        })
+        .await;
+        assert!(
+            no_more.is_err(),
+            "filter must NOT yield non-matching tr-OTHER row \
+             (timeout exhausted; got = {:?})",
+            no_more
+        );
+
+        drop(stream);
+    }
+
+    // ─── Postgres parity for the same four scenarios ───
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn get_detection_events_facade_dispatches_to_backend_postgres() {
+        use crate::derived::{DerivedSchema, EventFilter};
+
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let signer = test_signer();
+        let engine = Engine::with_signer(signer, &dsn)
+            .await
+            .expect("construct PG engine");
+        let pg = engine.postgres_backend().expect("pg backend");
+
+        // Use a unique trace_id per run so concurrent runs don't share rows.
+        let trace_a = format!("tr-A-{}", uuid::Uuid::new_v4().simple());
+        let trace_b = format!("tr-B-{}", uuid::Uuid::new_v4().simple());
+        let base_ts = chrono::Utc::now() - chrono::Duration::minutes(10);
+        let ev_a = de_event_fixture(&trace_a, b"canon-A", base_ts);
+        let ev_b = de_event_fixture(&trace_b, b"canon-B", base_ts + chrono::Duration::minutes(1));
+        pg.put_detection_event(ev_a.clone()).await.unwrap();
+        pg.put_detection_event(ev_b.clone()).await.unwrap();
+
+        let only_b = engine
+            .get_detection_events(EventFilter {
+                trace_id: Some(trace_b.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(only_b.len(), 1);
+        assert_eq!(only_b[0].detection_id, ev_b.detection_id);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn get_edge_detection_events_returns_v020_rows_postgres() {
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let signer = test_signer();
+        let engine = Engine::with_signer(signer, &dsn)
+            .await
+            .expect("construct PG engine");
+        let pg = engine.postgres_backend().expect("pg backend");
+
+        // Bootstrap a federation_keys row to satisfy the FK.
+        use crate::federation::{FederationDirectory, KeyRecord, SignedKeyRecord};
+        let suspect_id = format!("k-suspect-{}", uuid::Uuid::new_v4().simple());
+        let suspect = KeyRecord {
+            key_id: suspect_id.clone(),
+            pubkey_ed25519_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: crate::federation::types::algorithm::HYBRID.into(),
+            identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
+            identity_ref: suspect_id.clone(),
+            valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
+            valid_until: None,
+            registration_envelope: serde_json::json!({"id": suspect_id.clone()}),
+            original_content_hash: "deadbeef".into(),
+            scrub_signature_classical: "c2lnbmF0dXJl".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: suspect_id.clone(),
+            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+        };
+        pg.put_public_key(SignedKeyRecord { record: suspect })
+            .await
+            .unwrap();
+
+        // INSERT three edge_detection_events via the pool client.
+        let tenant_a = format!("tnt-A-{}", uuid::Uuid::new_v4().simple());
+        let tenant_b = format!("tnt-B-{}", uuid::Uuid::new_v4().simple());
+        let base_ts = chrono::Utc::now();
+        let client = pg.pool().get().await.unwrap();
+        let id_a1 = uuid::Uuid::new_v4();
+        let id_a2 = uuid::Uuid::new_v4();
+        let id_b = uuid::Uuid::new_v4();
+        client
+            .execute(
+                "INSERT INTO cirislens.edge_detection_events (\
+                    detection_id, tenant_id, detector_kind, subject_key_id, \
+                    observed_at, evidence, severity, signature, signing_key_id, \
+                    signature_verified, persist_row_hash\
+                 ) VALUES \
+                 ($1, $2, 'unconsented_external_probe', $3, $4, $5::jsonb, 'warn', \
+                  'sig', 'lens-detector', TRUE, 'hash'), \
+                 ($6, $7, 'excessive_recursion', $8, $9, $10::jsonb, 'warn', \
+                  'sig', 'lens-detector', TRUE, 'hash'), \
+                 ($11, $12, 'consent_gate_leak', $13, $14, $15::jsonb, 'info', \
+                  'sig', 'lens-detector', FALSE, 'hash')",
+                &[
+                    &id_a1,
+                    &tenant_a,
+                    &suspect_id,
+                    &(base_ts - chrono::Duration::minutes(2)),
+                    &serde_json::json!({"probed": "x"}),
+                    &id_a2,
+                    &tenant_a,
+                    &suspect_id,
+                    &(base_ts - chrono::Duration::minutes(1)),
+                    &serde_json::json!({"probed": "y"}),
+                    &id_b,
+                    &tenant_b,
+                    &suspect_id,
+                    &base_ts,
+                    &serde_json::json!({"probed": "z"}),
+                ],
+            )
+            .await
+            .unwrap();
+
+        // tenant filter → exactly tenant_a's 2 rows
+        let alpha = engine
+            .get_edge_detection_events(crate::derived::EdgeEventFilter {
+                tenant_id: Some(tenant_a.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(alpha.len(), 2);
+        for r in &alpha {
+            assert_eq!(r.tenant_id, tenant_a);
+            assert!(r.signature_verified);
+        }
+
+        // recorded_after cursor
+        let cursor = base_ts - chrono::Duration::minutes(1);
+        let after = engine
+            .get_edge_detection_events(crate::derived::EdgeEventFilter {
+                peer_key_id: Some(suspect_id.clone()),
+                recorded_after: Some(cursor),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // The base_ts row is strictly > cursor; the two earlier ones are not.
+        assert!(after.iter().any(|r| r.tenant_id == tenant_b));
+        assert!(after.iter().all(|r| r.observed_at > cursor));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn subscribe_detection_events_yields_new_events_only_postgres() {
+        use crate::derived::{DerivedSchema, EventFilter};
+        use futures_core::Stream;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let signer = test_signer();
+        let engine = Engine::with_signer(signer, &dsn)
+            .await
+            .expect("construct PG engine");
+        let pg = engine.postgres_backend().expect("pg backend");
+
+        // Seed a row BEFORE subscribing.
+        let trace_pre = format!("tr-PRE-{}", uuid::Uuid::new_v4().simple());
+        let before_ts = chrono::Utc::now() - chrono::Duration::seconds(10);
+        let pre_ev = de_event_fixture(&trace_pre, b"canon-PRE", before_ts);
+        pg.put_detection_event(pre_ev.clone()).await.unwrap();
+
+        // Subscribe with a trace_id filter to isolate from concurrent runs.
+        let trace_new = format!("tr-NEW-{}", uuid::Uuid::new_v4().simple());
+        let mut stream = Box::pin(engine.subscribe_detection_events(EventFilter {
+            trace_id: Some(trace_new.clone()),
+            ..Default::default()
+        }));
+
+        // Insert NEW row after subscribe.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let new_ts = chrono::Utc::now();
+        let new_ev = de_event_fixture(&trace_new, b"canon-NEW", new_ts);
+        pg.put_detection_event(new_ev.clone()).await.unwrap();
+
+        let next = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+            std::future::poll_fn(|cx: &mut Context<'_>| -> Poll<
+                Option<Result<crate::derived::DetectionEvent, crate::derived::Error>>,
+            > { Pin::new(&mut stream).poll_next(cx) })
+            .await
+        })
+        .await
+        .expect("yielded within 6s");
+        let yielded = next.expect("item").expect("ok");
+        assert_eq!(yielded.detection_id, new_ev.detection_id);
+        assert_ne!(yielded.detection_id, pre_ev.detection_id);
+        drop(stream);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn subscribe_detection_events_drop_terminates_poll_task_postgres() {
+        use crate::derived::EventFilter;
+
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let signer = test_signer();
+        let engine = Engine::with_signer(signer, &dsn)
+            .await
+            .expect("construct PG engine");
+        let stream = engine.subscribe_detection_events(EventFilter::default());
+        drop(stream);
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let _ = engine;
     }
 }

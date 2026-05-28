@@ -5,6 +5,82 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [2.13.0] — 2026-05-28
+
+**`#113` — Detection-events Engine read + subscribe facade.** Unblocks
+CIRISLensCore #15 (Node UX), #19 (scoring oracle), #20 (alert
+subscriptions), #21 (Counter-RII / UnconsentedExternalProbe), #25
+(ECF UI ProfileScorecard) — five lens issues converge here.
+
+### Three new Engine methods
+
+```rust
+impl Engine {
+    pub async fn get_detection_events(&self, filter: EventFilter)
+        -> Result<Vec<DetectionEvent>, DerivedError>;
+    pub async fn get_edge_detection_events(&self, filter: EdgeEventFilter)
+        -> Result<Vec<EdgeDetectionEvent>, DerivedError>;
+    pub fn subscribe_detection_events(&self, filter: EventFilter)
+        -> impl Stream<Item = Result<DetectionEvent, DerivedError>> + Send;
+}
+```
+
+- **`get_detection_events`** — thin facade over the existing
+  `DerivedSchema::get_detection_events` per-backend impls; same
+  closure pattern as `Engine::receive_and_persist` / `storage_summary`
+  / `sign_hybrid`. Both backends.
+- **`get_edge_detection_events`** — reads the V020
+  `edge_detection_events` table (INSERT side existed; SELECT side
+  added here). New `EdgeEventFilter` (`tenant_id` / `peer_key_id` /
+  `event_type` / `recorded_after` / `limit`) and `EdgeDetectionEvent`
+  types in `src/derived/types.rs`. Stable ORDER BY
+  `(tenant_id, observed_at, detection_id)`. Both backends.
+- **`subscribe_detection_events`** — v0.1 polling-based change feed.
+  2s poll cadence; bounded `mpsc::channel` capacity 256 (coarse-but-
+  honest backpressure: a full buffer makes the poll task `await` on
+  `send` rather than drop events); cursor initialized to
+  `Utc::now()` at subscribe time so subscribers see only new events,
+  not historical replay; drop discipline via `ReceiverStream` closing
+  the channel (poll task's `tx.is_closed()` + `send` error branches
+  exit cleanly — no leak). DB errors forward as `Err(DerivedError)`
+  on the stream without terminating the task — transient outages
+  don't kill long-lived subscribers.
+
+### v0.1 simplifications (documented in trait + here)
+
+- **Polling, not WAL-hook / LISTEN-NOTIFY**: persist#84's broader
+  substrate-wide change-feed is deferred to 3.0+; this is the
+  LensCore-scoped slice that satisfies #20 today without blocking on
+  the larger design.
+- **Backpressure shape**: the bounded channel + blocking-send model
+  is the right primitive; a v0.2 may add a `SubscriptionOptions`
+  struct for configurable cadence + channel capacity + dropped-when-
+  buffer-full policy. Doc-comments call it out.
+- **No PyO3 subscribe surface**: a Python-callable polling
+  subscription needs a queue across the FFI boundary; deferred. The
+  Rust `subscribe_detection_events` is for co-resident Rust consumers
+  (LensCore client-mode) until a Python-side design lands.
+
+### PyO3 read additions
+
+`get_detection_events_json` (existed since #18) is now the documented
+facade for the JSON-in/JSON-out read path; new
+`get_edge_detection_events_json` mirrors with the `EdgeEventFilter`
+shape. Errors route through the existing `derived_err_to_py` taxonomy
+(AV-15 stable kind tokens).
+
+### Cargo additions
+
+`futures-core = "0.3"` and `tokio-stream = "0.1"` declared directly
+(both were transitive via `tokio-postgres`; declaring at the surface
+so the public `Stream` signature doesn't lean on a transitive).
+
+10 new tests covering all three accessors + the subscription's
+yields-only-new + drop-terminates + filter-scoping invariants.
+**812/812 nextest tests pass** on both backends, fresh DB, full
+feature set. Clippy `--all-targets` clean on default AND full
+feature sets.
+
 ## [2.12.0] — 2026-05-28
 
 **`#112` — `Engine::sign_hybrid` facade + cohabitation propagation fix.**

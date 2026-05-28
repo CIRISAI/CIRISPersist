@@ -5353,6 +5353,85 @@ impl PyEngine {
         })
     }
 
+    /// v2.13.0 (CIRISPersist#113) — query the V020
+    /// `edge_detection_events` table. Filter is JSON-encoded
+    /// `EdgeEventFilter`:
+    ///
+    /// ```json
+    /// {
+    ///   "tenant_id":       "tnt-x",            // optional
+    ///   "peer_key_id":     "key-suspect",       // optional
+    ///   "event_type":      "unconsented_external_probe", // optional
+    ///   "recorded_after":  "2026-05-01T00:00:00Z",        // optional
+    ///   "limit":           500                  // optional (default 1000)
+    /// }
+    /// ```
+    ///
+    /// Returns a JSON array string of `EdgeDetectionEvent` objects,
+    /// ordered ASC by `(tenant_id, observed_at, detection_id)`.
+    fn get_edge_detection_events(
+        &self,
+        py: Python<'_>,
+        filter_json: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let filter: crate::derived::EdgeEventFilter = match filter_json {
+                None => crate::derived::EdgeEventFilter::default(),
+                Some(s) => {
+                    #[derive(serde::Deserialize)]
+                    struct EdgeEventFilterJson {
+                        tenant_id: Option<String>,
+                        peer_key_id: Option<String>,
+                        event_type: Option<String>,
+                        recorded_after: Option<chrono::DateTime<chrono::Utc>>,
+                        limit: Option<usize>,
+                    }
+                    let parsed: EdgeEventFilterJson = serde_json::from_str(s).map_err(|e| {
+                        PyValueError::new_err(format!("EdgeEventFilter JSON decode: {e}"))
+                    })?;
+                    crate::derived::EdgeEventFilter {
+                        tenant_id: parsed.tenant_id,
+                        peer_key_id: parsed.peer_key_id,
+                        event_type: parsed.event_type,
+                        recorded_after: parsed.recorded_after,
+                        limit: parsed.limit,
+                    }
+                }
+            };
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::derived::DerivedSchema;
+                        let rows = backend
+                            .get_edge_detection_events(filter)
+                            .await
+                            .map_err(derived_err_to_py)?;
+                        serde_json::to_string(&rows).map_err(|e| {
+                            PyRuntimeError::new_err(format!("EdgeDetectionEvent JSON encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::derived::DerivedSchema;
+                        let rows = backend
+                            .get_edge_detection_events(filter)
+                            .await
+                            .map_err(derived_err_to_py)?;
+                        serde_json::to_string(&rows).map_err(|e| {
+                            PyRuntimeError::new_err(format!("EdgeDetectionEvent JSON encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
     /// Lens-derived: write a calibration bundle.
     ///
     /// `bundle_json` is a JSON string of `CalibrationBundle`. Persist

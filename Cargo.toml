@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "2.12.0"
+version = "2.13.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -612,6 +612,18 @@ redb = "4"
 
 # Async runtime — phase 1+
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "signal", "time"] }
+
+# v2.13.0 (CIRISPersist#113) — change-feed substrate for
+# `Engine::subscribe_detection_events`. `futures-core` is the canonical
+# `Stream` trait surface (the workspace already pulls it transitively
+# via tokio-postgres; we declare it directly so the public signature
+# `impl Stream<Item = ...> + Send` doesn't depend on a transitive). The
+# tokio-stream `ReceiverStream` adapter wraps `mpsc::Receiver<Item>`
+# into a `Stream<Item>` — the v0.1 polling-subscription channel is an
+# mpsc, so this is the right adapter. Both are tiny pure-Rust crates;
+# no extra link-time / wheel-size cost worth gating.
+futures-core = "0.3"
+tokio-stream = "0.1"
 
 # v0.9.0 — iOS-specific rusqlite override. Cargo MERGES the features
 # list from `[dependencies]` and from any matching

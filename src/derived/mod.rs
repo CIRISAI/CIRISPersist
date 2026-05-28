@@ -47,7 +47,7 @@ pub mod types;
 
 pub use types::{
     CalibrationBundle, CohortCentroid, ConformityVariant, DetectionEvent, DetectionSeverity,
-    EventFilter, ProjectionMetadata, Standardization,
+    EdgeDetectionEvent, EdgeEventFilter, EventFilter, ProjectionMetadata, Standardization,
 };
 
 /// Lens-derived schema CRUD trait — substrate-layer storage for
@@ -88,6 +88,22 @@ pub trait DerivedSchema: Send + Sync {
         &self,
         filter: EventFilter,
     ) -> impl Future<Output = Result<Vec<DetectionEvent>, Error>> + Send;
+
+    // ── edge_detection_events (V020) ─────────────────────────────
+
+    /// v2.13.0 (CIRISPersist#113) — page-style lookup over
+    /// `cirislens.edge_detection_events` (V020). Filter is `AND`-ed
+    /// across set fields; ORDER BY `(tenant_id, observed_at,
+    /// detection_id)` ASC for stable cursor advancement; empty
+    /// filter returns up to 1000 rows.
+    ///
+    /// The write side (INSERT) lives at the LensCore detector call
+    /// site; persist owns this read accessor (Counter-RII joint-
+    /// correlation evidence per CIRISLensCore#21).
+    fn get_edge_detection_events(
+        &self,
+        filter: EdgeEventFilter,
+    ) -> impl Future<Output = Result<Vec<EdgeDetectionEvent>, Error>> + Send;
 
     // ── calibration_bundles ──────────────────────────────────────
 
