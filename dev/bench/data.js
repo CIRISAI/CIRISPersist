@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779998829984,
+  "lastUpdate": 1780000187733,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -35765,6 +35765,282 @@ window.BENCHMARK_DATA = {
             "name": "storage_floor/next_sequence_full",
             "value": 726,
             "range": "± 62",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "116685e20543e717eb028627e96b958c23f3544e",
+          "message": "2.12.0 — #112 Engine::sign_hybrid facade + cohabitation propagation fix\n\ncloses #112. Unblocks CIRISLensCore#11 (v0.3 client-mode trace signing\non ACTION_RESULT) + #14 (v0.4 EgressFilter re-signing).\n\nEngine struct gains `local_signer: Option<Arc<LocalSigner>>` field\nand a new sign_hybrid(message) -> Result<HybridSignature, SignError>\nmethod. Same closure-pattern as Engine::receive_and_persist /\nstorage_summary: persist owns the underlying primitive\n(LocalSigner::sign_hybrid combines Ed25519 + ML-DSA-65 + AV-33 bound-\nhybrid); persist exposes a clean Engine facade so co-resident Rust\nconsumers don't reach past Arc<dyn HardwareSigner>.\n\nCohabitation propagation fix: pre-v2.12 Engine::from_shared (used by\ncurrent_rust_engine() to hand co-resident Rust consumers an\nArc<Engine> view on the singleton) only carried Arc<dyn HardwareSigner>\nacross — the LocalSigner the singleton was constructed from was lost\nat the boundary. 2.12 adds Engine::from_shared_with_local(backend,\nsigner, local_signer) and updates current_rust_engine() to call it,\npropagating EngineCell's local_signer through. The singleton already\nholds it; sharing across the cohabitation boundary doesn't duplicate\nidentity.\n\nHardware-rooted deployments without LocalSigner keep using\nEngine::from_shared and get SignError::LocalSignerUnavailable from\nsign_hybrid — honest fail-mode; rebuild LocalSigner from\nPyEngine::keyring_signer()'s KeyringSignerHandle if the hardware-\nbacked PqcSigner is accessible.\n\nTyped SignError:\n  - LocalSignerUnavailable (from_shared without local_signer)\n  - LocalSigner(LocalSignerError) (underlying signer errors,\n    e.g. PqcNotConfigured for Ed25519-only deployments)\n\nThree new sign_hybrid tests on engine::tests. Verified: clippy\n--all-targets clean on default AND full feature sets; 803/803\nnextest tests pass on both backends, fresh DB, --test-threads=1.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-28T15:06:12-05:00",
+          "tree_id": "4ddc663d6bd2d39036ce70560bd2d7ccef3dd2bb",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/116685e20543e717eb028627e96b958c23f3544e"
+        },
+        "date": 1780000186530,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 45663578,
+            "range": "± 38321",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 2523,
+            "range": "± 28",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 5766,
+            "range": "± 62",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 12258,
+            "range": "± 57",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 43730,
+            "range": "± 85",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 6,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 30,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 145,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 520,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 591,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 2006,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 7,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 66,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 208,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 910,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 13,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 49104,
+            "range": "± 3099",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 150508,
+            "range": "± 30447",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 550923,
+            "range": "± 2158",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 6439,
+            "range": "± 836",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 7122,
+            "range": "± 306",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 14350,
+            "range": "± 1014",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 34960,
+            "range": "± 1306",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 600685,
+            "range": "± 1558",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 242147,
+            "range": "± 3351",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 13782,
+            "range": "± 461",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 37655,
+            "range": "± 334",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 2381188,
+            "range": "± 21605",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 95550,
+            "range": "± 5560",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 379719,
+            "range": "± 5647",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 5909179,
+            "range": "± 46282",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 243567,
+            "range": "± 7423",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 981339,
+            "range": "± 14653",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 4532,
+            "range": "± 333",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 3961,
+            "range": "± 251",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 1053,
+            "range": "± 46",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 3477,
+            "range": "± 155",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 26324,
+            "range": "± 226",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 1,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 530,
+            "range": "± 18",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 83,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 823,
+            "range": "± 27",
             "unit": "ns/iter"
           }
         ]
