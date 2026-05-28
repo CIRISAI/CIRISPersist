@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779928513096,
+  "lastUpdate": 1779932216417,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -33329,6 +33329,276 @@ window.BENCHMARK_DATA = {
             "name": "storage_floor/next_sequence_full",
             "value": 37273,
             "range": "± 2308",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "b42254c765a13e896f0000e4297f1f63bd80953d",
+          "message": "2.5.0 — #102 complete: envelope-schema hook (Ask 4) + hardware-attestation (Ask 8)\n\ncloses #102. The final two asks of the Registry directory contract.\n\nAsk 4 — Envelope-schema validation hook (FSD-002 §4.9.1):\nSchemaResolver trait (object-safe via boxed-future returns) + two\nimpls (NoOpSchemaResolver default; BlobBackedSchemaResolver<B>\ngeneric over the concrete BlobStorage backend). axis_from_dimension\nhelper picks the last non-:v[N] segment per FSD-002 §4.9.1 worked\nexample. Admission hook validates `scores` attestation envelopes\nagainst per-axis JSON Schemas resolved by SHA from federation_blobs.\nHash-keyed cache (HashMap, not LRU — axis vocabulary is bounded by\nFSD-002 §4.9). jsonschema 0.46 unconditional dep (default-features\noff — no file/network fetch surfaces; persist hands a preloaded\nserde_json::Value). Typed Error::EnvelopeSchemaViolation on failure.\n\nAsk 8 — Hardware-attestation attestation_evidence column (FSD-002\n§7.3): V048 (both dialects) adds attestation_evidence JSONB/TEXT to\nfederation_keys + CHECK / trigger enforcing accord_holder rows\nrequire it. HardwareAttestationPolicy: default rejects SoftwareOnly\n(Verify's one structural floor); explicit 11-variant accepted list\nmakes future ciris-keyring variants a compile error (forces policy\ndecision). Admission hook on put_public_key parses\n(PlatformAttestation, nonce_captured_at), picks finer-grained\nHardwareType (AndroidStrongbox vs Keystore, TpmDiscrete vs Firmware),\nchecks structural field presence per variant, checks nonce freshness\nvs 24h default. Four typed errors. NO active chain validation —\nVerify#32 Ask 5 future work; persist does structural local check +\npreserves evidence for registry-side / future Verify chain\nvalidation.\n\nSide-effect fix: cirisnode::postgres::tests::list_contributions_filter_extension\nflake (hardcoded [0xC4; 32] author seed accumulating under same key\nacross re-runs on shared PG) — fixed with UUID-v4-derived seed per\nfeedback_hundred_percent_green.\n\nVerified: clippy --all-targets clean on default AND full feature\nsets; 747/747 nextest tests pass on both backends, fresh DB,\n--test-threads=1, full feature set.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-27T20:16:00-05:00",
+          "tree_id": "7994f8bff2e49df369074cd498357a7d13d6ad95",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/b42254c765a13e896f0000e4297f1f63bd80953d"
+        },
+        "date": 1779932215445,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 121309,
+            "range": "± 437",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 269337,
+            "range": "± 600",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 563580,
+            "range": "± 1779",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1999622,
+            "range": "± 13367",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 402,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 1568,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 8458,
+            "range": "± 116",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 23170,
+            "range": "± 395",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 26387,
+            "range": "± 1122",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 90990,
+            "range": "± 229",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 364,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 2962,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 9527,
+            "range": "± 23",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 41291,
+            "range": "± 117",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 631,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 2217675,
+            "range": "± 23946",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 6942848,
+            "range": "± 245948",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 25829964,
+            "range": "± 1645263",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 326434,
+            "range": "± 29699",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 376719,
+            "range": "± 21627",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 725886,
+            "range": "± 79675",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 1777255,
+            "range": "± 92534",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 27022721,
+            "range": "± 136369",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 11994093,
+            "range": "± 98112",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 797723,
+            "range": "± 55911",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 1998985,
+            "range": "± 45493",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 108103301,
+            "range": "± 2073960",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 4636306,
+            "range": "± 202975",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 18796762,
+            "range": "± 354362",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 268484659,
+            "range": "± 7189725",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 13538149,
+            "range": "± 457312",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 48358317,
+            "range": "± 1101022",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 223173,
+            "range": "± 26162",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 200189,
+            "range": "± 14557",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 46588,
+            "range": "± 1416",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 159504,
+            "range": "± 5090",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 1230428,
+            "range": "± 30088",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 48,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 23208,
+            "range": "± 870",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 3792,
+            "range": "± 43",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 37337,
+            "range": "± 1376",
             "unit": "ns/iter"
           }
         ]
