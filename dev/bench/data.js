@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779996658820,
+  "lastUpdate": 1779998829984,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -35489,6 +35489,282 @@ window.BENCHMARK_DATA = {
             "name": "storage_floor/next_sequence_full",
             "value": 38726,
             "range": "± 1756",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "598ce9e3b7301ff1d48860393f8f455578a66088",
+          "message": "bench: calibration-anchored normalization to kill runner-noise alerts\n\nCloses the false-positive class that tripped 40 perf alerts on 2.11.0\nvs 2.10.0 — a 15-line PyCapsule + a verify pin bump that touched NO\nbenched hot path, but absolute ns/iter swung 1.4–2.5× uniformly from\nneighbor-tenant runner load.\n\nNew benches/calibration.rs: pure-compute 10M splitmix64 microbench.\nNo deps, no IO, no hardware-accel variance (no SHA-NI/AES-NI/RDRAND).\nDeterministic seed + fixed iteration count. The bench workflow extracts\nits ns/iter first and uses it as the runner's \"wall-time-per-CPU-op\"\ntick.\n\nbench.yml: each non-calibration bench's ns/iter is divided by\nCALIBRATION_NS (× 1M scale to keep numbers in readable integer\nrange), so published values are in \"calibration units\" — runner-\nindependent. The calibration line is preserved at the top of\nbench-output.txt with its raw ns so the trend chart also tracks\nrunner-fleet drift as its own series.\n\nGeomean cross-check (diagnostic log only): if the suite's geomean\nshifts dramatically run-over-run while calibration also shifts,\nnormalization is doing its job. Divergence between the two = real\nper-bench regression buried in there.\n\nBash-native normalization (no awk regex hell, no YAML-heredoc\nindentation pitfalls). Smoke-tested locally.\n\nNo version bump — CI infrastructure only, no wheel-affecting code.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-28T14:48:39-05:00",
+          "tree_id": "8be7e2615d3280a15c6eeadfcdc6ff6faec45249",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/598ce9e3b7301ff1d48860393f8f455578a66088"
+        },
+        "date": 1779998828714,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 53616008,
+            "range": "± 170388",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 1795,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 4445,
+            "range": "± 21",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 9735,
+            "range": "± 30",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 37216,
+            "range": "± 663",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 5,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 22,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 127,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 382,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 446,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 1648,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 6,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 57,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 177,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 823,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 9,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 39662,
+            "range": "± 845",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 119658,
+            "range": "± 1723",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 431984,
+            "range": "± 10788",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 7044,
+            "range": "± 1532",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 9441,
+            "range": "± 2769",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 18533,
+            "range": "± 2828",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 38367,
+            "range": "± 3164",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 509756,
+            "range": "± 5610",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 185436,
+            "range": "± 1375",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 16779,
+            "range": "± 982",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 38928,
+            "range": "± 853",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 1652765,
+            "range": "± 8994",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 88528,
+            "range": "± 3833",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 312731,
+            "range": "± 4400",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 4098613,
+            "range": "± 18681",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 223971,
+            "range": "± 9011",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 792281,
+            "range": "± 9233",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 5039,
+            "range": "± 802",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 4568,
+            "range": "± 1061",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 909,
+            "range": "± 62",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 2669,
+            "range": "± 94",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 20489,
+            "range": "± 515",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 1,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 419,
+            "range": "± 24",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 67,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 726,
+            "range": "± 62",
             "unit": "ns/iter"
           }
         ]
