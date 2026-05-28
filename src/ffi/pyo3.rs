@@ -14023,6 +14023,54 @@ impl PyEngine {
         pyo3::types::PyCapsule::new(py, handle, Some(name))
             .map_err(|e| PyErr::new::<LensQueryError, _>(format!("keyring_signer_capsule: {e}")))
     }
+
+    /// v2.8.0 (CIRISPersist#111) — cross-cdylib accessor for the tokio
+    /// runtime handle. Returns a `PyCapsule` wrapping a clone of the
+    /// engine's own `tokio::runtime::Handle`.
+    ///
+    /// Counterpart to #109's type-identity fix at the **statics** layer.
+    /// When persist is linked into BOTH `ciris_persist.abi3.so` AND a
+    /// consumer wheel (e.g. `ciris_edge.abi3.so`, which pulls persist
+    /// as a Cargo rlib), each `.so` gets its own copy of persist's
+    /// `static ENGINE_SINGLETON`. The consumer's copy is never
+    /// populated, so `ciris_persist::current_runtime_handle()` from
+    /// the consumer's `.so` always returns `None` in production
+    /// cross-wheel deployments — the failure CIRISConformance v0.10.0's
+    /// cohabitation gate caught with the `init_handshake` error.
+    ///
+    /// Sourcing the handle from `self.runtime` (rather than calling
+    /// the free `current_runtime_handle()`) sidesteps the static
+    /// entirely — `self` already IS the singleton holder in this
+    /// extension module's view, and `Runtime::handle()` clones cheaply.
+    ///
+    /// Consumer pattern (CIRISEdge):
+    /// ```ignore
+    /// let cap: Bound<PyCapsule> = engine
+    ///     .call_method0("runtime_handle_capsule")?
+    ///     .downcast_into()?;
+    /// // SAFETY: persist v2.8.0+'s runtime_handle_capsule wraps
+    /// // tokio::runtime::Handle with name tag
+    /// // "ciris_persist::runtime_handle"; the Cargo pin floor enforces.
+    /// let handle: &tokio::runtime::Handle = unsafe {
+    ///     cap.pointer_checked(Some(c"ciris_persist::runtime_handle"))?
+    ///         .cast()
+    ///         .as_ref()
+    /// };
+    /// let _enter = handle.enter();
+    /// ```
+    ///
+    /// Name tag: `ciris_persist::runtime_handle`.
+    #[pyo3(name = "runtime_handle_capsule")]
+    fn runtime_handle_capsule_py<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyCapsule>> {
+        let handle: tokio::runtime::Handle = self.runtime.handle().clone();
+        let name = std::ffi::CString::new("ciris_persist::runtime_handle")
+            .expect("static name has no NUL bytes");
+        pyo3::types::PyCapsule::new(py, handle, Some(name))
+            .map_err(|e| PyErr::new::<LensQueryError, _>(format!("runtime_handle_capsule: {e}")))
+    }
 }
 
 /// v1.5.9 (CIRISPersist#59 #1) — encode a [`ClaimResult<Task>`] onto the

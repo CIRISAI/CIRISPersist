@@ -5,6 +5,45 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [2.8.0] — 2026-05-28
+
+**`#111` — `runtime_handle_capsule` cross-cdylib statics fix (extends #109).**
+
+Persist#109 (v2.7.0) closed cross-cdylib **type identity** via the
+`federation_directory_capsule` / `outbound_queue_capsule` /
+`keyring_signer_capsule` PyCapsule accessors. #111 is the same
+architectural class one layer deeper — **statics duplication**.
+
+When persist is linked into BOTH `ciris_persist.abi3.so` AND a
+consumer wheel (e.g. `ciris_edge.abi3.so`, which pulls persist as
+a Cargo rlib via its `[dependencies]`), each `.so` gets its own
+copy of persist's `static ENGINE_SINGLETON: OnceLock<...>` (and
+every other persist `static`). The consumer's copy is never
+populated by `ciris_persist.Engine(...)` in Python; that bootstrap
+populates the persist `.so`'s copy. So
+`ciris_persist::current_runtime_handle()` called from the
+consumer's `.so` always returns `None` in production cross-wheel
+deployments — the `'persist tokio runtime not yet installed'`
+failure that CIRISConformance v0.10.0's cohabitation gate caught
+on all 6 cells (3 platforms × 2 backends).
+
+The fix mirrors #109's pattern: a new `#[pymethod]` on `PyEngine`
+that wraps `tokio::runtime::Handle` in a `PyCapsule` with name
+tag `ciris_persist::runtime_handle`. The handle is sourced from
+`self.runtime.handle().clone()` — `self` already IS the singleton
+holder in this extension module's view, so the static lookup is
+sidestepped entirely. Consumer calls `engine.call_method0(
+"runtime_handle_capsule")?` and extracts via
+`unsafe { cap.pointer_checked(name)?.cast().as_ref() }`, then
+`handle.enter()` to run any async substrate work under persist's
+runtime regardless of which cdylib the calling code was linked
+into.
+
+The capsule pattern now generalizes to any persist `static`-rooted
+accessor cross-wheel consumers might need; if more surface
+duplicates this way in the future (a new singleton, a new
+process-global), the recipe is the same.
+
 ## [2.7.0] — 2026-05-28
 
 **`#104` UI aggregate queries + `#109` PyCapsule cross-module cohabitation accessors.**
