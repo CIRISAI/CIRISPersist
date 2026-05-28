@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779992566568,
+  "lastUpdate": 1779994106394,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -34949,6 +34949,276 @@ window.BENCHMARK_DATA = {
             "name": "storage_floor/next_sequence_full",
             "value": 37526,
             "range": "± 1451",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "f89c935ef003b197519ff133d786fbec61b7ec27",
+          "message": "2.10.0 — #114 typed Goal primitive (M-1 alignment as structural invariant)\n\ncloses #114. Substrate for the F-3 detector family (CIRISLensCore#23/\n#24/#26). Every Goal MUST carry M-1 alignment, enforced at the type\nsystem the same way NonZeroU32 enforces non-zero — a Goal cannot be\nconstructed without it. M-1 is not a validation rule but a type-system\nconstruction precondition; a declarer cannot route around the\nframework by simply \"not setting it.\"\n\nTypes (src/federation/goal.rs):\n- Goal: UUIDv7 + declared_by_key_id FK + scope (SingleDeclarer |\n  Cohort{id} | Federation) + meta_goal_alignment (REQUIRED by value,\n  not Option) + retired_at.\n- MetaGoalAlignment: M1Dimension + rationale + Option<DeliberationRef>.\n- M1Dimension #[non_exhaustive]: Sustainability, Adaptivity, Coherence,\n  Plurality, Flourishing, Justice, Wonder (the 7 dimensions of CIRIS\n  Accord v1.2-Beta M-1).\n- Goal::new(...) takes meta_goal_alignment by value; no Default impl,\n  no other public constructor.\n\nV050 migration (both dialects): goals table with UUID PK, FK to\nfederation_keys ON DELETE RESTRICT, meta_dimension CHECK in 7 lex\nvariants, scope_kind CHECK in 3, JSONB meta_deliberation, partial\nindexes on the F-3 hot path (live goals only). Cross-column CHECK:\nscope_kind='cohort' iff scope_cohort_id IS NOT NULL. qa_harness bound\n→ 1..=50.\n\nFederationDirectory trait gains 4 async-trait methods: put_goal /\nget_goal / list_goals / retire_goal. GoalsFilter (declared_by_key_id,\nm1_dimension, scope_kind, cohort_id, include_retired). retire_goal\nis soft-idempotent (mirrors revoke_trust precedent). Stable lex order\nby (declared_at, goal_id).\n\nPyO3 surface: cirisnode_put_goal_json / cirisnode_get_goal_json /\ncirisnode_list_goals_json / cirisnode_retire_goal_json. M-1\nenforcement reaches the FFI boundary — a JSON payload missing\nmeta_goal_alignment raises ValueError before any DB call.\n\nJudgement calls flagged in CHANGELOG: DeliberationRef shape (issue\nbody cut off, picked conservative {artifact_type, artifact_id}),\ngoal_text canonicalization (ASCII whitespace trim+collapse), PG FK\ndetection (SQLSTATE 23503 / 23514, not Display string-match).\n\nVerified: clippy --all-targets clean on full feature set; 799/799\nnextest tests pass on both backends, fresh DB, --test-threads=1.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-28T13:32:44-05:00",
+          "tree_id": "a0e11630969609ec96c5256f1146ba2bf3e69b4b",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/f89c935ef003b197519ff133d786fbec61b7ec27"
+        },
+        "date": 1779994105045,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "ingest_pipeline/1",
+            "value": 62085,
+            "range": "± 42",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 143885,
+            "range": "± 337",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 312311,
+            "range": "± 592",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 1109318,
+            "range": "± 2020",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 168,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 653,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 3831,
+            "range": "± 58",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 12586,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 14183,
+            "range": "± 39",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 46193,
+            "range": "± 36",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 171,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 2060,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 6499,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 29233,
+            "range": "± 28",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 296,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 1584809,
+            "range": "± 289008",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 4072944,
+            "range": "± 382517",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 13916001,
+            "range": "± 2927037",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 166096,
+            "range": "± 8135",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 193096,
+            "range": "± 50485",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 323925,
+            "range": "± 12892",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 767847,
+            "range": "± 18483",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 15520174,
+            "range": "± 124956",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 5761539,
+            "range": "± 19329",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 319971,
+            "range": "± 5982",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 879751,
+            "range": "± 31072",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 58208817,
+            "range": "± 566717",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 2029012,
+            "range": "± 286142",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 9570834,
+            "range": "± 86900",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 152077809,
+            "range": "± 870490",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 7781947,
+            "range": "± 431949",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 29315103,
+            "range": "± 514800",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 130312,
+            "range": "± 5866",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 117660,
+            "range": "± 9189",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 28051,
+            "range": "± 929",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 80456,
+            "range": "± 790",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 586216,
+            "range": "± 5645",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 57,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 16620,
+            "range": "± 2027",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 2017,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 22756,
+            "range": "± 1082",
             "unit": "ns/iter"
           }
         ]
