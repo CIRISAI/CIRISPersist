@@ -2507,6 +2507,15 @@ impl PyEngine {
                 pqc_completed_at: None,
                 persist_row_hash: String::new(),
                 roles: roles.unwrap_or_default(),
+                // v2.5.0 (CIRISPersist#102 Ask 8) — the PyO3
+                // self-signing path is used by lens/agent bootstrap
+                // for steward / primitive / agent identities; it
+                // does NOT mint accord-holder keys (those go through
+                // a separate hardware-attestation bootstrap that
+                // populates `attestation_evidence` directly via
+                // `put_public_key` with a fully-formed
+                // SignedKeyRecord). Default to None here.
+                attestation_evidence: None,
             };
             let signed = crate::federation::SignedKeyRecord { record };
             let signed_json = serde_json::to_string(&signed).map_err(|e| {
@@ -14357,6 +14366,14 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // are caller-fault malformed-content; ValueError (4xx).
         crate::federation::Error::AccordDimensionRequiresAccordHolder { .. }
         | crate::federation::Error::DimensionRejected { .. } => PyValueError::new_err(kind),
+        // v2.5.0 (CIRISPersist#102 Ask 4 + Ask 8) — all the new
+        // admission-hook rejections are caller-fault malformed-
+        // content; ValueError (4xx).
+        crate::federation::Error::EnvelopeSchemaViolation { .. }
+        | crate::federation::Error::AccordHolderRequiresAttestationEvidence { .. }
+        | crate::federation::Error::HardwareTypeNotAccepted { .. }
+        | crate::federation::Error::AttestationEvidenceIncomplete { .. }
+        | crate::federation::Error::AttestationEvidenceStale { .. } => PyValueError::new_err(kind),
         // Rate-limit → RuntimeError; lens maps to 429.
         crate::federation::Error::RateLimited { .. } => PyRuntimeError::new_err(kind),
         // Server-fault → RuntimeError (5xx).

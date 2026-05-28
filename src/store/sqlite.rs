@@ -71,6 +71,16 @@ pub struct SqliteBackend {
     /// [`crate::federation::DEFAULT_INLINE_BYTES_CAP`]; an Engine
     /// builder may override via [`SqliteBackend::with_inline_bytes_cap`].
     inline_bytes_cap: std::sync::atomic::AtomicUsize,
+    /// v2.5.0 (CIRISPersist#102 Ask 4) — per-axis envelope-schema
+    /// resolver. The default is
+    /// [`crate::federation::NoOpSchemaResolver`], which makes the
+    /// admission hook a no-op (existing `put_attestation` callers
+    /// don't break). Override via [`SqliteBackend::set_schema_resolver`].
+    schema_resolver: std::sync::RwLock<std::sync::Arc<dyn crate::federation::SchemaResolver>>,
+    /// v2.5.0 (CIRISPersist#102 Ask 8) — hardware-attestation policy
+    /// for accord-holder `put_public_key` admission.
+    hardware_attestation_policy:
+        std::sync::RwLock<std::sync::Arc<crate::federation::HardwareAttestationPolicy>>,
 }
 
 impl SqliteBackend {
@@ -94,7 +104,56 @@ impl SqliteBackend {
             inline_bytes_cap: std::sync::atomic::AtomicUsize::new(
                 crate::federation::DEFAULT_INLINE_BYTES_CAP,
             ),
+            schema_resolver: std::sync::RwLock::new(std::sync::Arc::new(
+                crate::federation::NoOpSchemaResolver,
+            )),
+            hardware_attestation_policy: std::sync::RwLock::new(std::sync::Arc::new(
+                crate::federation::HardwareAttestationPolicy::default(),
+            )),
         }
+    }
+
+    /// v2.5.0 (CIRISPersist#102 Ask 4) — install a per-axis
+    /// envelope-schema resolver for the `put_attestation` admission
+    /// hook.
+    pub fn set_schema_resolver(
+        &self,
+        resolver: std::sync::Arc<dyn crate::federation::SchemaResolver>,
+    ) {
+        *self
+            .schema_resolver
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = resolver;
+    }
+
+    /// Snapshot the currently-installed schema resolver.
+    pub fn schema_resolver(&self) -> std::sync::Arc<dyn crate::federation::SchemaResolver> {
+        self.schema_resolver
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// v2.5.0 (CIRISPersist#102 Ask 8) — install a custom
+    /// hardware-attestation policy.
+    pub fn set_hardware_attestation_policy(
+        &self,
+        policy: std::sync::Arc<crate::federation::HardwareAttestationPolicy>,
+    ) {
+        *self
+            .hardware_attestation_policy
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = policy;
+    }
+
+    /// Snapshot the currently-installed hardware-attestation policy.
+    pub fn hardware_attestation_policy(
+        &self,
+    ) -> std::sync::Arc<crate::federation::HardwareAttestationPolicy> {
+        self.hardware_attestation_policy
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// v2.3 (CIRISPersist#103) — override the default inline-byte cap
@@ -163,6 +222,12 @@ impl SqliteBackend {
             inline_bytes_cap: std::sync::atomic::AtomicUsize::new(
                 crate::federation::DEFAULT_INLINE_BYTES_CAP,
             ),
+            schema_resolver: std::sync::RwLock::new(std::sync::Arc::new(
+                crate::federation::NoOpSchemaResolver,
+            )),
+            hardware_attestation_policy: std::sync::RwLock::new(std::sync::Arc::new(
+                crate::federation::HardwareAttestationPolicy::default(),
+            )),
         })
     }
 }
@@ -903,6 +968,18 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         record: crate::federation::SignedKeyRecord,
     ) -> Result<(), crate::federation::Error> {
         let mut row = record.record;
+
+        // v2.5.0 (CIRISPersist#102 Ask 8) — hardware-attestation
+        // admission gate for accord_holder rows. Runs BEFORE
+        // persist_row_hash + INSERT so rejected rows leave no trace.
+        if row.identity_type == crate::federation::types::identity_type::ACCORD_HOLDER {
+            self.hardware_attestation_policy().check(
+                &row.key_id,
+                row.attestation_evidence.as_ref(),
+                chrono::Utc::now(),
+            )?;
+        }
+
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
@@ -919,6 +996,16 @@ impl crate::federation::FederationDirectory for SqliteBackend {
 
         let registration_envelope_text = serde_json::to_string(&row.registration_envelope)
             .map_err(|e| crate::federation::Error::Backend(format!("envelope serialize: {e}")))?;
+        // v2.5.0 (CIRISPersist#102 Ask 8) — attestation_evidence
+        // serialized to TEXT for the JSON-on-SQLite convention.
+        // Non-accord-holder rows + accord-holder rows with no
+        // evidence (rejected above) both serialize to None.
+        let attestation_evidence_text: Option<String> = match &row.attestation_evidence {
+            Some(v) => Some(serde_json::to_string(v).map_err(|e| {
+                crate::federation::Error::Backend(format!("attestation_evidence serialize: {e}"))
+            })?),
+            None => None,
+        };
 
         let conn = self.conn.clone();
         let key_id = row.key_id.clone();
@@ -966,8 +1053,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
                     identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
+                    attestation_evidence\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
                 rusqlite::params![
                     row.key_id,
                     row.pubkey_ed25519_base64,
@@ -986,6 +1074,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.pqc_completed_at.map(|t| t.to_rfc3339()),
                     row.persist_row_hash,
                     roles_text,
+                    attestation_evidence_text,
                 ],
             )?;
             Ok(())
@@ -1009,7 +1098,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
                         identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
+                        attestation_evidence \
                      FROM federation_keys WHERE key_id = ?1",
                     [&key_id],
                     sqlite_row_to_key_record,
@@ -1035,7 +1125,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
                         identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
+                        attestation_evidence \
                      FROM federation_keys WHERE identity_ref = ?1",
                 )?;
                 let rows = stmt.query_map([&identity_ref], sqlite_row_to_key_record)?;
@@ -1089,6 +1180,41 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             dim,
             &attesting_identity_type,
         )?;
+
+        // v2.5.0 (CIRISPersist#102 Ask 4) — envelope-schema admission
+        // hook. Same shape as the postgres backend; see
+        // `src/store/postgres.rs` put_attestation for the
+        // architectural commentary. Skipped on the default
+        // `NoOpSchemaResolver`.
+        if row.attestation_type == crate::federation::types::attestation_type::SCORES {
+            if let Some(dim_str) = dim {
+                let resolver = self.schema_resolver();
+                let resolved = resolver.resolve(dim_str).await.map_err(|e| {
+                    crate::federation::Error::Backend(format!(
+                        "schema resolver: {} ({})",
+                        e,
+                        e.kind()
+                    ))
+                })?;
+                if let Some(schema) = resolved {
+                    if let Err(violations) =
+                        crate::federation::schema_resolver::validate_envelope_against_schema(
+                            &schema.document,
+                            &row.attestation_envelope,
+                        )
+                    {
+                        let axis = crate::federation::axis_from_dimension(dim_str)
+                            .unwrap_or("")
+                            .to_owned();
+                        return Err(crate::federation::Error::EnvelopeSchemaViolation {
+                            dimension: dim_str.to_string(),
+                            axis,
+                            violations,
+                        });
+                    }
+                }
+            }
+        }
 
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
@@ -3010,6 +3136,15 @@ fn sqlite_row_to_key_record(
         .filter(|s| !s.is_empty())
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_default();
+    // v2.5.0 (CIRISPersist#102 Ask 8): attestation_evidence stored as
+    // JSON-as-TEXT. NULL / absent column / empty string → None.
+    // Matches the `roles_text` shape above: `.get(column).ok()`
+    // swallows both rusqlite's absent-column Err and the NULL case.
+    let evidence_text: Option<String> = row.get("attestation_evidence").ok();
+    let attestation_evidence: Option<serde_json::Value> = evidence_text
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| serde_json::from_str(s).ok());
     Ok(crate::federation::KeyRecord {
         key_id: row.get("key_id")?,
         pubkey_ed25519_base64: row.get("pubkey_ed25519_base64")?,
@@ -3028,6 +3163,7 @@ fn sqlite_row_to_key_record(
         pqc_completed_at: pqc_completed_at.as_deref().map(parse_rfc3339),
         persist_row_hash: row.get("persist_row_hash")?,
         roles,
+        attestation_evidence,
     })
 }
 
@@ -4502,7 +4638,8 @@ impl crate::read::ReadEngine for SqliteBackend {
                     identity_type, identity_ref, valid_from, valid_until, \
                     registration_envelope, original_content_hash, \
                     scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
-                    scrub_timestamp, pqc_completed_at, persist_row_hash, roles \
+                    scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
+                    attestation_evidence \
              FROM federation_keys {where_sql} \
              ORDER BY valid_from DESC, key_id DESC LIMIT ?{p_limit}"
         );
@@ -6303,6 +6440,7 @@ mod tests {
             pqc_completed_at: None,
             persist_row_hash: String::new(),
             roles: Vec::new(),
+            attestation_evidence: None,
         }
     }
 
@@ -6541,6 +6679,9 @@ mod tests {
 
     /// Build a key with an explicit identity_type — covers the
     /// `accord_holder` vs `steward` distinction the gate switches on.
+    /// When `identity_type = accord_holder` the helper auto-fills a
+    /// valid hardware-attestation evidence value so the v2.5.0 admission
+    /// gate (Ask 8) doesn't reject the fixture.
     fn fed_key_with_identity_type(
         key_id: &str,
         identity_ref: &str,
@@ -6549,6 +6690,21 @@ mod tests {
     ) -> KeyRecord {
         let mut k = fed_key(key_id, identity_ref, scrub_key_id);
         k.identity_type = identity_type.into();
+        if identity_type == crate::federation::types::identity_type::ACCORD_HOLDER {
+            k.attestation_evidence = Some(serde_json::json!({
+                "platform_attestation": {
+                    "Android": {
+                        "key_attestation_chain": [
+                            vec![0x30u8, 0x82, 0x01, 0x00],
+                            vec![0x30u8, 0x82, 0x02, 0x00],
+                        ],
+                        "play_integrity_token": "eyJhbGciOiJIUzI1NiJ9.fake.token",
+                        "strongbox_backed": true,
+                    }
+                },
+                "nonce_captured_at": chrono::Utc::now().to_rfc3339(),
+            }));
+        }
         k
     }
 
@@ -8766,5 +8922,527 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, crate::derived::Error::Conflict(_)));
+    }
+
+    // ─── Ask 4: envelope-schema admission hook (v2.5.0) ─────────────
+
+    /// Build a per-axis JSON Schema requiring score/confidence/
+    /// dimension fields + an evidence_refs array that includes the
+    /// schema's own SHA (the FSD-002 §4.9.1 "evidence-shape
+    /// requirement" rule). The schema body is content-addressed —
+    /// the caller passes the SHA so the schema can reference its
+    /// own identity in `evidence_refs`.
+    fn rights_asymmetry_v1_schema(schema_sha_hex: &str) -> serde_json::Value {
+        serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "required": ["dimension", "score", "confidence", "evidence_refs"],
+            "properties": {
+                "dimension": {"type": "string"},
+                "score": {"type": "number", "minimum": -1.0, "maximum": 1.0},
+                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "evidence_refs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "contains": {"const": schema_sha_hex},
+                },
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn sqlite_axis_from_dimension_worked_example() {
+        // Smoke-test the helper through the public re-export.
+        assert_eq!(
+            crate::federation::axis_from_dimension(
+                "detection:correlated_action:rights_asymmetry:v1"
+            ),
+            Some("rights_asymmetry")
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_noop_resolver_default_admits_everything() {
+        // Smoke: default resolver is NoOp → schema gate is a no-op.
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("rs", "registry", "rs"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-a", "primitive-a", "rs"),
+            })
+            .await
+            .unwrap();
+        let att = scores_attestation_with_dimension(
+            "att-noop-1",
+            "rs",
+            "k-a",
+            "rs",
+            "detection:correlated_action:rights_asymmetry:v1",
+        );
+        // Schema-resolver wasn't installed; the gate skips.
+        backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_blob_backed_resolver_round_trip() {
+        // Write a schema blob, register the axis → SHA, resolve(dim),
+        // confirm the resolver returns Some(schema).
+        let backend = std::sync::Arc::new(SqliteBackend::open_in_memory().await.unwrap());
+        backend.run_migrations().await.unwrap();
+        // Bootstrap a federation key so put_blob's holder attestation
+        // can hang off something.
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("rs", "registry", "rs"),
+            })
+            .await
+            .unwrap();
+
+        let schema = serde_json::json!({"type": "object"});
+        let bytes = serde_json::to_vec(&schema).unwrap();
+        let sha: [u8; 32] = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(&bytes).into()
+        };
+        use crate::federation::BlobStorage;
+        let put_att = crate::federation::PutBlobAttestation {
+            attesting_key_id: "rs".into(),
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            original_content_hash_hex: hex::encode([0xab; 32]),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: "rs".into(),
+            scrub_timestamp: chrono::Utc::now(),
+        };
+        backend
+            .put_blob(
+                &sha,
+                crate::federation::BlobBody::Inline(bytes.clone()),
+                Some("application/schema+json"),
+                put_att,
+            )
+            .await
+            .unwrap();
+
+        let mut axis_index = std::collections::HashMap::new();
+        axis_index.insert("rights_asymmetry".to_owned(), sha);
+        let resolver =
+            crate::federation::BlobBackedSchemaResolver::new(axis_index, backend.clone());
+        let resolved = crate::federation::SchemaResolver::resolve(
+            &resolver,
+            "detection:correlated_action:rights_asymmetry:v1",
+        )
+        .await
+        .unwrap()
+        .expect("resolver returns Some(schema)");
+        assert_eq!(resolved.sha256, sha);
+        assert_eq!(resolved.document, schema);
+        // Cache hit: second call should land in the cache (don't need
+        // to delete the blob to prove this — the BlobBackedSchemaResolver's
+        // `cached()` introspection is sufficient).
+        assert!(
+            resolver.cached(&sha),
+            "schema body cached after first resolve"
+        );
+        // Resolve again — still works.
+        let resolved2 = crate::federation::SchemaResolver::resolve(
+            &resolver,
+            "detection:correlated_action:rights_asymmetry:v1",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(resolved2.document, schema);
+    }
+
+    #[tokio::test]
+    async fn sqlite_put_attestation_with_schema_accepts_valid_envelope() {
+        let backend = std::sync::Arc::new(SqliteBackend::open_in_memory().await.unwrap());
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("rs", "registry", "rs"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-a", "primitive-a", "rs"),
+            })
+            .await
+            .unwrap();
+
+        // Bootstrap the schema blob.
+        let bytes_placeholder = b"placeholder";
+        let mut sha = [0u8; 32];
+        {
+            use sha2::{Digest, Sha256};
+            // Compute SHA on the actual schema body once it knows its
+            // own SHA — chicken-and-egg avoided by computing on a
+            // simpler placeholder and using THAT sha inside the schema.
+            sha.copy_from_slice(&Sha256::digest(bytes_placeholder));
+        }
+        let schema = rights_asymmetry_v1_schema(&hex::encode(sha));
+        let schema_bytes = serde_json::to_vec(&schema).unwrap();
+        let schema_sha: [u8; 32] = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(&schema_bytes).into()
+        };
+
+        use crate::federation::BlobStorage;
+        let put_att = crate::federation::PutBlobAttestation {
+            attesting_key_id: "rs".into(),
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            original_content_hash_hex: hex::encode([0xab; 32]),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: "rs".into(),
+            scrub_timestamp: chrono::Utc::now(),
+        };
+        backend
+            .put_blob(
+                &schema_sha,
+                crate::federation::BlobBody::Inline(schema_bytes),
+                Some("application/schema+json"),
+                put_att,
+            )
+            .await
+            .unwrap();
+
+        // Install the resolver pointing at the schema_sha (the schema
+        // requires evidence_refs to contain the placeholder sha for
+        // simplicity — what matters for the test is the validator
+        // accepts when the envelope satisfies the schema).
+        let mut axis_index = std::collections::HashMap::new();
+        axis_index.insert("rights_asymmetry".to_owned(), schema_sha);
+        let resolver = std::sync::Arc::new(crate::federation::BlobBackedSchemaResolver::new(
+            axis_index,
+            backend.clone(),
+        ));
+        backend.set_schema_resolver(resolver);
+
+        let mut att = scores_attestation_with_dimension(
+            "att-valid-1",
+            "rs",
+            "k-a",
+            "rs",
+            "detection:correlated_action:rights_asymmetry:v1",
+        );
+        // Envelope satisfies the schema (has evidence_refs containing
+        // the placeholder SHA the schema requires).
+        att.attestation_envelope = serde_json::json!({
+            "dimension": "detection:correlated_action:rights_asymmetry:v1",
+            "score": 0.42,
+            "confidence": 0.9,
+            "evidence_refs": [hex::encode(sha)],
+        });
+        backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_put_attestation_rejects_envelope_missing_required_field() {
+        let backend = std::sync::Arc::new(SqliteBackend::open_in_memory().await.unwrap());
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("rs", "registry", "rs"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-a", "primitive-a", "rs"),
+            })
+            .await
+            .unwrap();
+
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "required": ["dimension", "score", "confidence", "evidence_refs"],
+            "properties": {
+                "evidence_refs": {"type": "array", "minItems": 1},
+            },
+        });
+        let schema_bytes = serde_json::to_vec(&schema).unwrap();
+        let schema_sha: [u8; 32] = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(&schema_bytes).into()
+        };
+        use crate::federation::BlobStorage;
+        let put_att = crate::federation::PutBlobAttestation {
+            attesting_key_id: "rs".into(),
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            original_content_hash_hex: hex::encode([0xab; 32]),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: "rs".into(),
+            scrub_timestamp: chrono::Utc::now(),
+        };
+        backend
+            .put_blob(
+                &schema_sha,
+                crate::federation::BlobBody::Inline(schema_bytes),
+                Some("application/schema+json"),
+                put_att,
+            )
+            .await
+            .unwrap();
+
+        let mut axis_index = std::collections::HashMap::new();
+        axis_index.insert("rights_asymmetry".to_owned(), schema_sha);
+        let resolver = std::sync::Arc::new(crate::federation::BlobBackedSchemaResolver::new(
+            axis_index,
+            backend.clone(),
+        ));
+        backend.set_schema_resolver(resolver);
+
+        let mut att = scores_attestation_with_dimension(
+            "att-bad-1",
+            "rs",
+            "k-a",
+            "rs",
+            "detection:correlated_action:rights_asymmetry:v1",
+        );
+        // Envelope is missing evidence_refs entirely.
+        att.attestation_envelope = serde_json::json!({
+            "dimension": "detection:correlated_action:rights_asymmetry:v1",
+            "score": 0.42,
+            "confidence": 0.9,
+        });
+        let err = backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap_err();
+        match err {
+            crate::federation::Error::EnvelopeSchemaViolation {
+                axis, violations, ..
+            } => {
+                assert_eq!(axis, "rights_asymmetry");
+                assert!(!violations.is_empty());
+            }
+            other => panic!("expected EnvelopeSchemaViolation, got {other:?}"),
+        }
+    }
+
+    // ─── Ask 8: hardware-attestation admission gate (v2.5.0) ────────
+
+    /// Build an accord-holder KeyRecord with the given evidence value.
+    fn accord_holder_key_with_evidence(
+        key_id: &str,
+        evidence: Option<serde_json::Value>,
+    ) -> KeyRecord {
+        let mut k = fed_key(key_id, "humanity-accord-x", key_id);
+        k.identity_type = crate::federation::types::identity_type::ACCORD_HOLDER.into();
+        k.attestation_evidence = evidence;
+        k
+    }
+
+    fn android_strongbox_evidence_value(
+        captured_at: chrono::DateTime<chrono::Utc>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "platform_attestation": {
+                "Android": {
+                    "key_attestation_chain": [
+                        vec![0x30u8, 0x82, 0x01, 0x00],
+                        vec![0x30u8, 0x82, 0x02, 0x00],
+                    ],
+                    "play_integrity_token": "eyJhbGciOiJIUzI1NiJ9.fake.token",
+                    "strongbox_backed": true,
+                }
+            },
+            "nonce_captured_at": captured_at.to_rfc3339(),
+        })
+    }
+
+    #[tokio::test]
+    async fn sqlite_put_public_key_rejects_accord_holder_without_evidence() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let key = accord_holder_key_with_evidence("ah-no-ev", None);
+        let err = backend
+            .put_public_key(SignedKeyRecord { record: key })
+            .await
+            .unwrap_err();
+        match err {
+            crate::federation::Error::AccordHolderRequiresAttestationEvidence {
+                detail, ..
+            } => {
+                assert_eq!(detail, "missing");
+            }
+            other => panic!("expected AccordHolderRequiresAttestationEvidence, got {other:?}"),
+        }
+        // Nothing landed.
+        assert!(
+            crate::federation::FederationDirectory::lookup_public_key(&backend, "ah-no-ev")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_put_public_key_rejects_accord_holder_software_only() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let ev = serde_json::json!({
+            "platform_attestation": {
+                "Software": {
+                    "key_derivation": "random",
+                    "storage": "memory",
+                    "security_warning": "test"
+                }
+            },
+            "nonce_captured_at": chrono::Utc::now().to_rfc3339(),
+        });
+        let key = accord_holder_key_with_evidence("ah-sw", Some(ev));
+        let err = backend
+            .put_public_key(SignedKeyRecord { record: key })
+            .await
+            .unwrap_err();
+        match err {
+            crate::federation::Error::HardwareTypeNotAccepted { got, .. } => {
+                assert_eq!(got, "SoftwareOnly");
+            }
+            other => panic!("expected HardwareTypeNotAccepted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_put_public_key_rejects_accord_holder_tpm_missing_pcr() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let ev = serde_json::json!({
+            "platform_attestation": {
+                "Tpm": {
+                    "tpm_version": "2.0",
+                    "manufacturer": "Infineon",
+                    "discrete": true,
+                    "quote": {
+                        "quoted": vec![0xffu8; 32],
+                        "signature": vec![0xeeu8; 64],
+                        "pcr_selection": [0x03],
+                        "qualifying_data": vec![0u8; 32],
+                        "pcr_values": null,
+                        "timestamp": 1_700_000_000u64,
+                    },
+                    "ek_cert": [0x30, 0x82, 0x01, 0x00],
+                    "ak_public_key": [0x04, 0x01, 0x02],
+                }
+            },
+            "nonce_captured_at": chrono::Utc::now().to_rfc3339(),
+        });
+        let key = accord_holder_key_with_evidence("ah-tpm-nopcr", Some(ev));
+        let err = backend
+            .put_public_key(SignedKeyRecord { record: key })
+            .await
+            .unwrap_err();
+        match err {
+            crate::federation::Error::AttestationEvidenceIncomplete {
+                hardware_type,
+                missing_fields,
+            } => {
+                assert_eq!(hardware_type, "TpmDiscrete");
+                assert!(missing_fields.iter().any(|f| f == "pcr_values"));
+            }
+            other => panic!("expected AttestationEvidenceIncomplete, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_put_public_key_rejects_accord_holder_stale_nonce() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let captured = chrono::Utc::now() - chrono::Duration::hours(48);
+        let ev = android_strongbox_evidence_value(captured);
+        let key = accord_holder_key_with_evidence("ah-stale", Some(ev));
+        let err = backend
+            .put_public_key(SignedKeyRecord { record: key })
+            .await
+            .unwrap_err();
+        match err {
+            crate::federation::Error::AttestationEvidenceStale { max_age_secs, .. } => {
+                assert_eq!(max_age_secs, 86_400);
+            }
+            other => panic!("expected AttestationEvidenceStale, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_put_public_key_accepts_accord_holder_android_strongbox() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let ev = android_strongbox_evidence_value(chrono::Utc::now());
+        let key = accord_holder_key_with_evidence("ah-ok", Some(ev));
+        backend
+            .put_public_key(SignedKeyRecord { record: key })
+            .await
+            .unwrap();
+        let read = crate::federation::FederationDirectory::lookup_public_key(&backend, "ah-ok")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.identity_type, "accord_holder");
+        assert!(read.attestation_evidence.is_some());
+    }
+
+    #[tokio::test]
+    async fn sqlite_put_public_key_accepts_non_accord_holder_without_evidence() {
+        // Non-accord-holder rows: column is informational; absence is fine.
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let key = fed_key("steward-k", "registry", "steward-k");
+        backend
+            .put_public_key(SignedKeyRecord { record: key })
+            .await
+            .unwrap();
+        let read = crate::federation::FederationDirectory::lookup_public_key(&backend, "steward-k")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(read.attestation_evidence.is_none());
+    }
+
+    #[tokio::test]
+    async fn sqlite_schema_check_constraint_catches_direct_sql_bypass() {
+        // The SQLite trigger fires when the admission hook is
+        // bypassed (e.g., direct INSERT with identity_type=accord_holder
+        // and NULL attestation_evidence). Belt-and-suspenders test.
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let conn = backend.conn_handle();
+        let result = tokio::task::spawn_blocking(move || {
+            let c = conn.blocking_lock();
+            c.execute(
+                "INSERT INTO federation_keys (key_id, pubkey_ed25519_base64, algorithm, \
+                    identity_type, identity_ref, valid_from, registration_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_key_id, \
+                    scrub_timestamp, persist_row_hash) \
+                 VALUES ('ah-direct', 'AA==', 'hybrid', 'accord_holder', 'x', \
+                    '2026-01-01T00:00:00Z', '{}', X'aa', 's', 'ah-direct', \
+                    '2026-01-01T00:00:00Z', 'h')",
+                [],
+            )
+        })
+        .await
+        .unwrap();
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("federation_keys_accord_holder_requires_attestation"),
+            "expected trigger to fire, got: {err}"
+        );
     }
 }

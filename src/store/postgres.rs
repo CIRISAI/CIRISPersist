@@ -85,6 +85,19 @@ pub struct PostgresBackend {
     /// [`crate::federation::DEFAULT_INLINE_BYTES_CAP`]; an Engine
     /// builder may override via [`PostgresBackend::with_inline_bytes_cap`].
     inline_bytes_cap: std::sync::atomic::AtomicUsize,
+    /// v2.5.0 (CIRISPersist#102 Ask 4) — per-axis envelope-schema
+    /// resolver. The default is
+    /// [`crate::federation::NoOpSchemaResolver`], which makes the
+    /// admission hook a no-op (existing `put_attestation` callers
+    /// don't break). Override via
+    /// [`PostgresBackend::with_schema_resolver`].
+    schema_resolver: std::sync::RwLock<std::sync::Arc<dyn crate::federation::SchemaResolver>>,
+    /// v2.5.0 (CIRISPersist#102 Ask 8) — hardware-attestation policy
+    /// for accord-holder `put_public_key` admission. Defaults to
+    /// [`crate::federation::HardwareAttestationPolicy::default`].
+    /// Override via [`PostgresBackend::with_hardware_attestation_policy`].
+    hardware_attestation_policy:
+        std::sync::RwLock<std::sync::Arc<crate::federation::HardwareAttestationPolicy>>,
 }
 
 impl PostgresBackend {
@@ -159,6 +172,12 @@ impl PostgresBackend {
             inline_bytes_cap: std::sync::atomic::AtomicUsize::new(
                 crate::federation::DEFAULT_INLINE_BYTES_CAP,
             ),
+            schema_resolver: std::sync::RwLock::new(std::sync::Arc::new(
+                crate::federation::NoOpSchemaResolver,
+            )),
+            hardware_attestation_policy: std::sync::RwLock::new(std::sync::Arc::new(
+                crate::federation::HardwareAttestationPolicy::default(),
+            )),
         })
     }
 
@@ -189,7 +208,60 @@ impl PostgresBackend {
             inline_bytes_cap: std::sync::atomic::AtomicUsize::new(
                 crate::federation::DEFAULT_INLINE_BYTES_CAP,
             ),
+            schema_resolver: std::sync::RwLock::new(std::sync::Arc::new(
+                crate::federation::NoOpSchemaResolver,
+            )),
+            hardware_attestation_policy: std::sync::RwLock::new(std::sync::Arc::new(
+                crate::federation::HardwareAttestationPolicy::default(),
+            )),
         }
+    }
+
+    /// v2.5.0 (CIRISPersist#102 Ask 4) — install a per-axis
+    /// envelope-schema resolver for the `put_attestation` admission
+    /// hook. Defaults to [`crate::federation::NoOpSchemaResolver`];
+    /// override here for deployments that want envelope validation
+    /// against per-axis JSON Schemas (FSD-002 §4.9.1).
+    pub fn set_schema_resolver(
+        &self,
+        resolver: std::sync::Arc<dyn crate::federation::SchemaResolver>,
+    ) {
+        *self
+            .schema_resolver
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = resolver;
+    }
+
+    /// Snapshot the currently-installed schema resolver. Returns the
+    /// default no-op resolver when nothing's been wired.
+    pub fn schema_resolver(&self) -> std::sync::Arc<dyn crate::federation::SchemaResolver> {
+        self.schema_resolver
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// v2.5.0 (CIRISPersist#102 Ask 8) — install a custom
+    /// hardware-attestation policy. Defaults to
+    /// [`crate::federation::HardwareAttestationPolicy::default`].
+    pub fn set_hardware_attestation_policy(
+        &self,
+        policy: std::sync::Arc<crate::federation::HardwareAttestationPolicy>,
+    ) {
+        *self
+            .hardware_attestation_policy
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = policy;
+    }
+
+    /// Snapshot the currently-installed hardware-attestation policy.
+    pub fn hardware_attestation_policy(
+        &self,
+    ) -> std::sync::Arc<crate::federation::HardwareAttestationPolicy> {
+        self.hardware_attestation_policy
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Install the Merkle-hook signer for v1.5.0 audit-service
@@ -1122,6 +1194,20 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         record: crate::federation::SignedKeyRecord,
     ) -> Result<(), crate::federation::Error> {
         let mut row = record.record;
+
+        // v2.5.0 (CIRISPersist#102 Ask 8) — hardware-attestation
+        // admission gate for accord_holder rows. Runs BEFORE
+        // persist_row_hash + INSERT so rejected rows leave no trace.
+        // Non-accord-holder rows skip the gate (the column is
+        // informational for them).
+        if row.identity_type == crate::federation::types::identity_type::ACCORD_HOLDER {
+            self.hardware_attestation_policy().check(
+                &row.key_id,
+                row.attestation_evidence.as_ref(),
+                chrono::Utc::now(),
+            )?;
+        }
+
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         let client = self
@@ -1161,8 +1247,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
                     identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
+                    attestation_evidence\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
                  ON CONFLICT (key_id) DO NOTHING",
                 &[
                     &row.key_id,
@@ -1182,6 +1269,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.pqc_completed_at,
                     &row.persist_row_hash,
                     &roles_param,
+                    &row.attestation_evidence,
                 ],
             )
             .await
@@ -1224,7 +1312,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
                     identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
+                    attestation_evidence \
                  FROM cirislens.federation_keys WHERE key_id = $1",
                 &[&key_id],
             )
@@ -1248,7 +1337,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
                     identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
+                    attestation_evidence \
                  FROM cirislens.federation_keys WHERE identity_ref = $1",
                 &[&identity_ref],
             )
@@ -1300,6 +1390,41 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             dim,
             &attesting_identity_type,
         )?;
+
+        // v2.5.0 (CIRISPersist#102 Ask 4) — envelope-schema admission
+        // hook. Runs AFTER the dimension gate; only fires on `scores`
+        // attestations with a resolvable axis. Skipped on
+        // `NoOpSchemaResolver` (the default) — existing callers
+        // observe no behavior change.
+        if row.attestation_type == crate::federation::types::attestation_type::SCORES {
+            if let Some(dim_str) = dim {
+                let resolver = self.schema_resolver();
+                let resolved = resolver.resolve(dim_str).await.map_err(|e| {
+                    crate::federation::Error::Backend(format!(
+                        "schema resolver: {} ({})",
+                        e,
+                        e.kind()
+                    ))
+                })?;
+                if let Some(schema) = resolved {
+                    if let Err(violations) =
+                        crate::federation::schema_resolver::validate_envelope_against_schema(
+                            &schema.document,
+                            &row.attestation_envelope,
+                        )
+                    {
+                        let axis = crate::federation::axis_from_dimension(dim_str)
+                            .unwrap_or("")
+                            .to_owned();
+                        return Err(crate::federation::Error::EnvelopeSchemaViolation {
+                            dimension: dim_str.to_string(),
+                            axis,
+                            violations,
+                        });
+                    }
+                }
+            }
+        }
 
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
@@ -3041,6 +3166,15 @@ fn pg_row_to_key_record(
         .ok()
         .flatten()
         .unwrap_or_default();
+    // v2.5.0 (CIRISPersist#102 Ask 8): attestation_evidence is JSONB
+    // NULL. `try_get::<_, Option<_>>` returns Ok(None) on NULL and
+    // Err on missing-column; the outer `.ok().flatten()` collapses
+    // both to `None`. Older SELECTs that didn't pull the column
+    // (pre-v2.5.0 read paths) just see None.
+    let attestation_evidence: Option<serde_json::Value> = row
+        .try_get::<_, Option<serde_json::Value>>("attestation_evidence")
+        .ok()
+        .flatten();
     Ok(crate::federation::KeyRecord {
         key_id: row.safe_get_with("key_id", mk_err)?,
         pubkey_ed25519_base64: row.safe_get_with("pubkey_ed25519_base64", mk_err)?,
@@ -3059,6 +3193,7 @@ fn pg_row_to_key_record(
         pqc_completed_at: row.safe_get_with("pqc_completed_at", mk_err)?,
         persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
         roles,
+        attestation_evidence,
     })
 }
 
@@ -4651,7 +4786,8 @@ impl crate::read::ReadEngine for PostgresBackend {
             "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
                     identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                    attestation_evidence \
              FROM cirislens.federation_keys \
              {where_sql} \
              ORDER BY valid_from DESC, key_id DESC \
@@ -8266,6 +8402,7 @@ mod tests {
             },
             persist_row_hash: String::new(),
             roles: Vec::new(),
+            attestation_evidence: None,
         }
     }
 
@@ -10143,6 +10280,10 @@ mod tests {
     /// Build a federation KeyRecord with parameterized identity_type
     /// — covers the `accord_holder` vs `steward` distinction the
     /// admission gate switches on for `accord:*` dimensions.
+    /// v2.5.0 (CIRISPersist#102 Ask 8): when `identity_type =
+    /// accord_holder` the helper auto-fills a valid hardware-
+    /// attestation evidence value so the new admission gate
+    /// doesn't reject the fixture.
     fn pg_admission_key(
         key_id: &str,
         identity_ref: &str,
@@ -10150,6 +10291,21 @@ mod tests {
     ) -> crate::federation::KeyRecord {
         let mut k = fix_section_i_key(key_id, identity_ref, chrono::Utc::now(), false);
         k.identity_type = identity_type.into();
+        if identity_type == crate::federation::types::identity_type::ACCORD_HOLDER {
+            k.attestation_evidence = Some(serde_json::json!({
+                "platform_attestation": {
+                    "Android": {
+                        "key_attestation_chain": [
+                            vec![0x30u8, 0x82, 0x01, 0x00],
+                            vec![0x30u8, 0x82, 0x02, 0x00],
+                        ],
+                        "play_integrity_token": "eyJhbGciOiJIUzI1NiJ9.fake.token",
+                        "strongbox_backed": true,
+                    }
+                },
+                "nonce_captured_at": chrono::Utc::now().to_rfc3339(),
+            }));
+        }
         k
     }
 
@@ -10451,5 +10607,441 @@ mod tests {
             .unwrap();
         let rows = backend.list_attestations_for(&agent_k).await.unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    // ─── v2.5.0 (CIRISPersist#102 Ask 4) — schema-resolver tests ────
+
+    fn pg_accord_holder_key_with_evidence(
+        key_id: &str,
+        evidence: Option<serde_json::Value>,
+    ) -> crate::federation::KeyRecord {
+        let mut k = pg_admission_key(
+            key_id,
+            "humanity-accord-x",
+            crate::federation::types::identity_type::ACCORD_HOLDER,
+        );
+        k.attestation_evidence = evidence;
+        k
+    }
+
+    fn pg_android_strongbox_evidence(
+        captured_at: chrono::DateTime<chrono::Utc>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "platform_attestation": {
+                "Android": {
+                    "key_attestation_chain": [
+                        vec![0x30u8, 0x82, 0x01, 0x00],
+                        vec![0x30u8, 0x82, 0x02, 0x00],
+                    ],
+                    "play_integrity_token": "eyJhbGciOiJIUzI1NiJ9.fake.token",
+                    "strongbox_backed": true,
+                }
+            },
+            "nonce_captured_at": captured_at.to_rfc3339(),
+        })
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_put_attestation_with_schema_accepts_valid_envelope() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = std::sync::Arc::new(PostgresBackend::connect(&dsn).await.unwrap());
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+        let steward = format!("pg-sch-stw-§102-{}", uuid_like());
+        let agent_k = format!("pg-sch-agt-§102-{}", uuid_like());
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &steward,
+                    "registry",
+                    crate::federation::types::identity_type::STEWARD,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &agent_k,
+                    "primitive-sch",
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await
+            .unwrap();
+
+        // Schema requires score+confidence+evidence_refs.
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "required": ["dimension", "score", "confidence", "evidence_refs"],
+        });
+        let schema_bytes = serde_json::to_vec(&schema).unwrap();
+        let schema_sha: [u8; 32] = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(&schema_bytes).into()
+        };
+        use crate::federation::BlobStorage;
+        let put_att = crate::federation::PutBlobAttestation {
+            attesting_key_id: steward.clone(),
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            original_content_hash_hex: hex::encode([0xab; 32]),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: steward.clone(),
+            scrub_timestamp: chrono::Utc::now(),
+        };
+        backend
+            .put_blob(
+                &schema_sha,
+                crate::federation::BlobBody::Inline(schema_bytes),
+                Some("application/schema+json"),
+                put_att,
+            )
+            .await
+            .unwrap();
+        let mut axis_index = std::collections::HashMap::new();
+        axis_index.insert("rights_asymmetry".into(), schema_sha);
+        let resolver = std::sync::Arc::new(crate::federation::BlobBackedSchemaResolver::new(
+            axis_index,
+            backend.clone(),
+        ));
+        backend.set_schema_resolver(resolver);
+
+        let mut att = pg_scores_attestation(
+            &steward,
+            &agent_k,
+            &steward,
+            "detection:correlated_action:rights_asymmetry:v1",
+        );
+        att.attestation_envelope = serde_json::json!({
+            "dimension": "detection:correlated_action:rights_asymmetry:v1",
+            "score": 0.42,
+            "confidence": 0.9,
+            "evidence_refs": [hex::encode(schema_sha)],
+        });
+        backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_put_attestation_rejects_envelope_missing_required_field() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = std::sync::Arc::new(PostgresBackend::connect(&dsn).await.unwrap());
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+        let steward = format!("pg-bsch-stw-§102-{}", uuid_like());
+        let agent_k = format!("pg-bsch-agt-§102-{}", uuid_like());
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &steward,
+                    "registry",
+                    crate::federation::types::identity_type::STEWARD,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &agent_k,
+                    "primitive-bsch",
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await
+            .unwrap();
+
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "required": ["dimension", "score", "confidence", "evidence_refs"],
+        });
+        let schema_bytes = serde_json::to_vec(&schema).unwrap();
+        let schema_sha: [u8; 32] = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(&schema_bytes).into()
+        };
+        use crate::federation::BlobStorage;
+        let put_att = crate::federation::PutBlobAttestation {
+            attesting_key_id: steward.clone(),
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            original_content_hash_hex: hex::encode([0xab; 32]),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: steward.clone(),
+            scrub_timestamp: chrono::Utc::now(),
+        };
+        backend
+            .put_blob(
+                &schema_sha,
+                crate::federation::BlobBody::Inline(schema_bytes),
+                Some("application/schema+json"),
+                put_att,
+            )
+            .await
+            .unwrap();
+        let mut axis_index = std::collections::HashMap::new();
+        axis_index.insert("rights_asymmetry".into(), schema_sha);
+        let resolver = std::sync::Arc::new(crate::federation::BlobBackedSchemaResolver::new(
+            axis_index,
+            backend.clone(),
+        ));
+        backend.set_schema_resolver(resolver);
+
+        let mut att = pg_scores_attestation(
+            &steward,
+            &agent_k,
+            &steward,
+            "detection:correlated_action:rights_asymmetry:v1",
+        );
+        att.attestation_envelope = serde_json::json!({
+            "dimension": "detection:correlated_action:rights_asymmetry:v1",
+            "score": 0.42,
+            "confidence": 0.9,
+        });
+        let err = backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: att })
+            .await
+            .unwrap_err();
+        match err {
+            crate::federation::Error::EnvelopeSchemaViolation { axis, .. } => {
+                assert_eq!(axis, "rights_asymmetry");
+            }
+            other => panic!("expected EnvelopeSchemaViolation, got {other:?}"),
+        }
+    }
+
+    // ─── v2.5.0 (CIRISPersist#102 Ask 8) — hardware-attestation tests ─
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_put_public_key_rejects_accord_holder_without_evidence() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+        let key_id = format!("pg-ah-noev-§102-{}", uuid_like());
+        let key = pg_accord_holder_key_with_evidence(&key_id, None);
+        let err = backend
+            .put_public_key(crate::federation::SignedKeyRecord { record: key })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::federation::Error::AccordHolderRequiresAttestationEvidence { .. }
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_put_public_key_rejects_accord_holder_software_only() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+        let key_id = format!("pg-ah-sw-§102-{}", uuid_like());
+        let ev = serde_json::json!({
+            "platform_attestation": {
+                "Software": {
+                    "key_derivation": "random",
+                    "storage": "memory",
+                    "security_warning": "test"
+                }
+            },
+            "nonce_captured_at": chrono::Utc::now().to_rfc3339(),
+        });
+        let key = pg_accord_holder_key_with_evidence(&key_id, Some(ev));
+        let err = backend
+            .put_public_key(crate::federation::SignedKeyRecord { record: key })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::federation::Error::HardwareTypeNotAccepted { .. }
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_put_public_key_rejects_accord_holder_tpm_missing_pcr() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+        let key_id = format!("pg-ah-tpm-nopcr-§102-{}", uuid_like());
+        let ev = serde_json::json!({
+            "platform_attestation": {
+                "Tpm": {
+                    "tpm_version": "2.0",
+                    "manufacturer": "Infineon",
+                    "discrete": true,
+                    "quote": {
+                        "quoted": vec![0xffu8; 32],
+                        "signature": vec![0xeeu8; 64],
+                        "pcr_selection": [0x03],
+                        "qualifying_data": vec![0u8; 32],
+                        "pcr_values": null,
+                        "timestamp": 1_700_000_000u64,
+                    },
+                    "ek_cert": [0x30, 0x82, 0x01, 0x00],
+                    "ak_public_key": [0x04, 0x01, 0x02],
+                }
+            },
+            "nonce_captured_at": chrono::Utc::now().to_rfc3339(),
+        });
+        let key = pg_accord_holder_key_with_evidence(&key_id, Some(ev));
+        let err = backend
+            .put_public_key(crate::federation::SignedKeyRecord { record: key })
+            .await
+            .unwrap_err();
+        match err {
+            crate::federation::Error::AttestationEvidenceIncomplete {
+                hardware_type,
+                missing_fields,
+            } => {
+                assert_eq!(hardware_type, "TpmDiscrete");
+                assert!(missing_fields.iter().any(|f| f == "pcr_values"));
+            }
+            other => panic!("expected AttestationEvidenceIncomplete, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_put_public_key_rejects_accord_holder_stale_nonce() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+        let key_id = format!("pg-ah-stale-§102-{}", uuid_like());
+        let captured = chrono::Utc::now() - chrono::Duration::hours(48);
+        let ev = pg_android_strongbox_evidence(captured);
+        let key = pg_accord_holder_key_with_evidence(&key_id, Some(ev));
+        let err = backend
+            .put_public_key(crate::federation::SignedKeyRecord { record: key })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::federation::Error::AttestationEvidenceStale { .. }
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_put_public_key_accepts_accord_holder_android_strongbox() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+        let key_id = format!("pg-ah-ok-§102-{}", uuid_like());
+        let ev = pg_android_strongbox_evidence(chrono::Utc::now());
+        let key = pg_accord_holder_key_with_evidence(&key_id, Some(ev));
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord { record: key })
+            .await
+            .unwrap();
+        let read = crate::federation::FederationDirectory::lookup_public_key(&backend, &key_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.identity_type, "accord_holder");
+        assert!(read.attestation_evidence.is_some());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_put_public_key_accepts_non_accord_holder_without_evidence() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+        let key_id = format!("pg-non-ah-§102-{}", uuid_like());
+        let key = pg_admission_key(
+            &key_id,
+            "registry",
+            crate::federation::types::identity_type::STEWARD,
+        );
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord { record: key })
+            .await
+            .unwrap();
+        let read = crate::federation::FederationDirectory::lookup_public_key(&backend, &key_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(read.attestation_evidence.is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_check_constraint_catches_direct_sql_bypass() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let client = backend
+            .pool()
+            .get()
+            .await
+            .map_err(|e| e.to_string())
+            .unwrap();
+        let key_id = format!("pg-ah-direct-§102-{}", uuid_like());
+        let err = client
+            .execute(
+                "INSERT INTO cirislens.federation_keys (\
+                    key_id, pubkey_ed25519_base64, algorithm, identity_type, identity_ref, \
+                    valid_from, registration_envelope, original_content_hash, \
+                    scrub_signature_classical, scrub_key_id, scrub_timestamp, persist_row_hash) \
+                 VALUES ($1, 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=', 'hybrid', \
+                    'accord_holder', 'x', NOW(), '{}', E'\\\\xaa', 's', $1, NOW(), 'h')",
+                &[&key_id],
+            )
+            .await
+            .unwrap_err();
+        // CHECK violation surfaces as SQL error containing the
+        // named constraint. tokio_postgres' Display impl trims the
+        // body; consult the DbError source to inspect the constraint
+        // name + sqlstate.
+        let dbe = err.as_db_error();
+        let constraint = dbe.and_then(|e| e.constraint()).unwrap_or("");
+        let sqlstate = dbe.map(|e| e.code().code()).unwrap_or("");
+        assert_eq!(
+            constraint, "federation_keys_accord_holder_requires_attestation",
+            "expected CHECK fire (sqlstate={sqlstate}), got err={err:?}"
+        );
     }
 }

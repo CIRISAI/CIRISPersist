@@ -248,6 +248,23 @@ pub struct KeyRecord {
     /// that don't know about the field yet.
     #[serde(default)]
     pub roles: Vec<String>,
+    /// v2.5.0 (CIRISPersist#102 Ask 8) — Hardware-attestation evidence
+    /// captured at key-binding time. REQUIRED for `identity_type =
+    /// 'accord_holder'` rows (FSD-002 §7.3 + FEDERATION_ANNOUNCEMENT
+    /// §4.5.2); the V048 schema CHECK + the
+    /// [`HardwareAttestationPolicy`](super::HardwareAttestationPolicy)
+    /// admission hook both enforce this.
+    ///
+    /// Shape is `{platform_attestation: <PlatformAttestation JSON>,
+    /// nonce_captured_at: "<RFC3339>"}` — see
+    /// [`super::hardware_attestation::AttestationEvidence`].
+    ///
+    /// `None` for non-accord-holder rows. Backward-compatible default
+    /// — pre-V048 reads return `None` and the field is
+    /// `skip_serializing_if = "Option::is_none"` so old `persist_row_hash`
+    /// computations stay stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation_evidence: Option<serde_json::Value>,
 }
 
 impl KeyRecord {
@@ -620,6 +637,7 @@ mod tests {
             ),
             persist_row_hash: String::new(),
             roles: Vec::new(),
+            attestation_evidence: None,
         }
     }
 

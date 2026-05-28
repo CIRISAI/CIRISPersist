@@ -1754,7 +1754,18 @@ mod tests {
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
 
-        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xC4; 32]);
+        // v2.5.0 — randomize the seed so reruns against a shared
+        // postgres DB don't accumulate contributions under the same
+        // author key (which made the count assertions flake when the
+        // test was rerun manually; closes the latent test-pollution
+        // bug per project memory `feedback_hundred_percent_green.md`).
+        // Seed entropy via UUID v4 (already a dep) — 16 bytes, copied
+        // twice into the 32-byte signing-key seed.
+        let mut seed = [0u8; 32];
+        let bytes = uuid::Uuid::new_v4().as_bytes().to_owned();
+        seed[..16].copy_from_slice(&bytes);
+        seed[16..].copy_from_slice(&bytes);
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&seed);
         let author = pubkey_b64(&author_key);
 
         let fixtures: Vec<(AnnouncementPriority, AuthorityClass, AnnouncementKind)> = vec![
@@ -1921,6 +1932,7 @@ mod tests {
             pqc_completed_at: None,
             persist_row_hash: String::new(),
             roles: Vec::new(),
+            attestation_evidence: None,
         };
         backend
             .put_public_key(crate::federation::SignedKeyRecord { record })

@@ -960,6 +960,7 @@ mod tests {
                 ROLE_SECRETS_WRITER.to_owned(),
                 ROLE_SECRETS_ADMIN.to_owned(),
             ],
+            attestation_evidence: None,
         };
         FederationDirectory::put_public_key(&*backend, SignedKeyRecord { record: key })
             .await

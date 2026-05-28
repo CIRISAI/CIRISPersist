@@ -5,6 +5,102 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [2.5.0] — 2026-05-27
+
+**`#102` complete (final 2 of 8 asks) — envelope-schema validation hook (Ask 4) + hardware-attestation evidence (Ask 8).**
+
+The two infrastructure-heavy asks that were deferred from 2.4.0. With
+2.5.0 #102 is fully closed.
+
+### Ask 4 — Envelope-schema validation hook (FSD-002 §4.9.1)
+
+`SchemaResolver` trait + two impls + admission-hook integration. Lets
+persist validate `scores` attestation envelopes at admission time
+against per-axis JSON schemas.
+
+- **`SchemaResolver`** — object-safe via boxed-future returns
+  (`Pin<Box<dyn Future>>`), so backends store `Arc<dyn SchemaResolver>`.
+  Default `NoOpSchemaResolver` returns `None` (fail-open; existing
+  put_attestation callers don't break).
+- **`BlobBackedSchemaResolver<B: BlobStorage>`** — generic over the
+  concrete blob backend (BlobStorage isn't itself object-safe).
+  Operator-supplied `axis_index: HashMap<String, [u8; 32]>` maps axis
+  names to content SHAs; resolves schemas via `BlobStorage::get_blob`.
+  Hash-keyed cache (`Arc<Mutex<HashMap<[u8;32], serde_json::Value>>>`)
+  so axis-index churn doesn't invalidate cached bodies. Axis
+  vocabulary is bounded (FSD-002 §4.9 — ~10s today, ~100s lifetime
+  max even with §4.9.2 amendment churn), so plain HashMap beats LRU.
+- **`axis_from_dimension(dimension) -> Option<&str>`** — pure helper
+  that picks the last non-`:v[0-9]+` segment. FSD-002 §4.9.1 worked
+  example: `detection:correlated_action:rights_asymmetry:v1` →
+  `rights_asymmetry`.
+- **Admission hook** — after `DimensionAdmissionPolicy::check`
+  passes, if the engine has a resolver wired AND
+  `attestation_type == "scores"`, validates the envelope JSON
+  against the resolved schema via `jsonschema` 0.46
+  (`default-features = false` — pure Rust, no file-fetch /
+  network-fetch surfaces). On failure: typed
+  `Error::EnvelopeSchemaViolation { dimension, axis, violations }`.
+- Per-deployment `set_schema_resolver(Arc<...>)` on each backend.
+  No Engine-level constructor variant; matches the `with_inline_bytes_cap`
+  pattern from 2.3.0.
+
+### Ask 8 — Hardware-attestation `attestation_evidence` (FSD-002 §7.3)
+
+The data-model implementation of today's CIRISVerify
+`docs/HARDWARE_ATTESTATION.md` answer: persist stores the evidence;
+admission-hook policy decides acceptance.
+
+- **V048 (both dialects)** — adds `attestation_evidence` column to
+  `federation_keys`: `JSONB NULL` on PG, `TEXT NULL` on SQLite
+  (JSON-as-text, mirrors persist's existing pattern). PG enforces
+  via named `CHECK federation_keys_accord_holder_requires_attestation`
+  (`identity_type <> 'accord_holder' OR attestation_evidence IS NOT NULL`);
+  SQLite via `BEFORE INSERT` / `BEFORE UPDATE` trigger pair with
+  `RAISE(ABORT, '<constraint name>')`. Partial index on accord-holder
+  rows for the admission hot path.
+- **`HardwareAttestationPolicy`** — `pub` fields
+  (`accepted_hardware_types: HashSet<HardwareType>`, `max_nonce_age: Duration`).
+  Default `accepted_hardware_types` lists the 11 non-`SoftwareOnly`
+  variants **explicitly** — so a future ciris-keyring variant
+  becomes a compile error here, forcing a policy decision rather
+  than silent admission. Default nonce age 24h.
+- **Admission hook** — on every `federation_keys` write with
+  `identity_type = 'accord_holder'`:
+  1. Parse `attestation_evidence` as
+     `{platform_attestation, nonce_captured_at}`. Missing/malformed →
+     `Error::AccordHolderRequiresAttestationEvidence`.
+  2. Pick the finer-grained `HardwareType` from the variant body
+     (`AndroidStrongbox` if `strongbox_backed`; `TpmDiscrete` if
+     `discrete`; etc.). Reject with `HardwareTypeNotAccepted` if
+     not in policy.
+  3. Structural field-presence check per variant (Android: cert
+     chain + Play Integrity token + StrongBox flag; iOS: SE flag +
+     App Attest assertion + DeviceCheck token; TPM: TPMS_ATTEST
+     quote + EK cert + AK pubkey + PCR values + manufacturer).
+     Missing → `AttestationEvidenceIncomplete { hardware_type, missing_fields }`.
+  4. Nonce-freshness vs `max_nonce_age`. Stale →
+     `AttestationEvidenceStale`.
+- **What persist does NOT do**: active chain validation (cert chain
+  to Google root for Android, EK cert validation for TPM, etc.).
+  Per CIRISVerify `docs/HARDWARE_ATTESTATION.md` §"Honest gap" —
+  Verify#32 Ask 5 lands local chain validators. Until then,
+  registry-side validates the chains; persist's storage of the
+  evidence preserves the audit trail.
+
+### Side-effect fix
+
+Pre-existing `cirisnode::postgres::tests::list_contributions_filter_extension`
+flake — hardcoded `[0xC4; 32]` author seed accumulated under the same
+key across re-runs on the shared CI PG container. Per
+`feedback_hundred_percent_green`, fixed (UUID-v4-derived seed) rather
+than deferred.
+
+V048 migration count bound: `1..=48`. PG `pg_row_to_key_record`
+reads via `try_get::<_, Option<serde_json::Value>>` (absent column +
+NULL both collapse to `None` — handles both pre- and post-V048
+schemas via the same code path).
+
 ## [2.4.0] — 2026-05-27
 
 **`#102` first cut (6 of 8 asks) — Registry directory contract: vocabularies + admission gate + operational docs.**

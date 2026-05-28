@@ -40,9 +40,11 @@ pub mod backfill;
 pub mod blobs;
 #[cfg(feature = "cirisaudit")]
 pub mod emit;
+pub mod hardware_attestation;
 #[cfg(feature = "cirisaudit")]
 pub mod read;
 pub mod rooting;
+pub mod schema_resolver;
 #[cfg(feature = "sqlite")]
 pub mod sqlite_open;
 pub mod trust_grant;
@@ -76,9 +78,15 @@ pub use blobs::{
     BlobStorage, ExternalRef, PutBlobAttestation, DEFAULT_INLINE_BYTES_CAP,
     HOLDS_BYTES_ATTESTATION_TYPE_PREFIX, HOLDS_BYTES_PREFIX_HEX_LEN,
 };
+pub use hardware_attestation::{HardwareAttestationPolicy, DEFAULT_MAX_NONCE_AGE};
 pub use rooting::{
     provenance_chain, root_binding, ProvenanceChain, ProvenanceLink, RootingRejection,
     RootingVerdict, MAX_PROVENANCE_DEPTH,
+};
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub use schema_resolver::BlobBackedSchemaResolver;
+pub use schema_resolver::{
+    axis_from_dimension, AxisSchema, NoOpSchemaResolver, SchemaResolver, SchemaResolverError,
 };
 #[cfg(feature = "sqlite")]
 pub use sqlite_open::FederationDirectorySqlite;
@@ -416,6 +424,104 @@ pub enum Error {
         reason: &'static str,
     },
 
+    /// v2.5.0 (CIRISPersist#102 Ask 4). The submitted `scores`
+    /// attestation's `attestation_envelope` failed JSON Schema
+    /// validation against the per-axis schema registered for the
+    /// dimension's axis (FSD-002 §4.9.1 operational-definition
+    /// "evidence-shape requirement"). The schema's `evidence_refs`
+    /// requirement (the schema SHA must appear in the envelope's
+    /// `evidence_refs[]`) is part of the schema document, not
+    /// separately enforced — JSON Schema does that work.
+    #[error(
+        "envelope schema violation for dimension {dimension:?} (axis={axis:?}): \
+         {} violation(s)", violations.len()
+    )]
+    EnvelopeSchemaViolation {
+        /// The `dimension` value from the attestation envelope.
+        dimension: String,
+        /// The axis derived from `dimension` (per
+        /// [`axis_from_dimension`]).
+        axis: String,
+        /// Human-readable violation strings, one per JSON Schema
+        /// failure. Order matches `jsonschema::iter_errors`.
+        violations: Vec<String>,
+    },
+
+    /// v2.5.0 (CIRISPersist#102 Ask 8). The submitted
+    /// `federation_keys` row has `identity_type = 'accord_holder'`
+    /// but no `attestation_evidence` field, or the field is null /
+    /// fails to deserialize. Per FSD-002 §7.3, accord-holder keys
+    /// MUST live on hardware substrate; the admission hook reads
+    /// `attestation_evidence` to confirm. Defense-in-depth:
+    /// V048 CHECK constraint catches the same shape if a row
+    /// bypasses the admission hook (e.g., direct SQL).
+    #[error(
+        "accord_holder row requires non-null attestation_evidence \
+         (key_id={key_id:?}): {detail}"
+    )]
+    AccordHolderRequiresAttestationEvidence {
+        /// The `key_id` of the rejected row.
+        key_id: String,
+        /// Detail: "missing", "null", "malformed: <serde err>", etc.
+        detail: String,
+    },
+
+    /// v2.5.0 (CIRISPersist#102 Ask 8). The submitted
+    /// `attestation_evidence` carries a `hardware_type` that
+    /// [`HardwareAttestationPolicy`] does not accept for accord-
+    /// holder identity. The default policy refuses
+    /// `HardwareType::SoftwareOnly` — Verify's one structural floor
+    /// (`supports_professional_license() == false`); operator
+    /// policies may tighten further.
+    #[error(
+        "accord_holder hardware_type {got:?} not accepted by policy \
+         (accepted={accepted:?})"
+    )]
+    HardwareTypeNotAccepted {
+        /// The submitted hardware_type variant name (e.g.
+        /// `"SoftwareOnly"`, `"AndroidStrongbox"`).
+        got: String,
+        /// The policy's accepted set, serialized for the error
+        /// message. Sorted for deterministic output.
+        accepted: Vec<String>,
+    },
+
+    /// v2.5.0 (CIRISPersist#102 Ask 8). The submitted
+    /// `PlatformAttestation` variant matches the
+    /// [`HardwareAttestationPolicy`] but is structurally
+    /// incomplete — missing one of the variant's required fields
+    /// (e.g. Android without `key_attestation_chain`; TPM without
+    /// `pcr_values`). Persist does NOT do active chain validation
+    /// here (that's CIRISVerify#32 Ask 5); only structural
+    /// field-presence checks locally.
+    #[error(
+        "accord_holder attestation_evidence incomplete \
+         (hardware_type={hardware_type:?}, missing={missing_fields:?})"
+    )]
+    AttestationEvidenceIncomplete {
+        /// The hardware type variant from the submitted evidence.
+        hardware_type: String,
+        /// The list of required-but-missing field names. Stable
+        /// vocabulary; tests pin specific names.
+        missing_fields: Vec<String>,
+    },
+
+    /// v2.5.0 (CIRISPersist#102 Ask 8). The submitted
+    /// `attestation_evidence` carries a `nonce_captured_at`
+    /// timestamp older than [`HardwareAttestationPolicy::max_nonce_age`].
+    /// Defeats replay of an old attestation against a new key-
+    /// binding event.
+    #[error(
+        "accord_holder attestation_evidence stale \
+         (captured_at={captured_at}, max_age={max_age_secs}s)"
+    )]
+    AttestationEvidenceStale {
+        /// RFC3339 timestamp of the captured nonce.
+        captured_at: chrono::DateTime<chrono::Utc>,
+        /// Max age in seconds (`HardwareAttestationPolicy::max_nonce_age`).
+        max_age_secs: u64,
+    },
+
     /// Backend-level error (DB connection, serialization, etc.).
     /// String-typed because each backend has its own error tree.
     #[error("backend: {0}")]
@@ -434,6 +540,15 @@ impl Error {
                 "federation_accord_dimension_requires_accord_holder"
             }
             Error::DimensionRejected { .. } => "federation_dimension_rejected",
+            Error::EnvelopeSchemaViolation { .. } => "federation_envelope_schema_violation",
+            Error::AccordHolderRequiresAttestationEvidence { .. } => {
+                "federation_accord_holder_requires_attestation_evidence"
+            }
+            Error::HardwareTypeNotAccepted { .. } => "federation_hardware_type_not_accepted",
+            Error::AttestationEvidenceIncomplete { .. } => {
+                "federation_attestation_evidence_incomplete"
+            }
+            Error::AttestationEvidenceStale { .. } => "federation_attestation_evidence_stale",
             Error::Backend(_) => "federation_backend",
         }
     }

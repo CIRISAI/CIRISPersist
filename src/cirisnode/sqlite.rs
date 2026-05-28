@@ -2234,6 +2234,7 @@ mod tests {
             pqc_completed_at: None,
             persist_row_hash: String::new(),
             roles: Vec::new(),
+            attestation_evidence: None,
         };
         backend
             .put_public_key(crate::federation::SignedKeyRecord { record })

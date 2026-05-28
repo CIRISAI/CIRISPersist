@@ -131,6 +131,7 @@ impl MemoryBackend {
             pqc_completed_at: None,
             persist_row_hash: String::new(),
             roles: Vec::new(),
+            attestation_evidence: None,
         };
         state.federation_keys.insert(key_id.to_owned(), rec);
         // Keep the legacy map populated too — some tests still
@@ -1835,6 +1836,7 @@ mod tests {
             pqc_completed_at: None,
             persist_row_hash: String::new(),
             roles: Vec::new(),
+            attestation_evidence: None,
         }
     }
 
