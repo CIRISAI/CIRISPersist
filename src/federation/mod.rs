@@ -38,6 +38,7 @@ pub mod backfill;
 pub mod blobs;
 #[cfg(feature = "cirisaudit")]
 pub mod emit;
+pub mod goal;
 pub mod hardware_attestation;
 #[cfg(feature = "cirisaudit")]
 pub mod read;
@@ -76,6 +77,10 @@ pub use blobs::{
     holds_bytes_attestation_envelope, holds_bytes_attestation_type, BlobBody, BlobError,
     BlobStorage, ExternalRef, PutBlobAttestation, DEFAULT_INLINE_BYTES_CAP,
     HOLDS_BYTES_ATTESTATION_TYPE_PREFIX, HOLDS_BYTES_PREFIX_HEX_LEN,
+};
+pub use goal::{
+    canonicalize_goal_text, DeliberationRef, Goal, GoalScope, GoalsFilter, M1Dimension,
+    MetaGoalAlignment,
 };
 pub use hardware_attestation::{HardwareAttestationPolicy, DEFAULT_MAX_NONCE_AGE};
 pub use rooting::{
@@ -344,6 +349,80 @@ pub trait FederationDirectory: Send + Sync {
         let _ = filter;
         Err(Error::Backend(
             "list_trusted_keys not implemented for this backend".into(),
+        ))
+    }
+
+    // ── Goals (v2.10.0, CIRISPersist#114) ──────────────────────────
+    //
+    // The typed `Goal` primitive (see [`goal`]) carries M-1 alignment
+    // as a structural construction-time invariant — a Goal cannot be
+    // constructed without [`MetaGoalAlignment`]. The persistence
+    // surface mirrors that discipline: every write goes through a
+    // typed `Goal`, never a free-form JSON envelope.
+    //
+    // F-3 detector consumers (CIRISLensCore#23 / #24 / #26) walk
+    // these rows to aggregate goals by `declared_by_key_id` + scope +
+    // `m1_dimension`. The hot path skips retired goals (the
+    // `(retired_at IS NULL)` partial index), so `list_goals` defaults
+    // to live-only via `GoalsFilter::include_retired = false`.
+    //
+    // Defaults route to `Error::Backend(...)` so the memory shim and
+    // any future test-only backend compile cleanly; the real backends
+    // (postgres, sqlite) override every method.
+
+    /// Insert a [`Goal`]. The row is persisted with a server-computed
+    /// `persist_row_hash` over the canonical bytes (same shape as
+    /// `KeyRecord` et al.). Errors:
+    /// - [`Error::InvalidArgument`] when `declared_by_key_id` is not
+    ///   present in `federation_keys` (FK enforcement).
+    /// - [`Error::Conflict`] when `goal_id` is already in the table
+    ///   with content that differs from the submitted row.
+    async fn put_goal(&self, goal: Goal) -> Result<(), Error> {
+        let _ = goal;
+        Err(Error::Backend(
+            "put_goal not implemented for this backend".into(),
+        ))
+    }
+
+    /// Fetch a single [`Goal`] by `goal_id`. Returns `None` when
+    /// absent.
+    async fn get_goal(&self, goal_id: uuid::Uuid) -> Result<Option<Goal>, Error> {
+        let _ = goal_id;
+        Err(Error::Backend(
+            "get_goal not implemented for this backend".into(),
+        ))
+    }
+
+    /// Enumerate [`Goal`] rows matching `filter`. Fields AND-composed
+    /// (see [`GoalsFilter`]); retired rows are filtered out by
+    /// default. Returned in stable lex order by `(declared_at,
+    /// goal_id)` so callers can deterministically paginate.
+    async fn list_goals(&self, filter: GoalsFilter) -> Result<Vec<Goal>, Error> {
+        let _ = filter;
+        Err(Error::Backend(
+            "list_goals not implemented for this backend".into(),
+        ))
+    }
+
+    /// Mark a [`Goal`] retired at `retired_at`. **Idempotent.** A
+    /// second call against an already-retired goal returns `Ok(())`
+    /// without changing the stored `retired_at` — the chosen
+    /// discipline matches [`revoke_trust`](Self::revoke_trust)'s
+    /// "soft-delete, idempotent" shape so consumers driving
+    /// retirement from a queue don't need to special-case the
+    /// race-replay window. Callers wanting strict-once semantics
+    /// MUST guard at their layer (the
+    /// [`Engine::receive_and_persist`](crate::Engine::receive_and_persist)
+    /// pattern uses content-hash dedup for that). When the row does
+    /// not exist, [`Error::InvalidArgument`] is returned.
+    async fn retire_goal(
+        &self,
+        goal_id: uuid::Uuid,
+        retired_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Error> {
+        let _ = (goal_id, retired_at);
+        Err(Error::Backend(
+            "retire_goal not implemented for this backend".into(),
         ))
     }
 }

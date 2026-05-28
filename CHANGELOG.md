@@ -5,6 +5,114 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [2.10.0] — 2026-05-28
+
+**`#114` — typed `Goal` primitive + storage + wire, with M-1 alignment as a structural construction-time invariant.**
+
+The F-3 detector family (CIRISLensCore#23/#24/#26) operates on
+"goals pursued by groups," but the substrate had no first-class
+representation — just an untyped `serde_json::Value` named
+`deferred_goals` and string-label detection axes like `goal:planet`.
+That category gap closes here: every Goal in persist's wire +
+storage MUST carry M-1 alignment, enforced at the type system the
+same way `NonZeroU32` enforces non-zero. **A Goal cannot be
+constructed without it.**
+
+### The `Goal` type
+
+```rust
+pub struct Goal {
+    pub goal_id: Uuid,                       // UUIDv7, creation-ordered
+    pub declared_by_key_id: String,          // federation_keys.key_id FK
+    pub declared_at: DateTime<Utc>,
+    pub goal_text: String,
+    pub scope: GoalScope,                    // SingleDeclarer | Cohort{id} | Federation
+    pub meta_goal_alignment: MetaGoalAlignment,  // REQUIRED — by value, not Option
+    pub retired_at: Option<DateTime<Utc>>,
+}
+```
+
+`Goal::new(...)` takes `meta_goal_alignment: MetaGoalAlignment` by
+value. There is no `Default` impl. The only constructor enforces the
+invariant. M-1 isn't a validation rule — it's a type-system
+construction precondition. A declarer cannot route around the
+framework by simply "not setting it"; the compiler refuses.
+
+### `MetaGoalAlignment` + `M1Dimension`
+
+```rust
+pub struct MetaGoalAlignment {
+    pub dimension: M1Dimension,    // closed enum, #[non_exhaustive]
+    pub rationale: String,          // free text, canonicalized into signed bytes
+    pub deliberation_ref: Option<DeliberationRef>,  // pointer to PDMA/WBD/thread
+}
+
+#[non_exhaustive]
+pub enum M1Dimension {
+    Sustainability, Adaptivity, Coherence, Plurality,
+    Flourishing, Justice, Wonder,
+}
+```
+
+The seven dimensions cover the CIRIS Accord v1.2-Beta M-1 framing:
+*"Promote sustainable adaptive coherence — the living conditions
+under which diverse sentient beings may pursue their own flourishing
+in justice and wonder."* The closed enum forces declarer engagement
+(can't bypass with a free-text dimension); `#[non_exhaustive]` keeps
+semver-minor extensibility.
+
+### V050 migration (both dialects)
+
+`goals` table: UUID PK, FK → `federation_keys(key_id) ON DELETE RESTRICT`,
+`meta_dimension` CHECK in the 7 lex-sorted variants, `scope_kind`
+CHECK in 3, JSONB `meta_deliberation` (TEXT-as-JSON on SQLite),
+partial indexes on the F-3 hot path (live goals only). Cross-column
+CHECK enforces `scope_kind = 'cohort' ⇔ scope_cohort_id IS NOT NULL`
+— defense in depth, schema is the backstop for direct-SQL bypass.
+
+qa_harness migration-count bound → `1..=50`.
+
+### `FederationDirectory` trait surface
+
+Four new `#[async_trait]` methods:
+
+- `put_goal(goal)` — typed write; FK + CHECK enforced.
+- `get_goal(goal_id)` — typed read; `Option` for not-found.
+- `list_goals(filter)` — `GoalsFilter { declared_by_key_id?,
+  m1_dimension?, scope_kind?, cohort_id?, include_retired: bool }`;
+  stable lex order by `(declared_at, goal_id)`; `include_retired`
+  defaults `false` so the F-3 hot path skips retired goals.
+- `retire_goal(goal_id, retired_at)` — soft-idempotent (mirrors
+  `revoke_trust`): second call against an already-retired goal
+  returns `Ok(())` without changing `retired_at`; missing
+  `goal_id` returns `Error::InvalidArgument`.
+
+### PyO3 surface
+
+`cirisnode_put_goal_json` / `cirisnode_get_goal_json` /
+`cirisnode_list_goals_json` / `cirisnode_retire_goal_json` —
+JSON in/out matching the existing `cirisnode_*_json` convention.
+**M-1 enforcement reaches the FFI boundary**: a JSON payload
+missing `meta_goal_alignment` raises `ValueError` before any DB
+call — the Rust deserializer refuses to construct a Goal without
+it.
+
+### Judgement calls
+
+- **`DeliberationRef` shape** — issue body cut off before defining;
+  picked conservative `{artifact_type: String, artifact_id: String}`
+  (vocabulary tokens like `"pdma"`, `"wbd"`, `"thread"`); persist
+  stores opaque, leaves the WBD adjudication contract to canonicalize
+  the vocabulary later.
+- **`goal_text_canonical`** — issue mentioned the column but not the
+  algorithm; implemented ASCII-whitespace trim + collapse runs to
+  single space. The unchanged `goal_text` remains the signed form;
+  `_canonical` is the lookup discriminant.
+- **PG FK violation detection** — `tokio_postgres::Error`'s top-level
+  `Display` is just `"db error"`; switched to
+  `as_db_error().code()` SQLSTATE check (23503 for FK, 23514 for
+  CHECK).
+
 ## [2.9.0] — 2026-05-28
 
 **CIRISVerify pin v3.0.1 → v3.7.0 (L1-L5 → un-numbered wire shape) + closes #110.**

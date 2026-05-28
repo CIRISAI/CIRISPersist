@@ -69,6 +69,11 @@ struct State {
     /// queue_id. State-machine integrity enforced by the impl,
     /// matching the postgres CHECK constraints.
     outbound_queue: HashMap<String, crate::outbound::OutboundRow>,
+    /// v2.10.0 (CIRISPersist#114) — Federation goals (`goals`).
+    /// Keyed by `goal_id`. M-1 alignment is structurally guaranteed
+    /// by [`crate::federation::Goal`]'s constructor; the memory shim
+    /// stores the typed value verbatim.
+    federation_goals: HashMap<uuid::Uuid, crate::federation::Goal>,
 }
 
 impl Default for MemoryBackend {
@@ -84,6 +89,7 @@ impl Default for MemoryBackend {
                 federation_revocations: Vec::new(),
                 federation_trust: HashMap::new(),
                 outbound_queue: HashMap::new(),
+                federation_goals: HashMap::new(),
             }),
         }
     }
@@ -810,6 +816,111 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         Ok(rows)
+    }
+
+    // ── Goals (v2.10.0, CIRISPersist#114) ──────────────────────────
+
+    async fn put_goal(
+        &self,
+        goal: crate::federation::Goal,
+    ) -> Result<(), crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        // FK enforcement parity with postgres: declared_by_key_id
+        // must exist in federation_keys.
+        if !state.federation_keys.contains_key(&goal.declared_by_key_id) {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "declared_by_key_id {} does not exist in federation_keys",
+                goal.declared_by_key_id
+            )));
+        }
+        // Idempotent on goal_id collision with matching content;
+        // conflict on differing content (same shape as
+        // put_public_key).
+        let new_hash = crate::federation::types::compute_persist_row_hash(&goal)?;
+        if let Some(existing) = state.federation_goals.get(&goal.goal_id) {
+            let existing_hash = crate::federation::types::compute_persist_row_hash(existing)?;
+            if existing_hash == new_hash {
+                return Ok(()); // exact duplicate — no-op
+            }
+            return Err(crate::federation::Error::Conflict(format!(
+                "goal_id {} already exists with different content",
+                goal.goal_id
+            )));
+        }
+        state.federation_goals.insert(goal.goal_id, goal);
+        Ok(())
+    }
+
+    async fn get_goal(
+        &self,
+        goal_id: uuid::Uuid,
+    ) -> Result<Option<crate::federation::Goal>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(state.federation_goals.get(&goal_id).cloned())
+    }
+
+    async fn list_goals(
+        &self,
+        filter: crate::federation::GoalsFilter,
+    ) -> Result<Vec<crate::federation::Goal>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<crate::federation::Goal> = state
+            .federation_goals
+            .values()
+            .filter(|g| {
+                if !filter.include_retired && g.retired_at.is_some() {
+                    return false;
+                }
+                if let Some(key) = &filter.declared_by_key_id {
+                    if &g.declared_by_key_id != key {
+                        return false;
+                    }
+                }
+                if let Some(dim) = filter.m1_dimension {
+                    if g.meta_goal_alignment.dimension != dim {
+                        return false;
+                    }
+                }
+                if let Some(kind) = &filter.scope_kind {
+                    if g.scope.scope_kind_str() != kind.as_str() {
+                        return false;
+                    }
+                }
+                if let Some(cohort) = &filter.cohort_id {
+                    if g.scope.cohort_id() != Some(cohort.as_str()) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect();
+        // Stable lex order by (declared_at, goal_id) — matches the
+        // SQL ORDER BY in the postgres + sqlite impls.
+        rows.sort_by(|a, b| {
+            a.declared_at
+                .cmp(&b.declared_at)
+                .then_with(|| a.goal_id.cmp(&b.goal_id))
+        });
+        Ok(rows)
+    }
+
+    async fn retire_goal(
+        &self,
+        goal_id: uuid::Uuid,
+        retired_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        let row = state.federation_goals.get_mut(&goal_id).ok_or_else(|| {
+            crate::federation::Error::InvalidArgument(format!("goal_id {goal_id} does not exist"))
+        })?;
+        // Idempotent: only set retired_at when the row is still
+        // live. A second call against an already-retired goal is a
+        // no-op (matches the `revoke_trust` shape).
+        if row.retired_at.is_none() {
+            row.retired_at = Some(retired_at);
+        }
+        Ok(())
     }
 }
 
