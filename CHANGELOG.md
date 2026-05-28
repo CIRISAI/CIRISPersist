@@ -5,6 +5,49 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [2.9.0] — 2026-05-28
+
+**CIRISVerify pin v3.0.1 → v3.7.0 (L1-L5 → un-numbered wire shape) + closes #110.**
+
+CIRISVerify v3.7.0 drops the L1-L5 attestation-ladder wire shape:
+`attestation:l1:self_verify` → `attestation:self_verify` (and the four
+others analogously); parameterized dimensions
+(`provenance:slsa:{level}`, `cert_validity:{authority}`,
+`hardware_custody:{platform}`, `transparency_log:*`) unchanged. The
+ladder lives nowhere in verify's response now; "measurements, not
+levels" is the standing principle.
+
+Persist consumes verify's `ciris-crypto` / `ciris-keyring` /
+`ciris-verify-core` APIs (signers, hybrid signatures, transparency-log
+machinery) — not its dimension constants — so persist's code is
+unaffected by the wire rename. **All 780/780 nextest tests pass on
+v3.7.0** on both backends, identical to the 2.7.0 baseline.
+
+- Cargo.toml: 6 `tag = "v3.0.1"` sites → `"v3.7.0"`
+  (ciris-keyring/ciris-verify-core/ciris-crypto across base +
+  per-target Linux/iOS/Android tables).
+- pyproject.toml `Requires-Dist`: `ciris-verify>=3.0.1,<4` →
+  `>=3.7.0,<4` — Python wheel consumers of persist now transitively
+  pull the un-numbered verify wire shape.
+
+### Closes `#110` (CIRIS 3.0 D09 per-occurrence mandate-fidelity)
+
+`occurrence_id` / `occurrence_count` / `occurrence_role` envelope
+fields landed at CIRISRegistry **FSD-002 v1.4.2 §2.1** (envelope-level,
+relocated from the requested §3.1.5 since they apply across all
+dimension families, not a per-component slice). All three are
+**optional** with documented backward-compat defaults
+(`occurrence_id → "occurrence-0"`, `occurrence_count → 1`,
+`occurrence_role → "primary"`); single-occurrence agents leave them
+null/absent.
+
+**Persist needs zero code change.** The `attestation_envelope` JSONB
+column on `federation_attestations` stores the envelope opaquely; the
+new optional fields ride within automatically. Persist itself emits
+no `system:*` attestations that would need to populate the fields
+(verified via grep; the only persist reference to `system:*` is a
+dimension-axis parsing test in `schema_resolver.rs`).
+
 ## [2.8.0] — 2026-05-28
 
 **`#111` — `runtime_handle_capsule` cross-cdylib statics fix (extends #109).**
