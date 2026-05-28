@@ -131,6 +131,45 @@ pub enum BackendDispatch {
 pub struct Engine {
     backend: BackendDispatch,
     signer: Arc<dyn HardwareSigner>,
+    /// v2.12.0 (CIRISPersist#112) — preserved `LocalSigner`, when the
+    /// Engine was constructed from one. The `signer` field above is
+    /// the hybrid `HardwareSigner` trait object (post v1.13.0 / #92);
+    /// for [`Engine::sign_hybrid`] we need the underlying
+    /// [`LocalSigner`](crate::signing::LocalSigner) to reach
+    /// `sign_hybrid` (which combines Ed25519 + ML-DSA-65 into a
+    /// [`HybridSignature`](ciris_crypto::HybridSignature)). When the
+    /// Engine was constructed via [`Engine::from_shared`] without a
+    /// LocalSigner (the cohabitation accessor path), this is `None`
+    /// and `sign_hybrid` returns [`SignError::LocalSignerUnavailable`].
+    local_signer: Option<Arc<crate::signing::LocalSigner>>,
+}
+
+/// v2.12.0 (CIRISPersist#112) — error from [`Engine::sign_hybrid`].
+#[derive(Debug, thiserror::Error)]
+pub enum SignError {
+    /// The Engine has no `LocalSigner` to reach Ed25519 + ML-DSA-65
+    /// signing through. This happens when the Engine was constructed
+    /// via [`Engine::from_shared`] with only an
+    /// `Arc<dyn HardwareSigner>` — the cohabitation accessor path
+    /// hands the singleton's hybrid signer to a co-resident Rust
+    /// consumer but does not carry the LocalSigner through. Construct
+    /// the Engine via [`Engine::with_signer`] /
+    /// [`Engine::with_signer_arcs`] (or rebuild a LocalSigner from
+    /// `PyEngine::keyring_signer()`'s
+    /// [`KeyringSignerHandle`](crate::signing::KeyringSignerHandle))
+    /// for `sign_hybrid` to be available.
+    #[error(
+        "Engine has no LocalSigner — sign_hybrid requires construction via with_signer / \
+         with_signer_arcs, not from_shared. Cohabitation consumers can rebuild a LocalSigner \
+         from PyEngine::keyring_signer()."
+    )]
+    LocalSignerUnavailable,
+
+    /// The underlying [`LocalSigner::sign_hybrid`] call failed —
+    /// typically [`LocalSignerError::PqcNotConfigured`](crate::signing::LocalSignerError::PqcNotConfigured)
+    /// when the engine's local signer is Ed25519-only.
+    #[error(transparent)]
+    LocalSigner(#[from] crate::signing::LocalSignerError),
 }
 
 impl Engine {
@@ -151,11 +190,18 @@ impl Engine {
     /// the returned Engine is ready to read/write immediately.
     pub async fn with_signer(signer: Arc<LocalSigner>, dsn: &str) -> Result<Self, EngineError> {
         let backend = build_backend(dsn).await?;
+        // v2.12.0 (#112): preserve the original `LocalSigner` Arc so
+        // `Engine::sign_hybrid` can reach `LocalSigner::sign_hybrid`.
+        let local_signer = Some(signer.clone());
         // v1.13.0 (#92): the stored field is `Arc<dyn HardwareSigner>`;
         // wrap the caller's `Arc<LocalSigner>` so the constructor stays
         // source-compatible.
         let signer: Arc<dyn HardwareSigner> = Arc::new(LocalSignerHardwareAdapter::new(signer));
-        Ok(Engine { backend, signer })
+        Ok(Engine {
+            backend,
+            signer,
+            local_signer,
+        })
     }
 
     /// Variant accepting raw signer Arcs — matches the issue's
@@ -225,7 +271,74 @@ impl Engine {
     /// re-wrapping the singleton's own `BackendDispatch` by cloning the
     /// inner `Arc<…Backend>`) shares the same connection pool.
     pub fn from_shared(backend: BackendDispatch, signer: Arc<dyn HardwareSigner>) -> Engine {
-        Engine { backend, signer }
+        Engine {
+            backend,
+            signer,
+            // v2.12.0 (#112) — `from_shared` only takes the hybrid
+            // `HardwareSigner` (the cohabitation singleton path);
+            // `sign_hybrid` is unavailable on Engines built this way.
+            // Use [`Engine::from_shared_with_local`] to propagate a
+            // `LocalSigner` through.
+            local_signer: None,
+        }
+    }
+
+    /// v2.12.0 (CIRISPersist#112) — variant of [`Engine::from_shared`]
+    /// that ALSO propagates the host's `LocalSigner`, enabling
+    /// [`Engine::sign_hybrid`] on the resulting Engine. The
+    /// process-singleton accessor
+    /// [`current_rust_engine`](crate::current_rust_engine) uses this
+    /// when the host singleton has a LocalSigner (the typical
+    /// software-rooted deployment); for hardware-rooted deployments
+    /// with no LocalSigner present, `from_shared` (no propagation) is
+    /// the right constructor.
+    pub fn from_shared_with_local(
+        backend: BackendDispatch,
+        signer: Arc<dyn HardwareSigner>,
+        local_signer: Option<Arc<LocalSigner>>,
+    ) -> Engine {
+        Engine {
+            backend,
+            signer,
+            local_signer,
+        }
+    }
+
+    /// v2.12.0 (CIRISPersist#112) — hybrid-sign canonical bytes with
+    /// the Engine's classical (Ed25519) + PQC (ML-DSA-65) identity.
+    /// Returns the standard
+    /// [`HybridSignature`](ciris_crypto::HybridSignature) shape
+    /// persist's signed-envelope discipline uses everywhere
+    /// (`federation_keys.scrub_signature_*`, V046
+    /// `delivery_attestation.signature_*`, etc.).
+    ///
+    /// Same closure pattern as [`Engine::receive_and_persist`] /
+    /// [`Engine::storage_summary`]: persist owns the underlying
+    /// primitive ([`LocalSigner::sign_hybrid`]); persist exposes a
+    /// clean Engine facade so co-resident Rust consumers
+    /// (CIRISLensCore client-mode trace signing, EgressFilter
+    /// re-signing) don't reach past the
+    /// `Arc<dyn HardwareSigner>` abstraction.
+    ///
+    /// Returns [`SignError::LocalSignerUnavailable`] when the Engine
+    /// was constructed via [`Engine::from_shared`] (no LocalSigner
+    /// propagation — the cohabitation accessor path); rebuild the
+    /// caller-side LocalSigner from
+    /// `PyEngine::keyring_signer()`'s [`KeyringSignerHandle`] in that
+    /// case. Returns
+    /// [`SignError::LocalSigner(LocalSignerError::PqcNotConfigured)`](crate::signing::LocalSignerError::PqcNotConfigured)
+    /// when the Engine has a LocalSigner but no PQC identity
+    /// configured (Ed25519-only deployments).
+    pub async fn sign_hybrid(
+        &self,
+        message: &[u8],
+    ) -> Result<ciris_crypto::HybridSignature, SignError> {
+        let local = self
+            .local_signer
+            .as_ref()
+            .ok_or(SignError::LocalSignerUnavailable)?;
+        let sig = local.sign_hybrid(message).await?;
+        Ok(sig)
     }
 
     /// Borrow the SQLite backend Arc, if this Engine was constructed
@@ -1528,5 +1641,89 @@ mod tests {
             .await
             .expect_err("Full mode must reject the unregistered key");
         assert!(matches!(err, IngestError::Verify(_)), "got: {err:?}");
+    }
+
+    // ── v2.12.0 (CIRISPersist#112) — Engine::sign_hybrid tests ───────
+
+    /// `with_signer` propagates the LocalSigner; without PQC configured
+    /// the signer's own `PqcNotConfigured` error surfaces through the
+    /// `SignError::LocalSigner(...)` variant.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sign_hybrid_without_pqc_returns_pqc_not_configured() {
+        let signer = test_signer(); // No PQC.
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("construct engine");
+
+        let err = engine
+            .sign_hybrid(b"any message")
+            .await
+            .expect_err("PQC not configured");
+        match err {
+            SignError::LocalSigner(crate::signing::LocalSignerError::PqcNotConfigured) => {}
+            other => panic!("expected SignError::LocalSigner(PqcNotConfigured), got {other:?}"),
+        }
+    }
+
+    /// `from_shared` constructs an Engine without a LocalSigner;
+    /// `sign_hybrid` returns `LocalSignerUnavailable` (the cohabitation
+    /// consumer must rebuild a LocalSigner from
+    /// `PyEngine::keyring_signer()`'s `KeyringSignerHandle` to use this
+    /// path).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sign_hybrid_from_shared_without_local_returns_unavailable() {
+        // Build a real Engine via with_signer, then synthesize a
+        // from_shared Engine that drops the LocalSigner — exactly the
+        // shape `current_rust_engine` produced pre-v2.12 (#92 to #112
+        // window).
+        let engine_full = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        let backend = engine_full.backend().clone();
+        let signer = engine_full.signer().clone();
+
+        let engine_shared = Engine::from_shared(backend, signer);
+
+        let err = engine_shared
+            .sign_hybrid(b"any message")
+            .await
+            .expect_err("no LocalSigner propagated");
+        assert!(
+            matches!(err, SignError::LocalSignerUnavailable),
+            "got: {err:?}"
+        );
+    }
+
+    /// `from_shared_with_local` propagates the LocalSigner; the
+    /// resulting Engine reaches `sign_hybrid` and surfaces the
+    /// LocalSigner's own errors (PqcNotConfigured here, since the
+    /// fixture signer has no PQC). This is the constructor
+    /// `current_rust_engine()` now uses to cross the cohabitation
+    /// boundary without losing hybrid-signing capability.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sign_hybrid_from_shared_with_local_propagates_to_local_signer() {
+        let signer = test_signer(); // No PQC.
+        let engine_full = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        let backend = engine_full.backend().clone();
+        let hw_signer = engine_full.signer().clone();
+
+        let engine_shared = Engine::from_shared_with_local(backend, hw_signer, Some(signer));
+
+        let err = engine_shared
+            .sign_hybrid(b"any message")
+            .await
+            .expect_err("PQC not configured (but the LocalSigner WAS reached)");
+        assert!(
+            matches!(
+                err,
+                SignError::LocalSigner(crate::signing::LocalSignerError::PqcNotConfigured)
+            ),
+            "got: {err:?}"
+        );
     }
 }

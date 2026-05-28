@@ -5,6 +5,65 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [2.12.0] — 2026-05-28
+
+**`#112` — `Engine::sign_hybrid` facade + cohabitation propagation fix.**
+
+The `Engine` struct gains a `local_signer: Option<Arc<LocalSigner>>`
+field and a new `Engine::sign_hybrid(message) -> Result<HybridSignature, SignError>`
+method. Same closure-pattern as `Engine::receive_and_persist` /
+`Engine::storage_summary`: persist owns the underlying primitive
+(`LocalSigner::sign_hybrid` — Ed25519 + ML-DSA-65 + hybrid binding);
+persist exposes a clean Engine facade so co-resident Rust consumers
+(CIRISLensCore client-mode trace signing on `ACTION_RESULT`, v0.4
+EgressFilter re-signing of redacted envelopes) don't reach past the
+`Arc<dyn HardwareSigner>` abstraction.
+
+### The cohabitation propagation fix
+
+Pre-v2.12, `Engine::from_shared` (which `current_rust_engine()` uses
+to hand a co-resident Rust consumer an `Arc<Engine>` view onto the
+process singleton) only carried `Arc<dyn HardwareSigner>` across —
+the `LocalSigner` the singleton was constructed from was lost at the
+boundary, so consumers could not reach the hybrid-signing path.
+
+2.12 adds `Engine::from_shared_with_local(backend, signer,
+local_signer)` and updates `current_rust_engine()` to call it,
+propagating the `EngineCell`'s `local_signer` through. The singleton
+already holds it; sharing across the cohabitation boundary doesn't
+duplicate identity.
+
+Hardware-rooted deployments (no LocalSigner present) keep using
+`Engine::from_shared` and get `SignError::LocalSignerUnavailable`
+from `sign_hybrid` — honest failure mode; rebuild a LocalSigner from
+`PyEngine::keyring_signer()`'s `KeyringSignerHandle` if the
+hardware-backed PqcSigner is accessible.
+
+### Typed `SignError`
+
+```rust
+pub enum SignError {
+    LocalSignerUnavailable,      // from_shared without local_signer propagation
+    LocalSigner(LocalSignerError),  // underlying LocalSigner::sign_hybrid errors
+}
+```
+
+`LocalSigner(LocalSignerError::PqcNotConfigured)` surfaces for
+Ed25519-only deployments — the LocalSigner was reached but has no
+PQC identity.
+
+### Unblocks
+
+- **CIRISLensCore#11** — v0.3 client-mode trace signing on `ACTION_RESULT`.
+- **CIRISLensCore#14** — v0.4 EgressFilter re-signing when redaction
+  has changed the canonical bytes.
+
+Three new tests on the sign_hybrid path (`with_signer` route +
+`from_shared` LocalSignerUnavailable + `from_shared_with_local`
+propagation through to the LocalSigner). **803/803 nextest tests
+pass** on both backends, clippy `--all-targets` clean on default AND
+full feature sets.
+
 ## [2.11.0] — 2026-05-28
 
 **`#115` `blob_storage_capsule` + CIRISVerify pin v3.7.0 → v3.9.0.**

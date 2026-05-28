@@ -16995,9 +16995,16 @@ pub fn current_rust_engine() -> Option<Arc<crate::Engine>> {
         return None;
     }
     let engine = cell.rust_engine.get_or_init(|| {
-        Arc::new(crate::Engine::from_shared(
+        // v2.12.0 (#112) — propagate the EngineCell's local_signer so
+        // `Engine::sign_hybrid` works on co-resident Rust consumers
+        // (CIRISLensCore client-mode trace signing, EgressFilter
+        // re-sign). The singleton already holds the LocalSigner;
+        // sharing it across the cohabitation boundary doesn't
+        // duplicate identity.
+        Arc::new(crate::Engine::from_shared_with_local(
             cell.engine_backend_dispatch(),
             cell.signer.clone(),
+            cell.local_signer.clone(),
         ))
     });
     Some(engine.clone())
