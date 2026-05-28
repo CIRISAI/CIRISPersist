@@ -11273,4 +11273,220 @@ mod tests {
         let rev2 = backend.revocations_for(&target).await.unwrap();
         assert_eq!(rev1[0].persist_row_hash, rev2[0].persist_row_hash);
     }
+
+    // ─── #104 topology aggregate-query tests (Postgres parity) ──────
+
+    /// Build a topology-test attestation. Sibling of the SQLite
+    /// `topo_attestation` helper — kept distinct so each backend
+    /// owns its own fixture path (no cross-module test dep).
+    #[allow(clippy::too_many_arguments)]
+    fn pg_topo_attestation(
+        attesting: &str,
+        attested: &str,
+        atype: &str,
+        dimension: Option<&str>,
+        scope: Option<&str>,
+        evidence: &[&str],
+        weight: Option<f64>,
+        asserted_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::federation::Attestation {
+        let mut env = serde_json::Map::new();
+        if let Some(d) = dimension {
+            env.insert("dimension".into(), serde_json::Value::String(d.into()));
+        }
+        if let Some(sc) = scope {
+            env.insert("scope".into(), serde_json::Value::String(sc.into()));
+        }
+        if !evidence.is_empty() {
+            env.insert(
+                "evidence_refs".into(),
+                serde_json::Value::Array(
+                    evidence
+                        .iter()
+                        .map(|e| serde_json::Value::String((*e).into()))
+                        .collect(),
+                ),
+            );
+        }
+        if atype == crate::federation::types::attestation_type::SCORES && dimension.is_none() {
+            env.insert(
+                "dimension".into(),
+                serde_json::Value::String("identity_binding:v1".into()),
+            );
+            env.insert(
+                "score".into(),
+                serde_json::Value::Number(serde_json::Number::from_f64(1.0).unwrap()),
+            );
+            env.insert(
+                "confidence".into(),
+                serde_json::Value::Number(serde_json::Number::from_f64(0.9).unwrap()),
+            );
+        }
+        crate::federation::Attestation {
+            // attestation_id is `::uuid`-cast on the PG write path —
+            // needs a real UUID (project_test_fixtures_uuid_vs_uuid_like).
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            attesting_key_id: attesting.into(),
+            attested_key_id: attested.into(),
+            attestation_type: atype.into(),
+            weight,
+            asserted_at,
+            expires_at: None,
+            attestation_envelope: serde_json::Value::Object(env),
+            original_content_hash: "abc123".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: attesting.into(),
+            scrub_timestamp: asserted_at,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn federation_directory_query_topology_direct_pg() {
+        use crate::federation::types::attestation_type;
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let suffix = uuid_like();
+        let granter = format!("topo-pg-granter-{suffix}");
+        let grantee = format!("topo-pg-grantee-{suffix}");
+        for (k, ident) in [(&granter, "agent-a"), (&grantee, "agent-b")] {
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord {
+                    record: fix_section_i_key(k, ident, chrono::Utc::now(), false),
+                })
+                .await
+                .unwrap();
+        }
+        let when = chrono::Utc::now();
+        backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: pg_topo_attestation(
+                    &granter,
+                    &grantee,
+                    attestation_type::SCORES,
+                    Some("identity_binding:v1"),
+                    None,
+                    &[],
+                    Some(3.0),
+                    when,
+                ),
+            })
+            .await
+            .unwrap();
+        let topo = crate::federation::build_trust_topology(
+            &backend,
+            &crate::federation::FederationDirectoryFilter {
+                granter_key: Some(granter.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(topo.edges.len(), 1);
+        assert_eq!(topo.edges[0].edge_type, crate::federation::EdgeType::Direct);
+        assert_eq!(topo.edges[0].from_key, grantee);
+        assert_eq!(topo.edges[0].to_key, granter);
+        assert!((topo.edges[0].weight - 3.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn federation_directory_query_empty_pg() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let topo = crate::federation::build_trust_topology(
+            &backend,
+            &crate::federation::FederationDirectoryFilter {
+                granter_key: Some(format!("missing-{}", uuid_like())),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(topo.edges.is_empty());
+        assert!(topo.nodes.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn delegates_to_graph_one_level_pg() {
+        use crate::federation::types::attestation_type;
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let suffix = uuid_like();
+        let root = format!("del-pg-root-{suffix}");
+        let child = format!("del-pg-child-{suffix}");
+        for (k, ident) in [(&root, "agent-a"), (&child, "agent-b")] {
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord {
+                    record: fix_section_i_key(k, ident, chrono::Utc::now(), false),
+                })
+                .await
+                .unwrap();
+        }
+        let when = chrono::Utc::now();
+        backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: pg_topo_attestation(
+                    &root,
+                    &child,
+                    attestation_type::DELEGATES_TO,
+                    None,
+                    Some("manifest:bundle-pg"),
+                    &["sha256:abcd1234"],
+                    None,
+                    when,
+                ),
+            })
+            .await
+            .unwrap();
+        let graph = crate::federation::build_delegation_graph(&backend, &root, 4)
+            .await
+            .unwrap();
+        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(graph.edges[0].scope, "manifest:bundle-pg");
+        assert_eq!(graph.edges[0].depth, 1);
+        assert_eq!(graph.edges[0].evidence_refs, vec!["sha256:abcd1234"]);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn delegates_to_graph_empty_pg() {
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let suffix = uuid_like();
+        let root = format!("solo-pg-{suffix}");
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: fix_section_i_key(&root, "agent-a", chrono::Utc::now(), false),
+            })
+            .await
+            .unwrap();
+        let graph = crate::federation::build_delegation_graph(&backend, &root, 4)
+            .await
+            .unwrap();
+        assert!(graph.edges.is_empty());
+    }
 }

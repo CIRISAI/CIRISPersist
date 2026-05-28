@@ -5,6 +5,93 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [2.7.0] — 2026-05-28
+
+**`#104` UI aggregate queries + `#109` PyCapsule cross-module cohabitation accessors.**
+
+Two parallel federation-unblockers — CIRISAgent 2.10.0's Epistemic
+Commons Framework UI (#104) and CIRISEdge 0.9.2's cross-wheel
+cohabitation init (#109). Shipping bundled because both touched
+`src/ffi/pyo3.rs` and were ready together. 780/780 nextest tests pass
+on both backends; clippy `--all-targets` clean on default AND full
+feature sets.
+
+### `#104` — Three PyO3 aggregate queries on `PyEngine`
+
+Composes on top of the now-stable FederationDirectory + cirisnode +
+audit-chain surfaces (the trait surface from 2.6.0). For
+CIRISAgent#800's three UI surfaces — Trust Topology, Delegation
+screen, The Commons audit-lineage.
+
+- **`federation_directory_query(filter_json)` → `TrustTopology`** —
+  feeds `TRUST_NODES + TRUST_EDGES` graph rendering. Walks
+  `federation_attestations` rows of type `SCORES` matching the
+  filter, partitions by `attestation_type` (`SCORES` /
+  `WITHDRAWS` / `RECANTS` / `DELEGATES_TO`), classifies each edge
+  as `Direct` / `Delegated` / `Adversarial`.
+- **`delegates_to_graph(from_key, max_depth)` → `DelegationGraph`**
+  — BFS over the `delegates_to:*` attestation graph from a root
+  key, bounded by `MAX_DELEGATION_DEPTH = 16`. Cycle-safe (visited
+  set keyed on granter `key_id`); annotates each edge with any
+  `WithdrawalEntry` (`withdraws`/`recants`) cancellation.
+- **`audit_chain_proof(trace_id)` → `AuditChainProof`** *(feature
+  `cirisaudit`)* — walks `audit_log` from genesis to the row
+  referencing `trace_id`; surfaces `head_signature` from the
+  Merkle tree-head signer when one is installed.
+
+New `src/federation/topology.rs` module + types
+(`TrustTopology` / `TrustNode` / `TrustEdge` / `EdgeType` /
+`DelegationGraph` / `DelegationEdge` / `WithdrawalEntry` /
+`AuditChainProof` / `AuditChainEntry`).
+
+### `#109` — Three PyCapsule cross-module accessors on `PyEngine`
+
+`#[pyclass]` registration is per-extension-module. When
+`ciris_persist.abi3.so` and a sibling consumer wheel (e.g.
+`ciris_edge.abi3.so`) each statically compile persist's source,
+each module registers its own `PyTypeInfo` for `PyEngine` and any
+`#[pyclass]` handle struct — Python's type-identity check
+(`isinstance(x, PyEngine)`) fails across modules even though both
+Rust structs are bit-identical from the same git tag. That's the
+production cohabitation init failure CIRISEdge#22 reported on
+2.9.x.
+
+The pure-Rust accessors (`pub fn federation_directory()` etc.
+from #95) work for sibling cdylibs that share persist's
+compiled-in type info; for Python-orchestrated cohabitation
+across separately-built wheels, **`PyCapsule` is the right
+primitive** — it's an opaque pointer with a name tag, no
+`PyTypeInfo` check, and the consumer extracts the wrapped value
+via `unsafe { capsule.pointer_checked(name)?.cast() }`.
+
+- **`federation_directory_capsule()`** — wraps the shared
+  `Arc<dyn FederationDirectory>` (object-safe after 2.6.0's
+  async-trait refactor). Name tag
+  `ciris_persist::federation_directory`.
+- **`outbound_queue_capsule()`** — wraps the shared
+  `BackendDispatch` enum. `OutboundQueue` is RPITIT
+  (`impl Future + Send` returns) and therefore NOT object-safe;
+  the dispatch-enum wrapping is the same pattern Option-B uses.
+  Name tag `ciris_persist::outbound_queue`.
+- **`keyring_signer_capsule()`** — wraps the
+  `KeyringSignerHandle` (`Arc<dyn HardwareSigner>` +
+  `Option<Arc<dyn PqcSigner>>` + `key_id`). Consumer reuses the
+  host's already-loaded signer rather than re-bootstrapping the
+  keyring (`docs/COHABITATION.md` rule 1). Name tag
+  `ciris_persist::keyring_signer`.
+
+The CIRISConformance suite captures `#109` as
+`xfail(strict=True)` on `test_init_edge_runtime_succeeds`; the
+moment 2.7.0 reaches PyPI and CIRISEdge picks up the capsule API,
+that test flips PASSED → XPASS-strict → the cell turns red and the
+xfail marker gets removed. That's the design working as intended —
+the conformance suite becomes a strict regression gate the moment
+the bridge is built.
+
+The longer-term endpoint where Python disappears (the trajectory
+endpoint #106 shipped in 2.6.0 unlocks) collapses these PyO3 layers
+entirely; capsules are the bridge until then.
+
 ## [2.6.0] — 2026-05-28
 
 **Federation-directory cohabitation unlock (#105 + #106 + #108) + retention primitives (#107).**

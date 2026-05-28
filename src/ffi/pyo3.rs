@@ -9034,6 +9034,159 @@ impl PyEngine {
         })
     }
 
+    // ── v2.7.0 (CIRISPersist#104) — Epistemic Commons aggregate queries ─
+    //
+    // Three JSON in / JSON out aggregate queries that feed the
+    // CIRISAgent 2.10.0 Epistemic Commons Framework UI
+    // (CIRISAgent#800 / Figma CIRISAgent#799):
+    //
+    //   1. federation_directory_query → Trust Topology
+    //   2. delegates_to_graph         → Delegation screen
+    //   3. audit_chain_proof          → Commons audit-lineage
+    //
+    // The aggregation logic lives in `crate::federation::topology`
+    // (the trust-topology + delegation-graph types) and
+    // `crate::audit` (the audit-chain walk). These wrappers route
+    // through `BackendDispatch` exactly like the per-backend
+    // federation / audit methods elsewhere in this file.
+    //
+    // Method shape mirrors `cirisnode_list_contributions_json` — JSON
+    // string in, JSON string out — the UI consumes JSON anyway, and
+    // the aggregate shapes have no sensible per-method Python class.
+    // The Rust types live in `crate::federation::topology` so a
+    // co-resident Rust extension (CIRISEdge) gets typed access too.
+
+    /// v2.7.0 (CIRISPersist#104) — Trust-Topology aggregate query.
+    /// Walks `federation_attestations` to produce a [`TrustTopology`]
+    /// with nodes (resolved through
+    /// [`crate::federation::FederationDirectory::lookup_public_key`])
+    /// and edges classified `direct` / `delegated` / `adversarial`.
+    ///
+    /// `filter_json` decodes to
+    /// [`crate::federation::FederationDirectoryFilter`]. At least one
+    /// of `granter_key` / `grantee_key` must be set — see the filter's
+    /// doc-comment for the trait-surface rationale.
+    ///
+    /// [`TrustTopology`]: crate::federation::TrustTopology
+    fn federation_directory_query(&self, py: Python<'_>, filter_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let filter: crate::federation::FederationDirectoryFilter =
+                serde_json::from_str(filter_json).map_err(|e| {
+                    PyValueError::new_err(format!("FederationDirectoryFilter decode: {e}"))
+                })?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        let topo = crate::federation::build_trust_topology(&*backend, &filter)
+                            .await
+                            .map_err(federation_err_to_py)?;
+                        serde_json::to_string(&topo).map_err(|e| {
+                            PyRuntimeError::new_err(format!("TrustTopology encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        let topo = crate::federation::build_trust_topology(&*backend, &filter)
+                            .await
+                            .map_err(federation_err_to_py)?;
+                        serde_json::to_string(&topo).map_err(|e| {
+                            PyRuntimeError::new_err(format!("TrustTopology encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v2.7.0 (CIRISPersist#104) — Delegation-graph BFS from
+    /// `from_key`. Returns a JSON
+    /// [`crate::federation::DelegationGraph`] with one
+    /// [`crate::federation::DelegationEdge`] per `delegates_to:*`
+    /// row reachable within `max_depth` (clamped to
+    /// [`crate::federation::MAX_DELEGATION_DEPTH`]).
+    ///
+    /// `withdraws` / `recants` rows are surfaced as a per-edge
+    /// [`crate::federation::WithdrawalEntry`] annotation, not
+    /// filtered out — UI policy decides whether to render the edge.
+    fn delegates_to_graph(
+        &self,
+        py: Python<'_>,
+        from_key: &str,
+        max_depth: usize,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let from_key = from_key.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        let graph = crate::federation::build_delegation_graph(
+                            &*backend, &from_key, max_depth,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)?;
+                        serde_json::to_string(&graph).map_err(|e| {
+                            PyRuntimeError::new_err(format!("DelegationGraph encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        let graph = crate::federation::build_delegation_graph(
+                            &*backend, &from_key, max_depth,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)?;
+                        serde_json::to_string(&graph).map_err(|e| {
+                            PyRuntimeError::new_err(format!("DelegationGraph encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v2.7.0 (CIRISPersist#104) — Audit-lineage walk for a
+    /// `trace_id`. Locates the `cirislens_audit_log` row whose
+    /// `subject_id == trace_id`, then walks back to genesis on the
+    /// matching tenant's chain and returns a JSON
+    /// [`crate::federation::AuditChainProof`].
+    ///
+    /// `head_signature` carries the JSON-serialized current
+    /// [`ciris_verify_core::transparency::SignedTreeHead`] for the
+    /// tenant when the Merkle hook is installed; `None` otherwise.
+    /// Empty `entries` (`[]`) when no audit row references the given
+    /// trace.
+    #[cfg(feature = "cirisaudit")]
+    fn audit_chain_proof(&self, py: Python<'_>, trace_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let backend = self.backend.clone();
+            let trace_id = trace_id.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    let proof = build_audit_chain_proof(&backend, &trace_id)
+                        .await
+                        .map_err(|e| PyRuntimeError::new_err(format!("audit_chain_proof: {e}")))?;
+                    serde_json::to_string(&proof).map_err(|e| {
+                        PyRuntimeError::new_err(format!("AuditChainProof encode: {e}"))
+                    })
+                })
+            })
+        })
+    }
+
     // ── v1.5.0 Phase H: trust-grant + Merkle transparency PyO3 surface ──
     //
     // 8 methods wrapping `federation::emit` (grant_trust /
@@ -13760,6 +13913,116 @@ impl PyEngine {
             })
         })
     }
+
+    // ── v2.7.0 (CIRISPersist#109) — PyCapsule cross-module accessors ──
+    //
+    // PyO3 `#[pyclass]` registration is per-extension-module. When
+    // `ciris_persist.abi3.so` and a sibling consumer wheel (e.g.
+    // `ciris_edge.abi3.so`) each statically compile persist's source,
+    // each module registers its own `PyTypeInfo` for `PyEngine` and any
+    // `#[pyclass]` handle struct. Python's type-identity check
+    // (`isinstance(x, PyEngine)`) fails across modules even though the
+    // underlying Rust structs are bit-identical from the same git tag —
+    // the production cohabitation init failure that CIRISEdge#22
+    // reported.
+    //
+    // The pure-Rust accessors `federation_directory()` / `outbound_queue()`
+    // / `keyring_signer()` (#95, Option-B `pub fn`s) work for sibling
+    // cdylibs that share persist's compiled-in type info. For
+    // Python-orchestrated cohabitation across separately-built wheels,
+    // `PyCapsule` is the right primitive — it's an opaque pointer with
+    // a name tag, no `PyTypeInfo` check, and the consumer extracts the
+    // wrapped value via `unsafe { capsule.reference() }`.
+    //
+    // The longer-term endpoint where Python disappears (#106 ships in
+    // 2.6.0) collapses these PyO3 layers entirely; until then, capsules
+    // are the bridge.
+
+    /// v2.7.0 (CIRISPersist#109) — cross-module accessor for the
+    /// federation directory. Returns a `PyCapsule` wrapping the shared
+    /// `Arc<dyn FederationDirectory>` the engine singleton holds.
+    ///
+    /// Consumer pattern (CIRISEdge):
+    /// ```ignore
+    /// let cap: Bound<PyCapsule> = engine
+    ///     .call_method0("federation_directory_capsule")?
+    ///     .downcast_into()?;
+    /// let arc: &Arc<dyn FederationDirectory> = unsafe { cap.reference() };
+    /// // Now call FederationDirectory trait methods directly in Rust.
+    /// ```
+    ///
+    /// Name tag: `ciris_persist::federation_directory`.
+    #[pyo3(name = "federation_directory_capsule")]
+    fn federation_directory_capsule_py<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyCapsule>> {
+        let arc: Arc<dyn crate::federation::FederationDirectory> = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.clone(),
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.clone(),
+        };
+        let name = std::ffi::CString::new("ciris_persist::federation_directory")
+            .expect("static name has no NUL bytes");
+        pyo3::types::PyCapsule::new(py, arc, Some(name)).map_err(|e| {
+            PyErr::new::<LensQueryError, _>(format!("federation_directory_capsule: {e}"))
+        })
+    }
+
+    /// v2.7.0 (CIRISPersist#109) — cross-module accessor for the
+    /// outbound queue substrate. Returns a `PyCapsule` wrapping the
+    /// shared `BackendDispatch` enum; consumer matches the variant and
+    /// calls [`OutboundQueue`](crate::outbound::OutboundQueue) trait
+    /// methods on the concrete backend.
+    ///
+    /// `OutboundQueue` is RPITIT (`impl Future + Send` returns) and
+    /// therefore NOT object-safe — `Arc<dyn OutboundQueue>` won't
+    /// compile. Wrapping `BackendDispatch` is the same dispatch-enum
+    /// pattern the Option-B pub-fn (#95) uses.
+    ///
+    /// Name tag: `ciris_persist::outbound_queue`.
+    #[pyo3(name = "outbound_queue_capsule")]
+    fn outbound_queue_capsule_py<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyCapsule>> {
+        let dispatch = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+        };
+        let name = std::ffi::CString::new("ciris_persist::outbound_queue")
+            .expect("static name has no NUL bytes");
+        pyo3::types::PyCapsule::new(py, dispatch, Some(name))
+            .map_err(|e| PyErr::new::<LensQueryError, _>(format!("outbound_queue_capsule: {e}")))
+    }
+
+    /// v2.7.0 (CIRISPersist#109) — cross-module accessor for the
+    /// federation keyring signer parts. Returns a `PyCapsule` wrapping
+    /// the same `KeyringSignerHandle` the Option-B pub-fn (#95)
+    /// returns: `Arc<dyn HardwareSigner>` + optional
+    /// `Arc<dyn PqcSigner>` + `key_id`. Consumer reuses the host's
+    /// already-loaded signer rather than re-bootstrapping the keyring
+    /// (docs/COHABITATION.md rule 1).
+    ///
+    /// Name tag: `ciris_persist::keyring_signer`.
+    #[pyo3(name = "keyring_signer_capsule")]
+    fn keyring_signer_capsule_py<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyCapsule>> {
+        let handle = crate::signing::KeyringSignerHandle {
+            signer: self.signer.clone(),
+            pqc_signer: self.local_signer.as_ref().and_then(|ls| ls.pqc_signer()),
+            key_id: self.signer_key_id.clone(),
+        };
+        let name = std::ffi::CString::new("ciris_persist::keyring_signer")
+            .expect("static name has no NUL bytes");
+        pyo3::types::PyCapsule::new(py, handle, Some(name))
+            .map_err(|e| PyErr::new::<LensQueryError, _>(format!("keyring_signer_capsule: {e}")))
+    }
 }
 
 /// v1.5.9 (CIRISPersist#59 #1) — encode a [`ClaimResult<Task>`] onto the
@@ -15190,6 +15453,236 @@ async fn boot_audit_self_verify(backend: &BackendDispatch) -> Result<BootAuditSu
     Ok(summary)
 }
 
+/// v2.7.0 (CIRISPersist#104) — build an
+/// [`crate::federation::AuditChainProof`] for a given `trace_id`.
+///
+/// Locates the row in `cirislens_audit_log` whose `subject_id` matches
+/// `trace_id` (the closest analog persist's audit schema has to a
+/// trace reference — the audit-log row's `subject_id` is the foreign
+/// key persist uses to bind audit entries to the artifacts they
+/// describe). Then walks the tenant's chain from sequence 1 up to the
+/// matching row's `sequence_number`, returning each entry in order.
+///
+/// If multiple audit rows reference the same `trace_id` (cross-tenant
+/// — AV-51 keeps them isolated), the proof chain for the FIRST
+/// tenant encountered is returned. Empty proof (`entries: []`) when
+/// no row matches.
+///
+/// `head_signature` is populated from
+/// [`crate::audit::AuditService::current_sth`] when the tenant's
+/// Merkle hook is installed; encoded as a JSON string of the
+/// [`ciris_verify_core::transparency::SignedTreeHead`]. `None` when
+/// no STH has been signed yet (Merkle hook disabled, or chain empty).
+#[cfg(feature = "cirisaudit")]
+async fn build_audit_chain_proof(
+    backend: &BackendDispatch,
+    trace_id: &str,
+) -> Result<crate::federation::AuditChainProof, String> {
+    use crate::audit::AuditService;
+    use crate::federation::{AuditChainEntry, AuditChainProof};
+
+    // Step 1 — locate (tenant_id, sequence_number) of the row whose
+    // subject_id == trace_id. We pull the lowest sequence_number
+    // because if the same trace_id is referenced multiple times
+    // (re-tries / supersessions) we want the EARLIEST one — that's
+    // the "first time persist saw this trace" anchor the UI cares
+    // about.
+    let located: Option<(String, i64)> = match backend {
+        BackendDispatch::Postgres(pg) => {
+            let client = pg.pool().get().await.map_err(|e| format!("pool: {e}"))?;
+            let rows = client
+                .query(
+                    "SELECT tenant_id, sequence_number \
+                     FROM cirislens.audit_log \
+                     WHERE subject_id = $1 \
+                     ORDER BY sequence_number ASC \
+                     LIMIT 1",
+                    &[&trace_id],
+                )
+                .await
+                .map_err(|e| format!("locate trace: {e}"))?;
+            rows.first().map(|r| {
+                (
+                    r.get::<_, String>("tenant_id"),
+                    r.get::<_, i64>("sequence_number"),
+                )
+            })
+        }
+        #[cfg(feature = "sqlite")]
+        BackendDispatch::Sqlite(sq) => {
+            let conn = sq.conn_handle();
+            let trace_id_owned = trace_id.to_owned();
+            tokio::task::spawn_blocking(move || -> Result<Option<(String, i64)>, String> {
+                let guard = conn.blocking_lock();
+                let mut stmt = guard
+                    .prepare(
+                        "SELECT tenant_id, sequence_number \
+                             FROM cirislens_audit_log \
+                             WHERE subject_id = ?1 \
+                             ORDER BY sequence_number ASC \
+                             LIMIT 1",
+                    )
+                    .map_err(|e| format!("prepare locate: {e}"))?;
+                let row = stmt
+                    .query_row([&trace_id_owned], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                    })
+                    .map(Some)
+                    .or_else(|e| match e {
+                        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                        other => Err(format!("locate trace: {other}")),
+                    })?;
+                Ok(row)
+            })
+            .await
+            .map_err(|e| format!("spawn_blocking: {e}"))??
+        }
+    };
+
+    let Some((tenant_id, anchor_seq)) = located else {
+        // No audit row references this trace_id — empty proof.
+        return Ok(AuditChainProof {
+            trace_id: trace_id.to_owned(),
+            entries: Vec::new(),
+            head_signature: None,
+        });
+    };
+
+    // Step 2 — walk audit_log from sequence 1 up to anchor_seq for
+    // the matched tenant. Mirrors `audit_verify_all_chains`'s
+    // per-backend dispatch.
+    let entries: Vec<AuditChainEntry> = match backend {
+        BackendDispatch::Postgres(pg) => {
+            let client = pg.pool().get().await.map_err(|e| format!("pool: {e}"))?;
+            let rows = client
+                .query(
+                    "SELECT sequence_number, tenant_id, action_type, recorded_at, \
+                            entry_hash, prev_hash \
+                     FROM cirislens.audit_log \
+                     WHERE tenant_id = $1 \
+                       AND sequence_number BETWEEN 1 AND $2 \
+                     ORDER BY sequence_number ASC",
+                    &[&tenant_id, &anchor_seq],
+                )
+                .await
+                .map_err(|e| format!("walk chain: {e}"))?;
+            let mut out = Vec::with_capacity(rows.len());
+            for r in rows {
+                let seq: i64 = r.get("sequence_number");
+                let tid: String = r.get("tenant_id");
+                let at: String = r.get("action_type");
+                let recorded_at: chrono::DateTime<chrono::Utc> = r.get("recorded_at");
+                let entry_hash: Vec<u8> = r.get("entry_hash");
+                let prev_hash: Vec<u8> = r.get("prev_hash");
+                let prev_hex = if seq == 1 {
+                    None
+                } else {
+                    Some(hex::encode(&prev_hash))
+                };
+                out.push(AuditChainEntry {
+                    sequence_number: seq,
+                    tenant_id: tid,
+                    action_type: at,
+                    timestamp: recorded_at,
+                    row_hash: hex::encode(&entry_hash),
+                    prev_hash: prev_hex,
+                });
+            }
+            out
+        }
+        #[cfg(feature = "sqlite")]
+        BackendDispatch::Sqlite(sq) => {
+            let conn = sq.conn_handle();
+            let tenant_owned = tenant_id.clone();
+            tokio::task::spawn_blocking(move || -> Result<Vec<AuditChainEntry>, String> {
+                let guard = conn.blocking_lock();
+                let mut stmt = guard
+                    .prepare(
+                        "SELECT sequence_number, tenant_id, action_type, recorded_at, \
+                                    entry_hash, prev_hash \
+                             FROM cirislens_audit_log \
+                             WHERE tenant_id = ?1 \
+                               AND sequence_number BETWEEN 1 AND ?2 \
+                             ORDER BY sequence_number ASC",
+                    )
+                    .map_err(|e| format!("prepare walk: {e}"))?;
+                let row_iter = stmt
+                    .query_map(rusqlite::params![tenant_owned, anchor_seq], |r| {
+                        let seq: i64 = r.get(0)?;
+                        let tid: String = r.get(1)?;
+                        let at: String = r.get(2)?;
+                        let recorded_at: String = r.get(3)?;
+                        let entry_hash: Vec<u8> = r.get(4)?;
+                        let prev_hash: Vec<u8> = r.get(5)?;
+                        Ok((seq, tid, at, recorded_at, entry_hash, prev_hash))
+                    })
+                    .map_err(|e| format!("walk query: {e}"))?;
+                let mut out: Vec<AuditChainEntry> = Vec::new();
+                for r in row_iter {
+                    let (seq, tid, at, recorded_at_str, entry_hash, prev_hash) =
+                        r.map_err(|e| format!("walk row: {e}"))?;
+                    // SQLite stores recorded_at as TEXT (RFC3339).
+                    let normalized = if recorded_at_str.contains('T') {
+                        recorded_at_str.clone()
+                    } else {
+                        format!("{}+00:00", recorded_at_str.replacen(' ', "T", 1))
+                    };
+                    let ts = chrono::DateTime::parse_from_rfc3339(&normalized)
+                        .map_err(|e| format!("recorded_at parse: {e}"))?
+                        .with_timezone(&chrono::Utc);
+                    let prev_hex = if seq == 1 {
+                        None
+                    } else {
+                        Some(hex::encode(&prev_hash))
+                    };
+                    out.push(AuditChainEntry {
+                        sequence_number: seq,
+                        tenant_id: tid,
+                        action_type: at,
+                        timestamp: ts,
+                        row_hash: hex::encode(&entry_hash),
+                        prev_hash: prev_hex,
+                    });
+                }
+                Ok(out)
+            })
+            .await
+            .map_err(|e| format!("spawn_blocking: {e}"))??
+        }
+    };
+
+    // Step 3 — surface the current STH if one exists (stretch goal).
+    // We tolerate `NotImplemented` / `None` cleanly — UIs that don't
+    // need the proof can ignore the field.
+    let head_signature: Option<String> = match backend {
+        BackendDispatch::Postgres(pg) => match pg.current_sth(&tenant_id).await {
+            Ok(Some(sth)) => Some(
+                serde_json::to_string(&sth).map_err(|e| format!("SignedTreeHead encode: {e}"))?,
+            ),
+            Ok(None) => None,
+            Err(_) => None,
+        },
+        #[cfg(feature = "sqlite")]
+        BackendDispatch::Sqlite(sq) => {
+            let audit = crate::audit::sqlite::SqliteAuditBackend::new(sq.conn_handle());
+            match audit.current_sth(&tenant_id).await {
+                Ok(Some(sth)) => Some(
+                    serde_json::to_string(&sth)
+                        .map_err(|e| format!("SignedTreeHead encode: {e}"))?,
+                ),
+                Ok(None) => None,
+                Err(_) => None,
+            }
+        }
+    };
+
+    Ok(AuditChainProof {
+        trace_id: trace_id.to_owned(),
+        entries,
+        head_signature,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -15740,6 +16233,234 @@ mod tests {
             h.pqc_signer.is_none(),
             "non-PQC LocalSigner — pqc_signer must be None"
         );
+    }
+
+    // ── v2.7.0 (CIRISPersist#109) — PyCapsule accessor tests ──────
+    //
+    // The capsule round-trip test is on Edge's side (CIRISEdge#22 will
+    // load both wheels separately and verify init_edge_runtime can
+    // extract the capsules via PyAny.call_method0). Persist's local
+    // verification is compile + clippy clean on the three accessors —
+    // they're 8 lines each, no logic to regression-test.
+
+    // ── #104 audit_chain_proof helper tests ─────────────────────────
+    //
+    // These exercise `build_audit_chain_proof` directly (the helper
+    // the `audit_chain_proof` pymethod delegates to) so we hit the
+    // backend dispatch + the per-backend audit-log walk without
+    // standing up a real PyEngine — same shape as the SQLite/PG
+    // topology tests in `src/store/{sqlite,postgres}.rs`.
+
+    #[cfg(all(feature = "sqlite", feature = "cirisaudit"))]
+    async fn seed_audit_entries_sqlite(
+        audit: &crate::audit::sqlite::SqliteAuditBackend,
+        tenant: &str,
+        trace_id: &str,
+        n: i64,
+    ) -> Vec<u8> {
+        use crate::audit::types::AuditEntry;
+        use crate::audit::verify::canonical_bytes_for_entry;
+        use crate::audit::AuditService;
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        use ed25519_dalek::Signer;
+        use ed25519_dalek::SigningKey;
+        let key = SigningKey::from_bytes(&[0xCE; 32]);
+        let pubkey_b64 = B64.encode(key.verifying_key().to_bytes());
+        let mut prev_hash = crate::audit::GENESIS_PREV_HASH.to_vec();
+        let mut last_hash = prev_hash.clone();
+        for i in 1..=n {
+            let subj = if i == n {
+                trace_id.to_owned()
+            } else {
+                format!("seed-{i}")
+            };
+            // Truncate to microseconds — the SQLite layer's
+            // `parse_datetime` round-trip canonicalises at micro
+            // resolution, and the audit chain's `entry_hash` is
+            // computed from canonical bytes, so anything finer
+            // would break the chain check on re-derivation.
+            let ts = chrono::Utc::now()
+                .with_timezone(&chrono::Utc)
+                .timestamp_micros();
+            let recorded_at = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap();
+            let mut e = AuditEntry {
+                entry_id: uuid::Uuid::new_v4().to_string(),
+                sequence_number: i,
+                tenant_id: tenant.to_owned(),
+                actor_id: pubkey_b64.clone(),
+                action_type: "system_event".into(),
+                subject_kind: "task".into(),
+                subject_id: subj,
+                payload: serde_json::json!({"i": i}),
+                prev_hash: prev_hash.clone(),
+                entry_hash: vec![],
+                recorded_at,
+                signature: String::new(),
+            };
+            let h = crate::audit::verify::compute_entry_hash(&e).unwrap();
+            e.entry_hash = h.to_vec();
+            let canon = canonical_bytes_for_entry(&e).unwrap();
+            let sig = key.sign(&canon);
+            e.signature = B64.encode(sig.to_bytes());
+            last_hash = e.entry_hash.clone();
+            audit.record_entry(e).await.unwrap();
+            prev_hash = last_hash.clone();
+        }
+        last_hash
+    }
+
+    /// #104 — audit_chain_proof walks genesis → trace row on SQLite.
+    #[cfg(all(feature = "sqlite", feature = "cirisaudit"))]
+    #[tokio::test]
+    async fn audit_chain_proof_walks_to_trace_sqlite() {
+        let runtime = tokio::runtime::Handle::current();
+        let _ = runtime;
+        let backend = Arc::new(
+            SqliteBackend::open_in_memory()
+                .await
+                .expect("open in-memory sqlite"),
+        );
+        backend.run_migrations().await.expect("migrations");
+        let audit = crate::audit::sqlite::SqliteAuditBackend::new(backend.conn_handle());
+        let tenant = format!("ap-tenant-{}", uuid::Uuid::new_v4().simple());
+        let trace_id = format!("trace-104-{}", uuid::Uuid::new_v4().simple());
+        seed_audit_entries_sqlite(&audit, &tenant, &trace_id, 3).await;
+        let dispatch = super::BackendDispatch::Sqlite(backend);
+        let proof = super::build_audit_chain_proof(&dispatch, &trace_id)
+            .await
+            .expect("audit_chain_proof");
+        assert_eq!(proof.trace_id, trace_id);
+        assert_eq!(proof.entries.len(), 3);
+        assert_eq!(proof.entries[0].sequence_number, 1);
+        assert_eq!(proof.entries[0].tenant_id, tenant);
+        assert!(
+            proof.entries[0].prev_hash.is_none(),
+            "genesis row prev_hash is None"
+        );
+        assert_eq!(proof.entries.last().unwrap().sequence_number, 3);
+        assert!(
+            proof.entries[1].prev_hash.is_some(),
+            "non-genesis prev_hash is hex"
+        );
+        // head_signature: tolerant — no Merkle signer installed in this
+        // fixture, so the field is None. The assertion is loose so the
+        // test stays green if a downstream change wires a signer
+        // through the default test path.
+        assert!(proof.head_signature.is_none());
+    }
+
+    /// #104 — audit_chain_proof returns an empty-entries proof when
+    /// no row references the given trace_id.
+    #[cfg(all(feature = "sqlite", feature = "cirisaudit"))]
+    #[tokio::test]
+    async fn audit_chain_proof_empty_sqlite() {
+        let backend = Arc::new(
+            SqliteBackend::open_in_memory()
+                .await
+                .expect("open in-memory sqlite"),
+        );
+        backend.run_migrations().await.expect("migrations");
+        let dispatch = super::BackendDispatch::Sqlite(backend);
+        let proof = super::build_audit_chain_proof(&dispatch, "no-such-trace")
+            .await
+            .expect("audit_chain_proof");
+        assert_eq!(proof.trace_id, "no-such-trace");
+        assert!(proof.entries.is_empty());
+        assert!(proof.head_signature.is_none());
+    }
+
+    /// #104 — audit_chain_proof against Postgres. Skipped when
+    /// `CIRIS_PERSIST_TEST_PG_URL` is unset.
+    #[cfg(all(feature = "postgres", feature = "cirisaudit"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn audit_chain_proof_walks_to_trace_pg() {
+        use crate::audit::types::AuditEntry;
+        use crate::audit::verify::canonical_bytes_for_entry;
+        use crate::audit::AuditService;
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        use ed25519_dalek::Signer;
+        use ed25519_dalek::SigningKey;
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = Arc::new(
+            PostgresBackend::connect(&dsn)
+                .await
+                .expect("connect postgres"),
+        );
+        backend.run_migrations().await.expect("migrations");
+        let key = SigningKey::from_bytes(&[0xCF; 32]);
+        let pubkey_b64 = B64.encode(key.verifying_key().to_bytes());
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let tenant = format!("ap-pg-{suffix}");
+        let trace_id = format!("trace-pg-104-{suffix}");
+        let mut prev_hash = crate::audit::GENESIS_PREV_HASH.to_vec();
+        for i in 1..=3i64 {
+            let subj = if i == 3 {
+                trace_id.clone()
+            } else {
+                format!("seed-pg-{i}")
+            };
+            let ts = chrono::Utc::now().timestamp_micros();
+            let recorded_at = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap();
+            let mut e = AuditEntry {
+                entry_id: uuid::Uuid::new_v4().to_string(),
+                sequence_number: i,
+                tenant_id: tenant.clone(),
+                actor_id: pubkey_b64.clone(),
+                action_type: "system_event".into(),
+                subject_kind: "task".into(),
+                subject_id: subj,
+                payload: serde_json::json!({"i": i}),
+                prev_hash: prev_hash.clone(),
+                entry_hash: vec![],
+                recorded_at,
+                signature: String::new(),
+            };
+            let h = crate::audit::verify::compute_entry_hash(&e).unwrap();
+            e.entry_hash = h.to_vec();
+            let canon = canonical_bytes_for_entry(&e).unwrap();
+            let sig = key.sign(&canon);
+            e.signature = B64.encode(sig.to_bytes());
+            prev_hash = e.entry_hash.clone();
+            backend.record_entry(e).await.expect("record");
+        }
+        let dispatch = super::BackendDispatch::Postgres(backend);
+        let proof = super::build_audit_chain_proof(&dispatch, &trace_id)
+            .await
+            .expect("audit_chain_proof");
+        assert_eq!(proof.trace_id, trace_id);
+        assert_eq!(proof.entries.len(), 3);
+        assert_eq!(proof.entries[0].sequence_number, 1);
+        assert!(proof.entries[0].prev_hash.is_none());
+        assert!(proof.entries.last().unwrap().prev_hash.is_some());
+    }
+
+    /// #104 — Postgres parity for the empty case.
+    #[cfg(all(feature = "postgres", feature = "cirisaudit"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn audit_chain_proof_empty_pg() {
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = Arc::new(
+            PostgresBackend::connect(&dsn)
+                .await
+                .expect("connect postgres"),
+        );
+        backend.run_migrations().await.expect("migrations");
+        let dispatch = super::BackendDispatch::Postgres(backend);
+        let proof = super::build_audit_chain_proof(&dispatch, "no-such-trace-pg")
+            .await
+            .expect("audit_chain_proof");
+        assert!(proof.entries.is_empty());
+        assert!(proof.head_signature.is_none());
     }
 }
 

@@ -45,6 +45,7 @@ pub mod rooting;
 pub mod schema_resolver;
 #[cfg(feature = "sqlite")]
 pub mod sqlite_open;
+pub mod topology;
 pub mod trust_grant;
 pub mod types;
 
@@ -88,6 +89,11 @@ pub use schema_resolver::{
 };
 #[cfg(feature = "sqlite")]
 pub use sqlite_open::FederationDirectorySqlite;
+pub use topology::{
+    build_delegation_graph, build_trust_topology, AuditChainEntry, AuditChainProof, DelegationEdge,
+    DelegationGraph, EdgeType, FederationDirectoryFilter, TrustEdge, TrustNode, TrustTopology,
+    WithdrawalEntry, MAX_DELEGATION_DEPTH,
+};
 pub use types::{
     Attestation, HybridPendingRow, KeyRecord, Revocation, SignedAttestation, SignedKeyRecord,
     SignedRevocation, TrustFilter, TrustGrant, TrustRelationship, TrustRow, TrustType,

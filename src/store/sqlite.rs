@@ -9605,4 +9605,429 @@ mod tests {
             "expected trigger to fire, got: {err}"
         );
     }
+
+    // ─── #104 topology aggregate-query tests ────────────────────────
+
+    /// Build an `Attestation` of the given `attestation_type` with a
+    /// stable test envelope. The wire-vocabulary tests below use this
+    /// to seed `delegates_to` / `withdraws` / `recants` rows alongside
+    /// `scores` rows.
+    #[allow(clippy::too_many_arguments)]
+    fn topo_attestation(
+        attesting: &str,
+        attested: &str,
+        atype: &str,
+        dimension: Option<&str>,
+        scope: Option<&str>,
+        evidence: &[&str],
+        weight: Option<f64>,
+        asserted_at: chrono::DateTime<chrono::Utc>,
+    ) -> Attestation {
+        let mut env = serde_json::Map::new();
+        if let Some(d) = dimension {
+            env.insert("dimension".into(), serde_json::Value::String(d.into()));
+        }
+        if let Some(sc) = scope {
+            env.insert("scope".into(), serde_json::Value::String(sc.into()));
+        }
+        if !evidence.is_empty() {
+            env.insert(
+                "evidence_refs".into(),
+                serde_json::Value::Array(
+                    evidence
+                        .iter()
+                        .map(|e| serde_json::Value::String((*e).into()))
+                        .collect(),
+                ),
+            );
+        }
+        // `scores` admission gate requires a versioned dimension —
+        // the helper picks `identity_binding:v1` when no dimension is
+        // provided for a scores row so tests don't have to spell it.
+        if atype == crate::federation::types::attestation_type::SCORES && dimension.is_none() {
+            env.insert(
+                "dimension".into(),
+                serde_json::Value::String("identity_binding:v1".into()),
+            );
+            env.insert(
+                "score".into(),
+                serde_json::Value::Number(serde_json::Number::from_f64(1.0).unwrap()),
+            );
+            env.insert(
+                "confidence".into(),
+                serde_json::Value::Number(serde_json::Number::from_f64(0.9).unwrap()),
+            );
+        }
+        Attestation {
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            attesting_key_id: attesting.into(),
+            attested_key_id: attested.into(),
+            attestation_type: atype.into(),
+            weight,
+            asserted_at,
+            expires_at: None,
+            attestation_envelope: serde_json::Value::Object(env),
+            original_content_hash: "abc123".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: attesting.into(),
+            scrub_timestamp: asserted_at,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+        }
+    }
+
+    /// #104 — federation_directory_query returns a non-empty
+    /// TrustTopology with direct edges when only `scores` rows exist.
+    #[tokio::test]
+    async fn federation_directory_query_topology_direct_sqlite() {
+        use crate::federation::types::attestation_type;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        // Three keys: granter, grantee, third.
+        for (k, ident) in [
+            ("topo-granter", "agent-a"),
+            ("topo-grantee", "agent-b"),
+            ("topo-third", "agent-c"),
+        ] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, ident, k),
+                })
+                .await
+                .unwrap();
+        }
+        let when = chrono::Utc::now();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: topo_attestation(
+                    "topo-granter",
+                    "topo-grantee",
+                    attestation_type::SCORES,
+                    Some("identity_binding:v1"),
+                    None,
+                    &[],
+                    Some(2.5),
+                    when,
+                ),
+            })
+            .await
+            .unwrap();
+
+        let topo = crate::federation::build_trust_topology(
+            &backend,
+            &crate::federation::FederationDirectoryFilter {
+                granter_key: Some("topo-granter".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(topo.edges.len(), 1, "exactly one direct edge");
+        let e = &topo.edges[0];
+        assert_eq!(e.edge_type, crate::federation::EdgeType::Direct);
+        assert_eq!(e.from_key, "topo-grantee");
+        assert_eq!(e.to_key, "topo-granter");
+        assert_eq!(e.purpose, "identity_binding:v1");
+        assert!((e.weight - 2.5).abs() < 1e-9);
+        assert!(e.revoked_at.is_none());
+        assert_eq!(topo.nodes.len(), 2);
+        let kinds: Vec<&str> = topo.nodes.iter().map(|n| n.key_id.as_str()).collect();
+        assert!(kinds.contains(&"topo-granter"));
+        assert!(kinds.contains(&"topo-grantee"));
+    }
+
+    /// #104 — adversarial edges (a withdraws/recants row by the
+    /// granter against the grantee) are filtered out by default but
+    /// surface when `include_revoked=true`.
+    #[tokio::test]
+    async fn federation_directory_query_adversarial_include_revoked_sqlite() {
+        use crate::federation::types::attestation_type;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for (k, ident) in [("adv-granter", "agent-a"), ("adv-grantee", "agent-b")] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, ident, k),
+                })
+                .await
+                .unwrap();
+        }
+        let when = chrono::Utc::now();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: topo_attestation(
+                    "adv-granter",
+                    "adv-grantee",
+                    attestation_type::SCORES,
+                    Some("identity_binding:v1"),
+                    None,
+                    &[],
+                    Some(1.0),
+                    when,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: topo_attestation(
+                    "adv-granter",
+                    "adv-grantee",
+                    attestation_type::WITHDRAWS,
+                    None,
+                    None,
+                    &[],
+                    None,
+                    when + chrono::Duration::seconds(1),
+                ),
+            })
+            .await
+            .unwrap();
+
+        // Default filter: revoked edges are dropped.
+        let topo = crate::federation::build_trust_topology(
+            &backend,
+            &crate::federation::FederationDirectoryFilter {
+                granter_key: Some("adv-granter".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(topo.edges.is_empty(), "revoked edge filtered by default");
+
+        // With include_revoked=true the adversarial edge is surfaced.
+        let topo = crate::federation::build_trust_topology(
+            &backend,
+            &crate::federation::FederationDirectoryFilter {
+                granter_key: Some("adv-granter".into()),
+                include_revoked: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(topo.edges.len(), 1);
+        assert_eq!(
+            topo.edges[0].edge_type,
+            crate::federation::EdgeType::Adversarial
+        );
+        assert!(
+            topo.edges[0].revoked_at.is_some(),
+            "adversarial edge carries revoked_at"
+        );
+    }
+
+    /// #104 — empty-result test: no attestations matching the filter
+    /// → empty edges + empty nodes, no error.
+    #[tokio::test]
+    async fn federation_directory_query_empty_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let topo = crate::federation::build_trust_topology(
+            &backend,
+            &crate::federation::FederationDirectoryFilter {
+                granter_key: Some("nonexistent-key".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(topo.edges.is_empty());
+        assert!(topo.nodes.is_empty());
+    }
+
+    /// #104 — filter with neither granter nor grantee set is
+    /// InvalidArgument.
+    #[tokio::test]
+    async fn federation_directory_query_requires_filter_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let err = crate::federation::build_trust_topology(
+            &backend,
+            &crate::federation::FederationDirectoryFilter::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, crate::federation::Error::InvalidArgument(_)));
+    }
+
+    /// #104 — delegates_to_graph BFS walks one level + carries
+    /// scope + evidence_refs from the envelope.
+    #[tokio::test]
+    async fn delegates_to_graph_one_level_sqlite() {
+        use crate::federation::types::attestation_type;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for (k, ident) in [("del-root", "agent-a"), ("del-child", "agent-b")] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, ident, k),
+                })
+                .await
+                .unwrap();
+        }
+        let when = chrono::Utc::now();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: topo_attestation(
+                    "del-root",
+                    "del-child",
+                    attestation_type::DELEGATES_TO,
+                    None,
+                    Some("manifest:bundle-x"),
+                    &["sha256:abcd1234", "https://example.test/ev/1"],
+                    None,
+                    when,
+                ),
+            })
+            .await
+            .unwrap();
+        let graph = crate::federation::build_delegation_graph(&backend, "del-root", 4)
+            .await
+            .unwrap();
+        assert_eq!(graph.root_key, "del-root");
+        assert_eq!(graph.edges.len(), 1);
+        let e = &graph.edges[0];
+        assert_eq!(e.from_key, "del-root");
+        assert_eq!(e.to_key, "del-child");
+        assert_eq!(e.scope, "manifest:bundle-x");
+        assert_eq!(e.depth, 1);
+        assert_eq!(e.evidence_refs.len(), 2);
+        assert!(e.withdrawn_by.is_none());
+    }
+
+    /// #104 — delegates_to_graph BFS respects cycles + depth bound.
+    #[tokio::test]
+    async fn delegates_to_graph_cycles_and_depth_sqlite() {
+        use crate::federation::types::attestation_type;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        // Cycle: a → b → a
+        for (k, ident) in [("cyc-a", "agent-a"), ("cyc-b", "agent-b")] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, ident, k),
+                })
+                .await
+                .unwrap();
+        }
+        let when = chrono::Utc::now();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: topo_attestation(
+                    "cyc-a",
+                    "cyc-b",
+                    attestation_type::DELEGATES_TO,
+                    None,
+                    Some("*"),
+                    &[],
+                    None,
+                    when,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: topo_attestation(
+                    "cyc-b",
+                    "cyc-a",
+                    attestation_type::DELEGATES_TO,
+                    None,
+                    Some("*"),
+                    &[],
+                    None,
+                    when,
+                ),
+            })
+            .await
+            .unwrap();
+        let graph = crate::federation::build_delegation_graph(&backend, "cyc-a", 8)
+            .await
+            .unwrap();
+        // Both edges discovered; the cycle does NOT cause a second
+        // visit (visited set keeps each granter from being expanded twice).
+        assert_eq!(graph.edges.len(), 2);
+        // Each granter expanded exactly once.
+        let from_a: usize = graph.edges.iter().filter(|e| e.from_key == "cyc-a").count();
+        let from_b: usize = graph.edges.iter().filter(|e| e.from_key == "cyc-b").count();
+        assert_eq!(from_a, 1);
+        assert_eq!(from_b, 1);
+    }
+
+    /// #104 — delegates_to_graph annotates an edge with `withdrawn_by`
+    /// when the granter has issued a retraction.
+    #[tokio::test]
+    async fn delegates_to_graph_withdraws_annotation_sqlite() {
+        use crate::federation::types::attestation_type;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for (k, ident) in [("w-root", "agent-a"), ("w-child", "agent-b")] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, ident, k),
+                })
+                .await
+                .unwrap();
+        }
+        let when = chrono::Utc::now();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: topo_attestation(
+                    "w-root",
+                    "w-child",
+                    attestation_type::DELEGATES_TO,
+                    None,
+                    Some("*"),
+                    &[],
+                    None,
+                    when,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: topo_attestation(
+                    "w-root",
+                    "w-child",
+                    attestation_type::RECANTS,
+                    None,
+                    None,
+                    &[],
+                    None,
+                    when + chrono::Duration::seconds(2),
+                ),
+            })
+            .await
+            .unwrap();
+        let graph = crate::federation::build_delegation_graph(&backend, "w-root", 4)
+            .await
+            .unwrap();
+        assert_eq!(graph.edges.len(), 1);
+        let entry = graph.edges[0].withdrawn_by.as_ref().expect("withdrawn_by");
+        assert_eq!(entry.kind, attestation_type::RECANTS);
+        assert_eq!(entry.key_id, "w-root");
+    }
+
+    /// #104 — empty delegates_to_graph when the root has no
+    /// outbound delegations.
+    #[tokio::test]
+    async fn delegates_to_graph_empty_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("solo-key", "agent-a", "solo-key"),
+            })
+            .await
+            .unwrap();
+        let graph = crate::federation::build_delegation_graph(&backend, "solo-key", 4)
+            .await
+            .unwrap();
+        assert!(graph.edges.is_empty());
+        assert_eq!(graph.root_key, "solo-key");
+    }
 }
