@@ -5,6 +5,52 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [2.11.0] — 2026-05-28
+
+**`#115` `blob_storage_capsule` + CIRISVerify pin v3.7.0 → v3.9.0.**
+
+### `#115` — fifth capsule on the cross-module cohabitation accessor family
+
+`BlobStorage` is RPITIT (`impl Future + Send` returns) and therefore
+NOT object-safe — `Arc<dyn BlobStorage>` won't compile. New
+`blob_storage_capsule()` `#[pymethod]` wraps the engine's
+`BackendDispatch` enum (same dispatch-enum pattern
+`outbound_queue_capsule` uses from #109); consumer matches the variant
+and calls `BlobStorage` trait methods on the concrete backend. Name
+tag `ciris_persist::blob_storage`.
+
+Unblocks **CIRISNodeCore#11** (`install_node_mode_serving`'s PyO3
+wrapper) — same cross-module identity problem the rest of the
+capsule family solves.
+
+The cohabitation accessor surface on `PyEngine` is now:
+
+| Capsule | Wraps | Issue |
+|---|---|---|
+| `federation_directory_capsule` | `Arc<dyn FederationDirectory>` | #109 |
+| `outbound_queue_capsule` | `BackendDispatch` (OutboundQueue is RPITIT) | #109 |
+| `keyring_signer_capsule` | `KeyringSignerHandle` | #109 |
+| `runtime_handle_capsule` | `tokio::runtime::Handle` | #111 |
+| `blob_storage_capsule` | `BackendDispatch` (BlobStorage is RPITIT) | #115 |
+
+### CIRISVerify pin v3.7.0 → v3.9.0
+
+CIRISVerify v3.8.0 added the Phase 1 `AttestBundle.provenance` carrier
+for `skill_imports` / `build_manifest_per_locale`; v3.9.0 (Phase 2,
+shipped today) added the verifiers: new `skill_import.rs` (with
+`§3.2.1.1 SkillImportManifest::canonical_bytes`) and
+`locale_merkle.rs` (with `§3.2.1.2 LocaleLeaf::leaf_hash` + RFC 6962
+0x00/0x01 + padding). Persist doesn't directly consume these verifier
+modules (they're Registry-facing), but the federation-wide consistency
+matters — pinning persist's transitive `ciris-verify` to v3.9.0 means
+consumers of persist's wheel get the new verifier surface for free.
+
+- Cargo.toml: 6 `tag = "v3.7.0"` sites → `"v3.9.0"`
+  (ciris-keyring/ciris-verify-core/ciris-crypto across base +
+  per-target Linux/iOS/Android tables).
+- pyproject.toml `Requires-Dist`: `ciris-verify>=3.7.0,<4` →
+  `>=3.9.0,<4`.
+
 ## [2.10.0] — 2026-05-28
 
 **`#114` — typed `Goal` primitive + storage + wire, with M-1 alignment as a structural construction-time invariant.**

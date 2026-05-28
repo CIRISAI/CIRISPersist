@@ -14280,6 +14280,39 @@ impl PyEngine {
         pyo3::types::PyCapsule::new(py, handle, Some(name))
             .map_err(|e| PyErr::new::<LensQueryError, _>(format!("runtime_handle_capsule: {e}")))
     }
+
+    /// v2.11.0 (CIRISPersist#115) — cross-module accessor for the blob
+    /// storage substrate. Returns a `PyCapsule` wrapping the shared
+    /// `BackendDispatch` enum; consumer matches the variant and calls
+    /// [`BlobStorage`](crate::federation::blobs::BlobStorage) trait
+    /// methods on the concrete backend.
+    ///
+    /// `BlobStorage` is RPITIT (`impl Future + Send` returns) and
+    /// therefore NOT object-safe — `Arc<dyn BlobStorage>` won't
+    /// compile. Wrapping `BackendDispatch` is the same dispatch-enum
+    /// pattern `outbound_queue_capsule` (#109) uses.
+    ///
+    /// Unblocks CIRISNodeCore#11 (`install_node_mode_serving`'s PyO3
+    /// wrapper) — same cross-module identity problem the rest of the
+    /// capsule family solves.
+    ///
+    /// Name tag: `ciris_persist::blob_storage`.
+    #[pyo3(name = "blob_storage_capsule")]
+    fn blob_storage_capsule_py<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyCapsule>> {
+        let dispatch = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+        };
+        let name = std::ffi::CString::new("ciris_persist::blob_storage")
+            .expect("static name has no NUL bytes");
+        pyo3::types::PyCapsule::new(py, dispatch, Some(name))
+            .map_err(|e| PyErr::new::<LensQueryError, _>(format!("blob_storage_capsule: {e}")))
+    }
 }
 
 /// v1.5.9 (CIRISPersist#59 #1) — encode a [`ClaimResult<Task>`] onto the

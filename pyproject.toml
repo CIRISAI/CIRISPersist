@@ -40,7 +40,7 @@ classifiers = [
 # is now the v3.x major (build-sign / build-verify CLIs); pin to
 # `<4` to follow semver-major.
 dependencies = [
-    "ciris-verify>=3.7.0,<4",
+    "ciris-verify>=3.9.0,<4",
 ]
 dynamic = ["version"]
 
