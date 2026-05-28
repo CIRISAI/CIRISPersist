@@ -14353,6 +14353,10 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         | crate::federation::Error::SignatureInvalid(_) => PyValueError::new_err(kind),
         // Conflict → ValueError too; lens-side maps to 409.
         crate::federation::Error::Conflict(_) => PyValueError::new_err(kind),
+        // v2.4.0 (CIRISPersist#102 Ask 3) — admission-gate rejections
+        // are caller-fault malformed-content; ValueError (4xx).
+        crate::federation::Error::AccordDimensionRequiresAccordHolder { .. }
+        | crate::federation::Error::DimensionRejected { .. } => PyValueError::new_err(kind),
         // Rate-limit → RuntimeError; lens maps to 429.
         crate::federation::Error::RateLimited { .. } => PyRuntimeError::new_err(kind),
         // Server-fault → RuntimeError (5xx).

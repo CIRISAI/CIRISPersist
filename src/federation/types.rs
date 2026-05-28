@@ -77,6 +77,13 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Identity classification per persist's `identity_type` column.
+///
+/// **Vocabulary stability (v2.4.0, CIRISPersist#102 Ask 1).** The
+/// column is free-form TEXT in the schema — consumers may extend.
+/// Persist publishes these five values as the canonical vocabulary
+/// per FSD-002 §7 (HUMANITY_ACCORD layer); see
+/// `docs/FEDERATION_DIRECTORY.md` §"Schema sketch" for per-value
+/// rationale.
 pub mod identity_type {
     /// Agent trace-signing keys.
     pub const AGENT: &str = "agent";
@@ -86,6 +93,13 @@ pub mod identity_type {
     pub const STEWARD: &str = "steward";
     /// Per-org partner keys for commercial onboarding.
     pub const PARTNER: &str = "partner";
+    /// HUMANITY_ACCORD key material — the three hardware-attested
+    /// human-held kill-switch keys per FSD-002 §7.2. Only rows with
+    /// this identity_type may emit `accord:*` attestations
+    /// (FSD-002 §4.1 / §7.1 — the federation's one constitutional
+    /// asymmetry); the admission gate in [`super::admission`]
+    /// enforces this at write time.
+    pub const ACCORD_HOLDER: &str = "accord_holder";
 }
 
 /// Algorithm strings matching persist's `algorithm` column.
@@ -107,21 +121,53 @@ pub mod algorithm {
     pub const HYBRID: &str = "hybrid";
 }
 
-/// Attestation type strings (string set is open — consumers may invent
-/// new types as trust models evolve).
+/// Attestation type vocabulary — the **one workhorse + four
+/// structural** primitives per FSD-002 §2.
+///
+/// **v2.4.0 clean-break replacement (CIRISPersist#102 Ask 2).** The
+/// pre-v2.4.0 vocabulary (`vouches_for` / `witnesses` / `referred` /
+/// `delegated_to`) was speculative and never reached a downstream
+/// consumer — persist was the only writer and the wire shape was
+/// unfinalized. The 2.4.0 cut replaces the constants in lockstep
+/// with the FSD-002 unified-primitive model; no migration is needed
+/// (the column is free-form TEXT) and no deprecation aliases are
+/// kept (per `feedback_clean_break_renames.md` — alias scaffolding
+/// is rejected; rename + remove ship in the same cut, flagged in
+/// CHANGELOG).
+///
+/// **Why `recants` is distinct from `withdraws`** (per FSD-002 v1.2
+/// PRIOR_ART_SCAN Bucket 1): no prior wire format (PGP / SPKI /
+/// W3C VC) typed *epistemic-error-admission* as a wire primitive.
+/// `withdraws` is "I no longer stand behind this attestation"
+/// (good-faith retraction; no claim that it was false at issuance);
+/// `recants` is "this attestation was false at issuance — I admit
+/// epistemic error". Persist keeps them distinct on the wire even
+/// when consumer UIs collapse them.
 pub mod attestation_type {
-    /// "I have personally verified this key represents identity X."
-    /// High-weight; what stewards do.
-    pub const VOUCHES_FOR: &str = "vouches_for";
-    /// "I observed this key in production traffic at time T, no
-    /// anomalies." Low-weight; what passive observers do.
-    pub const WITNESSES: &str = "witnesses";
-    /// "I trust the key, and I trust its referrer to vouch for it."
-    /// Transitive; weight decays per PoB §4.
-    pub const REFERRED: &str = "referred";
-    /// "This key may sign on my behalf within scope S." Used by
-    /// hardware-backed re-signers and steward-key rotation.
-    pub const DELEGATED_TO: &str = "delegated_to";
+    /// The unified workhorse primitive per FSD-002 §2.1. Every claim
+    /// about an entity — positive / negative, identity / capability /
+    /// behavior / state / commitment — is a `scores` attestation on
+    /// a named `dimension` with `score ∈ [-1, +1]` + `confidence ∈
+    /// [0, 1]` + optional evidence refs in the envelope.
+    pub const SCORES: &str = "scores";
+    /// Structural primitive: "A authorizes B to sign on A's behalf
+    /// within scope S" (FSD-002 §2.2.1). Bounded scope; default
+    /// transitive depth = 2.
+    pub const DELEGATES_TO: &str = "delegates_to";
+    /// Structural primitive: "this row replaces a prior attestation
+    /// by the same attester" (FSD-002 §2.2.2). Consumers walking
+    /// history apply latest-wins per (attesting_key_id, dimension,
+    /// attested_key_id).
+    pub const SUPERSEDES: &str = "supersedes";
+    /// Structural primitive: "I retract my prior attestation"
+    /// (FSD-002 §2.2.3). Does NOT claim the original was false at
+    /// issuance — good-faith withdrawal.
+    pub const WITHDRAWS: &str = "withdraws";
+    /// Structural primitive: "my prior attestation was false at
+    /// issuance" (FSD-002 §2.2.4). Admits epistemic error.
+    /// Wire-distinct from [`WITHDRAWS`] even when consumer UIs
+    /// collapse the two — see module-level note.
+    pub const RECANTS: &str = "recants";
 }
 
 /// `federation_keys` row.
@@ -233,7 +279,9 @@ pub struct Attestation {
     pub attesting_key_id: String,
     /// Key being attested (must exist in `federation_keys`).
     pub attested_key_id: String,
-    /// Attestation type ([`attestation_type::VOUCHES_FOR`], etc.).
+    /// Attestation type ([`attestation_type::SCORES`] /
+    /// [`attestation_type::DELEGATES_TO`] / [`attestation_type::SUPERSEDES`]
+    /// / [`attestation_type::WITHDRAWS`] / [`attestation_type::RECANTS`]).
     pub attestation_type: String,
     /// Optional weight signal carried by the attester.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -5,6 +5,124 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [2.4.0] — 2026-05-27
+
+**`#102` first cut (6 of 8 asks) — Registry directory contract: vocabularies + admission gate + operational docs.**
+
+The Registry-side asks that don't need new substrate infrastructure
+land in 2.4.0. The two infrastructure-heavy asks — envelope-schema
+validation hook (Ask 4) and `attestation_evidence` column for
+hardware-attested accord-holder rows (Ask 8) — are deferred to 2.5.0.
+
+Per CIRISRegistry FSD-002 v1.4 + v1.2 deltas (`a46ff01`).
+
+### Ask 1 — `identity_type` vocabulary extension
+
+`federation_keys.identity_type` was already free-form `TEXT NOT NULL`
+with no CHECK constraint, so no migration was needed. Added
+`identity_type::ACCORD_HOLDER = "accord_holder"` constant + a
+documented vocabulary table in `docs/FEDERATION_DIRECTORY.md` listing
+all five values (`steward` / `agent` / `primitive` / `partner` /
+`accord_holder`) with per-value rationale citing FSD-002 §7.2.
+
+### Ask 2 — `attestation_type` vocabulary replacement (clean break)
+
+Persist is the only consumer of `federation_attestations` and the
+wire shape was not finalized. **Clean slate replacement** per
+`feedback_clean_break_renames` — no deprecation aliases:
+
+- `VOUCHES_FOR` / `WITNESSES` / `REFERRED` / `DELEGATED_TO`
+  *(removed)*
+- `SCORES` / `DELEGATES_TO` / `SUPERSEDES` / `WITHDRAWS` / `RECANTS`
+  *(new)*
+
+Per FSD-002 v1.2 Ask 2 delta + PRIOR_ART_SCAN Bucket 1: `recants` is
+**wire-distinct** from `withdraws` — no prior (PGP/SPKI/VC) typed
+epistemic-error-admission as a wire primitive. Consumer UIs may
+collapse them; the wire keeps them distinct. Every old-constant
+reference across `src/`, `docs/`, `THREAT_MODEL.md` updated.
+
+### Ask 3 — Wire-enforced admission gate (FSD-002 §1.10.1)
+
+`put_attestation` admission path gains a `DimensionAdmissionPolicy`
+gate that fires only on `scores` attestations (the four structural
+primitives — `delegates_to` / `supersedes` / `withdraws` / `recants`
+— bypass; they carry structural metadata, not epistemic content).
+
+**Layer 1 — the constitutional asymmetry** (FSD-002 §4.1 + §7): a
+`dimension` starting with `accord:` is rejected when the attesting
+key's `identity_type` is not `accord_holder`. Typed
+`Error::AccordDimensionRequiresAccordHolder`. The schema CHECK can't
+enforce this (the constraint crosses tables — attestations row vs.
+keys row), so admission carries it.
+
+**Layer 2 — the four-test operational-language gate** (FSD-002 v1.2
+§1.10.1):
+
+1. Rules/verdicts separation — reject morally-charged stems
+   (`deception` / `harm` / `evil` / `bad_actor` /
+   `trustworthiness` / `malicious` / `lies`). The v1.2 rename target
+   `emergent_deception` → `correlated_action` is encoded by this
+   deny-list.
+2. Mechanism-descriptive-not-judgment-descriptive naming — same
+   deny-list class as #1.
+3. **Version-pinning** — every accepted `scores` dimension MUST
+   carry a `:v[0-9]+` segment.
+4. Adjudication separation — same deny-list as #1; verdicts/policy
+   are downstream of measurement.
+
+Default policy is deny-on-fail; the `DimensionAdmissionPolicy` struct
+has `pub` fields so sovereign deployments can extend the stem list.
+Empty dimension on a `scores` attestation is rejected (wire-format
+floor, not a policy choice). 24 tests cover the gate on both backends
+(12 unit + 6 sqlite-backend + 6 postgres-backend), including the
+FSD v1.2 rename-chain delta (structural primitive
+`delegates_to:correlated_action_v2:from:emergent_deception_v1` is
+exempt — references a now-banned dimension but the primitive itself
+isn't measuring, it's structural).
+
+### Asks 5, 6, 7 — Operational documentation
+
+Three new sections in `docs/FEDERATION_DIRECTORY.md`:
+
+- **Cross-region replication** (Ask 5): `federation_keys` rows with
+  `identity_type ∈ {steward, accord_holder}` replicate to all
+  regions (US / EU / APAC); other keys + their attestations
+  replicate per the publishing key's residency; Spock
+  replication-group config is **deployment-side** (no canonical
+  persist topology document to cite, flagged honestly).
+- **Transport story** (Ask 6): in-process (shipping) + direct-DB
+  (shipping); **gRPC deferred** — persist v2.4.0 has no gRPC
+  server, interim Registry deployments use direct-DB. Registry's
+  three requirements (transactional `put_attestation`, sub-100ms
+  cache-miss latency, distinguishable `Conflict` vs
+  `RateLimited` errors) audited against current persist; honest
+  gap surfaced: `Error::Conflict(String)` doesn't carry a
+  structured `existing` payload.
+- **PQC cold-path cadence** (Ask 7): persist exposes the
+  `attach_*_pqc_signature` API; the cadence is
+  **deployer-driven** (typical 5 min, worst-case
+  deployer-configured). Registry's cache-TTL discipline reads this
+  to size the hybrid-pending window.
+
+### Hotfix carried in 2.4.0
+
+2.3.0 (federation_blobs) committed to main but never tagged — its
+default-features build failed clippy under `-D warnings` because two
+`pub(crate)` helpers (`BlobBody::storage_kind` and
+`verify_inline_hash`) were dead under no-backend builds. Cfg-gated to
+`#[cfg(any(feature = "postgres", feature = "sqlite"))]`. 2.4.0
+publishes 2.3.0's federation_blobs work + 2.4.0's directory-contract
+work in a single PyPI release.
+
+### Side-effect fix
+
+Pre-existing PG `put_attestation`'s `weight` bind never actually
+worked (`Option<f64>` against `NUMERIC` has no built-in
+`tokio-postgres` serializer; no test had ever exercised the path).
+Fixed via `$N::float8::numeric` write-side cast + `weight::float8`
+read-side cast in the four affected SELECTs.
+
 ## [2.3.0] — 2026-05-27
 
 **`#103` — content-addressable `federation_blobs` storage substrate.**

@@ -149,6 +149,7 @@ impl BlobBody {
     }
 
     /// The wire `storage_kind` string for this body.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub(crate) fn storage_kind(&self) -> &'static str {
         match self {
             BlobBody::Inline(_) => "inline",
@@ -353,6 +354,7 @@ pub fn holds_bytes_attestation_envelope(sha256: &[u8; 32]) -> serde_json::Value 
 
 /// v2.3 (CIRISPersist#103) — verify a `[u8; 32]` SHA-256 against an
 /// inline byte payload. Used by [`BlobStorage::put_blob`] implementations.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub(crate) fn verify_inline_hash(expected: &[u8; 32], bytes: &[u8]) -> Result<(), BlobError> {
     use sha2::{Digest, Sha256};
     let computed = Sha256::digest(bytes);
@@ -391,6 +393,7 @@ mod tests {
         assert_eq!(refs[0], hex::encode(sha));
     }
 
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     #[test]
     fn body_storage_kind_strings() {
         assert_eq!(BlobBody::Inline(vec![1, 2, 3]).storage_kind(), "inline");
@@ -414,6 +417,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     #[test]
     fn verify_inline_hash_round_trip() {
         use sha2::Digest;

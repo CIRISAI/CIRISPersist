@@ -34,6 +34,7 @@
 
 use std::future::Future;
 
+pub mod admission;
 #[cfg(feature = "cirisaudit")]
 pub mod backfill;
 pub mod blobs;
@@ -69,6 +70,7 @@ pub(crate) mod serde_bytes_b64 {
     }
 }
 
+pub use admission::{DimensionAdmissionPolicy, DimensionRejectionReason};
 pub use blobs::{
     holds_bytes_attestation_envelope, holds_bytes_attestation_type, BlobBody, BlobError,
     BlobStorage, ExternalRef, PutBlobAttestation, DEFAULT_INLINE_BYTES_CAP,
@@ -380,6 +382,40 @@ pub enum Error {
     #[error("conflicts with existing row: {0}")]
     Conflict(String),
 
+    /// v2.4.0 (CIRISPersist#102 Ask 3a). The submitted `scores`
+    /// attestation's `dimension` begins with `accord:` but the
+    /// `attesting_key_id`'s `identity_type` is not `accord_holder`.
+    /// The federation's one constitutional asymmetry per FSD-002
+    /// §4.1 + §7.1; the admission gate refused the write.
+    #[error(
+        "accord:* dimensions require identity_type=accord_holder \
+         (got dimension={dimension:?}, attesting identity_type={identity_type:?})"
+    )]
+    AccordDimensionRequiresAccordHolder {
+        /// The `dimension` from the attestation envelope that
+        /// triggered the rejection.
+        dimension: String,
+        /// The attesting key's `identity_type` as resolved at
+        /// admission time.
+        identity_type: String,
+    },
+
+    /// v2.4.0 (CIRISPersist#102 Ask 3b). The submitted `scores`
+    /// attestation's `dimension` failed one of the four
+    /// operational-language tests (FSD-002 §1.10.1): rules/verdicts
+    /// separation (T1), mechanism-descriptive-not-judgment naming
+    /// (T2), version-pinning (T3), adjudication separation (T4).
+    /// See [`admission::DimensionAdmissionPolicy`] for the policy
+    /// shape and `docs/FEDERATION_DIRECTORY.md` for the rationale.
+    #[error("dimension rejected by admission policy: {reason} (dimension={dimension:?})")]
+    DimensionRejected {
+        /// The `dimension` value that failed the gate.
+        dimension: String,
+        /// Stable machine-readable reason token (matches one of
+        /// [`admission::DimensionRejectionReason`]'s `as_str()`).
+        reason: &'static str,
+    },
+
     /// Backend-level error (DB connection, serialization, etc.).
     /// String-typed because each backend has its own error tree.
     #[error("backend: {0}")]
@@ -394,6 +430,10 @@ impl Error {
             Error::SignatureInvalid(_) => "federation_signature_invalid",
             Error::RateLimited { .. } => "federation_rate_limited",
             Error::Conflict(_) => "federation_conflict",
+            Error::AccordDimensionRequiresAccordHolder { .. } => {
+                "federation_accord_dimension_requires_accord_holder"
+            }
+            Error::DimensionRejected { .. } => "federation_dimension_rejected",
             Error::Backend(_) => "federation_backend",
         }
     }

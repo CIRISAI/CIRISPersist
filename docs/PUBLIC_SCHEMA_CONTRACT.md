@@ -132,14 +132,18 @@ Federation public-key directory. Hybrid Ed25519 + ML-DSA-65 per
 
 ### `cirislens.federation_attestations`
 
-"Key A vouches for / witnesses / refers / delegates-to key B".
+The unified attestation primitive (FSD-002 §2). One workhorse
+(`scores`: "key A claims score S on dimension D about key B")
+plus four structural primitives (`delegates_to` / `supersedes` /
+`withdraws` / `recants`) operating on the attestation graph
+itself.
 
 | Column                       | Type        | Tier     | Notes |
 |------------------------------|-------------|----------|-------|
 | `attestation_id`             | uuid        | stable   | Primary key. |
 | `attesting_key_id`           | text        | stable   | FK to `federation_keys.key_id`. |
 | `attested_key_id`            | text        | stable   | FK to `federation_keys.key_id`. |
-| `attestation_type`           | text        | stable   | `vouches_for` \| `witnesses` \| `referred` \| `delegated_to` \| (consumer extensions). |
+| `attestation_type`           | text        | stable   | v2.4.0 vocabulary (CIRISPersist#102): `scores` (workhorse) \| `delegates_to` \| `supersedes` \| `withdraws` \| `recants` \| (consumer extensions). Replaces the pre-2.4.0 `vouches_for` / `witnesses` / `referred` / `delegated_to` set. See `docs/FEDERATION_DIRECTORY.md` §"attestation_type vocabulary" for full semantics + admission-gate rules on `scores.dimension`. |
 | `weight`                     | numeric     | stable   | Attester-supplied weight; null = consumer policy decides. |
 | `asserted_at`                | timestamptz | stable   | When the attestation was made. |
 | `expires_at`                 | timestamptz | stable   | Expiry; null = no expiry. |

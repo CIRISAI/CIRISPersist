@@ -865,10 +865,11 @@ distinguish forged-but-valid signatures pointwise.
 #### AV-29: Attestation graph poisoning
 
 **Attack**: An attacker submits attestations or revocations crafted
-to mislead consumer-side trust traversal — e.g., circular
-`vouches_for` chains, attestations with futures-dated `expires_at`
-to claim long-lived trust, revocations with retroactive
-`effective_at` to invalidate historical traces.
+to mislead consumer-side trust traversal — e.g., circular `scores`
+chains on `identity_binding:*` (v2.4.0 vocabulary; was `vouches_for`
+pre-2.4.0), attestations with futures-dated `expires_at` to claim
+long-lived trust, revocations with retroactive `effective_at` to
+invalidate historical traces.
 
 **Mitigation v0.2.0**: persist exposes the edges, never the
 traversal. There is no `is_trusted()` / `trust_score()` /

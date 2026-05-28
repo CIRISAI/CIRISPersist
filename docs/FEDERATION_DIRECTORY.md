@@ -209,7 +209,7 @@ federation_keys
   key_id              text PRIMARY KEY      -- canonical key identifier (matches signature_key_id on the wire)
   pubkey_base64       text NOT NULL         -- Ed25519 raw, ML-DSA-65 raw, or hybrid (separator-encoded)
   algorithm           text NOT NULL         -- "ed25519" | "ml-dsa-65" | "hybrid" (Ed25519+ML-DSA-65)
-  identity_type       text NOT NULL         -- "agent" | "primitive" | "steward" | "partner"
+  identity_type       text NOT NULL         -- see "identity_type vocabulary" below
   identity_ref        text NOT NULL         -- agent_id_hash (for agents) | primitive_id (for primitives) | org_id (for partners)
   valid_from          timestamptz NOT NULL
   valid_until         timestamptz           -- nullable; null = no expiry
@@ -223,6 +223,26 @@ federation_keys
   CONSTRAINT scrub_key_must_exist FOREIGN KEY (scrub_key_id) REFERENCES federation_keys(key_id)
 )
 ```
+
+#### `identity_type` vocabulary (v2.4.0, CIRISPersist#102 Ask 1)
+
+The column is free-form `TEXT` (no `CHECK` constraint) — consumers
+may extend without a schema break. Persist publishes the five
+canonical values:
+
+| Value | Rationale |
+|---|---|
+| `agent` | Agent trace-signing keys (one per running CIRISAgent occurrence under PoB §3.2's one-key model). |
+| `primitive` | Build-signing keys for the substrate binaries (ciris-persist, ciris-agent, ciris-edge, ciris-lens-core, ciris-node-core). |
+| `steward` | Per-region operational steward keys (US / EU / APAC). Trust roots for routine operations; rotatable per regional ops. |
+| `partner` | Per-org partner keys for commercial onboarding (registry's existing partner-key surface). |
+| `accord_holder` | **New v2.4.0.** HUMANITY_ACCORD key material — the three hardware-attested human-held kill-switch keys per FSD-002 §7.2 (Eric Moore / Eric Kudzin / Haley Bradley, 2-of-3 threshold). Only rows with this `identity_type` may emit `accord:*` attestations (FSD-002 §4.1 + §7.1 — the federation's one constitutional asymmetry); the admission gate in `src/federation/admission.rs` enforces this at write time. |
+
+The `accord_holder` addition needed **no migration** — the existing
+`identity_type TEXT NOT NULL` column accepted the new value as-is.
+The constant lives in `crate::federation::types::identity_type::ACCORD_HOLDER`
+(Rust) and is re-exported on the public `ciris_persist::federation`
+surface.
 
 **Why every row signs itself:** the registry's DB compromise
 problem disappears if every row carries cryptographic provenance.
@@ -266,7 +286,7 @@ federation_attestations
   attestation_id       uuid PRIMARY KEY
   attesting_key_id     text NOT NULL  REFERENCES federation_keys(key_id)
   attested_key_id      text NOT NULL  REFERENCES federation_keys(key_id)
-  attestation_type     text NOT NULL  -- "vouches_for" | "witnesses" | "referred" | "delegated_to"
+  attestation_type     text NOT NULL  -- see "attestation_type vocabulary" below
   weight               numeric        -- optional; attesters carry their own weight signal
   asserted_at          timestamptz NOT NULL
   expires_at           timestamptz    -- nullable
@@ -279,19 +299,108 @@ federation_attestations
 )
 ```
 
-`attestation_type` is intentionally a string, not an enum.
-Consumers may invent new types as their trust models evolve;
-persist doesn't gatekeep semantics. Examples:
+#### `attestation_type` vocabulary (v2.4.0, CIRISPersist#102 Ask 2)
 
-- `vouches_for` — "I have personally verified this key represents
-  identity X" (high-weight, what stewards do)
-- `witnesses` — "I observed this key in production traffic at
-  time T, no anomalies" (low-weight, what the registry does
-  passively)
-- `referred` — "I trust the key, and I trust its referrer to
-  vouch for it" (transitive trust, weight decays per PoB §4)
-- `delegated_to` — "this key may sign on my behalf within scope S"
-  (delegation, used by hardware-backed re-signers)
+The column is `TEXT NOT NULL` with no `CHECK` constraint —
+consumers may invent new types, persist doesn't gatekeep
+*semantics* (the dimension-admission gate below is the one
+exception, and it gates on `attestation_envelope.dimension`, not
+on the type token).
+
+**v2.4.0 clean-break replacement.** The pre-v2.4.0 speculative
+vocabulary (`vouches_for` / `witnesses` / `referred` /
+`delegated_to`) is replaced in lockstep with the FSD-002 §2
+unified-primitive model — **one workhorse + four structural
+primitives**. Persist is the only consumer of
+`federation_attestations` and the wire shape was unfinalized, so
+no migration is needed and no deprecation aliases are kept (per
+the persist convention in
+`feedback_clean_break_renames.md` — alias scaffolding is rejected;
+rename + remove ship in the same cut, flagged in CHANGELOG).
+
+| Value | Role | FSD-002 ref |
+|---|---|---|
+| `scores` | **The workhorse.** Every score claim about an entity — positive / negative, identity / capability / behavior / state / commitment — is a `scores` attestation on a named `dimension`. Envelope: `{dimension, score ∈ [-1, +1], confidence ∈ [0, 1], context, evidence_refs[], valid_until?, epistemic_mode?, witness_relation?, stake?}`. | §2.1 |
+| `delegates_to` | "A authorizes B to sign on A's behalf within scope S." Bounded scope; default consumer-policy transitive depth = 2. | §2.2.1 |
+| `supersedes` | "This row replaces a prior attestation by the same attester." Consumers walking history apply latest-wins per (`attesting_key_id`, `dimension`, `attested_key_id`). | §2.2.2 |
+| `withdraws` | "I retract my prior attestation." Does NOT claim the original was false at issuance — good-faith retraction. | §2.2.3 |
+| `recants` | "My prior attestation was false at issuance — I admit epistemic error." | §2.2.4 |
+
+**`recants` is wire-distinct from `withdraws`** (per FSD-002 v1.2
+PRIOR_ART_SCAN Bucket 1): no prior wire format (PGP / SPKI / W3C
+VC) typed *epistemic-error-admission* as a wire primitive. Persist
+keeps them distinct on the wire even when consumer UIs collapse
+them; downstream tooling that wants to display the two together
+gets to make that choice.
+
+The constants live in `crate::federation::types::attestation_type::{SCORES,
+DELEGATES_TO, SUPERSEDES, WITHDRAWS, RECANTS}` (Rust) and are
+re-exported on the public `ciris_persist::federation` surface.
+
+#### Dimension admission gate (v2.4.0, CIRISPersist#102 Ask 3)
+
+`put_attestation` calls a wire-enforced admission gate before the
+INSERT. Two layers, both restricted to `scores` attestations —
+the four structural primitives carry structural metadata about
+the attestation graph, not epistemic content, so they're exempt
+(documented in `src/federation/admission.rs`).
+
+**Layer 1 — `accord:*` × `accord_holder` constitutional rule**
+(FSD-002 §4.1 + §7.1). A `scores` attestation whose
+`attestation_envelope.dimension` starts with `accord:` is rejected
+unless `attesting_key_id`'s `identity_type` is `accord_holder`.
+The error variant is
+`Error::AccordDimensionRequiresAccordHolder { dimension, identity_type }`
+(stable telemetry token
+`federation_accord_dimension_requires_accord_holder`). This is
+the federation's one constitutional asymmetry; the schema's
+`CHECK` can't enforce it (the constraint crosses tables —
+`federation_attestations` row vs `federation_keys` row), so the
+admission gate is the load-bearing point.
+
+**Layer 2 — the four-test operational-language gate** (FSD-002
+§1.10.1, added v1.2). Every accepted `scores` dimension must:
+
+1. **T1 Rules / verdicts separation** — name a measurable
+   mechanism, not a verdict. Heuristic: reject dimensions
+   containing morally-charged stems (`deception`, `harm`,
+   `evil`, `bad_actor`, `trustworthiness`, `malicious`, `lies`).
+2. **T2 Mechanism-descriptive-not-judgment-descriptive naming**
+   — same enforcement as T1 (the two tests catch the same class
+   of slip from different angles).
+3. **T3 Version-pinning** — the dimension MUST include at least
+   one `:v[0-9]+` segment so any past verdict can be re-checked
+   against the rule version it ran against. Versionless prefixes
+   are rejected.
+4. **T4 Adjudication separation** — the dimension is a
+   measurement, not a verdict. Same enforcement as T1.
+
+Rejections surface as
+`Error::DimensionRejected { dimension, reason }` (stable telemetry
+token `federation_dimension_rejected`); `reason` is one of
+`morally_charged_stem` / `missing_version_segment` /
+`empty_or_missing_dimension`.
+
+The default-deny stem list encodes the FSD-002 §1.10.1
+anti-pattern catalogue. The canonical v1.2 rename target
+(`emergent_deception:*` → `correlated_action:*`) is blocked by
+the `deception` stem; future contributors proposing
+`detection:bad_actor_pattern:*` or `flag:malicious_coordination:*`
+also fail at admission. The policy is configurable via
+`DimensionAdmissionPolicy::default()` for sovereign deployments
+that need to extend the stem list per deployment.
+
+**Structural-primitive exemption.** The four structural primitives
+(`delegates_to` / `supersedes` / `withdraws` / `recants`) bypass
+the gate. This is what makes the v1.2 rename chain
+`delegates_to:correlated_action_v2:from:emergent_deception_v1`
+work: even though the scope references a now-banned legacy
+dimension, the structural primitive itself carries metadata about
+the attestation graph (a `delegates_to` claim that the new
+calibration version delegates from the old version's identity),
+not epistemic content. Consumers walking the chain discover the
+rename through the federation's own mechanism (FSD-002 v1.2 Ask 5
+delta).
 
 ### `federation_revocations`
 
@@ -411,7 +520,10 @@ async fn is_trusted_direct(
     if revoked { return false; }
 
     attestations.iter().any(|a| {
-        a.attestation_type == "vouches_for"
+        // v2.4.0 — `scores` is the workhorse; consumer-side
+        // identity-binding policy looks for high-magnitude positive
+        // scores on identity-binding dimensions emitted by stewards.
+        a.attestation_type == "scores"
             && steward_key_ids.contains(&a.attesting_key_id.as_str())
             && a.expires_at.is_none_or(|t| t > now)
     })
@@ -439,8 +551,11 @@ async fn is_trusted_transitive(
 
         let outbound = dir.list_attestations_by(&current).await.unwrap_or_default();
         for a in outbound {
-            if a.attestation_type == "vouches_for"
-                || a.attestation_type == "referred"
+            // v2.4.0 — `scores` is the workhorse for the trust walk;
+            // `delegates_to` is the structural primitive that grants
+            // signing authority within a scope.
+            if a.attestation_type == "scores"
+                || a.attestation_type == "delegates_to"
             {
                 frontier.push_back((a.attested_key_id, depth + 1));
             }
@@ -550,7 +665,7 @@ the contract.
 | # | Question | Decision |
 |---|---|---|
 | 1 | Schema ownership — separate `federation_keys` or widen `accord_public_keys` | **Separate.** Migration over 2-3 persist versions. No schema churn on the live `accord_public_keys` table. |
-| 2 | Write authority — steward-only or self-publish | **Self-publish + post-hoc attestation.** Each primitive's CI writes its own `federation_keys` row signed by its own steward key. Registry's `RegisterTrustedPrimitiveKey` admin RPC shifts from issuance call to attestation call (writes `federation_attestations` with `attesting_key_id=registry-steward`, `attestation_type="vouches_for"`). |
+| 2 | Write authority — steward-only or self-publish | **Self-publish + post-hoc attestation.** Each primitive's CI writes its own `federation_keys` row signed by its own steward key. Registry's `RegisterTrustedPrimitiveKey` admin RPC shifts from issuance call to attestation call — writes a `federation_attestations` row with `attesting_key_id=registry-steward`, `attestation_type="scores"`, and a `provenance:build_manifest:{target}:v1` envelope per FSD-002 §3.9 (v2.4.0 vocabulary; was `attestation_type="vouches_for"` pre-2.4.0). |
 | 3 | Consistency model | **Eventually-consistent + TTL.** Cache freshness controlled by consumer-side TTL; matches CIRISVerify's existing pubkey-pinning window. No new contract surface. |
 | 4 | Fail-mode when persist unreachable | **Fail-open from cache by default**, opt-in fail-closed via `PERSIST_REQUIRED=true`, **plus a hard ceiling**: `max_stale_cache_age_seconds=3600` (default) triggers fail-closed regardless of `PERSIST_REQUIRED`. |
 | 5 | Trust contract diff (`docs/TRUST_CONTRACT.md` on registry side) | **At persist v0.4.x.** Path A splits into A1 (registry attests) + A2 (persist witnesses); new Path D for consumer-aggregated multi-peer attestations. Registry team owns the diff. |
@@ -700,6 +815,192 @@ registry remains the high-weight peer with the steward key and
 the commercial onboarding lever (PoB §4 starting weight). They
 *are* arguments that the registry's storage layer should be
 persist, not its own DB.
+
+---
+
+## Cross-region replication (v2.4.0, CIRISPersist#102 Ask 5)
+
+Persist's federation tables replicate across the three operational
+regions (US / EU / APAC) via the substrate's Spock topology. The
+replication discipline differs by row class:
+
+### Federation-trust-root rows replicate to all regions
+
+`federation_keys` rows with `identity_type ∈ {steward,
+accord_holder}` are **federation trust roots** and replicate to
+all three regions. Every federation peer must be able to verify a
+trust chain locally without round-tripping to the steward's home
+region. The three regional stewards (US / EU / APAC, per
+FSD-002 §7.5) and the three accord-holders (FSD-002 §7.2; one
+constitutional triple, not regional) are the floor of the trust
+graph — they are visible everywhere.
+
+`federation_revocations` rows whose `revoked_key_id` references a
+steward or accord-holder row replicate to all regions on the same
+schedule.
+
+### Per-residency rows replicate per the publishing key's home region
+
+`federation_keys` rows with `identity_type ∈ {agent, primitive,
+partner}` and `federation_attestations` rows replicate per the
+publishing key's residency. A US-region steward signing a
+`scores` attestation about a US-resident agent stays in the US
+replication scope by default; cross-region read traffic walks via
+the read-only mirror to the publishing region.
+
+Practical knobs:
+
+- The Spock replication group / repset name + the residency
+  policy live in the **deployment-side** Spock configuration
+  (not in persist's source tree). Persist defines the
+  *intent* — "stewards + accord-holders replicate everywhere;
+  everyone else replicates per residency" — and the deployer
+  realizes that intent in their Spock topology.
+- A future-version operational doc may codify the Spock config
+  contract; the v2.4.0 cut documents the intent + flags the
+  deployment dependency.
+
+### Why this shape
+
+The trust-root replication asymmetry is **load-bearing for
+fail-honest verification**. A consumer reading an attestation
+chain ending at a steward / accord-holder needs to verify that
+chain locally, even when the consumer is offline-relative-to-the
+trust-root's-home-region. Putting the trust roots in every
+region's replica makes the chain walk a same-region read.
+
+Per FSD-002 v1.2 Ask 5 delta: "confirmed unchanged" — the v1.2
+revision does not modify this contract.
+
+---
+
+## Transport story (v2.4.0, CIRISPersist#102 Ask 6)
+
+Registry calls persist's `FederationDirectory` trait from
+`ciris-registry-core`. Three deployment shapes are supported;
+**persist picks the wire**, Registry adapts per the existing
+substrate-conformance migration discipline.
+
+### Three shapes
+
+| Shape | When it applies | Status (v2.4.0) |
+|---|---|---|
+| **In-process** | CIRISAgent post-fold and the bundled in-process cohabitation runtime per `docs/COHABITATION.md`. Direct `Engine` access via the shared connection pool — the calling code is in the same process as persist's `FederationDirectory` impl. | **Shipping.** This is the canonical shape; the trait methods are `async fn` and run inside the caller's tokio runtime. |
+| **Direct DB** | Deployed Registry service host where Registry queries the `federation_*` tables via `sqlx` against persist's Postgres backend. Interim shape until the gRPC server lands. | **Shipping.** The schema is documented in `docs/PUBLIC_SCHEMA_CONTRACT.md`; Registry uses the documented column shapes directly. |
+| **gRPC** | Future deployed Registry service host where persist exposes a gRPC server and Registry calls it. | **Deferred.** Persist v2.3.0 has no gRPC server; the v2.4.0 cut documents the shape and defers the implementation to a future release. Interim deployments use **Direct DB**. |
+
+### Registry's three requirements
+
+Per CIRISPersist#102 issue body, Registry's `FederationDirectory`
+consumer code requires:
+
+1. **Transactional semantics on `put_attestation`** (atomic write
+   + cache invalidate). **Met today** at the trait surface for
+   in-process and Postgres backends: `put_attestation` is a
+   single-statement INSERT and the row is queryable immediately on
+   completion. SQLite has the same guarantee via the
+   `tokio::task::spawn_blocking`-wrapped connection mutex.
+2. **Sub-100ms latency for cache misses.** **Met today** at the
+   backend layer: point reads on `federation_keys` /
+   `federation_attestations` go through indexed lookups
+   (`federation_keys_pkey`, `federation_keys_identity`,
+   `federation_attestations` per-column indexes). Substrate
+   latency for the cache-miss path is well under 100ms on a
+   colocated PG instance; network shape (the future gRPC vs.
+   current Direct DB) is what adds the tail.
+3. **Explicit error surface distinguishing `Conflict { existing
+   }` from `RateLimited { retry_after }`.**
+   `crate::federation::Error::Conflict(String)` and
+   `crate::federation::Error::RateLimited { retry_after_seconds }`
+   are both shipping today (see `src/federation/mod.rs`). The
+   `Conflict` variant carries the message; consumers parse for
+   key identification. **Honest gap**: the `Conflict` variant
+   carries a `String`, not a structured `existing: KeyRecord` /
+   `existing: Attestation`. A future cut may switch to a typed
+   payload; until then, the wire shape Registry sees is the
+   string message + the conflicting key_id parseable from it.
+
+### v2.4.0 admission-gate errors
+
+In addition to the three pre-existing variants, `put_attestation`
+now surfaces two more typed errors (CIRISPersist#102 Ask 3):
+
+- `Error::AccordDimensionRequiresAccordHolder { dimension, identity_type }`
+  — the `accord:*` × `accord_holder` constitutional rule.
+- `Error::DimensionRejected { dimension, reason }` — the
+  four-test operational-language gate.
+
+Both map to caller-fault (4xx) in the PyO3 / HTTP surface.
+
+---
+
+## PQC cold-path cadence (v2.4.0, CIRISPersist#102 Ask 7)
+
+Per the §"Trust contract — eventual consistency as a federation
+primitive" section, every federation row goes through a
+hybrid-pending window between the synchronous Ed25519 sign + INSERT
+and the cold-path ML-DSA-65 fill-in. Registry's cache TTL
+discipline needs to know how long that window is so refresh logic
+doesn't refresh stale-but-not-yet-PQC-complete rows excessively.
+
+### Persist provides the API; the deployer schedules the cadence
+
+The `FederationDirectory` trait surface exposes three attach
+methods:
+
+- `attach_key_pqc_signature(key_id, pubkey_ml_dsa_65_base64, scrub_signature_pqc)`
+- `attach_attestation_pqc_signature(attestation_id, scrub_signature_pqc)`
+- `attach_revocation_pqc_signature(revocation_id, scrub_signature_pqc)`
+
+Plus three list methods to feed a deployer-side worker:
+
+- `list_hybrid_pending_keys(limit)`
+- `list_hybrid_pending_attestations(limit)`
+- `list_hybrid_pending_revocations(limit)`
+
+Persist **does not** ship an in-band scheduler. The cadence is
+caller-driven: the deployer runs a cron / queue worker / explicit
+PyO3 `Engine.run_pqc_sweep()` call (the latter is the in-process
+sweep entry-point) that batches `list_hybrid_pending_*` results,
+recomputes the bound-signature input, signs with the operator's
+ML-DSA-65 signer, and calls the matching `attach_*_pqc_signature`.
+
+### What this means for Registry's cache TTL
+
+Operationally:
+
+- **Typical deployment cadence**: every 5 minutes (the default
+  `Engine.run_pqc_sweep()` schedule in CIRISAgent's in-process
+  cohabitation runtime, and the recommended cron interval for
+  deployed Registry hosts). A row that lands at T becomes
+  hybrid-complete by T + 5min in steady state.
+- **Worst-case bound**: deployment-configured. If the deployer
+  pauses the sweep (host outage, queue backlog), rows accumulate
+  in the hybrid-pending state. The
+  `federation_directory_writes_total{outcome=...}` /
+  `pqc_completed_at IS NULL` count metrics surface this for
+  paging.
+
+Registry's discipline (per
+[`CIRISRegistry/docs/FEDERATION_CLIENT.md`](https://github.com/CIRISAI/CIRISRegistry/blob/main/docs/FEDERATION_CLIENT.md)
+§"Cache shape"):
+
+- Cache rows whose `pqc_completed_at IS NOT NULL` at the standard
+  5-minute TTL — the row is hybrid-secure; refresh on the normal
+  cadence.
+- Cache rows whose `pqc_completed_at IS NULL` at a **shorter**
+  TTL (suggest: 60 seconds) — the row is hybrid-pending; refresh
+  more aggressively so a freshly-PQC-completed row reaches the
+  consumer quickly without waiting for the steady-state TTL.
+- A `pqc_completed_at IS NULL` row that's been pending for more
+  than the deployer's worst-case-bound (default: 1 hour) is a
+  monitoring signal — the sweep worker has fallen behind, and
+  the consumer's strict-hybrid-trust policy may want to fail
+  closed.
+
+The deployer publishes their actual sweep cadence + worst-case
+bound in their operational runbook; the values above are the
+defaults persist ships with.
 
 ---
 

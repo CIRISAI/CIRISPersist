@@ -425,18 +425,34 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut state = self.state.lock().expect("memory backend lock");
         // FK enforcement parity with postgres: both attesting_key_id
         // and attested_key_id must exist in federation_keys.
-        if !state.federation_keys.contains_key(&row.attesting_key_id) {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "attesting_key_id {} does not exist in federation_keys",
-                row.attesting_key_id
-            )));
-        }
+        let attesting_identity_type = match state.federation_keys.get(&row.attesting_key_id) {
+            Some(rec) => rec.identity_type.clone(),
+            None => {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "attesting_key_id {} does not exist in federation_keys",
+                    row.attesting_key_id
+                )));
+            }
+        };
         if !state.federation_keys.contains_key(&row.attested_key_id) {
             return Err(crate::federation::Error::InvalidArgument(format!(
                 "attested_key_id {} does not exist in federation_keys",
                 row.attested_key_id
             )));
         }
+
+        // v2.4.0 (CIRISPersist#102 Ask 3) — admission gate. Default
+        // policy enforces the `accord:*` × `accord_holder` rule and
+        // the four-test operational-language gate on `scores`
+        // attestations; structural primitives are exempt. See
+        // `src/federation/admission.rs`.
+        let dim = crate::federation::admission::envelope_dimension(&row.attestation_envelope);
+        crate::federation::admission::DimensionAdmissionPolicy::default().check(
+            &row.attestation_type,
+            dim,
+            &attesting_identity_type,
+        )?;
+
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         state.federation_attestations.push(row);
         Ok(())
@@ -1832,11 +1848,20 @@ mod tests {
             attestation_id: id.into(),
             attesting_key_id: attesting.into(),
             attested_key_id: attested.into(),
-            attestation_type: crate::federation::types::attestation_type::VOUCHES_FOR.into(),
+            attestation_type: crate::federation::types::attestation_type::SCORES.into(),
             weight: Some(1.0),
             asserted_at: "2026-05-01T00:00:00Z".parse().unwrap(),
             expires_at: None,
-            attestation_envelope: serde_json::json!({"id": id}),
+            // v2.4.0 admission gate (CIRISPersist#102 Ask 3) — `scores`
+            // attestations need a versioned mechanism-descriptive
+            // dimension. Test rows use a generic identity-binding
+            // shape that passes the four-test gate.
+            attestation_envelope: serde_json::json!({
+                "id": id,
+                "dimension": "identity_binding:v1",
+                "score": 1.0,
+                "confidence": 0.9,
+            }),
             original_content_hash: "abc123".into(),
             scrub_signature_classical: "c2ln".into(),
             scrub_signature_pqc: None,

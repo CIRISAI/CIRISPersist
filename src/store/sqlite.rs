@@ -1052,6 +1052,44 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         attestation: crate::federation::SignedAttestation,
     ) -> Result<(), crate::federation::Error> {
         let mut row = attestation.attestation;
+
+        // v2.4.0 (CIRISPersist#102 Ask 3) — admission gate. Look up
+        // the attesting key's `identity_type` before insert; let
+        // the FK violation surface as a clearer-typed
+        // `InvalidArgument` if the key is missing. The gate runs
+        // BEFORE persist_row_hash + INSERT so rejected rows leave
+        // no trace.
+        let attesting_identity_type = {
+            let conn = self.conn.clone();
+            let attesting = row.attesting_key_id.clone();
+            tokio::task::spawn_blocking(move || -> Result<Option<String>, rusqlite::Error> {
+                let conn = conn.blocking_lock();
+                conn.query_row(
+                    "SELECT identity_type FROM federation_keys WHERE key_id = ?1",
+                    [&attesting],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+            })
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("lookup attesting identity_type: {e}"))
+            })?
+        };
+        let attesting_identity_type = attesting_identity_type.ok_or_else(|| {
+            crate::federation::Error::InvalidArgument(format!(
+                "attesting_key_id {} does not exist in federation_keys",
+                row.attesting_key_id
+            ))
+        })?;
+        let dim = crate::federation::admission::envelope_dimension(&row.attestation_envelope);
+        crate::federation::admission::DimensionAdmissionPolicy::default().check(
+            &row.attestation_type,
+            dim,
+            &attesting_identity_type,
+        )?;
+
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
@@ -6278,11 +6316,20 @@ mod tests {
             attestation_id: id.into(),
             attesting_key_id: attesting.into(),
             attested_key_id: attested.into(),
-            attestation_type: crate::federation::types::attestation_type::VOUCHES_FOR.into(),
+            attestation_type: crate::federation::types::attestation_type::SCORES.into(),
             weight: Some(1.0),
             asserted_at: "2026-05-01T00:00:00Z".parse().unwrap(),
             expires_at: None,
-            attestation_envelope: serde_json::json!({"id": id}),
+            // v2.4.0 admission gate (CIRISPersist#102 Ask 3) — `scores`
+            // attestations need a versioned mechanism-descriptive
+            // dimension. Test rows use a generic identity-binding
+            // shape that passes the four-test gate.
+            attestation_envelope: serde_json::json!({
+                "id": id,
+                "dimension": "identity_binding:v1",
+                "score": 1.0,
+                "confidence": 0.9,
+            }),
             original_content_hash: "abc123".into(),
             scrub_signature_classical: "c2ln".into(),
             scrub_signature_pqc: None,
@@ -6488,6 +6535,264 @@ mod tests {
         assert_eq!(revs.len(), 1);
         assert_eq!(revs[0].revocation_id, "rev-1");
         assert_eq!(revs[0].persist_row_hash.len(), 64);
+    }
+
+    // ─── Admission-gate tests (v2.4.0, CIRISPersist#102 Ask 3) ──────
+
+    /// Build a key with an explicit identity_type — covers the
+    /// `accord_holder` vs `steward` distinction the gate switches on.
+    fn fed_key_with_identity_type(
+        key_id: &str,
+        identity_ref: &str,
+        scrub_key_id: &str,
+        identity_type: &str,
+    ) -> KeyRecord {
+        let mut k = fed_key(key_id, identity_ref, scrub_key_id);
+        k.identity_type = identity_type.into();
+        k
+    }
+
+    /// Build a `scores` attestation with an explicit dimension; lets
+    /// the test parameterize the field the gate evaluates.
+    fn scores_attestation_with_dimension(
+        id: &str,
+        attesting: &str,
+        attested: &str,
+        scrub_key_id: &str,
+        dimension: &str,
+    ) -> Attestation {
+        let mut a = fed_attestation(id, attesting, attested, scrub_key_id);
+        a.attestation_envelope = serde_json::json!({
+            "id": id,
+            "dimension": dimension,
+            "score": 1.0,
+            "confidence": 0.9,
+        });
+        a
+    }
+
+    #[tokio::test]
+    async fn sqlite_put_attestation_rejects_accord_dimension_from_steward() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key_with_identity_type(
+                    "registry-steward",
+                    "registry",
+                    "registry-steward",
+                    crate::federation::types::identity_type::STEWARD,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-a", "primitive-a", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        let att = scores_attestation_with_dimension(
+            "att-accord-1",
+            "registry-steward",
+            "k-a",
+            "registry-steward",
+            "accord:human_dignity:v1",
+        );
+        let err = backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::federation::Error::AccordDimensionRequiresAccordHolder { .. }
+        ));
+        // No row leaked through.
+        assert!(backend
+            .list_attestations_for("k-a")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn sqlite_put_attestation_accepts_accord_dimension_from_accord_holder() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("registry-steward", "registry", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key_with_identity_type(
+                    "accord-holder-1",
+                    "humanity-accord-1",
+                    "registry-steward",
+                    crate::federation::types::identity_type::ACCORD_HOLDER,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-a", "primitive-a", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        let att = scores_attestation_with_dimension(
+            "att-accord-2",
+            "accord-holder-1",
+            "k-a",
+            "registry-steward",
+            "accord:human_dignity:v1",
+        );
+        backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+        let rows = backend.list_attestations_for("k-a").await.unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_put_attestation_rejects_morally_charged_dimension() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("registry-steward", "registry", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-a", "primitive-a", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        let att = scores_attestation_with_dimension(
+            "att-bad-1",
+            "registry-steward",
+            "k-a",
+            "registry-steward",
+            "emergent_deception:v1",
+        );
+        let err = backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap_err();
+        match err {
+            crate::federation::Error::DimensionRejected { reason, .. } => {
+                assert_eq!(reason, "morally_charged_stem");
+            }
+            other => panic!("expected DimensionRejected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_put_attestation_rejects_versionless_dimension() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("registry-steward", "registry", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-a", "primitive-a", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        let att = scores_attestation_with_dimension(
+            "att-bad-2",
+            "registry-steward",
+            "k-a",
+            "registry-steward",
+            "rights_asymmetry",
+        );
+        let err = backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap_err();
+        match err {
+            crate::federation::Error::DimensionRejected { reason, .. } => {
+                assert_eq!(reason, "missing_version_segment");
+            }
+            other => panic!("expected DimensionRejected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_put_attestation_accepts_correlated_action_v1() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("registry-steward", "registry", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-a", "primitive-a", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        let att = scores_attestation_with_dimension(
+            "att-good-1",
+            "registry-steward",
+            "k-a",
+            "registry-steward",
+            "detection:correlated_action:rights_asymmetry:v1",
+        );
+        backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+        let rows = backend.list_attestations_for("k-a").await.unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_put_attestation_exempts_structural_rename_chain() {
+        // FSD-002 v1.2 Ask 5 delta — the rename chain
+        // `delegates_to:correlated_action_v2:from:emergent_deception_v1`
+        // is one of §2.2's four structural primitives. The dimension
+        // would fail the morally-charged-stem test under `scores`,
+        // but the structural primitive is exempt.
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("registry-steward", "registry", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-a", "primitive-a", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        let mut att = scores_attestation_with_dimension(
+            "att-rename-1",
+            "registry-steward",
+            "k-a",
+            "registry-steward",
+            "delegates_to:correlated_action_v2:from:emergent_deception_v1",
+        );
+        att.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
+        backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+        let rows = backend.list_attestations_for("k-a").await.unwrap();
+        assert_eq!(rows.len(), 1);
     }
 
     // ─── BlobStorage tests (v2.3, CIRISPersist#103) ────────────────

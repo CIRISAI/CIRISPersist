@@ -1264,12 +1264,44 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         attestation: crate::federation::SignedAttestation,
     ) -> Result<(), crate::federation::Error> {
         let mut row = attestation.attestation;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         let client = self
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+
+        // v2.4.0 (CIRISPersist#102 Ask 3) — admission gate. Look up
+        // the attesting key's `identity_type` first; this also
+        // turns a missing-FK case into a typed `InvalidArgument`
+        // before the eventual FK violation. Runs BEFORE
+        // persist_row_hash + INSERT so rejected rows leave no
+        // trace.
+        let attesting_row = client
+            .query_opt(
+                "SELECT identity_type FROM cirislens.federation_keys WHERE key_id = $1",
+                &[&row.attesting_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("lookup attesting identity_type: {e}"))
+            })?;
+        let attesting_identity_type: String = match attesting_row {
+            Some(r) => r.safe_get_with("identity_type", crate::federation::Error::Backend)?,
+            None => {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "attesting_key_id {} does not exist in federation_keys",
+                    row.attesting_key_id
+                )));
+            }
+        };
+        let dim = crate::federation::admission::envelope_dimension(&row.attestation_envelope);
+        crate::federation::admission::DimensionAdmissionPolicy::default().check(
+            &row.attestation_type,
+            dim,
+            &attesting_identity_type,
+        )?;
+
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
             crate::federation::Error::InvalidArgument(format!(
@@ -1286,8 +1318,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             ))
         })?;
 
-        // postgres-types doesn't have a built-in for f64→NUMERIC; cast
-        // weight to f64 and let postgres convert.
+        // postgres-types has no built-in `f64`→`NUMERIC` conversion
+        // (neither `Some(f64)` nor `None::<f64>` against a NUMERIC
+        // column serialize — closes the long-standing bug exposed
+        // when CIRISPersist#102's admission-gate tests first
+        // exercised `put_attestation` in postgres end-to-end at
+        // v2.4.0). Cast the bind via `$5::float8::numeric` so
+        // postgres performs the conversion server-side; both
+        // `Some(f64)` and `None` bind as `Option<f64>` against
+        // `FLOAT8` (which DOES have a built-in serializer),
+        // then PG widens to NUMERIC for storage.
         client
             .execute(
                 "INSERT INTO cirislens.federation_attestations (\
@@ -1295,7 +1335,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+                 ) VALUES ($1, $2, $3, $4, $5::float8::numeric, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
                 &[
                     &attestation_uuid,
                     &row.attesting_key_id,
@@ -1339,8 +1379,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
         let rows = client
             .query(
+                // weight::float8 AS weight — tokio-postgres has no
+                // built-in NUMERIC<->f64 deserializer, so the read
+                // path mirrors the write-path `$5::float8::numeric`
+                // cast. NUMERIC→FLOAT8 is the inverse hop;
+                // pg_row_to_attestation reads weight as Option<f64>.
                 "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
-                    weight, asserted_at, expires_at, attestation_envelope, \
+                    weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
                  FROM cirislens.federation_attestations \
@@ -1365,8 +1410,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
         let rows = client
             .query(
+                // weight::float8 AS weight — see list_attestations_for.
                 "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
-                    weight, asserted_at, expires_at, attestation_envelope, \
+                    weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
                  FROM cirislens.federation_attestations \
@@ -1544,8 +1590,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // Read existing row to recompute the hash with new fields.
         let row_opt = client
             .query_opt(
+                // weight::float8 AS weight — see list_attestations_for.
                 "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
-                    weight, asserted_at, expires_at, attestation_envelope, \
+                    weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
                  FROM cirislens.federation_attestations WHERE attestation_id = $1::uuid",
@@ -4695,8 +4742,9 @@ impl crate::read::ReadEngine for PostgresBackend {
         params.push(Box::new(limit));
         let p_limit = params.len();
         let sql = format!(
+            // weight::float8 AS weight — see list_attestations_for.
             "SELECT attestation_id::text AS attestation_id, attesting_key_id, attested_key_id, \
-                    attestation_type, weight, asserted_at, expires_at, attestation_envelope, \
+                    attestation_type, weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
              FROM cirislens.federation_attestations \
@@ -10088,5 +10136,320 @@ mod tests {
         let mut expected = vec![host_a, host_b];
         expected.sort();
         assert_eq!(holders, expected);
+    }
+
+    // ─── Admission-gate tests (v2.4.0, CIRISPersist#102 Ask 3) ──────
+
+    /// Build a federation KeyRecord with parameterized identity_type
+    /// — covers the `accord_holder` vs `steward` distinction the
+    /// admission gate switches on for `accord:*` dimensions.
+    fn pg_admission_key(
+        key_id: &str,
+        identity_ref: &str,
+        identity_type: &str,
+    ) -> crate::federation::KeyRecord {
+        let mut k = fix_section_i_key(key_id, identity_ref, chrono::Utc::now(), false);
+        k.identity_type = identity_type.into();
+        k
+    }
+
+    fn pg_scores_attestation(
+        attesting: &str,
+        attested: &str,
+        scrub_key_id: &str,
+        dimension: &str,
+    ) -> crate::federation::Attestation {
+        // attestation_id is `::uuid`-cast on the postgres write
+        // path — needs a real UUID per `project_test_fixtures_uuid_vs_uuid_like`.
+        // weight: Some(1.0) exercises the `$5::float8::numeric` cast
+        // that put_attestation uses to handle f64→NUMERIC.
+        crate::federation::Attestation {
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            attesting_key_id: attesting.into(),
+            attested_key_id: attested.into(),
+            attestation_type: crate::federation::types::attestation_type::SCORES.into(),
+            weight: Some(1.0),
+            asserted_at: chrono::Utc::now(),
+            expires_at: None,
+            attestation_envelope: serde_json::json!({
+                "dimension": dimension,
+                "score": 1.0,
+                "confidence": 0.9,
+            }),
+            original_content_hash: "abc123".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: scrub_key_id.into(),
+            scrub_timestamp: chrono::Utc::now(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_put_attestation_rejects_accord_dimension_from_steward() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+        let steward = format!("pg-steward-§102-{}", uuid_like());
+        let agent_k = format!("pg-agent-§102-{}", uuid_like());
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &steward,
+                    "registry",
+                    crate::federation::types::identity_type::STEWARD,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &agent_k,
+                    "primitive-a",
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await
+            .unwrap();
+        let att = pg_scores_attestation(&steward, &agent_k, &steward, "accord:human_dignity:v1");
+        let err = backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: att })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::federation::Error::AccordDimensionRequiresAccordHolder { .. }
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_put_attestation_accepts_accord_dimension_from_accord_holder() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+        let holder = format!("pg-holder-§102-{}", uuid_like());
+        let agent_k = format!("pg-aa-§102-{}", uuid_like());
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &holder,
+                    "humanity-accord-1",
+                    crate::federation::types::identity_type::ACCORD_HOLDER,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &agent_k,
+                    "primitive-aa",
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await
+            .unwrap();
+        let att = pg_scores_attestation(&holder, &agent_k, &holder, "accord:human_dignity:v1");
+        backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+        let rows = backend.list_attestations_for(&agent_k).await.unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_put_attestation_rejects_morally_charged_dimension() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+        let steward = format!("pg-bad-stw-§102-{}", uuid_like());
+        let agent_k = format!("pg-bad-agt-§102-{}", uuid_like());
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &steward,
+                    "registry",
+                    crate::federation::types::identity_type::STEWARD,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &agent_k,
+                    "primitive-bad",
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await
+            .unwrap();
+        let att = pg_scores_attestation(&steward, &agent_k, &steward, "emergent_deception:v1");
+        let err = backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: att })
+            .await
+            .unwrap_err();
+        match err {
+            crate::federation::Error::DimensionRejected { reason, .. } => {
+                assert_eq!(reason, "morally_charged_stem");
+            }
+            other => panic!("expected DimensionRejected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_put_attestation_rejects_versionless_dimension() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+        let steward = format!("pg-vless-stw-§102-{}", uuid_like());
+        let agent_k = format!("pg-vless-agt-§102-{}", uuid_like());
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &steward,
+                    "registry",
+                    crate::federation::types::identity_type::STEWARD,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &agent_k,
+                    "primitive-vless",
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await
+            .unwrap();
+        let att = pg_scores_attestation(&steward, &agent_k, &steward, "rights_asymmetry");
+        let err = backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: att })
+            .await
+            .unwrap_err();
+        match err {
+            crate::federation::Error::DimensionRejected { reason, .. } => {
+                assert_eq!(reason, "missing_version_segment");
+            }
+            other => panic!("expected DimensionRejected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_put_attestation_accepts_correlated_action_v1() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+        let steward = format!("pg-good-stw-§102-{}", uuid_like());
+        let agent_k = format!("pg-good-agt-§102-{}", uuid_like());
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &steward,
+                    "registry",
+                    crate::federation::types::identity_type::STEWARD,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &agent_k,
+                    "primitive-good",
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await
+            .unwrap();
+        let att = pg_scores_attestation(
+            &steward,
+            &agent_k,
+            &steward,
+            "detection:correlated_action:rights_asymmetry:v1",
+        );
+        backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+        let rows = backend.list_attestations_for(&agent_k).await.unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_put_attestation_exempts_structural_rename_chain() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+        let steward = format!("pg-ren-stw-§102-{}", uuid_like());
+        let agent_k = format!("pg-ren-agt-§102-{}", uuid_like());
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &steward,
+                    "registry",
+                    crate::federation::types::identity_type::STEWARD,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &agent_k,
+                    "primitive-ren",
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await
+            .unwrap();
+        let mut att = pg_scores_attestation(
+            &steward,
+            &agent_k,
+            &steward,
+            "delegates_to:correlated_action_v2:from:emergent_deception_v1",
+        );
+        att.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
+        backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+        let rows = backend.list_attestations_for(&agent_k).await.unwrap();
+        assert_eq!(rows.len(), 1);
     }
 }
