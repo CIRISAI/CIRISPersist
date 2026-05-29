@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780000187733,
+  "lastUpdate": 1780013023719,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -36041,6 +36041,282 @@ window.BENCHMARK_DATA = {
             "name": "storage_floor/next_sequence_full",
             "value": 823,
             "range": "± 27",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "940204e96b9264f5dab9c829bef731cfad98e96c",
+          "message": "2.13.0 — #113 detection-events Engine read + subscribe facade\n\ncloses #113. Unblocks CIRISLensCore #15 (Node UX), #19 (scoring\noracle), #20 (alert subscriptions), #21 (Counter-RII), #25 (ECF UI\nProfileScorecard) — five lens issues converge here.\n\nThree new Engine methods:\n- get_detection_events(filter) — facade over the existing per-backend\n  DerivedSchema::get_detection_events impls.\n- get_edge_detection_events(filter) — V020 edge_detection_events read\n  surface (INSERT existed; SELECT new). New EdgeEventFilter +\n  EdgeDetectionEvent types in src/derived/types.rs. Stable ORDER BY\n  (tenant_id, observed_at, detection_id).\n- subscribe_detection_events(filter) -> impl Stream — v0.1 polling\n  change feed. 2s cadence, bounded mpsc::channel cap=256 (coarse-but-\n  honest backpressure: full buffer makes poll task await on send);\n  cursor = Utc::now() at subscribe so only new events surface (no\n  historical replay); drop via ReceiverStream closes the channel +\n  poll task exits cleanly via tx.is_closed() / send-error branches.\n  DB errors forward without terminating the task — transient outages\n  don't kill long-lived subscribers.\n\nv0.1 simplifications documented in trait doc-comments:\n- Polling, not WAL-hook / LISTEN-NOTIFY (#84's broader substrate\n  change-feed is deferred to 3.0+).\n- SubscriptionOptions (configurable cadence + capacity + drop policy)\n  is v0.2.\n- No PyO3 subscribe surface — needs FFI queue design; deferred.\n- PyO3 reads (get_detection_events_json existed; new\n  get_edge_detection_events_json) route errors through the existing\n  derived_err_to_py taxonomy.\n\nCargo: futures-core 0.3 + tokio-stream 0.1 declared directly (both\ntransitive via tokio-postgres; surface the dependency rather than\nlean on transitive).\n\n10 new tests + full suite: 812/812 nextest pass on both backends,\nfresh DB, --test-threads=1. clippy --all-targets clean on default\nAND full feature sets.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-28T18:44:58-05:00",
+          "tree_id": "3066887a380ad255229b788bdb6c66232630cb3f",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/940204e96b9264f5dab9c829bef731cfad98e96c"
+        },
+        "date": 1780013022889,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 40446771,
+            "range": "± 2948276",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 2534,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 5938,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 12997,
+            "range": "± 47",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 45876,
+            "range": "± 366",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 36,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 183,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 524,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 599,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 2066,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 9,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 76,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 228,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 1020,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 15,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 55735,
+            "range": "± 2900",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 161428,
+            "range": "± 3087",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 576807,
+            "range": "± 3308",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 8131,
+            "range": "± 597",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 8763,
+            "range": "± 626",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 19727,
+            "range": "± 1648",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 53662,
+            "range": "± 2670",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 720839,
+            "range": "± 3580",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 294928,
+            "range": "± 7419",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 13827,
+            "range": "± 788",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 45199,
+            "range": "± 3267",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 2695612,
+            "range": "± 39932",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 103123,
+            "range": "± 5349",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 473387,
+            "range": "± 13731",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 6733591,
+            "range": "± 37014",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 240977,
+            "range": "± 16380",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 1192764,
+            "range": "± 22572",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 5258,
+            "range": "± 639",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 4083,
+            "range": "± 326",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 1455,
+            "range": "± 132",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 4146,
+            "range": "± 119",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 30414,
+            "range": "± 291",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 1,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 716,
+            "range": "± 63",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 98,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 1207,
+            "range": "± 99",
             "unit": "ns/iter"
           }
         ]
