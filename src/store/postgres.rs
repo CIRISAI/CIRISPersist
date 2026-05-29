@@ -3324,33 +3324,74 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .get_client()
             .await
             .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
-        let rows = client
-            .query(
-                // `asserted_at > cutoff` admits rows whose freshness
-                // window has NOT lapsed; rows whose asserted_at is at
-                // or before cutoff are TTL-expired.
-                "SELECT attestation_id::text, attesting_key_id, attestation_envelope \
-                 FROM cirislens.federation_attestations \
-                 WHERE attestation_type = $1 \
-                   AND asserted_at > $2 \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM cirislens.federation_attestations w \
-                     WHERE w.attestation_type = $3 \
-                       AND w.attesting_key_id = \
-                           cirislens.federation_attestations.attesting_key_id \
-                       AND w.attestation_envelope->>'references_attestation_id' = \
-                           cirislens.federation_attestations.attestation_id::text \
-                   )",
-                &[
-                    &attestation_type,
-                    &cutoff,
-                    &crate::federation::types::attestation_type::WITHDRAWS,
-                ],
+
+        // v3.5.1 (CIRISPersist#130) — bypass TTL when the blob is
+        // locally held. Federation §10.1.2 TTL is a backstop for
+        // peer attestations going stale; for blobs in our local
+        // `federation_blobs` table the bytes are definitively held
+        // + the holds_bytes attestations from any attester are
+        // reportable regardless of `asserted_at` age. The withdraws
+        // mechanism remains the active eviction signal.
+        let sha_vec = sha256.to_vec();
+        let blob_locally_held: bool = client
+            .query_opt(
+                "SELECT 1 FROM cirislens.federation_blobs WHERE sha256 = $1",
+                &[&sha_vec],
             )
             .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("list_holders query: {e}"))
-            })?;
+            .map_err(|e| crate::federation::BlobError::Backend(format!("local-hold lookup: {e}")))?
+            .is_some();
+
+        // Choose the SQL based on whether we bypass TTL. Both
+        // variants apply the withdraws filter; only the TTL
+        // predicate differs.
+        let rows = if blob_locally_held {
+            client
+                .query(
+                    "SELECT attestation_id::text, attesting_key_id, attestation_envelope \
+                     FROM cirislens.federation_attestations \
+                     WHERE attestation_type = $1 \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM cirislens.federation_attestations w \
+                         WHERE w.attestation_type = $2 \
+                           AND w.attesting_key_id = \
+                               cirislens.federation_attestations.attesting_key_id \
+                           AND w.attestation_envelope->>'references_attestation_id' = \
+                               cirislens.federation_attestations.attestation_id::text \
+                       )",
+                    &[
+                        &attestation_type,
+                        &crate::federation::types::attestation_type::WITHDRAWS,
+                    ],
+                )
+                .await
+        } else {
+            client
+                .query(
+                    // `asserted_at > cutoff` admits rows whose freshness
+                    // window has NOT lapsed; rows whose asserted_at is at
+                    // or before cutoff are TTL-expired.
+                    "SELECT attestation_id::text, attesting_key_id, attestation_envelope \
+                     FROM cirislens.federation_attestations \
+                     WHERE attestation_type = $1 \
+                       AND asserted_at > $2 \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM cirislens.federation_attestations w \
+                         WHERE w.attestation_type = $3 \
+                           AND w.attesting_key_id = \
+                               cirislens.federation_attestations.attesting_key_id \
+                           AND w.attestation_envelope->>'references_attestation_id' = \
+                               cirislens.federation_attestations.attestation_id::text \
+                       )",
+                    &[
+                        &attestation_type,
+                        &cutoff,
+                        &crate::federation::types::attestation_type::WITHDRAWS,
+                    ],
+                )
+                .await
+        }
+        .map_err(|e| crate::federation::BlobError::Backend(format!("list_holders query: {e}")))?;
 
         let mut holders: Vec<String> = Vec::with_capacity(rows.len());
         let mut seen = std::collections::HashSet::new();

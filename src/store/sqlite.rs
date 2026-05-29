@@ -3209,8 +3209,26 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let ttl = chrono::Duration::from_std(crate::federation::blobs::DEFAULT_HOLDS_BYTES_TTL)
             .expect("DEFAULT_HOLDS_BYTES_TTL fits chrono::Duration");
         let conn = self.conn.clone();
+        let sha_vec = sha256.to_vec();
         tokio::task::spawn_blocking(move || -> Result<Vec<String>, rusqlite::Error> {
             let conn = conn.blocking_lock();
+
+            // v3.5.1 (CIRISPersist#130) — bypass TTL when the blob is
+            // locally held. Federation §10.1.2 TTL is a backstop for
+            // peer attestations going stale; for blobs in our local
+            // `federation_blobs` table the bytes are definitively
+            // held + the holds_bytes attestations from any attester
+            // are reportable regardless of `asserted_at` age. The
+            // `withdraws` mechanism remains the active eviction
+            // signal; TTL just doesn't punish local-truth.
+            let blob_locally_held: bool = conn
+                .query_row(
+                    "SELECT 1 FROM federation_blobs WHERE sha256 = ?1",
+                    rusqlite::params![&sha_vec],
+                    |_| Ok(true),
+                )
+                .optional()?
+                .unwrap_or(false);
 
             // Step A: collect candidate holds_bytes rows.
             let mut stmt = conn.prepare(
@@ -3251,13 +3269,15 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 if !matches {
                     continue;
                 }
-                // (ii) TTL window
+                // (ii) TTL window — bypassed when the blob is locally
+                // held (#130: federation TTL is a backstop for peer
+                // attestations; local-held blobs have definitive truth).
                 let asserted_at = match chrono::DateTime::parse_from_rfc3339(&asserted_at_str) {
                     Ok(t) => t.with_timezone(&chrono::Utc),
                     Err(_) => continue,
                 };
                 let expires_at = asserted_at + ttl;
-                if expires_at <= now {
+                if !blob_locally_held && expires_at <= now {
                     continue;
                 }
                 // (iii) ContentMiss withdraws — the attester emitted a

@@ -703,6 +703,13 @@ mod postgres_tests {
             .unwrap();
     }
 
+    // v3.5.1 (CIRISPersist#128) — seed-byte allocation for PG tests in
+    // this module. `federation/emit.rs`'s tests claim 0x81/0x91/0xA1/
+    // 0xB1; collisions on the shared `federation_keys` row cause FK
+    // violations when nextest processes tests from both modules in
+    // parallel (`serial_test::serial(postgres)` only serializes within
+    // a process). Backfill claims the 0xC0-range to keep the two
+    // modules disjoint.
     async fn pg_cleanup(backend: &PostgresBackend, tenant: &str, pubkeys: &[&str]) {
         let client = backend.pool().get().await.unwrap();
         for sql in [
@@ -744,11 +751,11 @@ mod postgres_tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
-        let signer = build_signer(0xA1);
+        let signer = build_signer(0xC1);
         backend.set_merkle_signer(Some(signer.clone()));
         let granter = signer.public_key_b64();
-        let grantee_direct = pubkey_for(0xA2);
-        let grantee_registry = pubkey_for(0xA3);
+        let grantee_direct = pubkey_for(0xC2);
+        let grantee_registry = pubkey_for(0xC3);
         let tenant = format!("pg-phase-i-mixed-{}", Uuid::new_v4().simple());
 
         pg_cleanup(
@@ -812,11 +819,11 @@ mod postgres_tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
-        let signer = build_signer(0xB1);
+        let signer = build_signer(0xD1);
         backend.set_merkle_signer(Some(signer.clone()));
         let local_granter = signer.public_key_b64();
-        let other_granter = pubkey_for(0xB2);
-        let grantee = pubkey_for(0xB3);
+        let other_granter = pubkey_for(0xD2);
+        let grantee = pubkey_for(0xD3);
         let tenant = format!("pg-phase-i-other-{}", Uuid::new_v4().simple());
 
         pg_cleanup(

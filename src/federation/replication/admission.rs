@@ -59,6 +59,18 @@ impl AdmissionGate {
         self.recursion_depth
     }
 
+    /// v3.5.1 (CIRISPersist#129) — extract a clone of the inner
+    /// `Arc<dyn TrustScoring>` for cohabitation consumers that need
+    /// the scorer directly (CIRISEdge `init_edge_runtime` short-
+    /// circuit auto-derivation). Symmetric to
+    /// [`BackendDispatch`-as-`BlackholeRules`](crate::engine::BackendDispatch)
+    /// access for the deny-list trait — the substrate exposes its
+    /// trait-keyed handles so consumers don't have to re-wire scoring
+    /// from scratch.
+    pub fn scoring_arc(&self) -> Arc<dyn TrustScoring> {
+        self.scoring.clone()
+    }
+
     /// Check whether `key_id` clears the gate. Returns:
     ///
     /// - `Ok(Ok(score))` — the key cleared at `score >= threshold`.

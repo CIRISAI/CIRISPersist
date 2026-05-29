@@ -15480,6 +15480,42 @@ impl PyEngine {
         pyo3::types::PyCapsule::new(py, local_signer, Some(name))
             .map_err(|e| PyErr::new::<LensQueryError, _>(format!("local_signer_capsule: {e}")))
     }
+
+    /// v3.5.1 (CIRISPersist#129) — cross-cdylib accessor for the
+    /// `Arc<dyn TrustScoring>` from the currently-installed admission
+    /// gate. 7th member of the cohabitation capsule family
+    /// (federation_directory + outbound_queue + keyring_signer +
+    /// runtime_handle + blob_storage + local_signer + **trust_scoring**).
+    /// Each capsule one job — trust_scoring drives `dispatch_inbound`
+    /// trust short-circuit (CIRISEdge #48-B) while the other six
+    /// continue to drive their established surfaces.
+    ///
+    /// Raises `ValueError("trust_scoring_unavailable")` when no
+    /// admission gate is installed (bootstrap-permissive default).
+    /// Caller responsibility to either install a gate first via the
+    /// rust-side `Engine::set_admission_gate(...)` path, or accept
+    /// the unavailable case (cohab consumers fall back to a no-op
+    /// scorer when this raises).
+    ///
+    /// Name tag: `ciris_persist::trust_scoring`.
+    #[pyo3(name = "trust_scoring_capsule")]
+    fn trust_scoring_capsule_py<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyCapsule>> {
+        let gate = match &self.backend {
+            BackendDispatch::Postgres(b) => b.admission_gate(),
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.admission_gate(),
+        };
+        let scoring = gate
+            .map(|g| g.scoring_arc())
+            .ok_or_else(|| PyValueError::new_err("trust_scoring_unavailable"))?;
+        let name = std::ffi::CString::new("ciris_persist::trust_scoring")
+            .expect("static name has no NUL bytes");
+        pyo3::types::PyCapsule::new(py, scoring, Some(name))
+            .map_err(|e| PyErr::new::<LensQueryError, _>(format!("trust_scoring_capsule: {e}")))
+    }
 }
 
 /// v1.5.9 (CIRISPersist#59 #1) — encode a [`ClaimResult<Task>`] onto the

@@ -27,3 +27,37 @@ slow-timeout = { period = "60s", terminate-after = 6 }
 # Keep going after a failure so all failing tests surface in one run,
 # not just the first. Mirrors the `--no-fail-fast` we pass on the CLI.
 fail-fast = false
+
+# v3.5.1 (CIRISPersist#128) — PG test serialization.
+#
+# Why: 175+ tests carry `#[serial_test::serial(postgres)]`, but that
+# crate only serializes WITHIN a process. Nextest spawns one process
+# per test by default, so the serial annotation does nothing across
+# the process boundary. Multiple PG tests then race on the single
+# shared `CIRIS_PERSIST_TEST_PG_URL` database, producing intermittent
+# FK violations / row-conflicts / cleanup races that vary per run.
+# Confirmed by a 5-run gauntlet at v3.5.0: each run failed on a
+# different test (pg_backfill_mixed_and_idempotent, sweeper_evicts_
+# lowest_score_first_pg, maintenance_pg_maintain_umbrella_runs_all,
+# pg_lookup_trust_grant_exact_and_wildcard). All passed cleanly with
+# `--test-threads=1`.
+#
+# The right fix is structural: declare a `postgres` test group with
+# `max-threads = 1`, bind every PG-touching test to it, let non-PG
+# tests keep their parallelism. Honors the user directive
+# [feedback_hundred_percent_green] without paying the
+# `--test-threads=1` global tax.
+#
+# Binding is by test-path filter — anything matching the listed module
+# paths goes into the group. Mirrors the existing serial_test
+# annotation distribution (src/store/postgres.rs, src/secrets/postgres.rs,
+# src/cirisnode/postgres.rs, src/sequence/postgres.rs,
+# src/continuity_awareness/postgres.rs, src/graph/postgres.rs,
+# src/maintenance/postgres.rs, src/federation/{emit,backfill,read}.rs,
+# plus pg_*_pg test-name pattern across the substrate modules).
+[test-groups.postgres]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'test(/_pg$/) + test(/::pg_/) + test(/postgres_tests::/) + test(/::postgres::/)'
+test-group = "postgres"

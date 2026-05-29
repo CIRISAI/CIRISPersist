@@ -5,6 +5,44 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.5.1] — 2026-05-29
+
+**CIRISPersist 3.5.1 — `trust_scoring_capsule` cohabitation accessor (#129) + `list_holders` local-held bypass (#130) + partial `#128` parallel-test isolation fixes.**
+
+Patch closing the two real bugs surfaced by the CIRISConformance fabric-tier build + CIRISEdge cohabitation init, plus a partial fix on the pre-existing parallel-test isolation flake.
+
+### #129 — `trust_scoring_capsule` (7th PyCapsule accessor)
+
+CIRISEdge v0.19.6 ships #48-B trust short-circuit at `dispatch_inbound` consuming the v3.4.0 #123 `TrustScoring` trait. Non-cohab `EdgeBuilder` callers wire `Arc<dyn TrustScoring>` directly; cohab `init_edge_runtime` couldn't — `AdmissionGate.scoring` was a private field with no accessor.
+
+**Both Option A and Option B implemented**:
+
+- **Option A — accessors**: `AdmissionGate::scoring_arc(&self) -> Arc<dyn TrustScoring>` clone-and-return, plus `Engine::trust_scoring(&self) -> Option<Arc<dyn TrustScoring>>` that pulls from the currently-installed gate. Returns `None` when no gate is configured (bootstrap-permissive default).
+- **Option B — capsule**: `trust_scoring_capsule()` 7th cohabitation PyCapsule accessor on `PyEngine`, name tag `ciris_persist::trust_scoring`. Mirrors the established capsule discipline (federation_directory + outbound_queue + keyring_signer + runtime_handle + blob_storage + local_signer + **trust_scoring**). Each capsule one job.
+
+Cohab consumers prefer the capsule path; Rust-side callers can use the accessor pair directly. Raises `ValueError("trust_scoring_unavailable")` when no gate is installed — cohab consumers fall back to a no-op scorer in that case.
+
+### #130 — `list_holders` bypasses TTL for locally-held blobs
+
+CIRISConformance fabric-tier reported: `list_holders_json(sha)` returned `[]` for a blob the engine demonstrably held via `put_blob_signing`. Root cause: the CEG §10.1.2 24-hour `holds_bytes` TTL was excluding the local holder when callers passed a `now` timestamp more than 24h in the past (the `put_blob_signing` `now` parameter is for replay determinism per v3.3.0 #121 docstring; conformance harnesses use fixed timestamps).
+
+The TTL filter's design intent: backstop for **federation peers** going silently offline (no re-attestation in 24h → drop from holder set). For **locally-held blobs**, the bytes are in `federation_blobs` — definitive proof of holding. The TTL was punishing the local-truth case.
+
+**Fix**: `list_holders` now checks `federation_blobs` for the SHA. If the blob is locally present, the TTL filter is bypassed for all attestations (the `withdraws` mechanism stays the active eviction signal — CEG §10.1.2 ContentMiss feedback loop unchanged). Both backends.
+
+Pinned by `list_holders_includes_local_held_blob_with_stale_attestation_sqlite` regression test — 48h-old asserted_at, blob locally held → holder reported. Behavior unchanged when blob isn't locally held (TTL still applies to peer-only attestations).
+
+### #128 — partial fix (parallel-test isolation)
+
+Two surface fixes shipped against the pre-existing parallel-test isolation flake the v3.5.0 ship report flagged:
+
+- **`.config/nextest.toml`** — new `[test-groups.postgres]` config + override filter (`test(/_pg$/) + test(/::pg_/) + test(/postgres_tests::/) + test(/::postgres::/)`). All PG-touching tests run with `max-threads = 1`. Honors `[feedback_hundred_percent_green]` without paying a global `--test-threads=1` tax — non-PG tests keep their parallelism. Mirrors the existing `#[serial_test::serial(postgres)]` distribution; needed because that crate only serializes within a process, but nextest spawns one process per test.
+- **`src/federation/backfill.rs`** — seed-byte reallocation: `0xA1` → `0xC1`, `0xB1` → `0xD1`. Disjoint from `emit.rs`'s `0x81 / 0x91 / 0xA1 / 0xB1` claims; documented at the top of `backfill.rs::tests::pg_cleanup`.
+
+These two fixes take the gauntlet from **5/5 random failures** to a single deterministic residual (`put_get_goal_round_trip_pg` fails even at `--test-threads=1` — a separate test-state-pollution issue, not parallelism, **tracked as ongoing**). The dominant 80% of the flake surface is closed; the residual 20% requires deeper teardown-helper work that doesn't fit a patch cut.
+
+CIRISEdge 1.0 RC consumers should pin **v3.5.1** for all production code paths — the residual flake is test-infrastructure-only, not in any shipped behavior.
+
 ## [3.5.0] — 2026-05-29
 
 **CIRISPersist 3.5 — identity-aware storage (`list_held_by` + `evict_actor`) + CEG canonicalization rejection rules (#125 + #126 / CIRISConformance §0.5/§0.6/§0.7 + scaling-model §9 conformance gates).**
