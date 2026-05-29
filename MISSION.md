@@ -6,9 +6,10 @@
 > file. Methodology: `~/CIRISAgent/FSD/MISSION_DRIVEN_DEVELOPMENT.md`
 > and the overview at [ciris.ai/mdd](https://ciris.ai/mdd).
 
-**Version**: 1.0
-**Status**: Active — reverse-engineered against `main` at v1.11.1
-**Date**: 2026-05-22
+**Version**: 1.1
+**Status**: Active — current as of `main` at **v3.0.0**
+(Coherence Epistemic Graph 0.2 substrate conformance)
+**Date**: 2026-05-28
 
 This is the reverse-engineered MDD charter for CIRISPersist: it maps the
 four pillars — Mission (WHY) / Protocols (WHO) / Schemas (WHAT) / Logic

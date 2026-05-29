@@ -1572,6 +1572,107 @@ background are logged via `tracing::error` but don't propagate
 back to Python. Documented residual; v0.5.3 sweep applies the
 defensive layer at every point we control.
 
+#### AV-45: §7.0 admission bypass via deprecated `attestation:l{N}:*` past CEG-0.3 retirement
+
+**Attack**: an adversary emits `SCORES` attestations using the
+deprecated L1-L5 wire prefix (`attestation:l1:self_verify`, etc.)
+*after* CIRISRegistry retires the dual-acceptance via the CEG §11.2
+amendment process. If persist's admission policy still allows the
+deprecated form, the adversary's attestations land in the chain
+indistinguishable from canonical ones — and downstream consumers
+applying CEG §8.1.9 Policy I composition on the canonical-only
+mechanism strings silently drop the malicious data, masking the
+intrusion.
+
+**Mitigation v3.0.0**:
+
+1. **`AttestationLadderTransitionPolicy` enum on
+   `DimensionAdmissionPolicy`** (`src/federation/admission.rs`).
+   3.0.0 defaults to `DualAccept` per CEG 0.1→0.2 transition; the
+   `RejectDeprecated` variant exists and is regression-tested at the
+   admission gate (so the flip is a one-line change, not a refactor).
+2. **The `is_deprecated_attestation_ladder_prefix` parser** is a
+   runtime-checked match against `attestation:l<digits>:<mechanism>`,
+   so a future canonical mechanism named with a leading `l<N>` doesn't
+   accidentally match. Tight regex; no semantic confusion.
+3. **CEG §11.2 amendment process** is the human-loop gate on the
+   flip: persist tracks Registry's CEG release; the 3.1 flip ships
+   when Registry retires the deprecated form, not before.
+
+**Residual**: during the 3.0 dual-acceptance window, a producer
+emitting only deprecated-form `attestation:l{N}:*` looks valid at
+admission but is invisible to a CEG 0.2-strict consumer that only
+parses mechanism strings. Documented: producers MUST emit canonical
+form going forward (per CEG §13.1); deprecated-form emissions are a
+producer-conformance bug, surfaced by CIRISConformance suite, not
+substrate enforcement.
+
+#### AV-46: §10.1.2 ContentMiss flood DoS against `list_holders`
+
+**Attack**: an adversary emits forged `WITHDRAWS` attestations
+against legitimate `holds_bytes:sha256:{prefix}` rows en masse,
+attempting to make every legitimate holder appear withdrawn so
+`list_holders` returns empty and federation peers can't locate the
+bytes.
+
+**Mitigation v3.0.0**:
+
+1. **WITHDRAWS attestations are admission-gated** by the same
+   `put_attestation` path as every other attestation type — the
+   attester's `key_id` must exist in `federation_keys`, the
+   signature must verify against that row's pubkey, and the
+   structural-composer admission rules (CEG §6.1) apply.
+2. **WITHDRAWS scope is per-attester** per CEG §6.1: a withdrawal
+   from key K only suppresses K's own `holds_bytes` row from
+   `list_holders`, never another attester's. The `NOT EXISTS`
+   subquery in `list_holders` (`src/store/postgres.rs:2647`) filters
+   on `w.attesting_key_id = h.attesting_key_id`. A malicious peer
+   can only erase ITSELF from the holders list, not others — the
+   asymmetric advantage is zero.
+3. **Per-host attestation-rate caps** (deployer-policy, not
+   substrate-enforced) bound the volume of withdraw emissions per
+   key per window. Persist exposes the count via the existing
+   attestation read APIs.
+
+**Residual**: a single compromised federation peer can erase its
+own holders entries, reducing federation-wide blob redundancy by
+one. Not a DoS in the multi-holder case (the §10.1.2 design assumes
+N≥3 holders for federation-tier blobs). Tracked: federation operators
+should monitor `count_holders` ground-truth vs effective via
+operational dashboards.
+
+#### AV-47: §6.1 dedup-rule replay-protection hole
+
+**Attack**: an adversary replays an old `SUPERSEDES` attestation
+against a stale `references_attestation_id` after a newer `RECANTS`
+has been emitted, attempting to overwrite the retraction.
+
+**Mitigation v3.0.0**:
+
+1. **Precedence is applied at READ, not WRITE** per CEG §6.1 design
+   (audit chain stores all composers honestly; reads project the
+   current effective state via `precedence_winner`). A replayed
+   `SUPERSEDES` lands in the audit chain (it's an append-only
+   record, by design) but doesn't change what `precedence_winner`
+   returns.
+2. **`precedence_winner` ranks**
+   `RECANTS=3 > WITHDRAWS=2 > SUPERSEDES=1` per CEG §6.1 rule 1.
+   A `SUPERSEDES` can never outrank a `RECANTS` against the same
+   upstream from the same attester regardless of `asserted_at`
+   ordering — replay is structurally inert.
+3. **Idempotent on identical replay**: the
+   `(references_attestation_id, attestation_type, attesting_key_id)`
+   triple is the dedup key. A second `put_attestation` with the
+   same triple returns `Ok(())` silently — the chain has the original
+   row only, no duplicate audit-trail growth from replay flooding.
+
+**Residual**: an attester who issues their OWN `SUPERSEDES` ↔
+`RECANTS` ↔ `SUPERSEDES` ↔ `RECANTS` oscillation pollutes their
+own composer chain (different signed_at values, different triples).
+The precedence still resolves correctly (latest `RECANTS` wins);
+the audit-chain growth is bounded by per-key emission rate caps
+(AV-46 mitigation 3).
+
 ---
 
 ## 4. Mitigation Matrix
@@ -1975,9 +2076,14 @@ This document is updated:
   added for the new trait surfaces.
 - On every wire-format schema-version bump: AV-4 / AV-12 review.
 
-Last updated: 2026-05-03 (v0.3.6 — AV-28..AV-39 added covering
-federation directory, hybrid PQC, wire-format extensions, per-key
-DSAR, verify_hybrid surface). Previous landmarks:
+Last updated: 2026-05-28 (**v3.0.0** — AV-45..AV-47 added covering
+CEG 0.2 substrate-conformance threats: §7.0 admission bypass via
+deprecated `attestation:l{N}:*` past CEG-0.3 retirement, §10.1.2
+ContentMiss flood DoS against `list_holders`, §6.1 dedup-rule
+replay-protection hole. CEG conformance bundle landed via
+CIRISPersist#116; the substrate's role is wire-format gates +
+relational fabric per CEG §0.5, NOT Cartesian re-arbitration of
+cross-attestation truth). Previous landmarks:
 
 - 2026-05-01: v0.1.2 baseline — AV-5 / AV-6 / AV-7 / AV-9 / AV-15
   closed; Path B schema reconciliation complete.
