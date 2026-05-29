@@ -2618,6 +2618,99 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<(), crate::federation::Error> {
         sqlite_update_peer_field(self, key_id, SqlitePeerUpdate::Policy(policy)).await
     }
+
+    // v3.4.1 (CIRISPersist#127) — read accessor; returns `None` for
+    // non-existent or soft-removed peers.
+    async fn peer_metadata_for(
+        &self,
+        key_id: &str,
+    ) -> Result<Option<crate::federation::PeerMetadataRow>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let key_id_owned = key_id.to_owned();
+        tokio::task::spawn_blocking(
+            move || -> Result<Option<crate::federation::PeerMetadataRow>, crate::federation::Error> {
+                let conn = conn.blocking_lock();
+                type Row = (
+                    String,         // key_id
+                    Option<String>, // alias
+                    String,         // trust
+                    Option<String>, // notes
+                    Option<String>, // policy_blob (TEXT-as-JSON)
+                    Option<String>, // transport_identity
+                    Option<String>, // removed_at
+                    String,         // inserted_at
+                    String,         // updated_at
+                    String,         // persist_row_hash
+                );
+                let row_opt: Option<Row> = conn
+                    .query_row(
+                        "SELECT key_id, alias, trust, notes, policy_blob, transport_identity, \
+                                removed_at, inserted_at, updated_at, persist_row_hash \
+                         FROM federation_peer_metadata WHERE key_id = ?1",
+                        rusqlite::params![key_id_owned],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                                row.get(6)?,
+                                row.get(7)?,
+                                row.get(8)?,
+                                row.get(9)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(|e| {
+                        crate::federation::Error::Backend(format!(
+                            "peer_metadata_for query: {e}"
+                        ))
+                    })?;
+                let Some((
+                    key_id,
+                    alias,
+                    trust_str,
+                    notes,
+                    policy_text,
+                    transport_identity,
+                    removed_at_text,
+                    inserted_at_text,
+                    updated_at_text,
+                    persist_row_hash,
+                )) = row_opt
+                else {
+                    return Ok(None);
+                };
+                if removed_at_text.is_some() {
+                    return Ok(None);
+                }
+                let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_at_text)
+                    .map_err(|e| {
+                        crate::federation::Error::Backend(format!(
+                            "updated_at parse: {e}"
+                        ))
+                    })?
+                    .with_timezone(&chrono::Utc);
+                let tuple: PeerMetadataRowTuple = (
+                    key_id,
+                    alias,
+                    trust_str,
+                    notes,
+                    policy_text,
+                    transport_identity,
+                    inserted_at_text,
+                );
+                let mut meta = sqlite_row_tuple_to_peer_metadata(tuple, None, updated_at)?;
+                meta.persist_row_hash = persist_row_hash;
+                Ok(Some(meta))
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+    }
 }
 
 // ─── Peer-metadata update helpers (v3.1.0, CIRISPersist#117) ───────
@@ -12596,6 +12689,63 @@ mod tests {
             serde_json::from_str(meta.3.as_deref().expect("policy_blob set")).unwrap();
         assert_eq!(decoded["rate"], serde_json::json!(60));
         assert_eq!(decoded["tags"], serde_json::json!(["x", "y"]));
+    }
+
+    // ── v3.4.1 (CIRISPersist#127) — peer_metadata_for read accessor ──
+
+    #[tokio::test]
+    async fn peer_metadata_for_returns_full_row_sqlite() {
+        use crate::federation::FederationDirectory;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .add_peer_record("peer-read", "AAAA", "agent", Some("rns://abc".into()))
+            .await
+            .unwrap();
+        let blob = crate::federation::PeerPolicyBlob(serde_json::json!({
+            "cohort_scope": "federation",
+        }));
+        backend.update_peer_policy("peer-read", blob).await.unwrap();
+        let meta = backend
+            .peer_metadata_for("peer-read")
+            .await
+            .unwrap()
+            .expect("active peer must surface");
+        assert_eq!(meta.key_id, "peer-read");
+        assert!(meta.removed_at.is_none());
+        assert_eq!(meta.transport_identity.as_deref(), Some("rns://abc"));
+        let policy = meta.policy_blob.expect("policy_blob set");
+        assert_eq!(
+            policy.as_value()["cohort_scope"],
+            serde_json::json!("federation")
+        );
+        assert!(!meta.persist_row_hash.is_empty());
+    }
+
+    #[tokio::test]
+    async fn peer_metadata_for_returns_none_unknown_sqlite() {
+        use crate::federation::FederationDirectory;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let got = backend.peer_metadata_for("ghost").await.unwrap();
+        assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn peer_metadata_for_returns_none_soft_removed_sqlite() {
+        use crate::federation::FederationDirectory;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .add_peer_record("peer-gone", "AAAA", "agent", None)
+            .await
+            .unwrap();
+        backend
+            .remove_peer_record("peer-gone", false)
+            .await
+            .unwrap();
+        let got = backend.peer_metadata_for("peer-gone").await.unwrap();
+        assert!(got.is_none(), "soft-removed peer must read as None");
     }
 
     #[tokio::test]

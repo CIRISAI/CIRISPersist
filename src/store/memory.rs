@@ -1207,6 +1207,20 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
         Ok(())
     }
+
+    // v3.4.1 (CIRISPersist#127) — read accessor; returns `None` for
+    // non-existent or soft-removed peers.
+    async fn peer_metadata_for(
+        &self,
+        key_id: &str,
+    ) -> Result<Option<crate::federation::PeerMetadataRow>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(state
+            .federation_peer_metadata
+            .get(key_id)
+            .filter(|r| r.removed_at.is_none())
+            .cloned())
+    }
 }
 
 // ─── BlackholeRules impl (v3.2.0, CIRISPersist#120) ────────────────

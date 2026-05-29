@@ -566,6 +566,27 @@ pub trait FederationDirectory: Send + Sync {
             "update_peer_policy not implemented for this backend".into(),
         ))
     }
+
+    /// v3.4.1 (CIRISPersist#127) — read accessor for
+    /// `federation_peer_metadata`. Returns the full row shape for
+    /// active peers; `None` for non-existent or soft-removed peers
+    /// (`removed_at IS NOT NULL`).
+    ///
+    /// Symmetric to [`update_peer_policy`] + the four other peer
+    /// update methods — the write side shipped in v3.1.0 (#117); this
+    /// is the read side CIRISEdge#48 (cohort_scope consumer-side
+    /// enforcement) requires for `peer.policy_blob.cohort_scope`
+    /// comparison.
+    ///
+    /// The `policy_blob` field is opaque JSON (the same shape callers
+    /// pass to [`update_peer_policy`]); consumer is responsible for
+    /// the typed decode.
+    async fn peer_metadata_for(&self, key_id: &str) -> Result<Option<PeerMetadataRow>, Error> {
+        let _ = key_id;
+        Err(Error::Backend(
+            "peer_metadata_for not implemented for this backend".into(),
+        ))
+    }
 }
 
 /// Federation directory errors. Distinct from

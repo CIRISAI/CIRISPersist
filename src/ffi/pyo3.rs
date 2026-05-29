@@ -3655,6 +3655,67 @@ impl PyEngine {
         })
     }
 
+    /// v3.4.1 (CIRISPersist#127) — Federation directory: read peer
+    /// metadata row. Returns the JSON-encoded `PeerMetadataRow`
+    /// (carrying `alias`, `trust`, `notes`, `policy_blob`,
+    /// `transport_identity`, timestamps, and `persist_row_hash`) for
+    /// active peers; `None` for non-existent or soft-removed peers.
+    ///
+    /// CIRISEdge consumes `policy_blob.cohort_scope` for #48-A
+    /// consumer-side cohort_scope enforcement.
+    fn peer_metadata_for_json(&self, py: Python<'_>, key_id: &str) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key_id = key_id.to_owned();
+            py.detach(|| match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        let row = backend
+                            .peer_metadata_for(&key_id)
+                            .await
+                            .map_err(federation_err_to_py)?;
+                        match row {
+                            None => Ok(None),
+                            Some(r) => {
+                                let s = serde_json::to_string(&r).map_err(|e| {
+                                    PyRuntimeError::new_err(format!(
+                                        "peer_metadata_for_json encode: {e}"
+                                    ))
+                                })?;
+                                Ok(Some(s))
+                            }
+                        }
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        let row = backend
+                            .peer_metadata_for(&key_id)
+                            .await
+                            .map_err(federation_err_to_py)?;
+                        match row {
+                            None => Ok(None),
+                            Some(r) => {
+                                let s = serde_json::to_string(&r).map_err(|e| {
+                                    PyRuntimeError::new_err(format!(
+                                        "peer_metadata_for_json encode: {e}"
+                                    ))
+                                })?;
+                                Ok(Some(s))
+                            }
+                        }
+                    })
+                }
+            })
+        })
+    }
+
     // ── v3.2.0 (CIRISPersist#120) — BlackholeRules PyO3 surface ────
     //
     // Bytes in / bytes out for `identity_hash` (Python `bytes`); ISO

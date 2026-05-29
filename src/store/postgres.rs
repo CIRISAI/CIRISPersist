@@ -2789,6 +2789,44 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     ) -> Result<(), crate::federation::Error> {
         pg_update_peer_field(self, key_id, PgPeerUpdate::Policy(policy)).await
     }
+
+    // v3.4.1 (CIRISPersist#127) — read accessor; returns `None` for
+    // non-existent or soft-removed peers.
+    async fn peer_metadata_for(
+        &self,
+        key_id: &str,
+    ) -> Result<Option<crate::federation::PeerMetadataRow>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let row_opt = client
+            .query_opt(
+                "SELECT key_id, alias, trust, notes, policy_blob, \
+                        transport_identity, removed_at, inserted_at, updated_at, persist_row_hash \
+                 FROM cirislens.federation_peer_metadata WHERE key_id = $1",
+                &[&key_id],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("peer_metadata_for: {e}")))?;
+        let Some(row) = row_opt else { return Ok(None) };
+        let removed_at: Option<chrono::DateTime<chrono::Utc>> =
+            row.safe_get_with("removed_at", crate::federation::Error::Backend)?;
+        if removed_at.is_some() {
+            return Ok(None);
+        }
+        let inserted_at: chrono::DateTime<chrono::Utc> =
+            row.safe_get_with("inserted_at", crate::federation::Error::Backend)?;
+        let updated_at: chrono::DateTime<chrono::Utc> =
+            row.safe_get_with("updated_at", crate::federation::Error::Backend)?;
+        let persist_row_hash: String =
+            row.safe_get_with("persist_row_hash", crate::federation::Error::Backend)?;
+        let mut meta = pg_row_to_peer_metadata_for_hash(&row, None, updated_at)?;
+        meta.inserted_at = inserted_at;
+        meta.updated_at = updated_at;
+        meta.persist_row_hash = persist_row_hash;
+        Ok(Some(meta))
+    }
 }
 
 // ─── Peer-metadata update helpers (v3.1.0, CIRISPersist#117) ───────
@@ -13947,6 +13985,80 @@ mod tests {
             .unwrap();
         let meta = pg_peek_peer(&backend, &key_id).await.unwrap();
         assert_eq!(meta.3.expect("policy set"), blob.0);
+    }
+
+    // ── v3.4.1 (CIRISPersist#127) — peer_metadata_for read accessor ──
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn peer_metadata_for_returns_full_row_pg() {
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let key_id = format!("peer-read-{}", uuid_like());
+        backend
+            .add_peer_record(&key_id, "AAAA", "agent", Some("rns://abc".into()))
+            .await
+            .unwrap();
+        let blob = crate::federation::PeerPolicyBlob(serde_json::json!({
+            "cohort_scope": "federation",
+        }));
+        backend.update_peer_policy(&key_id, blob).await.unwrap();
+        let meta = backend
+            .peer_metadata_for(&key_id)
+            .await
+            .unwrap()
+            .expect("active peer must surface");
+        assert_eq!(meta.key_id, key_id);
+        assert!(meta.removed_at.is_none());
+        assert_eq!(meta.transport_identity.as_deref(), Some("rns://abc"));
+        let policy = meta.policy_blob.expect("policy_blob set");
+        assert_eq!(
+            policy.as_value()["cohort_scope"],
+            serde_json::json!("federation")
+        );
+        assert!(!meta.persist_row_hash.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn peer_metadata_for_returns_none_unknown_pg() {
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let got = backend
+            .peer_metadata_for(&format!("ghost-{}", uuid_like()))
+            .await
+            .unwrap();
+        assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn peer_metadata_for_returns_none_soft_removed_pg() {
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let key_id = format!("peer-gone-{}", uuid_like());
+        backend
+            .add_peer_record(&key_id, "AAAA", "agent", None)
+            .await
+            .unwrap();
+        backend.remove_peer_record(&key_id, false).await.unwrap();
+        let got = backend.peer_metadata_for(&key_id).await.unwrap();
+        assert!(got.is_none(), "soft-removed peer must read as None");
     }
 
     #[tokio::test]

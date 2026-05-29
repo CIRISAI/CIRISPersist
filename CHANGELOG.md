@@ -5,6 +5,51 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.4.1] — 2026-05-29
+
+**CIRISPersist 3.4.1 — `peer_metadata_for` read accessor (#127 / unblocks CIRISEdge#48 cohort_scope consumer-side enforcement).**
+
+Closes **#127**. Pure-additive read symmetry — fills the gap where v3.1.0 (#117) shipped `update_peer_policy` as write-only and left no read accessor for the same row.
+
+### New method on `FederationDirectory`
+
+```rust
+async fn peer_metadata_for(
+    &self,
+    key_id: &str,
+) -> Result<Option<PeerMetadataRow>, federation::Error>;
+```
+
+Returns full `PeerMetadataRow` (`alias`, `trust`, `notes`, `policy_blob`, `transport_identity`, timestamps, `persist_row_hash`) for active peers. **`None` for non-existent OR soft-removed peers** — mirrors the semantic of the existing `update_*` paths that treat `removed_at IS NOT NULL` as "absent for read." Hard-deleted rows are also `None` by construction.
+
+The `policy_blob` field round-trips opaquely — the same JSON value the caller passed to `update_peer_policy` comes back verbatim. Consumer-side decode (e.g. `policy_blob.cohort_scope`) is the caller's responsibility per the v3.1.0 #117 opaque-blob contract.
+
+### Backend parity
+
+- **Postgres**: single `query_opt` with `safe_get_with` hydration through the existing `pg_row_to_peer_metadata_for_hash` helper. Reuses the same row shape the update path emits, so the `persist_row_hash` field is round-trip-stable.
+- **SQLite**: `spawn_blocking` + `query_row` with `OptionalExtension`. Hydrates through `sqlite_row_tuple_to_peer_metadata` and preserves the stored `persist_row_hash` column verbatim (the SQLite hydrator initializes hash to empty; we override with the column value to match PG's round-trip stability).
+- **Memory**: trivial `HashMap` lookup, filtered on `removed_at.is_none()`.
+
+### PyO3 mirror
+
+```python
+PyEngine.peer_metadata_for_json(key_id: str) -> Optional[str]
+```
+
+JSON-encoded `PeerMetadataRow` on hit, `None` on miss. CIRISEdge consumes `json.loads(s)["policy_blob"]["cohort_scope"]` at the cohort_scope refusal site.
+
+### Test coverage — 6 new
+
+- `peer_metadata_for_returns_full_row_{sqlite,pg}` — round-trips alias / transport_identity / `policy_blob` JSON; asserts `persist_row_hash` is non-empty.
+- `peer_metadata_for_returns_none_unknown_{sqlite,pg}` — non-existent peer → `Ok(None)`.
+- `peer_metadata_for_returns_none_soft_removed_{sqlite,pg}` — `remove_peer_record(hard=false)` then read → `Ok(None)`.
+
+Full nextest unaffected (886/886 still pass; 6 new tests bring the cumulative #117/#127 peer-metadata count to 32).
+
+### Why this is a patch
+
+Additive, no trait-breakage, no schema change, no API surface removed. The trait method ships with a default impl that returns `Error::Backend("not implemented")` so any external `FederationDirectory` impl compiles cleanly without action.
+
 ## [3.4.0] — 2026-05-29
 
 **CIRISPersist 3.4 — replication-policy substrate: trust admission gate + popularity×freshness eviction sweeper + withdraws emission (#123 / CEG organic-replication discipline at the substrate).**
