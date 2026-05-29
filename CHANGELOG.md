@@ -5,6 +5,31 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.4.3] — 2026-05-29
+
+**CIRISPersist 3.4.3 — `ciris_persist.pyi` stub completion for blob / attestation / canonicalize / verify_hybrid surface (#124 / CIRISConformance CCS profile).**
+
+Documentation-only patch. Closes **#124**'s side-note: the PyO3 methods `put_blob_signing` (v3.3.0 #121), `put_blob_json` / `get_blob_json` / `list_holders_json` (v2.3.0 #103), `put_attestation`, `canonicalize_envelope` / `canonicalize_envelope_for_signing`, and `verify_hybrid` all existed at runtime but were absent from `python/ciris_persist/ciris_persist.pyi`. CIRISConformance harness (CCS profile) needs them documented to drive the §6.1 / §7.0 / §10.1.1 / §10.1.2 CEG conformance paths.
+
+### What's stub-documented
+
+Eight new method signatures with full docstrings covering:
+
+- **`put_blob_signing`** — the **recommended** one-call admission path (canonicalize + sign + atomic commit in persist). Includes the `body_inline_b64` XOR `external_ref_json` invariant and the canonicalizer-authority rationale (#121 JCS trap).
+- **`put_blob_json`** — the lower-level pre-signed `PutBlobAttestation` path with the full payload JSON shape, explicitly recommending `put_blob_signing` for callers without an already-signed envelope.
+- **`get_blob_json`** + **`list_holders_json`** — the read accessors, including the v3.4.0 #123 access-count side effect on read.
+- **`put_attestation`** — the `SignedAttestation` admission path with the full envelope JSON shape, citing the v3.0.0 #102 reserved-prefix gate + v3.4.0 #123 trust gate + CEG §6.1 dedup/precedence.
+- **`canonicalize_envelope`** + **`canonicalize_envelope_for_signing`** — production canonicalizer entry points with the **don't-use-JCS** warning (the #121 trap, stated explicitly so downstream consumers don't reach for `serde_json_canonicalizer`).
+- **`verify_hybrid`** — the hybrid (Ed25519 + ML-DSA-65) verify entry point with the `policy` argument values documented.
+
+### Why this is a patch, not a minor
+
+Zero Rust code change. Zero behavioral change. Zero schema change. Pure `.pyi` documentation. The methods themselves shipped in 2.3.0–3.4.0; the harness can call them today against any v3.x+ wheel — this just makes the stub authoritative so `mypy --strict` / `pyright` / IDE completion can see them.
+
+### #124's main ask — already shipped
+
+The "preferred" ask in #124 (Python-callable `put_blob_signing` that signs with the engine's own local signer) **shipped in v3.3.0 (#121)** before this issue was filed; the empirical finding in #124's body was against ciris-persist 3.1.1. Conformance can bump to ≥3.3.0 (v3.4.3 recommended for the full stub coverage) and use `engine.put_blob_signing(...)` directly.
+
 ## [3.4.2] — 2026-05-29
 
 **CIRISPersist 3.4.2 — CIRISVerify pin v4.0.0 → v4.2.0.**
