@@ -91,15 +91,33 @@ pub trait DerivedSchema: Send + Sync {
 
     // ── edge_detection_events (V020) ─────────────────────────────
 
+    /// v3.1.1 (CIRISPersist#118) — admission for `cirislens.edge_detection_events`.
+    /// Edge emits via `put_edge_detection_event`; LensCore reads via
+    /// `get_edge_detection_events`; joint correlation in LensCore
+    /// (per RATCHET `Core/ConsentGate.lean` F-CR-3 + CIRISLensCore#21).
+    ///
+    /// Idempotent on `detection_id` collision when `persist_row_hash`
+    /// matches; raises [`Error::Conflict`] when the same `detection_id`
+    /// is re-submitted with a different row hash.
+    ///
+    /// **Signature trust model.** Unlike `put_detection_event`, the
+    /// edge-detection envelope carries a single opaque `signature`
+    /// over the canonical row (edge#39 ProbePatternObserver shape).
+    /// Edge owns the verification policy — it signs at the transport
+    /// observation site and sets `signature_verified` to reflect its
+    /// own check. Persist stores both fields verbatim; downstream
+    /// consumers (LensCore joint-correlation) filter on
+    /// `signature_verified` per their threat model.
+    fn put_edge_detection_event(
+        &self,
+        event: EdgeDetectionEvent,
+    ) -> impl Future<Output = Result<(), Error>> + Send;
+
     /// v2.13.0 (CIRISPersist#113) — page-style lookup over
     /// `cirislens.edge_detection_events` (V020). Filter is `AND`-ed
     /// across set fields; ORDER BY `(tenant_id, observed_at,
     /// detection_id)` ASC for stable cursor advancement; empty
     /// filter returns up to 1000 rows.
-    ///
-    /// The write side (INSERT) lives at the LensCore detector call
-    /// site; persist owns this read accessor (Counter-RII joint-
-    /// correlation evidence per CIRISLensCore#21).
     fn get_edge_detection_events(
         &self,
         filter: EdgeEventFilter,

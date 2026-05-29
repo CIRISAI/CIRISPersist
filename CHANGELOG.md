@@ -5,6 +5,48 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.1.1] — 2026-05-28
+
+**CIRISPersist 3.1.1 — two thin admission accessors closing today's CIRISEdge cohabitation gaps (#118 + #119).**
+
+A patch release bundling two sub-50-line pyo3.rs additions that unblock distinct CIRISEdge consumers. Each addition is consumer-facing only — no schema changes, no trait breakage, no migration. The pair ships together because both touch `src/ffi/pyo3.rs` and ship in the same window.
+
+### #118 — `put_edge_detection_event` admission on `DerivedSchema`
+
+Mirrors the existing `get_edge_detection_events` read accessor (#113, v2.13.0). Unblocks **CIRISEdge#39 ProbePatternObserver** — `emit_verdict` changes from `tracing::warn!` to one `await` call.
+
+- New trait method `DerivedSchema::put_edge_detection_event(EdgeDetectionEvent) -> Result<(), derived::Error>` (RPITIT, mirrors existing put paths).
+- Both backends + memory:
+  - **Postgres** — `INSERT … ON CONFLICT (detection_id) DO NOTHING` with conflict-check fallback comparing `persist_row_hash`; idempotent on matching hash, `Conflict` on differing hash. `detection_id` parsed as UUID with typed `InvalidArgument` on parse failure; subject_key_id FK enforces referential integrity to `federation_keys`.
+  - **SQLite** — same shape via `rusqlite::params!`; `detection_id` stored as TEXT-UUID; subject_key_id FK via PRAGMA `foreign_keys=ON` (set at backend boot).
+  - **Memory** — `NotImplemented` per the existing put-path convention (sovereign-mode Pi-class deployments don't run lens-core).
+- **Signature trust model** documented in the trait docblock: unlike `put_detection_event` (which carries separate `ed25519_sig` + `ml_dsa_65_sig` + `canonical_bytes` for hybrid verification at the PyO3 boundary), `EdgeDetectionEvent` carries a single opaque `signature` over the canonical row. Edge owns the verification policy at the transport observation site (RATCHET `Core/ConsentGate.lean` F-CR-3 + Counter-RII Edge-layer spec); persist stores `signature` + `signature_verified` verbatim; LensCore joint-correlation reads filter on `signature_verified` per CIRISLensCore#21 threat model.
+- Docblock update on `get_edge_detection_events`: replaces "The write side (INSERT) lives at the LensCore detector call site" with "Edge emits via `put_edge_detection_event`; LensCore reads via `get_edge_detection_events`; joint correlation in LensCore."
+- PyO3 method `put_edge_detection_event(event_json)` on `PyEngine` — decodes JSON, dispatches through `BackendDispatch`, routes errors through `derived_err_to_py`.
+- 5 new tests: `put_edge_detection_event_idempotent_{pg,sqlite}` (same row hash → second put OK), `put_edge_detection_event_conflict_on_differing_row_hash_{pg,sqlite}` (differing row hash → `Conflict`), `put_edge_detection_event_bad_uuid_rejects_pg` (non-UUID `detection_id` → typed `InvalidArgument`).
+
+### #119 — `local_signer_capsule()` (6th PyCapsule accessor)
+
+Closes the cross-cdylib gap that blocks **CIRISEdge v0.13.1 `ReticulumTransport`** identity. The hardware-rooted hybrid 65-byte `keyring_signer` (v2.7.0 / #109) drives hot-path scrub envelopes, but Reticulum link establish + Curve25519-derived DH needs the 32-byte Ed25519 `LocalSigner` private key — pubkey-only is identity-hash only. Without this 6th capsule, edge can learn the agent's public key (`engine.local_public_key_b64()` at `src/signing/mod.rs:340`) but cannot drive Reticulum link signing.
+
+- 6th `PyEngine` method `local_signer_capsule()` parallel to `keyring_signer_capsule()` (v2.7.0 / #109 design pattern). Wraps a clone of the `Arc<crate::signing::LocalSigner>` field already at `src/ffi/pyo3.rs:355`.
+- Capsule type identifier `ciris_persist::local_signer` — matches the established `ciris_persist::{name}` naming for the family.
+- Defensive error: `ValueError("local_signer_unavailable")` when the engine was constructed without `from_shared_with_local` (older cohabitation init paths predating 2.12.0 / #112 don't propagate `LocalSigner` across the cross-cdylib boundary).
+- Each capsule one job — preserves the v2.7.0 #109 design intent. `keyring_signer` drives scrub envelopes; `local_signer` drives transport-link identity; no splitting of signing identity across two channels.
+
+Both additions are zero-schema-change and zero-trait-breakage; ship as `3.1.1` patch per #118's acceptance criterion.
+
+### Capsule family (6 accessors as of 3.1.1)
+
+| Capsule | Type tag | Wrapped | Ships |
+|---|---|---|---|
+| `federation_directory_capsule` | `ciris_persist::federation_directory` | `Arc<dyn FederationDirectory>` | v2.7.0 / #109 |
+| `outbound_queue_capsule` | `ciris_persist::outbound_queue` | `BackendDispatch` | v2.7.0 / #109 |
+| `keyring_signer_capsule` | `ciris_persist::keyring_signer` | `KeyringSignerHandle` | v2.7.0 / #109 |
+| `runtime_handle_capsule` | `ciris_persist::runtime_handle` | `tokio::runtime::Handle` | v2.8.0 / #111 |
+| `blob_storage_capsule` | `ciris_persist::blob_storage` | `BackendDispatch` | v2.11.0 / #115 |
+| **`local_signer_capsule`** | **`ciris_persist::local_signer`** | **`Arc<LocalSigner>`** | **v3.1.1 / #119** |
+
 ## [3.1.0] — 2026-05-28
 
 **CIRISPersist 3.1 — peer-mutation surface on `FederationDirectory` (#117 / unblocks CIRISEdge v0.13.0 peer-mgmt UniFFI stubs).**

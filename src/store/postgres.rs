@@ -7065,6 +7065,79 @@ impl crate::derived::DerivedSchema for PostgresBackend {
         Ok(out)
     }
 
+    // v3.1.1 (CIRISPersist#118) — admission for
+    // `cirislens.edge_detection_events` (V020). Idempotent on
+    // `detection_id` collision when persist_row_hash matches; raises
+    // Conflict on collision with differing hash. detection_id is
+    // UUID-typed on the PG side; subject_key_id FK to federation_keys.
+    async fn put_edge_detection_event(
+        &self,
+        event: crate::derived::EdgeDetectionEvent,
+    ) -> Result<(), crate::derived::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::derived::Error::Backend(e.to_string()))?;
+
+        let detection_uuid = uuid::Uuid::parse_str(&event.detection_id).map_err(|e| {
+            crate::derived::Error::InvalidArgument(format!(
+                "detection_id must be a UUID (got {}): {e}",
+                event.detection_id
+            ))
+        })?;
+
+        let result = client
+            .execute(
+                "INSERT INTO cirislens.edge_detection_events (\
+                    detection_id, tenant_id, detector_kind, subject_key_id, \
+                    observed_at, evidence, severity, signature, signing_key_id, \
+                    signature_verified, persist_row_hash\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                 ON CONFLICT (detection_id) DO NOTHING",
+                &[
+                    &detection_uuid,
+                    &event.tenant_id,
+                    &event.detector_kind,
+                    &event.subject_key_id,
+                    &event.observed_at,
+                    &event.evidence,
+                    &event.severity,
+                    &event.signature,
+                    &event.signing_key_id,
+                    &event.signature_verified,
+                    &event.persist_row_hash,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::derived::Error::Backend(format!("insert edge_detection_events: {e}"))
+            })?;
+
+        if result == 0 {
+            let existing: Option<String> = client
+                .query_opt(
+                    "SELECT persist_row_hash FROM cirislens.edge_detection_events \
+                     WHERE detection_id = $1",
+                    &[&detection_uuid],
+                )
+                .await
+                .map_err(|e| crate::derived::Error::Backend(format!("conflict check: {e}")))?
+                .and_then(|r| {
+                    r.safe_get_with("persist_row_hash", crate::derived::Error::Backend)
+                        .ok()
+                });
+            if let Some(existing_hash) = existing {
+                if existing_hash != event.persist_row_hash {
+                    return Err(crate::derived::Error::Conflict(format!(
+                        "detection_id {} already exists with different persist_row_hash",
+                        event.detection_id
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     // v2.13.0 (CIRISPersist#113) — read facade over
     // `cirislens.edge_detection_events` (V020). Stable ORDER BY
     // `(tenant_id ASC, observed_at ASC, detection_id ASC)` — the
@@ -13555,6 +13628,96 @@ mod tests {
             .await
             .expect_err("must reject");
         assert!(matches!(err, crate::federation::Error::PeerNotFound { .. }));
+    }
+
+    // ── v3.1.1 (CIRISPersist#118) — put_edge_detection_event ──────
+
+    fn ed_fixture_pg(
+        detection_id: &uuid::Uuid,
+        key_id: &str,
+    ) -> crate::derived::EdgeDetectionEvent {
+        crate::derived::EdgeDetectionEvent {
+            detection_id: detection_id.to_string(),
+            tenant_id: "test-tenant".into(),
+            detector_kind: "unconsented_external_probe".into(),
+            subject_key_id: key_id.into(),
+            observed_at: chrono::Utc::now(),
+            evidence: serde_json::json!({"probe_count": 7}),
+            severity: "warn".into(),
+            signature: "edge-sig-base64".into(),
+            signing_key_id: key_id.into(),
+            signature_verified: true,
+            persist_row_hash: "row-hash-A".into(),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn put_edge_detection_event_idempotent_pg() {
+        use crate::derived::DerivedSchema;
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let key_id = format!("edge-{}", uuid_like());
+        backend
+            .add_peer_record(&key_id, "AAAA", "agent", None)
+            .await
+            .unwrap();
+        let did = uuid::Uuid::new_v4();
+        let ev = ed_fixture_pg(&did, &key_id);
+        backend.put_edge_detection_event(ev.clone()).await.unwrap();
+        backend.put_edge_detection_event(ev).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn put_edge_detection_event_conflict_on_differing_row_hash_pg() {
+        use crate::derived::DerivedSchema;
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let key_id = format!("edge-{}", uuid_like());
+        backend
+            .add_peer_record(&key_id, "AAAA", "agent", None)
+            .await
+            .unwrap();
+        let did = uuid::Uuid::new_v4();
+        let ev_a = ed_fixture_pg(&did, &key_id);
+        let mut ev_b = ev_a.clone();
+        ev_b.persist_row_hash = "row-hash-B-different".into();
+        backend.put_edge_detection_event(ev_a).await.unwrap();
+        let err = backend.put_edge_detection_event(ev_b).await.unwrap_err();
+        assert!(
+            matches!(err, crate::derived::Error::Conflict(_)),
+            "expected Conflict; got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn put_edge_detection_event_bad_uuid_rejects_pg() {
+        use crate::derived::DerivedSchema;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let mut ev = ed_fixture_pg(&uuid::Uuid::new_v4(), "irrelevant");
+        ev.detection_id = "not-a-uuid".into();
+        let err = backend.put_edge_detection_event(ev).await.unwrap_err();
+        assert!(
+            matches!(err, crate::derived::Error::InvalidArgument(_)),
+            "expected InvalidArgument; got: {err:?}"
+        );
     }
 
     /// V051 CHECK constraint catches direct-SQL bypass — a value

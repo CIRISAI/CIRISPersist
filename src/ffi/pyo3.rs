@@ -5550,6 +5550,54 @@ impl PyEngine {
         })
     }
 
+    /// v3.1.1 (CIRISPersist#118) — admission for
+    /// `cirislens.edge_detection_events` (V020). Unblocks edge#39
+    /// ProbePatternObserver `emit_verdict`.
+    ///
+    /// `event_json` is a JSON string of `EdgeDetectionEvent`
+    /// (`detection_id`, `tenant_id`, `detector_kind`, `subject_key_id`,
+    /// `observed_at`, `evidence`, `severity`, `signature`,
+    /// `signing_key_id`, `signature_verified`, `persist_row_hash`).
+    ///
+    /// Edge owns the signature-verification policy at the transport
+    /// observation site (RATCHET Counter-RII Edge-layer §); persist
+    /// stores `signature` + `signature_verified` verbatim. LensCore
+    /// joint-correlation reads filter on `signature_verified` per
+    /// CIRISLensCore#21 threat model.
+    fn put_edge_detection_event(&self, py: Python<'_>, event_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let event: crate::derived::EdgeDetectionEvent = serde_json::from_str(event_json)
+                .map_err(|e| {
+                    PyValueError::new_err(format!("EdgeDetectionEvent JSON decode: {e}"))
+                })?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::derived::DerivedSchema;
+                        backend
+                            .put_edge_detection_event(event)
+                            .await
+                            .map_err(derived_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::derived::DerivedSchema;
+                        backend
+                            .put_edge_detection_event(event)
+                            .await
+                            .map_err(derived_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
     /// Lens-derived: query detection events. Filter is JSON-encoded
     /// `EventFilter` (`{"trace_id": ?, "detector": ?, "since": ?}`;
     /// any field may be null/absent). Returns a JSON array string
@@ -14647,6 +14695,38 @@ impl PyEngine {
             .expect("static name has no NUL bytes");
         pyo3::types::PyCapsule::new(py, dispatch, Some(name))
             .map_err(|e| PyErr::new::<LensQueryError, _>(format!("blob_storage_capsule: {e}")))
+    }
+
+    /// v3.1.1 (CIRISPersist#119) — cross-cdylib accessor for the
+    /// agent's transport-identity `LocalSigner`. Returns a `PyCapsule`
+    /// wrapping a clone of `Arc<LocalSigner>`; consumer downcasts via
+    /// the name tag and uses it to drive Ed25519-backed transport
+    /// identity (CIRISEdge v0.13.1 `ReticulumTransport` link establish
+    /// + Curve25519-derived DH).
+    ///
+    /// Parallel to [`keyring_signer_capsule_py`] (the hardware-rooted
+    /// hybrid 65-byte signer for scrub envelopes). Each capsule one
+    /// job: keyring_signer drives hot-path scrub envelopes;
+    /// local_signer drives transport-link identity.
+    ///
+    /// Raises `ValueError` (`local_signer_unavailable`) when the
+    /// engine was constructed without `from_shared_with_local` —
+    /// older cohabitation init paths predating 2.12.0 (#112) don't
+    /// propagate `LocalSigner` across the cross-cdylib boundary.
+    ///
+    /// Name tag: `ciris_persist::local_signer`.
+    #[pyo3(name = "local_signer_capsule")]
+    fn local_signer_capsule_py<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyCapsule>> {
+        let Some(local_signer) = self.local_signer.clone() else {
+            return Err(PyValueError::new_err("local_signer_unavailable"));
+        };
+        let name = std::ffi::CString::new("ciris_persist::local_signer")
+            .expect("static name has no NUL bytes");
+        pyo3::types::PyCapsule::new(py, local_signer, Some(name))
+            .map_err(|e| PyErr::new::<LensQueryError, _>(format!("local_signer_capsule: {e}")))
     }
 }
 

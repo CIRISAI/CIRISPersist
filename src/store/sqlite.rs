@@ -7001,6 +7001,70 @@ impl crate::derived::DerivedSchema for SqliteBackend {
         .map_err(|e| crate::derived::Error::Backend(format!("spawn_blocking join: {e}")))?
     }
 
+    // v3.1.1 (CIRISPersist#118) — admission for
+    // `edge_detection_events` (V020). Idempotent on detection_id
+    // collision when persist_row_hash matches; raises Conflict on
+    // collision with differing hash. detection_id is TEXT (UUID
+    // as TEXT) on SQLite; subject_key_id FK to federation_keys
+    // enforced via PRAGMA foreign_keys=ON (set at backend boot).
+    async fn put_edge_detection_event(
+        &self,
+        event: crate::derived::EdgeDetectionEvent,
+    ) -> Result<(), crate::derived::Error> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), crate::derived::Error> {
+            let conn = conn.blocking_lock();
+            let observed_at_text = event.observed_at.to_rfc3339();
+            let evidence_text = serde_json::to_string(&event.evidence)
+                .map_err(|e| crate::derived::Error::Backend(format!("evidence encode: {e}")))?;
+            let rows = conn
+                .execute(
+                    "INSERT INTO edge_detection_events (\
+                        detection_id, tenant_id, detector_kind, subject_key_id, \
+                        observed_at, evidence, severity, signature, signing_key_id, \
+                        signature_verified, persist_row_hash\
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                     ON CONFLICT (detection_id) DO NOTHING",
+                    rusqlite::params![
+                        event.detection_id,
+                        event.tenant_id,
+                        event.detector_kind,
+                        event.subject_key_id,
+                        observed_at_text,
+                        evidence_text,
+                        event.severity,
+                        event.signature,
+                        event.signing_key_id,
+                        event.signature_verified as i64,
+                        event.persist_row_hash,
+                    ],
+                )
+                .map_err(sqlite_derived_err("insert edge_detection_events"))?;
+            if rows == 0 {
+                let existing: Option<String> = conn
+                    .query_row(
+                        "SELECT persist_row_hash FROM edge_detection_events \
+                         WHERE detection_id = ?1",
+                        rusqlite::params![event.detection_id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(sqlite_derived_err("conflict check"))?;
+                if let Some(existing_hash) = existing {
+                    if existing_hash != event.persist_row_hash {
+                        return Err(crate::derived::Error::Conflict(format!(
+                            "detection_id {} already exists with different persist_row_hash",
+                            event.detection_id
+                        )));
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| crate::derived::Error::Backend(format!("spawn_blocking join: {e}")))?
+    }
+
     // v2.13.0 (CIRISPersist#113) — read facade over
     // `edge_detection_events` (V020). Stable ORDER BY
     // `(tenant_id ASC, observed_at ASC, detection_id ASC)` — the
@@ -12164,6 +12228,65 @@ mod tests {
             .await
             .expect_err("must reject");
         assert!(matches!(err, crate::federation::Error::PeerNotFound { .. }));
+    }
+
+    // ── v3.1.1 (CIRISPersist#118) — put_edge_detection_event ──────
+
+    fn ed_fixture_sqlite(
+        detection_id: &uuid::Uuid,
+        key_id: &str,
+    ) -> crate::derived::EdgeDetectionEvent {
+        crate::derived::EdgeDetectionEvent {
+            detection_id: detection_id.to_string(),
+            tenant_id: "test-tenant".into(),
+            detector_kind: "unconsented_external_probe".into(),
+            subject_key_id: key_id.into(),
+            observed_at: chrono::Utc::now(),
+            evidence: serde_json::json!({"probe_count": 7}),
+            severity: "warn".into(),
+            signature: "edge-sig-base64".into(),
+            signing_key_id: key_id.into(),
+            signature_verified: true,
+            persist_row_hash: "row-hash-A".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn put_edge_detection_event_idempotent_sqlite() {
+        use crate::derived::DerivedSchema;
+        use crate::federation::FederationDirectory;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .add_peer_record("edge-sub", "AAAA", "agent", None)
+            .await
+            .unwrap();
+        let did = uuid::Uuid::new_v4();
+        let ev = ed_fixture_sqlite(&did, "edge-sub");
+        backend.put_edge_detection_event(ev.clone()).await.unwrap();
+        backend.put_edge_detection_event(ev).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn put_edge_detection_event_conflict_on_differing_row_hash_sqlite() {
+        use crate::derived::DerivedSchema;
+        use crate::federation::FederationDirectory;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .add_peer_record("edge-sub-2", "AAAA", "agent", None)
+            .await
+            .unwrap();
+        let did = uuid::Uuid::new_v4();
+        let ev_a = ed_fixture_sqlite(&did, "edge-sub-2");
+        let mut ev_b = ev_a.clone();
+        ev_b.persist_row_hash = "row-hash-B-different".into();
+        backend.put_edge_detection_event(ev_a).await.unwrap();
+        let err = backend.put_edge_detection_event(ev_b).await.unwrap_err();
+        assert!(
+            matches!(err, crate::derived::Error::Conflict(_)),
+            "expected Conflict; got: {err:?}"
+        );
     }
 
     /// V051 CHECK constraint catches direct-SQL bypass — a value

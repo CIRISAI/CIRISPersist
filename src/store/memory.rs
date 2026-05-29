@@ -1942,6 +1942,15 @@ impl crate::derived::DerivedSchema for MemoryBackend {
         Ok(Vec::new())
     }
 
+    async fn put_edge_detection_event(
+        &self,
+        _event: crate::derived::EdgeDetectionEvent,
+    ) -> Result<(), crate::derived::Error> {
+        Err(crate::derived::Error::NotImplemented(
+            "put_edge_detection_event (memory backend; use postgres for federation evidence)",
+        ))
+    }
+
     // v2.13.0 (CIRISPersist#113) — memory backend has no
     // `edge_detection_events` substrate (sovereign-mode Pi-class
     // deployments without LensCore don't need it). Returns empty so
