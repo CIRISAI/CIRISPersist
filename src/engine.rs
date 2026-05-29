@@ -520,6 +520,68 @@ impl Engine {
         }
     }
 
+    /// v3.3.0 (CIRISPersist#121) — convenience facade over
+    /// [`BlobStorage::put_blob_signing`](crate::federation::blobs::BlobStorage::put_blob_signing).
+    ///
+    /// Persist owns the holds_bytes envelope construction +
+    /// canonicalization (via the production
+    /// [`PythonJsonDumpsCanonicalizer`](crate::verify::canonical::PythonJsonDumpsCanonicalizer)),
+    /// signs via the Engine's composed `Arc<dyn HardwareSigner>`, and
+    /// commits the blob + holder atomically. The Engine's signer is
+    /// the same handle [`receive_and_persist`](Engine::receive_and_persist)
+    /// uses for scrub envelopes — no second signer field, no
+    /// adapter wrap (the field is already `Arc<dyn HardwareSigner>`
+    /// post v1.13.0 / #92).
+    ///
+    /// `now` + `attestation_id` are passed by the caller so pinned-time
+    /// tests, replay, and migration paths can reproduce specific
+    /// timestamps / IDs. Normal callers pass `chrono::Utc::now()` and
+    /// `uuid::Uuid::new_v4()`.
+    ///
+    /// See the trait method's doc-comment for the full rationale —
+    /// the JCS-vs-Python silent-correctness trap this method closes.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_blob_signing(
+        &self,
+        sha256: &[u8; 32],
+        body: crate::federation::BlobBody,
+        media_type: Option<&str>,
+        attesting_key_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+        attestation_id: uuid::Uuid,
+    ) -> Result<(), crate::federation::BlobError> {
+        use crate::federation::BlobStorage;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                arc.put_blob_signing(
+                    sha256,
+                    body,
+                    media_type,
+                    attesting_key_id,
+                    &**self.signer(),
+                    now,
+                    attestation_id,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                arc.put_blob_signing(
+                    sha256,
+                    body,
+                    media_type,
+                    attesting_key_id,
+                    &**self.signer(),
+                    now,
+                    attestation_id,
+                )
+                .await
+            }
+        }
+    }
+
     /// v1.11.0 (CIRISPersist#90) — borrow a per-backend
     /// [`NodeCoreService`](crate::cirisnode::NodeCoreService) handle
     /// wrapping the Engine's underlying backend Arc.
@@ -2584,5 +2646,457 @@ mod tests {
         drop(stream);
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         let _ = engine;
+    }
+
+    // ─── v3.3.0 (CIRISPersist#121) — put_blob_signing tests ────────
+    //
+    // Cover the trait default impl on each backend (via the Engine
+    // facade), the cross-canonicalizer identity pin, and the standard
+    // round-trip + error shapes. The trait method's default impl is
+    // inherited automatically; these tests prove the inheritance
+    // chain compiles and that the canonical bytes the engine signs
+    // match the production `PythonJsonDumpsCanonicalizer` shape.
+
+    /// Bootstrap a `federation_keys` row that satisfies the FK on
+    /// the holds_bytes attestation emitted by `put_blob_signing`.
+    /// The attesting key_id matches the test signer's alias so the
+    /// engine-facade signature path verifies end-to-end.
+    #[cfg(feature = "sqlite")]
+    async fn seed_test_attesting_key(engine: &Engine, key_id: &str) {
+        let sq = engine.sqlite_backend().expect("sqlite backend");
+        let conn = sq.conn_handle();
+        let key_id_owned = key_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO federation_keys (\
+                    key_id, pubkey_ed25519_base64, algorithm, \
+                    identity_type, identity_ref, valid_from, \
+                    registration_envelope, original_content_hash, \
+                    scrub_signature_classical, scrub_key_id, \
+                    scrub_timestamp, persist_row_hash\
+                 ) VALUES (?1, 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=', \
+                          'hybrid', 'primitive', ?1, ?2, '{}', x'00', '', \
+                          ?1, ?2, '0')",
+                rusqlite::params![key_id_owned, "2026-04-30T00:00:00+00:00"],
+            )
+            .expect("seed federation key");
+        })
+        .await
+        .expect("spawn_blocking join");
+    }
+
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    fn sha256_of_bytes(bytes: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let d = Sha256::digest(bytes);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&d);
+        out
+    }
+
+    /// Cross-canonicalizer regression test (the gate
+    /// CIRISPersist#121 cites). Computes the expected
+    /// `original_content_hash_hex` directly from the production
+    /// `PythonJsonDumpsCanonicalizer` and asserts the row
+    /// `put_blob_signing` writes carries the SAME hash. If a future
+    /// refactor swaps the canonicalizer (to JCS or anything else
+    /// that produces different bytes for the holds_bytes envelope)
+    /// the assertion catches it before the wrong-canonicalizer rows
+    /// ship.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn put_blob_signing_uses_python_canonicalizer_not_jcs_sqlite() {
+        use crate::federation::{
+            holds_bytes_attestation_envelope, holds_bytes_attestation_type, BlobBody, BlobStorage,
+        };
+        use crate::verify::canonical::{Canonicalizer, PythonJsonDumpsCanonicalizer};
+        use sha2::{Digest, Sha256};
+
+        let signer = test_signer();
+        let signer_alias = signer.key_id().to_string();
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        seed_test_attesting_key(&engine, &signer_alias).await;
+
+        let bytes = b"canonicalizer-identity-blob".to_vec();
+        let sha = sha256_of_bytes(&bytes);
+
+        // Expected hash: SHA-256 of the Python-compat canonical bytes
+        // for the holds_bytes envelope this sha produces.
+        let envelope = holds_bytes_attestation_envelope(&sha);
+        let py_canonical = PythonJsonDumpsCanonicalizer
+            .canonicalize_value(&envelope)
+            .expect("python canonicalize");
+        let expected_hash_hex = hex::encode(Sha256::digest(&py_canonical));
+
+        let now = chrono::Utc::now();
+        let attestation_id = uuid::Uuid::new_v4();
+        engine
+            .put_blob_signing(
+                &sha,
+                BlobBody::Inline(bytes),
+                Some("application/octet-stream"),
+                &signer_alias,
+                now,
+                attestation_id,
+            )
+            .await
+            .expect("put_blob_signing");
+
+        // Read the holds_bytes attestation row back and compare the
+        // stored original_content_hash (hex) against the expected
+        // Python-compat hash. Drift here proves the canonicalizer
+        // changed under put_blob_signing.
+        let sq = engine.sqlite_backend().expect("sqlite backend");
+        let conn = sq.conn_handle();
+        let attestation_id_str = attestation_id.to_string();
+        let attestation_type = holds_bytes_attestation_type(&sha);
+        let (stored_hash_hex, stored_scrub_key_id): (String, String) =
+            tokio::task::spawn_blocking(move || {
+                let conn = conn.blocking_lock();
+                conn.query_row(
+                    "SELECT lower(hex(original_content_hash)), scrub_key_id \
+                     FROM federation_attestations \
+                     WHERE attestation_id = ?1 AND attestation_type = ?2",
+                    rusqlite::params![attestation_id_str, attestation_type],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .expect("stored attestation row")
+            })
+            .await
+            .expect("spawn_blocking join");
+
+        assert_eq!(
+            stored_hash_hex, expected_hash_hex,
+            "put_blob_signing must canonicalize via PythonJsonDumpsCanonicalizer; \
+             the silent-correctness trap CIRISPersist#121 closes manifests as a \
+             mismatch here"
+        );
+        // Scrub key id comes from the signer (HardwareSigner::current_alias)
+        // — pin that wire too so a future refactor that lets callers
+        // override scrub_key_id is caught.
+        assert_eq!(stored_scrub_key_id, signer_alias);
+
+        // list_holders sees the writer.
+        let holders = sq.list_holders(&sha).await.expect("list_holders");
+        assert_eq!(holders, vec![signer_alias]);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn put_blob_signing_inline_round_trip_sqlite() {
+        use crate::federation::{BlobBody, BlobStorage};
+
+        let signer = test_signer();
+        let signer_alias = signer.key_id().to_string();
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        seed_test_attesting_key(&engine, &signer_alias).await;
+
+        let bytes = b"inline-round-trip".to_vec();
+        let sha = sha256_of_bytes(&bytes);
+
+        engine
+            .put_blob_signing(
+                &sha,
+                BlobBody::Inline(bytes.clone()),
+                Some("application/octet-stream"),
+                &signer_alias,
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .expect("put_blob_signing inline");
+
+        let sq = engine.sqlite_backend().expect("sqlite backend");
+        let got = sq.get_blob(&sha).await.expect("get").expect("present");
+        assert_eq!(got, BlobBody::Inline(bytes));
+        let holders = sq.list_holders(&sha).await.expect("list_holders");
+        assert_eq!(holders, vec![signer_alias]);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn put_blob_signing_external_round_trip_sqlite() {
+        use crate::federation::{BlobBody, BlobStorage, ExternalRef};
+
+        let signer = test_signer();
+        let signer_alias = signer.key_id().to_string();
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        seed_test_attesting_key(&engine, &signer_alias).await;
+
+        let ext = ExternalRef {
+            uri: "s3://test-bucket/blob-signing-ext".into(),
+            size_bytes: 4_567_890,
+            media_type: Some("application/octet-stream".into()),
+        };
+        // External case — caller-supplied sha (persist trusts it; no
+        // bytes to verify).
+        let sha = [0xA7u8; 32];
+        engine
+            .put_blob_signing(
+                &sha,
+                BlobBody::External(ext.clone()),
+                Some("application/octet-stream"),
+                &signer_alias,
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .expect("put_blob_signing external");
+
+        let sq = engine.sqlite_backend().expect("sqlite backend");
+        let got = sq.get_blob(&sha).await.expect("get").expect("present");
+        assert_eq!(got, BlobBody::External(ext));
+    }
+
+    /// Same content + same attesting key + same attestation_id →
+    /// the second call collides on the attestation_id PK. Matches
+    /// the documented `put_blob` semantic for replayed
+    /// attestation_ids (see store/sqlite.rs::put_blob's
+    /// AttestationEmissionFailed("attestation_id collision: ...")).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn put_blob_signing_replay_same_attestation_id_conflicts_sqlite() {
+        use crate::federation::{BlobBody, BlobError};
+
+        let signer = test_signer();
+        let signer_alias = signer.key_id().to_string();
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        seed_test_attesting_key(&engine, &signer_alias).await;
+
+        let bytes = b"replay-id-collision".to_vec();
+        let sha = sha256_of_bytes(&bytes);
+        let attestation_id = uuid::Uuid::new_v4();
+        let now = chrono::Utc::now();
+
+        engine
+            .put_blob_signing(
+                &sha,
+                BlobBody::Inline(bytes.clone()),
+                None,
+                &signer_alias,
+                now,
+                attestation_id,
+            )
+            .await
+            .expect("first call");
+
+        let err = engine
+            .put_blob_signing(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                &signer_alias,
+                now,
+                attestation_id,
+            )
+            .await
+            .expect_err("attestation_id collision");
+        assert!(
+            matches!(err, BlobError::AttestationEmissionFailed(_)),
+            "got {err:?}"
+        );
+    }
+
+    /// Same content + same attesting key + DIFFERENT attestation_id
+    /// → both calls succeed (each is an independent holder attestation
+    /// row; the blob row is idempotent on sha256 PK). Mirrors the
+    /// `blob_idempotent_put_same_writer` shape in store/sqlite.rs.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn put_blob_signing_idempotent_distinct_attestation_ids_sqlite() {
+        use crate::federation::{BlobBody, BlobStorage};
+
+        let signer = test_signer();
+        let signer_alias = signer.key_id().to_string();
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        seed_test_attesting_key(&engine, &signer_alias).await;
+
+        let bytes = b"distinct-id-idempotent".to_vec();
+        let sha = sha256_of_bytes(&bytes);
+
+        for _ in 0..2 {
+            engine
+                .put_blob_signing(
+                    &sha,
+                    BlobBody::Inline(bytes.clone()),
+                    None,
+                    &signer_alias,
+                    chrono::Utc::now(),
+                    uuid::Uuid::new_v4(),
+                )
+                .await
+                .expect("put");
+        }
+
+        // Blob still readable; the same key_id appears once in
+        // list_holders (DISTINCT behavior is per-backend; the SQLite
+        // impl deduplicates by attesting_key_id within the prefix
+        // grouping).
+        let sq = engine.sqlite_backend().expect("sqlite backend");
+        let got = sq.get_blob(&sha).await.expect("get").expect("present");
+        assert_eq!(got, BlobBody::Inline(bytes));
+    }
+
+    /// Unknown `attesting_key_id` → no federation_keys row exists
+    /// → FK violation on the holds_bytes attestation insert →
+    /// `BlobError::AttestationEmissionFailed`. Transactional rollback
+    /// means the blob row is NOT written.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn put_blob_signing_unknown_key_rejects_sqlite() {
+        use crate::federation::{BlobBody, BlobError, BlobStorage};
+
+        let signer = test_signer();
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        // NOTE: deliberately NOT seeding the federation_keys row.
+
+        let bytes = b"unknown-attesting-key".to_vec();
+        let sha = sha256_of_bytes(&bytes);
+        let err = engine
+            .put_blob_signing(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                "unknown-key-not-registered",
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .expect_err("FK violation");
+        assert!(
+            matches!(err, BlobError::AttestationEmissionFailed(_)),
+            "got {err:?}"
+        );
+
+        // Tx rollback: blob row NOT written.
+        let sq = engine.sqlite_backend().expect("sqlite backend");
+        assert!(!sq.has_blob(&sha).await.expect("has"));
+    }
+
+    /// PG parity for the canonicalizer-identity pin. Same shape as
+    /// the SQLite test above but using the shared PG test DB.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn put_blob_signing_uses_python_canonicalizer_not_jcs_postgres() {
+        use crate::federation::{
+            holds_bytes_attestation_envelope, holds_bytes_attestation_type, BlobBody,
+            FederationDirectory,
+        };
+        use crate::verify::canonical::{Canonicalizer, PythonJsonDumpsCanonicalizer};
+        use sha2::{Digest, Sha256};
+
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        // Per-test-randomized signer key_id so the FK insert doesn't
+        // collide with parallel tests on the shared PG DB.
+        let seed = [0xCDu8; 32];
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let key_id = format!("put-blob-signing-pg-{}", uuid::Uuid::new_v4());
+        let signer = Arc::new(LocalSigner::from_parts(
+            signing_key,
+            key_id.clone(),
+            None,
+            None,
+        ));
+        let engine = Engine::with_signer(signer, &dsn).await.expect("connect pg");
+
+        // Seed the federation_keys row that put_blob_signing's
+        // emitted attestation will FK-reference. We reuse the
+        // FederationDirectory put_public_key path so the signed
+        // record's invariants hold.
+        let pg = engine.postgres_backend().expect("pg backend");
+        let key_record = crate::federation::KeyRecord {
+            key_id: key_id.clone(),
+            pubkey_ed25519_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: crate::federation::types::algorithm::HYBRID.into(),
+            identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
+            identity_ref: key_id.clone(),
+            valid_from: chrono::Utc::now(),
+            valid_until: None,
+            registration_envelope: serde_json::json!({"id": key_id}),
+            original_content_hash: "deadbeef".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: key_id.clone(),
+            scrub_timestamp: chrono::Utc::now(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+        };
+        pg.put_public_key(crate::federation::SignedKeyRecord { record: key_record })
+            .await
+            .expect("seed federation key");
+
+        // SHA randomized so the blob row doesn't collide with
+        // parallel PG tests' rows.
+        let mut sha = [0u8; 32];
+        let nonce = uuid::Uuid::new_v4();
+        sha[..16].copy_from_slice(nonce.as_bytes());
+        sha[16..].copy_from_slice(nonce.as_bytes());
+        let bytes_payload = format!("pg-canon-{}", nonce).into_bytes();
+        // External case avoids the inline-bytes hash check (the sha
+        // doesn't match the payload — using External keeps the test
+        // focused on the holder attestation, not the inline-bytes path).
+        let ext = crate::federation::ExternalRef {
+            uri: format!("s3://test/{nonce}"),
+            size_bytes: bytes_payload.len() as u64,
+            media_type: Some("application/octet-stream".into()),
+        };
+
+        let envelope = holds_bytes_attestation_envelope(&sha);
+        let py_canonical = PythonJsonDumpsCanonicalizer
+            .canonicalize_value(&envelope)
+            .expect("python canonicalize");
+        let expected_hash_hex = hex::encode(Sha256::digest(&py_canonical));
+
+        let now = chrono::Utc::now();
+        let attestation_id = uuid::Uuid::new_v4();
+        engine
+            .put_blob_signing(
+                &sha,
+                BlobBody::External(ext),
+                Some("application/octet-stream"),
+                &key_id,
+                now,
+                attestation_id,
+            )
+            .await
+            .expect("put_blob_signing");
+
+        // Pin the stored hash equals the Python-compat canonical
+        // hash — same invariant the SQLite test checks.
+        let attestation_type = holds_bytes_attestation_type(&sha);
+        let client = pg.pool().get().await.expect("pg client");
+        let row = client
+            .query_one(
+                "SELECT encode(original_content_hash, 'hex'), scrub_key_id \
+                 FROM cirislens.federation_attestations \
+                 WHERE attestation_id = $1 AND attestation_type = $2",
+                &[&attestation_id, &attestation_type],
+            )
+            .await
+            .expect("stored row present");
+        let stored_hash_hex: String = row.get(0);
+        let stored_scrub_key_id: String = row.get(1);
+        assert_eq!(stored_hash_hex, expected_hash_hex);
+        assert_eq!(stored_scrub_key_id, key_id);
     }
 }

@@ -3845,6 +3845,148 @@ impl PyEngine {
         })
     }
 
+    // ── v3.3.0 (CIRISPersist#121) — ergonomic put_blob_signing ─────
+
+    /// v3.3.0 (CIRISPersist#121) — one-call ingest. Persist owns the
+    /// holds_bytes envelope construction, canonicalization (via the
+    /// production `PythonJsonDumpsCanonicalizer`, NOT JCS), signing
+    /// (via the engine's composed `Arc<dyn HardwareSigner>` —
+    /// cross-cdylib accessors `keyring_signer_capsule` /
+    /// `local_signer_capsule` cover the cross-module case, so PyO3
+    /// callers DON'T pass the signer through this method), and atomic
+    /// commit via `put_blob`.
+    ///
+    /// Closes the JCS-vs-Python silent-correctness trap a downstream
+    /// reimplementing the canonicalize-sign-assemble path could fall
+    /// into. See the [`BlobStorage::put_blob_signing`](crate::federation::blobs::BlobStorage::put_blob_signing)
+    /// trait method for the full rationale.
+    ///
+    /// # Body shape (matches `put_blob_json`)
+    ///
+    /// Exactly one of `body_inline_b64` (base64-encoded inline bytes)
+    /// or `external_ref_json` (JSON string of an `ExternalRef`) must
+    /// be provided. Both `None` or both `Some` → `ValueError`.
+    ///
+    /// # Parameters
+    ///
+    /// - `sha256_hex` — 64-char hex SHA-256.
+    /// - `body_inline_b64` — base64 inline bytes; `None` when external.
+    /// - `external_ref_json` — JSON of `ExternalRef`; `None` when inline.
+    /// - `media_type` — optional media type.
+    /// - `attesting_key_id` — `federation_keys.key_id` row referenced
+    ///   by the emitted holder attestation.
+    /// - `now_iso` — RFC3339 timestamp for the holder attestation's
+    ///   `scrub_timestamp` (caller-supplied for pinned-time tests +
+    ///   replay; normal callers pass `datetime.now(UTC).isoformat()`).
+    /// - `attestation_id_uuid` — UUID v4 string for the
+    ///   `federation_attestations.attestation_id` PK (caller-supplied
+    ///   for replay / migration; normal callers pass `str(uuid.uuid4())`).
+    #[pyo3(signature = (
+        sha256_hex, body_inline_b64, external_ref_json,
+        media_type, attesting_key_id, now_iso, attestation_id_uuid
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn put_blob_signing(
+        &self,
+        py: Python<'_>,
+        sha256_hex: &str,
+        body_inline_b64: Option<&str>,
+        external_ref_json: Option<&str>,
+        media_type: Option<&str>,
+        attesting_key_id: &str,
+        now_iso: &str,
+        attestation_id_uuid: &str,
+    ) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let sha = parse_sha256_hex(sha256_hex)?;
+
+            // Exactly-one-of body shape.
+            let body = match (body_inline_b64, external_ref_json) {
+                (Some(_), Some(_)) => {
+                    return Err(PyValueError::new_err(
+                        "put_blob_signing: pass either body_inline_b64 or external_ref_json, \
+                         not both",
+                    ));
+                }
+                (None, None) => {
+                    return Err(PyValueError::new_err(
+                        "put_blob_signing: one of body_inline_b64 / external_ref_json required",
+                    ));
+                }
+                (Some(b64), None) => {
+                    use base64::engine::general_purpose::STANDARD as B64;
+                    use base64::Engine as _;
+                    let bytes = B64.decode(b64).map_err(|e| {
+                        PyValueError::new_err(format!("put_blob_signing inline base64 decode: {e}"))
+                    })?;
+                    crate::federation::BlobBody::Inline(bytes)
+                }
+                (None, Some(json)) => {
+                    let ext: crate::federation::ExternalRef =
+                        serde_json::from_str(json).map_err(|e| {
+                            PyValueError::new_err(format!(
+                                "put_blob_signing external_ref_json decode: {e}"
+                            ))
+                        })?;
+                    crate::federation::BlobBody::External(ext)
+                }
+            };
+
+            let now = chrono::DateTime::parse_from_rfc3339(now_iso)
+                .map_err(|e| PyValueError::new_err(format!("put_blob_signing now_iso parse: {e}")))?
+                .with_timezone(&chrono::Utc);
+            let attestation_id = uuid::Uuid::parse_str(attestation_id_uuid).map_err(|e| {
+                PyValueError::new_err(format!("put_blob_signing attestation_id_uuid parse: {e}"))
+            })?;
+
+            let signer = self.signer.clone();
+            let attesting_key_id_owned = attesting_key_id.to_string();
+            let media_type_owned = media_type.map(str::to_owned);
+
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .put_blob_signing(
+                                &sha,
+                                body,
+                                media_type_owned.as_deref(),
+                                &attesting_key_id_owned,
+                                &*signer,
+                                now,
+                                attestation_id,
+                            )
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .put_blob_signing(
+                                &sha,
+                                body,
+                                media_type_owned.as_deref(),
+                                &attesting_key_id_owned,
+                                &*signer,
+                                now,
+                                attestation_id,
+                            )
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
     // ── v1.3.0 (CIRISPersist#46 + #47) — Trust hierarchy wraps ─────
     //
     // Wire shape mirrors the existing FederationDirectory PyO3

@@ -5,6 +5,72 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.3.0] — 2026-05-29
+
+**CIRISPersist 3.3 — `put_blob_signing` ergonomic ingest + canonicalizer authority (#121 / closes the JCS-vs-Python silent-correctness trap).**
+
+Closes **#121**: a new `BlobStorage::put_blob_signing` trait method (and `Engine` facade + PyO3 mirror) that collapses the 7-step holds_bytes ingest sequence to one call AND makes persist the canonical owner of the holds_bytes envelope canonicalizer. The existing `put_blob(PutBlobAttestation)` stays for re-emit / HSM-batch / replay paths where the caller has a specific signed envelope already.
+
+### The trap this closes — not just ergonomics
+
+Persist's production canonicalizer is **`PythonJsonDumpsCanonicalizer`** (`src/verify/canonical.rs:73`), NOT JCS RFC 8785. `Rfc8785Canonicalizer` lives at the bottom of the same file as a `#[cfg(test)]` parity reference — it doesn't ship in production builds.
+
+Downstream consumers (CIRISNodeCore, CIRISEdge, CIRISLensCore) writing their own holds_bytes ingest path would naturally reach for `serde_json_canonicalizer` (the obvious crate name, JCS implementation) and produce signatures that fail downstream verification — **silently wrong rows in `federation_attestations`**. The signature column would contain a valid Ed25519 signature over JCS-canonical bytes; the verifier would recompute Python-compat bytes; the comparison would fail; the holder would be filtered out at `list_holders` read time without any write-side error.
+
+This isn't a "make it nicer" feature. It's persist taking ownership of a substrate-defined operation (holds_bytes per CEG §10.1.2 is persist's invention) and closing a silent-correctness error class for every present and future consumer.
+
+### New surface
+
+```rust
+trait BlobStorage {
+    fn put_blob_signing<'s>(
+        &'s self,
+        sha256: &'s [u8; 32],
+        body: BlobBody,
+        media_type: Option<&'s str>,
+        attesting_key_id: &'s str,
+        signer: &'s dyn ciris_keyring::HardwareSigner,
+        now: chrono::DateTime<chrono::Utc>,
+        attestation_id: uuid::Uuid,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send + 's
+    where Self: Sync;
+}
+```
+
+**Default implementation provided in terms of `put_blob`** — backends inherit automatically, no per-backend code, no `BlobStorage` re-implementation. The default impl is the entire point: persist owns the canonicalization, all backends get it for free, future backends inherit correctness.
+
+`Engine::put_blob_signing` facade sources the signer internally from `Engine::signer()` (the `&Arc<dyn HardwareSigner>` shape locked in v1.13.0 / #92), so consumers using `current_rust_engine()` don't thread a signer through their call sites.
+
+PyO3 mirror `put_blob_signing(sha256: bytes, body_bytes, external_ref, media_type, attesting_key_id, now_iso, attestation_id_uuid)` likewise sources the signer internally from the engine — matches the cohabitation pattern (#119 `local_signer_capsule`): cross-cdylib signer access lives via capsules, not as PyO3 method args.
+
+### Design calls
+
+- **`&dyn HardwareSigner` not `&Arc<LocalSigner>`** — sidesteps the cross-cdylib `PyTypeInfo` trap (#109 / #111); both `LocalSigner` (via `LocalSignerHardwareAdapter` at `src/signing/mod.rs:405`) and hardware-rooted signers (TPM / Secure Enclave / StrongBox) implement the trait.
+- **Explicit `now: DateTime<Utc>`** — pinned-time tests + replay + backfill paths provide their own clock; the one extra parameter buys determinism.
+- **Explicit `attestation_id: Uuid`** — replay / migration paths reproduce specific IDs; normal callers pass `Uuid::new_v4()`.
+- **`scrub_signature_pqc` stays `None`** — the cold-path PQC sweep populates later, matching existing `PutBlobAttestation` semantics (see `src/federation/blobs.rs:298-300`).
+- **`scrub_key_id` sourced via `signer.current_alias()`** — verified against `Engine::receive_and_persist_with` at `src/engine.rs:496` which does exactly this for the existing ingest path (`let key_id = self.signer.current_alias().to_owned();`). Same shape, same source-of-truth.
+- **Method on the trait, not Engine-only** — `Arc<dyn BlobStorage>` consumers (which `current_rust_engine` returns) get the method directly without going through Engine facade. The Engine facade exists for API ergonomics, not as a gating layer.
+
+### Test coverage — 9 new tests pinning the correctness fix
+
+1. **`put_blob_signing_canonicalizer_identity_holds_bytes_envelope`** (trait-level) — pins the production canonicalizer's byte output for the holds_bytes envelope. The natural divergence test the issue sketched DOESN'T work for this envelope because the shape is ASCII-only (`{"kind": "holds_bytes", "evidence_refs": ["<64-hex>"]}`) — Python-compat and JCS produce byte-identical bytes here. So the regression gate is byte-exact identity instead: the test hashes `PythonJsonDumpsCanonicalizer.canonicalize_value(envelope)` and asserts the hex hash matches an anchored constant. Any future canonicalizer drift — whitespace, key reorder, ASCII-affecting bug — trips this.
+2. **`put_blob_signing_canonicalizer_divergence_for_non_ascii_envelope`** (trait-level) — pins the broader Python-vs-JCS divergence assumption on a non-ASCII envelope so a future refactor that accidentally flips the two impls into agreement (canonicalizer choice silently becoming irrelevant) is caught and forces the regression test design to be updated explicitly.
+3. **`put_blob_signing_uses_python_canonicalizer_not_jcs_sqlite`** + **`_postgres`** — write via `put_blob_signing`, read back the `federation_attestations.original_content_hash` column, assert it equals SHA-256 of the production canonicalizer's output. Also pins `scrub_key_id == signer.current_alias()` and `list_holders` returns the writer.
+4. **`put_blob_signing_inline_round_trip_sqlite`** — content + sha + key, `get_blob` returns the bytes; `list_holders` returns `[attesting_key_id]`.
+5. **`put_blob_signing_external_round_trip_sqlite`** — same shape with `BlobBody::External("url")`.
+6. **`put_blob_signing_unknown_key_rejects_sqlite`** — `attesting_key_id` not in `federation_keys` → `BlobError::AttestationEmissionFailed`.
+7. **`put_blob_signing_replay_same_attestation_id_conflicts_sqlite`** — same `attestation_id` twice → collides on the attestation_id PK → `BlobError::AttestationEmissionFailed("attestation_id collision: ...")`. The replay path documents that callers regenerating UUIDs across retries get clean idempotency; callers reusing UUIDs intentionally are signaling a different intent.
+8. **`put_blob_signing_idempotent_distinct_attestation_ids_sqlite`** — same content + same key + different `attestation_id` → both succeed (blob row idempotent on sha256 PK; two holder rows written; `list_holders` deduplicates by `attesting_key_id`).
+
+Full nextest: **895/895 pass** on fresh PG; no regressions in the existing 886 from 3.2.x.
+
+### Mission citations
+
+- §1.3 lowest-stateful-library-above-verify — persist owning the holds_bytes ingest sequence end-to-end matches this role. Making consumers reassemble a substrate-defined concept is the anti-pattern.
+- §1.5 parity invariant — trait default impl means both backends + every future backend get the convenience method for free.
+- §1.6 fail-honest — the canonicalizer choice is no longer a silent-correctness landmine for downstream; persist is the authority.
+
 ## [3.2.0] — 2026-05-29
 
 **CIRISPersist 3.2 — `BlackholeRules` durable per-identity deny-list (#120 / unblocks CIRISEdge#33 v0.15.0 routing-table FFI).**

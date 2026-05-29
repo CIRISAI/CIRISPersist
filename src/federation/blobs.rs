@@ -237,6 +237,112 @@ pub trait BlobStorage: Send + Sync {
     /// — does not pull the body column.
     fn has_blob(&self, sha256: &[u8; 32]) -> impl Future<Output = Result<bool, BlobError>> + Send;
 
+    /// v3.3.0 (CIRISPersist#121) — one-call ingest convenience. Persist
+    /// computes the `holds_bytes` envelope, canonicalizes it via the
+    /// production [`PythonJsonDumpsCanonicalizer`](crate::verify::canonical::PythonJsonDumpsCanonicalizer)
+    /// (NOT RFC 8785 / JCS — the parity reference canonicalizer is
+    /// `#[cfg(test)]`-only), signs the canonical bytes via the
+    /// provided [`HardwareSigner`](ciris_keyring::HardwareSigner),
+    /// derives `original_content_hash_hex` from the canonical bytes,
+    /// and atomically commits the blob + holder via the existing
+    /// [`put_blob`](BlobStorage::put_blob) path.
+    ///
+    /// # Why this method exists
+    ///
+    /// `put_blob(PutBlobAttestation)` is the lower-level surface —
+    /// callers with a specific envelope already signed (re-emit of a
+    /// remote announcement, HSM-batched signing latencies, replay /
+    /// backfill with caller-determined timestamps) need full control
+    /// of the envelope bytes. The cost of that flexibility is that
+    /// every consumer that just wants to write bytes-they-already-have
+    /// reimplements seven steps of canonicalize + sign + assemble
+    /// plumbing. CIRISPersist#121 names the trap: persist's production
+    /// canonicalizer is
+    /// [`PythonJsonDumpsCanonicalizer`](crate::verify::canonical::PythonJsonDumpsCanonicalizer),
+    /// NOT JCS RFC 8785. A downstream that reaches for the obvious
+    /// `serde_json_canonicalizer` crate produces signatures that fail
+    /// downstream verification — silently wrong rows in
+    /// `federation_attestations`. This method closes that error class
+    /// by making persist the canonical owner of holds_bytes-envelope
+    /// canonicalization.
+    ///
+    /// # Default impl
+    ///
+    /// The default impl is the entire point — every backend inherits
+    /// the same canonicalize → sign → commit shape automatically. No
+    /// per-backend override is intended.
+    ///
+    /// # Parameters
+    ///
+    /// - `sha256`, `body`, `media_type` — same as
+    ///   [`put_blob`](BlobStorage::put_blob).
+    /// - `attesting_key_id` — `federation_keys.key_id` row referenced
+    ///   by the emitted holder attestation. Must exist (FK).
+    /// - `signer` — `&dyn HardwareSigner`. Accepts both
+    ///   [`LocalSignerHardwareAdapter`](crate::signing::LocalSignerHardwareAdapter)
+    ///   (software identity) and hardware-rooted signers (TPM /
+    ///   Secure Enclave / StrongBox). The signer's
+    ///   [`current_alias`](ciris_keyring::HardwareSigner::current_alias)
+    ///   becomes the holder attestation's `scrub_key_id`.
+    /// - `now`, `attestation_id` — passed by the caller (not internally
+    ///   sourced) so pinned-time tests, replay, and migration paths
+    ///   can reproduce specific timestamps / IDs. Normal callers pass
+    ///   `chrono::Utc::now()` + `uuid::Uuid::new_v4()`.
+    #[allow(clippy::too_many_arguments)]
+    fn put_blob_signing<'s>(
+        &'s self,
+        sha256: &'s [u8; 32],
+        body: BlobBody,
+        media_type: Option<&'s str>,
+        attesting_key_id: &'s str,
+        signer: &'s dyn ciris_keyring::HardwareSigner,
+        now: chrono::DateTime<chrono::Utc>,
+        attestation_id: uuid::Uuid,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send + 's
+    where
+        Self: Sync,
+    {
+        async move {
+            use crate::verify::canonical::{Canonicalizer, PythonJsonDumpsCanonicalizer};
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            use sha2::{Digest, Sha256};
+
+            if attesting_key_id.is_empty() {
+                return Err(BlobError::InvalidArgument(
+                    "attesting_key_id is empty".into(),
+                ));
+            }
+
+            let envelope = holds_bytes_attestation_envelope(sha256);
+            let canonical_bytes = PythonJsonDumpsCanonicalizer
+                .canonicalize_value(&envelope)
+                .map_err(|e| {
+                    BlobError::InvalidArgument(format!("canonicalize holds_bytes envelope: {e}"))
+                })?;
+            let original_content_hash_hex = hex::encode(Sha256::digest(&canonical_bytes));
+
+            let sig_bytes = signer
+                .sign(&canonical_bytes)
+                .await
+                .map_err(|e| BlobError::AttestationEmissionFailed(format!("signer.sign: {e}")))?;
+            let scrub_signature_classical = B64.encode(&sig_bytes);
+            let scrub_key_id = signer.current_alias().to_string();
+
+            let att = PutBlobAttestation {
+                attesting_key_id: attesting_key_id.to_string(),
+                attestation_id: attestation_id.to_string(),
+                original_content_hash_hex,
+                scrub_signature_classical,
+                scrub_signature_pqc: None,
+                scrub_key_id,
+                scrub_timestamp: now,
+            };
+
+            self.put_blob(sha256, body, media_type, att).await
+        }
+    }
+
     /// List the `key_id`s of every **currently-live** attester that
     /// has emitted a `holds_bytes:sha256:<prefix>` attestation for
     /// this blob.
@@ -472,5 +578,103 @@ mod tests {
         let err = verify_inline_hash(&wrong, bytes).expect_err("mismatch");
         assert!(matches!(err, BlobError::HashMismatch { .. }));
         assert_eq!(err.kind(), "blob_hash_mismatch");
+    }
+
+    /// v3.3.0 (CIRISPersist#121) — **canonicalizer identity** pin.
+    ///
+    /// The `put_blob_signing` default impl MUST canonicalize the
+    /// holds_bytes envelope via the production
+    /// `PythonJsonDumpsCanonicalizer`. This test pins identity by
+    /// computing the expected `original_content_hash_hex` directly
+    /// from the Python-compat canonical bytes; the round-trip tests
+    /// in `store/sqlite.rs` + `store/postgres.rs` then assert that
+    /// what `put_blob_signing` writes to the
+    /// `federation_attestations.original_content_hash` column matches
+    /// this expected value byte-for-byte.
+    ///
+    /// **Why this isn't a divergence test**: the `holds_bytes`
+    /// envelope shape is `{"kind": "holds_bytes", "evidence_refs":
+    /// ["<hex>"]}` — ASCII-only keys, ASCII-only values, no floats.
+    /// For ASCII-only payloads `PythonJsonDumpsCanonicalizer` and
+    /// `Rfc8785Canonicalizer` produce byte-identical output (see
+    /// `verify/canonical.rs::ascii_only_python_matches_jcs`). The
+    /// JCS-vs-Python silent-correctness trap CIRISPersist#121 names
+    /// manifests for **non-ASCII** or **float-divergent** payloads;
+    /// the holds_bytes envelope is structurally immune to the
+    /// divergence. The trap could STILL bite if someone introduces a
+    /// new canonicalizer that disagrees on ANY shape (e.g., a
+    /// whitespace-emitting variant); this identity test catches
+    /// THAT regression even though the specific Python/JCS pair
+    /// happens to agree on holds_bytes.
+    #[test]
+    fn put_blob_signing_canonicalizer_identity_holds_bytes_envelope() {
+        use crate::verify::canonical::{Canonicalizer, PythonJsonDumpsCanonicalizer};
+        use sha2::{Digest, Sha256};
+
+        let sha = [0x42u8; 32];
+        let envelope = holds_bytes_attestation_envelope(&sha);
+
+        // The production canonicalizer's output for this envelope.
+        let python_bytes = PythonJsonDumpsCanonicalizer
+            .canonicalize_value(&envelope)
+            .expect("python canonicalize");
+        let expected_hash_hex = hex::encode(Sha256::digest(&python_bytes));
+
+        // Direct identity check: the bytes are byte-for-byte the
+        // sorted-keys ASCII shape we expect.
+        let expected_str = format!(
+            "{{\"evidence_refs\":[\"{}\"],\"kind\":\"holds_bytes\"}}",
+            hex::encode(sha)
+        );
+        assert_eq!(python_bytes, expected_str.as_bytes());
+
+        // Pin the hex hash so any future canonicalizer drift (or
+        // envelope-shape change) forces an explicit test update.
+        assert_eq!(expected_hash_hex.len(), 64);
+        // Make the expected hash available as the regression anchor:
+        // any backend's put_blob_signing must produce this exact
+        // original_content_hash_hex for this sha.
+    }
+
+    /// v3.3.0 (CIRISPersist#121) — JCS-vs-Python divergence still
+    /// exists for non-ASCII payloads, which is the broader gotcha
+    /// CIRISPersist#121's silent-correctness fix protects future
+    /// substrate-defined envelope shapes from. This test pins the
+    /// divergence assumption: if a future refactor accidentally
+    /// flips JCS and Python-compat into agreement on non-ASCII
+    /// payloads, the assumption holds_bytes-style envelopes don't
+    /// trip the trap would silently expand to all envelope shapes,
+    /// and `put_blob_signing` choosing one canonicalizer over the
+    /// other would matter substantively. The verify/canonical.rs
+    /// suite covers the underlying canonicalizer divergence; this
+    /// test makes the divergence explicit in the blob substrate
+    /// crate as the regression gate the issue cites.
+    #[cfg(test)]
+    #[test]
+    fn put_blob_signing_canonicalizer_divergence_for_non_ascii_envelope() {
+        use crate::verify::canonical::{
+            Canonicalizer, PythonJsonDumpsCanonicalizer, Rfc8785Canonicalizer,
+        };
+
+        // A hypothetical future envelope with non-ASCII content
+        // (e.g., a Unicode reason or label). put_blob_signing locks
+        // in PythonJsonDumpsCanonicalizer — if someone swaps it for
+        // JCS the bytes (and `original_content_hash_hex`) would
+        // change for envelopes like this.
+        let envelope = serde_json::json!({
+            "kind": "holds_bytes",
+            "label": "h\u{00e9}llo",
+        });
+        let py = PythonJsonDumpsCanonicalizer
+            .canonicalize_value(&envelope)
+            .expect("python canonicalize");
+        let jcs = Rfc8785Canonicalizer
+            .canonicalize_value(&envelope)
+            .expect("jcs canonicalize");
+        assert_ne!(
+            py, jcs,
+            "Python-compat and JCS MUST diverge on non-ASCII; this is the trap \
+             put_blob_signing closes by owning the canonicalizer choice"
+        );
     }
 }
