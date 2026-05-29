@@ -237,12 +237,27 @@ canonical values:
 | `steward` | Per-region operational steward keys (US / EU / APAC). Trust roots for routine operations; rotatable per regional ops. |
 | `partner` | Per-org partner keys for commercial onboarding (registry's existing partner-key surface). |
 | `accord_holder` | **New v2.4.0.** HUMANITY_ACCORD key material — the three hardware-attested human-held kill-switch keys per FSD-002 §7.2 (Eric Moore / Eric Kudzin / Haley Bradley, 2-of-3 threshold). Only rows with this `identity_type` may emit `accord:*` attestations (FSD-002 §4.1 + §7.1 — the federation's one constitutional asymmetry); the admission gate in `src/federation/admission.rs` enforces this at write time. |
+| `substrate_persist` | **New v3.0.0** (CIRISPersist#116, CEG 0.2 §7.0). The persist substrate's self-report identity. Required emitter for the substrate-self-report reserved-prefix families: `system:*` (CEG §4.5 substrate-internal), `audit_chain:*` (`hash_continuity` / `merkle_inclusion` / `tree_head_signed`), `corpus_health:n_eff_measurable`, `identity_continuity:relational_anchor`, `federation_directory:replication_lag`. The admission gate rejects these prefixes from non-`substrate_persist` attesters with `Error::ReservedPrefixEmitterMismatch`. |
+| `witness` | **New v3.0.0** (CIRISPersist#116, CEG §10.3). Per-region witness keys that cosign the audit log's signed tree-head. Required emitter for the `transparency_log:cosigned:{tree_size}` prefix family. The CEG 0.1 interim used per-region `registry_witnesses` + `registry_sth_cosignatures` tables in Registry; substrate-conformance migration moves these onto `federation_keys` (identity_type=`witness`) + `federation_attestations` carrying `transparency_log:cosigned:*` — this is the vocabulary surface Registry waits on for the migration. |
 
-The `accord_holder` addition needed **no migration** — the existing
-`identity_type TEXT NOT NULL` column accepted the new value as-is.
-The constant lives in `crate::federation::types::identity_type::ACCORD_HOLDER`
-(Rust) and is re-exported on the public `ciris_persist::federation`
-surface.
+The `accord_holder` / `substrate_persist` / `witness` additions
+needed **no migration** — the existing `identity_type TEXT NOT NULL`
+column accepted the new values as-is. The constants live in
+`crate::federation::types::identity_type::{ACCORD_HOLDER,
+SUBSTRATE_PERSIST, WITNESS}` (Rust) and are re-exported on the
+public `ciris_persist::federation` surface.
+
+**CEG 0.2 reserved-prefix admission** (CIRISPersist#116, 3.0.0).
+The `DimensionAdmissionPolicy` (2.4.0 baseline) now carries a
+`reserved_prefix_rules` allowlist that gates `SCORES` attestations
+on `(prefix → required identity_types)`. The defaults ship the
+CEG §5.3 + §7.x base set documented above; operators extend via
+the policy's `pub` fields. The dual-acceptance for the CEG
+0.1→0.2 `attestation:l{N}:*` → `attestation:{mechanism}` rename
+is a separate
+`AttestationLadderTransitionPolicy::DualAccept` knob — see
+[`docs/THREAT_MODEL.md` AV-45](THREAT_MODEL.md) for the
+transition-window analysis.
 
 **Why every row signs itself:** the registry's DB compromise
 problem disappears if every row carries cryptographic provenance.

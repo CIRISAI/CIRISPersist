@@ -311,6 +311,109 @@ the injected-engine-handle item still tracked in the #79–#84 set.
 Until that lands, ownership is a cooperative contract enforced by
 this table and by code review, not by the engine.
 
+## Cross-cdylib cohabitation — separately-built wheels (v2.7+ capsule family)
+
+The in-process model above assumes every co-resident consumer
+**statically links the same persist source** through its Cargo
+`[dependencies]`. That holds for the agent's own internal modules,
+but a sibling Python wheel (e.g. CIRISEdge's `ciris_edge.abi3.so`)
+also linking `ciris-persist` produces **two distinct PyO3
+extension modules** in the same Python process — and PyO3 registers
+`#[pyclass]` types per-extension-module, not per-process. The
+`PyEngine` from `ciris_persist.abi3.so` and the `PyEngine` from
+`ciris_edge.abi3.so` are the same Rust struct (same source, same
+git tag) but distinct `PyTypeInfo`'s; `isinstance(engine, PyEngine)`
+fails across modules. CIRISEdge#22 caught this in production
+cohabitation init: `'Engine' object is not an instance of 'Engine'`.
+
+Persist 2.7+ ships a family of **`PyCapsule` accessors** on
+`PyEngine` that sidestep the per-module identity check entirely.
+A capsule is an opaque pointer with a name tag; any module can
+extract the wrapped value via `unsafe { cap.pointer_checked(name)
+?.cast().as_ref() }`. No `PyTypeInfo` lookup happens, so the
+cross-module identity problem evaporates.
+
+| Capsule (on `PyEngine`) | Wraps | Issue | Released |
+|---|---|---|---|
+| `federation_directory_capsule` | `Arc<dyn FederationDirectory>` | #109 | 2.7.0 |
+| `outbound_queue_capsule` | `BackendDispatch` (OutboundQueue is RPITIT) | #109 | 2.7.0 |
+| `keyring_signer_capsule` | `KeyringSignerHandle` (reuses host's signer per rule 1 above) | #109 | 2.7.0 |
+| `runtime_handle_capsule` | `tokio::runtime::Handle` (statics-duplication counterpart) | #111 | 2.8.0 |
+| `blob_storage_capsule` | `BackendDispatch` (BlobStorage is RPITIT) | #115 | 2.11.0 |
+
+Consumer pattern from a sibling wheel (e.g. CIRISEdge):
+
+```rust
+let cap: Bound<PyCapsule> = engine
+    .call_method0("federation_directory_capsule")?
+    .downcast_into()?;
+let arc: &Arc<dyn FederationDirectory> = unsafe {
+    cap.pointer_checked(Some(c"ciris_persist::federation_directory"))?
+       .cast()
+       .as_ref()
+};
+// Now call FederationDirectory trait methods directly in Rust.
+```
+
+`runtime_handle_capsule` (#111, 2.8.0) is the statics-duplication
+counterpart: when persist is linked into both wheels, each `.so`
+gets its own copy of `static ENGINE_SINGLETON`. The consumer
+wheel's copy is never populated by the agent's
+`ciris_persist.Engine(...)` bootstrap, so
+`ciris_persist::current_runtime_handle()` called from the consumer
+side returns `None`. The capsule wraps a clone of
+`self.runtime.handle()` — sourced from `self`, not from the
+static — sidestepping the static entirely.
+
+### When Python disappears — Phase 3 endpoint
+
+The cohabitation accessor family is the bridge for the
+**Python-orchestrated phase**: every co-resident consumer reaches
+persist via Python attribute access + capsule extraction. The
+trajectory endpoint is **Rust-native** — `Engine::federation_directory()`
+(#106, 2.6.0) returns `Arc<dyn FederationDirectory>` directly to a
+Rust caller via `current_rust_engine()`, no PyO3 surface in the
+loop. Sibling cdylibs that compile `ciris-persist` as a Cargo
+dependency call the Rust-trait surface directly; the capsule layer
+collapses to a one-line marshalling shim, deletable when the host
+process goes Rust-native.
+
+The two paths coexist forever: capsules for Python-orchestrated
+cohabitation, the Rust-trait accessors for the Rust-native
+endpoint. Both backed by the same singleton `EngineCell` — there
+is only ever one engine, one pool, one runtime, one keyring per
+process.
+
+### Higher-level Engine facades shipped 2.6.0+
+
+The capsule family delivers raw substrate handles; persist also
+ships **higher-level Engine facades** that compose the substrate
+into common cohabitation operations:
+
+- `Engine::receive_and_persist` (#89, 2.x baseline) — ingest path.
+- `Engine::storage_summary` / `delete_traces_older_than` /
+  `archive_audit_range` (#107, 2.6.0) — retention primitives.
+- `Engine::node_core_service()` / `audit_service()` (#90, #93) —
+  per-substrate Rust accessors.
+- `Engine::sign_hybrid(message) -> Result<HybridSignature, SignError>`
+  (#112, 2.12.0) — hybrid Ed25519 + ML-DSA-65 signing facade. Reaches
+  the underlying `LocalSigner::sign_hybrid` via the propagated
+  `local_signer` field; pre-2.12 `current_rust_engine()` lost the
+  `LocalSigner` at the cohabitation boundary. 2.12 added
+  `Engine::from_shared_with_local` so the singleton's LocalSigner
+  propagates through.
+- `Engine::get_detection_events` / `get_edge_detection_events` /
+  `subscribe_detection_events` (#113, 2.13.0) — detection-events
+  read + v0.1 polling change feed. LensCore client-mode trace
+  signing on `ACTION_RESULT` (#11) + v0.4 EgressFilter re-sign
+  (#14) compose against `sign_hybrid` + the new read facades.
+
+Same closure pattern throughout: **persist owns the primitive;
+persist exposes the Engine facade** so cohabiting consumers don't
+reach past `Arc<dyn HardwareSigner>` / `BackendDispatch` / etc.
+
+---
+
 ## What v0.1.14 does NOT do
 
 - **Doesn't add a daemon.** Persist is and remains a Python wheel.
