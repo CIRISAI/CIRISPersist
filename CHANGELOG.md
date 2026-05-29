@@ -5,6 +5,57 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.3.1] — 2026-05-29
+
+**CIRISPersist 3.3.1 — second calibration anchor for memory-bound bench families (#122 / closes the v3.3.0 false-positive alert pattern).**
+
+Bench-infrastructure-only patch. No Rust code change, no schema, no API surface. Closes **#122**.
+
+### Why
+
+v3.3.0's bench run flagged 3 perf alerts on `read_engine_analytics/aggregate_llm_costs/{1000,10000,25000}` (1.28× / 1.48× / 1.10×) — same bench family, non-monotonic with input size, on a commit (`baad6bf`) that touched zero code in `src/read.rs` or any analytics aggregation path. 7 prior bench runs across v3.0 → v3.2 had 0 alerts.
+
+Diagnosis: the v2.12.0 / #116 CPU-bound calibration anchor (`splitmix64_10m`) doesn't normalize the memory/cache axis. A runner where CPU is fast but neighbor-tenant memory bandwidth contention is high produces CPU-anchored normalized values that look like memory-bound bench regressions but aren't real code regressions. The single-anchor design assumed runner noise was uniform across workloads; it isn't.
+
+### The fix — additive second anchor
+
+New `bench_calibration_dram_walk` function in `benches/calibration.rs`:
+- 64MB buffer of `u64` (exceeds L3 on every Actions runner image — largest observed is ~36MB on the AMD EPYC `ubuntu-24.04`).
+- 500k random reads per iteration via an LCG-driven index sequence (Numerical Recipes constants) — defeats the hardware prefetcher.
+- Each access misses cache → goes to DRAM → measures effective DRAM latency + bandwidth-under-contention.
+- ~50ms per iteration → 20 Criterion samples fit the default 5s budget with margin.
+- Deterministic across runs (same LCG seed, same buffer init).
+
+The bench workflow now extracts both `CALIBRATION_CPU_NS` and `CALIBRATION_MEM_NS`, errors if either is empty/zero, and classifies each downstream bench by name prefix:
+
+```bash
+case "$bench_name" in
+  read_engine_analytics/*|dedup_key/*|occurrence_registry/*)
+    anchor_ns="$CALIBRATION_MEM_NS"
+    ;;
+  *)
+    anchor_ns="$CALIBRATION_CPU_NS"
+    ;;
+esac
+```
+
+Three memory-bound families today: `read_engine_analytics/*` (large row aggregations — the family that alerted), `dedup_key/*` (hashmap operations), `occurrence_registry/*` (registry mutations over substantial in-memory state). Everything else stays on the CPU anchor — same normalization the v2.12.0 / #116 trend chart series has been using.
+
+### Back-compat with the existing trend chart
+
+The pre-#122 series was published under env `CALIBRATION_NS` mapped to the CPU anchor. v3.3.1 keeps the alias so:
+- The historical `splitmix64_10m` trend line on gh-pages doesn't fork — same series name, same anchor source.
+- Memory-bound bench history isn't retroactively renormalized — the v3.3.0 alert datapoints stay as recorded, and the new anchor starts being applied from v3.3.1 onward. Trend chart will show a one-time shift at v3.3.1 for the three reclassified families; that's expected and correct.
+
+### Why this is a release, not a config tweak
+
+The bench workflow runs against `main` on push. The classifier table lives in YAML; changing it requires a commit. Treating it as a release means the CHANGELOG documents which families got reclassified and why — anyone digging into a future alert can grep the CHANGELOG for "memory-bound" and find the policy.
+
+### Mission citations
+
+- §1.6 fail-honest — the CPU-only calibration was silently producing false-positive alerts for ~30% of the suite. Two anchors with explicit classification is honest about what's being measured.
+- Threat-model AV-15-adjacent — alert noise is signal-degradation. A regression-alert pipeline that cries wolf gets ignored; one that fires only on real regressions gets acted on.
+
 ## [3.3.0] — 2026-05-29
 
 **CIRISPersist 3.3 — `put_blob_signing` ergonomic ingest + canonicalizer authority (#121 / closes the JCS-vs-Python silent-correctness trap).**

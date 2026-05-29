@@ -13,28 +13,33 @@
 //! performance alerts solely from runner noise — exactly the false
 //! positive class normalization solves.
 //!
-//! ## What this measures
+//! ## Two anchors — CPU + DRAM
 //!
-//! A fixed-iteration SplitMix64 loop. Pure 64-bit integer arithmetic
-//! plus multiplies — no IO, no allocator pressure, no syscalls, and
-//! no hardware-acceleration variance (no SHA-NI / AES-NI / RDRAND
-//! path — those vary by runner image and bias the calibration).
+//! v2.12.0 shipped a single CPU-bound anchor ([`bench_calibration_splitmix`]).
+//! v3.3.1 (CIRISPersist#122) adds the DRAM-bound companion
+//! ([`bench_calibration_dram_walk`]) after v3.3.0's bench run
+//! flagged `read_engine_analytics/aggregate_llm_costs/*` as 1.10–1.48×
+//! regressed on a commit that touched no read-engine code. Diagnosis:
+//! the CPU anchor (`splitmix64_10m`) doesn't normalize the
+//! memory/cache axis — a runner where CPU is fast but neighbor-tenant
+//! memory bandwidth contention is high produces CPU-anchored norm
+//! values that look like regressions for memory-bound benches but
+//! aren't.
 //!
-//! The bench workflow extracts this bench's `ns/iter` and divides
-//! every other bench's `ns/iter` by it (scaled), so the published
-//! values are in "calibration units" — the wall-time cost relative
-//! to a deterministic CPU primitive. Runner-load shifts cancel:
-//! every bench's `ns/iter` scales with the runner's CPU availability;
-//! so does the calibration's. The ratio is runner-independent.
+//! The workflow classifies each bench by name prefix and divides by
+//! the appropriate anchor:
+//! - Memory-bound prefixes (`read_engine_analytics`, `dedup_key`,
+//!   `occurrence_registry`) → DRAM walk anchor
+//! - Default → SplitMix64 CPU anchor
 //!
-//! ## Do not modify the inner loop without bumping the baseline
+//! ## Do not modify the inner loops without bumping the baseline
 //!
-//! The trend chart's historical points are anchored to THIS workload.
-//! Changing the iteration count, the splitmix constants, or the inner
-//! loop shape silently invalidates the calibration baseline — the
-//! gh-pages history would compare apples to oranges. If a real
-//! upgrade is needed, treat it as a new metric (rename the bench
-//! function) and let the trend chart reset.
+//! The trend chart's historical points are anchored to THESE workloads.
+//! Changing iteration counts, constants, the inner loop shapes, or the
+//! buffer size silently invalidates the calibration baselines — the
+//! gh-pages history would compare apples to oranges. If a real upgrade
+//! is needed, treat it as a new metric (rename the bench function) and
+//! let the trend chart reset.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
@@ -70,5 +75,57 @@ fn bench_calibration_splitmix(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_calibration_splitmix);
+/// v3.3.1 (CIRISPersist#122) — DRAM-bound calibration anchor for
+/// memory/cache-axis runner-noise normalization.
+///
+/// Walks a 64MB buffer (well past any L1/L2/L3 on Actions runners —
+/// largest GHA L3 observed is ~36MB on the newer `ubuntu-24.04` AMD
+/// EPYC images) via a deterministic LCG-driven index sequence that
+/// defeats the hardware prefetcher. Each access misses cache and
+/// goes to DRAM, so the bench measures the runner's effective
+/// DRAM latency + bandwidth-under-contention.
+///
+/// Pairs with [`bench_calibration_splitmix`] (pure CPU); the workflow
+/// applies whichever anchor matches each bench's bottleneck.
+fn bench_calibration_dram_walk(c: &mut Criterion) {
+    // 64MB buffer of u64. Sized to exceed L3 on every runner we'll
+    // realistically encounter (Azure Actions runner specs cap at
+    // 36MB shared L3 for the newest AMD image).
+    const BUF_ELEMS: usize = 8 * 1024 * 1024;
+    // 500k random reads per iteration. With ~100ns DRAM-miss
+    // latency, each Criterion sample takes ~50ms — fits 20 samples
+    // in the default 5s budget with margin.
+    const N_ACCESSES: usize = 500_000;
+
+    // Allocate + init once outside the bench loop (allocation cost
+    // isn't what we want to measure). Sequential fill so dead-code
+    // elimination can't drop the buffer.
+    let buf: Vec<u64> = (0..BUF_ELEMS as u64).collect();
+
+    c.bench_function("calibration/dram_random_walk_500k", |b| {
+        b.iter(|| {
+            // Numerical-Recipes LCG — `idx = a * idx + c (mod 2^64)`
+            // produces a stream the hardware prefetcher can't pattern-
+            // match. Each step is ~3 cycles; the DRAM miss dominates.
+            let mut idx: u64 = 0x1234_5678_DEAD_BEEF;
+            let mut sum: u64 = 0;
+            for _ in 0..N_ACCESSES {
+                idx = idx
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                // Use the high bits — they have better randomness
+                // than the low bits for an LCG.
+                let i = (idx >> 32) as usize % BUF_ELEMS;
+                sum = sum.wrapping_add(buf[i]);
+            }
+            black_box(sum)
+        });
+    });
+}
+
+criterion_group!(
+    benches,
+    bench_calibration_splitmix,
+    bench_calibration_dram_walk,
+);
 criterion_main!(benches);

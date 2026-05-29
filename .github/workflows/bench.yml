@@ -126,21 +126,44 @@ jobs:
           MALLOC_ARENA_MAX: "4"
         run: |
           cargo bench --bench calibration -- --output-format bencher | tee calibration-output.txt
-          CAL_NS=$(grep -E '^test calibration/splitmix64_10m' calibration-output.txt \
+          # v3.3.1 (CIRISPersist#122) — TWO calibration anchors now:
+          # `splitmix64_10m` (CPU-bound) + `dram_random_walk_500k`
+          # (memory/cache-bound). The normalization step applies
+          # whichever anchor matches each bench's bottleneck.
+          CAL_CPU_NS=$(grep -E '^test calibration/splitmix64_10m' calibration-output.txt \
             | sed -E 's/.*bench:[[:space:]]+([0-9]+) ns\/iter.*/\1/' \
             | head -1)
-          if [ -z "$CAL_NS" ] || [ "$CAL_NS" = "0" ]; then
-            echo "::error::failed to extract calibration ns/iter from calibration-output.txt"
+          CAL_MEM_NS=$(grep -E '^test calibration/dram_random_walk_500k' calibration-output.txt \
+            | sed -E 's/.*bench:[[:space:]]+([0-9]+) ns\/iter.*/\1/' \
+            | head -1)
+          if [ -z "$CAL_CPU_NS" ] || [ "$CAL_CPU_NS" = "0" ]; then
+            echo "::error::failed to extract CPU calibration ns/iter from calibration-output.txt"
             cat calibration-output.txt
             exit 1
           fi
-          echo "CALIBRATION_NS=$CAL_NS" >> "$GITHUB_ENV"
-          echo "Runner calibration: $CAL_NS ns/iter for 10M splitmix64 iterations"
+          if [ -z "$CAL_MEM_NS" ] || [ "$CAL_MEM_NS" = "0" ]; then
+            echo "::error::failed to extract MEM calibration ns/iter from calibration-output.txt"
+            cat calibration-output.txt
+            exit 1
+          fi
+          echo "CALIBRATION_CPU_NS=$CAL_CPU_NS" >> "$GITHUB_ENV"
+          echo "CALIBRATION_MEM_NS=$CAL_MEM_NS" >> "$GITHUB_ENV"
+          # Back-compat alias — the gh-pages trend chart's pre-#122
+          # series was published under env `CALIBRATION_NS` mapped to
+          # the CPU anchor. Keep the alias so anything downstream that
+          # still reads it stays valid; the new code paths use the
+          # explicit `_CPU_NS` / `_MEM_NS` names.
+          echo "CALIBRATION_NS=$CAL_CPU_NS" >> "$GITHUB_ENV"
+          echo "Runner calibration: CPU=$CAL_CPU_NS ns/iter (splitmix64_10m), MEM=$CAL_MEM_NS ns/iter (dram_random_walk_500k)"
           {
             echo "## Runner calibration"
             echo '```'
-            echo "splitmix64_10m: $CAL_NS ns/iter"
-            echo "(higher = slower runner; every bench below is normalized against this so absolute ns/iter swings from neighbor-tenant load cancel)"
+            echo "splitmix64_10m:        $CAL_CPU_NS ns/iter  (CPU anchor — applied by default)"
+            echo "dram_random_walk_500k: $CAL_MEM_NS ns/iter  (DRAM anchor — applied to memory-bound benches)"
+            echo "(higher = slower runner on that axis. Each downstream bench"
+            echo " is normalized against whichever axis dominates its bottleneck."
+            echo " v3.3.1 #122: read_engine_analytics, dedup_key, and"
+            echo " occurrence_registry are memory-bound; everything else CPU-bound.)"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           # Now run the rest into bench-output-raw.txt; the next step
@@ -182,12 +205,28 @@ jobs:
           : > bench-output-normalized.txt
           n_normalized=0
           sum_log=0
+          # v3.3.1 (CIRISPersist#122) — bench-name → anchor classifier.
+          # Memory-bound prefixes get the DRAM walk anchor (those are
+          # the families that tripped false-positive alerts on v3.3.0
+          # — see CHANGELOG). Everything else uses the CPU anchor.
           while IFS= read -r line; do
-            if [[ "$line" =~ ^test\ .+\.\.\.\ bench:[[:space:]]+([0-9]+)\ ns/iter[[:space:]]+\(\+/-[[:space:]]+([0-9]+)\) ]]; then
-              val_ns="${BASH_REMATCH[1]}"
-              dev_ns="${BASH_REMATCH[2]}"
-              val_norm=$(( val_ns * SCALE / CALIBRATION_NS ))
-              dev_norm=$(( dev_ns * SCALE / CALIBRATION_NS ))
+            if [[ "$line" =~ ^test\ ([^[:space:]]+)\ \.\.\.\ bench:[[:space:]]+([0-9]+)\ ns/iter[[:space:]]+\(\+/-[[:space:]]+([0-9]+)\) ]]; then
+              bench_name="${BASH_REMATCH[1]}"
+              val_ns="${BASH_REMATCH[2]}"
+              dev_ns="${BASH_REMATCH[3]}"
+              # Classifier: explicit list-membership check on bench-
+              # name prefix. Update both this list AND the CHANGELOG
+              # note when reclassifying a family.
+              case "$bench_name" in
+                read_engine_analytics/*|dedup_key/*|occurrence_registry/*)
+                  anchor_ns="$CALIBRATION_MEM_NS"
+                  ;;
+                *)
+                  anchor_ns="$CALIBRATION_CPU_NS"
+                  ;;
+              esac
+              val_norm=$(( val_ns * SCALE / anchor_ns ))
+              dev_norm=$(( dev_ns * SCALE / anchor_ns ))
               prefix="${line%bench:*}bench:"
               printf '%s %d ns/iter (+/- %d)\n' "$prefix" "$val_norm" "$dev_norm" >> bench-output-normalized.txt
               if [ "$val_norm" -gt 0 ]; then
@@ -202,7 +241,7 @@ jobs:
           # Geomean cross-check, diagnostic log only.
           if [ "$n_normalized" -gt 0 ]; then
             geomean=$(echo "scale=2; e($sum_log / $n_normalized)" | bc -l)
-            echo "calibration_ns=$CALIBRATION_NS  n_normalized=$n_normalized  geomean(normalized ns/iter)=$geomean"
+            echo "calibration_cpu_ns=$CALIBRATION_CPU_NS  calibration_mem_ns=$CALIBRATION_MEM_NS  n_normalized=$n_normalized  geomean(normalized ns/iter)=$geomean"
           else
             echo "warning: no bench lines normalized; check the bench-output-raw.txt format"
           fi
