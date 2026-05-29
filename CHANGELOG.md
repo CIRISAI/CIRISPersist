@@ -5,6 +5,94 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.5.0] — 2026-05-29
+
+**CIRISPersist 3.5 — identity-aware storage (`list_held_by` + `evict_actor`) + CEG canonicalization rejection rules (#125 + #126 / CIRISConformance §0.5/§0.6/§0.7 + scaling-model §9 conformance gates).**
+
+Combined monolithic cut closing the two remaining CCS-profile conformance issues. **#125** adds the per-actor inverse-attribution + eviction surface; **#126** adds the canonical-form rejection validators for §0.5/§0.6/§0.7. Both are additive — no schema change, no existing-surface break.
+
+### #125 — `list_held_by` + `evict_actor` (FEDERATION_SCALING_MODEL §9 identity-aware storage)
+
+The scaling model's load-bearing claim ("you know whose bytes you are storing, and can evict their data at any time") needed a cross-wheel-callable surface that the harness can exercise against the real wheel. v3.4.0 (#123) shipped the popularity×freshness sweeper (eviction by *demand*); #125 ships eviction by *identity*.
+
+**Two new `BlobStorage` trait methods**:
+
+```rust
+fn list_held_by(&self, attesting_key_id: &str)
+    -> impl Future<Output = Result<Vec<[u8; 32]>, BlobError>> + Send;
+
+fn evict_actor<'s>(
+    &'s self,
+    attesting_key_id: &'s str,
+    signer: &'s dyn ciris_keyring::HardwareSigner,
+    now: DateTime<Utc>,
+) -> impl Future<Output = Result<EvictActorReport, BlobError>> + Send + 's;
+```
+
+`list_held_by` is the inverse of `list_holders` — same TTL + withdraws-filter discipline (CEG §10.1.2), keyed on the attester instead of the SHA. `evict_actor` lookups the actor's live `holds_bytes:sha256:*` attestations, emits a `withdraws` per attestation (signed via the supplied `HardwareSigner` over the canonical envelope, same #121 `PythonJsonDumpsCanonicalizer` discipline), then deletes the blob row. Race-tolerant — concurrent puts during eviction may leave new rows untouched; caller re-invokes for strict completion. Documented in the trait + struct doc-comments.
+
+```rust
+pub struct EvictActorReport {
+    pub blobs_evicted: usize,
+    pub withdraws_emitted: usize,
+    pub withdraws_failed: usize,
+}
+```
+
+`withdraws_failed` for signer / FK / admission errors on the withdraws path; the blob deletion still proceeds (matches the v3.4.0 #123 fail-honest contract — orphan withdraws > missing withdraws).
+
+**Engine facade**: `Engine::list_held_by(actor)` + `Engine::evict_actor(actor, now)` — signer sourced internally from `engine.signer()`.
+
+**PyO3 mirrors**: `list_held_by_json(actor) -> str` (JSON-encoded `Vec<sha256_hex>`) + `evict_actor_json(actor, now_iso) -> str` (JSON-encoded `EvictActorReport`).
+
+**Shared helper**: new `emit_withdraws_attestation_helper` in `src/federation/blobs.rs` carrying the canonicalize + sign + put_attestation triple. The v3.4.0 sweeper's `Engine::emit_withdraws_attestation` was NOT migrated to use the helper in this cut (minimal-scope) — both paths produce byte-identical envelopes via the same canonicalizer + `withdraws_attestation_envelope` pair.
+
+### #126 — CEG §0.5/§0.6/§0.7 canonicalization rejection (opt-in)
+
+New module `src/verify/canonical_validation.rs`. Three normative rejection paths the harness can observe:
+
+- **§0.5 datetime**: `YYYY-MM-DDTHH:MM:SS.sssZ` — literal uppercase `Z` (no `+00:00`, no lowercase `z`), exactly 3 fractional digits.
+- **§0.6 hex**: lowercase, unpadded, byte-length-exact (when expected length given).
+- **§0.7 future skew**: `signed_at` more than **5 minutes** ahead of `now` → reject.
+
+```rust
+pub enum CanonicalizationError {
+    InvalidDatetime { value, reason },     // kind: canonicalization_timestamp
+    InvalidHex { value, reason },          // kind: canonicalization_hex
+    SignedAtInFuture { signed_at, skew_secs }, // kind: signed_at_in_future
+}
+
+pub const MAX_SIGNED_AT_FUTURE_SKEW: Duration = Duration::minutes(5);
+
+pub fn validate_canonical_datetime(s: &str) -> Result<(), CanonicalizationError>;
+pub fn validate_canonical_hex(s: &str, expected_byte_len: Option<usize>) -> Result<(), CanonicalizationError>;
+pub fn validate_signed_at_not_future(signed_at: &str, now: DateTime<Utc>, max_skew: Duration) -> Result<(), CanonicalizationError>;
+pub fn validate_envelope_canonical_form(envelope: &Value, now: DateTime<Utc>) -> Result<(), CanonicalizationError>;
+```
+
+**Wiring decision — opt-in, not inline with `canonicalize_envelope`**. The validator is a separate free function + PyO3 mirror; callers explicitly opt in by calling `validate_envelope_canonical_form` before / alongside canonicalization. Rationale (documented at `canonical_validation.rs:30-48`): lower risk for the minor cut, no existing-caller breakage, conformance harness opts in explicitly to observe rejection. Future strict paths (e.g., a v4.x canonicalize-with-validation) can compose the validator inside `canonicalize_envelope`; this cut keeps that as an additive future option.
+
+**Signature-field hex heuristic resolved**: §0.6's "hex MUST be lowercase" only applies when the value's char set looks hex-like (`[0-9a-fA-F]+`); base64 signatures with `=` / `+` / `/` bypass the rule. Pinned by `validate_envelope_canonical_form_skips_base64_signature` + `..._applies_hex_to_signature_when_shape_matches` tests.
+
+**PyO3 mirror**: `validate_envelope_canonical_form(envelope_json: str, now_iso: Optional[str]) -> None` — raises `ValueError` with the closed-set kind token on rejection.
+
+### Test coverage — 32 new
+
+- **#125 (10)**: `list_held_by_returns_actor_shas_{sqlite,pg}`, `list_held_by_filters_withdrawn_{sqlite,pg}`, `evict_actor_evicts_blobs_and_emits_withdraws_{sqlite,pg}`, `evict_actor_no_holdings_returns_zero_report_{sqlite,pg}`, `evict_actor_returns_correct_report_under_partial_failure_{sqlite,pg}`.
+- **#126 (22)**: all 10 brief-required (datetime form variants, hex form variants, future skew at 4/6min, envelope-walk) + 12 supplementary (nested walks, base64 signature skip, hex-shape signature path).
+
+**Full nextest single-threaded: 978 passed / 978 run.** Clippy clean on defaults AND full feature set.
+
+### Known issue surfaced — parallel-test isolation flake (filed as follow-up)
+
+The agent's diagnosis: `federation::emit::pg_revoke_trust_grant_populates_revocation_columns` and `federation::backfill::pg_backfill_mixed_and_idempotent` both use Ed25519 seed `0xA1` for the granter. `emit.rs::pg_cleanup` deletes `federation_trust_grants` by `tenant_id` but does NOT clean the shared `federation_keys` row; backfill's setup then attempts to delete the same row while emit's residue still references it. The 32 new tests shift scheduling enough to expose the race intermittently. **`--test-threads=1` is fully green; parallel only.** Tracked separately; not blocking 3.5.0.
+
+### Mission citations
+
+- §1.3 lowest-stateful-library — identity-aware storage is a substrate-level guarantee; conformance verifies it at the substrate, not at the consumer.
+- §1.5 parity — both backends parity (`MemoryBackend` has no `BlobStorage` impl, so `_{sqlite,pg}` naming is exhaustive).
+- §1.6 fail-honest — `evict_actor` returns a tallied `EvictActorReport` instead of swallowing partial failure; opt-in validation surfaces typed errors with stable kind tokens.
+
 ## [3.4.3] — 2026-05-29
 
 **CIRISPersist 3.4.3 — `ciris_persist.pyi` stub completion for blob / attestation / canonicalize / verify_hybrid surface (#124 / CIRISConformance CCS profile).**

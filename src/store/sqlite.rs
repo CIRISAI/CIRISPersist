@@ -3302,6 +3302,204 @@ impl crate::federation::BlobStorage for SqliteBackend {
         .map_err(|e| crate::federation::BlobError::Backend(format!("spawn_blocking join: {e}")))?
         .map_err(|e| crate::federation::BlobError::Backend(format!("list_holders: {e}")))
     }
+
+    async fn list_held_by(
+        &self,
+        attesting_key_id: &str,
+    ) -> Result<Vec<[u8; 32]>, crate::federation::BlobError> {
+        // v3.5.0 (CIRISPersist#125) — inverse of list_holders:
+        //   "whose bytes do I hold for actor X?"
+        //
+        // 1. Pull every holds_bytes:sha256:* row authored by
+        //    `attesting_key_id`. The attestation_type prefix narrows
+        //    well below O(table).
+        // 2. For each, parse the full hex SHA out of the envelope's
+        //    `evidence_refs[0]` and decode to [u8; 32]. Skip rows that
+        //    don't have the expected shape (corrupt envelopes — same
+        //    defense-in-depth as list_holders).
+        // 3. Apply DEFAULT_HOLDS_BYTES_TTL freshness (rows whose
+        //    asserted_at + TTL <= now are stale; drop them).
+        // 4. Drop rows whose attester has emitted a `withdraws`
+        //    against the holds_bytes row's attestation_id (CEG §10.1.2
+        //    ContentMiss feedback loop).
+        let prefix = crate::federation::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX;
+        let now = chrono::Utc::now();
+        let ttl = chrono::Duration::from_std(crate::federation::blobs::DEFAULT_HOLDS_BYTES_TTL)
+            .expect("DEFAULT_HOLDS_BYTES_TTL fits chrono::Duration");
+        let actor = attesting_key_id.to_owned();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<[u8; 32]>, rusqlite::Error> {
+            let conn = conn.blocking_lock();
+            let like_pattern = format!("{prefix}%");
+            let mut stmt = conn.prepare(
+                "SELECT attestation_id, attestation_envelope, asserted_at \
+                 FROM federation_attestations \
+                 WHERE attesting_key_id = ?1 AND attestation_type LIKE ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![&actor, &like_pattern], |row| {
+                let attestation_id: String = row.get("attestation_id")?;
+                let env_text: String = row.get("attestation_envelope")?;
+                let asserted_at: String = row.get("asserted_at")?;
+                Ok((attestation_id, env_text, asserted_at))
+            })?;
+            let candidates: Vec<(String, String, String)> = rows.collect::<Result<_, _>>()?;
+            drop(stmt);
+
+            let mut out: Vec<[u8; 32]> = Vec::new();
+            let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+            for (attestation_id, env_text, asserted_at_str) in candidates {
+                let env: serde_json::Value = match serde_json::from_str(&env_text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                // Pull the full hex SHA from evidence_refs[0].
+                let sha_hex = match env
+                    .get("evidence_refs")
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|v| v.as_str())
+                {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let mut sha = [0u8; 32];
+                if hex::decode_to_slice(sha_hex, &mut sha).is_err() {
+                    continue;
+                }
+                // TTL freshness.
+                let asserted_at = match chrono::DateTime::parse_from_rfc3339(&asserted_at_str) {
+                    Ok(t) => t.with_timezone(&chrono::Utc),
+                    Err(_) => continue,
+                };
+                if asserted_at + ttl <= now {
+                    continue;
+                }
+                // ContentMiss withdraws filter.
+                let mut withdraws_stmt = conn.prepare(
+                    "SELECT attestation_envelope FROM federation_attestations \
+                     WHERE attestation_type = ?1 AND attesting_key_id = ?2",
+                )?;
+                let withdraws_rows = withdraws_stmt.query_map(
+                    rusqlite::params![
+                        crate::federation::types::attestation_type::WITHDRAWS,
+                        &actor
+                    ],
+                    |r| r.get::<_, String>("attestation_envelope"),
+                )?;
+                let mut withdrawn = false;
+                for w in withdraws_rows {
+                    let w_text = w?;
+                    let w_env: serde_json::Value = match serde_json::from_str(&w_text) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    if crate::federation::precedence::references_attestation_id_from_envelope(
+                        &w_env,
+                    ) == Some(attestation_id.as_str())
+                    {
+                        withdrawn = true;
+                        break;
+                    }
+                }
+                if withdrawn {
+                    continue;
+                }
+                if seen.insert(sha) {
+                    out.push(sha);
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| crate::federation::BlobError::Backend(format!("list_held_by: {e}")))
+    }
+
+    async fn evict_actor(
+        &self,
+        attesting_key_id: &str,
+        signer: &dyn ciris_keyring::HardwareSigner,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::federation::EvictActorReport, crate::federation::BlobError> {
+        // v3.5.0 (CIRISPersist#125) — per-actor eviction.
+        //
+        // 1. Pull the actor's live holds_bytes attestations via
+        //    FederationDirectory::list_attestations_by + a holds_bytes
+        //    type-prefix filter.
+        // 2. For each: emit a withdraws via the shared helper, then
+        //    delete the corresponding federation_blobs row. The blob
+        //    deletion proceeds regardless of withdraws outcome —
+        //    orphan withdraws > missing withdraws. Tally per
+        //    EvictActorReport.
+        use crate::federation::FederationDirectory;
+
+        let all = self
+            .list_attestations_by(attesting_key_id)
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!(
+                    "evict_actor: list_attestations_by failed: {e}"
+                ))
+            })?;
+
+        // Filter to holds_bytes:* attestations only.
+        let prefix = crate::federation::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX;
+        let holds_bytes_rows: Vec<crate::federation::Attestation> = all
+            .into_iter()
+            .filter(|a| a.attestation_type.starts_with(prefix))
+            .collect();
+
+        let mut report = crate::federation::EvictActorReport::default();
+        for prior in holds_bytes_rows {
+            // Recover the SHA from evidence_refs[0]; skip if shape's wrong.
+            let sha_hex = prior
+                .attestation_envelope
+                .get("evidence_refs")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            let sha = match sha_hex {
+                Some(hex_str) => {
+                    let mut s = [0u8; 32];
+                    if hex::decode_to_slice(&hex_str, &mut s).is_err() {
+                        continue;
+                    }
+                    s
+                }
+                None => continue,
+            };
+
+            // Emit the withdraws (fail-honest: still delete the blob).
+            let withdraws_outcome = crate::federation::blobs::emit_withdraws_attestation_helper(
+                &prior,
+                attesting_key_id,
+                signer,
+                self,
+                now,
+            )
+            .await;
+
+            // Delete the blob row.
+            let deleted = self.delete_blob(&sha).await?;
+            if deleted {
+                report.blobs_evicted += 1;
+            }
+            match withdraws_outcome {
+                Ok(()) => report.withdraws_emitted += 1,
+                Err(e) => {
+                    report.withdraws_failed += 1;
+                    tracing::warn!(
+                        error = %e,
+                        actor = %attesting_key_id,
+                        sha256_prefix = &hex::encode(sha)[..16],
+                        "ciris-persist v3.5.0 evict_actor: withdraws emission failed"
+                    );
+                }
+            }
+        }
+        Ok(report)
+    }
 }
 
 // ─── Eviction sweeper helpers (v3.4.0, CIRISPersist#123) ───────────
@@ -9559,6 +9757,255 @@ mod tests {
         assert!(
             holders.is_empty(),
             "expected withdrawn holder to be filtered, got {holders:?}"
+        );
+    }
+
+    // ─── v3.5.0 (CIRISPersist#125) — list_held_by + evict_actor ────
+
+    /// A signer that always errors on `sign()` — used to exercise
+    /// `evict_actor`'s `withdraws_failed` path. Every other
+    /// `HardwareSigner` method delegates to a real signer so the FK
+    /// shape stays intact.
+    struct AlwaysFailingSigner {
+        inner: std::sync::Arc<crate::signing::LocalSignerHardwareAdapter>,
+    }
+
+    #[async_trait::async_trait]
+    impl ciris_keyring::HardwareSigner for AlwaysFailingSigner {
+        fn algorithm(&self) -> ciris_keyring::ClassicalAlgorithm {
+            self.inner.algorithm()
+        }
+        fn hardware_type(&self) -> ciris_keyring::HardwareType {
+            self.inner.hardware_type()
+        }
+        async fn public_key(&self) -> Result<Vec<u8>, ciris_keyring::KeyringError> {
+            self.inner.public_key().await
+        }
+        async fn sign(&self, _data: &[u8]) -> Result<Vec<u8>, ciris_keyring::KeyringError> {
+            Err(ciris_keyring::KeyringError::SigningFailed {
+                reason: "test signer always fails".into(),
+            })
+        }
+        async fn attestation(
+            &self,
+        ) -> Result<ciris_keyring::PlatformAttestation, ciris_keyring::KeyringError> {
+            self.inner.attestation().await
+        }
+        async fn generate_key(
+            &self,
+            cfg: &ciris_keyring::KeyGenConfig,
+        ) -> Result<(), ciris_keyring::KeyringError> {
+            self.inner.generate_key(cfg).await
+        }
+        async fn key_exists(&self, alias: &str) -> Result<bool, ciris_keyring::KeyringError> {
+            self.inner.key_exists(alias).await
+        }
+        async fn delete_key(&self, alias: &str) -> Result<(), ciris_keyring::KeyringError> {
+            self.inner.delete_key(alias).await
+        }
+        fn current_alias(&self) -> &str {
+            self.inner.current_alias()
+        }
+        fn storage_descriptor(&self) -> ciris_keyring::StorageDescriptor {
+            self.inner.storage_descriptor()
+        }
+        async fn attestation_with_nonce(
+            &self,
+            nonce: Option<&[u8]>,
+        ) -> Result<ciris_keyring::PlatformAttestation, ciris_keyring::KeyringError> {
+            self.inner.attestation_with_nonce(nonce).await
+        }
+    }
+
+    fn test_signer_for(alias: &str) -> std::sync::Arc<crate::signing::LocalSignerHardwareAdapter> {
+        use crate::signing::{LocalSigner, LocalSignerHardwareAdapter};
+        use ed25519_dalek::SigningKey;
+        let signing_key = SigningKey::from_bytes(&[0x42; 32]);
+        let local = std::sync::Arc::new(LocalSigner::from_parts(
+            signing_key,
+            alias.to_owned(),
+            None,
+            None,
+        ));
+        std::sync::Arc::new(LocalSignerHardwareAdapter::new(local))
+    }
+
+    async fn evict_test_backend_with_actors(actors: &[&str]) -> SqliteBackend {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for actor in actors {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(actor, actor, actor),
+                })
+                .await
+                .unwrap();
+        }
+        backend
+    }
+
+    /// Seed `n` blobs from `actor`. Each blob has a unique payload so
+    /// the SHAs differ. Returns the SHAs in insert order.
+    async fn seed_blobs(
+        backend: &SqliteBackend,
+        actor: &str,
+        signer: &dyn ciris_keyring::HardwareSigner,
+        n: usize,
+        tag: &str,
+    ) -> Vec<[u8; 32]> {
+        use crate::federation::{BlobBody, BlobStorage};
+        let mut shas = Vec::with_capacity(n);
+        for i in 0..n {
+            let bytes = format!("{actor}-{tag}-{i}").into_bytes();
+            let sha = sha256_of(&bytes);
+            backend
+                .put_blob_signing(
+                    &sha,
+                    BlobBody::Inline(bytes),
+                    None,
+                    actor,
+                    signer,
+                    chrono::Utc::now(),
+                    uuid::Uuid::new_v4(),
+                )
+                .await
+                .unwrap();
+            shas.push(sha);
+        }
+        shas
+    }
+
+    #[tokio::test]
+    async fn list_held_by_returns_actor_shas_sqlite() {
+        let backend = evict_test_backend_with_actors(&["actor-a", "actor-b"]).await;
+        let signer = test_signer_for("actor-a");
+        let signer_b = test_signer_for("actor-b");
+        let shas_a = seed_blobs(&backend, "actor-a", &*signer, 3, "main").await;
+        let shas_b = seed_blobs(&backend, "actor-b", &*signer_b, 2, "main").await;
+
+        use crate::federation::BlobStorage;
+        let mut held_a = backend.list_held_by("actor-a").await.unwrap();
+        held_a.sort();
+        let mut expected_a = shas_a.clone();
+        expected_a.sort();
+        assert_eq!(held_a, expected_a, "A's holdings");
+
+        let mut held_b = backend.list_held_by("actor-b").await.unwrap();
+        held_b.sort();
+        let mut expected_b = shas_b.clone();
+        expected_b.sort();
+        assert_eq!(held_b, expected_b, "B's holdings");
+    }
+
+    #[tokio::test]
+    async fn list_held_by_filters_withdrawn_sqlite() {
+        // Seed one blob from actor-a, emit `withdraws` against the
+        // holds_bytes attestation, assert list_held_by(A) excludes it.
+        let backend = evict_test_backend_with_actors(&["actor-a"]).await;
+        let signer = test_signer_for("actor-a");
+        let shas = seed_blobs(&backend, "actor-a", &*signer, 1, "withdrawn").await;
+
+        // Look up the holds_bytes attestation_id we just emitted.
+        use crate::federation::FederationDirectory;
+        let atts = backend.list_attestations_by("actor-a").await.unwrap();
+        let holds_bytes = atts
+            .into_iter()
+            .find(|a| {
+                a.attestation_type
+                    .starts_with(crate::federation::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX)
+            })
+            .expect("holds_bytes from actor-a");
+        let withdraws = structural_composer_attestation(
+            &uuid::Uuid::new_v4().to_string(),
+            "actor-a",
+            crate::federation::types::attestation_type::WITHDRAWS,
+            &holds_bytes.attestation_id,
+            "2026-05-27T00:00:00Z",
+        );
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: withdraws,
+            })
+            .await
+            .unwrap();
+
+        use crate::federation::BlobStorage;
+        let held = backend.list_held_by("actor-a").await.unwrap();
+        assert!(
+            !held.contains(&shas[0]),
+            "withdrawn blob must be excluded, got {held:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn evict_actor_evicts_blobs_and_emits_withdraws_sqlite() {
+        let backend = evict_test_backend_with_actors(&["actor-a", "actor-b"]).await;
+        let signer_a = test_signer_for("actor-a");
+        let signer_b = test_signer_for("actor-b");
+        let shas_a = seed_blobs(&backend, "actor-a", &*signer_a, 3, "evict").await;
+        let shas_b = seed_blobs(&backend, "actor-b", &*signer_b, 2, "evict").await;
+
+        use crate::federation::BlobStorage;
+        let report = backend
+            .evict_actor("actor-a", &*signer_a, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(report.blobs_evicted, 3, "A's 3 blobs evicted");
+        assert_eq!(report.withdraws_emitted, 3, "3 withdraws emitted");
+        assert_eq!(report.withdraws_failed, 0, "no failures");
+
+        // A's blobs gone.
+        for sha in &shas_a {
+            assert!(
+                !backend.has_blob(sha).await.unwrap(),
+                "A's blob {sha:?} should be gone"
+            );
+        }
+        // B's blobs intact.
+        for sha in &shas_b {
+            assert!(
+                backend.has_blob(sha).await.unwrap(),
+                "B's blob {sha:?} must remain"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn evict_actor_no_holdings_returns_zero_report_sqlite() {
+        let backend = evict_test_backend_with_actors(&["actor-a"]).await;
+        let signer = test_signer_for("actor-a");
+
+        use crate::federation::BlobStorage;
+        let report = backend
+            .evict_actor("actor-a", &*signer, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(report, crate::federation::EvictActorReport::default());
+    }
+
+    #[tokio::test]
+    async fn evict_actor_returns_correct_report_under_partial_failure_sqlite() {
+        // Seed 1 blob; use a signer that fails sign() so the
+        // withdraws emission fails. The blob row MUST still be
+        // evicted — fail-honest contract.
+        let backend = evict_test_backend_with_actors(&["actor-a"]).await;
+        let real_signer = test_signer_for("actor-a");
+        let shas = seed_blobs(&backend, "actor-a", &*real_signer, 1, "partial").await;
+
+        let failing = AlwaysFailingSigner {
+            inner: real_signer.clone(),
+        };
+        use crate::federation::BlobStorage;
+        let report = backend
+            .evict_actor("actor-a", &failing, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(report.blobs_evicted, 1, "blob still evicted");
+        assert_eq!(report.withdraws_emitted, 0, "no withdraws emitted");
+        assert_eq!(report.withdraws_failed, 1, "1 withdraws failed");
+        assert!(
+            !backend.has_blob(&shas[0]).await.unwrap(),
+            "blob row deletion proceeds despite withdraws failure"
         );
     }
 

@@ -11,11 +11,16 @@
 //! Phase 2) are next.
 
 pub mod canonical;
+pub mod canonical_validation;
 pub mod ed25519;
 pub mod hybrid;
 
 pub use canonical::{
     body_sha256, canonicalize_envelope_for_signing, Canonicalizer, PythonJsonDumpsCanonicalizer,
+};
+pub use canonical_validation::{
+    validate_canonical_datetime, validate_canonical_hex, validate_envelope_canonical_form,
+    validate_signed_at_not_future, CanonicalizationError, MAX_SIGNED_AT_FUTURE_SKEW,
 };
 pub use ed25519::{
     canonical_payload_value, verify_trace, verify_trace_via_directory, PublicKeyDirectory,

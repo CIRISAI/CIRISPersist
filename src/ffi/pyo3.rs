@@ -1876,6 +1876,56 @@ impl PyEngine {
         })
     }
 
+    /// v3.5.0 (CIRISPersist#126) — opt-in CEG §0.5/§0.6/§0.7
+    /// validation. Walks `envelope_json` and rejects:
+    ///
+    /// - §0.5: timestamps not in `YYYY-MM-DDTHH:MM:SS.sssZ` shape
+    ///   (uppercase `Z`, exactly 3 fractional digits, no offset).
+    /// - §0.6: hex fields with uppercase digits or wrong byte length.
+    /// - §0.7: `signed_at` more than 5 minutes ahead of `now`.
+    ///
+    /// `now_iso` is caller-supplied (RFC3339); `None` → `Utc::now()`.
+    /// Caller-supplied for deterministic tests + replay.
+    ///
+    /// Raises `ValueError` on rejection — the message contains the
+    /// stable `kind` token (`canonicalization_timestamp`,
+    /// `canonicalization_hex`, `signed_at_in_future`) so the
+    /// CIRISConformance harness can observe which §-rule fired.
+    ///
+    /// This is **additive**: `canonicalize_envelope` does NOT invoke
+    /// validation. Callers that need CEG enforcement opt in via this
+    /// method before signing / verifying. See the
+    /// `verify::canonical_validation` module docs for the
+    /// opt-in-vs-in-canonicalize decision rationale.
+    #[pyo3(signature = (envelope_json, now_iso = None))]
+    fn validate_envelope_canonical_form(
+        &self,
+        envelope_json: &str,
+        now_iso: Option<&str>,
+    ) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let value: serde_json::Value = serde_json::from_str(envelope_json)
+                .map_err(|e| PyValueError::new_err(format!("envelope JSON decode: {e}")))?;
+            let now = match now_iso {
+                Some(s) => chrono::DateTime::parse_from_rfc3339(s)
+                    .map_err(|e| {
+                        PyValueError::new_err(format!(
+                            "validate_envelope_canonical_form now_iso parse: {e}"
+                        ))
+                    })?
+                    .with_timezone(&chrono::Utc),
+                None => chrono::Utc::now(),
+            };
+            crate::verify::validate_envelope_canonical_form(&value, now).map_err(|e| {
+                // Embed the stable kind token in the message so the
+                // CIRISConformance harness can string-match without
+                // depending on the Rust enum surface.
+                PyValueError::new_err(format!("{}: {}", e.kind(), e))
+            })
+        })
+    }
+
     /// v1.4.0 (CIRISPersist#51) — Return the local-process Ed25519
     /// public key (base64) for publishing to consumers (registry
     /// pinning, federation_keys.pubkey_ed25519_base64). Distinct from
@@ -4089,6 +4139,106 @@ impl PyEngine {
                         let holders = backend.list_holders(&sha).await.map_err(blob_err_to_py)?;
                         serde_json::to_string(&holders).map_err(|e| {
                             PyRuntimeError::new_err(format!("list_holders JSON encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v3.5.0 (CIRISPersist#125) — Federation blob storage: "whose
+    /// bytes do I hold for actor X?". Returns a JSON array of hex
+    /// SHA-256 strings (64-char each, lowercase, unpadded — matches
+    /// `list_holders_json`'s SHA serialization across the surface).
+    ///
+    /// Inverse of `list_holders_json`. The harness uses this to verify
+    /// the FEDERATION_SCALING_MODEL §9 identity-aware-storage property:
+    /// every actor's bytes-on-this-Engine are addressable for read,
+    /// and (via `evict_actor_json`) for eviction.
+    fn list_held_by_json(&self, py: Python<'_>, attesting_key_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let actor = attesting_key_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        let held = backend.list_held_by(&actor).await.map_err(blob_err_to_py)?;
+                        let hex_held: Vec<String> = held.iter().map(hex::encode).collect();
+                        serde_json::to_string(&hex_held).map_err(|e| {
+                            PyRuntimeError::new_err(format!("list_held_by JSON encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        let held = backend.list_held_by(&actor).await.map_err(blob_err_to_py)?;
+                        let hex_held: Vec<String> = held.iter().map(hex::encode).collect();
+                        serde_json::to_string(&hex_held).map_err(|e| {
+                            PyRuntimeError::new_err(format!("list_held_by JSON encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v3.5.0 (CIRISPersist#125) — Federation blob storage: per-actor
+    /// eviction. Deletes every `federation_blobs` row this Engine
+    /// holds for `attesting_key_id`, AND emits a `withdraws`
+    /// attestation against each of the actor's `holds_bytes`
+    /// attestations (CEG §10.1.2). Returns a JSON-encoded
+    /// [`crate::federation::EvictActorReport`].
+    ///
+    /// The signer is sourced internally from the Engine's composed
+    /// `Arc<dyn HardwareSigner>` (matches `put_blob_signing`'s
+    /// cohabitation pattern — signer not threaded through PyO3 args).
+    /// `now_iso` is caller-supplied (RFC3339) for pinned-time tests
+    /// and replay; normal callers pass `datetime.now(UTC).isoformat()`.
+    fn evict_actor_json(
+        &self,
+        py: Python<'_>,
+        attesting_key_id: &str,
+        now_iso: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let actor = attesting_key_id.to_owned();
+            let now = chrono::DateTime::parse_from_rfc3339(now_iso)
+                .map_err(|e| PyValueError::new_err(format!("evict_actor now_iso parse: {e}")))?
+                .with_timezone(&chrono::Utc);
+            let signer = self.signer.clone();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        let report = backend
+                            .evict_actor(&actor, &*signer, now)
+                            .await
+                            .map_err(blob_err_to_py)?;
+                        serde_json::to_string(&report).map_err(|e| {
+                            PyRuntimeError::new_err(format!("evict_actor JSON encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        let report = backend
+                            .evict_actor(&actor, &*signer, now)
+                            .await
+                            .map_err(blob_err_to_py)?;
+                        serde_json::to_string(&report).map_err(|e| {
+                            PyRuntimeError::new_err(format!("evict_actor JSON encode: {e}"))
                         })
                     })
                 }

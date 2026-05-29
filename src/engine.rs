@@ -1023,6 +1023,59 @@ impl Engine {
         }
     }
 
+    /// v3.5.0 (CIRISPersist#125) — Engine-facade for
+    /// [`BlobStorage::list_held_by`](crate::federation::BlobStorage::list_held_by).
+    /// Returns the full SHA-256 of every blob this Engine has a
+    /// currently-live `holds_bytes:sha256:*` attestation for from
+    /// `attesting_key_id` — the inverse of
+    /// [`list_holders`](crate::federation::BlobStorage::list_holders).
+    ///
+    /// See the trait method's doc-comment for the filter discipline
+    /// (TTL window, withdraws filter, full-SHA recovery from the
+    /// envelope's `evidence_refs`).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn list_held_by(
+        &self,
+        attesting_key_id: &str,
+    ) -> Result<Vec<[u8; 32]>, crate::federation::BlobError> {
+        use crate::federation::BlobStorage;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => arc.list_held_by(attesting_key_id).await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => arc.list_held_by(attesting_key_id).await,
+        }
+    }
+
+    /// v3.5.0 (CIRISPersist#125) — Engine-facade for
+    /// [`BlobStorage::evict_actor`](crate::federation::BlobStorage::evict_actor).
+    /// Sources the signer from `self.signer()` and delegates to the
+    /// backend's trait impl.
+    ///
+    /// See the trait method's doc-comment for the fail-honest contract
+    /// and race-tolerance posture; see
+    /// [`crate::federation::EvictActorReport`] for the return shape.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn evict_actor(
+        &self,
+        attesting_key_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::federation::EvictActorReport, crate::federation::BlobError> {
+        use crate::federation::BlobStorage;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                arc.evict_actor(attesting_key_id, &**self.signer(), now)
+                    .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                arc.evict_actor(attesting_key_id, &**self.signer(), now)
+                    .await
+            }
+        }
+    }
+
     /// v1.11.0 (CIRISPersist#90) — borrow a per-backend
     /// [`NodeCoreService`](crate::cirisnode::NodeCoreService) handle
     /// wrapping the Engine's underlying backend Arc.

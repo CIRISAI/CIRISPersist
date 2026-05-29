@@ -377,6 +377,101 @@ pub trait BlobStorage: Send + Sync {
         &self,
         sha256: &[u8; 32],
     ) -> impl Future<Output = Result<Vec<String>, BlobError>> + Send;
+
+    /// v3.5.0 (CIRISPersist#125) — the **inverse** of
+    /// [`list_holders`](BlobStorage::list_holders): "whose bytes do I
+    /// hold for actor X?". Returns the full SHA-256 of every blob this
+    /// Engine has a currently-live `holds_bytes:sha256:*` attestation
+    /// for from `attesting_key_id`.
+    ///
+    /// # Filter discipline (matches `list_holders`)
+    ///
+    /// 1. WHERE `attestation_type` starts with the
+    ///    [`HOLDS_BYTES_ATTESTATION_TYPE_PREFIX`].
+    /// 2. AND `attesting_key_id` equals the caller-supplied actor.
+    /// 3. AND the [`DEFAULT_HOLDS_BYTES_TTL`] freshness window has not
+    ///    lapsed (rows whose `asserted_at + TTL <= now` are stale and
+    ///    excluded — CEG §10.1.2 freshness window).
+    /// 4. AND the attester has not emitted a `withdraws` against the
+    ///    holds_bytes row's `attestation_id` (CEG §10.1.2 ContentMiss
+    ///    feedback loop).
+    ///
+    /// # FEDERATION_SCALING_MODEL §9 — identity-aware-storage
+    ///
+    /// The scaling model rests on the property "you know whose data
+    /// you are storing, and can evict their data at any time." This
+    /// method is the "whose bytes?" half of the proof: every actor's
+    /// holdings on this Engine are addressable.
+    ///
+    /// Returns an empty `Vec` when the actor has no live holdings.
+    fn list_held_by(
+        &self,
+        attesting_key_id: &str,
+    ) -> impl Future<Output = Result<Vec<[u8; 32]>, BlobError>> + Send;
+
+    /// v3.5.0 (CIRISPersist#125) — per-actor eviction. Delete every
+    /// `federation_blobs` row this Engine holds for `attesting_key_id`,
+    /// AND emit a `withdraws` structural composer against each of the
+    /// actor's `holds_bytes` attestations (CEG §10.1.2).
+    ///
+    /// # Mechanics
+    ///
+    /// 1. Resolve the actor's live holdings via [`list_held_by`].
+    /// 2. For each holding's `holds_bytes` attestation: emit a
+    ///    `withdraws` attestation (signed by `signer`, canonicalized
+    ///    via [`crate::verify::canonical::PythonJsonDumpsCanonicalizer`]
+    ///    — the same #121 discipline the sweeper follows).
+    /// 3. Delete the corresponding `federation_blobs` row keyed on the
+    ///    SHA the `holds_bytes` referenced.
+    ///
+    /// # Fail-honest contract
+    ///
+    /// The blob deletion proceeds even if the withdraws emission
+    /// fails — orphan withdraws is worse than a missing withdraws (the
+    /// same posture the v3.4.0 sweeper takes; CIRISPersist#123).
+    /// `withdraws_failed` counts the signer/FK failures so the caller
+    /// can detect the partial-failure path.
+    ///
+    /// # Race tolerance
+    ///
+    /// Concurrent `put_blob` calls during eviction may leave newly
+    /// written rows untouched (the actor's holdings were captured at
+    /// step 1). Callers requiring strict completion re-invoke until
+    /// the report shows zero blobs evicted.
+    ///
+    /// Returns an [`EvictActorReport`] tallying the work done.
+    fn evict_actor<'s>(
+        &'s self,
+        attesting_key_id: &'s str,
+        signer: &'s dyn ciris_keyring::HardwareSigner,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> impl Future<Output = Result<EvictActorReport, BlobError>> + Send + 's;
+}
+
+/// v3.5.0 (CIRISPersist#125) — outcome of
+/// [`BlobStorage::evict_actor`].
+///
+/// Per the trait's fail-honest contract: `blobs_evicted` counts rows
+/// actually deleted from `federation_blobs`; `withdraws_emitted` and
+/// `withdraws_failed` count the per-row `withdraws` attestation
+/// outcomes independently. `withdraws_emitted + withdraws_failed`
+/// equals the number of `holds_bytes` rows targeted for withdrawal.
+/// `blobs_evicted` can exceed both because a holds_bytes row whose
+/// blob is already gone still counts as no-op on the delete side; in
+/// practice for this method the two numbers are tied by construction
+/// (every targeted holdings entry is deleted), so the report's
+/// invariant is `blobs_evicted == withdraws_emitted + withdraws_failed`
+/// when no concurrent deletions race with the call.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvictActorReport {
+    /// Number of `federation_blobs` rows actually deleted by this call.
+    pub blobs_evicted: usize,
+    /// Number of `withdraws` attestations successfully signed + stored.
+    pub withdraws_emitted: usize,
+    /// Number of `withdraws` emissions that failed (signer error, FK
+    /// violation, etc.). The corresponding blob row was STILL deleted
+    /// — orphan withdraws is worse than a missing withdraws.
+    pub withdraws_failed: usize,
 }
 
 /// Caller-supplied envelope for the holder attestation emitted by
@@ -512,6 +607,93 @@ pub fn holds_bytes_attestation_envelope(sha256: &[u8; 32]) -> serde_json::Value 
         "kind": "holds_bytes",
         "evidence_refs": [hex::encode(sha256)],
     })
+}
+
+/// v3.5.0 (CIRISPersist#125) — extract the canonical
+/// withdraws-emission triple (build envelope → canonicalize via
+/// production canonicalizer → sign → put_attestation) into a single
+/// shared helper. Used by [`BlobStorage::evict_actor`] across both
+/// backends, and intended for reuse by future surfaces that need to
+/// emit a `withdraws` attestation against a prior `holds_bytes`.
+///
+/// # Inputs
+///
+/// - `prior` — the holds_bytes attestation being withdrawn. Its
+///   `attestation_id` + `attestation_type` are recorded on the
+///   withdraws envelope so consumers can walk the structural-composer
+///   reference back to the row being retracted.
+/// - `signer_key_id` — the key emitting the withdraws (acts as both
+///   `attesting_key_id` and `attested_key_id` on the row; see the
+///   note at the v3.4.0 `emit_withdraws_attestation` site for the
+///   self-attestation FK rationale).
+/// - `signer` — `&dyn HardwareSigner` produces the
+///   `scrub_signature_classical` over the canonical envelope bytes.
+/// - `directory` — concrete backend that owns
+///   `federation_attestations`. `&dyn FederationDirectory` keeps the
+///   helper backend-agnostic.
+/// - `now` — caller-supplied so deterministic tests + replay paths
+///   pin the timestamp.
+///
+/// # Errors
+///
+/// Returns [`BlobError::Backend`] for canonicalize / sign /
+/// put_attestation failures. The caller is responsible for tallying
+/// the outcome (the v3.4.0 sweeper + v3.5.0 evict_actor both delete
+/// the corresponding blob even when this helper fails — the
+/// fail-honest contract documented on
+/// [`BlobStorage::evict_actor`]).
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) async fn emit_withdraws_attestation_helper(
+    prior: &crate::federation::Attestation,
+    signer_key_id: &str,
+    signer: &dyn ciris_keyring::HardwareSigner,
+    directory: &dyn crate::federation::FederationDirectory,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), BlobError> {
+    use crate::verify::canonical::{Canonicalizer, PythonJsonDumpsCanonicalizer};
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+
+    let envelope = crate::federation::withdraws_attestation_envelope(
+        &prior.attestation_id,
+        &prior.attestation_type,
+    );
+    let canonical_bytes = PythonJsonDumpsCanonicalizer
+        .canonicalize_value(&envelope)
+        .map_err(|e| BlobError::Backend(format!("withdraws canonicalize: {e}")))?;
+    let original_content_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    let sig_bytes = signer
+        .sign(&canonical_bytes)
+        .await
+        .map_err(|e| BlobError::Backend(format!("withdraws sign: {e}")))?;
+    let scrub_signature_classical = B64.encode(&sig_bytes);
+
+    let row = crate::federation::Attestation {
+        attestation_id: uuid::Uuid::new_v4().to_string(),
+        attesting_key_id: signer_key_id.to_owned(),
+        // The withdraws row's FK target is `signer_key_id`: the host
+        // attests it itself no longer holds the bytes. Matches the
+        // v3.4.0 sweeper convention (`engine.rs::emit_withdraws_attestation`).
+        attested_key_id: signer_key_id.to_owned(),
+        attestation_type: crate::federation::types::attestation_type::WITHDRAWS.to_owned(),
+        weight: None,
+        asserted_at: now,
+        expires_at: None,
+        attestation_envelope: envelope,
+        original_content_hash,
+        scrub_signature_classical,
+        scrub_signature_pqc: None,
+        scrub_key_id: signer_key_id.to_owned(),
+        scrub_timestamp: now,
+        pqc_completed_at: None,
+        persist_row_hash: String::new(),
+    };
+
+    directory
+        .put_attestation(crate::federation::SignedAttestation { attestation: row })
+        .await
+        .map_err(|e| BlobError::Backend(format!("withdraws put_attestation: {e}")))
 }
 
 /// v2.3 (CIRISPersist#103) — verify a `[u8; 32]` SHA-256 against an

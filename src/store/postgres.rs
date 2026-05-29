@@ -3375,6 +3375,155 @@ impl crate::federation::BlobStorage for PostgresBackend {
         }
         Ok(holders)
     }
+
+    async fn list_held_by(
+        &self,
+        attesting_key_id: &str,
+    ) -> Result<Vec<[u8; 32]>, crate::federation::BlobError> {
+        // v3.5.0 (CIRISPersist#125) — inverse of list_holders.
+        //
+        // Same four-clause filter discipline as list_holders, but
+        // pivoted on `attesting_key_id` instead of `attestation_type`
+        // (the prefix-match shifts to a LIKE).
+        let prefix = crate::federation::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX;
+        let now = chrono::Utc::now();
+        let ttl_seconds: i64 = i64::try_from(
+            crate::federation::blobs::DEFAULT_HOLDS_BYTES_TTL.as_secs(),
+        )
+        .map_err(|_| {
+            crate::federation::BlobError::Backend("DEFAULT_HOLDS_BYTES_TTL out of i64 range".into())
+        })?;
+        let cutoff = now - chrono::Duration::seconds(ttl_seconds);
+        let like_pattern = format!("{prefix}%");
+
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT attestation_id::text, attestation_envelope \
+                 FROM cirislens.federation_attestations \
+                 WHERE attesting_key_id = $1 \
+                   AND attestation_type LIKE $2 \
+                   AND asserted_at > $3 \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM cirislens.federation_attestations w \
+                     WHERE w.attestation_type = $4 \
+                       AND w.attesting_key_id = $1 \
+                       AND w.attestation_envelope->>'references_attestation_id' = \
+                           cirislens.federation_attestations.attestation_id::text \
+                   )",
+                &[
+                    &attesting_key_id,
+                    &like_pattern,
+                    &cutoff,
+                    &crate::federation::types::attestation_type::WITHDRAWS,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("list_held_by query: {e}"))
+            })?;
+
+        let mut out: Vec<[u8; 32]> = Vec::with_capacity(rows.len());
+        let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+        for row in rows {
+            let envelope: serde_json::Value = row.safe_get_with(
+                "attestation_envelope",
+                crate::federation::BlobError::Backend,
+            )?;
+            let sha_hex = envelope
+                .get("evidence_refs")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_str());
+            let Some(sha_hex) = sha_hex else { continue };
+            let mut sha = [0u8; 32];
+            if hex::decode_to_slice(sha_hex, &mut sha).is_err() {
+                continue;
+            }
+            if seen.insert(sha) {
+                out.push(sha);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn evict_actor(
+        &self,
+        attesting_key_id: &str,
+        signer: &dyn ciris_keyring::HardwareSigner,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::federation::EvictActorReport, crate::federation::BlobError> {
+        // v3.5.0 (CIRISPersist#125) — per-actor eviction. Same shape as
+        // the SQLite impl; backend asymmetry is in the row source, not
+        // the orchestration.
+        use crate::federation::FederationDirectory;
+
+        let all = self
+            .list_attestations_by(attesting_key_id)
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!(
+                    "evict_actor: list_attestations_by failed: {e}"
+                ))
+            })?;
+
+        let prefix = crate::federation::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX;
+        let holds_bytes_rows: Vec<crate::federation::Attestation> = all
+            .into_iter()
+            .filter(|a| a.attestation_type.starts_with(prefix))
+            .collect();
+
+        let mut report = crate::federation::EvictActorReport::default();
+        for prior in holds_bytes_rows {
+            let sha_hex = prior
+                .attestation_envelope
+                .get("evidence_refs")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            let sha = match sha_hex {
+                Some(hex_str) => {
+                    let mut s = [0u8; 32];
+                    if hex::decode_to_slice(&hex_str, &mut s).is_err() {
+                        continue;
+                    }
+                    s
+                }
+                None => continue,
+            };
+
+            let withdraws_outcome = crate::federation::blobs::emit_withdraws_attestation_helper(
+                &prior,
+                attesting_key_id,
+                signer,
+                self,
+                now,
+            )
+            .await;
+
+            let deleted = self.delete_blob(&sha).await?;
+            if deleted {
+                report.blobs_evicted += 1;
+            }
+            match withdraws_outcome {
+                Ok(()) => report.withdraws_emitted += 1,
+                Err(e) => {
+                    report.withdraws_failed += 1;
+                    tracing::warn!(
+                        error = %e,
+                        actor = %attesting_key_id,
+                        sha256_prefix = &hex::encode(sha)[..16],
+                        "ciris-persist v3.5.0 evict_actor: withdraws emission failed"
+                    );
+                }
+            }
+        }
+        Ok(report)
+    }
 }
 
 // ─── Eviction sweeper helpers (v3.4.0, CIRISPersist#123) ───────────
@@ -14918,5 +15067,314 @@ mod tests {
         for sha in &shas {
             let _ = pg.delete_blob(sha).await;
         }
+    }
+
+    // ─── v3.5.0 (CIRISPersist#125) — list_held_by + evict_actor ────
+
+    /// A signer whose `sign` always errors — exercises the
+    /// `evict_actor` `withdraws_failed` path. All other methods
+    /// delegate to a real adapter so PG schema FKs stay satisfied
+    /// (`current_alias` in particular).
+    struct PgAlwaysFailingSigner {
+        inner: std::sync::Arc<crate::signing::LocalSignerHardwareAdapter>,
+    }
+
+    #[async_trait::async_trait]
+    impl ciris_keyring::HardwareSigner for PgAlwaysFailingSigner {
+        fn algorithm(&self) -> ciris_keyring::ClassicalAlgorithm {
+            self.inner.algorithm()
+        }
+        fn hardware_type(&self) -> ciris_keyring::HardwareType {
+            self.inner.hardware_type()
+        }
+        async fn public_key(&self) -> Result<Vec<u8>, ciris_keyring::KeyringError> {
+            self.inner.public_key().await
+        }
+        async fn sign(&self, _data: &[u8]) -> Result<Vec<u8>, ciris_keyring::KeyringError> {
+            Err(ciris_keyring::KeyringError::SigningFailed {
+                reason: "pg test signer always fails".into(),
+            })
+        }
+        async fn attestation(
+            &self,
+        ) -> Result<ciris_keyring::PlatformAttestation, ciris_keyring::KeyringError> {
+            self.inner.attestation().await
+        }
+        async fn generate_key(
+            &self,
+            cfg: &ciris_keyring::KeyGenConfig,
+        ) -> Result<(), ciris_keyring::KeyringError> {
+            self.inner.generate_key(cfg).await
+        }
+        async fn key_exists(&self, alias: &str) -> Result<bool, ciris_keyring::KeyringError> {
+            self.inner.key_exists(alias).await
+        }
+        async fn delete_key(&self, alias: &str) -> Result<(), ciris_keyring::KeyringError> {
+            self.inner.delete_key(alias).await
+        }
+        fn current_alias(&self) -> &str {
+            self.inner.current_alias()
+        }
+        fn storage_descriptor(&self) -> ciris_keyring::StorageDescriptor {
+            self.inner.storage_descriptor()
+        }
+        async fn attestation_with_nonce(
+            &self,
+            nonce: Option<&[u8]>,
+        ) -> Result<ciris_keyring::PlatformAttestation, ciris_keyring::KeyringError> {
+            self.inner.attestation_with_nonce(nonce).await
+        }
+    }
+
+    fn pg_test_signer_for(
+        alias: &str,
+    ) -> std::sync::Arc<crate::signing::LocalSignerHardwareAdapter> {
+        use crate::signing::{LocalSigner, LocalSignerHardwareAdapter};
+        use ed25519_dalek::SigningKey;
+        // Deterministic per-alias seed so signers across tests don't
+        // collide on a shared DB.
+        let mut seed = [0u8; 32];
+        for (i, b) in alias.as_bytes().iter().enumerate() {
+            seed[i % 32] ^= *b;
+        }
+        let signing_key = SigningKey::from_bytes(&seed);
+        let local = std::sync::Arc::new(LocalSigner::from_parts(
+            signing_key,
+            alias.to_owned(),
+            None,
+            None,
+        ));
+        std::sync::Arc::new(LocalSignerHardwareAdapter::new(local))
+    }
+
+    /// Seed `n` blobs from `actor` via the trait `put_blob_signing`
+    /// path; each payload is uniquified with `uuid_like()` so PG SHAs
+    /// don't collide across concurrent tests on the shared DB.
+    async fn pg_seed_blobs_for_actor(
+        backend: &PostgresBackend,
+        actor: &str,
+        signer: &dyn ciris_keyring::HardwareSigner,
+        n: usize,
+        tag: &str,
+    ) -> Vec<[u8; 32]> {
+        use crate::federation::{BlobBody, BlobStorage};
+        let mut shas = Vec::with_capacity(n);
+        for i in 0..n {
+            let bytes = format!("{actor}-{tag}-{i}-{}", uuid_like()).into_bytes();
+            let sha = pg_sha256_of(&bytes);
+            backend
+                .put_blob_signing(
+                    &sha,
+                    BlobBody::Inline(bytes),
+                    None,
+                    actor,
+                    signer,
+                    chrono::Utc::now(),
+                    uuid::Uuid::new_v4(),
+                )
+                .await
+                .unwrap();
+            shas.push(sha);
+        }
+        shas
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn list_held_by_returns_actor_shas_pg() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let actor_a = format!("evict-A-{}", uuid_like());
+        let actor_b = format!("evict-B-{}", uuid_like());
+        pg_blob_bootstrap_host(&backend, &actor_a).await;
+        pg_blob_bootstrap_host(&backend, &actor_b).await;
+        let signer_a = pg_test_signer_for(&actor_a);
+        let signer_b = pg_test_signer_for(&actor_b);
+        let shas_a = pg_seed_blobs_for_actor(&backend, &actor_a, &*signer_a, 3, "main").await;
+        let shas_b = pg_seed_blobs_for_actor(&backend, &actor_b, &*signer_b, 2, "main").await;
+
+        use crate::federation::BlobStorage;
+        let mut held_a = backend.list_held_by(&actor_a).await.unwrap();
+        held_a.sort();
+        let mut expected_a = shas_a.clone();
+        expected_a.sort();
+        assert_eq!(held_a, expected_a, "A's holdings");
+
+        let mut held_b = backend.list_held_by(&actor_b).await.unwrap();
+        held_b.sort();
+        let mut expected_b = shas_b.clone();
+        expected_b.sort();
+        assert_eq!(held_b, expected_b, "B's holdings");
+
+        // Cleanup.
+        for sha in shas_a.iter().chain(shas_b.iter()) {
+            let _ = backend.delete_blob(sha).await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn list_held_by_filters_withdrawn_pg() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let actor = format!("evict-W-{}", uuid_like());
+        pg_blob_bootstrap_host(&backend, &actor).await;
+        let signer = pg_test_signer_for(&actor);
+        let shas = pg_seed_blobs_for_actor(&backend, &actor, &*signer, 1, "withdrawn").await;
+
+        use crate::federation::FederationDirectory;
+        let atts = backend.list_attestations_by(&actor).await.unwrap();
+        let holds_bytes = atts
+            .into_iter()
+            .find(|a| {
+                a.attestation_type
+                    .starts_with(crate::federation::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX)
+            })
+            .expect("holds_bytes from actor");
+        let withdraws = crate::federation::Attestation {
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            attesting_key_id: actor.clone(),
+            attested_key_id: actor.clone(),
+            attestation_type: crate::federation::types::attestation_type::WITHDRAWS.to_owned(),
+            weight: None,
+            asserted_at: chrono::Utc::now(),
+            expires_at: None,
+            attestation_envelope: serde_json::json!({
+                "kind": "withdraws",
+                "references_attestation_id": holds_bytes.attestation_id,
+                "references_attestation_type": holds_bytes.attestation_type,
+            }),
+            original_content_hash: "deadbeef".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: actor.clone(),
+            scrub_timestamp: chrono::Utc::now(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+        };
+        backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: withdraws,
+            })
+            .await
+            .unwrap();
+
+        use crate::federation::BlobStorage;
+        let held = backend.list_held_by(&actor).await.unwrap();
+        assert!(
+            !held.contains(&shas[0]),
+            "withdrawn blob must be excluded, got {held:?}"
+        );
+
+        for sha in &shas {
+            let _ = backend.delete_blob(sha).await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn evict_actor_evicts_blobs_and_emits_withdraws_pg() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let actor_a = format!("evict-go-A-{}", uuid_like());
+        let actor_b = format!("evict-go-B-{}", uuid_like());
+        pg_blob_bootstrap_host(&backend, &actor_a).await;
+        pg_blob_bootstrap_host(&backend, &actor_b).await;
+        let signer_a = pg_test_signer_for(&actor_a);
+        let signer_b = pg_test_signer_for(&actor_b);
+        let shas_a = pg_seed_blobs_for_actor(&backend, &actor_a, &*signer_a, 3, "evict").await;
+        let shas_b = pg_seed_blobs_for_actor(&backend, &actor_b, &*signer_b, 2, "evict").await;
+
+        use crate::federation::BlobStorage;
+        let report = backend
+            .evict_actor(&actor_a, &*signer_a, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(report.blobs_evicted, 3, "A's 3 blobs evicted");
+        assert_eq!(report.withdraws_emitted, 3, "3 withdraws emitted");
+        assert_eq!(report.withdraws_failed, 0, "no failures");
+
+        // A's blobs gone.
+        for sha in &shas_a {
+            assert!(
+                !backend.has_blob(sha).await.unwrap(),
+                "A's blob {sha:?} should be gone"
+            );
+        }
+        // B's blobs intact.
+        for sha in &shas_b {
+            assert!(
+                backend.has_blob(sha).await.unwrap(),
+                "B's blob {sha:?} must remain"
+            );
+        }
+
+        for sha in &shas_b {
+            let _ = backend.delete_blob(sha).await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn evict_actor_no_holdings_returns_zero_report_pg() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let actor = format!("evict-empty-{}", uuid_like());
+        pg_blob_bootstrap_host(&backend, &actor).await;
+        let signer = pg_test_signer_for(&actor);
+
+        use crate::federation::BlobStorage;
+        let report = backend
+            .evict_actor(&actor, &*signer, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(report, crate::federation::EvictActorReport::default());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn evict_actor_returns_correct_report_under_partial_failure_pg() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let actor = format!("evict-partial-{}", uuid_like());
+        pg_blob_bootstrap_host(&backend, &actor).await;
+        let real_signer = pg_test_signer_for(&actor);
+        let shas = pg_seed_blobs_for_actor(&backend, &actor, &*real_signer, 1, "partial").await;
+
+        let failing = PgAlwaysFailingSigner {
+            inner: real_signer.clone(),
+        };
+        use crate::federation::BlobStorage;
+        let report = backend
+            .evict_actor(&actor, &failing, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(report.blobs_evicted, 1, "blob still evicted");
+        assert_eq!(report.withdraws_emitted, 0, "no withdraws emitted");
+        assert_eq!(report.withdraws_failed, 1, "1 withdraws failed");
+        assert!(
+            !backend.has_blob(&shas[0]).await.unwrap(),
+            "blob row deletion proceeds despite withdraws failure"
+        );
     }
 }
