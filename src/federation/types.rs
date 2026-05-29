@@ -588,6 +588,133 @@ pub struct TrustFilter {
     pub include_expired: bool,
 }
 
+// ─── Peer metadata (v3.1.0, CIRISPersist#117) ──────────────────────
+//
+// The peer-mutation surface CIRISEdge v0.13.0 stubbed under UniFFI's
+// `PEER_MUTATION_FOLLOWUP` constant lands here. Operator-local
+// per-instance metadata (alias / trust / notes / policy / transport
+// identity) — distinct from the federation-shared identity carried by
+// `federation_keys` rows. See `migrations/postgres/lens/V051__*.sql`
+// for the sibling-table architectural rationale.
+
+/// Operator's trust class for a federation peer. Closed-set vocabulary
+/// mirrored by the V051 `federation_peer_metadata.trust` CHECK
+/// constraint via [`as_wire_str`](Self::as_wire_str) /
+/// [`from_wire_str`](Self::from_wire_str) — same shape as
+/// [`crate::store::VerificationSource`] (v2.0 CIRISPersist#91).
+///
+/// Default is [`Untrusted`](Self::Untrusted) — newly-added peers come
+/// in unranked; the operator promotes via [`super::FederationDirectory
+/// ::update_peer_trust`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustClass {
+    /// No trust claim yet. Default for newly-added peers.
+    #[default]
+    Untrusted,
+    /// Operator has marked this peer as trusted.
+    Trusted,
+    /// Operator allows interaction under restrictions (e.g., read-
+    /// only, throttled). Persist does not enforce the restrictions —
+    /// that's a consumer-side composition.
+    Restricted,
+    /// Operator has blocked this peer. Persist still keeps the row
+    /// (the block IS the operator-state we're persisting); consumers
+    /// honor it.
+    Blocked,
+}
+
+impl TrustClass {
+    /// The TEXT-column wire form (`'untrusted'` / `'trusted'` /
+    /// `'restricted'` / `'blocked'`). Matches the V051 CHECK-constraint
+    /// value set.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            TrustClass::Untrusted => "untrusted",
+            TrustClass::Trusted => "trusted",
+            TrustClass::Restricted => "restricted",
+            TrustClass::Blocked => "blocked",
+        }
+    }
+
+    /// Parse the TEXT-column wire form. `None` for any value outside
+    /// the closed set — the caller surfaces it as a backend decode
+    /// error (the DB CHECK constraint should make this unreachable on
+    /// reads, but writes via [`update_peer_trust`](super::
+    /// FederationDirectory::update_peer_trust) use the typed variant
+    /// directly).
+    pub fn from_wire_str(s: &str) -> Option<Self> {
+        match s {
+            "untrusted" => Some(TrustClass::Untrusted),
+            "trusted" => Some(TrustClass::Trusted),
+            "restricted" => Some(TrustClass::Restricted),
+            "blocked" => Some(TrustClass::Blocked),
+            _ => None,
+        }
+    }
+}
+
+/// Opaque consumer-defined policy blob for a peer. Persist round-trips
+/// the JSON verbatim; the shape is owned by CIRISEdge's UniFFI
+/// `PeerPolicy` type. Stored as JSONB on Postgres + TEXT-as-JSON on
+/// SQLite.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PeerPolicyBlob(pub serde_json::Value);
+
+impl PeerPolicyBlob {
+    /// Construct a blob from a `serde_json::Value`.
+    pub fn new(value: serde_json::Value) -> Self {
+        Self(value)
+    }
+
+    /// Borrow the underlying JSON value.
+    pub fn as_value(&self) -> &serde_json::Value {
+        &self.0
+    }
+
+    /// Consume into the underlying JSON value.
+    pub fn into_value(self) -> serde_json::Value {
+        self.0
+    }
+}
+
+/// `federation_peer_metadata` row — read shape.
+///
+/// Returned by reads through the peer-metadata surface (future
+/// methods; the v3.1.0 cut ships writes only, mirroring the v0.2.0
+/// federation_keys/_attestations write-only initial cut). The row
+/// carries `persist_row_hash` populated server-side via
+/// [`compute_persist_row_hash`] over the rest of the row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerMetadataRow {
+    /// FK to `federation_keys.key_id`.
+    pub key_id: String,
+    /// Operator-local display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    /// Operator's trust class.
+    pub trust: TrustClass,
+    /// Operator-local notes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    /// Opaque policy blob.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_blob: Option<PeerPolicyBlob>,
+    /// Opaque transport identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_identity: Option<String>,
+    /// Soft-remove marker. `None` = live row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_at: Option<DateTime<Utc>>,
+    /// First insertion time.
+    pub inserted_at: DateTime<Utc>,
+    /// Last mutation time (bumped on every `update_*` call).
+    pub updated_at: DateTime<Utc>,
+    /// Server-computed canonical-bytes hash.
+    pub persist_row_hash: String,
+}
+
 /// Compute the canonical-bytes hash for a row used for
 /// `persist_row_hash`. Persist calls this server-side on every write
 /// path so consumers don't have to.

@@ -64,6 +64,12 @@ struct State {
     /// v0.2.0 — Federation `federation_revocations` rows,
     /// append-only.
     federation_revocations: Vec<crate::federation::Revocation>,
+    /// v3.1.0 (CIRISPersist#117) — Federation peer metadata, sibling
+    /// to `federation_keys`. Keyed by `key_id`. Memory backend
+    /// mirrors the V051 PG/SQLite shape: same fields, same soft-
+    /// remove discipline (`removed_at`) so behavioral parity tests
+    /// pass against any backend.
+    federation_peer_metadata: HashMap<String, crate::federation::PeerMetadataRow>,
     /// v0.4.0 — Edge outbound queue (CIRISPersist#16). Same logical
     /// surface as `cirislens.edge_outbound_queue`. Keyed by
     /// queue_id. State-machine integrity enforced by the impl,
@@ -90,6 +96,7 @@ impl Default for MemoryBackend {
                 federation_trust: HashMap::new(),
                 outbound_queue: HashMap::new(),
                 federation_goals: HashMap::new(),
+                federation_peer_metadata: HashMap::new(),
             }),
         }
     }
@@ -934,6 +941,264 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         if row.retired_at.is_none() {
             row.retired_at = Some(retired_at);
         }
+        Ok(())
+    }
+
+    // ── Peer-mutation surface (v3.1.0, CIRISPersist#117) ───────────
+
+    async fn add_peer_record(
+        &self,
+        key_id: &str,
+        pubkey_ed25519_base64: &str,
+        identity_type: &str,
+        transport_identity: Option<String>,
+    ) -> Result<(), crate::federation::Error> {
+        if key_id.is_empty() {
+            return Err(crate::federation::Error::InvalidArgument(
+                "key_id must be non-empty".into(),
+            ));
+        }
+        if pubkey_ed25519_base64.is_empty() {
+            return Err(crate::federation::Error::InvalidArgument(
+                "pubkey_ed25519_base64 must be non-empty".into(),
+            ));
+        }
+        if identity_type.is_empty() {
+            return Err(crate::federation::Error::InvalidArgument(
+                "identity_type must be non-empty".into(),
+            ));
+        }
+
+        let now = chrono::Utc::now();
+        let mut state = self.state.lock().expect("memory backend lock");
+
+        // Conflict semantics: if a federation_keys row exists with
+        // matching pubkey, treat add_peer_record as upsert-of-
+        // metadata; if pubkey differs, it's a genuine conflict.
+        if let Some(existing_key) = state.federation_keys.get(key_id) {
+            if existing_key.pubkey_ed25519_base64 != pubkey_ed25519_base64 {
+                return Err(crate::federation::Error::Conflict(format!(
+                    "key_id {key_id} already exists with different pubkey"
+                )));
+            }
+            // Identical key — metadata row may or may not exist yet.
+        } else {
+            // Insert minimal federation_keys row. Tests-only shape,
+            // mirroring `add_public_key`: zero-byte placeholders for
+            // the scrub envelope (the peer was added by the operator,
+            // not via a signed registration envelope from the peer
+            // itself; operator's authority is enforced at the UniFFI
+            // layer).
+            let key = crate::federation::KeyRecord {
+                key_id: key_id.to_owned(),
+                pubkey_ed25519_base64: pubkey_ed25519_base64.to_owned(),
+                pubkey_ml_dsa_65_base64: None,
+                algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+                identity_type: identity_type.to_owned(),
+                identity_ref: key_id.to_owned(),
+                valid_from: now,
+                valid_until: None,
+                registration_envelope: serde_json::json!({"peer_added_by_operator": true}),
+                original_content_hash: "00".repeat(32),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
+                scrub_key_id: key_id.to_owned(),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                roles: Vec::new(),
+                attestation_evidence: None,
+            };
+            // persist_row_hash filled in inline (mirrors put_public_key)
+            let mut to_insert = key;
+            to_insert.persist_row_hash =
+                crate::federation::types::compute_persist_row_hash(&to_insert)?;
+            state.federation_keys.insert(key_id.to_owned(), to_insert);
+        }
+
+        // Insert the metadata row. Conflict on existing row:
+        // - if it's soft-removed (`removed_at` is some), the
+        //   add re-uses it (clears removed_at) — operator re-adding
+        //   a previously-removed peer.
+        // - if it's live and matches content, no-op idempotent.
+        // - if it's live and differs (transport_identity), Conflict.
+        let mut row = crate::federation::PeerMetadataRow {
+            key_id: key_id.to_owned(),
+            alias: None,
+            trust: crate::federation::TrustClass::Untrusted,
+            notes: None,
+            policy_blob: None,
+            transport_identity: transport_identity.clone(),
+            removed_at: None,
+            inserted_at: now,
+            updated_at: now,
+            persist_row_hash: String::new(),
+        };
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+
+        if let Some(existing) = state.federation_peer_metadata.get(key_id) {
+            if existing.removed_at.is_some() {
+                // Soft-removed → re-add. Replace with the new row.
+                state
+                    .federation_peer_metadata
+                    .insert(key_id.to_owned(), row);
+                return Ok(());
+            }
+            // Live row already exists. If transport_identity matches
+            // (or both None) it's idempotent; otherwise Conflict.
+            if existing.transport_identity == transport_identity {
+                return Ok(());
+            }
+            return Err(crate::federation::Error::Conflict(format!(
+                "peer_metadata row for key_id {key_id} already exists with different transport_identity"
+            )));
+        }
+        state
+            .federation_peer_metadata
+            .insert(key_id.to_owned(), row);
+        Ok(())
+    }
+
+    async fn remove_peer_record(
+        &self,
+        key_id: &str,
+        hard: bool,
+    ) -> Result<(), crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        // PeerNotFound when no live metadata row OR (for hard remove)
+        // no key row either. Treat "metadata row already removed_at"
+        // as PeerNotFound for soft remove (idempotent re-call is fine
+        // — second soft remove finds the row already marked).
+        let exists_metadata_live = state
+            .federation_peer_metadata
+            .get(key_id)
+            .map(|r| r.removed_at.is_none())
+            .unwrap_or(false);
+        if !exists_metadata_live {
+            return Err(crate::federation::Error::PeerNotFound {
+                key_id: key_id.to_owned(),
+            });
+        }
+
+        if hard {
+            // Reject if there are any attestations referencing this
+            // key. Match the PG semantics: count rows where the key
+            // appears as attesting / attested / scrub_key_id.
+            let attestation_count = state
+                .federation_attestations
+                .iter()
+                .filter(|a| {
+                    a.attesting_key_id == key_id
+                        || a.attested_key_id == key_id
+                        || a.scrub_key_id == key_id
+                })
+                .count();
+            if attestation_count > 0 {
+                return Err(crate::federation::Error::HardRemoveWithActiveAttestations {
+                    key_id: key_id.to_owned(),
+                    attestation_count,
+                });
+            }
+            // Cascade: drop federation_keys row + metadata row.
+            state.federation_keys.remove(key_id);
+            state.federation_peer_metadata.remove(key_id);
+        } else {
+            // Soft-remove: mark removed_at; bump updated_at;
+            // recompute persist_row_hash.
+            let now = chrono::Utc::now();
+            if let Some(row) = state.federation_peer_metadata.get_mut(key_id) {
+                row.removed_at = Some(now);
+                row.updated_at = now;
+                let mut for_hash = row.clone();
+                for_hash.persist_row_hash = String::new();
+                row.persist_row_hash =
+                    crate::federation::types::compute_persist_row_hash(&for_hash)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn update_peer_alias(
+        &self,
+        key_id: &str,
+        alias: Option<String>,
+    ) -> Result<(), crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        let row = state
+            .federation_peer_metadata
+            .get_mut(key_id)
+            .filter(|r| r.removed_at.is_none())
+            .ok_or_else(|| crate::federation::Error::PeerNotFound {
+                key_id: key_id.to_owned(),
+            })?;
+        row.alias = alias;
+        row.updated_at = chrono::Utc::now();
+        let mut for_hash = row.clone();
+        for_hash.persist_row_hash = String::new();
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+        Ok(())
+    }
+
+    async fn update_peer_trust(
+        &self,
+        key_id: &str,
+        trust: crate::federation::TrustClass,
+    ) -> Result<(), crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        let row = state
+            .federation_peer_metadata
+            .get_mut(key_id)
+            .filter(|r| r.removed_at.is_none())
+            .ok_or_else(|| crate::federation::Error::PeerNotFound {
+                key_id: key_id.to_owned(),
+            })?;
+        row.trust = trust;
+        row.updated_at = chrono::Utc::now();
+        let mut for_hash = row.clone();
+        for_hash.persist_row_hash = String::new();
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+        Ok(())
+    }
+
+    async fn update_peer_notes(
+        &self,
+        key_id: &str,
+        notes: Option<String>,
+    ) -> Result<(), crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        let row = state
+            .federation_peer_metadata
+            .get_mut(key_id)
+            .filter(|r| r.removed_at.is_none())
+            .ok_or_else(|| crate::federation::Error::PeerNotFound {
+                key_id: key_id.to_owned(),
+            })?;
+        row.notes = notes;
+        row.updated_at = chrono::Utc::now();
+        let mut for_hash = row.clone();
+        for_hash.persist_row_hash = String::new();
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+        Ok(())
+    }
+
+    async fn update_peer_policy(
+        &self,
+        key_id: &str,
+        policy: crate::federation::PeerPolicyBlob,
+    ) -> Result<(), crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        let row = state
+            .federation_peer_metadata
+            .get_mut(key_id)
+            .filter(|r| r.removed_at.is_none())
+            .ok_or_else(|| crate::federation::Error::PeerNotFound {
+                key_id: key_id.to_owned(),
+            })?;
+        row.policy_blob = Some(policy);
+        row.updated_at = chrono::Utc::now();
+        let mut for_hash = row.clone();
+        for_hash.persist_row_hash = String::new();
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
         Ok(())
     }
 }
@@ -2951,5 +3216,286 @@ mod tests {
             .collect();
         assert_eq!(composers.len(), 1, "second triple should be a no-op");
         assert_eq!(composers[0].attestation_id, "w-1");
+    }
+
+    // ── v3.1.0 (CIRISPersist#117) — peer-mutation surface ──────────
+
+    /// Read helper for the memory backend's federation_peer_metadata.
+    /// Tests only — production reads will land in a follow-up cut.
+    fn peek_peer(
+        backend: &MemoryBackend,
+        key_id: &str,
+    ) -> Option<crate::federation::PeerMetadataRow> {
+        let state = backend.state.lock().expect("memory backend lock");
+        state.federation_peer_metadata.get(key_id).cloned()
+    }
+
+    fn peek_key(backend: &MemoryBackend, key_id: &str) -> Option<crate::federation::KeyRecord> {
+        let state = backend.state.lock().expect("memory backend lock");
+        state.federation_keys.get(key_id).cloned()
+    }
+
+    #[tokio::test]
+    async fn add_peer_record_creates_both_rows_atomically() {
+        use crate::federation::FederationDirectory;
+        let backend = MemoryBackend::new();
+        backend
+            .add_peer_record("peer-a", "AAAA", "agent", Some("rns://abc".into()))
+            .await
+            .unwrap();
+        let key = peek_key(&backend, "peer-a").expect("federation_keys row");
+        assert_eq!(key.pubkey_ed25519_base64, "AAAA");
+        assert_eq!(key.identity_type, "agent");
+        let meta = peek_peer(&backend, "peer-a").expect("peer_metadata row");
+        assert_eq!(meta.trust, crate::federation::TrustClass::Untrusted);
+        assert_eq!(meta.transport_identity.as_deref(), Some("rns://abc"));
+        assert!(meta.removed_at.is_none());
+        assert!(!meta.persist_row_hash.is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_peer_record_duplicate_key_id_rejects() {
+        use crate::federation::FederationDirectory;
+        let backend = MemoryBackend::new();
+        backend
+            .add_peer_record("peer-dup", "AAAA", "agent", None)
+            .await
+            .unwrap();
+        let err = backend
+            .add_peer_record("peer-dup", "BBBB", "agent", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::federation::Error::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn remove_peer_record_soft_marks_removed_at_and_hides_from_reads() {
+        use crate::federation::FederationDirectory;
+        let backend = MemoryBackend::new();
+        backend
+            .add_peer_record("peer-soft", "AAAA", "agent", None)
+            .await
+            .unwrap();
+        backend
+            .remove_peer_record("peer-soft", false)
+            .await
+            .unwrap();
+        let meta = peek_peer(&backend, "peer-soft").expect("metadata row preserved");
+        assert!(meta.removed_at.is_some(), "removed_at must be set");
+        // federation_keys row preserved (audit trail).
+        assert!(peek_key(&backend, "peer-soft").is_some());
+        // Subsequent updates against a soft-removed peer report
+        // PeerNotFound (live-row gate).
+        let err = backend
+            .update_peer_alias("peer-soft", Some("nope".into()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::federation::Error::PeerNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn remove_peer_record_hard_with_active_attestations_rejects() {
+        use crate::federation::FederationDirectory;
+        use crate::federation::{SignedAttestation, SignedKeyRecord};
+        let backend = MemoryBackend::new();
+        // Add a peer + a counter-peer so we can build an attestation
+        // between them.
+        backend
+            .add_peer_record("peer-att-a", "AAAA", "agent", None)
+            .await
+            .unwrap();
+        // A second federation_keys row registered the normal way.
+        let other_key = crate::federation::KeyRecord {
+            key_id: "peer-att-b".into(),
+            pubkey_ed25519_base64: "BBBB".into(),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: crate::federation::types::algorithm::HYBRID.into(),
+            identity_type: "agent".into(),
+            identity_ref: "peer-att-b".into(),
+            valid_from: chrono::Utc::now(),
+            valid_until: None,
+            registration_envelope: serde_json::json!({"id": "peer-att-b"}),
+            original_content_hash: "00".repeat(32),
+            scrub_signature_classical: "sig".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: "peer-att-b".into(),
+            scrub_timestamp: chrono::Utc::now(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+        };
+        backend
+            .put_public_key(SignedKeyRecord { record: other_key })
+            .await
+            .unwrap();
+        // Attestation that references peer-att-a as attesting key.
+        let att = crate::federation::Attestation {
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            attesting_key_id: "peer-att-a".into(),
+            attested_key_id: "peer-att-b".into(),
+            attestation_type: crate::federation::types::attestation_type::SCORES.into(),
+            weight: None,
+            asserted_at: chrono::Utc::now(),
+            expires_at: None,
+            attestation_envelope: serde_json::json!({
+                "dimension": "identity_binding:v1",
+                "score": 0.5,
+                "confidence": 0.9,
+            }),
+            original_content_hash: "00".repeat(32),
+            scrub_signature_classical: "sig".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: "peer-att-a".into(),
+            scrub_timestamp: chrono::Utc::now(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+        };
+        backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+
+        let err = backend
+            .remove_peer_record("peer-att-a", true)
+            .await
+            .unwrap_err();
+        match err {
+            crate::federation::Error::HardRemoveWithActiveAttestations {
+                key_id,
+                attestation_count,
+            } => {
+                assert_eq!(key_id, "peer-att-a");
+                assert!(attestation_count >= 1);
+            }
+            other => panic!("expected HardRemoveWithActiveAttestations, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_peer_record_hard_with_no_attestations_cascades() {
+        use crate::federation::FederationDirectory;
+        let backend = MemoryBackend::new();
+        backend
+            .add_peer_record("peer-hard", "AAAA", "agent", None)
+            .await
+            .unwrap();
+        backend.remove_peer_record("peer-hard", true).await.unwrap();
+        assert!(peek_key(&backend, "peer-hard").is_none(), "key row gone");
+        assert!(
+            peek_peer(&backend, "peer-hard").is_none(),
+            "metadata row gone via cascade"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_peer_alias_round_trip() {
+        use crate::federation::FederationDirectory;
+        let backend = MemoryBackend::new();
+        backend
+            .add_peer_record("peer-alias", "AAAA", "agent", None)
+            .await
+            .unwrap();
+        backend
+            .update_peer_alias("peer-alias", Some("home-base".into()))
+            .await
+            .unwrap();
+        let meta = peek_peer(&backend, "peer-alias").unwrap();
+        assert_eq!(meta.alias.as_deref(), Some("home-base"));
+        // Clearing.
+        backend.update_peer_alias("peer-alias", None).await.unwrap();
+        let meta = peek_peer(&backend, "peer-alias").unwrap();
+        assert!(meta.alias.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_peer_trust_round_trip_each_variant() {
+        use crate::federation::FederationDirectory;
+        let backend = MemoryBackend::new();
+        backend
+            .add_peer_record("peer-trust", "AAAA", "agent", None)
+            .await
+            .unwrap();
+        for variant in [
+            crate::federation::TrustClass::Trusted,
+            crate::federation::TrustClass::Restricted,
+            crate::federation::TrustClass::Blocked,
+            crate::federation::TrustClass::Untrusted,
+        ] {
+            backend
+                .update_peer_trust("peer-trust", variant)
+                .await
+                .unwrap();
+            let meta = peek_peer(&backend, "peer-trust").unwrap();
+            assert_eq!(meta.trust, variant, "round-trip failed for {variant:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn update_peer_notes_round_trip() {
+        use crate::federation::FederationDirectory;
+        let backend = MemoryBackend::new();
+        backend
+            .add_peer_record("peer-notes", "AAAA", "agent", None)
+            .await
+            .unwrap();
+        // null → some → null
+        let meta = peek_peer(&backend, "peer-notes").unwrap();
+        assert!(meta.notes.is_none());
+        backend
+            .update_peer_notes("peer-notes", Some("contact ops".into()))
+            .await
+            .unwrap();
+        let meta = peek_peer(&backend, "peer-notes").unwrap();
+        assert_eq!(meta.notes.as_deref(), Some("contact ops"));
+        backend.update_peer_notes("peer-notes", None).await.unwrap();
+        let meta = peek_peer(&backend, "peer-notes").unwrap();
+        assert!(meta.notes.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_peer_policy_round_trip() {
+        use crate::federation::FederationDirectory;
+        let backend = MemoryBackend::new();
+        backend
+            .add_peer_record("peer-policy", "AAAA", "agent", None)
+            .await
+            .unwrap();
+        let blob = crate::federation::PeerPolicyBlob(serde_json::json!({
+            "max_rate_per_min": 60,
+            "tags": ["sandbox", "staging"],
+        }));
+        backend
+            .update_peer_policy("peer-policy", blob.clone())
+            .await
+            .unwrap();
+        let meta = peek_peer(&backend, "peer-policy").unwrap();
+        assert_eq!(meta.policy_blob, Some(blob));
+    }
+
+    #[tokio::test]
+    async fn update_peer_unknown_key_id_rejects() {
+        use crate::federation::FederationDirectory;
+        let backend = MemoryBackend::new();
+        for outcome in [
+            backend.update_peer_alias("ghost", None).await,
+            backend
+                .update_peer_trust("ghost", crate::federation::TrustClass::Trusted)
+                .await,
+            backend.update_peer_notes("ghost", None).await,
+            backend
+                .update_peer_policy(
+                    "ghost",
+                    crate::federation::PeerPolicyBlob(serde_json::json!({})),
+                )
+                .await,
+        ] {
+            match outcome.expect_err("must fail with PeerNotFound") {
+                crate::federation::Error::PeerNotFound { key_id } => {
+                    assert_eq!(key_id, "ghost");
+                }
+                other => panic!("expected PeerNotFound, got {other:?}"),
+            }
+        }
     }
 }

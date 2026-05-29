@@ -2374,6 +2374,552 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| crate::federation::Error::Backend(format!("retire_goal update: {e}")))?;
         Ok(())
     }
+
+    // ── Peer-mutation surface (v3.1.0, CIRISPersist#117) ───────────
+
+    async fn add_peer_record(
+        &self,
+        key_id: &str,
+        pubkey_ed25519_base64: &str,
+        identity_type: &str,
+        transport_identity: Option<String>,
+    ) -> Result<(), crate::federation::Error> {
+        if key_id.is_empty() {
+            return Err(crate::federation::Error::InvalidArgument(
+                "key_id must be non-empty".into(),
+            ));
+        }
+        if pubkey_ed25519_base64.is_empty() {
+            return Err(crate::federation::Error::InvalidArgument(
+                "pubkey_ed25519_base64 must be non-empty".into(),
+            ));
+        }
+        if identity_type.is_empty() {
+            return Err(crate::federation::Error::InvalidArgument(
+                "identity_type must be non-empty".into(),
+            ));
+        }
+
+        // Build the federation_keys row + its persist_row_hash up
+        // front (same shape as put_public_key but without the
+        // SignedKeyRecord scrub envelope — peer-add is operator-
+        // authorized at the UniFFI layer, not via a peer-supplied
+        // signed registration envelope).
+        let now = chrono::Utc::now();
+        let mut key = crate::federation::KeyRecord {
+            key_id: key_id.to_owned(),
+            pubkey_ed25519_base64: pubkey_ed25519_base64.to_owned(),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+            identity_type: identity_type.to_owned(),
+            identity_ref: key_id.to_owned(),
+            valid_from: now,
+            valid_until: None,
+            registration_envelope: serde_json::json!({"peer_added_by_operator": true}),
+            // 32 bytes of zeros — placeholder sha; no signed envelope.
+            original_content_hash: "00".repeat(32),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: key_id.to_owned(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+        };
+        key.persist_row_hash = crate::federation::types::compute_persist_row_hash(&key)?;
+
+        let mut meta = crate::federation::PeerMetadataRow {
+            key_id: key_id.to_owned(),
+            alias: None,
+            trust: crate::federation::TrustClass::Untrusted,
+            notes: None,
+            policy_blob: None,
+            transport_identity: transport_identity.clone(),
+            removed_at: None,
+            inserted_at: now,
+            updated_at: now,
+            persist_row_hash: String::new(),
+        };
+        meta.persist_row_hash = crate::federation::types::compute_persist_row_hash(&meta)?;
+
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
+
+        // The federation_keys row — ON CONFLICT (key_id) DO NOTHING
+        // (matches put_public_key semantics; conflict-with-different-
+        // content is detected by re-reading the existing pubkey
+        // below).
+        let original_content_hash = hex::decode(&key.original_content_hash).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!(
+                "original_content_hash hex decode: {e}"
+            ))
+        })?;
+        let roles_param: Option<&Vec<String>> = None;
+        tx.execute(
+            "INSERT INTO cirislens.federation_keys (\
+                key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
+                identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
+                original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
+                attestation_evidence\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
+             ON CONFLICT (key_id) DO NOTHING",
+            &[
+                &key.key_id,
+                &key.pubkey_ed25519_base64,
+                &key.pubkey_ml_dsa_65_base64,
+                &key.algorithm,
+                &key.identity_type,
+                &key.identity_ref,
+                &key.valid_from,
+                &key.valid_until,
+                &key.registration_envelope,
+                &original_content_hash,
+                &key.scrub_signature_classical,
+                &key.scrub_signature_pqc,
+                &key.scrub_key_id,
+                &key.scrub_timestamp,
+                &key.pqc_completed_at,
+                &key.persist_row_hash,
+                &roles_param,
+                &key.attestation_evidence,
+            ],
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("add_peer_record federation_keys: {e}"))
+        })?;
+
+        // Conflict detection on federation_keys: if pubkey differs,
+        // the operator is trying to re-add a peer with a different
+        // pubkey under the same key_id → reject.
+        let existing_pubkey: Option<String> = tx
+            .query_opt(
+                "SELECT pubkey_ed25519_base64 FROM cirislens.federation_keys WHERE key_id = $1",
+                &[&key.key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "add_peer_record federation_keys conflict check: {e}"
+                ))
+            })?
+            .map(|r| r.safe_get_with(0, crate::federation::Error::Backend))
+            .transpose()?;
+        if let Some(existing) = existing_pubkey {
+            if existing != key.pubkey_ed25519_base64 {
+                return Err(crate::federation::Error::Conflict(format!(
+                    "key_id {} already exists with different pubkey",
+                    key.key_id
+                )));
+            }
+        }
+
+        // The federation_peer_metadata row.
+        // - Soft-removed re-add: clear removed_at + repopulate;
+        // - Live row with matching transport: idempotent no-op;
+        // - Live row with different transport: Conflict.
+        let existing_meta: Option<tokio_postgres::Row> = tx
+            .query_opt(
+                "SELECT transport_identity, removed_at \
+                 FROM cirislens.federation_peer_metadata WHERE key_id = $1",
+                &[&key.key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "add_peer_record peer_metadata existence: {e}"
+                ))
+            })?;
+        match existing_meta {
+            Some(row) => {
+                let existing_transport: Option<String> =
+                    row.safe_get_with(0, crate::federation::Error::Backend)?;
+                let existing_removed_at: Option<chrono::DateTime<chrono::Utc>> =
+                    row.safe_get_with(1, crate::federation::Error::Backend)?;
+                if existing_removed_at.is_some() {
+                    // Re-add: replace with the new row.
+                    tx.execute(
+                        "UPDATE cirislens.federation_peer_metadata SET \
+                            alias = NULL, trust = 'untrusted', notes = NULL, \
+                            policy_blob = NULL, transport_identity = $2, \
+                            removed_at = NULL, inserted_at = $3, updated_at = $3, \
+                            persist_row_hash = $4 \
+                         WHERE key_id = $1",
+                        &[
+                            &key.key_id,
+                            &meta.transport_identity,
+                            &now,
+                            &meta.persist_row_hash,
+                        ],
+                    )
+                    .await
+                    .map_err(|e| {
+                        crate::federation::Error::Backend(format!(
+                            "add_peer_record peer_metadata re-add: {e}"
+                        ))
+                    })?;
+                } else if existing_transport == transport_identity {
+                    // Idempotent no-op.
+                } else {
+                    return Err(crate::federation::Error::Conflict(format!(
+                        "peer_metadata row for key_id {} already exists with different transport_identity",
+                        key.key_id
+                    )));
+                }
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO cirislens.federation_peer_metadata (\
+                        key_id, alias, trust, notes, policy_blob, \
+                        transport_identity, removed_at, inserted_at, updated_at, persist_row_hash\
+                     ) VALUES ($1, NULL, 'untrusted', NULL, NULL, $2, NULL, $3, $3, $4)",
+                    &[
+                        &key.key_id,
+                        &meta.transport_identity,
+                        &now,
+                        &meta.persist_row_hash,
+                    ],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!(
+                        "add_peer_record peer_metadata insert: {e}"
+                    ))
+                })?;
+            }
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("commit tx: {e}")))?;
+        Ok(())
+    }
+
+    async fn remove_peer_record(
+        &self,
+        key_id: &str,
+        hard: bool,
+    ) -> Result<(), crate::federation::Error> {
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
+
+        // PeerNotFound when no live metadata row.
+        let meta_exists: Option<bool> = tx
+            .query_opt(
+                "SELECT removed_at IS NULL \
+                 FROM cirislens.federation_peer_metadata WHERE key_id = $1",
+                &[&key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("remove_peer_record existence: {e}"))
+            })?
+            .map(|r| r.safe_get_with(0, crate::federation::Error::Backend))
+            .transpose()?;
+        match meta_exists {
+            Some(true) => { /* live row — proceed */ }
+            _ => {
+                return Err(crate::federation::Error::PeerNotFound {
+                    key_id: key_id.to_owned(),
+                });
+            }
+        }
+
+        if hard {
+            // Defensive: count attestations that would be orphaned.
+            let count_row = tx
+                .query_one(
+                    "SELECT COUNT(*)::BIGINT FROM cirislens.federation_attestations \
+                     WHERE attesting_key_id = $1 OR attested_key_id = $1 OR scrub_key_id = $1",
+                    &[&key_id],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!(
+                        "remove_peer_record attestation count: {e}"
+                    ))
+                })?;
+            let count: i64 = count_row.safe_get_with(0, crate::federation::Error::Backend)?;
+            if count > 0 {
+                return Err(crate::federation::Error::HardRemoveWithActiveAttestations {
+                    key_id: key_id.to_owned(),
+                    attestation_count: count as usize,
+                });
+            }
+            // Cascade: DELETE federation_keys; ON DELETE CASCADE on
+            // federation_peer_metadata.key_id picks up the sibling.
+            tx.execute(
+                "DELETE FROM cirislens.federation_keys WHERE key_id = $1",
+                &[&key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "remove_peer_record federation_keys delete: {e}"
+                ))
+            })?;
+        } else {
+            // Soft-remove: bump removed_at + updated_at + recompute
+            // persist_row_hash. We need to compute the new hash with
+            // the new field values, which means fetching the current
+            // row first (to populate the rest of the PeerMetadataRow
+            // shape that the canonicalizer hashes).
+            let row = tx
+                .query_one(
+                    "SELECT key_id, alias, trust, notes, policy_blob, \
+                            transport_identity, inserted_at \
+                     FROM cirislens.federation_peer_metadata WHERE key_id = $1",
+                    &[&key_id],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!(
+                        "remove_peer_record peer_metadata fetch: {e}"
+                    ))
+                })?;
+            let now = chrono::Utc::now();
+            let new_row = pg_row_to_peer_metadata_for_hash(&row, Some(now), now)?;
+            let new_hash = crate::federation::types::compute_persist_row_hash(&new_row)?;
+            tx.execute(
+                "UPDATE cirislens.federation_peer_metadata SET \
+                    removed_at = $2, updated_at = $2, persist_row_hash = $3 \
+                 WHERE key_id = $1",
+                &[&key_id, &now, &new_hash],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "remove_peer_record peer_metadata update: {e}"
+                ))
+            })?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("commit tx: {e}")))?;
+        Ok(())
+    }
+
+    async fn update_peer_alias(
+        &self,
+        key_id: &str,
+        alias: Option<String>,
+    ) -> Result<(), crate::federation::Error> {
+        pg_update_peer_field(self, key_id, PgPeerUpdate::Alias(alias)).await
+    }
+
+    async fn update_peer_trust(
+        &self,
+        key_id: &str,
+        trust: crate::federation::TrustClass,
+    ) -> Result<(), crate::federation::Error> {
+        pg_update_peer_field(self, key_id, PgPeerUpdate::Trust(trust)).await
+    }
+
+    async fn update_peer_notes(
+        &self,
+        key_id: &str,
+        notes: Option<String>,
+    ) -> Result<(), crate::federation::Error> {
+        pg_update_peer_field(self, key_id, PgPeerUpdate::Notes(notes)).await
+    }
+
+    async fn update_peer_policy(
+        &self,
+        key_id: &str,
+        policy: crate::federation::PeerPolicyBlob,
+    ) -> Result<(), crate::federation::Error> {
+        pg_update_peer_field(self, key_id, PgPeerUpdate::Policy(policy)).await
+    }
+}
+
+// ─── Peer-metadata update helpers (v3.1.0, CIRISPersist#117) ───────
+//
+// The four `update_peer_*` methods share the same shape: fetch the
+// existing row, mutate one field, recompute persist_row_hash, write
+// back inside a single transaction. Encapsulated as an enum + a
+// shared helper so the SQL templates don't drift across the four
+// methods.
+
+enum PgPeerUpdate {
+    Alias(Option<String>),
+    Trust(crate::federation::TrustClass),
+    Notes(Option<String>),
+    Policy(crate::federation::PeerPolicyBlob),
+}
+
+/// Apply a peer-metadata field update under a single transaction.
+/// Returns `Error::PeerNotFound` when the row is missing or
+/// soft-removed (matches the v3.1.0 #117 contract — updates against
+/// removed peers fail loudly, not silently).
+async fn pg_update_peer_field(
+    backend: &PostgresBackend,
+    key_id: &str,
+    update: PgPeerUpdate,
+) -> Result<(), crate::federation::Error> {
+    let mut client = backend
+        .get_client()
+        .await
+        .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
+
+    // PeerNotFound if no live row.
+    let row_opt = tx
+        .query_opt(
+            "SELECT key_id, alias, trust, notes, policy_blob, \
+                    transport_identity, removed_at, inserted_at \
+             FROM cirislens.federation_peer_metadata WHERE key_id = $1",
+            &[&key_id],
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("update_peer_* fetch: {e}")))?;
+    let row = match row_opt {
+        None => {
+            return Err(crate::federation::Error::PeerNotFound {
+                key_id: key_id.to_owned(),
+            });
+        }
+        Some(r) => r,
+    };
+    let removed_at: Option<chrono::DateTime<chrono::Utc>> =
+        row.safe_get_with("removed_at", crate::federation::Error::Backend)?;
+    if removed_at.is_some() {
+        return Err(crate::federation::Error::PeerNotFound {
+            key_id: key_id.to_owned(),
+        });
+    }
+
+    // Hydrate the row, then mutate the targeted field. Recompute
+    // persist_row_hash against the mutated shape.
+    let inserted_at: chrono::DateTime<chrono::Utc> =
+        row.safe_get_with("inserted_at", crate::federation::Error::Backend)?;
+    let mut mut_row = pg_row_to_peer_metadata_for_hash(&row, None, chrono::Utc::now())?;
+    mut_row.inserted_at = inserted_at;
+    let now = chrono::Utc::now();
+    mut_row.updated_at = now;
+
+    match &update {
+        PgPeerUpdate::Alias(v) => mut_row.alias = v.clone(),
+        PgPeerUpdate::Trust(v) => mut_row.trust = *v,
+        PgPeerUpdate::Notes(v) => mut_row.notes = v.clone(),
+        PgPeerUpdate::Policy(v) => mut_row.policy_blob = Some(v.clone()),
+    }
+    let new_hash = crate::federation::types::compute_persist_row_hash(&mut_row)?;
+
+    let sql = match update {
+        PgPeerUpdate::Alias(_) => {
+            "UPDATE cirislens.federation_peer_metadata SET \
+                alias = $2, updated_at = $3, persist_row_hash = $4 WHERE key_id = $1"
+        }
+        PgPeerUpdate::Trust(_) => {
+            "UPDATE cirislens.federation_peer_metadata SET \
+                trust = $2, updated_at = $3, persist_row_hash = $4 WHERE key_id = $1"
+        }
+        PgPeerUpdate::Notes(_) => {
+            "UPDATE cirislens.federation_peer_metadata SET \
+                notes = $2, updated_at = $3, persist_row_hash = $4 WHERE key_id = $1"
+        }
+        PgPeerUpdate::Policy(_) => {
+            "UPDATE cirislens.federation_peer_metadata SET \
+                policy_blob = $2, updated_at = $3, persist_row_hash = $4 WHERE key_id = $1"
+        }
+    };
+
+    // Bind the value for $2 based on which variant we have.
+    let res = match &update {
+        PgPeerUpdate::Alias(_) => {
+            tx.execute(sql, &[&key_id, &mut_row.alias, &now, &new_hash])
+                .await
+        }
+        PgPeerUpdate::Trust(_) => {
+            let trust_wire = mut_row.trust.as_wire_str();
+            tx.execute(sql, &[&key_id, &trust_wire, &now, &new_hash])
+                .await
+        }
+        PgPeerUpdate::Notes(_) => {
+            tx.execute(sql, &[&key_id, &mut_row.notes, &now, &new_hash])
+                .await
+        }
+        PgPeerUpdate::Policy(_) => {
+            // policy_blob is serde_json::Value (JSONB column).
+            let value = mut_row
+                .policy_blob
+                .as_ref()
+                .map(|p| p.as_value().clone())
+                .unwrap_or(serde_json::Value::Null);
+            tx.execute(sql, &[&key_id, &value, &now, &new_hash]).await
+        }
+    };
+    res.map_err(|e| crate::federation::Error::Backend(format!("update_peer_* update: {e}")))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("commit tx: {e}")))?;
+    Ok(())
+}
+
+/// Hydrate a `federation_peer_metadata` row into a
+/// [`crate::federation::PeerMetadataRow`] for the canonical-bytes
+/// hash. `removed_at_override` lets the soft-remove path stamp the
+/// new `removed_at` value without re-fetching after UPDATE.
+fn pg_row_to_peer_metadata_for_hash(
+    row: &tokio_postgres::Row,
+    removed_at_override: Option<chrono::DateTime<chrono::Utc>>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+) -> Result<crate::federation::PeerMetadataRow, crate::federation::Error> {
+    let key_id: String = row.safe_get_with("key_id", crate::federation::Error::Backend)?;
+    let alias: Option<String> = row.safe_get_with("alias", crate::federation::Error::Backend)?;
+    let trust_str: String = row.safe_get_with("trust", crate::federation::Error::Backend)?;
+    let trust = crate::federation::TrustClass::from_wire_str(&trust_str).ok_or_else(|| {
+        crate::federation::Error::Backend(format!(
+            "federation_peer_metadata.trust has unrecognized value {trust_str:?} \
+             (CHECK constraint bypass — direct SQL write?)"
+        ))
+    })?;
+    let notes: Option<String> = row.safe_get_with("notes", crate::federation::Error::Backend)?;
+    let policy_value: Option<serde_json::Value> =
+        row.safe_get_with("policy_blob", crate::federation::Error::Backend)?;
+    let policy_blob = policy_value.map(crate::federation::PeerPolicyBlob);
+    let transport_identity: Option<String> =
+        row.safe_get_with("transport_identity", crate::federation::Error::Backend)?;
+    let inserted_at: chrono::DateTime<chrono::Utc> = row
+        .safe_get_with("inserted_at", crate::federation::Error::Backend)
+        .unwrap_or(updated_at);
+    let removed_at = if removed_at_override.is_some() {
+        removed_at_override
+    } else {
+        row.try_get::<_, Option<chrono::DateTime<chrono::Utc>>>("removed_at")
+            .unwrap_or(None)
+    };
+    Ok(crate::federation::PeerMetadataRow {
+        key_id,
+        alias,
+        trust,
+        notes,
+        policy_blob,
+        transport_identity,
+        removed_at,
+        inserted_at,
+        updated_at,
+        persist_row_hash: String::new(),
+    })
 }
 
 // ─── BlobStorage impl (v2.3, CIRISPersist#103) ─────────────────────
@@ -12683,6 +13229,361 @@ mod tests {
         assert!(
             matches!(err, crate::federation::Error::InvalidArgument(_)),
             "got: {err:?}"
+        );
+    }
+
+    // ── v3.1.0 (CIRISPersist#117) — peer-mutation surface ──────────
+
+    async fn pg_peek_peer(
+        backend: &PostgresBackend,
+        key_id: &str,
+    ) -> Option<(
+        Option<String>,
+        String,
+        Option<String>,
+        Option<serde_json::Value>,
+        Option<String>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )> {
+        let client = backend.get_client().await.ok()?;
+        let row = client
+            .query_opt(
+                "SELECT alias, trust, notes, policy_blob, transport_identity, removed_at \
+                 FROM cirislens.federation_peer_metadata WHERE key_id = $1",
+                &[&key_id],
+            )
+            .await
+            .ok()??;
+        Some((
+            row.safe_get_with("alias", crate::federation::Error::Backend)
+                .ok()?,
+            row.safe_get_with("trust", crate::federation::Error::Backend)
+                .ok()?,
+            row.safe_get_with("notes", crate::federation::Error::Backend)
+                .ok()?,
+            row.safe_get_with("policy_blob", crate::federation::Error::Backend)
+                .ok()?,
+            row.safe_get_with("transport_identity", crate::federation::Error::Backend)
+                .ok()?,
+            row.safe_get_with("removed_at", crate::federation::Error::Backend)
+                .ok()?,
+        ))
+    }
+
+    async fn pg_peek_key_exists(backend: &PostgresBackend, key_id: &str) -> bool {
+        let client = backend.get_client().await.unwrap();
+        client
+            .query_opt(
+                "SELECT 1 FROM cirislens.federation_keys WHERE key_id = $1",
+                &[&key_id],
+            )
+            .await
+            .unwrap()
+            .is_some()
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn add_peer_record_creates_both_rows_atomically_pg() {
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let key_id = format!("peer-{}", uuid_like());
+        backend
+            .add_peer_record(&key_id, "AAAA", "agent", Some("rns://abc".into()))
+            .await
+            .unwrap();
+        assert!(pg_peek_key_exists(&backend, &key_id).await);
+        let meta = pg_peek_peer(&backend, &key_id).await.expect("row");
+        assert_eq!(meta.1, "untrusted");
+        assert_eq!(meta.4.as_deref(), Some("rns://abc"));
+        assert!(meta.5.is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn add_peer_record_duplicate_key_id_rejects_pg() {
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let key_id = format!("peer-dup-{}", uuid_like());
+        backend
+            .add_peer_record(&key_id, "AAAA", "agent", None)
+            .await
+            .unwrap();
+        let err = backend
+            .add_peer_record(&key_id, "BBBB", "agent", None)
+            .await
+            .expect_err("must reject pubkey conflict");
+        assert!(
+            matches!(err, crate::federation::Error::Conflict(_)),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn remove_peer_record_soft_marks_removed_at_and_hides_from_reads_pg() {
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let key_id = format!("peer-soft-{}", uuid_like());
+        backend
+            .add_peer_record(&key_id, "AAAA", "agent", None)
+            .await
+            .unwrap();
+        backend.remove_peer_record(&key_id, false).await.unwrap();
+        let meta = pg_peek_peer(&backend, &key_id).await.expect("preserved");
+        assert!(meta.5.is_some(), "removed_at set");
+        assert!(pg_peek_key_exists(&backend, &key_id).await, "key preserved");
+        let err = backend
+            .update_peer_alias(&key_id, Some("nope".into()))
+            .await
+            .expect_err("must reject");
+        assert!(matches!(err, crate::federation::Error::PeerNotFound { .. }));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn remove_peer_record_hard_with_active_attestations_rejects_pg() {
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let a = format!("peer-att-a-{}", uuid_like());
+        let b = format!("peer-att-b-{}", uuid_like());
+        backend
+            .add_peer_record(&a, "AAAA", "agent", None)
+            .await
+            .unwrap();
+        backend
+            .add_peer_record(&b, "BBBB", "agent", None)
+            .await
+            .unwrap();
+        // Build attestation referencing key a as attesting. Use a
+        // dimension that passes the v2.4.0 admission gate.
+        let att = crate::federation::Attestation {
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            attesting_key_id: a.clone(),
+            attested_key_id: b.clone(),
+            attestation_type: crate::federation::types::attestation_type::SCORES.into(),
+            weight: Some(1.0),
+            asserted_at: chrono::Utc::now(),
+            expires_at: None,
+            attestation_envelope: serde_json::json!({
+                "dimension": "identity_binding:v1",
+                "score": 1.0,
+                "confidence": 0.9,
+            }),
+            original_content_hash: hex::encode([0u8; 32]),
+            scrub_signature_classical: "sig".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: a.clone(),
+            scrub_timestamp: chrono::Utc::now(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+        };
+        backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+
+        let err = backend
+            .remove_peer_record(&a, true)
+            .await
+            .expect_err("must reject orphaning");
+        assert!(matches!(
+            err,
+            crate::federation::Error::HardRemoveWithActiveAttestations { .. }
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn remove_peer_record_hard_with_no_attestations_cascades_pg() {
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let key_id = format!("peer-hard-{}", uuid_like());
+        backend
+            .add_peer_record(&key_id, "AAAA", "agent", None)
+            .await
+            .unwrap();
+        backend.remove_peer_record(&key_id, true).await.unwrap();
+        assert!(!pg_peek_key_exists(&backend, &key_id).await);
+        assert!(pg_peek_peer(&backend, &key_id).await.is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn update_peer_alias_round_trip_pg() {
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let key_id = format!("peer-alias-{}", uuid_like());
+        backend
+            .add_peer_record(&key_id, "AAAA", "agent", None)
+            .await
+            .unwrap();
+        backend
+            .update_peer_alias(&key_id, Some("home".into()))
+            .await
+            .unwrap();
+        let meta = pg_peek_peer(&backend, &key_id).await.unwrap();
+        assert_eq!(meta.0.as_deref(), Some("home"));
+        backend.update_peer_alias(&key_id, None).await.unwrap();
+        let meta = pg_peek_peer(&backend, &key_id).await.unwrap();
+        assert!(meta.0.is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn update_peer_trust_round_trip_each_variant_pg() {
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let key_id = format!("peer-trust-{}", uuid_like());
+        backend
+            .add_peer_record(&key_id, "AAAA", "agent", None)
+            .await
+            .unwrap();
+        for variant in [
+            crate::federation::TrustClass::Trusted,
+            crate::federation::TrustClass::Restricted,
+            crate::federation::TrustClass::Blocked,
+            crate::federation::TrustClass::Untrusted,
+        ] {
+            backend.update_peer_trust(&key_id, variant).await.unwrap();
+            let meta = pg_peek_peer(&backend, &key_id).await.unwrap();
+            assert_eq!(meta.1, variant.as_wire_str());
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn update_peer_notes_round_trip_pg() {
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let key_id = format!("peer-notes-{}", uuid_like());
+        backend
+            .add_peer_record(&key_id, "AAAA", "agent", None)
+            .await
+            .unwrap();
+        let meta = pg_peek_peer(&backend, &key_id).await.unwrap();
+        assert!(meta.2.is_none());
+        backend
+            .update_peer_notes(&key_id, Some("ops".into()))
+            .await
+            .unwrap();
+        let meta = pg_peek_peer(&backend, &key_id).await.unwrap();
+        assert_eq!(meta.2.as_deref(), Some("ops"));
+        backend.update_peer_notes(&key_id, None).await.unwrap();
+        let meta = pg_peek_peer(&backend, &key_id).await.unwrap();
+        assert!(meta.2.is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn update_peer_policy_round_trip_pg() {
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let key_id = format!("peer-policy-{}", uuid_like());
+        backend
+            .add_peer_record(&key_id, "AAAA", "agent", None)
+            .await
+            .unwrap();
+        let blob = crate::federation::PeerPolicyBlob(serde_json::json!({
+            "rate": 60, "tags": ["x", "y"],
+        }));
+        backend
+            .update_peer_policy(&key_id, blob.clone())
+            .await
+            .unwrap();
+        let meta = pg_peek_peer(&backend, &key_id).await.unwrap();
+        assert_eq!(meta.3.expect("policy set"), blob.0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn update_peer_unknown_key_id_rejects_pg() {
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let err = backend
+            .update_peer_alias(&format!("ghost-{}", uuid_like()), None)
+            .await
+            .expect_err("must reject");
+        assert!(matches!(err, crate::federation::Error::PeerNotFound { .. }));
+    }
+
+    /// V051 CHECK constraint catches direct-SQL bypass — a value
+    /// outside the closed-set vocabulary must fail at the DB layer.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn peer_metadata_trust_check_rejects_direct_sql_bypass_pg() {
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let key_id = format!("peer-check-{}", uuid_like());
+        backend
+            .add_peer_record(&key_id, "AAAA", "agent", None)
+            .await
+            .unwrap();
+        let client = backend.get_client().await.unwrap();
+        let res = client
+            .execute(
+                "UPDATE cirislens.federation_peer_metadata SET trust = 'mystery' WHERE key_id = $1",
+                &[&key_id],
+            )
+            .await;
+        assert!(
+            res.is_err(),
+            "direct-SQL bypass of trust CHECK must fail; got: {res:?}"
         );
     }
 }

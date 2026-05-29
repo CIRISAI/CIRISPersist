@@ -104,8 +104,9 @@ pub use topology::{
     WithdrawalEntry, MAX_DELEGATION_DEPTH,
 };
 pub use types::{
-    Attestation, HybridPendingRow, KeyRecord, Revocation, SignedAttestation, SignedKeyRecord,
-    SignedRevocation, TrustFilter, TrustGrant, TrustRelationship, TrustRow, TrustType,
+    Attestation, HybridPendingRow, KeyRecord, PeerMetadataRow, PeerPolicyBlob, Revocation,
+    SignedAttestation, SignedKeyRecord, SignedRevocation, TrustClass, TrustFilter, TrustGrant,
+    TrustRelationship, TrustRow, TrustType,
 };
 
 /// Federation directory trait — the registry/lens/agent's read+write
@@ -429,6 +430,134 @@ pub trait FederationDirectory: Send + Sync {
             "retire_goal not implemented for this backend".into(),
         ))
     }
+
+    // ── Peer-mutation surface (v3.1.0, CIRISPersist#117) ───────────
+    //
+    // Unblocks CIRISEdge v0.13.0's `PEER_MUTATION_FOLLOWUP` stubs in
+    // `src/ffi/uniffi_impl.rs`. Operator-driven writes against the
+    // V051 `federation_peer_metadata` sibling table. Access control
+    // for these methods is enforced OUTSIDE persist (the UniFFI layer
+    // is operator-local); persist's responsibility is value-domain
+    // validation — typed errors, no silent coercion.
+    //
+    // Defaults route to `Error::Backend(...)` so backends that
+    // haven't been ported yet compile cleanly. The real backends
+    // (memory, postgres, sqlite) override every method.
+
+    /// Insert a new peer row. Atomically:
+    /// 1. Inserts a minimal `federation_keys` identity row carrying
+    ///    `key_id`, `pubkey_ed25519_base64`, `identity_type`.
+    /// 2. Inserts the sibling `federation_peer_metadata` row with
+    ///    default `trust = TrustClass::Untrusted` + the supplied
+    ///    `transport_identity`.
+    ///
+    /// Both writes happen in a single transaction; either both land
+    /// or neither does.
+    ///
+    /// Errors:
+    /// - [`Error::Conflict`] when `key_id` already exists with
+    ///   different content.
+    /// - [`Error::InvalidArgument`] when `key_id` /
+    ///   `pubkey_ed25519_base64` / `identity_type` are empty.
+    async fn add_peer_record(
+        &self,
+        key_id: &str,
+        pubkey_ed25519_base64: &str,
+        identity_type: &str,
+        transport_identity: Option<String>,
+    ) -> Result<(), Error> {
+        let _ = (
+            key_id,
+            pubkey_ed25519_base64,
+            identity_type,
+            transport_identity,
+        );
+        Err(Error::Backend(
+            "add_peer_record not implemented for this backend".into(),
+        ))
+    }
+
+    /// Remove a peer row. Two modes:
+    /// - `hard = false` (recommended): marks
+    ///   `federation_peer_metadata.removed_at = NOW()`; subsequent
+    ///   reads filter the row out. The federation_keys row is
+    ///   preserved — the audit trail of "this peer was once a peer"
+    ///   stays intact.
+    /// - `hard = true`: DELETEs the federation_keys row in the same
+    ///   transaction; the FK ON DELETE CASCADE removes the
+    ///   federation_peer_metadata row too. **Rejected** with
+    ///   [`Error::HardRemoveWithActiveAttestations`] when the peer
+    ///   still has rows in `federation_attestations` —
+    ///   hard-removing would orphan the attestation_envelope. Caller
+    ///   must either soft-remove (preserve the audit trail) OR
+    ///   explicitly revoke the key first.
+    ///
+    /// Errors:
+    /// - [`Error::PeerNotFound`] when no peer row exists for
+    ///   `key_id`.
+    /// - [`Error::HardRemoveWithActiveAttestations`] when `hard =
+    ///   true` and the peer has active attestations.
+    async fn remove_peer_record(&self, key_id: &str, hard: bool) -> Result<(), Error> {
+        let _ = (key_id, hard);
+        Err(Error::Backend(
+            "remove_peer_record not implemented for this backend".into(),
+        ))
+    }
+
+    /// Set the peer's operator-local alias. `None` clears it. Bumps
+    /// `updated_at` and recomputes `persist_row_hash`.
+    ///
+    /// Errors:
+    /// - [`Error::PeerNotFound`] when no peer row exists for
+    ///   `key_id`.
+    async fn update_peer_alias(&self, key_id: &str, alias: Option<String>) -> Result<(), Error> {
+        let _ = (key_id, alias);
+        Err(Error::Backend(
+            "update_peer_alias not implemented for this backend".into(),
+        ))
+    }
+
+    /// Set the peer's operator-trust class. Typed enum (no silent
+    /// coercion of unrecognized strings). Bumps `updated_at` and
+    /// recomputes `persist_row_hash`.
+    ///
+    /// Errors:
+    /// - [`Error::PeerNotFound`] when no peer row exists for
+    ///   `key_id`.
+    async fn update_peer_trust(&self, key_id: &str, trust: TrustClass) -> Result<(), Error> {
+        let _ = (key_id, trust);
+        Err(Error::Backend(
+            "update_peer_trust not implemented for this backend".into(),
+        ))
+    }
+
+    /// Set the peer's operator-local notes. `None` clears the field.
+    /// Bumps `updated_at` and recomputes `persist_row_hash`.
+    ///
+    /// Errors:
+    /// - [`Error::PeerNotFound`] when no peer row exists for
+    ///   `key_id`.
+    async fn update_peer_notes(&self, key_id: &str, notes: Option<String>) -> Result<(), Error> {
+        let _ = (key_id, notes);
+        Err(Error::Backend(
+            "update_peer_notes not implemented for this backend".into(),
+        ))
+    }
+
+    /// Set the peer's opaque policy blob. Persist round-trips the
+    /// JSON verbatim; the shape is owned by the consumer (CIRISEdge
+    /// UniFFI's `PeerPolicy`). Bumps `updated_at` and recomputes
+    /// `persist_row_hash`.
+    ///
+    /// Errors:
+    /// - [`Error::PeerNotFound`] when no peer row exists for
+    ///   `key_id`.
+    async fn update_peer_policy(&self, key_id: &str, policy: PeerPolicyBlob) -> Result<(), Error> {
+        let _ = (key_id, policy);
+        Err(Error::Backend(
+            "update_peer_policy not implemented for this backend".into(),
+        ))
+    }
 }
 
 /// Federation directory errors. Distinct from
@@ -620,6 +749,36 @@ pub enum Error {
         max_age_secs: u64,
     },
 
+    /// v3.1.0 (CIRISPersist#117). The peer-mutation surface was
+    /// called with a `key_id` that has no row in
+    /// `federation_peer_metadata`. Distinct from
+    /// [`Error::InvalidArgument`] so consumers can deterministically
+    /// pattern-match the "you addressed an unknown peer" outcome.
+    #[error("peer record not found for key_id={key_id}")]
+    PeerNotFound {
+        /// The `key_id` the caller addressed.
+        key_id: String,
+    },
+
+    /// v3.1.0 (CIRISPersist#117). [`FederationDirectory::remove_peer_record`]
+    /// was called with `hard = true` against a peer that still has
+    /// `federation_attestations` rows attesting to / from / scrubbed-by
+    /// the key. A hard remove would orphan those attestations'
+    /// `attestation_envelope` (the federation_keys row they reference
+    /// would disappear). The caller MUST either soft-remove (preserve
+    /// the audit trail) OR explicitly revoke the key first.
+    #[error(
+        "hard remove of peer with active attestations rejected — \
+         use soft remove or revoke the key first; key_id={key_id}, \
+         attestation_count={attestation_count}"
+    )]
+    HardRemoveWithActiveAttestations {
+        /// The `key_id` the caller tried to hard-remove.
+        key_id: String,
+        /// The count of attestations that would have been orphaned.
+        attestation_count: usize,
+    },
+
     /// Backend-level error (DB connection, serialization, etc.).
     /// String-typed because each backend has its own error tree.
     #[error("backend: {0}")]
@@ -650,6 +809,10 @@ impl Error {
                 "federation_attestation_evidence_incomplete"
             }
             Error::AttestationEvidenceStale { .. } => "federation_attestation_evidence_stale",
+            Error::PeerNotFound { .. } => "federation_peer_not_found",
+            Error::HardRemoveWithActiveAttestations { .. } => {
+                "federation_hard_remove_with_active_attestations"
+            }
             Error::Backend(_) => "federation_backend",
         }
     }

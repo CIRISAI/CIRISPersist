@@ -2240,6 +2240,547 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         }
         Ok(())
     }
+
+    // ── Peer-mutation surface (v3.1.0, CIRISPersist#117) ───────────
+
+    async fn add_peer_record(
+        &self,
+        key_id: &str,
+        pubkey_ed25519_base64: &str,
+        identity_type: &str,
+        transport_identity: Option<String>,
+    ) -> Result<(), crate::federation::Error> {
+        if key_id.is_empty() {
+            return Err(crate::federation::Error::InvalidArgument(
+                "key_id must be non-empty".into(),
+            ));
+        }
+        if pubkey_ed25519_base64.is_empty() {
+            return Err(crate::federation::Error::InvalidArgument(
+                "pubkey_ed25519_base64 must be non-empty".into(),
+            ));
+        }
+        if identity_type.is_empty() {
+            return Err(crate::federation::Error::InvalidArgument(
+                "identity_type must be non-empty".into(),
+            ));
+        }
+
+        let now = chrono::Utc::now();
+        // Build the federation_keys row with its persist_row_hash.
+        let mut key = crate::federation::KeyRecord {
+            key_id: key_id.to_owned(),
+            pubkey_ed25519_base64: pubkey_ed25519_base64.to_owned(),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+            identity_type: identity_type.to_owned(),
+            identity_ref: key_id.to_owned(),
+            valid_from: now,
+            valid_until: None,
+            registration_envelope: serde_json::json!({"peer_added_by_operator": true}),
+            original_content_hash: "00".repeat(32),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: key_id.to_owned(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+        };
+        key.persist_row_hash = crate::federation::types::compute_persist_row_hash(&key)?;
+
+        let mut meta = crate::federation::PeerMetadataRow {
+            key_id: key_id.to_owned(),
+            alias: None,
+            trust: crate::federation::TrustClass::Untrusted,
+            notes: None,
+            policy_blob: None,
+            transport_identity: transport_identity.clone(),
+            removed_at: None,
+            inserted_at: now,
+            updated_at: now,
+            persist_row_hash: String::new(),
+        };
+        meta.persist_row_hash = crate::federation::types::compute_persist_row_hash(&meta)?;
+
+        // Stringify fields ahead of the spawn_blocking boundary.
+        let original_content_hash = hex::decode(&key.original_content_hash).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!(
+                "original_content_hash hex decode: {e}"
+            ))
+        })?;
+        let registration_envelope_text = serde_json::to_string(&key.registration_envelope)
+            .map_err(|e| crate::federation::Error::Backend(format!("envelope serialize: {e}")))?;
+        let valid_from_str = key.valid_from.to_rfc3339();
+        let scrub_timestamp_str = key.scrub_timestamp.to_rfc3339();
+        let now_str = now.to_rfc3339();
+        let meta_hash = meta.persist_row_hash.clone();
+        let key_hash = key.persist_row_hash.clone();
+        let key_id_owned = key.key_id.clone();
+        let pubkey_owned = key.pubkey_ed25519_base64.clone();
+        let algorithm_owned = key.algorithm.clone();
+        let identity_type_owned = key.identity_type.clone();
+        let identity_ref_owned = key.identity_ref.clone();
+        let scrub_key_id_owned = key.scrub_key_id.clone();
+        let scrub_classical_owned = key.scrub_signature_classical.clone();
+        let transport_owned = meta.transport_identity.clone();
+
+        let conn = self.conn.clone();
+        let outcome = tokio::task::spawn_blocking(
+            move || -> Result<Result<(), crate::federation::Error>, rusqlite::Error> {
+                let mut conn = conn.blocking_lock();
+                let tx = conn.transaction()?;
+
+                // federation_keys ON CONFLICT DO NOTHING.
+                tx.execute(
+                    "INSERT INTO federation_keys (\
+                        key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
+                        identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
+                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
+                        attestation_evidence\
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18) \
+                     ON CONFLICT(key_id) DO NOTHING",
+                    rusqlite::params![
+                        key_id_owned,
+                        pubkey_owned,
+                        Option::<String>::None,
+                        algorithm_owned,
+                        identity_type_owned,
+                        identity_ref_owned,
+                        valid_from_str,
+                        Option::<String>::None,
+                        registration_envelope_text,
+                        original_content_hash,
+                        scrub_classical_owned,
+                        Option::<String>::None,
+                        scrub_key_id_owned,
+                        scrub_timestamp_str,
+                        Option::<String>::None,
+                        key_hash,
+                        Option::<String>::None,
+                        Option::<String>::None,
+                    ],
+                )?;
+
+                // Verify pubkey conflict (existing key with different pubkey
+                // → Conflict).
+                let existing_pubkey: Option<String> = tx
+                    .query_row(
+                        "SELECT pubkey_ed25519_base64 FROM federation_keys WHERE key_id = ?1",
+                        [&key_id_owned],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(existing) = existing_pubkey {
+                    if existing != pubkey_owned {
+                        return Ok(Err(crate::federation::Error::Conflict(format!(
+                            "key_id {key_id_owned} already exists with different pubkey"
+                        ))));
+                    }
+                }
+
+                // federation_peer_metadata — handle soft-removed re-add,
+                // idempotent matching transport, or conflict.
+                let existing: Option<(Option<String>, Option<String>)> = tx
+                    .query_row(
+                        "SELECT transport_identity, removed_at \
+                         FROM federation_peer_metadata WHERE key_id = ?1",
+                        [&key_id_owned],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                match existing {
+                    Some((_existing_transport, Some(_removed_at_text))) => {
+                        // Re-add.
+                        tx.execute(
+                            "UPDATE federation_peer_metadata SET \
+                                alias = NULL, trust = 'untrusted', notes = NULL, \
+                                policy_blob = NULL, transport_identity = ?2, \
+                                removed_at = NULL, inserted_at = ?3, updated_at = ?3, \
+                                persist_row_hash = ?4 \
+                             WHERE key_id = ?1",
+                            rusqlite::params![
+                                key_id_owned,
+                                transport_owned,
+                                now_str,
+                                meta_hash,
+                            ],
+                        )?;
+                    }
+                    Some((existing_transport, None)) => {
+                        if existing_transport == transport_owned {
+                            // idempotent no-op
+                        } else {
+                            return Ok(Err(crate::federation::Error::Conflict(format!(
+                                "peer_metadata row for key_id {key_id_owned} already exists with different transport_identity"
+                            ))));
+                        }
+                    }
+                    None => {
+                        tx.execute(
+                            "INSERT INTO federation_peer_metadata (\
+                                key_id, alias, trust, notes, policy_blob, \
+                                transport_identity, removed_at, inserted_at, updated_at, persist_row_hash\
+                             ) VALUES (?1, NULL, 'untrusted', NULL, NULL, ?2, NULL, ?3, ?3, ?4)",
+                            rusqlite::params![
+                                key_id_owned,
+                                transport_owned,
+                                now_str,
+                                meta_hash,
+                            ],
+                        )?;
+                    }
+                }
+
+                tx.commit()?;
+                Ok(Ok(()))
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("add_peer_record sqlite: {e}"))
+        })?;
+        outcome
+    }
+
+    async fn remove_peer_record(
+        &self,
+        key_id: &str,
+        hard: bool,
+    ) -> Result<(), crate::federation::Error> {
+        let key_id_owned = key_id.to_owned();
+        let now = chrono::Utc::now();
+        let now_str = now.to_rfc3339();
+        let conn = self.conn.clone();
+
+        let outcome = tokio::task::spawn_blocking(
+            move || -> Result<Result<(), crate::federation::Error>, rusqlite::Error> {
+                let mut conn = conn.blocking_lock();
+                let tx = conn.transaction()?;
+
+                // Live-row gate. removed_at TEXT — IS NULL means live.
+                let live: Option<i64> = tx
+                    .query_row(
+                        "SELECT 1 FROM federation_peer_metadata \
+                         WHERE key_id = ?1 AND removed_at IS NULL",
+                        [&key_id_owned],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if live.is_none() {
+                    return Ok(Err(crate::federation::Error::PeerNotFound {
+                        key_id: key_id_owned.clone(),
+                    }));
+                }
+
+                if hard {
+                    let count: i64 = tx.query_row(
+                        "SELECT COUNT(*) FROM federation_attestations \
+                         WHERE attesting_key_id = ?1 OR attested_key_id = ?1 OR scrub_key_id = ?1",
+                        [&key_id_owned],
+                        |r| r.get(0),
+                    )?;
+                    if count > 0 {
+                        return Ok(Err(
+                            crate::federation::Error::HardRemoveWithActiveAttestations {
+                                key_id: key_id_owned.clone(),
+                                attestation_count: count as usize,
+                            },
+                        ));
+                    }
+                    // DELETE federation_keys — FK ON DELETE CASCADE on
+                    // federation_peer_metadata cleans up the sibling.
+                    tx.execute(
+                        "DELETE FROM federation_keys WHERE key_id = ?1",
+                        [&key_id_owned],
+                    )?;
+                } else {
+                    // Soft-remove: bump removed_at + updated_at +
+                    // recompute persist_row_hash from the mutated row.
+                    let row = tx.query_row(
+                        "SELECT key_id, alias, trust, notes, policy_blob, \
+                                transport_identity, inserted_at \
+                         FROM federation_peer_metadata WHERE key_id = ?1",
+                        [&key_id_owned],
+                        |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, Option<String>>(1)?,
+                                r.get::<_, String>(2)?,
+                                r.get::<_, Option<String>>(3)?,
+                                r.get::<_, Option<String>>(4)?,
+                                r.get::<_, Option<String>>(5)?,
+                                r.get::<_, String>(6)?,
+                            ))
+                        },
+                    )?;
+                    let new_row = sqlite_row_tuple_to_peer_metadata(row, Some(now), now)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                    let new_hash = crate::federation::types::compute_persist_row_hash(&new_row)
+                        .map_err(|e| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(
+                                std::io::Error::other(format!("hash: {e}")),
+                            ))
+                        })?;
+                    tx.execute(
+                        "UPDATE federation_peer_metadata SET \
+                            removed_at = ?2, updated_at = ?2, persist_row_hash = ?3 \
+                         WHERE key_id = ?1",
+                        rusqlite::params![key_id_owned, now_str, new_hash],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(Ok(()))
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("remove_peer_record sqlite: {e}"))
+        })?;
+        outcome
+    }
+
+    async fn update_peer_alias(
+        &self,
+        key_id: &str,
+        alias: Option<String>,
+    ) -> Result<(), crate::federation::Error> {
+        sqlite_update_peer_field(self, key_id, SqlitePeerUpdate::Alias(alias)).await
+    }
+
+    async fn update_peer_trust(
+        &self,
+        key_id: &str,
+        trust: crate::federation::TrustClass,
+    ) -> Result<(), crate::federation::Error> {
+        sqlite_update_peer_field(self, key_id, SqlitePeerUpdate::Trust(trust)).await
+    }
+
+    async fn update_peer_notes(
+        &self,
+        key_id: &str,
+        notes: Option<String>,
+    ) -> Result<(), crate::federation::Error> {
+        sqlite_update_peer_field(self, key_id, SqlitePeerUpdate::Notes(notes)).await
+    }
+
+    async fn update_peer_policy(
+        &self,
+        key_id: &str,
+        policy: crate::federation::PeerPolicyBlob,
+    ) -> Result<(), crate::federation::Error> {
+        sqlite_update_peer_field(self, key_id, SqlitePeerUpdate::Policy(policy)).await
+    }
+}
+
+// ─── Peer-metadata update helpers (v3.1.0, CIRISPersist#117) ───────
+
+/// Row-tuple shape read from `federation_peer_metadata` for the
+/// canonical-hash hydrator. Order: `key_id, alias, trust, notes,
+/// policy_blob, transport_identity, inserted_at`.
+type PeerMetadataRowTuple = (
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
+/// Row-tuple shape that adds `removed_at` for the update path.
+type PeerMetadataRowTupleWithRemoved = (
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+);
+
+enum SqlitePeerUpdate {
+    Alias(Option<String>),
+    Trust(crate::federation::TrustClass),
+    Notes(Option<String>),
+    Policy(crate::federation::PeerPolicyBlob),
+}
+
+/// Hydrate a row-tuple read from federation_peer_metadata into a
+/// [`crate::federation::PeerMetadataRow`] suitable for canonical-bytes
+/// hashing. `removed_at_override` lets the soft-remove path stamp the
+/// new `removed_at` without a second SELECT after UPDATE.
+fn sqlite_row_tuple_to_peer_metadata(
+    row: PeerMetadataRowTuple,
+    removed_at_override: Option<chrono::DateTime<chrono::Utc>>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+) -> Result<crate::federation::PeerMetadataRow, crate::federation::Error> {
+    let (key_id, alias, trust_str, notes, policy_text, transport_identity, inserted_at_text) = row;
+    let trust = crate::federation::TrustClass::from_wire_str(&trust_str).ok_or_else(|| {
+        crate::federation::Error::Backend(format!(
+            "federation_peer_metadata.trust has unrecognized value {trust_str:?} \
+             (CHECK constraint bypass — direct SQL write?)"
+        ))
+    })?;
+    let policy_blob = match policy_text {
+        Some(text) => Some(crate::federation::PeerPolicyBlob(
+            serde_json::from_str(&text).map_err(|e| {
+                crate::federation::Error::Backend(format!("policy_blob JSON decode: {e}"))
+            })?,
+        )),
+        None => None,
+    };
+    let inserted_at = chrono::DateTime::parse_from_rfc3339(&inserted_at_text)
+        .map_err(|e| crate::federation::Error::Backend(format!("inserted_at parse: {e}")))?
+        .with_timezone(&chrono::Utc);
+    Ok(crate::federation::PeerMetadataRow {
+        key_id,
+        alias,
+        trust,
+        notes,
+        policy_blob,
+        transport_identity,
+        removed_at: removed_at_override,
+        inserted_at,
+        updated_at,
+        persist_row_hash: String::new(),
+    })
+}
+
+async fn sqlite_update_peer_field(
+    backend: &SqliteBackend,
+    key_id: &str,
+    update: SqlitePeerUpdate,
+) -> Result<(), crate::federation::Error> {
+    let key_id_owned = key_id.to_owned();
+    let now = chrono::Utc::now();
+    let now_str = now.to_rfc3339();
+    let conn = backend.conn.clone();
+    let outcome = tokio::task::spawn_blocking(
+        move || -> Result<Result<(), crate::federation::Error>, rusqlite::Error> {
+            let mut conn = conn.blocking_lock();
+            let tx = conn.transaction()?;
+
+            // Fetch live-row tuple; PeerNotFound on missing or
+            // soft-removed.
+            let row_opt: Option<PeerMetadataRowTupleWithRemoved> = tx
+                .query_row(
+                    "SELECT key_id, alias, trust, notes, policy_blob, \
+                            transport_identity, inserted_at, removed_at \
+                     FROM federation_peer_metadata WHERE key_id = ?1",
+                    [&key_id_owned],
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                            r.get(7)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let row = match row_opt {
+                None => {
+                    return Ok(Err(crate::federation::Error::PeerNotFound {
+                        key_id: key_id_owned.clone(),
+                    }));
+                }
+                Some(r) => r,
+            };
+            if row.7.is_some() {
+                return Ok(Err(crate::federation::Error::PeerNotFound {
+                    key_id: key_id_owned.clone(),
+                }));
+            }
+
+            let mut mut_row = match sqlite_row_tuple_to_peer_metadata(
+                (
+                    row.0.clone(),
+                    row.1.clone(),
+                    row.2.clone(),
+                    row.3.clone(),
+                    row.4.clone(),
+                    row.5.clone(),
+                    row.6.clone(),
+                ),
+                None,
+                now,
+            ) {
+                Ok(r) => r,
+                Err(e) => return Ok(Err(e)),
+            };
+            mut_row.updated_at = now;
+
+            match &update {
+                SqlitePeerUpdate::Alias(v) => mut_row.alias = v.clone(),
+                SqlitePeerUpdate::Trust(v) => mut_row.trust = *v,
+                SqlitePeerUpdate::Notes(v) => mut_row.notes = v.clone(),
+                SqlitePeerUpdate::Policy(v) => mut_row.policy_blob = Some(v.clone()),
+            }
+            let new_hash = match crate::federation::types::compute_persist_row_hash(&mut_row) {
+                Ok(h) => h,
+                Err(e) => return Ok(Err(e)),
+            };
+
+            match update {
+                SqlitePeerUpdate::Alias(_) => {
+                    tx.execute(
+                        "UPDATE federation_peer_metadata SET \
+                            alias = ?2, updated_at = ?3, persist_row_hash = ?4 \
+                         WHERE key_id = ?1",
+                        rusqlite::params![key_id_owned, mut_row.alias, now_str, new_hash],
+                    )?;
+                }
+                SqlitePeerUpdate::Trust(_) => {
+                    let wire = mut_row.trust.as_wire_str().to_owned();
+                    tx.execute(
+                        "UPDATE federation_peer_metadata SET \
+                            trust = ?2, updated_at = ?3, persist_row_hash = ?4 \
+                         WHERE key_id = ?1",
+                        rusqlite::params![key_id_owned, wire, now_str, new_hash],
+                    )?;
+                }
+                SqlitePeerUpdate::Notes(_) => {
+                    tx.execute(
+                        "UPDATE federation_peer_metadata SET \
+                            notes = ?2, updated_at = ?3, persist_row_hash = ?4 \
+                         WHERE key_id = ?1",
+                        rusqlite::params![key_id_owned, mut_row.notes, now_str, new_hash],
+                    )?;
+                }
+                SqlitePeerUpdate::Policy(_) => {
+                    let policy_text: Option<String> =
+                        match &mut_row.policy_blob {
+                            Some(p) => Some(serde_json::to_string(p.as_value()).map_err(|e| {
+                                rusqlite::Error::ToSqlConversionFailure(Box::new(e))
+                            })?),
+                            None => None,
+                        };
+                    tx.execute(
+                        "UPDATE federation_peer_metadata SET \
+                            policy_blob = ?2, updated_at = ?3, persist_row_hash = ?4 \
+                         WHERE key_id = ?1",
+                        rusqlite::params![key_id_owned, policy_text, now_str, new_hash],
+                    )?;
+                }
+            }
+            tx.commit()?;
+            Ok(Ok(()))
+        },
+    )
+    .await
+    .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+    .map_err(|e| crate::federation::Error::Backend(format!("update_peer_* sqlite: {e}")))?;
+    outcome
 }
 
 // ─── BlobStorage impl (v2.3, CIRISPersist#103) ─────────────────────
@@ -11369,5 +11910,285 @@ mod tests {
             .await
             .expect_err("missing goal_id must reject");
         assert!(matches!(err, crate::federation::Error::InvalidArgument(_)));
+    }
+
+    // ── v3.1.0 (CIRISPersist#117) — peer-mutation surface ──────────
+
+    /// Read-helper for tests — peek at `federation_peer_metadata`.
+    async fn peek_peer_sqlite(
+        backend: &SqliteBackend,
+        key_id: &str,
+    ) -> Option<(
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> {
+        let key_id = key_id.to_owned();
+        let conn = backend.conn.clone();
+        tokio::task::spawn_blocking(move || -> Option<_> {
+            let conn = conn.blocking_lock();
+            conn.query_row(
+                "SELECT alias, trust, notes, policy_blob, transport_identity, removed_at \
+                 FROM federation_peer_metadata WHERE key_id = ?1",
+                [&key_id],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .ok()
+            .flatten()
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    async fn peek_key_exists_sqlite(backend: &SqliteBackend, key_id: &str) -> bool {
+        let key_id = key_id.to_owned();
+        let conn = backend.conn.clone();
+        tokio::task::spawn_blocking(move || -> bool {
+            let conn = conn.blocking_lock();
+            conn.query_row(
+                "SELECT 1 FROM federation_keys WHERE key_id = ?1",
+                [&key_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .is_some()
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn add_peer_record_creates_both_rows_atomically_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .add_peer_record("peer-a", "AAAA", "agent", Some("rns://abc".into()))
+            .await
+            .unwrap();
+        assert!(peek_key_exists_sqlite(&backend, "peer-a").await);
+        let meta = peek_peer_sqlite(&backend, "peer-a").await.expect("row");
+        assert_eq!(meta.1, "untrusted");
+        assert_eq!(meta.4.as_deref(), Some("rns://abc"));
+        assert!(meta.5.is_none(), "removed_at NULL");
+    }
+
+    #[tokio::test]
+    async fn add_peer_record_duplicate_key_id_rejects_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .add_peer_record("peer-dup", "AAAA", "agent", None)
+            .await
+            .unwrap();
+        let err = backend
+            .add_peer_record("peer-dup", "BBBB", "agent", None)
+            .await
+            .expect_err("must reject pubkey conflict");
+        assert!(matches!(err, crate::federation::Error::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn remove_peer_record_soft_marks_removed_at_and_hides_from_reads_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .add_peer_record("peer-soft", "AAAA", "agent", None)
+            .await
+            .unwrap();
+        backend
+            .remove_peer_record("peer-soft", false)
+            .await
+            .unwrap();
+        let meta = peek_peer_sqlite(&backend, "peer-soft").await.expect("row");
+        assert!(meta.5.is_some(), "removed_at set");
+        // Updates against a soft-removed peer fail.
+        let err = backend
+            .update_peer_trust("peer-soft", crate::federation::TrustClass::Trusted)
+            .await
+            .expect_err("must reject");
+        assert!(matches!(err, crate::federation::Error::PeerNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn remove_peer_record_hard_with_active_attestations_rejects_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .add_peer_record("peer-att-a", "AAAA", "agent", None)
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("peer-att-b", "peer-att-b", "peer-att-b"),
+            })
+            .await
+            .unwrap();
+        // Attestation: peer-att-a attests peer-att-b. Need to satisfy
+        // the admission gate, so use the test fixture's known-good
+        // dimension shape.
+        let att = fed_attestation("a-1", "peer-att-a", "peer-att-b", "peer-att-a");
+        backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+        let err = backend
+            .remove_peer_record("peer-att-a", true)
+            .await
+            .expect_err("must reject orphaning");
+        assert!(matches!(
+            err,
+            crate::federation::Error::HardRemoveWithActiveAttestations { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn remove_peer_record_hard_with_no_attestations_cascades_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .add_peer_record("peer-hard", "AAAA", "agent", None)
+            .await
+            .unwrap();
+        backend.remove_peer_record("peer-hard", true).await.unwrap();
+        assert!(!peek_key_exists_sqlite(&backend, "peer-hard").await);
+        assert!(peek_peer_sqlite(&backend, "peer-hard").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_peer_alias_round_trip_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .add_peer_record("peer-alias", "AAAA", "agent", None)
+            .await
+            .unwrap();
+        backend
+            .update_peer_alias("peer-alias", Some("home".into()))
+            .await
+            .unwrap();
+        let meta = peek_peer_sqlite(&backend, "peer-alias").await.unwrap();
+        assert_eq!(meta.0.as_deref(), Some("home"));
+        backend.update_peer_alias("peer-alias", None).await.unwrap();
+        let meta = peek_peer_sqlite(&backend, "peer-alias").await.unwrap();
+        assert!(meta.0.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_peer_trust_round_trip_each_variant_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .add_peer_record("peer-trust", "AAAA", "agent", None)
+            .await
+            .unwrap();
+        for variant in [
+            crate::federation::TrustClass::Trusted,
+            crate::federation::TrustClass::Restricted,
+            crate::federation::TrustClass::Blocked,
+            crate::federation::TrustClass::Untrusted,
+        ] {
+            backend
+                .update_peer_trust("peer-trust", variant)
+                .await
+                .unwrap();
+            let meta = peek_peer_sqlite(&backend, "peer-trust").await.unwrap();
+            assert_eq!(meta.1, variant.as_wire_str(), "variant {variant:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn update_peer_notes_round_trip_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .add_peer_record("peer-notes", "AAAA", "agent", None)
+            .await
+            .unwrap();
+        let meta = peek_peer_sqlite(&backend, "peer-notes").await.unwrap();
+        assert!(meta.2.is_none());
+        backend
+            .update_peer_notes("peer-notes", Some("ops".into()))
+            .await
+            .unwrap();
+        let meta = peek_peer_sqlite(&backend, "peer-notes").await.unwrap();
+        assert_eq!(meta.2.as_deref(), Some("ops"));
+        backend.update_peer_notes("peer-notes", None).await.unwrap();
+        let meta = peek_peer_sqlite(&backend, "peer-notes").await.unwrap();
+        assert!(meta.2.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_peer_policy_round_trip_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .add_peer_record("peer-policy", "AAAA", "agent", None)
+            .await
+            .unwrap();
+        let blob = crate::federation::PeerPolicyBlob(serde_json::json!({
+            "rate": 60, "tags": ["x", "y"],
+        }));
+        backend
+            .update_peer_policy("peer-policy", blob)
+            .await
+            .unwrap();
+        let meta = peek_peer_sqlite(&backend, "peer-policy").await.unwrap();
+        let decoded: serde_json::Value =
+            serde_json::from_str(meta.3.as_deref().expect("policy_blob set")).unwrap();
+        assert_eq!(decoded["rate"], serde_json::json!(60));
+        assert_eq!(decoded["tags"], serde_json::json!(["x", "y"]));
+    }
+
+    #[tokio::test]
+    async fn update_peer_unknown_key_id_rejects_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let err = backend
+            .update_peer_alias("ghost", None)
+            .await
+            .expect_err("must reject");
+        assert!(matches!(err, crate::federation::Error::PeerNotFound { .. }));
+    }
+
+    /// V051 CHECK constraint catches direct-SQL bypass — a value
+    /// outside the closed-set vocabulary must fail at the DB layer.
+    #[tokio::test]
+    async fn peer_metadata_trust_check_rejects_direct_sql_bypass_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .add_peer_record("peer-check", "AAAA", "agent", None)
+            .await
+            .unwrap();
+        let conn = backend.conn.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE federation_peer_metadata SET trust = 'mystery' WHERE key_id = ?1",
+                ["peer-check"],
+            )
+        })
+        .await
+        .unwrap();
+        assert!(
+            res.is_err(),
+            "direct-SQL bypass of trust CHECK must fail; got Ok"
+        );
     }
 }

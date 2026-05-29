@@ -3209,6 +3209,262 @@ impl PyEngine {
         })
     }
 
+    // ── v3.1.0 (CIRISPersist#117) — peer-mutation surface ──────────
+    //
+    // Mirrors the six new FederationDirectory methods that unblock
+    // CIRISEdge v0.13.0 UniFFI peer-mgmt stubs (`PEER_MUTATION_FOLLOWUP`).
+    // JSON-shaped argument inputs follow the existing `*_json`
+    // convention so the surface is uniform with `put_public_key` /
+    // `put_attestation` / `put_blob_json`. Trust values cross the wire
+    // as the snake_case TEXT-column form (`untrusted` / `trusted` /
+    // `restricted` / `blocked`); the typed Rust enum decodes on the
+    // way in. Errors route through `federation_err_to_py` per the
+    // AV-15 stable-kind-tokens taxonomy; new kind tokens are
+    // `federation_peer_not_found` and
+    // `federation_hard_remove_with_active_attestations`.
+
+    /// Federation directory: add a peer record. Atomically inserts a
+    /// federation_keys identity row + a federation_peer_metadata row
+    /// with default `trust = "untrusted"`.
+    ///
+    /// `payload_json` shape:
+    /// ```json
+    /// {
+    ///   "key_id": "...",
+    ///   "pubkey_ed25519_base64": "...",
+    ///   "identity_type": "...",
+    ///   "transport_identity": "...|null"
+    /// }
+    /// ```
+    fn add_peer_record_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let payload: AddPeerRecordPayload = serde_json::from_str(payload_json)
+                .map_err(|e| PyValueError::new_err(format!("add_peer_record_json decode: {e}")))?;
+            py.detach(|| match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        backend
+                            .add_peer_record(
+                                &payload.key_id,
+                                &payload.pubkey_ed25519_base64,
+                                &payload.identity_type,
+                                payload.transport_identity,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        backend
+                            .add_peer_record(
+                                &payload.key_id,
+                                &payload.pubkey_ed25519_base64,
+                                &payload.identity_type,
+                                payload.transport_identity,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
+    /// Federation directory: remove a peer record. `hard=false`
+    /// soft-marks `removed_at`; `hard=true` cascades through the FK to
+    /// delete the federation_keys row (rejected with
+    /// `federation_hard_remove_with_active_attestations` if there are
+    /// outstanding attestations).
+    fn remove_peer_record(&self, py: Python<'_>, key_id: &str, hard: bool) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key_id = key_id.to_owned();
+            py.detach(|| match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        backend
+                            .remove_peer_record(&key_id, hard)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        backend
+                            .remove_peer_record(&key_id, hard)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
+    /// Federation directory: set peer alias. `alias_json` is the
+    /// JSON-encoded value (e.g. `"null"`, `"\"my-peer\""`) so `None`
+    /// can be distinguished from empty-string at the wire.
+    fn update_peer_alias(&self, py: Python<'_>, key_id: &str, alias_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key_id = key_id.to_owned();
+            let alias: Option<String> = serde_json::from_str(alias_json)
+                .map_err(|e| PyValueError::new_err(format!("alias_json decode: {e}")))?;
+            py.detach(|| match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        backend
+                            .update_peer_alias(&key_id, alias)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        backend
+                            .update_peer_alias(&key_id, alias)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
+    /// Federation directory: set peer trust class. `trust_wire` is
+    /// the snake_case TEXT form (`untrusted` / `trusted` /
+    /// `restricted` / `blocked`); unrecognized values raise
+    /// `ValueError`. No silent coercion.
+    fn update_peer_trust(&self, py: Python<'_>, key_id: &str, trust_wire: &str) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key_id = key_id.to_owned();
+            let trust =
+                crate::federation::TrustClass::from_wire_str(trust_wire).ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "trust_wire must be one of 'untrusted' | 'trusted' | \
+                         'restricted' | 'blocked' (got {trust_wire:?})"
+                    ))
+                })?;
+            py.detach(|| match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        backend
+                            .update_peer_trust(&key_id, trust)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        backend
+                            .update_peer_trust(&key_id, trust)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
+    /// Federation directory: set peer notes. `notes_json` is the
+    /// JSON-encoded value (e.g. `"null"`, `"\"contact ops\""`).
+    fn update_peer_notes(&self, py: Python<'_>, key_id: &str, notes_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key_id = key_id.to_owned();
+            let notes: Option<String> = serde_json::from_str(notes_json)
+                .map_err(|e| PyValueError::new_err(format!("notes_json decode: {e}")))?;
+            py.detach(|| match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        backend
+                            .update_peer_notes(&key_id, notes)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        backend
+                            .update_peer_notes(&key_id, notes)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
+    /// Federation directory: set peer policy blob. `policy_json` is
+    /// the JSON-encoded shape (any valid JSON value). Persist
+    /// round-trips it verbatim; the shape is owned by the consumer
+    /// (CIRISEdge UniFFI `PeerPolicy`).
+    fn update_peer_policy(&self, py: Python<'_>, key_id: &str, policy_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key_id = key_id.to_owned();
+            let value: serde_json::Value = serde_json::from_str(policy_json)
+                .map_err(|e| PyValueError::new_err(format!("policy_json decode: {e}")))?;
+            let policy = crate::federation::PeerPolicyBlob(value);
+            py.detach(|| match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        backend
+                            .update_peer_policy(&key_id, policy.clone())
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        backend
+                            .update_peer_policy(&key_id, policy.clone())
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
     // ── v2.3 (CIRISPersist#103) — BlobStorage PyO3 surface ─────────
     //
     // JSON in / JSON out. Inline bytes ride the wire as base64
@@ -15043,6 +15299,15 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         | crate::federation::Error::HardwareTypeNotAccepted { .. }
         | crate::federation::Error::AttestationEvidenceIncomplete { .. }
         | crate::federation::Error::AttestationEvidenceStale { .. } => PyValueError::new_err(kind),
+        // v3.1.0 (CIRISPersist#117) — peer-mutation surface typed
+        // errors. PeerNotFound is caller-addresses-unknown-key (4xx
+        // shape); HardRemoveWithActiveAttestations is caller-asked-
+        // for-orphaning-write (4xx shape — the caller can recover by
+        // soft-removing or revoking first).
+        crate::federation::Error::PeerNotFound { .. }
+        | crate::federation::Error::HardRemoveWithActiveAttestations { .. } => {
+            PyValueError::new_err(kind)
+        }
         // Rate-limit → RuntimeError; lens maps to 429.
         crate::federation::Error::RateLimited { .. } => PyRuntimeError::new_err(kind),
         // Server-fault → RuntimeError (5xx).
@@ -15066,6 +15331,19 @@ fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
         | crate::federation::BlobError::AttestationEmissionFailed(_) => PyValueError::new_err(kind),
         crate::federation::BlobError::Backend(_) => PyRuntimeError::new_err(kind),
     }
+}
+
+/// v3.1.0 (CIRISPersist#117) — Wire-shape for `add_peer_record_json`.
+/// All four fields are required at the wire (with
+/// `transport_identity` allowed to be `null`); the PyO3 wrapper
+/// deserializes once and hands the typed shape to the backend.
+#[derive(serde::Deserialize)]
+struct AddPeerRecordPayload {
+    key_id: String,
+    pubkey_ed25519_base64: String,
+    identity_type: String,
+    #[serde(default)]
+    transport_identity: Option<String>,
 }
 
 /// v2.3 (CIRISPersist#103) — decoded `put_blob_json` payload (Rust-side

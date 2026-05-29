@@ -5,6 +5,76 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.1.0] — 2026-05-28
+
+**CIRISPersist 3.1 — peer-mutation surface on `FederationDirectory` (#117 / unblocks CIRISEdge v0.13.0 peer-mgmt UniFFI stubs).**
+
+The release that closes **#117** in full: 6 new async mutation methods on `FederationDirectory` for operator-driven peer management, a new sibling table `federation_peer_metadata` (V051) carrying operator-local per-instance metadata, two new typed types (`TrustClass` enum + `PeerPolicyBlob` opaque newtype), two new typed errors with stable `AV-15` kind tokens, and PyO3 mirrors. Unblocks CIRISEdge v0.13.0's 7 UniFFI peer-mgmt stubs (the `PEER_MUTATION_FOLLOWUP` constant).
+
+### Six new `FederationDirectory` methods (object-safe `#[async_trait]`)
+
+- `add_peer_record(key_id, pubkey_ed25519_base64, identity_type, transport_identity)` — atomic insert of both the `federation_keys` identity row and the `federation_peer_metadata` row with default `trust = Untrusted`. Idempotent on matching pubkey; rejects with `Conflict` on differing pubkey.
+- `remove_peer_record(key_id, hard: bool)` — soft (default) marks `removed_at = NOW()` and hides the row from reads while preserving the audit trail; hard cascades delete through the FK. Hard remove with active attestations rejects via the new `HardRemoveWithActiveAttestations` typed error — operator must soft-remove or revoke the key first.
+- `update_peer_alias` / `update_peer_notes` — string field updates with `None`/`Some` semantics distinguished end-to-end.
+- `update_peer_trust(key_id, TrustClass)` — typed-enum value-domain validation; no silent coercion.
+- `update_peer_policy(key_id, PeerPolicyBlob)` — opaque JSON blob round-trip.
+
+All return `Result<(), federation::Error>`; missing-row paths return the new `PeerNotFound` typed error.
+
+### V051 migration — sibling `federation_peer_metadata` table
+
+The design call: **operator-local per-instance metadata** lives outside `federation_keys` so the federation-shared identity row stays clean. One persist instance's view of a peer (`alias = "edge-east-1"`, `trust = Trusted`, operator notes, policy blob) differs from another's; the federation_keys row (pubkey + scrub envelope + identity_type) is the same across every member. Trust-boundary clarity per CIRIS Accord §I operator-autonomy framing.
+
+```sql
+key_id           TEXT NOT NULL PRIMARY KEY REFERENCES federation_keys(key_id) ON DELETE CASCADE,
+alias            TEXT NULL,
+trust            TEXT NOT NULL DEFAULT 'untrusted' CHECK (trust IN ('untrusted','trusted','restricted','blocked')),
+notes            TEXT NULL,
+policy_blob      JSONB NULL,
+transport_identity TEXT NULL,
+removed_at       TIMESTAMPTZ NULL,
+inserted_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+persist_row_hash TEXT NOT NULL
+```
+
+Partial indexes: `(trust) WHERE removed_at IS NULL`, `(alias) WHERE alias IS NOT NULL`. SQLite dialect parity (TEXT timestamps + TEXT-as-JSON policy_blob); `tests/qa_harness.rs` migration bound 50 → 51.
+
+### New typed surface
+
+- **`TrustClass`** enum (`Untrusted` / `Trusted` / `Restricted` / `Blocked`) with `as_wire_str()` / `from_wire_str()` mirroring `VerificationSource` (#91). Wire mapping pinned by the SQL CHECK constraint — same closed set on both sides.
+- **`PeerPolicyBlob`** — `#[serde(transparent)]` newtype around `serde_json::Value`. Opaque to persist; the operator-policy semantic lives at the CIRISEdge UniFFI layer.
+- **`PeerMetadataRow`** — read shape carrying server-computed `persist_row_hash` via the same `compute_persist_row_hash` discipline as `KeyRecord` / `Attestation` / `Revocation`.
+
+### Two new typed errors on `federation::Error`
+
+- `PeerNotFound { key_id }` — stable kind token `federation_peer_not_found`. Returned by every `update_*` method when the peer doesn't exist.
+- `HardRemoveWithActiveAttestations { key_id, attestation_count }` — stable kind token `federation_hard_remove_with_active_attestations`. Defensive: orphaning an attestation_envelope by hard-removing its issuer would break §6.1 chain-honesty; operator must soft-remove or revoke first.
+
+Both route through `federation_err_to_py` as `PyValueError` per AV-15.
+
+### PyO3 mirrors
+
+Six new methods on `PyEngine` after `attach_revocation_pqc_signature`:
+- `add_peer_record_json(payload_json)`
+- `remove_peer_record(key_id, hard)`
+- `update_peer_alias(key_id, alias_json)` — JSON-encoded `Option<String>` so `null` vs `""` is distinguishable
+- `update_peer_trust(key_id, trust_wire)` — wire-string decode via `from_wire_str`; bad value raises `ValueError` with no silent coercion
+- `update_peer_notes(key_id, notes_json)`
+- `update_peer_policy(key_id, policy_json)`
+
+### Test coverage — 32 new (both backends + memory parity)
+
+- 10 memory-backend tests (atomic-insert / duplicate-rejects / soft-remove / hard-remove-with-attestations rejects / hard-remove-cascade / 4 round-trip update paths / unknown-key rejects).
+- 11 SQLite + 11 Postgres mirrors (each adds the CHECK-bypass test catching direct-SQL trust-value bypass).
+- Full feature-set nextest: **883/883 pass** on fresh PG container; no regressions in the existing 851 tests.
+
+### Mission citations
+
+- §1.5 parity invariant — both backends + memory, no PG-only declarations, no deferral.
+- §1.6 fail-honest — typed errors, no silent coercion of TrustClass values, defensive `HardRemoveWithActiveAttestations` instead of orphaning attestations.
+- §1.7 fractal-self — peer-management surface puts the **operator** at the centre of the trust-neighborhood decisions (CIRIS Accord §I autonomy); persist stores opinion, doesn't confer.
+
 ## [3.0.0] — 2026-05-28
 
 **CIRISPersist 3.0 — Coherence Epistemic Graph 0.2 substrate conformance.**
