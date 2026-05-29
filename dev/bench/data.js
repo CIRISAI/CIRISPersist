@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780092850211,
+  "lastUpdate": 1780097425571,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -39941,6 +39941,288 @@ window.BENCHMARK_DATA = {
             "name": "storage_floor/next_sequence_full",
             "value": 1209,
             "range": "± 168",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "61ac37cee7b628d99070c8ce81da51f511a5eefb",
+          "message": "3.5.1 — #129 trust_scoring_capsule + #130 list_holders local-held bypass + partial #128 PG test isolation\n\nPatch closing two real bugs from CIRISConformance fabric-tier + CIRISEdge\ncohabitation init, plus partial fix on the pre-existing parallel-test\nisolation flake.\n\n#129: New AdmissionGate::scoring_arc + Engine::trust_scoring accessors\n(Option A) + trust_scoring_capsule 7th PyCapsule on PyEngine (Option B,\nname tag ciris_persist::trust_scoring). Cohab consumers can now pull\nArc<dyn TrustScoring> from a live persist engine; CIRISEdge v0.19.x cohab\ninit unblocked. Raises ValueError(\"trust_scoring_unavailable\") when no\nadmission gate installed (bootstrap-permissive default).\n\n#130: list_holders bypasses CEG §10.1.2 24h TTL when blob is locally\npresent in federation_blobs. Federation TTL is a backstop for peer\nattestations going silently offline; for locally-held blobs the bytes\nare definitive proof of holding. The withdraws mechanism remains the\nactive eviction signal — ContentMiss feedback loop unchanged. Both\nbackends; pinned by list_holders_includes_local_held_blob_with_stale_\nattestation_sqlite (48h-old asserted_at, blob locally held → holder\nreported).\n\n#128 partial: .config/nextest.toml gains [test-groups.postgres] +\noverride filter (test(/_pg$/) + test(/::pg_/) + test(/postgres_tests::/)\n+ test(/::postgres::/)) — max-threads=1 for PG tests; non-PG tests keep\nparallelism. backfill.rs seed reallocation 0xA1/0xB1 → 0xC1/0xD1\ndisjoint from emit.rs's claims. Takes gauntlet from 5/5 random fails to\n1 deterministic residual (put_get_goal_round_trip_pg fails even at\n--test-threads=1 — separate state-pollution issue, tracked ongoing).\n\nCIRISEdge 1.0 RC consumers pin v3.5.1 — residual flake is\ntest-infrastructure-only, not in shipped behavior.",
+          "timestamp": "2026-05-29T18:09:35-05:00",
+          "tree_id": "0b9e9c476cceff6405191d2516465a2c4ed3a2f4",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/61ac37cee7b628d99070c8ce81da51f511a5eefb"
+        },
+        "date": 1780097424361,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 53618986,
+            "range": "± 37691",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 1148255,
+            "range": "± 343845",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 1796,
+            "range": "± 20",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 4392,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 9739,
+            "range": "± 74",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 36266,
+            "range": "± 367",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 5,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 23,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 136,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 383,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 445,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 1648,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 5,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 57,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 182,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 824,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 10,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 37493,
+            "range": "± 1841",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 117110,
+            "range": "± 6414",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 428140,
+            "range": "± 11452",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 6174,
+            "range": "± 746",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 9143,
+            "range": "± 1988",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 15734,
+            "range": "± 1787",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 37482,
+            "range": "± 4905",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 553108,
+            "range": "± 3426",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 8560247,
+            "range": "± 101217",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 637357,
+            "range": "± 21052",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 1630518,
+            "range": "± 49550",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 77051183,
+            "range": "± 774031",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 3863845,
+            "range": "± 359032",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 13910380,
+            "range": "± 256422",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 191875558,
+            "range": "± 1304093",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 10294189,
+            "range": "± 1023201",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 36570038,
+            "range": "± 573398",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 220566,
+            "range": "± 29997",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 238033,
+            "range": "± 77621",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 41616,
+            "range": "± 2202",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 123638,
+            "range": "± 1929",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 934695,
+            "range": "± 13618",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 1,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 407,
+            "range": "± 27",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 66,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 729,
+            "range": "± 69",
             "unit": "ns/iter"
           }
         ]
