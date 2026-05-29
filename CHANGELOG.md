@@ -5,6 +5,95 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.0.0] — 2026-05-28
+
+**CIRISPersist 3.0 — Coherence Epistemic Graph 0.2 substrate conformance.**
+
+The milestone release that closes persist's substrate-conformance against CIRISRegistry's Coherence Epistemic Graph 0.2 (commit [`4b27130`](https://github.com/CIRISAI/CIRISRegistry/commit/4b27130)). CEG 0.2 supersedes FSD-002 as the canonical federation spec; **3.0.0 is persist's conformant substrate adoption.**
+
+The release closes **#116** in full (the persist-owned CEG slice), bumps the **CIRISVerify pin v3.9.0 → v4.0.0** (the federation-wide CEG 0.2 wire alignment), and brings forward the three earlier-shipped CEG-adjacent items:
+- **#114** typed Goal primitive with M-1 alignment as construction-time invariant (shipped 2.10.0).
+- **#110** occurrence_id / occurrence_count / occurrence_role envelope fields (shipped 2.9.0 via FSD-002 v1.4.2 §2.1 amendment).
+- **#102** attestation_type vocabulary clean-break rename (shipped 2.4.0).
+
+### CIRISVerify pin v3.9.0 → v4.0.0 (federation-wide CEG 0.2 wire alignment)
+
+CIRISVerify v4.0.0 is the formal landing of the mechanism-prefix
+wire shape (per CIRISVerify#38 / CEG §8.1.9 Policy I): the L1-L5
+ladder is officially consumer-side composition, the wire carries
+only mechanism strings (`attestation:self_verify`, etc.), and the
+canonicalization tightening in §5.2.1 is locked. **3.0.0 is the
+release that pairs persist's substrate-side CEG 0.2 conformance
+with verify's wire-side conformance**, so consumers of persist's
+wheel get the CEG 0.2 verify surface transitively.
+
+- Cargo.toml: 6 `tag = "v3.9.0", version = "3"` sites → `"v4.0.0", "4"`
+  (ciris-keyring / ciris-verify-core / ciris-crypto across base + the
+  three per-target `[target.*]` tables for Linux TPM / iOS / Android).
+- pyproject.toml `Requires-Dist`: `ciris-verify>=3.9.0,<4` →
+  `>=4.0.0,<5` — Python wheel consumers now transitively pull the
+  v4.x verify line.
+
+Persist's consumed surface (`HardwareSigner`, hybrid signatures,
+transparency-log machinery, `derive_symmetric_key`) is unchanged
+across v3→v4 — the major break was wire-format-only. 851/851 nextest
+tests pass identically on v4.0.0 and v3.9.0; no persist code change
+needed beyond the pin sites.
+
+### §6.1 — Concurrent-write precedence + dedup triple
+
+Structural composers (`SUPERSEDES` / `WITHDRAWS` / `RECANTS`) are now idempotent on replay AND obey the precedence rule when concurrent writes target the same upstream attestation.
+
+- **Dedup at write**: a second `put_attestation` with the same `(references_attestation_id, attestation_type, attesting_key_id)` triple is a silent `Ok(())` no-op (mirrors the V043 master-key idempotent contract). New `src/federation/precedence.rs` module (`is_dedup_match` / `is_structural_composer` helpers). Both backends + memory parity.
+- **Precedence at read**: new `precedence_winner` helper over a slice of grouped attestations. Rank: `RECANTS=3 > WITHDRAWS=2 > SUPERSEDES=1`; tied rank → latest `asserted_at` wins; tied `asserted_at` → lex-smallest `attestation_id` wins. **Audit chain stores all composers honestly** (the write path is append-only); reads project the current effective state. Caller narrows the slice by `(attesting_key_id, references_attestation_id)` group per §6.1 rule 4.
+- `delegates_to` excluded from precedence scope — it's forward-looking authorization with a different envelope shape (`delegated_scope[]`, no `references_attestation_id`); documented in the precedence module.
+
+### §7.0 — Reserved-prefix admission rules + CEG 0.1→0.2 dual-acceptance
+
+`DimensionAdmissionPolicy` (shipped 2.4.0) extended with two new rule families:
+
+- **Reserved-prefix emitter rule**: `SCORES` attestations whose `dimension` matches a reserved prefix MUST be signed by a key with the matching `identity_type`. Defaults ship the CEG §5.3/§7.x base set — `system:` / `audit_chain:` / `corpus_health:` / `identity_continuity:` / `federation_directory:` → `substrate_persist`; `transparency_log:cosigned:` → `witness`. New typed `Error::ReservedPrefixEmitterMismatch { dimension, prefix, required, got_identity_type }` (stable `kind() = "federation_reserved_prefix_emitter_mismatch"`).
+- **CEG 0.1 → 0.2 attestation-prefix transition**: CEG 0.2 renamed `attestation:l{N}:*` → mechanism-only (`attestation:self_verify` / `hardware_rooted` / `registry_consensus` / `license_validity` / `agent_integrity`). The L1-L5 ladder is now consumer-side composition per CEG §8.1.9 Policy I. Persist's policy: `AttestationLadderTransitionPolicy::DualAccept` (default for 3.0.0) admits BOTH the deprecated `attestation:l{N}:*` form AND the canonical mechanism form. Post-CEG-0.3 (separate future PR) the policy flips to `RejectDeprecated`. The transition target is documented + regression-tested at admission.
+
+New `identity_type` constants: `SUBSTRATE_PERSIST`, `WITNESS`.
+
+### §10.1.2 — `holds_bytes` 24-hour TTL + ContentMiss feedback
+
+`DEFAULT_HOLDS_BYTES_TTL: Duration = 24h` constant on `crate::federation::blobs`. `BlobStorage::list_holders` now:
+- Filters out rows whose `asserted_at + TTL < now` (stale holders no longer surfaced).
+- Skips rows with a matching `WITHDRAWS` attestation from the same attester (the ContentMiss feedback loop — when a consumer can't fetch the bytes, they emit a `WITHDRAWS` against the stale `holds_bytes:sha256:{prefix}` row, which the §6.1 dedup + precedence machinery from §6.1 above accepts as a structural composer).
+
+No migration required — the TTL is computed from `federation_attestations.asserted_at` (per CEG §10.1.2's "from `signed_at`" wording). PG impl uses a `NOT EXISTS` subquery for ContentMiss; SQLite uses a two-stage scan.
+
+### §0.5 fractal-self framing — MISSION.md §1.7
+
+New section documenting **persist is relational fabric, not a Cartesian gate**. Distinguishes wire-format gates that are Cartesian-OK (the `accord:*` constitutional asymmetry, §7.0 reserved-prefix, T1–T4 operational-language gate, attestation-ladder transition) from relational gates that would be Cartesian-misread (admission re-checks of self-attestation truth, N-cross-attestation requirements, gating writes on consumer composition outcomes). `DimensionAdmissionPolicy`'s doc-comment carries the same framing at the call site.
+
+Cross-attestation already happened upstream (NodeCore / Verify / Registry); persist records the relational fabric, doesn't second-guess whether the self is "real."
+
+### Verified
+
+`cargo clippy --all-targets -- -D warnings` clean on default features AND `postgres server pyo3 sqlite cirisaudit secrets cirisnode cirisgraph telemetry`. **851/851 nextest tests pass** on both backends, fresh DB, `--test-threads=1`, full feature set. 39 new tests in the CEG bundle covering: structural-composer dedup, precedence rule + tie-break, reserved-prefix rejection + acceptance, dual-acceptance of both deprecated and canonical `attestation:*` forms, `holds_bytes` TTL filter, ContentMiss withdraw integration.
+
+### Carry-forwards from earlier 2.x cuts that close the CEG conformance picture
+
+| CEG ask | Closed by | Shipped |
+|---|---|---|
+| §6.1 dedup + precedence | **#116 (this release)** | 3.0.0 |
+| §7.0 reserved-prefix + 0.1→0.2 dual | **#116 (this release)** | 3.0.0 |
+| §10.1.2 holds_bytes TTL + ContentMiss | **#116 (this release)** | 3.0.0 |
+| §0.5 fractal-self doc framing | **#116 (this release)** | 3.0.0 |
+| occurrence_id / occurrence_count / occurrence_role envelope | #110 (opaque JSONB; spec ratified at FSD-002 v1.4.2 §2.1) | 2.9.0 |
+| Typed Goal with M-1 alignment as construction-time invariant | #114 | 2.10.0 |
+| `attestation_type` clean-break vocabulary rename | #102 Ask 2 | 2.4.0 |
+
+### Judgement calls flagged (documented in code)
+
+- **TTL anchor: `asserted_at`, not `first_seen_at`** — per CEG §10.1.2's "from `signed_at`" wording. The per-holder TTL has to anchor at the per-holder `asserted_at`; `first_seen_at` lives on `federation_blobs` (per-blob), not on the per-holder `federation_attestations` row.
+- **Precedence at READ, not WRITE** — audit chain stores all composers honestly (append-only); reads project current effective state via `precedence_winner`. Trust-grant projection (chain-event-based, `federation_trust_grants`) is a separate read path and NOT wired into §6.1 precedence — that's a follow-up needing the projection's data model reconciled with composer rows.
+- **`capacity:*` / `licensure:*` / `detection:*` admission carve-outs deliberately deferred** — those have rules at the envelope-shape layer (attester == attested for capacity; single-source confidence floor for licensure; primary-vs-cross-attestation distinction for detection) that don't fit the prefix-emitter-identity-type rule shape cleanly. Documented in `default_reserved_prefix_rules()` `What's deliberately NOT here`.
+- **Version-segment exemption for attestation-ladder dimensions** — `attestation:self_verify` lacks `:v[0-9]+`; the T3 version-pinning rule would otherwise reject. Carve-out: version-pinning for these mechanisms lives in the attesting binary's SLSA stamp + calibration package, not the wire prefix.
+
 ## [2.13.0] — 2026-05-28
 
 **`#113` — Detection-events Engine read + subscribe facade.** Unblocks

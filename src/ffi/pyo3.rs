@@ -15029,6 +15029,12 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // are caller-fault malformed-content; ValueError (4xx).
         crate::federation::Error::AccordDimensionRequiresAccordHolder { .. }
         | crate::federation::Error::DimensionRejected { .. } => PyValueError::new_err(kind),
+        // v3.0.0 (CIRISPersist#116, CEG 0.2 §7.0) — reserved-prefix
+        // emitter mismatch is caller-fault malformed-content; same
+        // shape as the other admission-gate rejections.
+        crate::federation::Error::ReservedPrefixEmitterMismatch { .. } => {
+            PyValueError::new_err(kind)
+        }
         // v2.5.0 (CIRISPersist#102 Ask 4 + Ask 8) — all the new
         // admission-hook rejections are caller-fault malformed-
         // content; ValueError (4xx).

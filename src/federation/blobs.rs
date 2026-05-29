@@ -76,12 +76,31 @@
 //! attester.)
 
 use std::future::Future;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 /// v2.3 (CIRISPersist#103) — default maximum byte length for an
 /// `Inline` payload. 1 MiB (1,048,576 bytes).
 pub const DEFAULT_INLINE_BYTES_CAP: usize = 1024 * 1024;
+
+/// v3.0.0 (CIRISPersist#116, CEG 0.2 §10.1.2) — default TTL for a
+/// `holds_bytes:sha256:{prefix}` directory entry. Measured from the
+/// attestation's `asserted_at` (the `signed_at` in CEG §10.1.2 wire
+/// terms). After this window passes the holder is considered stale
+/// and [`BlobStorage::list_holders`] filters the row out.
+///
+/// **24 hours per CEG §10.1.2.** The constant is the operator-tunable
+/// default; sovereign deployments override per their freshness
+/// policy (e.g., LAN-only edges that always-on may tighten the TTL;
+/// cold-archive nodes may extend it). Persist exposes the constant
+/// rather than a runtime field so the default is the same shape across
+/// every deployment that hasn't overridden — operators tune by
+/// providing their own freshness window when consuming `list_holders`
+/// (the trait surface returns the unfiltered + filtered shapes
+/// depending on the implementation; see [`BlobStorage::list_holders`]
+/// for the contract).
+pub const DEFAULT_HOLDS_BYTES_TTL: Duration = Duration::from_secs(24 * 3600);
 
 /// v2.3 (CIRISPersist#103) — hex-prefix length for the
 /// `holds_bytes:sha256:<prefix>` attestation index.
@@ -218,16 +237,36 @@ pub trait BlobStorage: Send + Sync {
     /// — does not pull the body column.
     fn has_blob(&self, sha256: &[u8; 32]) -> impl Future<Output = Result<bool, BlobError>> + Send;
 
-    /// List the `key_id`s of every attester that has emitted a
-    /// `holds_bytes:sha256:<prefix>` attestation for this blob.
+    /// List the `key_id`s of every **currently-live** attester that
+    /// has emitted a `holds_bytes:sha256:<prefix>` attestation for
+    /// this blob.
     ///
     /// Queries the `federation_attestations` table:
     ///
     /// 1. WHERE attestation_type = `holds_bytes:sha256:<8-hex-prefix>`
     /// 2. AND evidence_refs (from the JSONB envelope) contains the
     ///    full hex SHA (discriminates prefix collisions)
+    /// 3. AND `asserted_at + DEFAULT_HOLDS_BYTES_TTL > now` (the
+    ///    CEG §10.1.2 24-hour freshness window; expired holders are
+    ///    treated as stale per the spec)
+    /// 4. AND the attester has NOT emitted a `withdraws` structural
+    ///    composer against the holds_bytes attestation (CEG §10.1.2
+    ///    ContentMiss feedback loop — when a consumer fetches from a
+    ///    holder via the directory and the holder no longer has the
+    ///    blob, the consumer emits a `withdraws` against the stale
+    ///    `holds_bytes` row; the directory filters the row out
+    ///    before serving the next consumer)
     ///
-    /// Returns an empty `Vec` when no holders exist.
+    /// Returns an empty `Vec` when no live holders exist. The
+    /// substrate stores every holds_bytes row honestly (the audit
+    /// chain is complete); the freshness filter applies at read.
+    ///
+    /// # Default TTL
+    ///
+    /// [`DEFAULT_HOLDS_BYTES_TTL`] is the CEG §10.1.2 24-hour
+    /// default. Sovereign deployments override via their own
+    /// implementation if they need a different freshness window;
+    /// the trait's default behavior matches the spec.
     fn list_holders(
         &self,
         sha256: &[u8; 32],

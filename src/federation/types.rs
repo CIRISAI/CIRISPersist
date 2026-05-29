@@ -100,6 +100,22 @@ pub mod identity_type {
     /// asymmetry); the admission gate in [`super::admission`]
     /// enforces this at write time.
     pub const ACCORD_HOLDER: &str = "accord_holder";
+    /// v3.0.0 (CIRISPersist#116, CEG 0.2 §5.3 / §7.2) — the running
+    /// persist instance's self-reporting key. Only `federation_keys`
+    /// rows with this identity_type may emit attestations on the
+    /// substrate-self-report prefixes (`system:*`, `audit_chain:*`,
+    /// `corpus_health:*`, `identity_continuity:*`,
+    /// `federation_directory:*`). The admission gate in
+    /// [`super::admission::default_reserved_prefix_rules`] enforces
+    /// this.
+    pub const SUBSTRATE_PERSIST: &str = "substrate_persist";
+    /// v3.0.0 (CIRISPersist#116, CEG 0.2 §7.6 / §10.3) — registered
+    /// transparency-log witnesses. Only `federation_keys` rows with
+    /// this identity_type may emit `transparency_log:cosigned:*`
+    /// attestations. The substrate-conformance migration path moves
+    /// the 0.x interim per-region `registry_witnesses` table over to
+    /// `federation_keys` rows with this identity_type, per CEG §10.3.
+    pub const WITNESS: &str = "witness";
 }
 
 /// Algorithm strings matching persist's `algorithm` column.

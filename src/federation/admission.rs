@@ -1,12 +1,45 @@
 //! Wire-enforced admission gate on `scores`-attestation dimensions
-//! (CIRISPersist#102 Ask 3, v2.4.0).
+//! (CIRISPersist#102 Ask 3, v2.4.0; extended for CEG 0.2 §7.0 +
+//! transition-window dual-acceptance at v3.0.0, CIRISPersist#116).
+//!
+//! # Fractal-self framing (CEG §0.5)
+//!
+//! Persist is **relational fabric**, not a Cartesian gate. The
+//! admission policy here enforces **wire-format invariants** —
+//! shapes that consumers downstream cannot recover from on the read
+//! path — NOT relational arbitration. Concretely:
+//!
+//! - **Cartesian-OK gates** (kept): the constitutional
+//!   `accord:*` × `accord_holder` asymmetry (CEG §7.1), the
+//!   reserved-prefix emitter rule (CEG §7.0 — `system:*`,
+//!   `audit_chain:*`, `transparency_log:cosigned:*`, `capacity:*`
+//!   self-emission, …), the four-test operational-language gate
+//!   (T1/T2/T3/T4 — names must describe machine-checkable
+//!   mechanisms, not subjective qualities).
+//!
+//! - **Cartesian-misread (DON'T add)**: a gate that rejects
+//!   `witness_relation: self` rows, or a gate that demands every row
+//!   carry N cross-attestations before admission, or a gate that
+//!   re-checks whether a self-attestation's emitter "really is" the
+//!   identity it claims. Cross-attestation already happened upstream
+//!   (in NodeCore / Verify / Registry) — persist's job is to record
+//!   the relational fabric the federation produces, not to gate
+//!   admission on whether the self is "real."
+//!
+//! The wire-format gates above are admitted because a misformed
+//! prefix string or a wrong-emitter-class row cannot be repaired by
+//! any read-path policy — the row is structurally invalid. The
+//! self/relational gates are refused because consumer composition
+//! IS where relational arbitration belongs; persist's substrate role
+//! is to keep the audit chain complete enough that composition can
+//! happen.
 //!
 //! # What this module is
 //!
 //! `put_attestation` calls [`DimensionAdmissionPolicy::check`] at
 //! the start of the write path. The gate rejects malformed or
 //! reserved-prefix `scores` attestations *before* they hit the DB.
-//! Two layers compose:
+//! Three layers compose:
 //!
 //! 1. **The `accord:*` × `accord_holder` constitutional rule**
 //!    (FSD-002 §4.1 + §7.1) — only keys whose `identity_type` is
@@ -66,8 +99,106 @@ use serde::{Deserialize, Serialize};
 use super::types::{attestation_type, identity_type};
 use super::Error;
 
+/// v3.0.0 (CEG 0.2 §5.2 / §8.1.9) — the canonical mechanism-only
+/// vocabulary for `attestation:{mechanism}` dimensions. CEG 0.2
+/// renamed the L1-L5 ladder prefixes from `attestation:l{N}:*` to
+/// mechanism-only form per [§1.3.1](https://github.com/CIRISAI/CIRISRegistry/blob/main/FSD/CEG/01_foundation.md)
+/// T2 (L-numbers name a ladder-position, not a mechanism; only
+/// mechanism belongs in the wire prefix). The five canonical
+/// mechanism leaves below are the post-rename target shapes.
+///
+/// Order matches the consumer-side §8.1.9 Policy I ladder
+/// (L1=self_verify, L2=hardware_rooted, L3=registry_consensus,
+/// L4=license_validity, L5=agent_integrity).
+pub const ATTESTATION_LADDER_MECHANISMS: &[&str] = &[
+    "attestation:self_verify",
+    "attestation:hardware_rooted",
+    "attestation:registry_consensus",
+    "attestation:license_validity",
+    "attestation:agent_integrity",
+];
+
+/// v3.0.0 (CEG 0.1 → 0.2 transition window) — policy for the L1-L5
+/// attestation-ladder rename. CEG 0.2 renamed `attestation:l{N}:*` →
+/// `attestation:{mechanism}`; the deprecated form is admitted during
+/// the transition window so producers still emitting the 0.1 wire
+/// shape don't have their rows rejected.
+///
+/// The `dimension` field on `federation_attestations` is TEXT — no
+/// schema migration is required by the rename. The transition policy
+/// here is purely string-level admission behavior.
+///
+/// # Flip target
+///
+/// Post-CEG 0.3 (separate future PR; tracked at CIRISPersist#117
+/// when CEG 0.3 lands), persist's policy flips to
+/// [`AttestationLadderTransitionPolicy::RejectDeprecated`] — the
+/// deprecated `attestation:l{N}:*` form is rejected at admission per
+/// CEG §13.1 deprecation table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttestationLadderTransitionPolicy {
+    /// CEG 0.1 → 0.2 transition (v3.0.0 default). Both
+    /// `attestation:l{N}:*` and `attestation:{mechanism}` are admitted
+    /// on write. Producers SHOULD migrate to the mechanism form;
+    /// consumers SHOULD treat both as equivalent during the window.
+    DualAccept,
+    /// Post-CEG 0.3 target (NOT the default at v3.0.0). The
+    /// deprecated `attestation:l{N}:*` form is rejected at admission;
+    /// only the mechanism-only form is admitted.
+    RejectDeprecated,
+}
+
+impl AttestationLadderTransitionPolicy {
+    /// True iff the policy admits the deprecated `attestation:l{N}:*`
+    /// wire shape. The current v3.0.0 default returns true.
+    pub fn admits_deprecated_form(self) -> bool {
+        matches!(self, Self::DualAccept)
+    }
+}
+
+/// v3.0.0 (CIRISPersist#116, CEG 0.2 §7.0) — a reserved-prefix
+/// admission rule. The substrate rejects a `scores` attestation whose
+/// `dimension` matches the prefix pattern AND whose attesting key's
+/// `identity_type` is not in the rule's `required_identity_types`.
+///
+/// # Why a list, not a single value
+///
+/// Some reserved prefixes accept multiple identity types (e.g.,
+/// `licensure:*` per CEG §7.3 is co-owned between CIRISRegistry and
+/// CIRISVerify). The vocabulary is a set, not a singleton.
+///
+/// # Why a Vec, not a fixed array
+///
+/// Operator policy may extend the set per deployment (e.g., a
+/// sovereign deployment may admit a fourth steward identity).
+/// [`DimensionAdmissionPolicy::default()`] ships the CEG 0.2 §5.3 +
+/// §7.x base set; extensions ride the policy struct.
+///
+/// # Match semantics
+///
+/// `pattern_prefix` is a literal byte-string prefix match against the
+/// `dimension`. No regex; no wildcards; the rule fires iff
+/// `dimension.starts_with(&self.pattern_prefix)`. Reserved prefixes
+/// in CEG §7.x are all literal prefixes — e.g., `system:*` matches
+/// any `dimension` beginning with `system:`. The `:` separator is
+/// included in `pattern_prefix` to avoid accidental sub-token matches
+/// (`system:foo` matches `system:`; `systematic` does NOT — the
+/// prefix string is `"system:"` with the trailing colon).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservedPrefixRule {
+    /// Literal prefix the rule fires on (e.g., `"system:"`,
+    /// `"audit_chain:"`, `"transparency_log:cosigned:"`).
+    pub pattern_prefix: String,
+    /// Identity types whose keys may emit under this prefix. A
+    /// `scores` attestation whose attesting key's `identity_type` is
+    /// NOT in this list is rejected with
+    /// [`super::Error::ReservedPrefixEmitterMismatch`].
+    pub required_identity_types: Vec<String>,
+}
+
 /// Machine-readable reason tokens emitted alongside
-/// [`Error::DimensionRejected`]. The string form is the stable
+/// [`super::Error::DimensionRejected`]. The string form is the stable
 /// telemetry / log token; consumer code should match on the enum
 /// variant or the `as_str()` constant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -105,7 +236,7 @@ impl DimensionRejectionReason {
 /// constitutionally fixed (not policy-tunable — it's enforced
 /// independently of the deny-list).
 ///
-/// # Default contents (v2.4.0)
+/// # Default contents (v3.0.0)
 ///
 /// - `morally_charged_stems`: the FSD-002 §1.10.1 anti-pattern
 ///   list (`deception`, `harm`, `evil`, `bad_actor`,
@@ -115,6 +246,19 @@ impl DimensionRejectionReason {
 ///   `detection:emergent_deception:*` gets rejected at admission.
 /// - `require_version_segment`: `true`. Every accepted `scores`
 ///   dimension must contain `:v[0-9]+`.
+/// - `reserved_prefix_rules`: the CEG 0.2 §5.3 + §7.x base set
+///   (`system:*`, `audit_chain:*`, `corpus_health:*`,
+///   `identity_continuity:*`, `federation_directory:*` →
+///   `substrate_persist`; `transparency_log:cosigned:*` →
+///   `witness`). See [`ReservedPrefixRule`] for the match shape.
+///   v3.0.0 ships a minimal allowlist; sovereign deployments extend
+///   per CEG §7.6 (e.g., adding the `witness` identity type once
+///   their federation directory has registered witnesses).
+/// - `attestation_ladder_transition`: CEG 0.1 → 0.2 transition window
+///   policy. Default is [`AttestationLadderTransitionPolicy::DualAccept`]
+///   — both `attestation:l{N}:*` (deprecated) and
+///   `attestation:{mechanism}` (canonical) admit. Flips to
+///   `RejectDeprecated` post-CEG 0.3.
 ///
 /// Customize via the explicit constructor for tests / sovereign
 /// deployments that need a different stem list. The default is
@@ -131,6 +275,24 @@ pub struct DimensionAdmissionPolicy {
     /// at least one `:v[0-9]+` segment. Versionless rejection
     /// emits [`DimensionRejectionReason::MissingVersionSegment`].
     pub require_version_segment: bool,
+    /// v3.0.0 (CEG 0.2 §7.0) — reserved-prefix admission rules.
+    /// Each rule names a prefix pattern + the identity-type set
+    /// whose keys are allowed to emit under that prefix. A `scores`
+    /// dimension matching `rule.pattern_prefix` requires the
+    /// attesting key's `identity_type` to be in
+    /// `rule.required_identity_types`; otherwise the gate emits
+    /// [`super::Error::ReservedPrefixEmitterMismatch`].
+    ///
+    /// Rules are evaluated in declaration order; the first matching
+    /// rule's identity-type set is checked. Disjoint prefixes are
+    /// expected; an overlapping rule shadow is a configuration bug
+    /// the operator owns (the policy struct doesn't normalize).
+    pub reserved_prefix_rules: Vec<ReservedPrefixRule>,
+    /// v3.0.0 (CEG 0.1 → 0.2 transition). Default
+    /// [`AttestationLadderTransitionPolicy::DualAccept`] — both
+    /// `attestation:l{N}:*` and `attestation:{mechanism}` admit.
+    /// See the policy enum docs for the post-CEG-0.3 flip target.
+    pub attestation_ladder_transition: AttestationLadderTransitionPolicy,
 }
 
 impl Default for DimensionAdmissionPolicy {
@@ -146,8 +308,83 @@ impl Default for DimensionAdmissionPolicy {
                 "lies".into(),
             ],
             require_version_segment: true,
+            reserved_prefix_rules: default_reserved_prefix_rules(),
+            attestation_ladder_transition: AttestationLadderTransitionPolicy::DualAccept,
         }
     }
+}
+
+/// v3.0.0 (CIRISPersist#116, CEG 0.2 §5.3 + §7.x) — the base set of
+/// reserved-prefix rules persist ships out of the box. Sovereign
+/// operators extend per deployment (e.g., adding witness keys once
+/// their federation directory has them registered).
+///
+/// # Coverage
+///
+/// | Prefix | Required emitter | CEG section |
+/// |---|---|---|
+/// | `system:` | `substrate_persist` | §5.3 + §7.2 |
+/// | `audit_chain:` | `substrate_persist` | §5.3 |
+/// | `corpus_health:` | `substrate_persist` | §5.3 |
+/// | `identity_continuity:` | `substrate_persist` | §5.3 |
+/// | `federation_directory:` | `substrate_persist` | §5.3 |
+/// | `transparency_log:cosigned:` | `witness` | §7.6 |
+///
+/// # What's deliberately NOT here
+///
+/// - `accord:*` is handled separately by the constitutional-asymmetry
+///   layer (see [`DimensionAdmissionPolicy::check`] Layer 1) so its
+///   typed error variant stays distinct
+///   ([`super::Error::AccordDimensionRequiresAccordHolder`]).
+/// - `capacity:*` self-emission rejection (CEG §7.5) is NOT in this
+///   table — it's an attester==attested check, not an identity-type
+///   check, and lives at the consumer composition layer per §7.5's
+///   anti-Goodhart commentary. The substrate's reserved-prefix gate
+///   doesn't enforce it because the substrate doesn't see the
+///   attester==attested distinction except at the row level (the
+///   `Attestation` row carries `attesting_key_id` + `attested_key_id`;
+///   the admission gate only knows the attester's identity-type, not
+///   whether the two keys are the same row).
+/// - `licensure:*` (CEG §7.3) is co-owned — the admission gate
+///   doesn't reject single-source emissions; per §7.3, consumers
+///   mark them `confidence ≤ 0.5` until the second co-owner attests.
+/// - `detection:correlated_action:*` / `detection:distributive:*`
+///   (CEG §7.4) are LensCore-only emission but the substrate accepts
+///   cross-attestations under a different prefix per §7.4's last
+///   sentence; mapping this to a substrate-admission rule requires
+///   knowing whether the row is a primary detection-emission vs a
+///   cross-attestation, which lives in the envelope shape. Deferred
+///   to consumer-side check pending CEG-side rule clarification.
+pub fn default_reserved_prefix_rules() -> Vec<ReservedPrefixRule> {
+    use super::types::identity_type;
+    let substrate_persist = identity_type::SUBSTRATE_PERSIST.to_owned();
+    let witness = identity_type::WITNESS.to_owned();
+    vec![
+        ReservedPrefixRule {
+            pattern_prefix: "system:".into(),
+            required_identity_types: vec![substrate_persist.clone()],
+        },
+        ReservedPrefixRule {
+            pattern_prefix: "audit_chain:".into(),
+            required_identity_types: vec![substrate_persist.clone()],
+        },
+        ReservedPrefixRule {
+            pattern_prefix: "corpus_health:".into(),
+            required_identity_types: vec![substrate_persist.clone()],
+        },
+        ReservedPrefixRule {
+            pattern_prefix: "identity_continuity:".into(),
+            required_identity_types: vec![substrate_persist.clone()],
+        },
+        ReservedPrefixRule {
+            pattern_prefix: "federation_directory:".into(),
+            required_identity_types: vec![substrate_persist],
+        },
+        ReservedPrefixRule {
+            pattern_prefix: "transparency_log:cosigned:".into(),
+            required_identity_types: vec![witness],
+        },
+    ]
 }
 
 impl DimensionAdmissionPolicy {
@@ -199,6 +436,39 @@ impl DimensionAdmissionPolicy {
             });
         }
 
+        // Layer 1b — CEG 0.2 §7.0 reserved-prefix emitter rule.
+        // Checked after the `accord:*` constitutional rule so that
+        // layer's distinct error variant stays the canonical signal
+        // for the constitutional asymmetry. Reserved-prefix rules
+        // produce [`Error::ReservedPrefixEmitterMismatch`] which is
+        // a separate machine-readable signal.
+        //
+        // Rules fire on `dim.starts_with(rule.pattern_prefix)`; the
+        // first matching rule's identity-type set is checked. A
+        // single matching prefix per dimension is the expected shape
+        // — overlapping prefix rules are a configuration bug the
+        // operator owns.
+        for rule in &self.reserved_prefix_rules {
+            if dim.starts_with(rule.pattern_prefix.as_str()) {
+                if !rule
+                    .required_identity_types
+                    .iter()
+                    .any(|t| t == attesting_identity_type)
+                {
+                    let mut required = rule.required_identity_types.clone();
+                    required.sort();
+                    return Err(Error::ReservedPrefixEmitterMismatch {
+                        dimension: dim.to_string(),
+                        prefix: rule.pattern_prefix.clone(),
+                        required,
+                        got_identity_type: attesting_identity_type.to_string(),
+                    });
+                }
+                // Match satisfied — stop scanning further rules.
+                break;
+            }
+        }
+
         // Layer 2a — the morally-charged-stem deny-list.
         // T1 (rules/verdicts) + T2 (mechanism-vs-judgment) + T4
         // (adjudication separation) are all caught by the same
@@ -223,7 +493,23 @@ impl DimensionAdmissionPolicy {
         // than a regex compile per call — keeps the hot path zero-
         // alloc and avoids pulling `regex` into a dep tree that
         // doesn't have it.
-        if self.require_version_segment && !contains_version_segment(dim) {
+        //
+        // CEG 0.2 §5.2 + §8.1.9 carve-out: the attestation-ladder
+        // dimensions (canonical `attestation:{mechanism}` and the
+        // deprecated `attestation:l{N}:*` shape during the 0.1→0.2
+        // transition) are mechanism-naming rather than versioned-
+        // mechanism-naming. The wire shape names the verification
+        // mechanism the producer ran (`self_verify`,
+        // `hardware_rooted`, `registry_consensus`, `license_validity`,
+        // `agent_integrity`); the L1-L5 ladder ordering happens
+        // consumer-side per §8.1.9 Policy I. Version-pinning of
+        // these mechanisms lives in the attesting binary's commit
+        // (CIRISVerify's own SLSA-stamped build) and the
+        // calibration package's version, not the wire prefix.
+        if self.require_version_segment
+            && !contains_version_segment(dim)
+            && !self.is_attestation_ladder_dimension(dim)
+        {
             return Err(Error::DimensionRejected {
                 dimension: dim.to_string(),
                 reason: DimensionRejectionReason::MissingVersionSegment.as_str(),
@@ -232,6 +518,67 @@ impl DimensionAdmissionPolicy {
 
         Ok(())
     }
+
+    /// True iff `dim` is one of the CEG 0.2 §5.2 attestation-ladder
+    /// dimensions — either the canonical mechanism form
+    /// ([`ATTESTATION_LADDER_MECHANISMS`]) or the deprecated
+    /// `attestation:l{N}:*` form when
+    /// [`AttestationLadderTransitionPolicy::DualAccept`] is in effect.
+    ///
+    /// # Transition window
+    ///
+    /// During the 0.1 → 0.2 transition window (default policy
+    /// [`AttestationLadderTransitionPolicy::DualAccept`]):
+    ///
+    /// - Both `attestation:l1:self_verify` (deprecated 0.1 wire shape)
+    ///   AND `attestation:self_verify` (canonical 0.2 mechanism form)
+    ///   return `true`.
+    /// - The `dimension` field on `federation_attestations` is TEXT
+    ///   so no schema migration is required; the transition is purely
+    ///   admission-layer behavior.
+    ///
+    /// Post-CEG-0.3 (policy flipped to
+    /// [`AttestationLadderTransitionPolicy::RejectDeprecated`]), only
+    /// the canonical mechanism form returns `true`; the deprecated
+    /// form falls through to the version-segment check and is
+    /// rejected with `missing_version_segment`. The CEG §13.1
+    /// deprecation table records the timing.
+    fn is_attestation_ladder_dimension(&self, dim: &str) -> bool {
+        // Canonical mechanism form is always admitted.
+        if ATTESTATION_LADDER_MECHANISMS.contains(&dim) {
+            return true;
+        }
+        // Deprecated `attestation:l{N}:*` form — only during the
+        // transition window.
+        if self.attestation_ladder_transition.admits_deprecated_form()
+            && is_deprecated_attestation_ladder_prefix(dim)
+        {
+            return true;
+        }
+        false
+    }
+}
+
+/// True iff `dim` matches the deprecated CEG 0.1 attestation-ladder
+/// shape `attestation:l<N>:<mechanism>`, where `<N>` is one or more
+/// ASCII digits and `<mechanism>` is any non-empty suffix. CEG 0.2
+/// §13.1 records this as a deprecated wire shape; persist admits it
+/// during the 0.1 → 0.2 transition window (see
+/// [`AttestationLadderTransitionPolicy`]).
+fn is_deprecated_attestation_ladder_prefix(dim: &str) -> bool {
+    let Some(rest) = dim.strip_prefix("attestation:l") else {
+        return false;
+    };
+    let Some((digits, mech)) = rest.split_once(':') else {
+        return false;
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    if mech.is_empty() {
+        return false;
+    }
+    true
 }
 
 /// Returns true iff `dim` contains at least one segment of the
@@ -494,5 +841,209 @@ mod tests {
         assert_eq!(envelope_dimension(&v3), None);
         let v4 = serde_json::json!(null);
         assert_eq!(envelope_dimension(&v4), None);
+    }
+
+    // ── v3.0.0 (CIRISPersist#116, CEG 0.2 §7.0) — reserved-prefix ──
+
+    #[test]
+    fn admission_rejects_system_prefix_from_non_substrate_persist() {
+        // CEG §7.2 — `system:*` is reserved to substrate_persist.
+        // An agent (or steward, or any other identity_type) emitting
+        // under `system:*` is a category error per §7.2.
+        let p = default_policy();
+        let err = p
+            .check(
+                attestation_type::SCORES,
+                Some("system:health:n_eff_measurable:v1"),
+                identity_type::STEWARD,
+            )
+            .unwrap_err();
+        match err {
+            Error::ReservedPrefixEmitterMismatch {
+                dimension,
+                prefix,
+                required,
+                got_identity_type,
+            } => {
+                assert_eq!(dimension, "system:health:n_eff_measurable:v1");
+                assert_eq!(prefix, "system:");
+                assert_eq!(required, vec!["substrate_persist".to_string()]);
+                assert_eq!(got_identity_type, "steward");
+            }
+            other => panic!("expected ReservedPrefixEmitterMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn admission_accepts_system_prefix_from_substrate_persist() {
+        let p = default_policy();
+        p.check(
+            attestation_type::SCORES,
+            Some("system:health:n_eff_measurable:v1"),
+            identity_type::SUBSTRATE_PERSIST,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn admission_rejects_audit_chain_prefix_from_agent() {
+        // §5.3 — audit_chain:* is a substrate-self-report prefix.
+        let p = default_policy();
+        let err = p
+            .check(
+                attestation_type::SCORES,
+                Some("audit_chain:hash_continuity:v1"),
+                identity_type::AGENT,
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::ReservedPrefixEmitterMismatch { .. }));
+    }
+
+    #[test]
+    fn admission_rejects_transparency_log_cosigned_from_non_witness() {
+        // §7.6 — transparency_log:cosigned:* is witness-only.
+        let p = default_policy();
+        let err = p
+            .check(
+                attestation_type::SCORES,
+                Some("transparency_log:cosigned:42:v1"),
+                identity_type::STEWARD,
+            )
+            .unwrap_err();
+        match err {
+            Error::ReservedPrefixEmitterMismatch {
+                prefix, required, ..
+            } => {
+                assert_eq!(prefix, "transparency_log:cosigned:");
+                assert_eq!(required, vec!["witness".to_string()]);
+            }
+            other => panic!("expected ReservedPrefixEmitterMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn admission_accepts_transparency_log_cosigned_from_witness() {
+        let p = default_policy();
+        p.check(
+            attestation_type::SCORES,
+            Some("transparency_log:cosigned:42:v1"),
+            identity_type::WITNESS,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn admission_reserved_prefix_emitter_mismatch_kind_token_stable() {
+        let e = Error::ReservedPrefixEmitterMismatch {
+            dimension: "system:foo:v1".into(),
+            prefix: "system:".into(),
+            required: vec!["substrate_persist".into()],
+            got_identity_type: "agent".into(),
+        };
+        assert_eq!(e.kind(), "federation_reserved_prefix_emitter_mismatch");
+    }
+
+    // ── CEG 0.1 → 0.2 attestation-ladder transition window ──
+
+    #[test]
+    fn admission_accepts_deprecated_attestation_ladder_in_dual_accept() {
+        // CEG 0.2 transition: persist admits BOTH
+        // `attestation:l1:self_verify` (deprecated 0.1 shape) AND
+        // `attestation:self_verify` (canonical 0.2 shape) on write.
+        // The dimension lacks a `:v[0-9]+` segment but is exempt via
+        // the attestation-ladder carve-out.
+        let p = default_policy();
+        for dim in [
+            "attestation:l1:self_verify",
+            "attestation:l2:hardware",
+            "attestation:l5:agent_integrity",
+        ] {
+            p.check(attestation_type::SCORES, Some(dim), identity_type::AGENT)
+                .unwrap_or_else(|e| panic!("transition admit failed for {dim}: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn admission_accepts_canonical_attestation_mechanism_form() {
+        let p = default_policy();
+        for dim in ATTESTATION_LADDER_MECHANISMS {
+            p.check(attestation_type::SCORES, Some(dim), identity_type::AGENT)
+                .unwrap_or_else(|e| panic!("canonical admit failed for {dim}: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn admission_rejects_deprecated_form_post_ceg_0_3_flip() {
+        // Post-CEG-0.3 flip target — operator sets the policy to
+        // RejectDeprecated. The deprecated wire shape no longer
+        // benefits from the version-segment carve-out and falls
+        // through to the standard missing_version_segment check.
+        let mut p = default_policy();
+        p.attestation_ladder_transition = AttestationLadderTransitionPolicy::RejectDeprecated;
+        let err = p
+            .check(
+                attestation_type::SCORES,
+                Some("attestation:l1:self_verify"),
+                identity_type::AGENT,
+            )
+            .unwrap_err();
+        match err {
+            Error::DimensionRejected { reason, .. } => {
+                assert_eq!(reason, "missing_version_segment");
+            }
+            other => panic!("expected DimensionRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deprecated_ladder_prefix_parser_rejects_malformed() {
+        // Sanity checks on the deprecated-shape parser.
+        assert!(super::is_deprecated_attestation_ladder_prefix(
+            "attestation:l1:self_verify"
+        ));
+        assert!(super::is_deprecated_attestation_ladder_prefix(
+            "attestation:l42:agent_integrity"
+        ));
+        // Missing digit set.
+        assert!(!super::is_deprecated_attestation_ladder_prefix(
+            "attestation:l:foo"
+        ));
+        // Non-digit after l.
+        assert!(!super::is_deprecated_attestation_ladder_prefix(
+            "attestation:lxa:foo"
+        ));
+        // Missing mechanism.
+        assert!(!super::is_deprecated_attestation_ladder_prefix(
+            "attestation:l1:"
+        ));
+        // Not the attestation:l prefix at all.
+        assert!(!super::is_deprecated_attestation_ladder_prefix(
+            "attestation:self_verify"
+        ));
+        assert!(!super::is_deprecated_attestation_ladder_prefix(
+            "system:l1:foo"
+        ));
+    }
+
+    #[test]
+    fn default_reserved_prefix_rules_cover_ceg_persist_slice() {
+        // Sanity: the default rules cover the CEG §5.3 substrate-
+        // self-report set + §7.6 witness rule. Regression-guards the
+        // table doc-comment.
+        let rules = default_reserved_prefix_rules();
+        let prefixes: Vec<&str> = rules.iter().map(|r| r.pattern_prefix.as_str()).collect();
+        for expected in &[
+            "system:",
+            "audit_chain:",
+            "corpus_health:",
+            "identity_continuity:",
+            "federation_directory:",
+            "transparency_log:cosigned:",
+        ] {
+            assert!(
+                prefixes.contains(expected),
+                "default rules missing {expected}; got {prefixes:?}"
+            );
+        }
     }
 }

@@ -164,6 +164,60 @@ it is.
   (`thiserror` throughout; `IngestError`, `VerifyError`,
   `SecretsError`).
 
+### 1.7 Persist is relational fabric, not a Cartesian gate
+
+v3.0.0 (CIRISPersist#116, CEG 0.2 §0.5) — when reviewing the
+admission surface (`src/federation/admission.rs` and the structural-
+composer §6.1 path), anchor against this frame: **the substrate
+records the relational fabric the federation produces; it does not
+arbitrate whether the self the fabric describes is "real."**
+
+This matters for a specific reviewer reach. The federation layer
+admits self-attestations (`witness_relation: self` rows), self-signed
+`federation_keys` (the bootstrap pattern), and attester-asserted
+`occurrence_id` envelope fields. A reviewer importing the Cartesian
+default ("a key represents a pre-existing atomic principal whose
+self-claims need cross-verification before they count") will see
+those shapes and want the substrate to add cross-attestation
+admission gates. **That is the misread.** Cross-attestation already
+happened upstream (NodeCore decides who counts as a principal;
+Verify checks the hybrid signatures; Registry's steward triple
+witnesses key registrations). Persist's job is to keep the audit
+chain complete enough that downstream consumers can compose policy
+over the fabric — not to gate admission on whether the self the
+chain describes is "real."
+
+The two gate classes the admission policy carries
+([`src/federation/admission.rs`](src/federation/admission.rs)
+`DimensionAdmissionPolicy`):
+
+- **Wire-format gates (Cartesian-OK)** — kept because the row is
+  structurally invalid without them, not because the substrate is
+  arbitrating relational claims. The `accord:*` × `accord_holder`
+  constitutional asymmetry (CEG §7.1), the reserved-prefix emitter
+  rule (CEG §7.0 — `system:*`, `audit_chain:*`,
+  `transparency_log:cosigned:*`, …), the four-test
+  operational-language gate (T1/T2/T3/T4 — names must describe
+  machine-checkable mechanisms, not subjective qualities), the
+  CEG 0.1 → 0.2 attestation-ladder transition-window dual-acceptance.
+  None of these arbitrate "is the attester really X"; they enforce
+  that the row's prefix string is a wire-format shape that
+  consumers can compose over.
+
+- **Relational gates (Cartesian-misread, REFUSE)** — anything that
+  would have the substrate re-check whether a self-attestation's
+  emitter "really is" what it claims; anything that would require
+  N cross-attestations before admission of a self-claim; anything
+  that would gate write-path admission on consumer-side
+  composition outcomes. Those belong at the composition layer, not
+  the substrate.
+
+The CEG §0.5 framing is not philosophy bolted on after the fact —
+it's the reviewer-discipline the namespace + admission gate already
+embody. Naming it here keeps future reviewers from drifting back
+toward the Cartesian default through a sequence of individually-
+reasonable-looking gate additions.
+
 ---
 
 ## 2. PROTOCOLS (WHO)

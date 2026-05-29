@@ -40,6 +40,7 @@ pub mod blobs;
 pub mod emit;
 pub mod goal;
 pub mod hardware_attestation;
+pub mod precedence;
 #[cfg(feature = "cirisaudit")]
 pub mod read;
 pub mod rooting;
@@ -72,7 +73,10 @@ pub(crate) mod serde_bytes_b64 {
     }
 }
 
-pub use admission::{DimensionAdmissionPolicy, DimensionRejectionReason};
+pub use admission::{
+    AttestationLadderTransitionPolicy, DimensionAdmissionPolicy, DimensionRejectionReason,
+    ReservedPrefixRule, ATTESTATION_LADDER_MECHANISMS,
+};
 pub use blobs::{
     holds_bytes_attestation_envelope, holds_bytes_attestation_type, BlobBody, BlobError,
     BlobStorage, ExternalRef, PutBlobAttestation, DEFAULT_INLINE_BYTES_CAP,
@@ -493,6 +497,31 @@ pub enum Error {
         reason: &'static str,
     },
 
+    /// v3.0.0 (CIRISPersist#116, CEG 0.2 §7.0). The submitted
+    /// `scores` attestation's `dimension` matches a reserved-prefix
+    /// pattern (`system:*`, `audit_chain:*`, `transparency_log:cosigned:*`,
+    /// `capacity:*` self-emission, …) but the `attesting_key_id`'s
+    /// `identity_type` does not satisfy the emitter rule for that
+    /// prefix. Rejected at admission; the row is not stored. See
+    /// [`admission::ReservedPrefixRule`] for the per-prefix rule
+    /// shape and [`admission::DimensionAdmissionPolicy::reserved_prefix_rules`]
+    /// for the default policy contents.
+    #[error(
+        "reserved-prefix emitter mismatch: dimension {dimension:?} requires \
+         identity_type ∈ {required:?} but got identity_type={got_identity_type:?}"
+    )]
+    ReservedPrefixEmitterMismatch {
+        /// The `dimension` value from the attestation envelope.
+        dimension: String,
+        /// The reserved prefix pattern that matched.
+        prefix: String,
+        /// Identity-type vocabulary the prefix accepts (sorted for
+        /// deterministic error output).
+        required: Vec<String>,
+        /// The submitting key's resolved `identity_type`.
+        got_identity_type: String,
+    },
+
     /// v2.5.0 (CIRISPersist#102 Ask 4). The submitted `scores`
     /// attestation's `attestation_envelope` failed JSON Schema
     /// validation against the per-axis schema registered for the
@@ -609,6 +638,9 @@ impl Error {
                 "federation_accord_dimension_requires_accord_holder"
             }
             Error::DimensionRejected { .. } => "federation_dimension_rejected",
+            Error::ReservedPrefixEmitterMismatch { .. } => {
+                "federation_reserved_prefix_emitter_mismatch"
+            }
             Error::EnvelopeSchemaViolation { .. } => "federation_envelope_schema_violation",
             Error::AccordHolderRequiresAttestationEvidence { .. } => {
                 "federation_accord_holder_requires_attestation_evidence"

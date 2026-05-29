@@ -479,6 +479,20 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             &attesting_identity_type,
         )?;
 
+        // v3.0.0 (CIRISPersist#116, CEG 0.2 §6.1) — structural-composer
+        // dedup on `(references_attestation_id, attestation_type,
+        // attesting_key_id)`. A duplicate composer is a typed
+        // `Ok(())` no-op; the audit chain stays complete without
+        // accumulating replayed rows. Non-composers (scores,
+        // delegates_to) skip this branch.
+        if crate::federation::precedence::is_structural_composer(&row.attestation_type) {
+            for existing in &state.federation_attestations {
+                if crate::federation::precedence::is_dedup_match(existing, &row) {
+                    return Ok(());
+                }
+            }
+        }
+
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         state.federation_attestations.push(row);
         Ok(())
@@ -2866,5 +2880,76 @@ mod tests {
         assert_eq!(revs.len(), 1);
         assert_eq!(revs[0].revocation_id, "rev-1");
         assert_eq!(revs[0].persist_row_hash.len(), 64);
+    }
+
+    // ─── v3.0.0 (CIRISPersist#116, CEG 0.2 §6.1) — structural-composer ──
+    //     dedup (memory backend parity).
+
+    fn fix_structural_composer(
+        id: &str,
+        attester: &str,
+        ty: &str,
+        references_attestation_id: &str,
+        asserted_at: &str,
+    ) -> Attestation {
+        Attestation {
+            attestation_id: id.into(),
+            attesting_key_id: attester.into(),
+            attested_key_id: attester.into(),
+            attestation_type: ty.into(),
+            weight: None,
+            asserted_at: asserted_at.parse().unwrap(),
+            expires_at: None,
+            attestation_envelope: serde_json::json!({
+                "references_attestation_id": references_attestation_id,
+                "withdrawal_reason": "test",
+            }),
+            original_content_hash: "deadbeef".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: attester.into(),
+            scrub_timestamp: asserted_at.parse().unwrap(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_put_attestation_structural_dedup_silent_noop() {
+        let backend = MemoryBackend::new();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("registry-steward", "registry", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        let w1 = fix_structural_composer(
+            "w-1",
+            "registry-steward",
+            crate::federation::types::attestation_type::WITHDRAWS,
+            "upstream-1",
+            "2026-05-01T00:00:00Z",
+        );
+        let mut w2 = w1.clone();
+        w2.attestation_id = "w-2".into();
+        w2.asserted_at = "2026-05-02T00:00:00Z".parse().unwrap();
+        backend
+            .put_attestation(SignedAttestation { attestation: w1 })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(SignedAttestation { attestation: w2 })
+            .await
+            .unwrap();
+        let rows = backend
+            .list_attestations_for("registry-steward")
+            .await
+            .unwrap();
+        let composers: Vec<_> = rows
+            .iter()
+            .filter(|r| r.attestation_type == crate::federation::types::attestation_type::WITHDRAWS)
+            .collect();
+        assert_eq!(composers.len(), 1, "second triple should be a no-op");
+        assert_eq!(composers[0].attestation_id, "w-1");
     }
 }

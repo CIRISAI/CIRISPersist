@@ -1423,6 +1423,41 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             &attesting_identity_type,
         )?;
 
+        // v3.0.0 (CIRISPersist#116, CEG 0.2 §6.1) — structural-composer
+        // dedup on `(references_attestation_id, attestation_type,
+        // attesting_key_id)`. A second put with the same triple is a
+        // silent no-op so structural composers are idempotent on
+        // replay per §6.1. JSONB `->>` extracts the
+        // references_attestation_id from the envelope for the WHERE
+        // clause; the cost is one indexable scan per write but only
+        // for structural composers (most traffic is `scores`).
+        if crate::federation::precedence::is_structural_composer(&row.attestation_type) {
+            if let Some(ref_id) =
+                crate::federation::precedence::references_attestation_id_from_envelope(
+                    &row.attestation_envelope,
+                )
+            {
+                let exists = client
+                    .query_opt(
+                        "SELECT 1 AS one FROM cirislens.federation_attestations \
+                         WHERE attestation_type = $1 \
+                           AND attesting_key_id = $2 \
+                           AND attestation_envelope->>'references_attestation_id' = $3 \
+                         LIMIT 1",
+                        &[&row.attestation_type, &row.attesting_key_id, &ref_id],
+                    )
+                    .await
+                    .map_err(|e| {
+                        crate::federation::Error::Backend(format!(
+                            "dedup lookup structural composer: {e}"
+                        ))
+                    })?;
+                if exists.is_some() {
+                    return Ok(());
+                }
+            }
+        }
+
         // v2.5.0 (CIRISPersist#102 Ask 4) — envelope-schema admission
         // hook. Runs AFTER the dimension gate; only fires on `scores`
         // attestations with a resolvable axis. Skipped on
@@ -2609,19 +2644,36 @@ impl crate::federation::BlobStorage for PostgresBackend {
         &self,
         sha256: &[u8; 32],
     ) -> Result<Vec<String>, crate::federation::BlobError> {
-        // Query strategy:
-        //   1. server-side prefix filter on attestation_type
-        //      ("holds_bytes:sha256:<8-hex>") — uses sequential scan or
-        //      a future btree index on attestation_type prefix
-        //   2. client-side full-SHA filter against
-        //      attestation_envelope->'evidence_refs' — discriminates
-        //      prefix collisions
-        // Server-side JSONB containment would be marginally faster
-        // for a populated index, but the prefix already narrows the
-        // candidate set well below O(table). Future work: an index
-        // on `(attestation_type)` lights up the prefix scan.
+        // v3.0.0 (CIRISPersist#116, CEG 0.2 §10.1.2):
+        // 1. server-side prefix filter on attestation_type
+        //    ("holds_bytes:sha256:<8-hex>") — narrows the candidate
+        //    set well below O(table) without an extra index.
+        // 2. client-side full-SHA filter against
+        //    attestation_envelope->'evidence_refs' — discriminates
+        //    32-bit prefix collisions.
+        // 3. TTL filter — DEFAULT_HOLDS_BYTES_TTL (24 hours) measured
+        //    from `asserted_at`; expired rows are treated as stale per
+        //    CEG §10.1.2.
+        // 4. ContentMiss withdraws filter — drop rows whose attester
+        //    emitted a `withdraws` against the holds_bytes row's
+        //    attestation_id (CEG §10.1.2 ContentMiss feedback loop).
+        //
+        // The TTL window is applied via the WHERE clause with
+        // `asserted_at + interval` so the index on asserted_at (if
+        // present) can prune. The withdraws filter is a NOT EXISTS
+        // subquery against the same table; the JSONB extraction
+        // `->>'references_attestation_id'` matches the structural-
+        // composer dedup query shape.
         let attestation_type = crate::federation::holds_bytes_attestation_type(sha256);
         let full_hex = hex::encode(sha256);
+        let now = chrono::Utc::now();
+        let ttl_seconds: i64 = i64::try_from(
+            crate::federation::blobs::DEFAULT_HOLDS_BYTES_TTL.as_secs(),
+        )
+        .map_err(|_| {
+            crate::federation::BlobError::Backend("DEFAULT_HOLDS_BYTES_TTL out of i64 range".into())
+        })?;
+        let cutoff = now - chrono::Duration::seconds(ttl_seconds);
 
         let client = self
             .get_client()
@@ -2629,10 +2681,26 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
         let rows = client
             .query(
-                "SELECT attesting_key_id, attestation_envelope \
+                // `asserted_at > cutoff` admits rows whose freshness
+                // window has NOT lapsed; rows whose asserted_at is at
+                // or before cutoff are TTL-expired.
+                "SELECT attestation_id::text, attesting_key_id, attestation_envelope \
                  FROM cirislens.federation_attestations \
-                 WHERE attestation_type = $1",
-                &[&attestation_type],
+                 WHERE attestation_type = $1 \
+                   AND asserted_at > $2 \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM cirislens.federation_attestations w \
+                     WHERE w.attestation_type = $3 \
+                       AND w.attesting_key_id = \
+                           cirislens.federation_attestations.attesting_key_id \
+                       AND w.attestation_envelope->>'references_attestation_id' = \
+                           cirislens.federation_attestations.attestation_id::text \
+                   )",
+                &[
+                    &attestation_type,
+                    &cutoff,
+                    &crate::federation::types::attestation_type::WITHDRAWS,
+                ],
             )
             .await
             .map_err(|e| {
@@ -10994,6 +11062,440 @@ mod tests {
             .unwrap();
         let rows = backend.list_attestations_for(&agent_k).await.unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    // ─── v3.0.0 (CIRISPersist#116, CEG 0.2 §6.1) — structural-composer ──
+    //     dedup + precedence (postgres backend).
+
+    fn pg_structural_composer(
+        attester: &str,
+        ty: &str,
+        references_attestation_id: &str,
+        asserted_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::federation::Attestation {
+        crate::federation::Attestation {
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            attesting_key_id: attester.into(),
+            attested_key_id: attester.into(),
+            attestation_type: ty.into(),
+            weight: None,
+            asserted_at,
+            expires_at: None,
+            attestation_envelope: serde_json::json!({
+                "references_attestation_id": references_attestation_id,
+                "withdrawal_reason": "test",
+            }),
+            original_content_hash: "deadbeef".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: attester.into(),
+            scrub_timestamp: asserted_at,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_put_attestation_structural_dedup_silent_noop_on_replay() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+        let steward = format!("pg-dedup-stw-§116-{}", uuid_like());
+        let upstream = uuid::Uuid::new_v4().to_string();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &steward,
+                    "registry",
+                    crate::federation::types::identity_type::STEWARD,
+                ),
+            })
+            .await
+            .unwrap();
+        let w1 = pg_structural_composer(
+            &steward,
+            crate::federation::types::attestation_type::WITHDRAWS,
+            &upstream,
+            chrono::Utc::now(),
+        );
+        let w1_id = w1.attestation_id.clone();
+        let mut w2 = w1.clone();
+        w2.attestation_id = uuid::Uuid::new_v4().to_string();
+        w2.asserted_at += chrono::Duration::seconds(60);
+        w2.scrub_timestamp = w2.asserted_at;
+        backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: w1 })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: w2 })
+            .await
+            .unwrap();
+        let rows = backend.list_attestations_by(&steward).await.unwrap();
+        let withdraws_for_upstream: Vec<_> = rows
+            .iter()
+            .filter(|r| {
+                r.attestation_type == crate::federation::types::attestation_type::WITHDRAWS
+                    && crate::federation::precedence::references_attestation_id_from_envelope(
+                        &r.attestation_envelope,
+                    ) == Some(upstream.as_str())
+            })
+            .collect();
+        assert_eq!(
+            withdraws_for_upstream.len(),
+            1,
+            "duplicate triple should be silent no-op"
+        );
+        assert_eq!(withdraws_for_upstream[0].attestation_id, w1_id);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_precedence_recants_wins_over_withdraws() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::precedence::{
+            is_structural_composer, precedence_winner, references_attestation_id_from_envelope,
+        };
+        use crate::federation::FederationDirectory;
+        let steward = format!("pg-prec-stw-§116-{}", uuid_like());
+        let upstream = uuid::Uuid::new_v4().to_string();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &steward,
+                    "registry",
+                    crate::federation::types::identity_type::STEWARD,
+                ),
+            })
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let recants = pg_structural_composer(
+            &steward,
+            crate::federation::types::attestation_type::RECANTS,
+            &upstream,
+            now,
+        );
+        let recants_id = recants.attestation_id.clone();
+        let withdraws_later = pg_structural_composer(
+            &steward,
+            crate::federation::types::attestation_type::WITHDRAWS,
+            &upstream,
+            now + chrono::Duration::hours(1),
+        );
+        backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: recants,
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: withdraws_later,
+            })
+            .await
+            .unwrap();
+        let all = backend.list_attestations_by(&steward).await.unwrap();
+        let group: Vec<_> = all
+            .iter()
+            .filter(|r| {
+                is_structural_composer(&r.attestation_type)
+                    && references_attestation_id_from_envelope(&r.attestation_envelope)
+                        == Some(upstream.as_str())
+            })
+            .collect();
+        let winner = precedence_winner(&group).expect("non-empty");
+        // recants wins regardless of signed_at.
+        assert_eq!(winner.attestation_id, recants_id);
+        assert_eq!(
+            winner.attestation_type,
+            crate::federation::types::attestation_type::RECANTS
+        );
+    }
+
+    // ─── v3.0.0 (CIRISPersist#116, CEG 0.2 §7.0) — reserved-prefix ──
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_put_attestation_rejects_system_prefix_from_agent() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+        let steward = format!("pg-rp-stw-§116-{}", uuid_like());
+        let agent_k = format!("pg-rp-agt-§116-{}", uuid_like());
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &steward,
+                    "registry",
+                    crate::federation::types::identity_type::STEWARD,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &agent_k,
+                    "primitive-rp",
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await
+            .unwrap();
+        let att = pg_scores_attestation(
+            &steward,
+            &agent_k,
+            &steward,
+            "system:health:n_eff_measurable:v1",
+        );
+        let err = backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: att })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::federation::Error::ReservedPrefixEmitterMismatch { .. }
+            ),
+            "expected ReservedPrefixEmitterMismatch, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_put_attestation_accepts_system_prefix_from_substrate_persist() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+        let persist_self = format!("pg-self-§116-{}", uuid_like());
+        let agent_k = format!("pg-rp-ok-agt-§116-{}", uuid_like());
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &persist_self,
+                    "persist",
+                    crate::federation::types::identity_type::SUBSTRATE_PERSIST,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &agent_k,
+                    "primitive-rp-ok",
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await
+            .unwrap();
+        let att = pg_scores_attestation(
+            &persist_self,
+            &agent_k,
+            &persist_self,
+            "system:health:n_eff_measurable:v1",
+        );
+        backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_put_attestation_admits_deprecated_attestation_ladder_in_transition() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+        let steward = format!("pg-dep-stw-§116-{}", uuid_like());
+        let agent_k = format!("pg-dep-agt-§116-{}", uuid_like());
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &steward,
+                    "registry",
+                    crate::federation::types::identity_type::STEWARD,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &agent_k,
+                    "primitive-dep",
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await
+            .unwrap();
+        // Deprecated 0.1 shape — admitted during transition without
+        // `:v[0-9]+` segment.
+        let att = pg_scores_attestation(&steward, &agent_k, &steward, "attestation:l1:self_verify");
+        backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+        // Canonical 0.2 shape.
+        let att = pg_scores_attestation(&steward, &agent_k, &steward, "attestation:self_verify");
+        backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+    }
+
+    // ─── v3.0.0 (CIRISPersist#116, CEG 0.2 §10.1.2) — holds_bytes ──
+    //     24-hour TTL + ContentMiss feedback (postgres backend).
+
+    fn pg_blob_attestation_at(
+        attesting_key_id: &str,
+        scrub_key_id: &str,
+        scrub_timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> crate::federation::PutBlobAttestation {
+        crate::federation::PutBlobAttestation {
+            attesting_key_id: attesting_key_id.into(),
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            original_content_hash_hex: "deadbeef".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: scrub_key_id.into(),
+            scrub_timestamp,
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_blob_list_holders_filters_out_expired_ttl() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::{BlobBody, BlobStorage};
+        let host = format!("pg-blob-ttl-§116-{}", uuid_like());
+        pg_blob_bootstrap_host(&backend, &host).await;
+        let bytes = pg_blob_payload("ttl-expired");
+        let sha = pg_sha256_of(&bytes);
+        let backdated = chrono::Utc::now()
+            - chrono::Duration::from_std(crate::federation::blobs::DEFAULT_HOLDS_BYTES_TTL)
+                .unwrap()
+            - chrono::Duration::hours(1);
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                pg_blob_attestation_at(&host, &host, backdated),
+            )
+            .await
+            .unwrap();
+        let holders = backend.list_holders(&sha).await.unwrap();
+        assert!(
+            holders.is_empty(),
+            "expected expired holder filtered, got {holders:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_blob_list_holders_includes_fresh_ttl() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::{BlobBody, BlobStorage};
+        let host = format!("pg-blob-fresh-§116-{}", uuid_like());
+        pg_blob_bootstrap_host(&backend, &host).await;
+        let bytes = pg_blob_payload("ttl-fresh");
+        let sha = pg_sha256_of(&bytes);
+        let fresh = chrono::Utc::now() - chrono::Duration::hours(1);
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                pg_blob_attestation_at(&host, &host, fresh),
+            )
+            .await
+            .unwrap();
+        let holders = backend.list_holders(&sha).await.unwrap();
+        assert_eq!(holders, vec![host]);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_blob_list_holders_drops_withdrawn_via_content_miss() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::{BlobBody, BlobStorage, FederationDirectory};
+        let host = format!("pg-blob-miss-§116-{}", uuid_like());
+        pg_blob_bootstrap_host(&backend, &host).await;
+        let bytes = pg_blob_payload("content-miss");
+        let sha = pg_sha256_of(&bytes);
+        let holds_bytes_attestation = pg_blob_attestation_at(
+            &host,
+            &host,
+            chrono::Utc::now() - chrono::Duration::hours(1),
+        );
+        let holds_bytes_attestation_id = holds_bytes_attestation.attestation_id.clone();
+        backend
+            .put_blob(&sha, BlobBody::Inline(bytes), None, holds_bytes_attestation)
+            .await
+            .unwrap();
+        // Present before withdraws.
+        assert_eq!(
+            backend.list_holders(&sha).await.unwrap(),
+            vec![host.clone()]
+        );
+
+        // host emits the WITHDRAWS referencing the holds_bytes row.
+        let withdraws = pg_structural_composer(
+            &host,
+            crate::federation::types::attestation_type::WITHDRAWS,
+            &holds_bytes_attestation_id,
+            chrono::Utc::now(),
+        );
+        backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: withdraws,
+            })
+            .await
+            .unwrap();
+        let holders = backend.list_holders(&sha).await.unwrap();
+        assert!(
+            holders.is_empty(),
+            "expected withdrawn holder filtered, got {holders:?}"
+        );
     }
 
     // ─── v2.5.0 (CIRISPersist#102 Ask 4) — schema-resolver tests ────

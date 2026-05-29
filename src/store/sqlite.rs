@@ -1215,6 +1215,64 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             &attesting_identity_type,
         )?;
 
+        // v3.0.0 (CIRISPersist#116, CEG 0.2 §6.1) — structural-composer
+        // dedup on `(references_attestation_id, attestation_type,
+        // attesting_key_id)`. Look up the candidate row's
+        // references-id from its envelope; if a row with the same
+        // triple already exists, the second put is a silent no-op
+        // (structural composers are idempotent on replay per §6.1).
+        if crate::federation::precedence::is_structural_composer(&row.attestation_type) {
+            if let Some(ref_id) =
+                crate::federation::precedence::references_attestation_id_from_envelope(
+                    &row.attestation_envelope,
+                )
+            {
+                let conn = self.conn.clone();
+                let attestation_type_owned = row.attestation_type.clone();
+                let attesting_owned = row.attesting_key_id.clone();
+                let ref_id_owned = ref_id.to_owned();
+                let dup_exists =
+                    tokio::task::spawn_blocking(move || -> Result<bool, rusqlite::Error> {
+                        let conn = conn.blocking_lock();
+                        let mut stmt = conn.prepare(
+                            "SELECT attestation_envelope FROM federation_attestations \
+                         WHERE attestation_type = ?1 AND attesting_key_id = ?2",
+                        )?;
+                        let rows = stmt.query_map(
+                            rusqlite::params![attestation_type_owned, attesting_owned],
+                            |r| r.get::<_, String>(0),
+                        )?;
+                        for env_text in rows {
+                            let env_text = env_text?;
+                            let env: serde_json::Value = match serde_json::from_str(&env_text) {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+                            let existing_ref =
+                            crate::federation::precedence::references_attestation_id_from_envelope(
+                                &env,
+                            );
+                            if existing_ref == Some(ref_id_owned.as_str()) {
+                                return Ok(true);
+                            }
+                        }
+                        Ok(false)
+                    })
+                    .await
+                    .map_err(|e| {
+                        crate::federation::Error::Backend(format!("spawn_blocking join: {e}"))
+                    })?
+                    .map_err(|e| {
+                        crate::federation::Error::Backend(format!(
+                            "dedup lookup structural composer: {e}"
+                        ))
+                    })?;
+                if dup_exists {
+                    return Ok(());
+                }
+            }
+        }
+
         // v2.5.0 (CIRISPersist#102 Ask 4) — envelope-schema admission
         // hook. Same shape as the postgres backend; see
         // `src/store/postgres.rs` put_attestation for the
@@ -2416,25 +2474,51 @@ impl crate::federation::BlobStorage for SqliteBackend {
         &self,
         sha256: &[u8; 32],
     ) -> Result<Vec<String>, crate::federation::BlobError> {
+        // v3.0.0 (CIRISPersist#116, CEG 0.2 §10.1.2):
+        // 1. Fetch holds_bytes attestation rows matching the SHA prefix.
+        // 2. Filter to rows whose envelope evidence_refs contains the
+        //    full hex SHA (discriminates 32-bit prefix collisions).
+        // 3. Apply the DEFAULT_HOLDS_BYTES_TTL freshness window —
+        //    rows whose asserted_at + TTL <= now are treated as stale.
+        // 4. Drop rows whose attester emitted a `withdraws` structural
+        //    composer against the holds_bytes row's attestation_id
+        //    (the ContentMiss feedback loop).
         let attestation_type = crate::federation::holds_bytes_attestation_type(sha256);
         let full_hex = hex::encode(sha256);
+        let now = chrono::Utc::now();
+        let ttl = chrono::Duration::from_std(crate::federation::blobs::DEFAULT_HOLDS_BYTES_TTL)
+            .expect("DEFAULT_HOLDS_BYTES_TTL fits chrono::Duration");
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<String>, rusqlite::Error> {
             let conn = conn.blocking_lock();
+
+            // Step A: collect candidate holds_bytes rows.
             let mut stmt = conn.prepare(
-                "SELECT attesting_key_id, attestation_envelope \
+                "SELECT attestation_id, attesting_key_id, attestation_envelope, asserted_at \
                  FROM federation_attestations \
                  WHERE attestation_type = ?1",
             )?;
-            let rows = stmt.query_map(rusqlite::params![attestation_type], |row| {
+            let rows = stmt.query_map(rusqlite::params![&attestation_type], |row| {
+                let attestation_id: String = row.get("attestation_id")?;
                 let key_id: String = row.get("attesting_key_id")?;
                 let env_text: String = row.get("attestation_envelope")?;
-                Ok((key_id, env_text))
+                let asserted_at: String = row.get("asserted_at")?;
+                Ok((attestation_id, key_id, env_text, asserted_at))
             })?;
+            // Pre-collect so we can release the prepared-statement
+            // borrow before doing the withdraws lookup (avoids holding
+            // two prepared statements on the same connection).
+            let candidates: Vec<(String, String, String, String)> =
+                rows.collect::<Result<_, _>>()?;
+            drop(stmt);
+
+            // Step B: for each candidate, prune (i) full-SHA mismatch
+            // on evidence_refs, (ii) expired TTL window, (iii)
+            // withdrawn by the attester.
             let mut holders: Vec<String> = Vec::new();
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for r in rows {
-                let (key_id, env_text) = r?;
+            for (attestation_id, key_id, env_text, asserted_at_str) in candidates {
+                // (i) full-SHA match
                 let env: serde_json::Value = match serde_json::from_str(&env_text) {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -2444,7 +2528,51 @@ impl crate::federation::BlobStorage for SqliteBackend {
                     .and_then(|v| v.as_array())
                     .map(|arr| arr.iter().any(|v| v.as_str() == Some(full_hex.as_str())))
                     .unwrap_or(false);
-                if matches && seen.insert(key_id.clone()) {
+                if !matches {
+                    continue;
+                }
+                // (ii) TTL window
+                let asserted_at = match chrono::DateTime::parse_from_rfc3339(&asserted_at_str) {
+                    Ok(t) => t.with_timezone(&chrono::Utc),
+                    Err(_) => continue,
+                };
+                let expires_at = asserted_at + ttl;
+                if expires_at <= now {
+                    continue;
+                }
+                // (iii) ContentMiss withdraws — the attester emitted a
+                // `withdraws` referencing this row's attestation_id.
+                let mut withdraws_stmt = conn.prepare(
+                    "SELECT attestation_envelope FROM federation_attestations \
+                     WHERE attestation_type = ?1 AND attesting_key_id = ?2",
+                )?;
+                let withdraws_rows = withdraws_stmt.query_map(
+                    rusqlite::params![
+                        crate::federation::types::attestation_type::WITHDRAWS,
+                        &key_id
+                    ],
+                    |r| r.get::<_, String>("attestation_envelope"),
+                )?;
+                let mut withdrawn = false;
+                for w in withdraws_rows {
+                    let w_text = w?;
+                    let w_env: serde_json::Value = match serde_json::from_str(&w_text) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    if crate::federation::precedence::references_attestation_id_from_envelope(
+                        &w_env,
+                    ) == Some(attestation_id.as_str())
+                    {
+                        withdrawn = true;
+                        break;
+                    }
+                }
+                if withdrawn {
+                    continue;
+                }
+
+                if seen.insert(key_id.clone()) {
                     holders.push(key_id);
                 }
             }
@@ -7541,6 +7669,358 @@ mod tests {
         assert_eq!(rows.len(), 1);
     }
 
+    // ─── v3.0.0 (CIRISPersist#116, CEG 0.2 §6.1) — structural-composer ──
+    //     dedup + precedence tests.
+
+    /// Build a structural-composer attestation with an envelope that
+    /// carries the §6.1 `references_attestation_id` field. The
+    /// attestation_type can be SUPERSEDES / WITHDRAWS / RECANTS.
+    fn structural_composer_attestation(
+        id: &str,
+        attester: &str,
+        ty: &str,
+        references_attestation_id: &str,
+        asserted_at: &str,
+    ) -> Attestation {
+        Attestation {
+            attestation_id: id.into(),
+            attesting_key_id: attester.into(),
+            attested_key_id: attester.into(),
+            attestation_type: ty.into(),
+            weight: None,
+            asserted_at: asserted_at.parse().unwrap(),
+            expires_at: None,
+            attestation_envelope: serde_json::json!({
+                "references_attestation_id": references_attestation_id,
+                "withdrawal_reason": "test",
+            }),
+            original_content_hash: "deadbeef".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: attester.into(),
+            scrub_timestamp: asserted_at.parse().unwrap(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_put_attestation_structural_dedup_silent_noop_on_replay() {
+        // CEG 0.2 §6.1 — a second `withdraws` with the same triple
+        // `(references_attestation_id, attestation_type,
+        // attesting_key_id)` is a silent no-op. The audit chain has
+        // ONE row, not two.
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in ["registry-steward", "k-a"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, k, "registry-steward"),
+                })
+                .await
+                .unwrap();
+        }
+        let w1 = structural_composer_attestation(
+            "w-1",
+            "registry-steward",
+            crate::federation::types::attestation_type::WITHDRAWS,
+            "upstream-1",
+            "2026-05-01T00:00:00Z",
+        );
+        let mut w2 = w1.clone();
+        w2.attestation_id = "w-2".into();
+        w2.asserted_at = "2026-05-02T00:00:00Z".parse().unwrap();
+        backend
+            .put_attestation(SignedAttestation { attestation: w1 })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(SignedAttestation { attestation: w2 })
+            .await
+            .unwrap();
+        let rows = backend
+            .list_attestations_for("registry-steward")
+            .await
+            .unwrap();
+        let withdraws_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.attestation_type == crate::federation::types::attestation_type::WITHDRAWS)
+            .collect();
+        assert_eq!(
+            withdraws_rows.len(),
+            1,
+            "second withdraws with same triple should be a silent no-op"
+        );
+        // First write wins on attestation_id (the second was silently
+        // discarded).
+        assert_eq!(withdraws_rows[0].attestation_id, "w-1");
+    }
+
+    #[tokio::test]
+    async fn sqlite_put_attestation_structural_dedup_distinguishes_distinct_triples() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in ["registry-steward", "k-a", "agent-2"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, k, "registry-steward"),
+                })
+                .await
+                .unwrap();
+        }
+        // Same attester, different references → not a dup.
+        let w1 = structural_composer_attestation(
+            "w-r1",
+            "registry-steward",
+            crate::federation::types::attestation_type::WITHDRAWS,
+            "upstream-1",
+            "2026-05-01T00:00:00Z",
+        );
+        let w2 = structural_composer_attestation(
+            "w-r2",
+            "registry-steward",
+            crate::federation::types::attestation_type::WITHDRAWS,
+            "upstream-2",
+            "2026-05-02T00:00:00Z",
+        );
+        // Same attester + references, different type → not a dup.
+        let r3 = structural_composer_attestation(
+            "r-r1",
+            "registry-steward",
+            crate::federation::types::attestation_type::RECANTS,
+            "upstream-1",
+            "2026-05-03T00:00:00Z",
+        );
+        // Different attester → not a dup.
+        let w4 = structural_composer_attestation(
+            "w-r3",
+            "agent-2",
+            crate::federation::types::attestation_type::WITHDRAWS,
+            "upstream-1",
+            "2026-05-04T00:00:00Z",
+        );
+        for att in [w1, w2, r3, w4] {
+            backend
+                .put_attestation(SignedAttestation { attestation: att })
+                .await
+                .unwrap();
+        }
+        let by_steward = backend
+            .list_attestations_by("registry-steward")
+            .await
+            .unwrap();
+        let composers: Vec<_> = by_steward
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.attestation_type.as_str(),
+                    "withdraws" | "recants" | "supersedes"
+                )
+            })
+            .collect();
+        assert_eq!(composers.len(), 3, "expected three distinct triples");
+        let by_agent = backend.list_attestations_by("agent-2").await.unwrap();
+        assert_eq!(by_agent.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_precedence_recants_wins_over_withdraws() {
+        // CEG §6.1 — `recants` outranks `withdraws` regardless of
+        // signed_at. Verified by composing the precedence_winner
+        // helper over the same-attester chain.
+        use crate::federation::precedence::{
+            is_structural_composer, precedence_winner, references_attestation_id_from_envelope,
+        };
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in ["registry-steward", "k-a"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, k, "registry-steward"),
+                })
+                .await
+                .unwrap();
+        }
+        // recants earlier, withdraws later.
+        let recants = structural_composer_attestation(
+            "r-1",
+            "registry-steward",
+            crate::federation::types::attestation_type::RECANTS,
+            "upstream-x",
+            "2026-05-01T00:00:00Z",
+        );
+        let withdraws_later = structural_composer_attestation(
+            "w-1",
+            "registry-steward",
+            crate::federation::types::attestation_type::WITHDRAWS,
+            "upstream-x",
+            "2026-06-01T00:00:00Z",
+        );
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: recants,
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: withdraws_later,
+            })
+            .await
+            .unwrap();
+        let all = backend
+            .list_attestations_by("registry-steward")
+            .await
+            .unwrap();
+        let group: Vec<_> = all
+            .iter()
+            .filter(|r| {
+                is_structural_composer(&r.attestation_type)
+                    && references_attestation_id_from_envelope(&r.attestation_envelope)
+                        == Some("upstream-x")
+            })
+            .collect();
+        let winner = precedence_winner(&group).expect("non-empty");
+        assert_eq!(winner.attestation_id, "r-1");
+        assert_eq!(
+            winner.attestation_type,
+            crate::federation::types::attestation_type::RECANTS
+        );
+    }
+
+    // ─── v3.0.0 (CIRISPersist#116, CEG 0.2 §7.0) — reserved-prefix ──
+
+    #[tokio::test]
+    async fn sqlite_put_attestation_rejects_system_prefix_from_agent() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("registry-steward", "registry", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-a", "primitive-a", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        let att = scores_attestation_with_dimension(
+            "att-sys-1",
+            "registry-steward",
+            "k-a",
+            "registry-steward",
+            "system:health:n_eff_measurable:v1",
+        );
+        let err = backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::federation::Error::ReservedPrefixEmitterMismatch { .. }
+            ),
+            "expected ReservedPrefixEmitterMismatch, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_put_attestation_accepts_system_prefix_from_substrate_persist() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key_with_identity_type(
+                    "persist-self",
+                    "persist",
+                    "persist-self",
+                    crate::federation::types::identity_type::SUBSTRATE_PERSIST,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-a", "primitive-a", "persist-self"),
+            })
+            .await
+            .unwrap();
+        let att = scores_attestation_with_dimension(
+            "att-sys-2",
+            "persist-self",
+            "k-a",
+            "persist-self",
+            "system:health:n_eff_measurable:v1",
+        );
+        backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_put_attestation_admits_deprecated_attestation_ladder_in_transition() {
+        // CEG 0.1 → 0.2 transition: `attestation:l1:self_verify` is
+        // the deprecated 0.1 wire shape; persist admits it during the
+        // transition window WITHOUT requiring `:v[0-9]+`.
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("registry-steward", "registry", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-a", "primitive-a", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        let att = scores_attestation_with_dimension(
+            "att-deprecated",
+            "registry-steward",
+            "k-a",
+            "registry-steward",
+            "attestation:l1:self_verify",
+        );
+        backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_put_attestation_admits_canonical_attestation_mechanism() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("registry-steward", "registry", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-a", "primitive-a", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        let att = scores_attestation_with_dimension(
+            "att-canonical",
+            "registry-steward",
+            "k-a",
+            "registry-steward",
+            "attestation:self_verify",
+        );
+        backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+    }
+
     // ─── BlobStorage tests (v2.3, CIRISPersist#103) ────────────────
 
     use crate::federation::{BlobBody, BlobError, BlobStorage, ExternalRef, PutBlobAttestation};
@@ -7550,6 +8030,9 @@ mod tests {
         scrub_key_id: &str,
         attestation_id: &str,
     ) -> PutBlobAttestation {
+        // v3.0.0 (CIRISPersist#116, CEG 0.2 §10.1.2): use Utc::now()
+        // so the row lands inside the DEFAULT_HOLDS_BYTES_TTL window
+        // — `list_holders` now filters TTL-expired rows.
         PutBlobAttestation {
             attesting_key_id: attesting_key_id.into(),
             attestation_id: attestation_id.into(),
@@ -7557,7 +8040,7 @@ mod tests {
             scrub_signature_classical: "c2ln".into(),
             scrub_signature_pqc: None,
             scrub_key_id: scrub_key_id.into(),
-            scrub_timestamp: "2026-05-27T00:00:00Z".parse().unwrap(),
+            scrub_timestamp: chrono::Utc::now(),
         }
     }
 
@@ -7873,6 +8356,133 @@ mod tests {
         let mut holders = backend.list_holders(&sha).await.unwrap();
         holders.sort();
         assert_eq!(holders, vec!["host-a".to_string(), "host-b".to_string()]);
+    }
+
+    // ─── v3.0.0 (CIRISPersist#116, CEG 0.2 §10.1.2) — holds_bytes ──
+    //     24-hour TTL + ContentMiss feedback tests.
+
+    /// Build a holds_bytes attestation with a CALLER-CHOSEN
+    /// `scrub_timestamp` so tests can backdate the row to verify the
+    /// TTL filter. Matches `blob_attestation()` shape but with the
+    /// asserted_at / scrub_timestamp exposed.
+    fn blob_attestation_at(
+        attesting_key_id: &str,
+        scrub_key_id: &str,
+        attestation_id: &str,
+        scrub_timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> PutBlobAttestation {
+        PutBlobAttestation {
+            attesting_key_id: attesting_key_id.into(),
+            attestation_id: attestation_id.into(),
+            original_content_hash_hex: "abcdef01".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: scrub_key_id.into(),
+            scrub_timestamp,
+        }
+    }
+
+    #[tokio::test]
+    async fn blob_list_holders_filters_out_expired_ttl() {
+        // CEG §10.1.2 — a holds_bytes attestation older than 24 hours
+        // is treated as stale; list_holders drops it.
+        let backend = blob_test_backend().await;
+        let bytes = b"ttl-expired-blob".to_vec();
+        let sha = sha256_of(&bytes);
+        let backdated = chrono::Utc::now()
+            - chrono::Duration::from_std(crate::federation::blobs::DEFAULT_HOLDS_BYTES_TTL)
+                .unwrap()
+            - chrono::Duration::hours(1);
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                blob_attestation_at(
+                    "host-a",
+                    "host-a",
+                    uuid::Uuid::new_v4().to_string().as_str(),
+                    backdated,
+                ),
+            )
+            .await
+            .unwrap();
+        let holders = backend.list_holders(&sha).await.unwrap();
+        assert!(
+            holders.is_empty(),
+            "expected expired holder to be filtered out, got {holders:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn blob_list_holders_includes_fresh_ttl() {
+        // Same shape as the expired test, but inside the freshness
+        // window — the row stays.
+        let backend = blob_test_backend().await;
+        let bytes = b"ttl-fresh-blob".to_vec();
+        let sha = sha256_of(&bytes);
+        let fresh = chrono::Utc::now() - chrono::Duration::hours(1);
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                blob_attestation_at(
+                    "host-a",
+                    "host-a",
+                    uuid::Uuid::new_v4().to_string().as_str(),
+                    fresh,
+                ),
+            )
+            .await
+            .unwrap();
+        let holders = backend.list_holders(&sha).await.unwrap();
+        assert_eq!(holders, vec!["host-a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn blob_list_holders_drops_withdrawn_via_content_miss() {
+        // CEG §10.1.2 — the consumer that fetched and saw a
+        // ContentMiss emits a `withdraws` referencing the stale
+        // holds_bytes row's attestation_id. list_holders MUST drop
+        // the row.
+        let backend = blob_test_backend().await;
+        let bytes = b"content-miss-blob".to_vec();
+        let sha = sha256_of(&bytes);
+        let holds_bytes_attestation_id = uuid::Uuid::new_v4().to_string();
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                blob_attestation("host-a", "host-a", holds_bytes_attestation_id.as_str()),
+            )
+            .await
+            .unwrap();
+        // Sanity: present before withdraws.
+        let holders = backend.list_holders(&sha).await.unwrap();
+        assert_eq!(holders, vec!["host-a".to_string()]);
+
+        // host-a emits the WITHDRAWS pointing at the holds_bytes row.
+        let withdraws = structural_composer_attestation(
+            "w-content-miss-1",
+            "host-a",
+            crate::federation::types::attestation_type::WITHDRAWS,
+            &holds_bytes_attestation_id,
+            "2026-05-27T00:00:00Z",
+        );
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: withdraws,
+            })
+            .await
+            .unwrap();
+
+        let holders = backend.list_holders(&sha).await.unwrap();
+        assert!(
+            holders.is_empty(),
+            "expected withdrawn holder to be filtered, got {holders:?}"
+        );
     }
 
     // ─── Trust hierarchy tests (v1.3.0, CIRISPersist#46+#47) ───────
