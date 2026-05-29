@@ -5,6 +5,21 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.4.2] — 2026-05-29
+
+**CIRISPersist 3.4.2 — CIRISVerify pin v4.0.0 → v4.2.0.**
+
+Pin-bump-only patch. Picks up the verify 4.1 + 4.2 additions on the 4.x line without persist code changes:
+
+- **v4.1.0** — `impl ciris-keyring::PqcSigner for ciris-crypto::MlDsa65Signer` (CIRISVerify#39). Closes the keyring/crypto trait gap so PQC signers compose through the keyring trait directly; persist's existing `LocalSignerHardwareAdapter` (which proxies the classical signer) benefits transitively.
+- **v4.2.0** — conformance cross-wheel boundary additions per CEG §4 / §0.5 / §9.2.1 / §10.3.1 (CIRISVerify#40, #41, #42). Hardens the wire-shape contract that CIRISConformance asserts across the 5-wheel cohabitation; persist's downstream consumers (CIRISEdge, CIRISNodeCore) inherit the tightened guarantees.
+
+Six pin sites bumped from `tag = "v4.0.0"` → `tag = "v4.2.0"` (base `ciris-keyring` / `ciris-verify-core` / `ciris-crypto` + the three per-target `[target.*]` tables for Linux TPM / iOS / Android). `version = "4"` floor stays — minor-compatible within the 4.x line.
+
+`pyproject.toml` `Requires-Dist`: `ciris-verify>=4.0.0,<5` → `>=4.2.0,<5`. Python wheel consumers now transitively pull the v4.2.x verify line.
+
+Persist's consumed verify surface (`HardwareSigner`, hybrid signatures, transparency-log machinery, `derive_symmetric_key`, `PythonJsonDumpsCanonicalizer`) is unchanged — minor bump is additive on the verify side. Full nextest passes identically on v4.2.0 vs v4.0.0.
+
 ## [3.4.1] — 2026-05-29
 
 **CIRISPersist 3.4.1 — `peer_metadata_for` read accessor (#127 / unblocks CIRISEdge#48 cohort_scope consumer-side enforcement).**
