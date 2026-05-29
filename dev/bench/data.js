@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780018964936,
+  "lastUpdate": 1780022355802,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -36869,6 +36869,282 @@ window.BENCHMARK_DATA = {
             "name": "storage_floor/next_sequence_full",
             "value": 745,
             "range": "± 56",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "d97beac22ec0395e8fe91ecfbd83e5e23cd2fe37",
+          "message": "docs: COHABITATION capsule family section + FEDERATION_DIRECTORY CEG vocab\n\nFollow-up to de0046b. Covers the two bigger structural rewrites flagged\nfor a second pass.\n\ndocs/COHABITATION.md:\n- New \"Cross-cdylib cohabitation — separately-built wheels (v2.7+\n  capsule family)\" section. Explains the per-extension-module\n  PyTypeInfo trap CIRISEdge#22 caught in production cohabitation init,\n  the 5-capsule family that sidesteps it (federation_directory /\n  outbound_queue / keyring_signer / runtime_handle / blob_storage),\n  + the runtime_handle statics-duplication counterpart from #111.\n- Consumer pattern code block showing the unsafe-extract from a\n  PyCapsule with name-tag verification.\n- New \"When Python disappears — Phase 3 endpoint\" subsection: the\n  Rust-trait accessor surface from #106 (Engine::federation_directory\n  returns Arc<dyn FederationDirectory> directly to a Rust caller) is\n  the trajectory endpoint; capsules collapse to a one-line marshalling\n  shim when host goes Rust-native.\n- New \"Higher-level Engine facades shipped 2.6.0+\" subsection cataloging\n  the persist-owns-primitive / persist-exposes-facade pattern across\n  receive_and_persist (#89), storage_summary / delete_traces_older_than /\n  archive_audit_range (#107), node_core_service / audit_service (#90,\n  #93), sign_hybrid (#112), get_detection_events /\n  get_edge_detection_events / subscribe_detection_events (#113).\n\ndocs/FEDERATION_DIRECTORY.md:\n- identity_type vocabulary extended with substrate_persist (3.0.0,\n  CIRISPersist#116 / CEG §7.0 — required emitter for system:* /\n  audit_chain:* / corpus_health:* / identity_continuity:* /\n  federation_directory:* reserved prefixes) and witness (3.0.0 / CEG\n  §10.3 — required emitter for transparency_log:cosigned:* +\n  substrate-conformance migration off Registry's interim\n  registry_witnesses + registry_sth_cosignatures tables).\n- New CEG 0.2 reserved-prefix admission paragraph noting the\n  DimensionAdmissionPolicy extension + the\n  AttestationLadderTransitionPolicy::DualAccept knob for the CEG\n  0.1→0.2 attestation-prefix rename. Cross-refs THREAT_MODEL AV-45.\n\nNo version bump — docs only.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-28T21:22:27-05:00",
+          "tree_id": "6b976b928987ef8e5f1bc2b456bef3adabbe0ff9",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/d97beac22ec0395e8fe91ecfbd83e5e23cd2fe37"
+        },
+        "date": 1780022354475,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 35436256,
+            "range": "± 45056",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 2389,
+            "range": "± 17",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 5616,
+            "range": "± 51",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 12270,
+            "range": "± 159",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 43449,
+            "range": "± 519",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 7,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 30,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 178,
+            "range": "± 16",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 507,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 577,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 1991,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 7,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 65,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 211,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 919,
+            "range": "± 26",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 14,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 61521,
+            "range": "± 29075",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 162075,
+            "range": "± 47204",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 566297,
+            "range": "± 396907",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 6344,
+            "range": "± 435",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 7383,
+            "range": "± 356",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 14307,
+            "range": "± 758",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 34832,
+            "range": "± 1075",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 594371,
+            "range": "± 2730",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 246794,
+            "range": "± 1008",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 13794,
+            "range": "± 441",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 36908,
+            "range": "± 288",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 2471664,
+            "range": "± 23588",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 98204,
+            "range": "± 4346",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 379916,
+            "range": "± 2851",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 6140324,
+            "range": "± 55547",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 264132,
+            "range": "± 5393",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 1011773,
+            "range": "± 9098",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 4711,
+            "range": "± 341",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 4045,
+            "range": "± 499",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 1058,
+            "range": "± 73",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 3424,
+            "range": "± 34",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 25966,
+            "range": "± 698",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 1,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 526,
+            "range": "± 21",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 80,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 847,
+            "range": "± 29",
             "unit": "ns/iter"
           }
         ]
