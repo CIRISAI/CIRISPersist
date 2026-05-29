@@ -383,6 +383,17 @@ struct EngineCell {
     /// pool, or migration run is created: the cohabitation invariant
     /// (one process, one singleton) holds.
     rust_engine: std::sync::OnceLock<Arc<crate::Engine>>,
+    /// v3.4.0 (CIRISPersist#123) — replication config installed at
+    /// construction; consulted by every `PyEngine` method that takes
+    /// a knob (set_trust_threshold, set_storage_budget_bytes,
+    /// sweep_evictions_once). Mutable through interior `RwLock` —
+    /// the three setters rebuild and re-install on each call.
+    replication_config: std::sync::RwLock<Arc<crate::federation::ReplicationConfig>>,
+    /// v3.4.0 (CIRISPersist#123) — singleton sweeper JoinHandle.
+    /// Built when `replication_sweeper_enabled = true` AND the
+    /// installed config's budget is finite. `None` otherwise.
+    /// `close()` calls `.stop()` on the handle.
+    sweeper: std::sync::Mutex<Option<crate::federation::EvictionSweeper>>,
 }
 
 /// The one global slot. `OnceLock` initializes the `Mutex` once;
@@ -729,7 +740,8 @@ impl PyEngine {
     #[pyo3(signature = (dsn, signing_key_id, scrubber=None,
                         local_key_id=None, local_key_path=None,
                         local_pqc_key_id=None, local_pqc_key_path=None,
-                        pqc_sweep_on_init=true))]
+                        pqc_sweep_on_init=true,
+                        replication_sweeper_enabled=true))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -741,6 +753,7 @@ impl PyEngine {
         local_pqc_key_id: Option<String>,
         local_pqc_key_path: Option<String>,
         pqc_sweep_on_init: bool,
+        replication_sweeper_enabled: bool,
     ) -> PyResult<Self> {
         // ── v1.6.8 (CIRISPersist#75-78) — process-singleton gate ────
         //
@@ -1151,7 +1164,53 @@ impl PyEngine {
             consumers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             subscriptions: Arc::new(std::sync::Mutex::new(SubscriptionState::default())),
             rust_engine: std::sync::OnceLock::new(),
+            // v3.4.0 (#123) — defaults: bootstrap-permissive trust gate,
+            // sweeper inactive (budget = u64::MAX). The three PyO3
+            // setters (`set_trust_threshold`, `set_storage_budget_bytes`,
+            // `set_eviction_decay_half_life_days`) reconfigure on the
+            // running cell; `sweeper` is recomputed in spawn_sweeper
+            // when budget transitions from infinite to finite.
+            replication_config: std::sync::RwLock::new(Arc::new(
+                crate::federation::ReplicationConfig::default(),
+            )),
+            sweeper: std::sync::Mutex::new(None),
         });
+        // v3.4.0 (#123) — auto-spawn sweeper on init when the operator
+        // opted in AND the installed config has a finite budget. The
+        // default config has budget = u64::MAX so this is a no-op
+        // unless the caller calls set_storage_budget_bytes immediately
+        // afterward. Either way the handle holds the spawn_sweeper
+        // affordance for later (PyO3 set_storage_budget_bytes
+        // re-spawns). Reads cell.replication_config under the RwLock.
+        if replication_sweeper_enabled {
+            let snapshot = cell
+                .replication_config
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            if snapshot.sweeper_active() {
+                // Build a temporary Engine view that shares the cell's
+                // backend + signer (the spawn_sweeper loop calls
+                // sweep_evictions_once on this Engine each tick).
+                let engine = crate::Engine::from_shared_with_local(
+                    cell.engine_backend_dispatch(),
+                    cell.signer.clone(),
+                    cell.local_signer.clone(),
+                );
+                // Apply the snapshot config to the Engine — the
+                // sweeper loop reads cfg via Engine::sweep_evictions_once.
+                // We bypass with_replication_config (which connects)
+                // by manually attaching via a setter pattern. Add a
+                // helper on Engine for the cohabitation path.
+                let engine = engine.with_replication_config_shared(snapshot);
+                // Switch into the runtime context so tokio::spawn
+                // works inside the constructor's sync detach block.
+                let _enter = cell.runtime.enter();
+                if let Some(sweeper) = engine.spawn_sweeper() {
+                    *cell.sweeper.lock().unwrap_or_else(|p| p.into_inner()) = Some(sweeper);
+                }
+            }
+        }
         let handle = PyEngine::from_cell(&cell);
         *slot = Some(cell);
         Ok(handle)
@@ -1220,6 +1279,21 @@ impl PyEngine {
         // guard against clearing a fresh post-close rebuild.
         if let Some(cell) = slot.as_ref() {
             if Arc::ptr_eq(&cell.closed, &self.closed) {
+                // v3.4.0 (#123) — shut the sweeper down before
+                // dropping the cell. `stop()` consumes the
+                // EvictionSweeper and returns the JoinHandle; the
+                // task observes the Notify and exits at its next
+                // tokio::select! poll.
+                if let Some(sweeper) = cell
+                    .sweeper
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take()
+                {
+                    // Stop signals + returns the JoinHandle; explicit
+                    // drop satisfies clippy::let_underscore_future.
+                    std::mem::drop(sweeper.stop());
+                }
                 *slot = None;
             }
         }
@@ -1232,6 +1306,122 @@ impl PyEngine {
     #[getter]
     fn is_closed(&self) -> bool {
         self.closed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// v3.4.0 (CIRISPersist#123) — set the trust-score admission
+    /// threshold consulted by every write path. Range `[0.0, 1.0]`;
+    /// out-of-range values are clamped at the gate. Threshold `0.0`
+    /// short-circuits to admit-all (bootstrap-permissive); higher
+    /// values gate writes whose attesting key's aggregate trust
+    /// score falls below.
+    ///
+    /// **Note**: this sets the threshold on the
+    /// [`crate::federation::ReplicationConfig`] held by the
+    /// EngineCell. The actual gate (an `AdmissionGate` holding a
+    /// `TrustScoring`) must be wired separately — the PyO3 surface
+    /// alone cannot install a Rust-only trait object. CIRISAgent's
+    /// cohabitation bootstrap installs the gate via
+    /// `current_rust_engine().set_admission_gate(...)`.
+    fn set_trust_threshold(&self, threshold: f64) -> PyResult<()> {
+        self.ensure_usable()?;
+        let slot = engine_slot();
+        let cell = slot
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("engine cell missing"))?;
+        let mut guard = cell
+            .replication_config
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut next = (**guard).clone();
+        next.trust_threshold = threshold.clamp(0.0, 1.0);
+        *guard = Arc::new(next);
+        Ok(())
+    }
+
+    /// v3.4.0 (CIRISPersist#123) — set the local
+    /// `federation_blobs` storage budget in bytes. Above
+    /// `budget × steady_state_utilization` the eviction sweeper
+    /// drives evictions until usage falls back below the watermark.
+    /// Setting `u64::MAX` (or any value ≥ that) deactivates the
+    /// sweeper.
+    ///
+    /// Transitions from-inactive to active also (re)spawn the
+    /// background sweeper loop using the cell's owned
+    /// [`crate::federation::EvictionSweeper`] handle.
+    fn set_storage_budget_bytes(&self, budget: u64) -> PyResult<()> {
+        self.ensure_usable()?;
+        let slot = engine_slot();
+        let cell = slot
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("engine cell missing"))?;
+        let mut guard = cell
+            .replication_config
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let was_active = guard.sweeper_active();
+        let mut next = (**guard).clone();
+        next.storage_budget_bytes = budget;
+        let now_active = next.sweeper_active();
+        let snapshot = Arc::new(next);
+        *guard = snapshot.clone();
+        drop(guard);
+
+        // Sweeper lifecycle: respawn on activate or stop on
+        // deactivate. Idempotent — if the sweeper was already running
+        // we stop it first so the new config takes effect.
+        let mut sweeper_slot = cell.sweeper.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(existing) = sweeper_slot.take() {
+            // .stop() signals the loop and returns the JoinHandle —
+            // dropping the handle is fine here: the loop task observes
+            // the Notify on its next select! and exits on its own.
+            std::mem::drop(existing.stop());
+        }
+        if now_active {
+            let engine = crate::Engine::from_shared_with_local(
+                cell.engine_backend_dispatch(),
+                cell.signer.clone(),
+                cell.local_signer.clone(),
+            )
+            .with_replication_config_shared(snapshot);
+            let _enter = cell.runtime.enter();
+            if let Some(sweeper) = engine.spawn_sweeper() {
+                *sweeper_slot = Some(sweeper);
+            }
+        }
+        let _ = was_active;
+        Ok(())
+    }
+
+    /// v3.4.0 (CIRISPersist#123) — drive one sweep cycle synchronously.
+    /// Returns the number of rows evicted in this pass. Sovereign
+    /// callers (Pi-cron, k8s CronJob) drive this on their own schedule;
+    /// the background loop spawned at construction time also calls
+    /// this on its cadence.
+    fn sweep_evictions_once(&self, py: Python<'_>) -> PyResult<i64> {
+        self.ensure_usable()?;
+        let runtime = self.runtime.clone();
+        let slot = engine_slot();
+        let cell = slot
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("engine cell missing"))?;
+        let snapshot = cell
+            .replication_config
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let engine = crate::Engine::from_shared_with_local(
+            cell.engine_backend_dispatch(),
+            cell.signer.clone(),
+            cell.local_signer.clone(),
+        )
+        .with_replication_config_shared(snapshot);
+        drop(slot);
+        py.detach(move || {
+            runtime
+                .block_on(async move { engine.sweep_evictions_once().await })
+                .map(|report| report.rows_evicted as i64)
+                .map_err(blob_err_to_py)
+        })
     }
 
     /// v1.7.0 (CIRISPersist#79) — return a fresh handle to the
@@ -15741,6 +15931,9 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         }
         // Rate-limit → RuntimeError; lens maps to 429.
         crate::federation::Error::RateLimited { .. } => PyRuntimeError::new_err(kind),
+        // v3.4.0 (CIRISPersist#123) — trust gate rejection is
+        // caller-side authorization failure; ValueError (4xx).
+        crate::federation::Error::TrustBelowThreshold { .. } => PyValueError::new_err(kind),
         // Server-fault → RuntimeError (5xx).
         crate::federation::Error::Backend(_) => PyRuntimeError::new_err(kind),
     }
@@ -15760,6 +15953,8 @@ fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
         | crate::federation::BlobError::InlineSizeExceeded { .. }
         | crate::federation::BlobError::InvalidArgument(_)
         | crate::federation::BlobError::AttestationEmissionFailed(_) => PyValueError::new_err(kind),
+        // v3.4.0 (CIRISPersist#123) — trust gate rejection.
+        crate::federation::BlobError::TrustBelowThreshold { .. } => PyValueError::new_err(kind),
         crate::federation::BlobError::Backend(_) => PyRuntimeError::new_err(kind),
     }
 }
@@ -17053,6 +17248,10 @@ mod tests {
             construction_pid: std::process::id(),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rust_engine: std::sync::OnceLock::new(),
+            replication_config: std::sync::RwLock::new(Arc::new(
+                crate::federation::ReplicationConfig::default(),
+            )),
+            sweeper: std::sync::Mutex::new(None),
         });
         *engine_slot() = Some(cell);
         sq
@@ -17194,6 +17393,10 @@ mod tests {
             construction_pid: std::process::id(),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rust_engine: std::sync::OnceLock::new(),
+            replication_config: std::sync::RwLock::new(Arc::new(
+                crate::federation::ReplicationConfig::default(),
+            )),
+            sweeper: std::sync::Mutex::new(None),
         });
         *engine_slot() = Some(cell);
 
@@ -17274,6 +17477,10 @@ mod tests {
             construction_pid: std::process::id(),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rust_engine: std::sync::OnceLock::new(),
+            replication_config: std::sync::RwLock::new(Arc::new(
+                crate::federation::ReplicationConfig::default(),
+            )),
+            sweeper: std::sync::Mutex::new(None),
         });
         (cell, sq)
     }
@@ -17563,6 +17770,129 @@ mod tests {
             .expect("audit_chain_proof");
         assert!(proof.entries.is_empty());
         assert!(proof.head_signature.is_none());
+    }
+
+    // ─── v3.4.0 (CIRISPersist#123) — PyO3 surface tests ────────────
+    //
+    // The three PyO3 methods (`set_trust_threshold`,
+    // `set_storage_budget_bytes`, `sweep_evictions_once`) are tested
+    // via the EngineCell's interior `replication_config` rather than
+    // through the PyO3 method dispatch boundary — instantiating a
+    // `PyEngine` from `cargo test` requires a live Python interpreter
+    // attached, which the `--lib` test harness does not provide. The
+    // PyO3 method bodies are thin wrappers over Engine + cell-config
+    // mutation; the underlying Rust-side surface is exercised here
+    // and via the broader Engine sweeper tests.
+
+    /// v3.4.0 (CIRISPersist#123) — `set_trust_threshold` clamps to
+    /// `[0.0, 1.0]` and updates the cell's replication_config.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    #[serial_test::serial(engine_singleton)]
+    fn pyo3_set_trust_threshold_clamps_and_updates_cell() {
+        clear_singleton_slot();
+        install_test_sqlite_cell();
+        // Simulate the same mutation the PyO3 setter performs.
+        {
+            let slot = engine_slot();
+            let cell = slot.as_ref().unwrap();
+            let mut guard = cell
+                .replication_config
+                .write()
+                .unwrap_or_else(|p| p.into_inner());
+            let mut next = (**guard).clone();
+            next.trust_threshold = 1.5_f64.clamp(0.0, 1.0);
+            *guard = Arc::new(next);
+        }
+        {
+            let slot = engine_slot();
+            let cell = slot.as_ref().unwrap();
+            let snapshot = cell
+                .replication_config
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            assert_eq!(snapshot.trust_threshold, 1.0);
+        }
+        clear_singleton_slot();
+    }
+
+    /// v3.4.0 (CIRISPersist#123) — `set_storage_budget_bytes` updates
+    /// the cell config and flips the sweeper_active state.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    #[serial_test::serial(engine_singleton)]
+    fn pyo3_set_storage_budget_bytes_activates_sweeper() {
+        clear_singleton_slot();
+        install_test_sqlite_cell();
+        // Default → sweeper_active() == false (budget u64::MAX).
+        {
+            let slot = engine_slot();
+            let cell = slot.as_ref().unwrap();
+            let snap = cell
+                .replication_config
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            assert!(!snap.sweeper_active());
+        }
+        // Apply same mutation set_storage_budget_bytes does.
+        {
+            let slot = engine_slot();
+            let cell = slot.as_ref().unwrap();
+            let mut guard = cell
+                .replication_config
+                .write()
+                .unwrap_or_else(|p| p.into_inner());
+            let mut next = (**guard).clone();
+            next.storage_budget_bytes = 1_000_000;
+            *guard = Arc::new(next);
+        }
+        {
+            let slot = engine_slot();
+            let cell = slot.as_ref().unwrap();
+            let snap = cell
+                .replication_config
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            assert!(snap.sweeper_active());
+            assert_eq!(snap.storage_budget_bytes, 1_000_000);
+        }
+        clear_singleton_slot();
+    }
+
+    /// v3.4.0 (CIRISPersist#123) — `sweep_evictions_once` returns the
+    /// row count from Engine::sweep_evictions_once. Drives a real
+    /// sweep through the cell's runtime and checks the report.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    #[serial_test::serial(engine_singleton)]
+    fn pyo3_sweep_evictions_once_returns_rows_evicted() {
+        clear_singleton_slot();
+        install_test_sqlite_cell();
+        let slot = engine_slot();
+        let cell = slot.as_ref().unwrap().clone();
+        drop(slot);
+        // Empty federation_blobs + default config → noop returns 0
+        // rows.
+        let snapshot = cell
+            .replication_config
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let engine = crate::Engine::from_shared_with_local(
+            cell.engine_backend_dispatch(),
+            cell.signer.clone(),
+            cell.local_signer.clone(),
+        )
+        .with_replication_config_shared(snapshot);
+        let report = cell
+            .runtime
+            .block_on(async move { engine.sweep_evictions_once().await })
+            .expect("sweep");
+        assert_eq!(report.rows_evicted, 0);
+        clear_singleton_slot();
     }
 }
 

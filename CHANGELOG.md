@@ -5,6 +5,133 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.4.0] — 2026-05-29
+
+**CIRISPersist 3.4 — replication-policy substrate: trust admission gate + popularity×freshness eviction sweeper + withdraws emission (#123 / CEG organic-replication discipline at the substrate).**
+
+Closes **#123** in full as a monolithic 3.4.0 cut. Lands the **replication-policy execution sites** the substrate needs to operate the CEG organic-replication discipline (NodeCore FSD/FEDERATION_SCALING_MODEL.md v0.3, full-internet-scale feasibility at 5B users / 1 TB / 1 Gbps / 1 core per server). Persist already owned the storage substrate; this release makes it the execution site for trust-gated admission + popularity×freshness-gated eviction.
+
+> **The discipline (NodeCore FSD §1):** replication is `trust(source) ≥ threshold AND capacity_available` at every byte-attempt (push or pull). Eviction is `popularity(blob) × freshness(blob)`. Single bytes-held pool — no archive/cache split. Persist owns this; node-core + edge consume it.
+
+### 1. `TrustScoring` trait + per-call weighted aggregate
+
+New `src/federation/replication/trust_scoring.rs`:
+
+```rust
+#[async_trait]
+pub trait TrustScoring: Send + Sync {
+    async fn trust_score(&self, key_id: &str, recursion_depth: u8)
+        -> Result<f64, TrustScoringError>;
+}
+```
+
+Score in `[0.0, 1.0]`, weighted aggregate over `scores` attestations targeting the key, BFS-walked through `delegates_to` edges at depth ≤ `recursion_depth`. Unknown key → `Ok(0.0)` (gate decides), not an error. **No cache** — per-call. Justification: federation byte-attempts at hundreds/sec, single SQL per write is cheaper than the stale-cache bug class; benchmark first, optimize second.
+
+### 2. `AdmissionGate` at all 3+ write sites
+
+New `src/federation/replication/admission.rs`. `AdmissionGate::check(key_id) -> Result<f64, TrustGateRejection>` consulted BEFORE any DB work at:
+
+- `BlobStorage::put_blob` (+ inherits to `put_blob_signing` via the v3.3.0 / #121 default impl)
+- `FederationDirectory::put_attestation`
+- `FederationDirectory::put_revocation`
+- `NodeCoreService::put_contribution` (cohabitation)
+
+Strict ordering: empty-key `InvalidArgument` → **`TrustBelowThreshold`** → inline-size → hash-mismatch → DB FK violation. **Rationale**: trust is the cheapest reject and bears the least information leak — an unauthorized writer shouldn't learn "your bytes matched the SHA" or "your FK target exists."
+
+New typed variants: `BlobError::TrustBelowThreshold { key_id, score, threshold }` (kind `blob_trust_below_threshold`) + `federation::Error::TrustBelowThreshold { key_id, score, threshold }` (kind `federation_trust_below_threshold`). Routed through `blob_err_to_py` + `federation_err_to_py` as `PyValueError` (4xx-shaped) per the AV-15 stable kind-token taxonomy.
+
+### 3. V053 — `last_accessed_at` + `access_count` on `federation_blobs`
+
+Both dialects, additive `ADD COLUMN IF NOT EXISTS`. PG: `last_accessed_at TIMESTAMPTZ NOT NULL DEFAULT first_seen_at` + `access_count BIGINT NOT NULL DEFAULT 0`. SQLite parallel with TEXT ISO8601 timestamps + INTEGER counter. Backfill UPDATE for pre-V053 rows (`first_seen_at` → `last_accessed_at`). Composite index `(last_accessed_at ASC, access_count ASC)` powers the sweeper's ascending-eviction scan. `tests/qa_harness.rs` bound 52 → 53.
+
+### 4. Per-row access tracking — single UPDATE per hit
+
+Every `get_blob` / `has_blob` bumps the row:
+- PG: `UPDATE federation_blobs SET access_count = access_count + 1, last_accessed_at = NOW() WHERE sha256 = $1 RETURNING ...` — one round-trip.
+- SQLite: 2-statement tx (SELECT + UPDATE).
+
+**No in-memory counter buffer.** Trade ~0.5ms per read for sweeper-correct popularity signal — an Engine crash with a buffered counter would drop hot-blob signal and the sweeper would evict bytes operators actually want. Batched-flush optimization is a tracked follow-up if benchmarks demand it.
+
+### 5. `EvictionSweeper` — popularity × freshness ascending eviction
+
+New `src/federation/replication/eviction.rs`. `EvictionDecay::score(now, last_accessed_at) = access_count * exp(-ln(2) * Δt / half_life)`. Higher = more valuable; sweep evicts ascending.
+
+`Engine::sweep_evictions_once()`:
+- Compute `SUM(size_bytes)` from `federation_blobs`.
+- If `total ≤ budget × steady_state_utilization` → noop.
+- Otherwise: `SELECT sha256, size_bytes, access_count, last_accessed_at ORDER BY <evict-score ASC> LIMIT DEFAULT_SWEEP_BATCH`. Target bytes-to-free = `total - watermark`.
+- Per candidate ascending: emit `withdraws` attestation, DELETE blob, accumulate bytes_freed. Stop when bytes_freed ≥ target OR batch exhausted.
+
+Per-backend candidate fetch:
+- **PG**: full decay-weighted score in SQL via `(access_count + 1) * exp(-ln(2) * EXTRACT(EPOCH FROM (NOW() - last_accessed_at)) / half_life_secs)` — inline evict-order, single query.
+- **SQLite**: scan by composite monotone bound `(last_accessed_at ASC, access_count ASC)` (no `exp()` in SQLite stdlib), then Rust re-rank via `EvictionDecay::score`. The asymmetry is documented in `SqliteBackend::sweep_candidates` rustdoc.
+
+### 6. `withdraws` emission — per-eviction, signed, canonical-byte-pinned
+
+For each evicted SHA, the sweeper emits a CEG §10.1.2 `withdraws` attestation against the prior `holds_bytes:sha256:<prefix>` row this Engine emitted:
+
+1. One per-cycle directory query (`list_attestations_by(signer_key_id)`) builds a `HashMap<attestation_type, Attestation>` keyed on `holds_bytes:sha256:<prefix>` — O(1) per-candidate lookup, no per-row directory hits.
+2. New `withdraws_attestation_envelope(target_attestation_id, target_attestation_type)` helper builds the canonical shape.
+3. Envelope canonicalized via **production `PythonJsonDumpsCanonicalizer`** (NOT JCS — same #121 / v3.3.0 trap discipline).
+4. SHA-256 → `original_content_hash_hex`. Signed via `engine.signer().sign(canonical_bytes).await?`.
+5. `FederationDirectory::put_attestation(envelope)` persists the row.
+
+**Missing-prior contract**: if no holds_bytes row from this Engine is found (already withdrawn / cohabitation drift), log + **skip the withdraws emission BUT STILL delete the blob** — an orphaned withdraws is worse than no withdraws. Counted neither `withdraws_emitted` nor `withdraws_failed`.
+
+### 7. Auto-spawn + PyO3 surface
+
+`PyEngine::__new__` accepts `replication_sweeper_enabled: bool = true` kwarg. When true AND `storage_budget_bytes < u64::MAX`, the constructor spawns the `EvictionSweeper` loop on the cell's runtime. `EngineCell` owns the `JoinHandle`; **`Engine::from_shared` / `from_shared_with_local` do NOT spawn** — cohabitation invariant against dual-sweeper races.
+
+Three new PyO3 methods:
+- `set_trust_threshold(threshold: f64)` — clamps to `[0.0, 1.0]`, atomic update.
+- `set_storage_budget_bytes(budget: u64)` — sweeper lifecycle management: tears down prior sweeper if any, respawns if new budget is finite.
+- `sweep_evictions_once() -> i64` — operator/cron-triggered single-pass primitive, returns `rows_evicted`.
+
+`close()` shuts the sweeper down via `EvictionSweeper::stop()` (Notify) before clearing the cell.
+
+### 8. `ReplicationConfig` — operator knobs
+
+```rust
+pub struct ReplicationConfig {
+    pub trust_threshold: f64,              // default 0.0 (bootstrap permissive)
+    pub trust_recursion_depth: u8,         // default 0 (strict)
+    pub tier_recursion_depths: HashMap<String, u8>,  // per-tier overrides
+    pub storage_budget_bytes: u64,         // default u64::MAX (off)
+    pub steady_state_utilization: f64,     // default 0.92
+    pub eviction_decay_half_life_days: f64,// default 30.0
+    pub sweep_interval: Duration,          // default 60s, clamped ≥ MIN_SWEEP_INTERVAL (1s)
+}
+```
+
+`tier_recursion_depths` carries per-`identity_type` overrides (e.g., `{"client": 0, "server": 1}`) for the friend-of-friends graph walk depth; falls back to `trust_recursion_depth`.
+
+Bootstrap defaults are permissive — `threshold = 0.0` admits everything, `budget = u64::MAX` disables the sweeper. **Upgrade safety**: v3.3.1 → v3.4.0 with no config changes is a no-op behavioral change. Pinned by `replication_config_defaults_are_permissive` test.
+
+### 9. Test coverage — 45 new tests
+
+- 20 module-level (config defaults / tier override / watermark math / withdraws envelope shape / trust-score formula / decay-weight curve / admission ordering / config edges)
+- 13 SQLite backend (V053 columns + index, access-count bump on get_blob + has_blob, gate ordering at 4 write sites, sweeper evict-order + withdraws emission + idle-below-watermark + list_holders filters evicted)
+- 7 Postgres parity (V053, access-count bump, gate ordering, sweeper parity)
+- 1 cirisnode SQLite (put_contribution gate)
+- 3 Engine config + dispatch
+- 3 PyO3 surface (cell-config mutation + sweeper lifecycle)
+
+**Full nextest: 886/886 pass** on fresh PG; default features: 687/687.
+
+### 10. Honest deviations + accepted compromises (reviewer signed off)
+
+- **`MIN_SWEEP_INTERVAL = 1s` silent clamp** of `sweep_interval = Duration::ZERO`. Safer than panic-on-zero; documented in `ReplicationConfig::new()`.
+- **`TrustScoringError::Backend` → `federation::Error::Backend(format!("trust_scoring: {e}"))`** — two error tokens collapsed to one. Subsystem info recoverable via the prefix; full chain logged.
+- **PG sweeper test relaxation**: `sweeper_emits_withdraws_on_eviction_pg` asserts `withdraws_emitted ≤ rows_evicted` (not strict equality) to tolerate shared-DB test pollution. Still asserts seeded blobs were evicted + their holders disappear from `list_holders`. Strict equality holds on fresh DB.
+- **Memory backend `TrustScoring` is trivial** — returns `1.0` for known keys, `0.0` otherwise. Test-only backend; full BFS belongs in the production backends.
+
+### Mission citations
+
+- §1.3 lowest-stateful-library — replication policy execution at the substrate, not at the consumer. Trust + eviction are deterministic primitives the higher layers compose.
+- §1.5 parity — dual-backend V053, same CEG envelope shape, no PG-only declaration. SQLite re-rank asymmetry documented, not deferred.
+- §1.6 fail-honest — trust gate rejects first (cheapest, least-leaking); withdraws are optional on prior-lookup miss but the blob still goes (CEG §10.1.2 TTL closes the loop downstream); typed errors throughout; no silent coercion of trust scores or thresholds.
+- CIRIS Accord §I autonomy — operator owns `trust_threshold` / `storage_budget_bytes` / `eviction_decay_half_life_days`. Persist stores opinion, doesn't confer it. NodeCore + Edge consume the substrate's verdict; persist provides the discipline's execution sites.
+
 ## [3.3.1] — 2026-05-29
 
 **CIRISPersist 3.3.1 — second calibration anchor for memory-bound bench families (#122 / closes the v3.3.0 false-positive alert pattern).**

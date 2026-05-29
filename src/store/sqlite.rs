@@ -81,6 +81,10 @@ pub struct SqliteBackend {
     /// for accord-holder `put_public_key` admission.
     hardware_attestation_policy:
         std::sync::RwLock<std::sync::Arc<crate::federation::HardwareAttestationPolicy>>,
+    /// v3.4.0 (CIRISPersist#123) — trust-weighted admission gate.
+    /// `None` = no gate (bootstrap-permissive). See
+    /// [`SqliteBackend::set_admission_gate`].
+    admission_gate: std::sync::RwLock<Option<crate::federation::AdmissionGate>>,
 }
 
 impl SqliteBackend {
@@ -110,7 +114,26 @@ impl SqliteBackend {
             hardware_attestation_policy: std::sync::RwLock::new(std::sync::Arc::new(
                 crate::federation::HardwareAttestationPolicy::default(),
             )),
+            admission_gate: std::sync::RwLock::new(None),
         }
+    }
+
+    /// v3.4.0 (CIRISPersist#123) — install the trust-weighted
+    /// [`AdmissionGate`](crate::federation::AdmissionGate). Passing
+    /// `None` clears the gate (bootstrap-permissive).
+    pub fn set_admission_gate(&self, gate: Option<crate::federation::AdmissionGate>) {
+        *self
+            .admission_gate
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = gate;
+    }
+
+    /// Snapshot of the currently-installed admission gate, if any.
+    pub fn admission_gate(&self) -> Option<crate::federation::AdmissionGate> {
+        self.admission_gate
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// v2.5.0 (CIRISPersist#102 Ask 4) — install a per-axis
@@ -228,6 +251,7 @@ impl SqliteBackend {
             hardware_attestation_policy: std::sync::RwLock::new(std::sync::Arc::new(
                 crate::federation::HardwareAttestationPolicy::default(),
             )),
+            admission_gate: std::sync::RwLock::new(None),
         })
     }
 }
@@ -1178,6 +1202,16 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<(), crate::federation::Error> {
         let mut row = attestation.attestation;
 
+        // v3.4.0 (CIRISPersist#123) — trust-threshold gate runs FIRST.
+        // Trust is the cheapest reject AND the one that leaks the
+        // least information; an unauthorized writer shouldn't learn
+        // about FK / envelope-schema state past the gate.
+        if !row.attesting_key_id.is_empty() {
+            if let Some(gate) = self.admission_gate() {
+                gate.check_federation(&row.attesting_key_id).await?;
+            }
+        }
+
         // v2.4.0 (CIRISPersist#102 Ask 3) — admission gate. Look up
         // the attesting key's `identity_type` before insert; let
         // the FK violation surface as a clearer-typed
@@ -1422,6 +1456,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         revocation: crate::federation::SignedRevocation,
     ) -> Result<(), crate::federation::Error> {
         let mut row = revocation.revocation;
+
+        // v3.4.0 (CIRISPersist#123) — trust gate first; the revoking
+        // key is the attester.
+        if !row.revoking_key_id.is_empty() {
+            if let Some(gate) = self.admission_gate() {
+                gate.check_federation(&row.revoking_key_id).await?;
+            }
+        }
+
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
@@ -2805,7 +2848,20 @@ impl crate::federation::BlobStorage for SqliteBackend {
         media_type: Option<&str>,
         attestation: crate::federation::PutBlobAttestation,
     ) -> Result<(), crate::federation::BlobError> {
-        // 1. API-side validation.
+        // v3.4.0 (CIRISPersist#123) — admission ordering:
+        //   1. empty-string → InvalidArgument
+        //   2. trust-threshold → TrustBelowThreshold
+        //   3. inline-size → InlineSizeExceeded
+        //   4. hash-mismatch → HashMismatch
+        //   5. DB FK → AttestationEmissionFailed
+        if attestation.attesting_key_id.is_empty() {
+            return Err(crate::federation::BlobError::InvalidArgument(
+                "attesting_key_id is empty".into(),
+            ));
+        }
+        if let Some(gate) = self.admission_gate() {
+            gate.check_blob(&attestation.attesting_key_id).await?;
+        }
         let cap = self.inline_bytes_cap();
         if let crate::federation::BlobBody::Inline(ref bytes) = body {
             if bytes.len() > cap {
@@ -2815,12 +2871,6 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 });
             }
             crate::federation::blobs::verify_inline_hash(sha256, bytes)?;
-        }
-
-        if attestation.attesting_key_id.is_empty() {
-            return Err(crate::federation::BlobError::InvalidArgument(
-                "attesting_key_id is empty".into(),
-            ));
         }
 
         let original_content_hash =
@@ -2879,14 +2929,21 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let scrub_signature_pqc_owned = attestation.scrub_signature_pqc.clone();
         let scrub_key_id_owned = attestation.scrub_key_id.clone();
         let media_type_owned = media_type.map(str::to_owned);
+        // v3.4.0 (CIRISPersist#123) — V053 last_accessed_at column has
+        // a literal-default sentinel on SQLite (datetime functions are
+        // not allowed in ALTER … ADD COLUMN DEFAULT). Write the real
+        // wall-clock here so a fresh blob's last_accessed_at matches
+        // its first_seen_at instead of the 1970 epoch placeholder.
+        let now_iso = chrono::Utc::now().to_rfc3339();
 
         tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
             let mut conn = conn.blocking_lock();
             let tx = conn.transaction()?;
             tx.execute(
                 "INSERT INTO federation_blobs (\
-                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
+                    last_accessed_at, access_count\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0) \
                  ON CONFLICT (sha256) DO NOTHING",
                 rusqlite::params![
                     sha_vec,
@@ -2895,6 +2952,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
                     external_ref_opt,
                     size_bytes_i64,
                     media_type_owned,
+                    now_iso,
                 ],
             )?;
             tx.execute(
@@ -2951,10 +3009,16 @@ impl crate::federation::BlobStorage for SqliteBackend {
     ) -> Result<Option<crate::federation::BlobBody>, crate::federation::BlobError> {
         let sha_vec = sha256.to_vec();
         let conn = self.conn.clone();
+        // v3.4.0 (CIRISPersist#123) — bump access-tracking columns on
+        // every read hit. SQLite has no UPDATE … RETURNING for our row
+        // shape; we do SELECT first, then bump in the same transaction
+        // so the counter survives a concurrent get_blob.
+        let now_iso = chrono::Utc::now().to_rfc3339();
         tokio::task::spawn_blocking(
             move || -> Result<Option<crate::federation::BlobBody>, rusqlite::Error> {
-                let conn = conn.blocking_lock();
-                let row_opt = conn
+                let mut conn = conn.blocking_lock();
+                let tx = conn.transaction()?;
+                let row_opt = tx
                     .query_row(
                         "SELECT storage_kind, bytes_inline, external_ref, size_bytes, media_type \
                          FROM federation_blobs WHERE sha256 = ?1",
@@ -2975,6 +3039,14 @@ impl crate::federation::BlobStorage for SqliteBackend {
                         },
                     )
                     .optional()?;
+                if row_opt.is_some() {
+                    tx.execute(
+                        "UPDATE federation_blobs SET access_count = access_count + 1, \
+                         last_accessed_at = ?2 WHERE sha256 = ?1",
+                        rusqlite::params![sha_vec, now_iso],
+                    )?;
+                }
+                tx.commit()?;
                 Ok(
                     row_opt.map(|(kind, inline, ext, size, mt)| match kind.as_str() {
                         "inline" => crate::federation::BlobBody::Inline(inline.unwrap_or_default()),
@@ -2997,13 +3069,27 @@ impl crate::federation::BlobStorage for SqliteBackend {
     async fn has_blob(&self, sha256: &[u8; 32]) -> Result<bool, crate::federation::BlobError> {
         let sha_vec = sha256.to_vec();
         let conn = self.conn.clone();
+        // v3.4.0 (CIRISPersist#123) — has_blob also bumps the
+        // access-tracking columns when the row exists (per the
+        // architect's plan §"Per-row access tracking"). Both reads are
+        // treated as evidence the blob is still hot.
+        let now_iso = chrono::Utc::now().to_rfc3339();
         tokio::task::spawn_blocking(move || -> Result<bool, rusqlite::Error> {
-            let conn = conn.blocking_lock();
-            let count: i64 = conn.query_row(
+            let mut conn = conn.blocking_lock();
+            let tx = conn.transaction()?;
+            let count: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM federation_blobs WHERE sha256 = ?1",
                 rusqlite::params![sha_vec],
                 |row| row.get(0),
             )?;
+            if count > 0 {
+                tx.execute(
+                    "UPDATE federation_blobs SET access_count = access_count + 1, \
+                     last_accessed_at = ?2 WHERE sha256 = ?1",
+                    rusqlite::params![sha_vec, now_iso],
+                )?;
+            }
+            tx.commit()?;
             Ok(count > 0)
         })
         .await
@@ -3122,6 +3208,103 @@ impl crate::federation::BlobStorage for SqliteBackend {
         .await
         .map_err(|e| crate::federation::BlobError::Backend(format!("spawn_blocking join: {e}")))?
         .map_err(|e| crate::federation::BlobError::Backend(format!("list_holders: {e}")))
+    }
+}
+
+// ─── Eviction sweeper helpers (v3.4.0, CIRISPersist#123) ───────────
+//
+// Inherent methods, not trait methods — the Engine layer owns the
+// orchestration (signer + put_attestation lookup), backends just
+// expose "give me the next N eviction candidates" + "delete this
+// row". Keeping them off the BlobStorage trait preserves the trait's
+// "what a consumer needs to read/write a blob" focus.
+
+impl SqliteBackend {
+    /// v3.4.0 (CIRISPersist#123) — fetch the next `limit` eviction
+    /// candidates ordered by `(last_accessed_at ASC, access_count
+    /// ASC)`. SQLite has no `exp()` in its stdlib so we can't apply
+    /// the decay-weighted score in SQL; the composite ASC order is a
+    /// monotone bound on the full score (older + less-accessed always
+    /// scores lower for any positive half-life), so the top-K by this
+    /// SQL order is a superset of the top-K by full score. The Engine
+    /// re-ranks the returned candidates by
+    /// [`crate::federation::EvictionDecay::score`].
+    ///
+    /// **Postgres asymmetry**: Postgres computes the full score
+    /// `access_count * exp(-ln(2) * Δt / half_life)` inline in SQL via
+    /// the `exp()` function. SQLite needs the Rust-side re-rank.
+    pub async fn sweep_candidates(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<crate::federation::EvictionCandidate>, crate::federation::BlobError> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(
+            move || -> Result<Vec<crate::federation::EvictionCandidate>, rusqlite::Error> {
+                let conn = conn.blocking_lock();
+                let mut stmt = conn.prepare(
+                    "SELECT sha256, size_bytes, access_count, last_accessed_at \
+                     FROM federation_blobs \
+                     ORDER BY last_accessed_at ASC, access_count ASC \
+                     LIMIT ?1",
+                )?;
+                let rows = stmt.query_map([limit], |r| {
+                    let sha_vec: Vec<u8> = r.get(0)?;
+                    let size_bytes: i64 = r.get(1)?;
+                    let access_count: i64 = r.get(2)?;
+                    let last_str: String = r.get(3)?;
+                    Ok((sha_vec, size_bytes, access_count, last_str))
+                })?;
+                let mut out = Vec::new();
+                for row in rows {
+                    let (sha_vec, size_bytes, access_count, last_str) = row?;
+                    let mut sha = [0u8; 32];
+                    if sha_vec.len() != 32 {
+                        // Defense in depth — schema enforces 32-byte
+                        // sha256 but a corrupt row shouldn't panic
+                        // the sweeper. Skip the row.
+                        continue;
+                    }
+                    sha.copy_from_slice(&sha_vec);
+                    let last_accessed_at: chrono::DateTime<chrono::Utc> =
+                        chrono::DateTime::parse_from_rfc3339(&last_str)
+                            .map(|t| t.with_timezone(&chrono::Utc))
+                            .unwrap_or_else(|_| chrono::Utc::now());
+                    out.push(crate::federation::EvictionCandidate {
+                        sha256: sha,
+                        size_bytes: size_bytes.max(0) as u64,
+                        access_count: access_count.max(0) as u64,
+                        last_accessed_at,
+                    });
+                }
+                Ok(out)
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| crate::federation::BlobError::Backend(format!("sweep_candidates: {e}")))
+    }
+
+    /// v3.4.0 (CIRISPersist#123) — delete one `federation_blobs` row
+    /// by SHA. Returns `true` iff a row was removed (rows-affected ==
+    /// 1). Used by the Engine eviction loop after a successful
+    /// withdraws emission.
+    pub async fn delete_blob(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<bool, crate::federation::BlobError> {
+        let sha_vec = sha256.to_vec();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<usize, rusqlite::Error> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "DELETE FROM federation_blobs WHERE sha256 = ?1",
+                rusqlite::params![sha_vec],
+            )
+        })
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| crate::federation::BlobError::Backend(format!("delete_blob: {e}")))
+        .map(|n| n > 0)
     }
 }
 
@@ -12688,5 +12871,221 @@ mod tests {
         let dropped = backend.blackhole_prune_expired(now).await.unwrap();
         assert_eq!(dropped, 0);
         assert_eq!(backend.blackhole_list().await.unwrap().len(), 2);
+    }
+
+    // ─── v3.4.0 (CIRISPersist#123) — replication substrate tests ───
+
+    /// Trivial `TrustScoring` impl for tests: a hard-coded map.
+    /// Mirrors the architect's plan §"Memory backend" minimal shim.
+    struct FixedTrustScoring(std::collections::HashMap<String, f64>);
+
+    #[async_trait::async_trait]
+    impl crate::federation::TrustScoring for FixedTrustScoring {
+        async fn trust_score(
+            &self,
+            key_id: &str,
+            _recursion_depth: u8,
+        ) -> Result<f64, crate::federation::TrustScoringError> {
+            match self.0.get(key_id) {
+                Some(s) => Ok(*s),
+                None => Err(crate::federation::TrustScoringError::KeyNotFound(
+                    key_id.into(),
+                )),
+            }
+        }
+    }
+
+    fn gate_for(pairs: &[(&str, f64)], threshold: f64) -> crate::federation::AdmissionGate {
+        let mut map = std::collections::HashMap::new();
+        for (k, v) in pairs {
+            map.insert((*k).to_owned(), *v);
+        }
+        crate::federation::AdmissionGate::new(
+            std::sync::Arc::new(FixedTrustScoring(map)),
+            threshold,
+            0,
+        )
+    }
+
+    /// Sweeper-batch test #1 — V053 columns exist and default sanely.
+    #[tokio::test]
+    async fn v053_columns_default_and_index_present() {
+        let backend = blob_test_backend().await;
+        let bytes = b"v053-defaults".to_vec();
+        let sha = sha256_of(&bytes);
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                blob_attestation("host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+            )
+            .await
+            .unwrap();
+        // Row exists; access_count == 0; last_accessed_at populated.
+        let conn = backend.conn_handle();
+        let sha_vec = sha.to_vec();
+        let (last, count) =
+            tokio::task::spawn_blocking(move || -> Result<(String, i64), rusqlite::Error> {
+                let c = conn.blocking_lock();
+                c.query_row(
+                    "SELECT last_accessed_at, access_count \
+                     FROM federation_blobs WHERE sha256 = ?1",
+                    rusqlite::params![sha_vec],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(count, 0);
+        // last_accessed_at must NOT be the V053 sentinel.
+        assert_ne!(last, "1970-01-01T00:00:00+00:00");
+    }
+
+    /// Access-tracking test — get_blob bumps access_count and
+    /// last_accessed_at.
+    #[tokio::test]
+    async fn get_blob_bumps_access_count() {
+        let backend = blob_test_backend().await;
+        let bytes = b"access-track".to_vec();
+        let sha = sha256_of(&bytes);
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes.clone()),
+                None,
+                blob_attestation("host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+            )
+            .await
+            .unwrap();
+        let _ = backend.get_blob(&sha).await.unwrap();
+        let _ = backend.get_blob(&sha).await.unwrap();
+        // has_blob also bumps the counter.
+        assert!(backend.has_blob(&sha).await.unwrap());
+        let conn = backend.conn_handle();
+        let sha_vec = sha.to_vec();
+        let count: i64 = tokio::task::spawn_blocking(move || -> Result<i64, rusqlite::Error> {
+            let c = conn.blocking_lock();
+            c.query_row(
+                "SELECT access_count FROM federation_blobs WHERE sha256 = ?1",
+                rusqlite::params![sha_vec],
+                |r| r.get(0),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        // 2 get_blob hits + 1 has_blob = 3.
+        assert_eq!(count, 3);
+    }
+
+    /// Admission ordering test — trust rejection beats inline-size
+    /// rejection.
+    #[tokio::test]
+    async fn trust_rejection_short_circuits_inline_size_check() {
+        let backend = blob_test_backend().await;
+        backend.set_admission_gate(Some(gate_for(&[("host-a", 0.1)], 0.5)));
+        let huge = vec![0u8; crate::federation::DEFAULT_INLINE_BYTES_CAP + 1];
+        let sha = sha256_of(&huge);
+        let err = backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(huge),
+                None,
+                blob_attestation("host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+            )
+            .await
+            .expect_err("must trust-reject before size-reject");
+        match err {
+            BlobError::TrustBelowThreshold {
+                key_id,
+                score,
+                threshold,
+            } => {
+                assert_eq!(key_id, "host-a");
+                assert!((score - 0.1).abs() < 1e-9);
+                assert!((threshold - 0.5).abs() < 1e-9);
+            }
+            other => panic!("expected TrustBelowThreshold, got {other:?}"),
+        }
+    }
+
+    /// Admission ordering test — empty-key still beats trust check.
+    #[tokio::test]
+    async fn empty_key_id_beats_trust_check() {
+        let backend = blob_test_backend().await;
+        backend.set_admission_gate(Some(gate_for(&[], 0.5)));
+        let sha = sha256_of(b"x");
+        let err = backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(b"x".to_vec()),
+                None,
+                blob_attestation("", "host-a", &uuid::Uuid::new_v4().to_string()),
+            )
+            .await
+            .expect_err("empty key beats trust");
+        assert!(matches!(err, BlobError::InvalidArgument(_)));
+    }
+
+    /// Admission-gate test — gate above threshold admits write.
+    #[tokio::test]
+    async fn trust_admit_when_score_meets_threshold() {
+        let backend = blob_test_backend().await;
+        backend.set_admission_gate(Some(gate_for(&[("host-a", 0.9)], 0.5)));
+        let bytes = b"admit-me".to_vec();
+        let sha = sha256_of(&bytes);
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                blob_attestation("host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+            )
+            .await
+            .expect("trust admits");
+    }
+
+    /// Attestation write-path also honors the gate.
+    #[tokio::test]
+    async fn put_attestation_honors_trust_gate() {
+        let backend = blob_test_backend().await;
+        backend.set_admission_gate(Some(gate_for(&[("host-a", 0.1)], 0.5)));
+        let att =
+            signed_attestation_fixture("host-a", "host-a", "host-a", "attestation:self_verify");
+        let err = backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .expect_err("trust-reject");
+        assert!(
+            matches!(err, crate::federation::Error::TrustBelowThreshold { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    fn signed_attestation_fixture(
+        attesting_key_id: &str,
+        attested_key_id: &str,
+        scrub_key_id: &str,
+        attestation_type: &str,
+    ) -> crate::federation::Attestation {
+        crate::federation::Attestation {
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            attesting_key_id: attesting_key_id.into(),
+            attested_key_id: attested_key_id.into(),
+            attestation_type: attestation_type.into(),
+            weight: Some(1.0),
+            asserted_at: chrono::Utc::now(),
+            expires_at: None,
+            attestation_envelope: serde_json::json!({}),
+            original_content_hash: "abcdef01".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: scrub_key_id.into(),
+            scrub_timestamp: chrono::Utc::now(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+        }
     }
 }

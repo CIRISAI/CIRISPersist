@@ -44,6 +44,7 @@ pub mod hardware_attestation;
 pub mod precedence;
 #[cfg(feature = "cirisaudit")]
 pub mod read;
+pub mod replication;
 pub mod rooting;
 pub mod schema_resolver;
 #[cfg(feature = "sqlite")]
@@ -89,6 +90,11 @@ pub use goal::{
     MetaGoalAlignment,
 };
 pub use hardware_attestation::{HardwareAttestationPolicy, DEFAULT_MAX_NONCE_AGE};
+pub use replication::{
+    aggregate_trust_score, withdraws_attestation_envelope, AdmissionGate, EvictionCandidate,
+    EvictionDecay, EvictionSweeper, MemoryTrustScoring, ReplicationConfig, SweepReport,
+    TrustScoring, TrustScoringError, DEFAULT_SWEEP_BATCH, MIN_SWEEP_INTERVAL,
+};
 pub use rooting::{
     provenance_chain, root_binding, ProvenanceChain, ProvenanceLink, RootingRejection,
     RootingVerdict, MAX_PROVENANCE_DEPTH,
@@ -781,6 +787,26 @@ pub enum Error {
         attestation_count: usize,
     },
 
+    /// v3.4.0 (CIRISPersist#123) — the
+    /// [`AdmissionGate`](crate::federation::AdmissionGate) rejected the
+    /// write: the attesting key's aggregate trust score is below the
+    /// deployment's `trust_threshold`. The row was NOT written.
+    /// Distinct from [`Error::InvalidArgument`] so consumers can
+    /// match the trust-rejection deterministically without parsing
+    /// the error string. The trust gate runs BEFORE FK validation,
+    /// envelope-schema validation, and signature verification — by
+    /// design, an unauthorized writer should not learn whether the
+    /// downstream checks would have succeeded.
+    #[error("trust score {score} for key_id={key_id} is below threshold {threshold}")]
+    TrustBelowThreshold {
+        /// The attesting key the gate evaluated.
+        key_id: String,
+        /// The aggregate score returned by the resolver.
+        score: f64,
+        /// The configured threshold.
+        threshold: f64,
+    },
+
     /// Backend-level error (DB connection, serialization, etc.).
     /// String-typed because each backend has its own error tree.
     #[error("backend: {0}")]
@@ -815,6 +841,7 @@ impl Error {
             Error::HardRemoveWithActiveAttestations { .. } => {
                 "federation_hard_remove_with_active_attestations"
             }
+            Error::TrustBelowThreshold { .. } => "federation_trust_below_threshold",
             Error::Backend(_) => "federation_backend",
         }
     }

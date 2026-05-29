@@ -142,6 +142,11 @@ pub struct Engine {
     /// LocalSigner (the cohabitation accessor path), this is `None`
     /// and `sign_hybrid` returns [`SignError::LocalSignerUnavailable`].
     local_signer: Option<Arc<crate::signing::LocalSigner>>,
+    /// v3.4.0 (CIRISPersist#123) — replication-layer config (trust
+    /// threshold, recursion depth, storage budget, eviction cadence).
+    /// `None` = defaults (bootstrap-permissive, sweeper inactive).
+    /// Cheaply clonable into the spawned sweeper task.
+    replication_config: Option<Arc<crate::federation::ReplicationConfig>>,
 }
 
 /// v2.12.0 (CIRISPersist#112) — error from [`Engine::sign_hybrid`].
@@ -201,6 +206,7 @@ impl Engine {
             backend,
             signer,
             local_signer,
+            replication_config: None,
         })
     }
 
@@ -280,6 +286,9 @@ impl Engine {
             // Use [`Engine::from_shared_with_local`] to propagate a
             // `LocalSigner` through.
             local_signer: None,
+            // v3.4.0 (#123) — cohabitation views do NOT spawn a
+            // second sweeper; the singleton owns the JoinHandle.
+            replication_config: None,
         }
     }
 
@@ -301,6 +310,438 @@ impl Engine {
             backend,
             signer,
             local_signer,
+            replication_config: None,
+        }
+    }
+
+    /// v3.4.0 (CIRISPersist#123) — opt-in constructor that composes a
+    /// [`ReplicationConfig`](crate::federation::ReplicationConfig)
+    /// onto a freshly-built Engine. The config governs the
+    /// trust-weighted [`AdmissionGate`](crate::federation::AdmissionGate)
+    /// applied to write paths and the eviction-sweeper cadence /
+    /// budget. **Does not** spawn the sweeper task; sovereign Rust
+    /// callers drive single passes via [`Engine::sweep_evictions_once`].
+    pub async fn with_replication_config(
+        signer: Arc<LocalSigner>,
+        dsn: &str,
+        replication_config: crate::federation::ReplicationConfig,
+    ) -> Result<Self, EngineError> {
+        let mut engine = Self::with_signer(signer, dsn).await?;
+        engine.replication_config = Some(Arc::new(replication_config));
+        Ok(engine)
+    }
+
+    /// v3.4.0 (CIRISPersist#123) — snapshot of the active replication
+    /// config. Returns `None` when the Engine was constructed without
+    /// one (defaults: bootstrap-permissive trust gate, sweeper off).
+    pub fn replication_config(&self) -> Option<Arc<crate::federation::ReplicationConfig>> {
+        self.replication_config.clone()
+    }
+
+    /// v3.4.0 (CIRISPersist#123) — variant of
+    /// [`Self::with_replication_config`] for the cohabitation path
+    /// (no DSN, no migrations). Consumes `self` because the field is
+    /// not interior-mutable; cheap (Arc clones).
+    pub fn with_replication_config_shared(
+        mut self,
+        cfg: Arc<crate::federation::ReplicationConfig>,
+    ) -> Self {
+        self.replication_config = Some(cfg);
+        self
+    }
+
+    /// v3.4.0 (CIRISPersist#123) — install / clear the trust-weighted
+    /// admission gate on the Engine's underlying storage backend. The
+    /// four write paths consult this gate BEFORE any DB work.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub fn set_admission_gate(&self, gate: Option<crate::federation::AdmissionGate>) {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.set_admission_gate(gate),
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.set_admission_gate(gate),
+        }
+    }
+
+    /// v3.4.0 (CIRISPersist#123) — drive one sweep cycle against the
+    /// underlying `federation_blobs` table. Returns a
+    /// [`crate::federation::SweepReport`] summarizing the result. A
+    /// no-op when no [`ReplicationConfig`] is configured or
+    /// `storage_budget_bytes == u64::MAX`.
+    ///
+    /// Sovereign Pi-cron callers + the spawned-sweeper loop both call
+    /// this method; the loop body is the same single-pass function.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn sweep_evictions_once(
+        &self,
+    ) -> Result<crate::federation::SweepReport, crate::federation::BlobError> {
+        use crate::federation::{EvictionDecay, SweepReport};
+
+        let Some(cfg) = self.replication_config.clone() else {
+            return Ok(SweepReport::default());
+        };
+        if !cfg.sweeper_active() {
+            return Ok(SweepReport::default());
+        }
+
+        let bytes_before = self.federation_blob_bytes().await?;
+        let watermark = cfg.watermark_bytes();
+        if bytes_before <= watermark {
+            return Ok(SweepReport {
+                bytes_before,
+                bytes_after: bytes_before,
+                rows_evicted: 0,
+                withdraws_emitted: 0,
+                withdraws_failed: 0,
+            });
+        }
+
+        let target_freed = bytes_before.saturating_sub(watermark);
+        let decay = EvictionDecay::new(cfg.eviction_decay_half_life_days);
+        let now = chrono::Utc::now();
+        let signer_key_id = self.signer.current_alias().to_owned();
+
+        // Pull one batch — DEFAULT_SWEEP_BATCH cap per cycle keeps
+        // each pass bounded. If the cycle exhausts the batch without
+        // hitting target_freed, the next tick (or the next caller of
+        // sweep_evictions_once) picks up where we left off.
+        let mut candidates = self.sweep_candidates_batch(&cfg).await?;
+        // Rust-side re-rank applies on both backends. PG already ranks
+        // in SQL by full decay score; SQLite ranks by the monotone
+        // bound. Re-ranking is idempotent on PG (no-op reorder) and
+        // load-bearing on SQLite. Sorting ascending so lowest-score
+        // evicts first.
+        candidates.sort_by(|a, b| {
+            let sa = decay.score(now, a.last_accessed_at, a.access_count);
+            let sb = decay.score(now, b.last_accessed_at, b.access_count);
+            sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Lookup prior holds_bytes attestations once per cycle so we
+        // don't pay an O(N) directory query for each candidate. The
+        // sweeper only withdraws attestations IT (the local signer)
+        // emitted — that's what the federation graph expects: each
+        // host announces eviction of its OWN holds_bytes rows.
+        let directory = self.federation_directory();
+        let signer_attestations = directory
+            .list_attestations_by(&signer_key_id)
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!(
+                    "sweeper: list_attestations_by failed: {e}"
+                ))
+            })?;
+        // Index by attestation_type so per-candidate lookup is O(1).
+        // A single signer may have emitted multiple holds_bytes rows
+        // over time for the same SHA (replay / re-attestation); the
+        // sweeper withdraws the MOST RECENT one (max asserted_at).
+        let mut holds_bytes_by_type: std::collections::HashMap<
+            String,
+            crate::federation::Attestation,
+        > = std::collections::HashMap::new();
+        for att in signer_attestations {
+            if !att
+                .attestation_type
+                .starts_with(crate::federation::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX)
+            {
+                continue;
+            }
+            holds_bytes_by_type
+                .entry(att.attestation_type.clone())
+                .and_modify(|existing| {
+                    if att.asserted_at > existing.asserted_at {
+                        *existing = att.clone();
+                    }
+                })
+                .or_insert(att);
+        }
+
+        let mut rows_evicted: u64 = 0;
+        let mut withdraws_emitted: u64 = 0;
+        let mut withdraws_failed: u64 = 0;
+        let mut bytes_freed: u64 = 0;
+
+        for candidate in candidates {
+            if bytes_freed >= target_freed {
+                break;
+            }
+            // Try to emit a withdraws attestation for this SHA. If
+            // the local signer never emitted a holds_bytes for it
+            // (cohabitation drift, signer rotation, etc.), skip the
+            // withdraws emission and STILL delete — orphaned
+            // withdraws is worse than no withdraws.
+            let holds_bytes_type =
+                crate::federation::holds_bytes_attestation_type(&candidate.sha256);
+            let withdraws_outcome = match holds_bytes_by_type.get(&holds_bytes_type) {
+                Some(prior) => {
+                    match self
+                        .emit_withdraws_attestation(
+                            &prior.attestation_id,
+                            &holds_bytes_type,
+                            &signer_key_id,
+                        )
+                        .await
+                    {
+                        Ok(()) => Some(Ok(())),
+                        Err(e) => Some(Err(e)),
+                    }
+                }
+                None => None,
+            };
+
+            // Delete the blob row regardless of withdraws outcome —
+            // the local copy is gone either way. The directory now
+            // either has an explicit withdraws (consumers will skip
+            // the holder) or simply will see TTL-expire the
+            // holds_bytes row on its own freshness window.
+            let deleted = self.delete_blob(&candidate.sha256).await?;
+            if deleted {
+                rows_evicted += 1;
+                bytes_freed = bytes_freed.saturating_add(candidate.size_bytes);
+            }
+            match withdraws_outcome {
+                Some(Ok(())) => withdraws_emitted += 1,
+                Some(Err(e)) => {
+                    withdraws_failed += 1;
+                    tracing::warn!(
+                        error = %e,
+                        sha256_prefix = &hex::encode(candidate.sha256)[..16],
+                        "ciris-persist v3.4.0 sweeper: withdraws emission failed"
+                    );
+                }
+                None => {
+                    // No prior holds_bytes from this signer — silent
+                    // skip is the documented behavior.
+                }
+            }
+        }
+
+        let bytes_after = self.federation_blob_bytes().await?;
+        Ok(SweepReport {
+            bytes_before,
+            bytes_after,
+            rows_evicted,
+            withdraws_emitted,
+            withdraws_failed,
+        })
+    }
+
+    /// v3.4.0 (CIRISPersist#123) — spawn the background eviction
+    /// sweeper. Returns an [`EvictionSweeper`] handle whose
+    /// [`EvictionSweeper::stop`] method shuts the loop down. The
+    /// loop calls [`Engine::sweep_evictions_once`] every
+    /// `cfg.sweep_interval` (clamped below by
+    /// [`crate::federation::MIN_SWEEP_INTERVAL`]).
+    ///
+    /// Sovereign mode: the Rust-side caller owns the
+    /// [`EvictionSweeper`] handle and calls `.stop()` on shutdown.
+    /// PyO3 mode: the [`crate::ffi::pyo3::EngineCell`] owns the
+    /// handle so all `PyEngine` clones share one loop —
+    /// [`Engine::from_shared`] does NOT spawn a second loop.
+    ///
+    /// No-op (returns `None`) when no
+    /// [`crate::federation::ReplicationConfig`] is composed onto this
+    /// Engine, or when the budget sentinel `u64::MAX` indicates the
+    /// sweeper is intentionally inactive.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub fn spawn_sweeper(&self) -> Option<crate::federation::EvictionSweeper> {
+        let cfg = self.replication_config.clone()?;
+        if !cfg.sweeper_active() {
+            return None;
+        }
+        let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+        let shutdown_for_loop = shutdown.clone();
+        let interval = cfg
+            .sweep_interval
+            .max(crate::federation::MIN_SWEEP_INTERVAL);
+        let engine = self.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown_for_loop.notified() => {
+                        tracing::info!(
+                            "ciris-persist v3.4.0 sweeper: shutdown signal received"
+                        );
+                        return;
+                    }
+                    _ = tokio::time::sleep(interval) => {}
+                }
+                match engine.sweep_evictions_once().await {
+                    Ok(report) if !report.is_noop() => {
+                        tracing::info!(
+                            rows_evicted = report.rows_evicted,
+                            bytes_freed = report.bytes_freed(),
+                            withdraws_emitted = report.withdraws_emitted,
+                            withdraws_failed = report.withdraws_failed,
+                            "ciris-persist v3.4.0 sweeper cycle"
+                        );
+                    }
+                    Ok(_) => {
+                        // Watermark not crossed — silent.
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "ciris-persist v3.4.0 sweeper cycle failed"
+                        );
+                    }
+                }
+            }
+        });
+        Some(crate::federation::EvictionSweeper::new(handle, shutdown))
+    }
+
+    /// v3.4.0 (CIRISPersist#123) — backend-dispatched candidate fetch.
+    /// Per-backend ranking strategy:
+    /// - PG ranks by full decay-weighted score in SQL.
+    /// - SQLite ranks by the monotone composite bound; the caller
+    ///   re-ranks in Rust by full score.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn sweep_candidates_batch(
+        &self,
+        cfg: &crate::federation::ReplicationConfig,
+    ) -> Result<Vec<crate::federation::EvictionCandidate>, crate::federation::BlobError> {
+        let limit = crate::federation::DEFAULT_SWEEP_BATCH;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => {
+                b.sweep_candidates(limit, cfg.eviction_decay_half_life_days)
+                    .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => {
+                let _ = cfg; // SQLite computes the score Rust-side; cfg unused at SQL layer.
+                b.sweep_candidates(limit).await
+            }
+        }
+    }
+
+    /// v3.4.0 (CIRISPersist#123) — delete one blob row by SHA from
+    /// the underlying backend.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn delete_blob(&self, sha256: &[u8; 32]) -> Result<bool, crate::federation::BlobError> {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.delete_blob(sha256).await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.delete_blob(sha256).await,
+        }
+    }
+
+    /// v3.4.0 (CIRISPersist#123) — build, sign, and persist a
+    /// `withdraws` attestation that retracts a prior `holds_bytes`
+    /// emission. The canonical envelope is produced via
+    /// [`crate::federation::withdraws_attestation_envelope`] and
+    /// canonicalized via
+    /// [`crate::verify::canonical::PythonJsonDumpsCanonicalizer`]
+    /// (NOT JCS — the same #121 discipline `put_blob_signing`
+    /// follows).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn emit_withdraws_attestation(
+        &self,
+        target_attestation_id: &str,
+        target_holds_bytes_type: &str,
+        signer_key_id: &str,
+    ) -> Result<(), crate::federation::BlobError> {
+        use crate::verify::canonical::{Canonicalizer, PythonJsonDumpsCanonicalizer};
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+
+        let envelope = crate::federation::withdraws_attestation_envelope(
+            target_attestation_id,
+            target_holds_bytes_type,
+        );
+        let canonical_bytes = PythonJsonDumpsCanonicalizer
+            .canonicalize_value(&envelope)
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("withdraws canonicalize: {e}"))
+            })?;
+        let original_content_hash = hex::encode(Sha256::digest(&canonical_bytes));
+        let sig_bytes =
+            self.signer.sign(&canonical_bytes).await.map_err(|e| {
+                crate::federation::BlobError::Backend(format!("withdraws sign: {e}"))
+            })?;
+        let scrub_signature_classical = B64.encode(&sig_bytes);
+        let now = chrono::Utc::now();
+
+        let row = crate::federation::Attestation {
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            attesting_key_id: signer_key_id.to_owned(),
+            // A withdraws attestation targets the holds_bytes
+            // attestation_id, not a key — but the schema requires a
+            // valid `attested_key_id`. The signer attests itself
+            // (the host that's withdrawing) so the FK is satisfied
+            // and the relationship is honest: "I attest I no longer
+            // hold these bytes."
+            attested_key_id: signer_key_id.to_owned(),
+            attestation_type: crate::federation::types::attestation_type::WITHDRAWS.to_owned(),
+            weight: None,
+            asserted_at: now,
+            expires_at: None,
+            attestation_envelope: envelope,
+            original_content_hash,
+            scrub_signature_classical,
+            scrub_signature_pqc: None,
+            scrub_key_id: signer_key_id.to_owned(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+        };
+
+        let directory = self.federation_directory();
+        directory
+            .put_attestation(crate::federation::SignedAttestation { attestation: row })
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("withdraws put_attestation: {e}"))
+            })
+    }
+
+    /// v3.4.0 (CIRISPersist#123) — total bytes currently held by
+    /// `federation_blobs`. Feeds the eviction-sweeper watermark.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn federation_blob_bytes(&self) -> Result<u64, crate::federation::BlobError> {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => {
+                let client =
+                    b.pool().get().await.map_err(|e| {
+                        crate::federation::BlobError::Backend(format!("pool get: {e}"))
+                    })?;
+                let row = client
+                    .query_one(
+                        "SELECT COALESCE(SUM(size_bytes), 0)::BIGINT AS total \
+                         FROM cirislens.federation_blobs",
+                        &[],
+                    )
+                    .await
+                    .map_err(|e| {
+                        crate::federation::BlobError::Backend(format!("federation_blob_bytes: {e}"))
+                    })?;
+                let total: i64 = row.get("total");
+                Ok(u64::try_from(total).unwrap_or(0))
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => {
+                let conn = b.conn_handle();
+                let total = tokio::task::spawn_blocking(move || -> Result<i64, rusqlite::Error> {
+                    let conn = conn.blocking_lock();
+                    conn.query_row(
+                        "SELECT COALESCE(SUM(size_bytes), 0) FROM federation_blobs",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )
+                })
+                .await
+                .map_err(|e| {
+                    crate::federation::BlobError::Backend(format!("spawn_blocking join: {e}"))
+                })?
+                .map_err(|e| {
+                    crate::federation::BlobError::Backend(format!("federation_blob_bytes: {e}"))
+                })?;
+                Ok(u64::try_from(total).unwrap_or(0))
+            }
         }
     }
 
@@ -1232,6 +1673,66 @@ mod tests {
             None,
             None,
         ))
+    }
+
+    /// v3.4.0 (CIRISPersist#123) — engine carries a replication
+    /// config and `sweep_evictions_once` is a no-op when the sweeper
+    /// is inactive (default).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sweep_evictions_once_is_noop_without_budget() {
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        // No replication config → noop.
+        let report = engine.sweep_evictions_once().await.expect("sweep");
+        assert!(report.is_noop());
+        assert!(engine.replication_config().is_none());
+    }
+
+    /// v3.4.0 (CIRISPersist#123) — `with_replication_config` composes
+    /// the knobs onto a fresh Engine; defaults still keep the sweeper
+    /// inactive (`u64::MAX` budget).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn with_replication_config_propagates_knobs() {
+        let cfg = crate::federation::ReplicationConfig {
+            trust_threshold: 0.7,
+            storage_budget_bytes: 1_000_000,
+            ..Default::default()
+        };
+        let engine = Engine::with_replication_config(test_signer(), "sqlite::memory:", cfg)
+            .await
+            .expect("construct engine");
+        let got = engine.replication_config().expect("config present");
+        assert_eq!(got.trust_threshold, 0.7);
+        assert_eq!(got.storage_budget_bytes, 1_000_000);
+        assert!(got.sweeper_active());
+        // Empty federation_blobs → bytes_before == 0, no rows evicted.
+        let report = engine.sweep_evictions_once().await.expect("sweep");
+        assert_eq!(report.bytes_before, 0);
+        assert_eq!(report.bytes_after, 0);
+        assert_eq!(report.rows_evicted, 0);
+    }
+
+    /// v3.4.0 (CIRISPersist#123) — Engine::set_admission_gate dispatches
+    /// to the underlying backend gate accessor.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn engine_set_admission_gate_dispatches_to_backend() {
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        let gate = crate::federation::AdmissionGate::new(
+            std::sync::Arc::new(crate::federation::MemoryTrustScoring::new()),
+            0.5,
+            0,
+        );
+        engine.set_admission_gate(Some(gate));
+        let sq = engine.sqlite_backend().expect("sqlite");
+        assert!(sq.admission_gate().is_some());
+        engine.set_admission_gate(None);
+        assert!(sq.admission_gate().is_none());
     }
 
     #[cfg(feature = "sqlite")]
@@ -3098,5 +3599,237 @@ mod tests {
         let stored_scrub_key_id: String = row.get(1);
         assert_eq!(stored_hash_hex, expected_hash_hex);
         assert_eq!(stored_scrub_key_id, key_id);
+    }
+
+    // ─── v3.4.0 (CIRISPersist#123) — sweeper integration tests ─────
+
+    /// Build a SignedKeyRecord whose key_id and scrub_key_id are
+    /// self-referential so the FK constraints land cleanly.
+    #[cfg(feature = "sqlite")]
+    fn sweeper_test_key(key_id: &str) -> crate::federation::SignedKeyRecord {
+        crate::federation::SignedKeyRecord {
+            record: crate::federation::KeyRecord {
+                key_id: key_id.into(),
+                pubkey_ed25519_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+                pubkey_ml_dsa_65_base64: None,
+                algorithm: crate::federation::types::algorithm::HYBRID.into(),
+                identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
+                identity_ref: key_id.into(),
+                valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
+                valid_until: None,
+                registration_envelope: serde_json::json!({"id": key_id}),
+                original_content_hash: "deadbeef".into(),
+                scrub_signature_classical: "c2lnbmF0dXJl".into(),
+                scrub_signature_pqc: None,
+                scrub_key_id: key_id.into(),
+                scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                roles: Vec::new(),
+                attestation_evidence: None,
+            },
+        }
+    }
+
+    /// Build a SQLite engine, register the test signer's key in
+    /// `federation_keys`, seed N blobs through `put_blob_signing` so
+    /// each lands a holds_bytes attestation. Returns the Engine + the
+    /// SHAs (in insertion order).
+    #[cfg(feature = "sqlite")]
+    async fn sweeper_seed_blobs(
+        cfg: crate::federation::ReplicationConfig,
+        n: usize,
+    ) -> (Engine, Vec<[u8; 32]>) {
+        use crate::federation::{BlobBody, FederationDirectory};
+        let signer = test_signer();
+        let engine = Engine::with_replication_config(signer, "sqlite::memory:", cfg)
+            .await
+            .expect("construct engine");
+        let sq = engine.sqlite_backend().expect("sqlite present");
+        sq.put_public_key(sweeper_test_key("test-engine-steward"))
+            .await
+            .expect("seed signer key");
+        let mut shas = Vec::with_capacity(n);
+        for i in 0..n {
+            // 1 KiB payloads so storage budgets are predictable.
+            let bytes = vec![i as u8 + 1; 1024];
+            let sha = {
+                use sha2::{Digest, Sha256};
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&Sha256::digest(&bytes));
+                out
+            };
+            engine
+                .put_blob_signing(
+                    &sha,
+                    BlobBody::Inline(bytes),
+                    None,
+                    "test-engine-steward",
+                    chrono::Utc::now(),
+                    uuid::Uuid::new_v4(),
+                )
+                .await
+                .expect("put_blob_signing");
+            shas.push(sha);
+        }
+        (engine, shas)
+    }
+
+    /// v3.4.0 (CIRISPersist#123) — sweeper is a noop when total bytes
+    /// sit below the watermark.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sweeper_idle_when_below_watermark_sqlite() {
+        let cfg = crate::federation::ReplicationConfig {
+            storage_budget_bytes: 1_000_000, // 1 MB — well above 5 KiB seed.
+            steady_state_utilization: 0.92,
+            ..Default::default()
+        };
+        let (engine, _shas) = sweeper_seed_blobs(cfg, 5).await;
+        let report = engine.sweep_evictions_once().await.expect("sweep");
+        assert_eq!(report.rows_evicted, 0);
+        assert_eq!(report.withdraws_emitted, 0);
+        assert_eq!(report.bytes_before, report.bytes_after);
+        // Total stored ≈ 5 KiB.
+        assert!(report.bytes_before >= 5 * 1024);
+    }
+
+    /// v3.4.0 (CIRISPersist#123) — sweeper evicts lowest-score rows
+    /// first. We seed 5 blobs in age order (each 1 KiB), then bump
+    /// access_count on the OLDER ones so the YOUNGER ones become the
+    /// eviction targets (their `(access_count + 1) × decay` score is
+    /// lower because they were never touched).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sweeper_evicts_lowest_score_first_sqlite() {
+        let cfg = crate::federation::ReplicationConfig {
+            // Budget = 4 KiB → watermark = 3.6 KiB → must evict so
+            // post-sweep ≤ 3.6 KiB. With 5 × 1 KiB rows = 5 KiB stored,
+            // target_freed = 5120 - 3686 ≈ 1.4 KiB → must evict 2 rows.
+            // Those 2 evictions should hit the 2 LEAST-touched
+            // (shas[3], shas[4]) — leaving the 3 hot ones (shas[0..3]).
+            storage_budget_bytes: 4 * 1024,
+            steady_state_utilization: 0.9,
+            // Very long half-life so access_count dominates score,
+            // not decay over the short test interval.
+            eviction_decay_half_life_days: 365.0,
+            ..Default::default()
+        };
+        let (engine, shas) = sweeper_seed_blobs(cfg, 5).await;
+        // Bump access_count on the OLDEST three blobs so they outrank
+        // the two newest. get_blob bumps access_count + last_accessed_at;
+        // we call it three times on shas[0..3].
+        use crate::federation::BlobStorage;
+        let sq = engine.sqlite_backend().expect("sqlite");
+        for sha in &shas[..3] {
+            for _ in 0..3 {
+                let _ = sq.get_blob(sha).await.unwrap();
+            }
+        }
+
+        let report = engine.sweep_evictions_once().await.expect("sweep");
+        // Expect at least one eviction; the LEAST-recently-accessed
+        // never-touched rows go first.
+        assert!(
+            report.rows_evicted > 0,
+            "sweeper should evict; got {report:?}"
+        );
+        assert!(report.bytes_after < report.bytes_before);
+        // The 3 hot blobs (shas[0..3]) MUST still be present — they
+        // have high access_count AND their last_accessed_at is
+        // post-get_blob, both of which boost their score.
+        for sha in &shas[..3] {
+            assert!(
+                sq.has_blob(sha).await.unwrap(),
+                "hot blob must survive eviction"
+            );
+        }
+        // The 2 cold blobs (shas[3], shas[4]) — at least one was
+        // evicted.
+        let mut cold_present_count = 0usize;
+        for sha in &shas[3..5] {
+            if sq.has_blob(sha).await.unwrap() {
+                cold_present_count += 1;
+            }
+        }
+        assert!(
+            cold_present_count < 2,
+            "at least one cold blob must have been evicted"
+        );
+    }
+
+    /// v3.4.0 (CIRISPersist#123) — sweeper emits a `withdraws`
+    /// attestation for each evicted row that has a prior `holds_bytes`
+    /// emission from the local signer.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sweeper_emits_withdraws_on_eviction_sqlite() {
+        let cfg = crate::federation::ReplicationConfig {
+            storage_budget_bytes: 2 * 1024,
+            steady_state_utilization: 0.5,
+            eviction_decay_half_life_days: 365.0,
+            ..Default::default()
+        };
+        let (engine, _shas) = sweeper_seed_blobs(cfg, 5).await;
+        let report = engine.sweep_evictions_once().await.expect("sweep");
+        assert!(report.rows_evicted > 0);
+        assert_eq!(
+            report.withdraws_emitted, report.rows_evicted,
+            "each eviction should have a withdraws attestation"
+        );
+        assert_eq!(report.withdraws_failed, 0);
+        // Confirm withdraws rows exist in federation_attestations.
+        let directory = engine.federation_directory();
+        let atts = directory
+            .list_attestations_by("test-engine-steward")
+            .await
+            .unwrap();
+        let withdraws_count = atts
+            .iter()
+            .filter(|a| a.attestation_type == crate::federation::types::attestation_type::WITHDRAWS)
+            .count();
+        assert_eq!(
+            withdraws_count, report.rows_evicted as usize,
+            "withdraws rows in directory must match rows_evicted"
+        );
+    }
+
+    /// v3.4.0 (CIRISPersist#123) — `list_holders` filters out the
+    /// holds_bytes attestation whose attester later emitted a
+    /// `withdraws` referencing it. Confirms the eviction → withdraws
+    /// → list_holders loop closes end-to-end.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn list_holders_filters_evicted_rows_sqlite() {
+        let cfg = crate::federation::ReplicationConfig {
+            storage_budget_bytes: 2 * 1024,
+            steady_state_utilization: 0.5,
+            eviction_decay_half_life_days: 365.0,
+            ..Default::default()
+        };
+        let (engine, shas) = sweeper_seed_blobs(cfg, 5).await;
+        use crate::federation::BlobStorage;
+        let sq = engine.sqlite_backend().expect("sqlite");
+        // Confirm every blob has the local signer as holder before
+        // the sweep.
+        for sha in &shas {
+            let holders = sq.list_holders(sha).await.unwrap();
+            assert_eq!(holders, vec!["test-engine-steward".to_string()]);
+        }
+        let report = engine.sweep_evictions_once().await.expect("sweep");
+        assert!(report.rows_evicted > 0);
+        // For each evicted SHA, list_holders should now be empty
+        // (the local signer's holds_bytes row is now withdrawn).
+        let mut empty_holder_count = 0usize;
+        for sha in &shas {
+            let holders = sq.list_holders(sha).await.unwrap();
+            if holders.is_empty() {
+                empty_holder_count += 1;
+            }
+        }
+        assert!(
+            empty_holder_count as u64 >= report.rows_evicted,
+            "evicted blobs must have list_holders return empty after withdraws"
+        );
     }
 }

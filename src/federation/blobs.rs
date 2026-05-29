@@ -448,6 +448,22 @@ pub enum BlobError {
     #[error("attestation emission failed: {0}")]
     AttestationEmissionFailed(String),
 
+    /// v3.4.0 (CIRISPersist#123) — the
+    /// [`AdmissionGate`](crate::federation::AdmissionGate) rejected the
+    /// write: the attesting key's aggregate trust score is below the
+    /// deployment's `trust_threshold`. The blob row was NOT written.
+    /// Field shape mirrors
+    /// [`crate::federation::Error::TrustBelowThreshold`].
+    #[error("trust score {score} for key_id={key_id} is below threshold {threshold}")]
+    TrustBelowThreshold {
+        /// The attesting key the gate evaluated.
+        key_id: String,
+        /// The score returned by the resolver.
+        score: f64,
+        /// The configured threshold.
+        threshold: f64,
+    },
+
     /// Backend-level error (DB connection, serialization, etc.).
     #[error("backend: {0}")]
     Backend(String),
@@ -462,6 +478,7 @@ impl BlobError {
             BlobError::InlineSizeExceeded { .. } => "blob_inline_size_exceeded",
             BlobError::InvalidArgument(_) => "blob_invalid_argument",
             BlobError::AttestationEmissionFailed(_) => "blob_attestation_emission_failed",
+            BlobError::TrustBelowThreshold { .. } => "blob_trust_below_threshold",
             BlobError::Backend(_) => "blob_backend",
         }
     }

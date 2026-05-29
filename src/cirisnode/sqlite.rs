@@ -175,13 +175,37 @@ fn json_value(s: &str) -> Result<serde_json::Value, Error> {
 /// ride the same WAL + PRAGMA settings as the trace-ingest path.
 pub struct SqliteNodeCoreBackend {
     conn: Arc<Mutex<Connection>>,
+    /// v3.4.0 (CIRISPersist#123) — trust-weighted admission gate. The
+    /// `put_contribution` write path consults this when set; `None`
+    /// preserves pre-#123 bootstrap-permissive behavior.
+    admission_gate: std::sync::RwLock<Option<crate::federation::AdmissionGate>>,
 }
 
 impl SqliteNodeCoreBackend {
     /// Construct from a shared connection handle (typically
     /// `SqliteBackend::conn_handle()`).
     pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            admission_gate: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// v3.4.0 (CIRISPersist#123) — install / clear the trust-weighted
+    /// admission gate consulted by `put_contribution`.
+    pub fn set_admission_gate(&self, gate: Option<crate::federation::AdmissionGate>) {
+        *self
+            .admission_gate
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = gate;
+    }
+
+    /// Snapshot of the currently-installed gate.
+    pub fn admission_gate(&self) -> Option<crate::federation::AdmissionGate> {
+        self.admission_gate
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 }
 
@@ -189,6 +213,22 @@ impl SqliteNodeCoreBackend {
 
 impl NodeCoreService for SqliteNodeCoreBackend {
     async fn put_contribution(&self, env: ContributionEnvelope) -> Result<(), Error> {
+        // v3.4.0 (CIRISPersist#123) — trust gate runs FIRST. The
+        // contribution's `author_id` is the attesting key for this
+        // surface; an unauthorized writer learns nothing about
+        // envelope shape / signature state until they clear the gate.
+        if let Some(gate) = self.admission_gate() {
+            if let Err(rej) = gate
+                .check(&env.author_id)
+                .await
+                .map_err(|e| Error::Backend(format!("trust_scoring: {e}")))?
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "trust below threshold: score={} threshold={} key={}",
+                    rej.score, rej.threshold, rej.key_id
+                )));
+            }
+        }
         super::verify::verify_envelope_signed(&env, &env.signature, &env.author_id)?;
         let id = parse_id(&env.contribution_id)?;
         let subject_kind = env.subject.subject.clone().ok_or_else(|| {
@@ -2360,5 +2400,52 @@ mod tests {
         );
         let err = backend.put_delivery_attestation(att).await.unwrap_err();
         assert!(matches!(err, Error::Signature(_)), "got: {err:?}");
+    }
+
+    /// v3.4.0 (CIRISPersist#123) — admission gate gates
+    /// `put_contribution` on author_id trust score.
+    #[tokio::test]
+    async fn put_contribution_trust_gate_rejects_low_score() {
+        let (_b, backend) = fresh_backend().await;
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xA1; 32]);
+        let author = pubkey_b64(&author_key);
+
+        // Install a gate that rates the author at 0.1, threshold 0.5.
+        let mut scoring = crate::federation::MemoryTrustScoring::new();
+        scoring.set_score(author.clone(), 0.1);
+        let gate = crate::federation::AdmissionGate::new(std::sync::Arc::new(scoring), 0.5, 0);
+        backend.set_admission_gate(Some(gate));
+
+        let env = ContributionEnvelope {
+            contribution_id: Uuid::new_v4().to_string(),
+            contribution_type: ContributionType::Proposal,
+            author_id: author.clone(),
+            subject: Cell {
+                domain: "trust-gate-test".into(),
+                language: "en".into(),
+                subject: Some("arc_question".into()),
+            },
+            payload: serde_json::json!({"question_id": "tg_q01"}),
+            witness_set: None,
+            signature: HybridSignature {
+                ed25519: String::new(),
+                ml_dsa_65: None,
+                signed_at: Utc::now(),
+            },
+            submitted_at: Utc::now(),
+        };
+        let mut env = env;
+        env.signature = sign_envelope(&env, &author_key);
+
+        let err = backend
+            .put_contribution(env)
+            .await
+            .expect_err("trust-reject");
+        match err {
+            Error::InvalidArgument(msg) => {
+                assert!(msg.contains("trust below threshold"), "got: {msg}");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
     }
 }

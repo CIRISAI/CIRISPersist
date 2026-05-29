@@ -102,6 +102,19 @@ fn map_pg_error(e: tokio_postgres::Error, op: &str) -> Error {
 
 impl NodeCoreService for PostgresBackend {
     async fn put_contribution(&self, env: ContributionEnvelope) -> Result<(), Error> {
+        // v3.4.0 (CIRISPersist#123) — trust gate runs FIRST.
+        if let Some(gate) = self.admission_gate() {
+            if let Err(rej) = gate
+                .check(&env.author_id)
+                .await
+                .map_err(|e| Error::Backend(format!("trust_scoring: {e}")))?
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "trust below threshold: score={} threshold={} key={}",
+                    rej.score, rej.threshold, rej.key_id
+                )));
+            }
+        }
         super::verify::verify_envelope_signed(&env, &env.signature, &env.author_id)?;
         let id = parse_id(&env.contribution_id)?;
         let subject_kind = env.subject.subject.as_deref().ok_or_else(|| {

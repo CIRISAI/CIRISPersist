@@ -98,6 +98,11 @@ pub struct PostgresBackend {
     /// Override via [`PostgresBackend::with_hardware_attestation_policy`].
     hardware_attestation_policy:
         std::sync::RwLock<std::sync::Arc<crate::federation::HardwareAttestationPolicy>>,
+    /// v3.4.0 (CIRISPersist#123) — trust-weighted admission gate.
+    /// `None` = no trust gate is installed (bootstrap-permissive — the
+    /// historical pre-#123 behavior). Set via
+    /// [`PostgresBackend::set_admission_gate`].
+    admission_gate: std::sync::RwLock<Option<crate::federation::AdmissionGate>>,
 }
 
 impl PostgresBackend {
@@ -178,6 +183,7 @@ impl PostgresBackend {
             hardware_attestation_policy: std::sync::RwLock::new(std::sync::Arc::new(
                 crate::federation::HardwareAttestationPolicy::default(),
             )),
+            admission_gate: std::sync::RwLock::new(None),
         })
     }
 
@@ -214,7 +220,30 @@ impl PostgresBackend {
             hardware_attestation_policy: std::sync::RwLock::new(std::sync::Arc::new(
                 crate::federation::HardwareAttestationPolicy::default(),
             )),
+            admission_gate: std::sync::RwLock::new(None),
         }
+    }
+
+    /// v3.4.0 (CIRISPersist#123) — install the trust-weighted
+    /// [`AdmissionGate`](crate::federation::AdmissionGate). Passing
+    /// `None` clears the gate (bootstrap-permissive). The four write
+    /// paths (`put_blob`, `put_attestation`, `put_revocation`,
+    /// `put_contribution`) consult the gate BEFORE any DB work; an
+    /// unauthorized writer learns nothing about FK / schema /
+    /// signature state past the gate's verdict.
+    pub fn set_admission_gate(&self, gate: Option<crate::federation::AdmissionGate>) {
+        *self
+            .admission_gate
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = gate;
+    }
+
+    /// Snapshot of the currently-installed admission gate, if any.
+    pub fn admission_gate(&self) -> Option<crate::federation::AdmissionGate> {
+        self.admission_gate
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// v2.5.0 (CIRISPersist#102 Ask 4) — install a per-axis
@@ -1387,6 +1416,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     ) -> Result<(), crate::federation::Error> {
         let mut row = attestation.attestation;
 
+        // v3.4.0 (CIRISPersist#123) — trust-threshold gate runs FIRST.
+        if !row.attesting_key_id.is_empty() {
+            if let Some(gate) = self.admission_gate() {
+                gate.check_federation(&row.attesting_key_id).await?;
+            }
+        }
+
         let client = self
             .get_client()
             .await
@@ -1622,6 +1658,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         revocation: crate::federation::SignedRevocation,
     ) -> Result<(), crate::federation::Error> {
         let mut row = revocation.revocation;
+
+        // v3.4.0 (CIRISPersist#123) — trust gate first.
+        if !row.revoking_key_id.is_empty() {
+            if let Some(gate) = self.admission_gate() {
+                gate.check_federation(&row.revoking_key_id).await?;
+            }
+        }
+
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         let client = self
@@ -2944,9 +2988,20 @@ impl crate::federation::BlobStorage for PostgresBackend {
         media_type: Option<&str>,
         attestation: crate::federation::PutBlobAttestation,
     ) -> Result<(), crate::federation::BlobError> {
-        // 1. API-side validation: inline-cap + hash-on-write. The DB
-        //    CHECK constraints catch direct-DB drift; this catches the
-        //    library-call drift before we reach the network.
+        // v3.4.0 (CIRISPersist#123) — admission ordering:
+        //   1. empty-string → InvalidArgument
+        //   2. trust-threshold → TrustBelowThreshold
+        //   3. inline-size → InlineSizeExceeded
+        //   4. hash-mismatch → HashMismatch
+        //   5. DB FK → AttestationEmissionFailed
+        if attestation.attesting_key_id.is_empty() {
+            return Err(crate::federation::BlobError::InvalidArgument(
+                "attesting_key_id is empty".into(),
+            ));
+        }
+        if let Some(gate) = self.admission_gate() {
+            gate.check_blob(&attestation.attesting_key_id).await?;
+        }
         let cap = self.inline_bytes_cap();
         if let crate::federation::BlobBody::Inline(ref bytes) = body {
             if bytes.len() > cap {
@@ -2956,13 +3011,6 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 });
             }
             crate::federation::blobs::verify_inline_hash(sha256, bytes)?;
-        }
-
-        // 2. Validate the attestation envelope shape.
-        if attestation.attesting_key_id.is_empty() {
-            return Err(crate::federation::BlobError::InvalidArgument(
-                "attesting_key_id is empty".into(),
-            ));
         }
         let attestation_uuid = uuid::Uuid::parse_str(&attestation.attestation_id).map_err(|e| {
             crate::federation::BlobError::InvalidArgument(format!(
@@ -3123,15 +3171,21 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .await
             .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
         let sha_vec = sha256.to_vec();
+        // v3.4.0 (CIRISPersist#123) — single UPDATE … RETURNING to
+        // bump the access tracker AND fetch the row in one
+        // round-trip. NULL row_opt = blob absent.
         let row_opt = client
             .query_opt(
-                "SELECT storage_kind, bytes_inline, external_ref, size_bytes, media_type \
-                 FROM cirislens.federation_blobs WHERE sha256 = $1",
+                "UPDATE cirislens.federation_blobs \
+                    SET access_count = access_count + 1, \
+                        last_accessed_at = NOW() \
+                  WHERE sha256 = $1 \
+                  RETURNING storage_kind, bytes_inline, external_ref, size_bytes, media_type",
                 &[&sha_vec],
             )
             .await
             .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("select federation_blobs: {e}"))
+                crate::federation::BlobError::Backend(format!("get_blob update+select: {e}"))
             })?;
         let Some(row) = row_opt else {
             return Ok(None);
@@ -3176,9 +3230,16 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .await
             .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
         let sha_vec = sha256.to_vec();
+        // v3.4.0 (CIRISPersist#123) — UPDATE … RETURNING also serves
+        // as existence check. RETURNING 1 returns 0 rows when no row
+        // matches; the access-count bump happens iff the row exists.
         let row_opt = client
             .query_opt(
-                "SELECT 1 AS one FROM cirislens.federation_blobs WHERE sha256 = $1",
+                "UPDATE cirislens.federation_blobs \
+                    SET access_count = access_count + 1, \
+                        last_accessed_at = NOW() \
+                  WHERE sha256 = $1 \
+                  RETURNING 1::int4 AS one",
                 &[&sha_vec],
             )
             .await
@@ -3275,6 +3336,92 @@ impl crate::federation::BlobStorage for PostgresBackend {
             }
         }
         Ok(holders)
+    }
+}
+
+// ─── Eviction sweeper helpers (v3.4.0, CIRISPersist#123) ───────────
+
+impl PostgresBackend {
+    /// v3.4.0 (CIRISPersist#123) — fetch the next `limit` eviction
+    /// candidates ordered ASC by the full decay-weighted score
+    /// `(access_count + 1) * exp(-ln(2) * Δt_secs / half_life_secs)`.
+    /// Postgres ships `exp()` and `ln()` in its math stdlib, so the
+    /// full ranking lives in SQL — single round-trip, no Rust-side
+    /// re-sort.
+    ///
+    /// The `+1` matches [`crate::federation::EvictionDecay::score`]
+    /// so SQL- and Rust-side rankings agree on the same tie-break.
+    pub async fn sweep_candidates(
+        &self,
+        limit: i64,
+        half_life_days: f64,
+    ) -> Result<Vec<crate::federation::EvictionCandidate>, crate::federation::BlobError> {
+        let half_life_secs = half_life_days.max(f64::EPSILON) * 86_400.0;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("pool get: {e}")))?;
+        let rows = client
+            .query(
+                "SELECT sha256, size_bytes, access_count, last_accessed_at \
+                 FROM cirislens.federation_blobs \
+                 ORDER BY \
+                   (access_count + 1)::float8 * \
+                   exp(-ln(2.0) * \
+                       EXTRACT(EPOCH FROM (NOW() - last_accessed_at))::float8 / $1::float8) \
+                   ASC, \
+                   last_accessed_at ASC \
+                 LIMIT $2",
+                &[&half_life_secs, &limit],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("sweep_candidates query: {e}"))
+            })?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let sha_vec: Vec<u8> =
+                row.safe_get_with("sha256", crate::federation::BlobError::Backend)?;
+            if sha_vec.len() != 32 {
+                continue;
+            }
+            let mut sha = [0u8; 32];
+            sha.copy_from_slice(&sha_vec);
+            let size_bytes: i64 =
+                row.safe_get_with("size_bytes", crate::federation::BlobError::Backend)?;
+            let access_count: i64 =
+                row.safe_get_with("access_count", crate::federation::BlobError::Backend)?;
+            let last_accessed_at: chrono::DateTime<chrono::Utc> =
+                row.safe_get_with("last_accessed_at", crate::federation::BlobError::Backend)?;
+            out.push(crate::federation::EvictionCandidate {
+                sha256: sha,
+                size_bytes: size_bytes.max(0) as u64,
+                access_count: access_count.max(0) as u64,
+                last_accessed_at,
+            });
+        }
+        Ok(out)
+    }
+
+    /// v3.4.0 (CIRISPersist#123) — delete one `federation_blobs` row
+    /// by SHA. Returns `true` iff a row was removed.
+    pub async fn delete_blob(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<bool, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("pool get: {e}")))?;
+        let sha_vec = sha256.to_vec();
+        let n = client
+            .execute(
+                "DELETE FROM cirislens.federation_blobs WHERE sha256 = $1",
+                &[&sha_vec],
+            )
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("delete_blob: {e}")))?;
+        Ok(n > 0)
     }
 }
 
@@ -14206,5 +14353,458 @@ mod tests {
         assert_eq!(dropped, 0, "no expired rules → zero drops");
         backend.blackhole_remove(&permanent).await.unwrap();
         backend.blackhole_remove(&future).await.unwrap();
+    }
+
+    // ─── v3.4.0 (CIRISPersist#123) — Postgres parity for #123 ──────
+
+    struct PgFixedTrustScoring(std::collections::HashMap<String, f64>);
+
+    #[async_trait::async_trait]
+    impl crate::federation::TrustScoring for PgFixedTrustScoring {
+        async fn trust_score(
+            &self,
+            key_id: &str,
+            _recursion_depth: u8,
+        ) -> Result<f64, crate::federation::TrustScoringError> {
+            match self.0.get(key_id) {
+                Some(s) => Ok(*s),
+                None => Err(crate::federation::TrustScoringError::KeyNotFound(
+                    key_id.into(),
+                )),
+            }
+        }
+    }
+
+    fn pg_gate(pairs: &[(&str, f64)], threshold: f64) -> crate::federation::AdmissionGate {
+        let mut map = std::collections::HashMap::new();
+        for (k, v) in pairs {
+            map.insert((*k).to_owned(), *v);
+        }
+        crate::federation::AdmissionGate::new(
+            std::sync::Arc::new(PgFixedTrustScoring(map)),
+            threshold,
+            0,
+        )
+    }
+
+    /// V053 migration applied — access tracking columns exist.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn v053_pg_access_columns_present() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let client = backend.pool().get().await.unwrap();
+        let row = client
+            .query_one(
+                "SELECT column_name FROM information_schema.columns \
+                 WHERE table_schema = 'cirislens' AND table_name = 'federation_blobs' \
+                   AND column_name = 'last_accessed_at'",
+                &[],
+            )
+            .await
+            .expect("last_accessed_at exists");
+        let _: String = row
+            .safe_get_with("column_name", crate::federation::Error::Backend)
+            .expect("column_name present");
+        let row = client
+            .query_one(
+                "SELECT column_name FROM information_schema.columns \
+                 WHERE table_schema = 'cirislens' AND table_name = 'federation_blobs' \
+                   AND column_name = 'access_count'",
+                &[],
+            )
+            .await
+            .expect("access_count exists");
+        let _: String = row
+            .safe_get_with("column_name", crate::federation::Error::Backend)
+            .expect("column_name present");
+    }
+
+    /// PG put_blob honors admission gate + admission ordering.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_put_blob_trust_rejection_beats_inline_size() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        use crate::federation::{BlobBody, BlobError, BlobStorage};
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let host = format!("trust-gate-host-{}", uuid_like());
+        pg_blob_bootstrap_host(&backend, &host).await;
+        backend.set_admission_gate(Some(pg_gate(&[(&host, 0.1)], 0.5)));
+        let huge = vec![0u8; crate::federation::DEFAULT_INLINE_BYTES_CAP + 1];
+        let sha = pg_sha256_of(&huge);
+        let err = backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(huge),
+                None,
+                pg_blob_attestation(&host, &host),
+            )
+            .await
+            .expect_err("trust beats size");
+        // Clear gate so we don't poison subsequent tests on shared DB.
+        backend.set_admission_gate(None);
+        match err {
+            BlobError::TrustBelowThreshold { key_id, .. } => assert_eq!(key_id, host),
+            other => panic!("expected TrustBelowThreshold, got {other:?}"),
+        }
+    }
+
+    /// PG get_blob bumps access tracking via UPDATE … RETURNING.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_get_blob_bumps_access_count() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        use crate::federation::{BlobBody, BlobStorage};
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let host = format!("access-host-{}", uuid_like());
+        pg_blob_bootstrap_host(&backend, &host).await;
+        let bytes = pg_blob_payload("access");
+        let sha = pg_sha256_of(&bytes);
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                pg_blob_attestation(&host, &host),
+            )
+            .await
+            .unwrap();
+        let _ = backend.get_blob(&sha).await.unwrap();
+        let _ = backend.get_blob(&sha).await.unwrap();
+        // has_blob also bumps.
+        assert!(backend.has_blob(&sha).await.unwrap());
+        let client = backend.pool().get().await.unwrap();
+        let row = client
+            .query_one(
+                "SELECT access_count FROM cirislens.federation_blobs WHERE sha256 = $1",
+                &[&sha.to_vec()],
+            )
+            .await
+            .unwrap();
+        let count: i64 = row
+            .safe_get_with("access_count", crate::federation::Error::Backend)
+            .expect("access_count column present");
+        assert_eq!(count, 3);
+    }
+
+    // ─── v3.4.0 (CIRISPersist#123) — PG sweeper parity ─────────────
+
+    /// PG parity for `sweeper_idle_when_below_watermark_sqlite`.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn sweeper_idle_when_below_watermark_pg() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        use crate::federation::BlobBody;
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        // Seed key + a handful of small blobs.
+        let host = format!("idle-host-{}", uuid_like());
+        pg_blob_bootstrap_host(&backend, &host).await;
+        let mut shas = Vec::new();
+        for i in 0..3 {
+            let bytes = vec![(i + 1) as u8; 256];
+            let sha = pg_sha256_of(&bytes);
+            use crate::federation::BlobStorage;
+            backend
+                .put_blob(
+                    &sha,
+                    BlobBody::Inline(bytes),
+                    None,
+                    pg_blob_attestation(&host, &host),
+                )
+                .await
+                .unwrap();
+            shas.push(sha);
+        }
+        // Compose an Engine view over this backend so we can drive
+        // sweep_evictions_once with a high budget.
+        use crate::signing::LocalSigner;
+        use ed25519_dalek::SigningKey;
+        let signer = std::sync::Arc::new(LocalSigner::from_parts(
+            SigningKey::from_bytes(&[0x9A; 32]),
+            host.clone(),
+            None,
+            None,
+        ));
+        let cfg = crate::federation::ReplicationConfig {
+            storage_budget_bytes: 100_000_000, // 100 MB — far above seeded.
+            steady_state_utilization: 0.92,
+            ..Default::default()
+        };
+        let engine = crate::Engine::with_replication_config(signer, &dsn, cfg)
+            .await
+            .unwrap();
+        let report = engine.sweep_evictions_once().await.expect("sweep");
+        assert_eq!(report.rows_evicted, 0);
+        assert_eq!(report.withdraws_emitted, 0);
+        // Cleanup: caller-managed (shared PG DB).
+        for sha in &shas {
+            let _ = backend.delete_blob(sha).await;
+        }
+    }
+
+    /// PG parity for `sweeper_emits_withdraws_on_eviction_sqlite`.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn sweeper_emits_withdraws_on_eviction_pg() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        use crate::signing::LocalSigner;
+        use ed25519_dalek::SigningKey;
+        // Each run uses a freshly-seeded host_key_id so the
+        // list_attestations_by query is scoped to this test only,
+        // even on the shared PG database.
+        let host = format!("evict-host-{}", uuid_like());
+        let host_for_signer = host.clone();
+        let signer = std::sync::Arc::new(LocalSigner::from_parts(
+            SigningKey::from_bytes(&[0x8B; 32]),
+            host_for_signer,
+            None,
+            None,
+        ));
+        let cfg = crate::federation::ReplicationConfig {
+            // Very tight budget so eviction is forced.
+            storage_budget_bytes: 1024,
+            steady_state_utilization: 0.5,
+            eviction_decay_half_life_days: 365.0,
+            ..Default::default()
+        };
+        let engine = crate::Engine::with_replication_config(signer.clone(), &dsn, cfg)
+            .await
+            .unwrap();
+        // Seed the federation_keys row for the signer (FK target for
+        // withdraws attestations).
+        let pg = engine.postgres_backend().expect("pg").clone();
+        pg_blob_bootstrap_host(&pg, &host).await;
+        // Seed 5 × 1 KiB blobs via the Engine's put_blob_signing path
+        // so each lands a holds_bytes attestation owned by the
+        // signer.
+        use crate::federation::BlobBody;
+        let mut shas = Vec::new();
+        for i in 0..5 {
+            let bytes = vec![(i + 1) as u8; 1024];
+            let sha = pg_sha256_of(&bytes);
+            engine
+                .put_blob_signing(
+                    &sha,
+                    BlobBody::Inline(bytes),
+                    None,
+                    &host,
+                    chrono::Utc::now(),
+                    uuid::Uuid::new_v4(),
+                )
+                .await
+                .unwrap();
+            shas.push(sha);
+        }
+
+        let report = engine.sweep_evictions_once().await.expect("sweep");
+        assert!(report.rows_evicted > 0);
+        // On a shared PG database the sweeper may evict blobs left
+        // behind by other tests (they have no holds_bytes from THIS
+        // signer); for those the withdraws emission is silently
+        // skipped per architect's contract. So we assert the
+        // emission count covers AT LEAST the blobs WE inserted
+        // (whose prior holds_bytes IS owned by `host`).
+        assert!(
+            report.withdraws_emitted >= 1,
+            "withdraws_emitted must be ≥1 since we seeded holds_bytes \
+             attestations under this host"
+        );
+        assert!(
+            report.withdraws_emitted <= report.rows_evicted,
+            "withdraws_emitted ≤ rows_evicted invariant"
+        );
+
+        // Confirm at least one withdraws row exists in PG
+        // federation_attestations for this signer.
+        let directory = engine.federation_directory();
+        let atts = directory.list_attestations_by(&host).await.unwrap();
+        let withdraws_count = atts
+            .iter()
+            .filter(|a| a.attestation_type == crate::federation::types::attestation_type::WITHDRAWS)
+            .count();
+        assert!(
+            withdraws_count >= report.withdraws_emitted as usize,
+            "PG must have ≥{} withdraws rows for this signer; got {}",
+            report.withdraws_emitted,
+            withdraws_count
+        );
+
+        // Cleanup: drop any surviving blobs so concurrent tests
+        // aren't impacted by per-budget bytes-budget accumulation
+        // across runs (shared PG DB).
+        for sha in &shas {
+            let _ = pg.delete_blob(sha).await;
+        }
+    }
+
+    /// PG parity for `sweeper_evicts_lowest_score_first_sqlite`.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn sweeper_evicts_lowest_score_first_pg() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        use crate::federation::{BlobBody, BlobStorage};
+        use crate::signing::LocalSigner;
+        use ed25519_dalek::SigningKey;
+        let host = format!("score-host-{}", uuid_like());
+        let signer = std::sync::Arc::new(LocalSigner::from_parts(
+            SigningKey::from_bytes(&[0x7C; 32]),
+            host.clone(),
+            None,
+            None,
+        ));
+        let cfg = crate::federation::ReplicationConfig {
+            storage_budget_bytes: 4 * 1024,
+            steady_state_utilization: 0.9,
+            eviction_decay_half_life_days: 365.0,
+            ..Default::default()
+        };
+        let engine = crate::Engine::with_replication_config(signer, &dsn, cfg)
+            .await
+            .unwrap();
+        let pg = engine.postgres_backend().expect("pg").clone();
+        pg_blob_bootstrap_host(&pg, &host).await;
+        let mut shas = Vec::new();
+        for i in 0..5 {
+            let bytes = vec![(i + 10) as u8; 1024];
+            let sha = pg_sha256_of(&bytes);
+            engine
+                .put_blob_signing(
+                    &sha,
+                    BlobBody::Inline(bytes),
+                    None,
+                    &host,
+                    chrono::Utc::now(),
+                    uuid::Uuid::new_v4(),
+                )
+                .await
+                .unwrap();
+            shas.push(sha);
+        }
+        // Bump access_count on the OLDEST three so they outrank.
+        for sha in &shas[..3] {
+            for _ in 0..3 {
+                let _ = pg.get_blob(sha).await.unwrap();
+            }
+        }
+        let report = engine.sweep_evictions_once().await.expect("sweep");
+        assert!(report.rows_evicted > 0);
+        // Hot blobs must survive.
+        for sha in &shas[..3] {
+            assert!(
+                pg.has_blob(sha).await.unwrap(),
+                "PG: hot blob must survive eviction"
+            );
+        }
+        // Cleanup.
+        for sha in &shas {
+            let _ = pg.delete_blob(sha).await;
+        }
+    }
+
+    /// PG parity for `list_holders_filters_evicted_rows_sqlite`.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn list_holders_filters_evicted_rows_pg() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        use crate::federation::{BlobBody, BlobStorage};
+        use crate::signing::LocalSigner;
+        use ed25519_dalek::SigningKey;
+        let host = format!("list-holders-host-{}", uuid_like());
+        let signer = std::sync::Arc::new(LocalSigner::from_parts(
+            SigningKey::from_bytes(&[0x6D; 32]),
+            host.clone(),
+            None,
+            None,
+        ));
+        let cfg = crate::federation::ReplicationConfig {
+            storage_budget_bytes: 1024,
+            steady_state_utilization: 0.5,
+            eviction_decay_half_life_days: 365.0,
+            ..Default::default()
+        };
+        let engine = crate::Engine::with_replication_config(signer, &dsn, cfg)
+            .await
+            .unwrap();
+        let pg = engine.postgres_backend().expect("pg").clone();
+        pg_blob_bootstrap_host(&pg, &host).await;
+        let mut shas = Vec::new();
+        for i in 0..3 {
+            let bytes = vec![(i + 20) as u8; 1024];
+            let sha = pg_sha256_of(&bytes);
+            engine
+                .put_blob_signing(
+                    &sha,
+                    BlobBody::Inline(bytes),
+                    None,
+                    &host,
+                    chrono::Utc::now(),
+                    uuid::Uuid::new_v4(),
+                )
+                .await
+                .unwrap();
+            shas.push(sha);
+        }
+        // Before sweep: each blob has this signer as holder.
+        for sha in &shas {
+            let holders = pg.list_holders(sha).await.unwrap();
+            assert!(holders.contains(&host));
+        }
+        let report = engine.sweep_evictions_once().await.expect("sweep");
+        assert!(report.rows_evicted > 0);
+        // Count how many of OUR test's blobs got evicted (others may
+        // have been swept up from concurrent-test pollution on the
+        // shared PG DB — those have no prior holds_bytes from our
+        // signer so their withdraws emission is silently skipped per
+        // architect's contract).
+        let mut my_evicted_count = 0usize;
+        for sha in &shas {
+            if !pg.has_blob(sha).await.unwrap() {
+                my_evicted_count += 1;
+            }
+        }
+        assert!(
+            my_evicted_count >= 1,
+            "at least one of our blobs must have been evicted"
+        );
+        // For each of OUR evicted blobs, the host is no longer a
+        // listed holder (because the withdraws covers it).
+        for sha in &shas {
+            if pg.has_blob(sha).await.unwrap() {
+                continue;
+            }
+            let holders = pg.list_holders(sha).await.unwrap();
+            assert!(
+                !holders.contains(&host),
+                "evicted blob must have host removed from holders"
+            );
+        }
+        for sha in &shas {
+            let _ = pg.delete_blob(sha).await;
+        }
     }
 }
