@@ -80,6 +80,11 @@ struct State {
     /// by [`crate::federation::Goal`]'s constructor; the memory shim
     /// stores the typed value verbatim.
     federation_goals: HashMap<uuid::Uuid, crate::federation::Goal>,
+    /// v3.2.0 (CIRISPersist#120) — Per-identity Reticulum blackhole
+    /// rules, keyed by the 16-byte identity hash. Mirrors the V052
+    /// PG/SQLite shape so behavioral parity tests pass against any
+    /// backend.
+    blackhole_rules: HashMap<Vec<u8>, crate::federation::BlackholeRecord>,
 }
 
 impl Default for MemoryBackend {
@@ -97,6 +102,7 @@ impl Default for MemoryBackend {
                 outbound_queue: HashMap::new(),
                 federation_goals: HashMap::new(),
                 federation_peer_metadata: HashMap::new(),
+                blackhole_rules: HashMap::new(),
             }),
         }
     }
@@ -1200,6 +1206,106 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         for_hash.persist_row_hash = String::new();
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
         Ok(())
+    }
+}
+
+// ─── BlackholeRules impl (v3.2.0, CIRISPersist#120) ────────────────
+//
+// In-memory mirror of the V052 blackhole_rules table. The same
+// upsert / remove / hit / prune contract the PG + SQLite backends
+// implement, against an in-process HashMap keyed by the 16-byte
+// identity_hash. Used by fixture tests + by the in-process Engine
+// when no DB backend is wired (test harness).
+
+#[async_trait::async_trait]
+impl crate::federation::BlackholeRules for MemoryBackend {
+    async fn blackhole_list(
+        &self,
+    ) -> Result<Vec<crate::federation::BlackholeRecord>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state.blackhole_rules.values().cloned().collect();
+        rows.sort_by_key(|a| a.added_at);
+        Ok(rows)
+    }
+
+    async fn blackhole_upsert(
+        &self,
+        identity_hash: &[u8],
+        until: Option<chrono::DateTime<chrono::Utc>>,
+        reason: Option<&str>,
+    ) -> Result<(), crate::federation::Error> {
+        crate::federation::blackhole::validate_identity_hash_len(identity_hash)?;
+        let mut state = self.state.lock().expect("memory backend lock");
+        let now = chrono::Utc::now();
+        let key = identity_hash.to_vec();
+        let reason_owned = reason.map(str::to_owned);
+
+        match state.blackhole_rules.get_mut(&key) {
+            Some(row) => {
+                // Re-upsert: preserve hits + added_at, overwrite
+                // operator-intent fields, recompute persist_row_hash.
+                row.until = until;
+                row.reason = reason_owned;
+                row.persist_row_hash = crate::federation::blackhole::compute_blackhole_row_hash(
+                    &row.identity_hash,
+                    &row.until,
+                    &row.reason,
+                    &row.added_at,
+                )?;
+            }
+            None => {
+                let mut record = crate::federation::BlackholeRecord {
+                    identity_hash: key.clone(),
+                    until,
+                    reason: reason_owned,
+                    added_at: now,
+                    hits: 0,
+                    persist_row_hash: String::new(),
+                };
+                record.persist_row_hash = crate::federation::blackhole::compute_blackhole_row_hash(
+                    &record.identity_hash,
+                    &record.until,
+                    &record.reason,
+                    &record.added_at,
+                )?;
+                state.blackhole_rules.insert(key, record);
+            }
+        }
+        Ok(())
+    }
+
+    async fn blackhole_remove(&self, identity_hash: &[u8]) -> Result<(), crate::federation::Error> {
+        crate::federation::blackhole::validate_identity_hash_len(identity_hash)?;
+        let mut state = self.state.lock().expect("memory backend lock");
+        state.blackhole_rules.remove(identity_hash);
+        Ok(())
+    }
+
+    async fn blackhole_record_hit(
+        &self,
+        identity_hash: &[u8],
+    ) -> Result<(), crate::federation::Error> {
+        crate::federation::blackhole::validate_identity_hash_len(identity_hash)?;
+        let mut state = self.state.lock().expect("memory backend lock");
+        if let Some(row) = state.blackhole_rules.get_mut(identity_hash) {
+            row.hits = row.hits.saturating_add(1);
+        }
+        // Silent no-op when absent — race-tolerant.
+        Ok(())
+    }
+
+    async fn blackhole_prune_expired(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        let before = state.blackhole_rules.len();
+        state.blackhole_rules.retain(|_, row| match row.until {
+            Some(until) => until >= now,
+            None => true, // permanent
+        });
+        let after = state.blackhole_rules.len();
+        Ok((before - after) as u64)
     }
 }
 
@@ -3506,5 +3612,179 @@ mod tests {
                 other => panic!("expected PeerNotFound, got {other:?}"),
             }
         }
+    }
+
+    // ── BlackholeRules tests (v3.2.0, CIRISPersist#120) ────────────
+
+    fn id16(byte: u8) -> Vec<u8> {
+        vec![byte; 16]
+    }
+
+    #[tokio::test]
+    async fn blackhole_upsert_then_list_round_trip() {
+        use crate::federation::BlackholeRules;
+        let backend = MemoryBackend::new();
+        let id = id16(0xAA);
+        backend
+            .blackhole_upsert(&id, None, Some("noisy"))
+            .await
+            .unwrap();
+        let rows = backend.blackhole_list().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].identity_hash, id);
+        assert!(rows[0].until.is_none(), "permanent rule");
+        assert_eq!(rows[0].reason.as_deref(), Some("noisy"));
+        assert_eq!(rows[0].hits, 0);
+        assert!(
+            !rows[0].persist_row_hash.is_empty(),
+            "server populates row hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn blackhole_upsert_with_until_round_trip() {
+        use crate::federation::BlackholeRules;
+        let backend = MemoryBackend::new();
+        let id = id16(0xBB);
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        backend
+            .blackhole_upsert(&id, Some(future), Some("temp"))
+            .await
+            .unwrap();
+        let rows = backend.blackhole_list().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].until.is_some());
+        let stored = rows[0].until.unwrap();
+        // Sub-second roundtrip jitter is fine on memory; identity-cmp.
+        assert_eq!(stored.timestamp_millis(), future.timestamp_millis());
+    }
+
+    #[tokio::test]
+    async fn blackhole_upsert_idempotent_preserves_hits() {
+        use crate::federation::BlackholeRules;
+        let backend = MemoryBackend::new();
+        let id = id16(0xCC);
+        backend
+            .blackhole_upsert(&id, None, Some("first"))
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            backend.blackhole_record_hit(&id).await.unwrap();
+        }
+        let before = backend.blackhole_list().await.unwrap();
+        assert_eq!(before[0].hits, 3);
+        let added_at_before = before[0].added_at;
+
+        // Re-upsert with new reason — hits + added_at preserved,
+        // reason overwritten.
+        backend
+            .blackhole_upsert(&id, None, Some("second"))
+            .await
+            .unwrap();
+        let after = backend.blackhole_list().await.unwrap();
+        assert_eq!(after[0].hits, 3, "hits preserved across re-upsert");
+        assert_eq!(after[0].reason.as_deref(), Some("second"));
+        assert_eq!(
+            after[0].added_at, added_at_before,
+            "added_at preserved across re-upsert"
+        );
+    }
+
+    #[tokio::test]
+    async fn blackhole_upsert_invalid_hash_length_rejects() {
+        use crate::federation::BlackholeRules;
+        let backend = MemoryBackend::new();
+        for bad in [vec![], vec![1u8; 8], vec![1u8; 15], vec![1u8; 17]] {
+            let err = backend
+                .blackhole_upsert(&bad, None, None)
+                .await
+                .expect_err("non-16 must reject");
+            assert!(
+                matches!(err, crate::federation::Error::InvalidArgument(_)),
+                "got {err:?} for len {}",
+                bad.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn blackhole_remove_unknown_silent_ok() {
+        use crate::federation::BlackholeRules;
+        let backend = MemoryBackend::new();
+        backend.blackhole_remove(&id16(0xEE)).await.unwrap();
+        assert!(backend.blackhole_list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn blackhole_remove_idempotent() {
+        use crate::federation::BlackholeRules;
+        let backend = MemoryBackend::new();
+        let id = id16(0xFE);
+        backend.blackhole_upsert(&id, None, None).await.unwrap();
+        backend.blackhole_remove(&id).await.unwrap();
+        backend.blackhole_remove(&id).await.unwrap(); // 2nd call also OK
+        assert!(backend.blackhole_list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn blackhole_record_hit_increments() {
+        use crate::federation::BlackholeRules;
+        let backend = MemoryBackend::new();
+        let id = id16(0x42);
+        backend.blackhole_upsert(&id, None, None).await.unwrap();
+        for _ in 0..5 {
+            backend.blackhole_record_hit(&id).await.unwrap();
+        }
+        let rows = backend.blackhole_list().await.unwrap();
+        assert_eq!(rows[0].hits, 5);
+    }
+
+    #[tokio::test]
+    async fn blackhole_record_hit_unknown_silent_ok() {
+        use crate::federation::BlackholeRules;
+        let backend = MemoryBackend::new();
+        backend.blackhole_record_hit(&id16(0xAB)).await.unwrap();
+        assert!(backend.blackhole_list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn blackhole_prune_expired_drops_only_expired() {
+        use crate::federation::BlackholeRules;
+        let backend = MemoryBackend::new();
+        let now = chrono::Utc::now();
+        let expired = id16(0x11);
+        let permanent = id16(0x22);
+        backend
+            .blackhole_upsert(&expired, Some(now - chrono::Duration::hours(1)), None)
+            .await
+            .unwrap();
+        backend
+            .blackhole_upsert(&permanent, None, None)
+            .await
+            .unwrap();
+
+        let dropped = backend.blackhole_prune_expired(now).await.unwrap();
+        assert_eq!(dropped, 1);
+        let rows = backend.blackhole_list().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].identity_hash, permanent);
+    }
+
+    #[tokio::test]
+    async fn blackhole_prune_expired_with_no_expired_returns_zero() {
+        use crate::federation::BlackholeRules;
+        let backend = MemoryBackend::new();
+        let now = chrono::Utc::now();
+        backend
+            .blackhole_upsert(&id16(0x33), None, None)
+            .await
+            .unwrap();
+        backend
+            .blackhole_upsert(&id16(0x44), Some(now + chrono::Duration::hours(1)), None)
+            .await
+            .unwrap();
+        let dropped = backend.blackhole_prune_expired(now).await.unwrap();
+        assert_eq!(dropped, 0);
+        assert_eq!(backend.blackhole_list().await.unwrap().len(), 2);
     }
 }

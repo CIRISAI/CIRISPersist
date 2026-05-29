@@ -5,6 +5,86 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.2.0] — 2026-05-29
+
+**CIRISPersist 3.2 — `BlackholeRules` durable per-identity deny-list (#120 / unblocks CIRISEdge#33 v0.15.0 routing-table FFI).**
+
+Closes **#120**: a new sibling trait `BlackholeRules` + V052 `cirislens.blackhole_rules` table giving CIRISEdge's `ReticulumTransport` a durable home for operator-configured deny-list rules. v0.15.0's in-memory `Arc<RwLock<HashMap<Vec<u8>, BlackholeRecord>>>` survives transport rebuilds inside a single Edge; this release lets rules survive *process* restarts, which the v0.15.0 acceptance criterion requires.
+
+### New `BlackholeRules` trait (sibling, not folded into `FederationDirectory`)
+
+Trait location is a deliberate call: federation directory is about **cryptographic identities + trust statements**; blackhole is about **transport-layer address denials**. Different concern, different lifetime (transport addresses exist independently of crypto identities). Sibling pattern matches #115's `BlobStorage`. Object-safe via `#[async_trait]` — `Arc<dyn BlackholeRules>` works through the CIRISEdge `current_rust_engine()` path.
+
+```rust
+#[async_trait]
+pub trait BlackholeRules: Send + Sync {
+    async fn blackhole_list(&self) -> Result<Vec<BlackholeRecord>, Error>;
+    async fn blackhole_upsert(
+        &self,
+        identity_hash: &[u8],
+        until: Option<DateTime<Utc>>,
+        reason: Option<&str>,
+    ) -> Result<(), Error>;
+    async fn blackhole_remove(&self, identity_hash: &[u8]) -> Result<(), Error>;
+    async fn blackhole_record_hit(&self, identity_hash: &[u8]) -> Result<(), Error>;
+    async fn blackhole_prune_expired(&self, now: DateTime<Utc>) -> Result<u64, Error>;
+}
+```
+
+Lives at `src/federation/blackhole.rs`; re-exported from `crate::federation`.
+
+### Operator-semantics calls baked into the surface
+
+- **`blackhole_upsert` preserves `hits` + `added_at` on re-upsert.** Operator changing `reason` or `until` on an existing rule is intent-change, not counter-reset. `added_at` survives so forensics-style "when did we first ban this peer?" queries work.
+- **`blackhole_remove` is silent on unknown hash** (no `PeerNotFound`-style error). Matches POSIX `rm -f` ergonomics; operator scripts can call without first checking. Different semantic from #117's peer-mutation surface where `update_*` rightly errors on unknown peers because the operator is asserting state-change on what they think exists.
+- **`blackhole_record_hit` is race-tolerant.** Silent no-op if the rule was removed between the send-path check and the increment. The send-path is hot; persist does not gate it behind a transaction.
+- **`blackhole_prune_expired` treats `until IS NULL` as the operator's "permanent" signal.** Pruner deletes only `until IS NOT NULL AND until < now`. Permanent rules survive every prune call by design.
+
+### Hot-path hit-recording — single round-trip, no batching in persist
+
+`record_hit` is the send-path check that fires for every blackholed envelope. Implementation: single `UPDATE blackhole_rules SET hits = hits + 1 WHERE identity_hash = $1` — commutative increment, no transaction wrap, no `persist_row_hash` recomputation. Callers concerned about latency batch client-side (the docblock points at `HashMap<Vec<u8>, u64>` + periodic flush) — persist exposes the primitive, doesn't pre-optimize the caller's shape.
+
+### `persist_row_hash` excludes `hits`
+
+A design call beyond the issue spec: the canonical-bytes shape (`compute_blackhole_row_hash`) covers `identity_hash`, `until`, `reason`, `added_at` — but NOT `hits`. Hot-path increments don't force a re-canonicalize. Operator-intent fields participate in the hash; counter doesn't.
+
+### V052 migration — sibling table, both dialects
+
+```sql
+CREATE TABLE IF NOT EXISTS cirislens.blackhole_rules (
+    identity_hash    BYTEA PRIMARY KEY,
+    until            TIMESTAMPTZ,
+    reason           TEXT,
+    added_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    hits             BIGINT NOT NULL DEFAULT 0,
+    persist_row_hash TEXT NOT NULL
+);
+CREATE INDEX idx_blackhole_until ON cirislens.blackhole_rules (until)
+    WHERE until IS NOT NULL;
+```
+
+Partial index `(until) WHERE until IS NOT NULL` lets `prune_expired` scan only rules with finite TTLs. SQLite parallel: `BLOB PRIMARY KEY`, TEXT RFC3339 timestamps, identical partial index. No SQL CHECK on `identity_hash` length — length validated at the API surface (`Error::InvalidArgument` when `!= 16` bytes) instead, so a hypothetical future Reticulum hash-width change won't force a schema rewrite. `tests/qa_harness.rs` migration bound 51 → 52.
+
+### Engine facade
+
+Five methods on `Engine` mirroring the trait surface, plus `blackhole_rules() -> Arc<dyn BlackholeRules>` for consumers that want trait access directly. All `#[cfg(any(feature = "postgres", feature = "sqlite"))]` — matches the dispatch pattern for the existing facade methods (`archive_audit_range`, `sign_hybrid`, etc.).
+
+### PyO3 mirrors
+
+Five methods on `PyEngine`: `blackhole_list_json`, `blackhole_upsert(identity_hash: bytes, until_iso, reason)`, `blackhole_remove(identity_hash: bytes)`, `blackhole_record_hit(identity_hash: bytes)`, `blackhole_prune_expired_iso(now_iso)`. `identity_hash` flows as Python `bytes`; timestamps as ISO strings (matching `attach_revocation_pqc_signature` and the broader textual-timestamp convention). Errors route through the existing `federation_err_to_py` — no new kind tokens needed.
+
+### Test coverage — 33 new (memory + sqlite + postgres + 3 module-unit)
+
+- 10 per backend: `blackhole_upsert_then_list_round_trip`, `blackhole_upsert_with_until_round_trip`, `blackhole_upsert_idempotent_preserves_hits`, `blackhole_upsert_invalid_hash_length_rejects`, `blackhole_remove_unknown_silent_ok`, `blackhole_remove_idempotent`, `blackhole_record_hit_increments`, `blackhole_record_hit_unknown_silent_ok`, `blackhole_prune_expired_drops_only_expired`, `blackhole_prune_expired_with_no_expired_returns_zero`.
+- 3 module-unit: `validate_identity_hash_len_accepts_16`, `validate_identity_hash_len_rejects_other_lengths`, `compute_blackhole_row_hash_excludes_hits_field`.
+- Full nextest: **886/886 pass** on fresh PG; no regressions in the existing 883 from 3.1.x.
+
+### Mission citations
+
+- §1.5 parity invariant — both backends + memory parity; SQLite Pi-class deployment carries the same durable deny-list as a datacenter PG instance.
+- §1.6 fail-honest — typed `InvalidArgument` on length-mismatch instead of silent CHECK violation at the DB layer; `record_hit` race-tolerance is documented, not buried.
+- Operator-autonomy framing (Accord §I) — the deny-list is the operator's tool for refusing federation neighbors; persist stores the decision, doesn't second-guess it.
+
 ## [3.1.1] — 2026-05-28
 
 **CIRISPersist 3.1.1 — two thin admission accessors closing today's CIRISEdge cohabitation gaps (#118 + #119).**

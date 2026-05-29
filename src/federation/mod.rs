@@ -35,6 +35,7 @@
 pub mod admission;
 #[cfg(feature = "cirisaudit")]
 pub mod backfill;
+pub mod blackhole;
 pub mod blobs;
 #[cfg(feature = "cirisaudit")]
 pub mod emit;
@@ -77,6 +78,7 @@ pub use admission::{
     AttestationLadderTransitionPolicy, DimensionAdmissionPolicy, DimensionRejectionReason,
     ReservedPrefixRule, ATTESTATION_LADDER_MECHANISMS,
 };
+pub use blackhole::{BlackholeRecord, BlackholeRules, RETICULUM_IDENTITY_HASH_LEN};
 pub use blobs::{
     holds_bytes_attestation_envelope, holds_bytes_attestation_type, BlobBody, BlobError,
     BlobStorage, ExternalRef, PutBlobAttestation, DEFAULT_INLINE_BYTES_CAP,

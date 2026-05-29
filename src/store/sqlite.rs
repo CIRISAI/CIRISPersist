@@ -3182,6 +3182,202 @@ fn sqlite_row_to_trust_row(
     })
 }
 
+// ─── BlackholeRules impl (v3.2.0, CIRISPersist#120) ────────────────
+//
+// SQLite-backed mirror of the V052 PG impl. Same upsert / remove /
+// hit / prune contract; same in-RAM hash discipline (exclude `hits`
+// from the canonical bytes so hot-path hit-recording doesn't force a
+// re-hash).
+
+#[async_trait::async_trait]
+impl crate::federation::BlackholeRules for SqliteBackend {
+    async fn blackhole_list(
+        &self,
+    ) -> Result<Vec<crate::federation::BlackholeRecord>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let rows = tokio::task::spawn_blocking(
+            move || -> Result<Vec<crate::federation::BlackholeRecord>, rusqlite::Error> {
+                let conn = conn.blocking_lock();
+                let mut stmt = conn.prepare(
+                    "SELECT identity_hash, until, reason, added_at, hits, persist_row_hash \
+                     FROM blackhole_rules \
+                     ORDER BY added_at ASC",
+                )?;
+                let iter = stmt.query_map([], |row| {
+                    let identity_hash: Vec<u8> = row.get(0)?;
+                    let until_text: Option<String> = row.get(1)?;
+                    let reason: Option<String> = row.get(2)?;
+                    let added_at_text: String = row.get(3)?;
+                    let hits: i64 = row.get(4)?;
+                    let persist_row_hash: String = row.get(5)?;
+                    Ok((
+                        identity_hash,
+                        until_text,
+                        reason,
+                        added_at_text,
+                        hits,
+                        persist_row_hash,
+                    ))
+                })?;
+                let mut out = Vec::new();
+                for r in iter {
+                    let (identity_hash, until_text, reason, added_at_text, hits, persist_row_hash) =
+                        r?;
+                    let added_at = parse_rfc3339(&added_at_text);
+                    let until = until_text.as_deref().map(parse_rfc3339);
+                    out.push(crate::federation::BlackholeRecord {
+                        identity_hash,
+                        until,
+                        reason,
+                        added_at,
+                        hits,
+                        persist_row_hash,
+                    });
+                }
+                Ok(out)
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| crate::federation::Error::Backend(format!("blackhole_list sqlite: {e}")))?;
+        Ok(rows)
+    }
+
+    async fn blackhole_upsert(
+        &self,
+        identity_hash: &[u8],
+        until: Option<chrono::DateTime<chrono::Utc>>,
+        reason: Option<&str>,
+    ) -> Result<(), crate::federation::Error> {
+        crate::federation::blackhole::validate_identity_hash_len(identity_hash)?;
+        let now = chrono::Utc::now();
+        let identity_owned = identity_hash.to_vec();
+        let reason_owned = reason.map(str::to_owned);
+        let conn = self.conn.clone();
+        let outcome = tokio::task::spawn_blocking(
+            move || -> Result<Result<(), crate::federation::Error>, rusqlite::Error> {
+                let mut conn = conn.blocking_lock();
+                let tx = conn.transaction()?;
+                let existing_added_at_text: Option<String> = tx
+                    .query_row(
+                        "SELECT added_at FROM blackhole_rules WHERE identity_hash = ?1",
+                        [&identity_owned],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                let added_at = match &existing_added_at_text {
+                    Some(text) => parse_rfc3339(text),
+                    None => now,
+                };
+                let new_hash = match crate::federation::blackhole::compute_blackhole_row_hash(
+                    &identity_owned,
+                    &until,
+                    &reason_owned,
+                    &added_at,
+                ) {
+                    Ok(h) => h,
+                    Err(e) => return Ok(Err(e)),
+                };
+                let until_text = until.as_ref().map(|t| t.to_rfc3339());
+                if existing_added_at_text.is_some() {
+                    tx.execute(
+                        "UPDATE blackhole_rules SET \
+                            until = ?2, reason = ?3, persist_row_hash = ?4 \
+                         WHERE identity_hash = ?1",
+                        rusqlite::params![identity_owned, until_text, reason_owned, new_hash],
+                    )?;
+                } else {
+                    let added_at_text = added_at.to_rfc3339();
+                    tx.execute(
+                        "INSERT INTO blackhole_rules \
+                            (identity_hash, until, reason, added_at, hits, persist_row_hash) \
+                         VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+                        rusqlite::params![
+                            identity_owned,
+                            until_text,
+                            reason_owned,
+                            added_at_text,
+                            new_hash
+                        ],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(Ok(()))
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| crate::federation::Error::Backend(format!("blackhole_upsert sqlite: {e}")))?;
+        outcome
+    }
+
+    async fn blackhole_remove(&self, identity_hash: &[u8]) -> Result<(), crate::federation::Error> {
+        crate::federation::blackhole::validate_identity_hash_len(identity_hash)?;
+        let identity_owned = identity_hash.to_vec();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "DELETE FROM blackhole_rules WHERE identity_hash = ?1",
+                [&identity_owned],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| crate::federation::Error::Backend(format!("blackhole_remove sqlite: {e}")))?;
+        Ok(())
+    }
+
+    async fn blackhole_record_hit(
+        &self,
+        identity_hash: &[u8],
+    ) -> Result<(), crate::federation::Error> {
+        crate::federation::blackhole::validate_identity_hash_len(identity_hash)?;
+        let identity_owned = identity_hash.to_vec();
+        let conn = self.conn.clone();
+        // Single-statement UPDATE; race-tolerant — silent no-op when
+        // no row matches (rows-affected == 0).
+        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE blackhole_rules SET hits = hits + 1 WHERE identity_hash = ?1",
+                [&identity_owned],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("blackhole_record_hit sqlite: {e}"))
+        })?;
+        Ok(())
+    }
+
+    async fn blackhole_prune_expired(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, crate::federation::Error> {
+        let now_str = now.to_rfc3339();
+        let conn = self.conn.clone();
+        let n = tokio::task::spawn_blocking(move || -> Result<u64, rusqlite::Error> {
+            let conn = conn.blocking_lock();
+            let affected = conn.execute(
+                "DELETE FROM blackhole_rules \
+                 WHERE until IS NOT NULL AND until < ?1",
+                [&now_str],
+            )?;
+            Ok(affected as u64)
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("blackhole_prune_expired sqlite: {e}"))
+        })?;
+        Ok(n)
+    }
+}
+
 // ─── OutboundQueue impl (v0.4.0, CIRISPersist#16) ──────────────────
 //
 // SQLite-backed durable substrate. Same logical surface as the
@@ -12313,5 +12509,184 @@ mod tests {
             res.is_err(),
             "direct-SQL bypass of trust CHECK must fail; got Ok"
         );
+    }
+
+    // ── BlackholeRules tests (v3.2.0, CIRISPersist#120) ────────────
+
+    fn id16(byte: u8) -> Vec<u8> {
+        vec![byte; 16]
+    }
+
+    #[tokio::test]
+    async fn blackhole_upsert_then_list_round_trip_sqlite() {
+        use crate::federation::BlackholeRules;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let id = id16(0xAA);
+        backend
+            .blackhole_upsert(&id, None, Some("noisy"))
+            .await
+            .unwrap();
+        let rows = backend.blackhole_list().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].identity_hash, id);
+        assert!(rows[0].until.is_none());
+        assert_eq!(rows[0].reason.as_deref(), Some("noisy"));
+        assert_eq!(rows[0].hits, 0);
+        assert!(!rows[0].persist_row_hash.is_empty());
+    }
+
+    #[tokio::test]
+    async fn blackhole_upsert_with_until_round_trip_sqlite() {
+        use crate::federation::BlackholeRules;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let id = id16(0xBB);
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        backend
+            .blackhole_upsert(&id, Some(future), Some("temp"))
+            .await
+            .unwrap();
+        let rows = backend.blackhole_list().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let stored = rows[0].until.expect("until set");
+        // RFC3339 round-trip preserves seconds; allow sub-second drift.
+        assert!(
+            (stored.timestamp_millis() - future.timestamp_millis()).abs() < 1000,
+            "stored {stored:?} != expected {future:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn blackhole_upsert_idempotent_preserves_hits_sqlite() {
+        use crate::federation::BlackholeRules;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let id = id16(0xCC);
+        backend
+            .blackhole_upsert(&id, None, Some("first"))
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            backend.blackhole_record_hit(&id).await.unwrap();
+        }
+        let before = backend.blackhole_list().await.unwrap();
+        assert_eq!(before[0].hits, 3);
+        let added_at_before = before[0].added_at;
+        backend
+            .blackhole_upsert(&id, None, Some("second"))
+            .await
+            .unwrap();
+        let after = backend.blackhole_list().await.unwrap();
+        assert_eq!(after[0].hits, 3);
+        assert_eq!(after[0].reason.as_deref(), Some("second"));
+        assert_eq!(
+            after[0].added_at.timestamp_millis(),
+            added_at_before.timestamp_millis()
+        );
+    }
+
+    #[tokio::test]
+    async fn blackhole_upsert_invalid_hash_length_rejects_sqlite() {
+        use crate::federation::BlackholeRules;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for bad in [vec![], vec![1u8; 8], vec![1u8; 15], vec![1u8; 17]] {
+            let err = backend
+                .blackhole_upsert(&bad, None, None)
+                .await
+                .expect_err("non-16 must reject");
+            assert!(
+                matches!(err, crate::federation::Error::InvalidArgument(_)),
+                "got {err:?} for len {}",
+                bad.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn blackhole_remove_unknown_silent_ok_sqlite() {
+        use crate::federation::BlackholeRules;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend.blackhole_remove(&id16(0xEE)).await.unwrap();
+        assert!(backend.blackhole_list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn blackhole_remove_idempotent_sqlite() {
+        use crate::federation::BlackholeRules;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let id = id16(0xFE);
+        backend.blackhole_upsert(&id, None, None).await.unwrap();
+        backend.blackhole_remove(&id).await.unwrap();
+        backend.blackhole_remove(&id).await.unwrap();
+        assert!(backend.blackhole_list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn blackhole_record_hit_increments_sqlite() {
+        use crate::federation::BlackholeRules;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let id = id16(0x42);
+        backend.blackhole_upsert(&id, None, None).await.unwrap();
+        for _ in 0..5 {
+            backend.blackhole_record_hit(&id).await.unwrap();
+        }
+        let rows = backend.blackhole_list().await.unwrap();
+        assert_eq!(rows[0].hits, 5);
+    }
+
+    #[tokio::test]
+    async fn blackhole_record_hit_unknown_silent_ok_sqlite() {
+        use crate::federation::BlackholeRules;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend.blackhole_record_hit(&id16(0xAB)).await.unwrap();
+        assert!(backend.blackhole_list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn blackhole_prune_expired_drops_only_expired_sqlite() {
+        use crate::federation::BlackholeRules;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let now = chrono::Utc::now();
+        let expired = id16(0x11);
+        let permanent = id16(0x22);
+        backend
+            .blackhole_upsert(&expired, Some(now - chrono::Duration::hours(1)), None)
+            .await
+            .unwrap();
+        backend
+            .blackhole_upsert(&permanent, None, None)
+            .await
+            .unwrap();
+        let dropped = backend.blackhole_prune_expired(now).await.unwrap();
+        assert_eq!(dropped, 1);
+        let rows = backend.blackhole_list().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].identity_hash, permanent);
+    }
+
+    #[tokio::test]
+    async fn blackhole_prune_expired_with_no_expired_returns_zero_sqlite() {
+        use crate::federation::BlackholeRules;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let now = chrono::Utc::now();
+        backend
+            .blackhole_upsert(&id16(0x33), None, None)
+            .await
+            .unwrap();
+        backend
+            .blackhole_upsert(&id16(0x44), Some(now + chrono::Duration::hours(1)), None)
+            .await
+            .unwrap();
+        let dropped = backend.blackhole_prune_expired(now).await.unwrap();
+        assert_eq!(dropped, 0);
+        assert_eq!(backend.blackhole_list().await.unwrap().len(), 2);
     }
 }

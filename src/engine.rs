@@ -610,6 +610,86 @@ impl Engine {
         }
     }
 
+    /// v3.2.0 (CIRISPersist#120) — Rust-tier accessor returning an
+    /// `Arc<dyn BlackholeRules>` over the Engine's underlying backend.
+    ///
+    /// Sibling to [`federation_directory`](Self::federation_directory)
+    /// — both traits live on the same connection pool, distinct
+    /// surfaces. The blackhole surface lets co-resident crates
+    /// (CIRISEdge v0.15.0's `ReticulumTransport`) call persist's
+    /// per-identity deny-list in Rust without PyO3 method dispatch.
+    ///
+    /// Cheap: clones the inner backend `Arc` once and coerces.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub fn blackhole_rules(&self) -> Arc<dyn crate::federation::BlackholeRules> {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.clone(),
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.clone(),
+        }
+    }
+
+    /// v3.2.0 (CIRISPersist#120) — list every blackhole rule. Thin
+    /// dispatch facade over
+    /// [`BlackholeRules::blackhole_list`](crate::federation::BlackholeRules::blackhole_list).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn blackhole_list(
+        &self,
+    ) -> Result<Vec<crate::federation::BlackholeRecord>, crate::federation::Error> {
+        self.blackhole_rules().blackhole_list().await
+    }
+
+    /// v3.2.0 (CIRISPersist#120) — upsert a blackhole rule. Thin
+    /// dispatch facade over
+    /// [`BlackholeRules::blackhole_upsert`](crate::federation::BlackholeRules::blackhole_upsert).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn blackhole_upsert(
+        &self,
+        identity_hash: &[u8],
+        until: Option<chrono::DateTime<chrono::Utc>>,
+        reason: Option<&str>,
+    ) -> Result<(), crate::federation::Error> {
+        self.blackhole_rules()
+            .blackhole_upsert(identity_hash, until, reason)
+            .await
+    }
+
+    /// v3.2.0 (CIRISPersist#120) — remove a blackhole rule. Thin
+    /// dispatch facade over
+    /// [`BlackholeRules::blackhole_remove`](crate::federation::BlackholeRules::blackhole_remove).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn blackhole_remove(
+        &self,
+        identity_hash: &[u8],
+    ) -> Result<(), crate::federation::Error> {
+        self.blackhole_rules().blackhole_remove(identity_hash).await
+    }
+
+    /// v3.2.0 (CIRISPersist#120) — record one hit on a blackhole
+    /// rule. Race-tolerant: silent no-op when the rule was removed
+    /// between the send-path check and this call.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn blackhole_record_hit(
+        &self,
+        identity_hash: &[u8],
+    ) -> Result<(), crate::federation::Error> {
+        self.blackhole_rules()
+            .blackhole_record_hit(identity_hash)
+            .await
+    }
+
+    /// v3.2.0 (CIRISPersist#120) — drop rules whose `until` is in the
+    /// past. Permanent rules (`until IS NULL`) are NEVER pruned.
+    /// Returns the rows-affected count.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn blackhole_prune_expired(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, crate::federation::Error> {
+        self.blackhole_rules().blackhole_prune_expired(now).await
+    }
+
     /// v2.7.0 (CIRISPersist#107) — read-only snapshot of disk + row +
     /// age across the cohabitation store.
     ///

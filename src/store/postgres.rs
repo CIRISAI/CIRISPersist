@@ -3320,6 +3320,195 @@ fn pg_row_to_trust_row(
     })
 }
 
+// ─── BlackholeRules impl (v3.2.0, CIRISPersist#120) ────────────────
+//
+// Operator-driven per-Reticulum-identity deny-list. Sibling to the
+// FederationDirectory + BlobStorage traits — different concern (a
+// transport-address deny-list, not a cryptographic-identity directory),
+// same backend pool.
+//
+// All five methods route every column read through
+// `PgRowExt::safe_get_with` (pre-commit hook bans bare `row.get(`).
+// `record_hit` is a single-statement UPDATE — no transaction wrap,
+// commutative-counter semantic (a race between two writers is
+// double-incrementing, which is the desired hot-path behavior; the
+// counter is observation, not consensus).
+
+#[async_trait::async_trait]
+impl crate::federation::BlackholeRules for PostgresBackend {
+    async fn blackhole_list(
+        &self,
+    ) -> Result<Vec<crate::federation::BlackholeRecord>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT identity_hash, until, reason, added_at, hits, persist_row_hash \
+                 FROM cirislens.blackhole_rules \
+                 ORDER BY added_at ASC",
+                &[],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("blackhole_list: {e}")))?;
+        rows.into_iter().map(pg_row_to_blackhole_record).collect()
+    }
+
+    async fn blackhole_upsert(
+        &self,
+        identity_hash: &[u8],
+        until: Option<chrono::DateTime<chrono::Utc>>,
+        reason: Option<&str>,
+    ) -> Result<(), crate::federation::Error> {
+        crate::federation::blackhole::validate_identity_hash_len(identity_hash)?;
+        let now = chrono::Utc::now();
+        // Compute the would-be `persist_row_hash` for the FRESH-insert
+        // arm (added_at = now). The conflict path recomputes against
+        // the existing row's added_at; do that inside the SQL via a
+        // RETURNING + second UPDATE? No — simpler: pre-fetch the
+        // existing added_at within the same client (no transaction
+        // needed since upserts are operator-scale, not hot-path).
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let tx = client.transaction().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("blackhole_upsert begin tx: {e}"))
+        })?;
+
+        let identity_vec = identity_hash.to_vec();
+        let existing_row = tx
+            .query_opt(
+                "SELECT added_at FROM cirislens.blackhole_rules \
+                 WHERE identity_hash = $1",
+                &[&identity_vec],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("blackhole_upsert existence: {e}"))
+            })?;
+
+        let reason_owned = reason.map(str::to_owned);
+        let added_at = match &existing_row {
+            Some(r) => r.safe_get_with("added_at", crate::federation::Error::Backend)?,
+            None => now,
+        };
+        let new_hash = crate::federation::blackhole::compute_blackhole_row_hash(
+            identity_hash,
+            &until,
+            &reason_owned,
+            &added_at,
+        )?;
+
+        if existing_row.is_some() {
+            tx.execute(
+                "UPDATE cirislens.blackhole_rules SET \
+                    until = $2, reason = $3, persist_row_hash = $4 \
+                 WHERE identity_hash = $1",
+                &[&identity_vec, &until, &reason_owned, &new_hash],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("blackhole_upsert update: {e}"))
+            })?;
+        } else {
+            tx.execute(
+                "INSERT INTO cirislens.blackhole_rules \
+                    (identity_hash, until, reason, added_at, hits, persist_row_hash) \
+                 VALUES ($1, $2, $3, $4, 0, $5)",
+                &[&identity_vec, &until, &reason_owned, &added_at, &new_hash],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("blackhole_upsert insert: {e}"))
+            })?;
+        }
+        tx.commit().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("blackhole_upsert commit: {e}"))
+        })?;
+        Ok(())
+    }
+
+    async fn blackhole_remove(&self, identity_hash: &[u8]) -> Result<(), crate::federation::Error> {
+        crate::federation::blackhole::validate_identity_hash_len(identity_hash)?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let identity_vec = identity_hash.to_vec();
+        client
+            .execute(
+                "DELETE FROM cirislens.blackhole_rules WHERE identity_hash = $1",
+                &[&identity_vec],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("blackhole_remove: {e}")))?;
+        Ok(())
+    }
+
+    async fn blackhole_record_hit(
+        &self,
+        identity_hash: &[u8],
+    ) -> Result<(), crate::federation::Error> {
+        crate::federation::blackhole::validate_identity_hash_len(identity_hash)?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let identity_vec = identity_hash.to_vec();
+        // Single-statement UPDATE; no transaction wrap. When no row
+        // exists the rows-affected count is 0 — silent no-op.
+        client
+            .execute(
+                "UPDATE cirislens.blackhole_rules \
+                 SET hits = hits + 1 \
+                 WHERE identity_hash = $1",
+                &[&identity_vec],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("blackhole_record_hit: {e}")))?;
+        Ok(())
+    }
+
+    async fn blackhole_prune_expired(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let n = client
+            .execute(
+                "DELETE FROM cirislens.blackhole_rules \
+                 WHERE until IS NOT NULL AND until < $1",
+                &[&now],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("blackhole_prune_expired: {e}"))
+            })?;
+        Ok(n)
+    }
+}
+
+/// Hydrate a `cirislens.blackhole_rules` row into a
+/// [`crate::federation::BlackholeRecord`].
+fn pg_row_to_blackhole_record(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::BlackholeRecord, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    Ok(crate::federation::BlackholeRecord {
+        identity_hash: row.safe_get_with("identity_hash", mk_err)?,
+        until: row.safe_get_with("until", mk_err)?,
+        reason: row.safe_get_with("reason", mk_err)?,
+        added_at: row.safe_get_with("added_at", mk_err)?,
+        hits: row.safe_get_with("hits", mk_err)?,
+        persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
+    })
+}
+
 // ─── OutboundQueue impl (v0.4.0, CIRISPersist#16) ──────────────────
 //
 // Postgres-backed durable substrate for CIRISEdge::send_durable().
@@ -13748,5 +13937,274 @@ mod tests {
             res.is_err(),
             "direct-SQL bypass of trust CHECK must fail; got: {res:?}"
         );
+    }
+
+    // ── BlackholeRules tests (v3.2.0, CIRISPersist#120) ────────────
+    //
+    // Each test uses a deterministically-unique 16-byte identity_hash
+    // built from `uuid_like()` so concurrent test runs (and re-runs
+    // against the persisted test DB) don't collide on PK.
+
+    fn pg_unique_id16(prefix: u8) -> Vec<u8> {
+        let tag = uuid_like();
+        let mut out = vec![prefix; 16];
+        let tag_bytes = tag.as_bytes();
+        let n = tag_bytes.len().min(15);
+        out[1..=n].copy_from_slice(&tag_bytes[..n]);
+        out
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn blackhole_upsert_then_list_round_trip_pg() {
+        use crate::federation::BlackholeRules;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let id = pg_unique_id16(0xA0);
+        backend
+            .blackhole_upsert(&id, None, Some("noisy"))
+            .await
+            .unwrap();
+        let rows = backend.blackhole_list().await.unwrap();
+        let found = rows
+            .iter()
+            .find(|r| r.identity_hash == id)
+            .expect("row landed");
+        assert!(found.until.is_none());
+        assert_eq!(found.reason.as_deref(), Some("noisy"));
+        assert_eq!(found.hits, 0);
+        assert!(!found.persist_row_hash.is_empty());
+        backend.blackhole_remove(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn blackhole_upsert_with_until_round_trip_pg() {
+        use crate::federation::BlackholeRules;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let id = pg_unique_id16(0xA1);
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        backend
+            .blackhole_upsert(&id, Some(future), Some("temp"))
+            .await
+            .unwrap();
+        let rows = backend.blackhole_list().await.unwrap();
+        let found = rows.iter().find(|r| r.identity_hash == id).unwrap();
+        let stored = found.until.unwrap();
+        assert!(
+            (stored.timestamp_millis() - future.timestamp_millis()).abs() < 1000,
+            "stored {stored:?} vs expected {future:?}"
+        );
+        backend.blackhole_remove(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn blackhole_upsert_idempotent_preserves_hits_pg() {
+        use crate::federation::BlackholeRules;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let id = pg_unique_id16(0xA2);
+        backend
+            .blackhole_upsert(&id, None, Some("first"))
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            backend.blackhole_record_hit(&id).await.unwrap();
+        }
+        let before = backend.blackhole_list().await.unwrap();
+        let before_row = before.iter().find(|r| r.identity_hash == id).unwrap();
+        assert_eq!(before_row.hits, 3);
+        let added_at_before = before_row.added_at;
+
+        backend
+            .blackhole_upsert(&id, None, Some("second"))
+            .await
+            .unwrap();
+        let after = backend.blackhole_list().await.unwrap();
+        let after_row = after.iter().find(|r| r.identity_hash == id).unwrap();
+        assert_eq!(after_row.hits, 3, "hits preserved across re-upsert");
+        assert_eq!(after_row.reason.as_deref(), Some("second"));
+        assert_eq!(
+            after_row.added_at.timestamp_millis(),
+            added_at_before.timestamp_millis(),
+            "added_at preserved"
+        );
+        backend.blackhole_remove(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn blackhole_upsert_invalid_hash_length_rejects_pg() {
+        use crate::federation::BlackholeRules;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for bad in [vec![], vec![1u8; 8], vec![1u8; 15], vec![1u8; 17]] {
+            let err = backend
+                .blackhole_upsert(&bad, None, None)
+                .await
+                .expect_err("non-16 must reject");
+            assert!(
+                matches!(err, crate::federation::Error::InvalidArgument(_)),
+                "got {err:?} for len {}",
+                bad.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn blackhole_remove_unknown_silent_ok_pg() {
+        use crate::federation::BlackholeRules;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        // Use a unique id that has NOT been upserted.
+        let id = pg_unique_id16(0xA3);
+        backend.blackhole_remove(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn blackhole_remove_idempotent_pg() {
+        use crate::federation::BlackholeRules;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let id = pg_unique_id16(0xA4);
+        backend.blackhole_upsert(&id, None, None).await.unwrap();
+        backend.blackhole_remove(&id).await.unwrap();
+        backend.blackhole_remove(&id).await.unwrap(); // 2nd call: silent ok
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn blackhole_record_hit_increments_pg() {
+        use crate::federation::BlackholeRules;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let id = pg_unique_id16(0xA5);
+        backend.blackhole_upsert(&id, None, None).await.unwrap();
+        for _ in 0..5 {
+            backend.blackhole_record_hit(&id).await.unwrap();
+        }
+        let rows = backend.blackhole_list().await.unwrap();
+        let found = rows.iter().find(|r| r.identity_hash == id).unwrap();
+        assert_eq!(found.hits, 5);
+        backend.blackhole_remove(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn blackhole_record_hit_unknown_silent_ok_pg() {
+        use crate::federation::BlackholeRules;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        // Hit a hash that has no rule. Must be silent OK.
+        backend
+            .blackhole_record_hit(&pg_unique_id16(0xA6))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn blackhole_prune_expired_drops_only_expired_pg() {
+        use crate::federation::BlackholeRules;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let now = chrono::Utc::now();
+        let expired = pg_unique_id16(0xA7);
+        let permanent = pg_unique_id16(0xA8);
+        backend
+            .blackhole_upsert(&expired, Some(now - chrono::Duration::hours(1)), None)
+            .await
+            .unwrap();
+        backend
+            .blackhole_upsert(&permanent, None, None)
+            .await
+            .unwrap();
+        let dropped = backend.blackhole_prune_expired(now).await.unwrap();
+        assert!(
+            dropped >= 1,
+            "expected at least 1 drop (this test's expired); got {dropped}"
+        );
+        let rows = backend.blackhole_list().await.unwrap();
+        assert!(
+            rows.iter().any(|r| r.identity_hash == permanent),
+            "permanent rule must remain"
+        );
+        assert!(
+            rows.iter().all(|r| r.identity_hash != expired),
+            "expired rule must be gone"
+        );
+        backend.blackhole_remove(&permanent).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn blackhole_prune_expired_with_no_expired_returns_zero_pg() {
+        use crate::federation::BlackholeRules;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        // Ensure baseline: no expired rules sneak in by pruning first.
+        backend
+            .blackhole_prune_expired(chrono::Utc::now())
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let permanent = pg_unique_id16(0xA9);
+        let future = pg_unique_id16(0xAB);
+        backend
+            .blackhole_upsert(&permanent, None, None)
+            .await
+            .unwrap();
+        backend
+            .blackhole_upsert(&future, Some(now + chrono::Duration::hours(1)), None)
+            .await
+            .unwrap();
+        let dropped = backend.blackhole_prune_expired(now).await.unwrap();
+        assert_eq!(dropped, 0, "no expired rules → zero drops");
+        backend.blackhole_remove(&permanent).await.unwrap();
+        backend.blackhole_remove(&future).await.unwrap();
     }
 }

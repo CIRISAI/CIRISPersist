@@ -3465,6 +3465,215 @@ impl PyEngine {
         })
     }
 
+    // ── v3.2.0 (CIRISPersist#120) — BlackholeRules PyO3 surface ────
+    //
+    // Bytes in / bytes out for `identity_hash` (Python `bytes`); ISO
+    // strings for timestamps; JSON-encoded list for `blackhole_list`.
+    // Errors route through `federation_err_to_py` — InvalidArgument
+    // (length-mismatched identity_hash) and Backend (DB failures) are
+    // the only outcomes; no new error variants needed.
+
+    /// Federation blackhole rules: list every rule.
+    ///
+    /// Returns a JSON string carrying a list of records — the
+    /// [`crate::federation::BlackholeRecord`] shape (with
+    /// `identity_hash` rendered as a base64-standard-alphabet string
+    /// via `serde_bytes` for wire efficiency vs. an array of integers).
+    fn blackhole_list_json(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(|| match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlackholeRules;
+                        let rows = backend
+                            .blackhole_list()
+                            .await
+                            .map_err(federation_err_to_py)?;
+                        serde_json::to_string(&rows).map_err(|e| {
+                            PyRuntimeError::new_err(format!("blackhole_list_json encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlackholeRules;
+                        let rows = backend
+                            .blackhole_list()
+                            .await
+                            .map_err(federation_err_to_py)?;
+                        serde_json::to_string(&rows).map_err(|e| {
+                            PyRuntimeError::new_err(format!("blackhole_list_json encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// Federation blackhole rules: insert or revise a rule.
+    ///
+    /// `identity_hash` MUST be exactly 16 bytes (Reticulum identity
+    /// hash); non-conforming lengths raise `ValueError` with the
+    /// `federation_invalid_argument` kind token. `until_iso` is an
+    /// optional RFC3339 timestamp (`None` = permanent rule); `reason`
+    /// is an operator-readable annotation.
+    ///
+    /// On conflict: `until` + `reason` are overwritten; `hits` +
+    /// `added_at` are preserved.
+    fn blackhole_upsert(
+        &self,
+        py: Python<'_>,
+        identity_hash: &[u8],
+        until_iso: Option<&str>,
+        reason: Option<&str>,
+    ) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let identity_owned = identity_hash.to_vec();
+            let reason_owned = reason.map(str::to_owned);
+            let until = match until_iso {
+                Some(s) => Some(
+                    chrono::DateTime::parse_from_rfc3339(s)
+                        .map(|t| t.with_timezone(&chrono::Utc))
+                        .map_err(|e| PyValueError::new_err(format!("until_iso parse: {e}")))?,
+                ),
+                None => None,
+            };
+            py.detach(|| match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlackholeRules;
+                        backend
+                            .blackhole_upsert(&identity_owned, until, reason_owned.as_deref())
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlackholeRules;
+                        backend
+                            .blackhole_upsert(&identity_owned, until, reason_owned.as_deref())
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
+    /// Federation blackhole rules: drop a rule. Silent no-op when the
+    /// identity isn't in the table (POSIX `rm -f` ergonomics).
+    fn blackhole_remove(&self, py: Python<'_>, identity_hash: &[u8]) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let identity_owned = identity_hash.to_vec();
+            py.detach(|| match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlackholeRules;
+                        backend
+                            .blackhole_remove(&identity_owned)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlackholeRules;
+                        backend
+                            .blackhole_remove(&identity_owned)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
+    /// Federation blackhole rules: increment the hit counter for a
+    /// rule. Race-tolerant: silent no-op when no rule exists for
+    /// `identity_hash`.
+    fn blackhole_record_hit(&self, py: Python<'_>, identity_hash: &[u8]) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let identity_owned = identity_hash.to_vec();
+            py.detach(|| match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlackholeRules;
+                        backend
+                            .blackhole_record_hit(&identity_owned)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlackholeRules;
+                        backend
+                            .blackhole_record_hit(&identity_owned)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
+    /// Federation blackhole rules: drop every rule whose `until` is
+    /// in the past relative to `now_iso`. Permanent rules (`until IS
+    /// NULL`) are NEVER pruned. Returns the rows-affected count.
+    fn blackhole_prune_expired_iso(&self, py: Python<'_>, now_iso: &str) -> PyResult<u64> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let now = chrono::DateTime::parse_from_rfc3339(now_iso)
+                .map(|t| t.with_timezone(&chrono::Utc))
+                .map_err(|e| PyValueError::new_err(format!("now_iso parse: {e}")))?;
+            py.detach(|| match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlackholeRules;
+                        backend
+                            .blackhole_prune_expired(now)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlackholeRules;
+                        backend
+                            .blackhole_prune_expired(now)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
     // ── v2.3 (CIRISPersist#103) — BlobStorage PyO3 surface ─────────
     //
     // JSON in / JSON out. Inline bytes ride the wire as base64
