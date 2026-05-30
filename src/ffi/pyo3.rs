@@ -9904,7 +9904,7 @@ impl PyEngine {
         })
     }
 
-    /// v3.6.0 (CIRISPersist#134) — emit a `withdraws` attestation
+    /// v3.6.0 (CIRISPersist#134) — emit a `supersedes` Contribution
     /// against every prior `key_grant` Contribution issued by
     /// `actor_key_id`. Uses the engine's composed signer; the
     /// supersession Contributions carry the prior contribution_ids in
