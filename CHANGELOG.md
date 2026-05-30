@@ -5,6 +5,25 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.6.6] — 2026-05-30
+
+**CIRISPersist 3.6.6 — CI-only release: restore build-manifest hard-gate + adapt to M-of-N steward-key shape.**
+
+No Rust changes. Functionally identical to v3.6.5; consumers can re-pin if they want the registered BuildManifest round-trip.
+
+### Why this release exists
+
+v3.6.5 shipped to PyPI while the CIRISRegistry was 503'ing — the `build-manifest` job was `continue-on-error: true` (v2.5.0 stopgap from when the hybrid-signing secrets weren't configured), so the publish proceeded anyway. The PyPI artifact is fine; what's missing is the `/v1/builds/<v>?project=ciris-persist` round-trip consumers use to verify the wheel.
+
+Two CI fixes ship in this cut:
+
+1. **`build-manifest` is a hard gate again** — `continue-on-error` removed; the job re-added to `publish-pypi`'s `needs` list. A registry outage or manifest failure now blocks PyPI publish, preserving the cryptographic-root-of-trust posture.
+2. **Steward-key parse adapts to M-of-N shape** — CIRISRegistry shipped the M-of-N steward rotation (per CIRISVerify#31). The new `/v1/steward-key` returns `{stewards: [{region, key_id, deployed, ...}], verification_policy: {threshold, of_total, scheme}}` instead of the old `{classical: {key_id, ...}, pqc: {...}}`. CI now picks the first deployed steward's key_id for the step-summary surfacing, and additionally records the M-of-N policy line.
+
+### Why a version bump instead of rerunning v3.6.5
+
+GitHub Actions reruns use the workflow file at the original ref's commit. Rerunning v3.6.5's tag CI would re-run the broken parse step. A new tag is the simplest way to get a manifest-registered ship under the new posture.
+
 ## [3.6.5] — 2026-05-30
 
 **CIRISPersist 3.6.5 — `put_blob_signing` PyO3 hot-path: prefer in-memory local signer (~1000× speedup, #137).**
