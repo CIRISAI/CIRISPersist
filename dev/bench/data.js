@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780097425571,
+  "lastUpdate": 1780101632096,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -40223,6 +40223,288 @@ window.BENCHMARK_DATA = {
             "name": "storage_floor/next_sequence_full",
             "value": 729,
             "range": "± 69",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "380f23cb7b95faac2a50aea220e7d12c97cbabee",
+          "message": "3.5.2 — RCA triple-close: #132 libsqlite3 cross-cdylib SIGSEGV + #130 list_local_holders (corrected) + #128 av26 schema-wipe race\n\nThree issues blocking CIRISEdge v1.0 RC, each with a real root cause +\nstructural fix rather than a workaround.\n\n#132 (libsqlite3 cross-cdylib SIGSEGV): Cargo.toml `bundled` is now\nAndroid-only. Linux/macOS/Windows/iOS link dynamically against the\nplatform's libsqlite3 → ONE library instance shared across cdylibs via\ndlopen, ONE initialization, ONE allocator. Same posture iOS already\nused (CIRISVerify v1.6.4 libRPAC fix); generalized to all desktops.\nAndroid keeps bundled (NDK libsqlite3 not guaranteed across vendors).\nCIRISEdge#50 SIGSEGV closed structurally — affects every blanket-impl\ntrait edge consumes (OutboundQueue, VerifyDirectory, RootingDirectory,\nEdgeDetectionAdmission, BlackholeRules).\n\n#130 (corrected from withdrawn v3.5.1): v3.5.1 bypassed CEG §10.1.2\nTTL in list_holders when blob locally held, breaking 2 pre-existing\ntests. CI matrix all-red, never reached PyPI. v3.5.2 reverts and\nintroduces a separate `list_local_holders` API + PyO3 mirror that\ngates on federation_blobs presence and skips TTL (withdraws filter\npreserved). Federation-discovery semantic in list_holders preserved\nexactly; local-truth in the new method. 5 new tests (3 sqlite + 2 PG).\n\n#128 (real root cause): tests/qa_harness.rs::av26_concurrent_boot_\nadvisory_lock does DROP SCHEMA cirislens CASCADE to simulate cold-\nstart. The #[serial_test::serial(postgres)] annotation only\nserializes within a process — nextest spawns one process per test\nso the annotation was a cross-process no-op. While av26 ran, every\nother PG test saw \"relation cirislens.* does not exist\". Diagnosed\nvia a fail-path-only diagnostic in pg_cleanup_tenant_merkle that\ncaptures the schema state at panic boundary + a Debug-format upgrade\non merkle_store::pg_storage_err (was Display = \"db error\"). RCA\noutput: \"cirislens merkle tables: []\", schema_history not readable.\nFix: added av26 to the postgres test-group filter; max-threads=1\ngives cross-process serialization. 3-run gauntlet: 951/951 every run.\n\nCarry-forward from withdrawn v3.5.1: #129 trust_scoring_capsule\nunchanged.\n\nDiagnostic instrumentation left in tree on both sites — zero-cost on\nsuccess path, captures rich snapshot on failure. Future #128-class\nissues debugged in minutes not hours.",
+          "timestamp": "2026-05-29T19:20:25-05:00",
+          "tree_id": "b848c9e5e582056662ad16c4e81724ab3acc019e",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/380f23cb7b95faac2a50aea220e7d12c97cbabee"
+        },
+        "date": 1780101630492,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 40425206,
+            "range": "± 293797",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 3448497,
+            "range": "± 98871",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 2750,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 6257,
+            "range": "± 247",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 13281,
+            "range": "± 46",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 46353,
+            "range": "± 564",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 35,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 203,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 522,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 598,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 2065,
+            "range": "± 82",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 9,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 74,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 236,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 1045,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 15,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 58266,
+            "range": "± 4907",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 164313,
+            "range": "± 2621",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 587224,
+            "range": "± 19778",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 6842,
+            "range": "± 593",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 8778,
+            "range": "± 793",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 16830,
+            "range": "± 917",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 46587,
+            "range": "± 1954",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 788418,
+            "range": "± 5557",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 3240454,
+            "range": "± 24367",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 162190,
+            "range": "± 8284",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 585952,
+            "range": "± 32044",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 30899506,
+            "range": "± 260597",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 1145113,
+            "range": "± 55088",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 5242273,
+            "range": "± 81611",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 77047217,
+            "range": "± 319463",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 3226562,
+            "range": "± 232933",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 13660624,
+            "range": "± 330526",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 63133,
+            "range": "± 6413",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 51489,
+            "range": "± 6162",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 16413,
+            "range": "± 1487",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 49498,
+            "range": "± 1334",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 371549,
+            "range": "± 3008",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 1,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 656,
+            "range": "± 62",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 98,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 1161,
+            "range": "± 112",
             "unit": "ns/iter"
           }
         ]
