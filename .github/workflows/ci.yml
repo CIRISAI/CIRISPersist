@@ -693,9 +693,18 @@ jobs:
       # v1.10.0 (CIRISPersist#87) — libtss2 for the `tpm` keyring
       # feature on the Linux wheel builds. macOS wheels build the
       # base keyring (no tss-esapi), so this step is Linux-only.
-      - name: install libtss2-dev (TPM build dep)
+      #
+      # v3.5.3 (CIRISPersist#133) — libsqlite3-dev for the dynamic
+      # libsqlite3 link. v3.5.2 narrowed the `bundled` rusqlite feature
+      # to Android-only, but the Linux wheel-build runner had no
+      # libsqlite3-dev installed so `pkg-config --libs sqlite3` failed
+      # and the wheel still ended up with libsqlite3 statically embedded.
+      # That defeated #132's cross-cdylib SIGSEGV fix at the wheel tier
+      # (CIRISEdge#50 still SEGV against the v3.5.2 wheel). The
+      # post-build `readelf` gate below catches any future regression.
+      - name: install libtss2-dev + libsqlite3-dev (TPM + SQLite build deps)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libtss2-dev
+        run: sudo apt-get update && sudo apt-get install -y libtss2-dev libsqlite3-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
@@ -713,6 +722,68 @@ jobs:
           done
       - name: maturin build
         run: maturin build --release --strip
+      # v3.5.3 (CIRISPersist#133) — wheel-tier libsqlite3 dynamic-link
+      # verification. The source-tier #132 fix (Cargo.toml target-
+      # narrowed `bundled`) requires libsqlite3-dev present at build
+      # time so pkg-config succeeds. If pkg-config fails or any
+      # transitive dep re-enables `bundled`, the wheel ends up with
+      # libsqlite3 statically embedded and the cross-cdylib SIGSEGV
+      # class returns. Reject any wheel that doesn't have libsqlite3
+      # as a NEEDED entry OR as an auditwheel sidecar.
+      #
+      # Android wheels are produced by a different job (not this matrix)
+      # and intentionally bundle — skip them here.
+      - name: verify wheel links libsqlite3 dynamically (Linux/macOS)
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for whl in target/wheels/*.whl; do
+            echo "::group::Inspect $whl"
+            # Extract the .so/.dylib to a temp file (cdylib filename is stable: ciris_persist.abi3.so / .abi3.dylib).
+            tmpdir=$(mktemp -d)
+            unzip -qq "$whl" -d "$tmpdir"
+            so=$(find "$tmpdir" -maxdepth 4 \( -name '*.abi3.so' -o -name '*.abi3.dylib' \) | head -1)
+            if [ -z "$so" ]; then
+              echo "::error::No abi3 cdylib found inside $whl"
+              ls -la "$tmpdir"
+              exit 1
+            fi
+            echo "Inspecting cdylib: $so"
+            if [ "$RUNNER_OS" = "Linux" ]; then
+              needed_libs=$(readelf -d "$so" | awk '/NEEDED/ {print}')
+              echo "NEEDED entries:"
+              echo "$needed_libs"
+              if echo "$needed_libs" | grep -q 'libsqlite3'; then
+                echo "✓ $whl links libsqlite3 dynamically (NEEDED entry present)"
+              else
+                # auditwheel may bundle libsqlite3 into a sidecar — check.
+                sidecar=$(find "$tmpdir" -path '*.libs/*libsqlite3*' | head -1)
+                if [ -n "$sidecar" ]; then
+                  echo "✓ $whl carries libsqlite3 via auditwheel sidecar: $sidecar"
+                else
+                  echo "::error::$whl is missing libsqlite3 NEEDED entry AND auditwheel sidecar"
+                  echo "::error::This means `bundled` is still effective; the cross-cdylib SIGSEGV class (CIRISEdge#50) returns"
+                  echo "::error::Check that libsqlite3-dev is installed AND no transitive dep re-enables rusqlite/bundled"
+                  exit 1
+                fi
+              fi
+            else
+              # macOS: otool -L lists dynamic deps.
+              loaded=$(otool -L "$so")
+              echo "Dynamic deps:"
+              echo "$loaded"
+              if echo "$loaded" | grep -q 'libsqlite3'; then
+                echo "✓ $whl links libsqlite3 dynamically"
+              else
+                echo "::error::$whl is missing libsqlite3 dynamic link on macOS"
+                echo "::error::Check that no transitive dep re-enables rusqlite/bundled"
+                exit 1
+              fi
+            fi
+            rm -rf "$tmpdir"
+            echo "::endgroup::"
+          done
       - name: confirm wheel shape
         # Reject anything that isn't cp310-abi3 — the v0.1.10 regression
         # showed mixed-mode maturin can silently emit cp31N-cp31N

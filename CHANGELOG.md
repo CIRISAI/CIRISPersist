@@ -5,6 +5,55 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.5.3] — 2026-05-29
+
+**CIRISPersist 3.5.3 — wheel-tier completion of #132 (#133): CIRISVerify v4.3.0 pin + libsqlite3-dev in CI + readelf verification gate.**
+
+v3.5.2 narrowed the `rusqlite/bundled` feature to Android-only at the source tier (`Cargo.toml`), but the published PyPI wheel **still had libsqlite3 statically embedded**. CIRISEdge#50 SIGSEGV still fired against the v3.5.2 wheel. Two reasons:
+
+1. **`ciris-verify-core` (v4.2.0 and earlier) hardcoded `rusqlite = { features = ["bundled"] }`** at both the workspace root and a target-conditional override matching every non-iOS target. The transitive feature activation defeated persist's target-narrowed override per cargo's feature-union semantics (you can't UN-enable a feature once any dep activates it).
+2. **The Linux wheel-build runner had no `libsqlite3-dev` installed**, so even if the source-tier fix had worked end-to-end, `pkg-config --libs sqlite3` would have failed, leaving `libsqlite3-sys` no way to find a system libsqlite3.
+
+### What v3.5.3 lands
+
+**1. CIRISVerify pin bump v4.2.0 → v4.3.0.** All 6 pin sites (base `ciris-keyring` / `ciris-verify-core` / `ciris-crypto` + the three per-target `[target.*]` tables for Linux TPM / iOS / Android). pyproject.toml `Requires-Dist`: `ciris-verify>=4.2.0,<5` → `>=4.3.0,<5`. CIRISVerify v4.3.0 removes `rusqlite/bundled` at workspace root and narrows the verify-core override to Android-only — the same posture v3.5.2 adopted in persist.
+
+After the pin bump, `cargo tree -e features --invert libsqlite3-sys` confirms `bundled` is GONE from the persist feature graph: only `pkg-config` / `vcpkg` / `min_sqlite_version_3_14_0` remain. libsqlite3-sys looks for the system library at link time.
+
+**2. Linux wheel-build CI installs `libsqlite3-dev`.** The existing `libtss2-dev` install step (added v1.10.0 for the TPM keyring) now also installs `libsqlite3-dev`. With that in place, `pkg-config --libs sqlite3` succeeds and the wheel links dynamically against the system libsqlite3.
+
+**3. Post-build `readelf` verification gate.** New CI step rejects any wheel that doesn't have `libsqlite3` as a NEEDED entry (Linux) OR as a dynamic-link entry via `otool -L` (macOS) OR as an auditwheel sidecar in `<wheel>.libs/`. Any future regression where someone re-enables `bundled` transitively gets caught at the wheel-build job, not after PyPI publish.
+
+```bash
+# Linux
+needed_libs=$(readelf -d "$so" | awk '/NEEDED/ {print}')
+if echo "$needed_libs" | grep -q 'libsqlite3'; then
+    echo "✓ links libsqlite3 dynamically (NEEDED entry present)"
+else
+    # auditwheel sidecar fallback acceptable too
+    sidecar=$(find ... -path '*.libs/*libsqlite3*' | head -1)
+    [ -n "$sidecar" ] || { echo "FAIL: bundled effective"; exit 1; }
+fi
+
+# macOS
+otool -L "$so" | grep -q 'libsqlite3' || { echo "FAIL"; exit 1; }
+```
+
+Android wheels are built in a separate job (not this matrix) and are EXPECTED to bundle — the verification gate skips them.
+
+### What's structurally closed
+
+CIRISEdge#50 cross-cdylib SIGSEGV is now closed at BOTH tiers:
+- **Source tier** (v3.5.2): persist's Cargo.toml + CIRISVerify v4.3.0's Cargo.toml narrowed `bundled` to Android-only.
+- **Wheel tier** (v3.5.3): manylinux runner has `libsqlite3-dev`; build resolves system libsqlite3; readelf gate catches any regression.
+
+The cross-cdylib invariant: `ciris-persist.so` and `ciris-edge.so` (and any future cohabitation consumer wheel) all dlopen the SAME `libsqlite3.so.0` → ONE library instance shared across cdylibs → no NULL `xMalloc` indirection → no SIGSEGV on `OutboundQueue::enqueue_outbound`, no SIGSEGV on `VerifyDirectory`, `RootingDirectory`, `EdgeDetectionAdmission`, `BlackholeRules`, or any other blanket-impl trait.
+
+### Mission citations
+
+- §1.6 fail-honest — v3.5.2's CI passed but the published wheel silently bundled libsqlite3. The new readelf gate makes that class of silent regression impossible to ship in the future.
+- §1.3 lowest-stateful-library — closes the cohabitation trap that prevented edge from pinning persist. Edge v1.0 RC unblocked at the wheel tier.
+
 ## [3.5.2] — 2026-05-29
 
 **CIRISPersist 3.5.2 — RCA-driven triple-close: #132 libsqlite3 cross-cdylib SIGSEGV (blocks CIRISEdge v1.0 RC) + #130 `list_local_holders` (corrected) + #128 av26 schema-wipe race (real root cause found).**
