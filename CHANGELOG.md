@@ -5,7 +5,36 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [3.6.0] — 2026-05-30
+## [3.6.1] — 2026-05-30
+
+**CIRISPersist 3.6.1 — wheel-CI gate fix (the gate from v3.5.3 / #133 was over-strict for the CIRISVerify v4.4.x posture and blocked v3.5.4 + v3.6.0 from PyPI).**
+
+The `readelf`/`otool` verification gate added in v3.5.3 to catch bundled-libsqlite3 regressions ran on Linux AND macOS. CIRISVerify v4.4.x intentionally bundles libsqlite3 on macOS + Windows + Android (the cross-cdylib SIGSEGV is a Linux-specific symbol-merging issue; bundled is the conventional posture on the other platforms). Persist's darwin-aarch64 wheel inherits bundled from verify transitively — expected and correct.
+
+The gate's macOS branch rejected this intentional bundled posture. Result: v3.5.4 + v3.6.0 both failed the darwin wheel job + skipped PyPI publish.
+
+### Fix
+
+The gate is now **Linux-only**:
+
+- Linux: verify `libsqlite3` is a NEEDED entry OR an auditwheel sidecar (the SIGSEGV-protective discipline).
+- macOS / Windows / Android: gate is skipped. These platforms are expected to bundle per CIRISVerify v4.4.x posture.
+
+### Carry-forward from withdrawn v3.6.0 (the entire monolith)
+
+v3.6.0's CHANGELOG body (below) describes the #134 multimedia tier substrate. **All of it ships in v3.6.1.** v3.6.0 main never pushed; the tag was created but never reached PyPI. v3.6.1 is the actually-published cut of the #134 work.
+
+### Carry-forward from withdrawn v3.5.4
+
+v3.5.4's verify v4.4.2 pin bump is included in v3.6.1 (same pin). v3.5.4 main was pushed but the tag never reached PyPI for the same darwin gate reason. v3.6.1 supersedes both 3.5.4 and 3.6.0 for CIRISEdge v1.0 RC pinning.
+
+## [3.6.0] — 2026-05-30 — **DID NOT REACH PYPI**
+
+v3.6.0 tag CI failed at the darwin-aarch64 wheel job because the v3.5.3 readelf gate was over-strict for verify v4.4.x's macOS-bundled posture. **v3.6.1 carries the entire v3.6.0 #134 work + the gate fix.**
+
+The v3.6.0 changelog body below describes the design intent; the actually-shipped behavior is in v3.6.1.
+
+---
 
 **CIRISPersist 3.6 — multimedia tier substrate (#134 / MEDIA_SHARING.md / CEG 0.3 §5.6.8 + §8.1.10 + §11.4 + §11.5).**
 

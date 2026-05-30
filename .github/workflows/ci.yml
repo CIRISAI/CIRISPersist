@@ -731,53 +731,51 @@ jobs:
       # class returns. Reject any wheel that doesn't have libsqlite3
       # as a NEEDED entry OR as an auditwheel sidecar.
       #
+      # v3.6.1 (CIRISPersist#133 follow-up) — gate is LINUX-ONLY.
+      # The cross-cdylib SIGSEGV (CIRISEdge#50) is a Linux-specific
+      # symbol-merging issue. CIRISVerify v4.4.x intentionally bundles
+      # libsqlite3 on macOS + Windows + Android (no symbol-merging
+      # exposure on those platforms; bundled is the conventional
+      # posture) and only stays dynamic on Linux + iOS where the
+      # cohabitation cdylib pattern actually trips. Persist's darwin
+      # wheel inherits bundled from verify transitively — that's
+      # expected and correct. Running the readelf gate on macOS rejects
+      # the intentional bundled posture and is wrong; v3.5.4 + v3.6.0
+      # both failed PyPI publish for exactly this reason. The gate is
+      # now Linux-only.
+      #
       # Android wheels are produced by a different job (not this matrix)
       # and intentionally bundle — skip them here.
-      - name: verify wheel links libsqlite3 dynamically (Linux/macOS)
-        if: runner.os == 'Linux' || runner.os == 'macOS'
+      - name: verify wheel links libsqlite3 dynamically (Linux only)
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
           for whl in target/wheels/*.whl; do
             echo "::group::Inspect $whl"
-            # Extract the .so/.dylib to a temp file (cdylib filename is stable: ciris_persist.abi3.so / .abi3.dylib).
             tmpdir=$(mktemp -d)
             unzip -qq "$whl" -d "$tmpdir"
-            so=$(find "$tmpdir" -maxdepth 4 \( -name '*.abi3.so' -o -name '*.abi3.dylib' \) | head -1)
+            so=$(find "$tmpdir" -maxdepth 4 -name '*.abi3.so' | head -1)
             if [ -z "$so" ]; then
               echo "::error::No abi3 cdylib found inside $whl"
               ls -la "$tmpdir"
               exit 1
             fi
             echo "Inspecting cdylib: $so"
-            if [ "$RUNNER_OS" = "Linux" ]; then
-              needed_libs=$(readelf -d "$so" | awk '/NEEDED/ {print}')
-              echo "NEEDED entries:"
-              echo "$needed_libs"
-              if echo "$needed_libs" | grep -q 'libsqlite3'; then
-                echo "✓ $whl links libsqlite3 dynamically (NEEDED entry present)"
-              else
-                # auditwheel may bundle libsqlite3 into a sidecar — check.
-                sidecar=$(find "$tmpdir" -path '*.libs/*libsqlite3*' | head -1)
-                if [ -n "$sidecar" ]; then
-                  echo "✓ $whl carries libsqlite3 via auditwheel sidecar: $sidecar"
-                else
-                  echo "::error::$whl is missing libsqlite3 NEEDED entry AND auditwheel sidecar"
-                  echo "::error::This means `bundled` is still effective; the cross-cdylib SIGSEGV class (CIRISEdge#50) returns"
-                  echo "::error::Check that libsqlite3-dev is installed AND no transitive dep re-enables rusqlite/bundled"
-                  exit 1
-                fi
-              fi
+            needed_libs=$(readelf -d "$so" | awk '/NEEDED/ {print}')
+            echo "NEEDED entries:"
+            echo "$needed_libs"
+            if echo "$needed_libs" | grep -q 'libsqlite3'; then
+              echo "✓ $whl links libsqlite3 dynamically (NEEDED entry present)"
             else
-              # macOS: otool -L lists dynamic deps.
-              loaded=$(otool -L "$so")
-              echo "Dynamic deps:"
-              echo "$loaded"
-              if echo "$loaded" | grep -q 'libsqlite3'; then
-                echo "✓ $whl links libsqlite3 dynamically"
+              # auditwheel may bundle libsqlite3 into a sidecar — check.
+              sidecar=$(find "$tmpdir" -path '*.libs/*libsqlite3*' | head -1)
+              if [ -n "$sidecar" ]; then
+                echo "✓ $whl carries libsqlite3 via auditwheel sidecar: $sidecar"
               else
-                echo "::error::$whl is missing libsqlite3 dynamic link on macOS"
-                echo "::error::Check that no transitive dep re-enables rusqlite/bundled"
+                echo "::error::$whl is missing libsqlite3 NEEDED entry AND auditwheel sidecar"
+                echo "::error::This means `bundled` is still effective on Linux; the cross-cdylib SIGSEGV class (CIRISEdge#50) returns"
+                echo "::error::Check that libsqlite3-dev is installed AND no transitive dep re-enables rusqlite/bundled"
                 exit 1
               fi
             fi
