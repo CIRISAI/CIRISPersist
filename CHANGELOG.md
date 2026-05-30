@@ -5,6 +5,30 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.6.8] — 2026-05-30
+
+**CIRISPersist 3.6.8 — local-signer fast-path extended to all sign-emitting PyO3 surfaces (#138, #140).**
+
+### Fixes
+
+**#140 (darwin CI evict_actor regression)** — `PyEngine::evict_actor_json` hardcoded `self.signer.clone()`. In headless macOS CI runners the platform keyring (Security framework → Keychain) isn't unlocked, so `signer.sign()` failed for every holds_bytes withdraws emission → `withdraws_failed == blobs_evicted` instead of `withdraws_emitted == blobs_evicted`. Linux × {sqlite,postgres} passed because the Linux platform signer (dbus → libsecret) was reachable. The local-signer fast-path bypasses the platform IPC entirely when the caller-supplied `attesting_key_id` matches the engine's local alias.
+
+**#138 (audit follow-up for #137)** — generalized the v3.6.5 `put_blob_signing` fix into a shared `select_signer(attesting_key_id)` helper on `PyEngine`. Same pattern applied to every sign-emitting PyO3 method:
+
+| Site | Trigger key |
+|---|---|
+| `put_blob_signing` | `attesting_key_id` arg |
+| `evict_actor_json` | `attesting_key_id` arg |
+| `cirisnode_process_takedown_admission_json` | `signer_key_id` arg |
+| `cirisnode_retire_key_grants_json` | `actor_key_id` arg |
+| `receive_and_persist` | `self.signer_key_id` |
+
+Left as-is (explicit-intent platform-signer surfaces): `public_key`, `sign` (caller wants the platform keyring's deployment key by contract).
+
+### #139 — separately investigated; NOT a persist regression
+
+The user filed #139 against v3.6.5 claiming `send_durable_inline_text` hangs under postgres with a `'no reactor running'` panic. The diff v3.6.3 → v3.6.5 only touched `list_holders` (TTL bypass) and `put_blob_signing` (signer fast-path) — neither touches the outbound queue, tokio runtime, or sqlx pool. Direct repro of persist's `enqueue_outbound` PyO3 surface against postgres at v3.6.7+ runs cleanly: 10 rounds of interleaved `put_blob_signing` + `enqueue_outbound` complete without hang or panic. The hang is in CIRISEdge's `send_durable_inline_text` path, not persist's. Filing comment on #139 to redirect investigation to edge.
+
 ## [3.6.7] — 2026-05-30
 
 **CIRISPersist 3.6.7 — CI-only re-roll of v3.6.6 (shell-escape bug in the v3.6.6 steward-key parse).**

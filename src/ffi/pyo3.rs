@@ -706,6 +706,38 @@ impl PyEngine {
         }
         Ok(())
     }
+
+    /// v3.6.8 (CIRISPersist#138, #140) — select the signer for a
+    /// PyO3 sign-emitting method based on the caller-supplied
+    /// `attesting_key_id`.
+    ///
+    /// When the alias matches the engine's in-memory local signer
+    /// (loaded from `local_key_path` at Engine construction), return
+    /// a `LocalSignerHardwareAdapter` over it — Ed25519 signs in
+    /// ~14µs, no IPC. Otherwise return `self.signer` — the platform
+    /// keyring `HardwareSigner` (dbus / Keychain / TPM / etc.).
+    ///
+    /// Closes two real problems:
+    /// 1. The 80ms-per-call dbus overhead on Linux desktops that
+    ///    CIRISConformance surfaced in #137 (originally fixed for
+    ///    `put_blob_signing` only).
+    /// 2. The headless-darwin `Keychain not unlocked` failure mode
+    ///    that CIRISConformance #140 surfaced for `evict_actor_json`
+    ///    — when the platform signer can't reach the keychain, every
+    ///    holds_bytes withdraws emission fails; the local-signer
+    ///    fast-path bypasses that entirely when applicable.
+    fn select_signer(&self, attesting_key_id: &str) -> Arc<dyn ciris_keyring::HardwareSigner> {
+        match self
+            .local_signer
+            .as_ref()
+            .filter(|ls| ls.key_id() == attesting_key_id)
+        {
+            Some(local) => Arc::new(crate::signing::LocalSignerHardwareAdapter::new(
+                local.clone(),
+            )),
+            None => self.signer.clone(),
+        }
+    }
 }
 
 #[pymethods]
@@ -2390,8 +2422,13 @@ impl PyEngine {
         catch_panic(|| {
             let bytes = body.as_bytes().to_vec();
             let scrubber = self.scrubber.clone();
-            let signer = self.signer.clone();
             let signer_key_id = self.signer_key_id.clone();
+            // v3.6.8 (CIRISPersist#138) — local-signer fast-path. The
+            // ingest pipeline signs every received envelope with the
+            // engine's identity (`self.signer_key_id`); when that
+            // matches the local alias, the in-memory adapter cuts
+            // sign overhead from ~80ms (dbus) to ~14µs.
+            let signer = self.select_signer(&signer_key_id);
             let runtime = self.runtime.clone();
             let verify_mode = if pre_verified {
                 crate::ingest::VerifyMode::TrustPreVerified
@@ -4283,7 +4320,11 @@ impl PyEngine {
             let now = chrono::DateTime::parse_from_rfc3339(now_iso)
                 .map_err(|e| PyValueError::new_err(format!("evict_actor now_iso parse: {e}")))?
                 .with_timezone(&chrono::Utc);
-            let signer = self.signer.clone();
+            // v3.6.8 (CIRISPersist#140) — local-signer fast-path. The
+            // headless-darwin CI failure mode for `evict_actor` (Keychain
+            // not unlocked → withdraws_failed equals blobs_evicted) was
+            // the trigger; same shape as #137 for put_blob_signing.
+            let signer = self.select_signer(&actor);
             py.detach(move || match &self.backend {
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
@@ -4412,28 +4453,10 @@ impl PyEngine {
                 PyValueError::new_err(format!("put_blob_signing attestation_id_uuid parse: {e}"))
             })?;
 
-            // v3.6.5 (CIRISPersist#137) — prefer the in-memory local
-            // signer for the put_blob_signing hot path when its alias
-            // matches the caller-supplied `attesting_key_id`. The
-            // platform keyring signer (`self.signer`) goes through
-            // dbus/libsecret on Linux desktops, adding ~80ms per
-            // sign() call — the single largest fixed cost in the
-            // Python boundary's blob-ingest path. The local signer
-            // holds the Ed25519 secret in process memory and signs in
-            // ~14µs. When `attesting_key_id` doesn't match either
-            // signer's alias we fall back to `self.signer` — that
-            // path is unchanged.
+            // v3.6.5 (CIRISPersist#137), generalized in v3.6.8 (#138,
+            // #140) to a shared `select_signer` helper.
             let attesting_key_id_owned = attesting_key_id.to_string();
-            let signer: Arc<dyn HardwareSigner> = match self
-                .local_signer
-                .as_ref()
-                .filter(|ls| ls.key_id() == attesting_key_id_owned.as_str())
-            {
-                Some(local) => Arc::new(crate::signing::LocalSignerHardwareAdapter::new(
-                    local.clone(),
-                )),
-                None => self.signer.clone(),
-            };
+            let signer = self.select_signer(&attesting_key_id_owned);
             let media_type_owned = media_type.map(str::to_owned);
 
             py.detach(move || match &self.backend {
@@ -9948,7 +9971,10 @@ impl PyEngine {
                     PyValueError::new_err(format!("retire_key_grants now_iso parse: {e}"))
                 })?
                 .with_timezone(&chrono::Utc);
-            let signer = self.signer.clone();
+            // v3.6.8 (CIRISPersist#138) — local-signer fast-path. The
+            // actor_key_id IS the signing key for the supersedes
+            // emission; match it against the local alias.
+            let signer = self.select_signer(&actor);
             py.detach(move || match &self.backend {
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
@@ -10021,7 +10047,9 @@ impl PyEngine {
                     PyValueError::new_err(format!("process_takedown_admission now_iso parse: {e}"))
                 })?
                 .with_timezone(&chrono::Utc);
-            let signer = self.signer.clone();
+            // v3.6.8 (CIRISPersist#138) — local-signer fast-path; the
+            // takedown handler emits withdraws signed by `signer_key_id`.
+            let signer = self.select_signer(&signer_kid);
             let cfg_snapshot = self
                 .multimedia_config
                 .read()
