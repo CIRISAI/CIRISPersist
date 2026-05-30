@@ -41,6 +41,7 @@ pub mod blobs;
 pub mod emit;
 pub mod goal;
 pub mod hardware_attestation;
+pub mod perceptual_hash;
 pub mod precedence;
 #[cfg(feature = "cirisaudit")]
 pub mod read;
@@ -90,6 +91,10 @@ pub use goal::{
     MetaGoalAlignment,
 };
 pub use hardware_attestation::{HardwareAttestationPolicy, DEFAULT_MAX_NONCE_AGE};
+pub use perceptual_hash::{
+    HashDatabaseId, HashMatchError, HashMatchResult, MatcherUnreachablePolicy,
+    NullPerceptualHashMatcher, OnMatchPolicy, PerceptualHashMatcher, SharedMatcher,
+};
 pub use replication::{
     aggregate_trust_score, withdraws_attestation_envelope, AdmissionGate, EvictionCandidate,
     EvictionDecay, EvictionSweeper, MemoryTrustScoring, ReplicationConfig, SweepReport,
@@ -195,6 +200,83 @@ pub trait FederationDirectory: Send + Sync {
     /// "which keys does K vouch for?"). Ordered by `asserted_at` DESC.
     async fn list_attestations_by(&self, attesting_key_id: &str)
         -> Result<Vec<Attestation>, Error>;
+
+    /// v3.6.0 (CIRISPersist#134, CEG 0.3 §8.1.10 Policy J / §11.5.3)
+    /// — return the chain of `content_rating:*` attestations rooted
+    /// at a `trusted_publisher` identity_type that vouches for
+    /// `content_sha256`. Returns an empty vector when the content is
+    /// not trusted-publisher-blessed.
+    ///
+    /// Composition (default impl):
+    ///
+    ///   1. Enumerate all `trusted_publisher`-type keys via
+    ///      [`Self::list_keys_by_identity_type`].
+    ///   2. For each, list attestations issued by the key via
+    ///      [`Self::list_attestations_by`].
+    ///   3. Keep `scores` attestations whose envelope `dimension`
+    ///      starts with `content_rating:` AND whose `evidence_refs`
+    ///      array contains the hex `content_sha256`.
+    ///
+    /// CEG 0.3 §11.5.3: only `trusted_publisher`-type keys may emit
+    /// publisher-curated content ratings (the
+    /// [`super::admission::default_reserved_prefix_rules`]
+    /// admission gate enforces this at write time). The returned set
+    /// is the publisher's vouch chain — receiver-side Policy J
+    /// composition consumes the chain alongside the age-assurance
+    /// gate.
+    ///
+    /// # Default impl rationale
+    ///
+    /// Composes [`Self::list_keys_by_identity_type`] +
+    /// [`Self::list_attestations_by`] (both already trait-required);
+    /// no per-backend SQL needed. Memory / Postgres / SQLite backends
+    /// inherit the same shape. Backends with a `content_rating:*`
+    /// secondary index may override for O(log N) lookup instead of the
+    /// default O(P · A) scan (P trusted_publishers, A attestations
+    /// each).
+    async fn lookup_trusted_publisher_chain(
+        &self,
+        content_sha256: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        // Validate hex shape early — callers may pass arbitrary user input.
+        if content_sha256.len() != 64 || !content_sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(Vec::new());
+        }
+        let publishers = self
+            .list_keys_by_identity_type(types::identity_type::TRUSTED_PUBLISHER)
+            .await?;
+        let mut chain: Vec<Attestation> = Vec::new();
+        for publisher in publishers {
+            let attestations = self.list_attestations_by(&publisher.key_id).await?;
+            for att in attestations {
+                if att.attestation_type != types::attestation_type::SCORES {
+                    continue;
+                }
+                // CEG 0.3 §5.6.8.3 reserved-prefix rule: content_rating:*
+                // dimensions are emitter-restricted to trusted_publisher,
+                // so a (publisher, content_rating:*) pair carries the
+                // publisher's vouch by construction.
+                let dimension_match = att
+                    .attestation_envelope
+                    .get("dimension")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| s.starts_with("content_rating:"));
+                if !dimension_match {
+                    continue;
+                }
+                let evidence_match = att
+                    .attestation_envelope
+                    .get("evidence_refs")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|arr| arr.iter().any(|r| r.as_str() == Some(content_sha256)));
+                if !evidence_match {
+                    continue;
+                }
+                chain.push(att);
+            }
+        }
+        Ok(chain)
+    }
 
     // ── Revocations ────────────────────────────────────────────────
 

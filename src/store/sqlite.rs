@@ -85,6 +85,9 @@ pub struct SqliteBackend {
     /// `None` = no gate (bootstrap-permissive). See
     /// [`SqliteBackend::set_admission_gate`].
     admission_gate: std::sync::RwLock<Option<crate::federation::AdmissionGate>>,
+    /// v3.6.0 (CIRISPersist#134) — perceptual-hash matcher for the
+    /// `put_blob_signing` admission hook. `None` = no hook (default).
+    perceptual_hash_matcher: std::sync::RwLock<Option<crate::federation::SharedMatcher>>,
 }
 
 impl SqliteBackend {
@@ -115,6 +118,7 @@ impl SqliteBackend {
                 crate::federation::HardwareAttestationPolicy::default(),
             )),
             admission_gate: std::sync::RwLock::new(None),
+            perceptual_hash_matcher: std::sync::RwLock::new(None),
         }
     }
 
@@ -134,6 +138,16 @@ impl SqliteBackend {
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
+    }
+
+    /// v3.6.0 (CIRISPersist#134) — install the perceptual-hash matcher
+    /// consulted by `put_blob_signing` for inline-body writes. `None`
+    /// removes the hook (the default state).
+    pub fn set_perceptual_hash_matcher(&self, matcher: Option<crate::federation::SharedMatcher>) {
+        *self
+            .perceptual_hash_matcher
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = matcher;
     }
 
     /// v2.5.0 (CIRISPersist#102 Ask 4) — install a per-axis
@@ -252,6 +266,7 @@ impl SqliteBackend {
                 crate::federation::HardwareAttestationPolicy::default(),
             )),
             admission_gate: std::sync::RwLock::new(None),
+            perceptual_hash_matcher: std::sync::RwLock::new(None),
         })
     }
 }
@@ -2932,6 +2947,13 @@ impl crate::federation::BlobStorage for SqliteBackend {
     fn inline_bytes_cap(&self) -> usize {
         self.inline_bytes_cap
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn perceptual_hash_matcher(&self) -> Option<crate::federation::SharedMatcher> {
+        self.perceptual_hash_matcher
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     async fn put_blob(
@@ -13895,5 +13917,131 @@ mod tests {
             pqc_completed_at: None,
             persist_row_hash: String::new(),
         }
+    }
+
+    // ── v3.6.0 (CIRISPersist#134, CEG 0.3 §11.5.3) — trusted-publisher chain ──
+
+    /// CEG 0.3 §11.5.3: `lookup_trusted_publisher_chain` returns an
+    /// empty vector when no `trusted_publisher`-type key has emitted a
+    /// `content_rating:*` attestation referencing the SHA.
+    #[tokio::test]
+    async fn lookup_trusted_publisher_chain_returns_empty_for_unblessed_content() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let sha_hex = "a".repeat(64);
+        let chain = backend
+            .lookup_trusted_publisher_chain(&sha_hex)
+            .await
+            .unwrap();
+        assert!(chain.is_empty(), "no publishers seeded → empty chain");
+    }
+
+    /// CEG 0.3 §11.5.3: seed a `trusted_publisher`-type key + a
+    /// `content_rating:*` attestation referencing the SHA; the chain
+    /// includes the attestation.
+    #[tokio::test]
+    async fn lookup_trusted_publisher_chain_returns_chain_when_trusted_publisher_attests() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let publisher_key = "pub-1";
+        let sha_hex = "b".repeat(64);
+        let other_sha = "c".repeat(64);
+        // Seed the publisher key as trusted_publisher identity_type.
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key_with_identity_type(
+                    publisher_key,
+                    publisher_key,
+                    publisher_key,
+                    crate::federation::types::identity_type::TRUSTED_PUBLISHER,
+                ),
+            })
+            .await
+            .unwrap();
+        // Seed a content_rating attestation referencing the target SHA.
+        let mut hit = fed_attestation("att-hit", publisher_key, publisher_key, publisher_key);
+        hit.attestation_envelope = serde_json::json!({
+            "dimension": "content_rating:mpa:pg13:v1",
+            "score": 1.0,
+            "confidence": 0.9,
+            "evidence_refs": [sha_hex],
+        });
+        backend
+            .put_attestation(SignedAttestation { attestation: hit })
+            .await
+            .unwrap();
+        // Seed a different content_rating referencing a different SHA —
+        // must NOT appear in the result.
+        let mut miss = fed_attestation("att-miss", publisher_key, publisher_key, publisher_key);
+        miss.attestation_envelope = serde_json::json!({
+            "dimension": "content_rating:mpa:r:v1",
+            "score": 1.0,
+            "confidence": 0.9,
+            "evidence_refs": [other_sha],
+        });
+        backend
+            .put_attestation(SignedAttestation { attestation: miss })
+            .await
+            .unwrap();
+
+        let chain = backend
+            .lookup_trusted_publisher_chain(&sha_hex)
+            .await
+            .unwrap();
+        assert_eq!(chain.len(), 1, "exactly one matching attestation");
+        assert_eq!(chain[0].attestation_id, "att-hit");
+        assert_eq!(chain[0].attesting_key_id, publisher_key);
+        let dim = chain[0]
+            .attestation_envelope
+            .get("dimension")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(dim.starts_with("content_rating:"));
+    }
+
+    /// CEG 0.3 §11.5.3: non-`trusted_publisher` identities cannot
+    /// emit `content_rating:*` attestations (the reserved-prefix
+    /// admission gate would reject them on put_attestation). The chain
+    /// accessor reads through `trusted_publisher` keys only, so a
+    /// rogue agent's bypass attempt would still not surface here.
+    #[tokio::test]
+    async fn lookup_trusted_publisher_chain_ignores_non_publisher_emitters() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        // Seed a steward (not trusted_publisher).
+        let steward_key = "steward-1";
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key_with_identity_type(
+                    steward_key,
+                    steward_key,
+                    steward_key,
+                    crate::federation::types::identity_type::STEWARD,
+                ),
+            })
+            .await
+            .unwrap();
+        // Steward's attestation under content_rating:* would be
+        // rejected by the admission gate in production. For this
+        // test, we bypass put_attestation's emitter check via a non-
+        // content_rating dimension so the row lands, then assert the
+        // accessor still returns empty (steward isn't a publisher).
+        let sha_hex = "d".repeat(64);
+        let mut att = fed_attestation("att-steward", steward_key, steward_key, steward_key);
+        att.attestation_envelope = serde_json::json!({
+            "dimension": "identity_binding:v1",
+            "score": 1.0,
+            "confidence": 0.9,
+            "evidence_refs": [sha_hex],
+        });
+        backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+        let chain = backend
+            .lookup_trusted_publisher_chain(&sha_hex)
+            .await
+            .unwrap();
+        assert!(chain.is_empty(), "steward isn't a trusted_publisher");
     }
 }

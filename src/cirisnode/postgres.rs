@@ -140,6 +140,23 @@ impl NodeCoreService for PostgresBackend {
             None => (None, None),
         };
 
+        // v3.6.0 (CIRISPersist#134) — media-sharing extractors. The
+        // typed shape validators run BEFORE the DB CHECK fires (same
+        // discipline as the announcement extractor). Mismatched
+        // payloads land Error::InvalidArgument up-front.
+        let takedown =
+            super::media_sharing::extract_takedown_notice_payload(subject_kind, &env.payload)?;
+        let key_grant =
+            super::media_sharing::extract_key_grant_payload(subject_kind, &env.payload)?;
+        let media_content_sha256: Option<String> = takedown
+            .as_ref()
+            .map(|p| p.content_sha256.clone())
+            .or_else(|| key_grant.as_ref().map(|p| p.content_sha256.clone()));
+        let takedown_legal_basis: Option<&'static str> =
+            takedown.as_ref().map(|p| p.legal_basis.as_str());
+        let key_grant_recipient_key_id: Option<String> =
+            key_grant.as_ref().map(|p| p.recipient_key_id.clone());
+
         let client = self
             .pool()
             .get()
@@ -155,8 +172,10 @@ impl NodeCoreService for PostgresBackend {
                     contribution_id, contribution_type, domain, language, subject_kind, \
                     author_id, payload, witness_set, submitted_at, \
                     signature, signing_key_id, signature_verified, persist_row_hash, \
-                    announcement_priority, announcement_authority_class\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, TRUE, $12, $13, $14)",
+                    announcement_priority, announcement_authority_class, \
+                    media_content_sha256, key_grant_recipient_key_id, takedown_legal_basis\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, TRUE, $12, $13, $14, \
+                           $15, $16, $17)",
                 &[
                     &id,
                     &contribution_type_str(env.contribution_type),
@@ -172,6 +191,9 @@ impl NodeCoreService for PostgresBackend {
                     &env.signature.ed25519, // persist_row_hash placeholder; canonical hash lands in v0.7.0.x
                     &announcement_priority,
                     &announcement_authority_class,
+                    &media_content_sha256,
+                    &key_grant_recipient_key_id,
+                    &takedown_legal_basis,
                 ],
             )
             .await
@@ -1077,6 +1099,270 @@ impl NodeCoreService for PostgresBackend {
         // world deployment sizes (PG counts are i64 max 2^63-1).
         Ok(u64::try_from(n).unwrap_or(0))
     }
+
+    // ── Media-sharing reads (v3.6.0, CIRISPersist#134) ─────────────
+
+    async fn list_takedowns_for(
+        &self,
+        content_sha256: &str,
+    ) -> Result<Vec<ContributionEnvelope>, Error> {
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let rows = client
+            .query(
+                "SELECT contribution_id::text, contribution_type, domain, language, subject_kind, \
+                        author_id, payload, witness_set, submitted_at, signature \
+                 FROM cirisnode.contributions \
+                 WHERE subject_kind = 'takedown_notice' \
+                   AND media_content_sha256 = $1 \
+                 ORDER BY submitted_at DESC, contribution_id DESC",
+                &[&content_sha256],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "list_takedowns_for"))?;
+        rows.into_iter().map(row_to_contribution).collect()
+    }
+
+    async fn list_key_grants_for(
+        &self,
+        recipient_key_id: &str,
+    ) -> Result<Vec<ContributionEnvelope>, Error> {
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let rows = client
+            .query(
+                "SELECT contribution_id::text, contribution_type, domain, language, subject_kind, \
+                        author_id, payload, witness_set, submitted_at, signature \
+                 FROM cirisnode.contributions \
+                 WHERE subject_kind = 'key_grant' \
+                   AND key_grant_recipient_key_id = $1 \
+                 ORDER BY submitted_at DESC, contribution_id DESC",
+                &[&recipient_key_id],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "list_key_grants_for"))?;
+        rows.into_iter().map(row_to_contribution).collect()
+    }
+
+    async fn list_key_grants_for_content(
+        &self,
+        content_sha256: &str,
+        recipient_key_id: &str,
+    ) -> Result<Vec<ContributionEnvelope>, Error> {
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let rows = client
+            .query(
+                "SELECT contribution_id::text, contribution_type, domain, language, subject_kind, \
+                        author_id, payload, witness_set, submitted_at, signature \
+                 FROM cirisnode.contributions \
+                 WHERE subject_kind = 'key_grant' \
+                   AND media_content_sha256 = $1 \
+                   AND key_grant_recipient_key_id = $2 \
+                 ORDER BY submitted_at DESC, contribution_id DESC",
+                &[&content_sha256, &recipient_key_id],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "list_key_grants_for_content"))?;
+        rows.into_iter().map(row_to_contribution).collect()
+    }
+
+    async fn retire_key_grants(
+        &self,
+        actor_key_id: &str,
+        signer: &dyn ciris_keyring::HardwareSigner,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<super::RetireKeyGrantsReport, Error> {
+        // CEG 0.3 §5.6.8.4 — rotation_chain supersession (option b
+        // from CIRISRegistry#38): each prior grant is retired by
+        // emitting a fresh key_grant Contribution whose rotation_chain
+        // is extended by the prior contribution_id, with an empty
+        // wrapped_dek_base64 as the revocation sentinel.
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let rows = client
+            .query(
+                "SELECT contribution_id::text, domain, language, payload \
+                 FROM cirisnode.contributions \
+                 WHERE subject_kind = 'key_grant' AND author_id = $1",
+                &[&actor_key_id],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "retire_key_grants list"))?;
+        let mut report = super::RetireKeyGrantsReport {
+            grants_seen: rows.len(),
+            ..Default::default()
+        };
+        for row in rows {
+            let contribution_id: String = row.get(0);
+            let domain: String = row.get(1);
+            let language: String = row.get(2);
+            let payload_json: serde_json::Value = row.get(3);
+            let prior: super::media_sharing::KeyGrantPayload =
+                match serde_json::from_value(payload_json.clone()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        report.supersedes_failed += 1;
+                        tracing::warn!(
+                            error = %e,
+                            actor = %actor_key_id,
+                            contribution_id = %contribution_id,
+                            "ciris-persist v3.6.0 retire_key_grants: prior payload decode failed"
+                        );
+                        continue;
+                    }
+                };
+            let outcome = emit_key_grant_supersession(
+                self,
+                &contribution_id,
+                actor_key_id,
+                &domain,
+                &language,
+                &prior,
+                signer,
+                now,
+            )
+            .await;
+            match outcome {
+                Ok(()) => report.supersedes_emitted += 1,
+                Err(e) => {
+                    report.supersedes_failed += 1;
+                    tracing::warn!(
+                        error = %e,
+                        actor = %actor_key_id,
+                        contribution_id = %contribution_id,
+                        "ciris-persist v3.6.0 retire_key_grants: supersession emission failed"
+                    );
+                }
+            }
+        }
+        Ok(report)
+    }
+}
+
+/// v3.6.0 (CIRISPersist#134) — Postgres row → ContributionEnvelope.
+/// Shared between the three media-sharing list_* methods.
+fn row_to_contribution(row: tokio_postgres::Row) -> Result<ContributionEnvelope, Error> {
+    let ct_str: String = row.get(1);
+    let witness_set_val: Option<serde_json::Value> = row.get(7);
+    let witness_set = match witness_set_val {
+        Some(v) if !v.is_null() => {
+            Some(serde_json::from_value(v).map_err(|e| Error::Internal(e.to_string()))?)
+        }
+        _ => None,
+    };
+    Ok(ContributionEnvelope {
+        contribution_id: row.get(0),
+        contribution_type: contribution_type_from_str(&ct_str)?,
+        author_id: row.get(5),
+        subject: Cell {
+            domain: row.get(2),
+            language: row.get(3),
+            subject: Some(row.get(4)),
+        },
+        payload: row.get(6),
+        witness_set,
+        signature: HybridSignature {
+            ed25519: row.get(9),
+            ml_dsa_65: None,
+            signed_at: row.get(8),
+        },
+        submitted_at: row.get(8),
+    })
+}
+
+/// v3.6.0 (CIRISPersist#134) — emit a supersession `key_grant`
+/// Contribution against a prior `key_grant` Contribution row. Used
+/// by [`PostgresBackend::retire_key_grants`].
+///
+/// CEG 0.3 §5.6.8.4 — rotation_chain supersession (option b from
+/// CIRISRegistry#38): the new Contribution carries the same
+/// `recipient_key_id` + `content_sha256` as the prior grant, with an
+/// empty `wrapped_dek_base64` as the revocation sentinel, and
+/// `rotation_chain` extended by the prior `contribution_id`.
+#[allow(clippy::too_many_arguments)]
+async fn emit_key_grant_supersession(
+    backend: &PostgresBackend,
+    prior_contribution_id: &str,
+    actor_key_id: &str,
+    domain: &str,
+    language: &str,
+    prior: &super::media_sharing::KeyGrantPayload,
+    signer: &dyn ciris_keyring::HardwareSigner,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Error> {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+
+    let mut rotation_chain = prior.rotation_chain.clone();
+    rotation_chain.push(prior_contribution_id.to_owned());
+
+    // CEG 0.3 §5.6.8.4 revocation sentinel: empty base64 string
+    // round-trips to zero-length bytes; recipient sees the empty DEK
+    // and knows the grant is retired.
+    let revocation_dek = B64.encode(Vec::<u8>::new());
+
+    let supersession_payload = super::media_sharing::KeyGrantPayload {
+        recipient_key_id: prior.recipient_key_id.clone(),
+        content_sha256: prior.content_sha256.clone(),
+        wrapped_dek_base64: revocation_dek,
+        wrap_algorithm: super::media_sharing::WrapAlgorithm::HpkeRfc9180BaseX25519AesGcm,
+        ratchet_version: prior.ratchet_version,
+        key_validity_window: super::media_sharing::KeyValidityWindow {
+            // The supersession grant's validity window is bounded by
+            // `now` — the prior grant is retired as of the
+            // supersession Contribution's wall-clock.
+            not_before: now,
+            not_after: now + chrono::Duration::seconds(1),
+        },
+        scope: prior.scope,
+        scope_id: prior.scope_id.clone(),
+        rotation_chain,
+    };
+    let payload_value = serde_json::to_value(&supersession_payload)
+        .map_err(|e| Error::Internal(format!("supersession serialize: {e}")))?;
+
+    let mut env = ContributionEnvelope {
+        contribution_id: uuid::Uuid::new_v4().to_string(),
+        contribution_type: ContributionType::Proposal,
+        author_id: actor_key_id.to_owned(),
+        subject: Cell {
+            domain: domain.to_owned(),
+            language: language.to_owned(),
+            subject: Some(super::media_sharing::KEY_GRANT_SUBJECT_KIND.to_owned()),
+        },
+        payload: payload_value,
+        witness_set: None,
+        signature: HybridSignature {
+            ed25519: String::new(),
+            ml_dsa_65: None,
+            signed_at: now,
+        },
+        submitted_at: now,
+    };
+    let canonical = super::verify::canonical_bytes_for_envelope(&env)?;
+    let sig_bytes = signer
+        .sign(&canonical)
+        .await
+        .map_err(|e| Error::Backend(format!("supersession sign: {e}")))?;
+    env.signature = HybridSignature {
+        ed25519: B64.encode(&sig_bytes),
+        ml_dsa_65: None,
+        signed_at: now,
+    };
+    backend.put_contribution(env).await
 }
 
 #[cfg(test)]
@@ -2106,5 +2392,502 @@ mod tests {
         );
         let err = backend.put_delivery_attestation(att).await.unwrap_err();
         assert!(matches!(err, Error::Signature(_)), "got: {err:?}");
+    }
+
+    // ── Media-sharing tests (v3.6.0, CIRISPersist#134) ─────────────
+
+    fn fixture_sha_hex(seed: u8) -> String {
+        let mut bytes = [0u8; 32];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = seed.wrapping_add(i as u8);
+        }
+        hex::encode(bytes)
+    }
+
+    fn build_takedown_contribution(
+        author_key: &ed25519_dalek::SigningKey,
+        sha_hex: &str,
+        basis: crate::cirisnode::LegalBasis,
+    ) -> ContributionEnvelope {
+        let author = pubkey_b64(author_key);
+        let payload = crate::cirisnode::TakedownNoticePayload {
+            content_sha256: sha_hex.to_owned(),
+            perceptual_hash: None,
+            content_holder_key_ids: vec![],
+            claimant_key_id: author.clone(),
+            legal_basis: basis,
+            jurisdiction: "US".into(),
+            good_faith_statement: "good faith".into(),
+            claim_text: "claim".into(),
+            evidence_refs: vec![],
+            counter_notice_channel: None,
+            asserted_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::days(30),
+        };
+        let mut env = ContributionEnvelope {
+            contribution_id: Uuid::new_v4().to_string(),
+            contribution_type: ContributionType::Proposal,
+            author_id: author,
+            subject: Cell {
+                domain: format!("media-{}", Uuid::new_v4()),
+                language: "en".into(),
+                subject: Some(crate::cirisnode::TAKEDOWN_NOTICE_SUBJECT_KIND.into()),
+            },
+            payload: serde_json::to_value(&payload).unwrap(),
+            witness_set: None,
+            signature: HybridSignature {
+                ed25519: String::new(),
+                ml_dsa_65: None,
+                signed_at: Utc::now(),
+            },
+            submitted_at: Utc::now(),
+        };
+        env.signature = sign_envelope(&env, author_key);
+        env
+    }
+
+    fn build_key_grant_contribution(
+        author_key: &ed25519_dalek::SigningKey,
+        sha_hex: &str,
+        recipient_key_id: &str,
+    ) -> ContributionEnvelope {
+        let author = pubkey_b64(author_key);
+        let payload = crate::cirisnode::KeyGrantPayload {
+            recipient_key_id: recipient_key_id.to_owned(),
+            content_sha256: sha_hex.to_owned(),
+            wrapped_dek_base64: {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD.encode([0u8; 48])
+            },
+            wrap_algorithm: crate::cirisnode::WrapAlgorithm::HpkeRfc9180BaseX25519AesGcm,
+            ratchet_version: 1,
+            key_validity_window: crate::cirisnode::KeyValidityWindow {
+                not_before: Utc::now(),
+                not_after: Utc::now() + chrono::Duration::days(30),
+            },
+            scope: crate::cirisnode::KeyGrantScope::SingleContent,
+            scope_id: sha_hex.to_owned(),
+            rotation_chain: vec![],
+        };
+        let mut env = ContributionEnvelope {
+            contribution_id: Uuid::new_v4().to_string(),
+            contribution_type: ContributionType::Proposal,
+            author_id: author,
+            subject: Cell {
+                domain: format!("media-{}", Uuid::new_v4()),
+                language: "en".into(),
+                subject: Some(crate::cirisnode::KEY_GRANT_SUBJECT_KIND.into()),
+            },
+            payload: serde_json::to_value(&payload).unwrap(),
+            witness_set: None,
+            signature: HybridSignature {
+                ed25519: String::new(),
+                ml_dsa_65: None,
+                signed_at: Utc::now(),
+            },
+            submitted_at: Utc::now(),
+        };
+        env.signature = sign_envelope(&env, author_key);
+        env
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn takedown_notice_admits_via_put_contribution() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xF1; 32]);
+        let sha_hex = fixture_sha_hex(0x70);
+        let env = build_takedown_contribution(
+            &author_key,
+            &sha_hex,
+            crate::cirisnode::LegalBasis::Dmca512,
+        );
+        backend.put_contribution(env).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn takedown_notice_payload_shape_validates() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xF2; 32]);
+        let mut env = build_takedown_contribution(
+            &author_key,
+            "not-hex",
+            crate::cirisnode::LegalBasis::Dmca512,
+        );
+        env.signature = sign_envelope(&env, &author_key);
+        let err = backend.put_contribution(env).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn key_grant_admits_via_put_contribution() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xF3; 32]);
+        let sha_hex = fixture_sha_hex(0x71);
+        let env = build_key_grant_contribution(&author_key, &sha_hex, "recipient-key-1");
+        backend.put_contribution(env).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn key_grant_payload_shape_validates() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xF4; 32]);
+        // wrapped_dek_base64 invalid → InvalidArgument.
+        let sha_hex = fixture_sha_hex(0x72);
+        let mut env = build_key_grant_contribution(&author_key, &sha_hex, "rec");
+        // Mutate the payload JSON in place to corrupt the base64.
+        if let Some(obj) = env.payload.as_object_mut() {
+            obj.insert(
+                "wrapped_dek_base64".into(),
+                serde_json::Value::String("!!not_base64!!".into()),
+            );
+        }
+        env.signature = sign_envelope(&env, &author_key);
+        let err = backend.put_contribution(env).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn list_takedowns_for_returns_only_matching_sha() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xF5; 32]);
+        let sha_a = fixture_sha_hex(0x10);
+        let sha_b = fixture_sha_hex(0x20);
+        backend
+            .put_contribution(build_takedown_contribution(
+                &author_key,
+                &sha_a,
+                crate::cirisnode::LegalBasis::Dmca512,
+            ))
+            .await
+            .unwrap();
+        backend
+            .put_contribution(build_takedown_contribution(
+                &author_key,
+                &sha_b,
+                crate::cirisnode::LegalBasis::DsaArticle16,
+            ))
+            .await
+            .unwrap();
+        let rows = backend.list_takedowns_for(&sha_a).await.unwrap();
+        assert!(
+            rows.iter().all(|r| {
+                r.payload
+                    .get("content_sha256")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| s == sha_a)
+            }),
+            "every row matches sha_a; got {rows:?}"
+        );
+        assert!(rows.iter().any(|r| {
+            r.payload.get("content_sha256").and_then(|v| v.as_str()) == Some(sha_a.as_str())
+        }));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn list_key_grants_for_returns_only_matching_recipient() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xF6; 32]);
+        let sha = fixture_sha_hex(0x30);
+        let recip = format!("rec-{}", Uuid::new_v4());
+        let other = format!("other-{}", Uuid::new_v4());
+        backend
+            .put_contribution(build_key_grant_contribution(&author_key, &sha, &recip))
+            .await
+            .unwrap();
+        backend
+            .put_contribution(build_key_grant_contribution(&author_key, &sha, &other))
+            .await
+            .unwrap();
+        let rows = backend.list_key_grants_for(&recip).await.unwrap();
+        assert!(rows.iter().all(
+            |r| r.payload.get("recipient_key_id").and_then(|v| v.as_str()) == Some(recip.as_str())
+        ));
+        assert!(!rows.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn list_key_grants_for_content_filters_both_axes() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xF7; 32]);
+        let sha_a = fixture_sha_hex(0x40);
+        let sha_b = fixture_sha_hex(0x50);
+        let recip_a = format!("rec-a-{}", Uuid::new_v4());
+        let recip_b = format!("rec-b-{}", Uuid::new_v4());
+        backend
+            .put_contribution(build_key_grant_contribution(&author_key, &sha_a, &recip_a))
+            .await
+            .unwrap();
+        backend
+            .put_contribution(build_key_grant_contribution(&author_key, &sha_a, &recip_b))
+            .await
+            .unwrap();
+        backend
+            .put_contribution(build_key_grant_contribution(&author_key, &sha_b, &recip_a))
+            .await
+            .unwrap();
+        let rows = backend
+            .list_key_grants_for_content(&sha_a, &recip_a)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(
+            row.payload.get("content_sha256").and_then(|v| v.as_str()),
+            Some(sha_a.as_str())
+        );
+        assert_eq!(
+            row.payload.get("recipient_key_id").and_then(|v| v.as_str()),
+            Some(recip_a.as_str())
+        );
+    }
+
+    /// CEG 0.3 §5.6.8.4 — option (b) supersession: retire_key_grants
+    /// emits a FRESH key_grant Contribution with rotation_chain
+    /// extended by the prior contribution_id, not a withdraws against
+    /// the prior. The fresh grant carries an empty wrapped_dek_base64
+    /// (revocation sentinel).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn retire_key_grants_emits_rotation_chain_not_withdraws() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let mut seed = [0u8; 32];
+        let bytes = uuid::Uuid::new_v4().as_bytes().to_owned();
+        seed[..16].copy_from_slice(&bytes);
+        seed[16..].copy_from_slice(&bytes);
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let author = pubkey_b64(&author_key);
+        seed_actor_federation_key(&backend, &author, &author_key).await;
+
+        let sha_a = fixture_sha_hex(0x60);
+        let sha_b = fixture_sha_hex(0x61);
+        let prior_a = build_key_grant_contribution(&author_key, &sha_a, "rec-1");
+        let prior_a_id = prior_a.contribution_id.clone();
+        let prior_b = build_key_grant_contribution(&author_key, &sha_b, "rec-2");
+        let prior_b_id = prior_b.contribution_id.clone();
+        backend.put_contribution(prior_a).await.unwrap();
+        backend.put_contribution(prior_b).await.unwrap();
+
+        use crate::signing::{LocalSigner, LocalSignerHardwareAdapter};
+        let local = std::sync::Arc::new(LocalSigner::from_parts(
+            author_key.clone(),
+            author.clone(),
+            None,
+            None,
+        ));
+        let signer = LocalSignerHardwareAdapter::new(local);
+        let report = backend
+            .retire_key_grants(&author, &signer, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(report.grants_seen, 2);
+        assert_eq!(report.supersedes_emitted, 2);
+        assert_eq!(report.supersedes_failed, 0);
+
+        // Confirm the supersession Contributions exist and carry the
+        // expected rotation_chain shape + empty wrapped_dek sentinel.
+        let recip_a_grants = backend.list_key_grants_for("rec-1").await.unwrap();
+        let supersedes_a = recip_a_grants
+            .iter()
+            .find(|g| {
+                g.payload
+                    .get("rotation_chain")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().any(|x| x.as_str() == Some(prior_a_id.as_str())))
+                    .unwrap_or(false)
+            })
+            .expect("supersession grant referencing prior_a_id");
+        assert_eq!(
+            supersedes_a
+                .payload
+                .get("wrapped_dek_base64")
+                .and_then(|v| v.as_str()),
+            Some(""),
+            "CEG 0.3 §5.6.8.4 revocation sentinel: empty DEK base64"
+        );
+        assert_eq!(
+            supersedes_a
+                .payload
+                .get("wrap_algorithm")
+                .and_then(|v| v.as_str()),
+            Some("hpke_rfc9180_base_x25519_aes_gcm"),
+            "CEG 0.3 §5.6.8.4 wrap_algorithm wire string"
+        );
+
+        let recip_b_grants = backend.list_key_grants_for("rec-2").await.unwrap();
+        assert!(
+            recip_b_grants.iter().any(|g| g
+                .payload
+                .get("rotation_chain")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().any(|x| x.as_str() == Some(prior_b_id.as_str())))
+                .unwrap_or(false)),
+            "supersession grant referencing prior_b_id"
+        );
+    }
+
+    /// Helper used by retire_key_grants_emits_withdraws_for_actor —
+    /// seeds an `cirislens.federation_keys` row for the actor so the
+    /// `WITHDRAWS` attestation FK clears.
+    async fn seed_actor_federation_key(
+        backend: &PostgresBackend,
+        key_id: &str,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) {
+        use base64::Engine as _;
+        let pubkey_b64 = base64::engine::general_purpose::STANDARD
+            .encode(signing_key.verifying_key().to_bytes());
+        let record = crate::federation::types::KeyRecord {
+            key_id: key_id.to_owned(),
+            pubkey_ed25519_base64: pubkey_b64,
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: crate::federation::types::algorithm::HYBRID.into(),
+            identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
+            identity_ref: key_id.to_owned(),
+            valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
+            valid_until: None,
+            registration_envelope: serde_json::json!({"id": key_id}),
+            original_content_hash: "deadbeef".into(),
+            scrub_signature_classical: "c2lnbmF0dXJl".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: key_id.to_owned(),
+            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+        };
+        use crate::federation::FederationDirectory;
+        backend
+            .put_public_key(crate::federation::types::SignedKeyRecord { record })
+            .await
+            .unwrap();
+    }
+
+    /// V054 CHECK constraint must reject a bare-SQL direct insert
+    /// that violates the takedown_notice subject/column asymmetry.
+    /// Mirrors V051 / V053 bare-SQL bypass test discipline.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn v054_check_rejects_mismatched_takedown_columns() {
+        use crate::store::backend::Backend;
+        use tokio_postgres::error::SqlState;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let client = backend.pool().get().await.unwrap();
+        // Try to insert a non-takedown subject_kind with
+        // takedown_legal_basis populated — the V054 CHECK must reject.
+        let err = client
+            .execute(
+                "INSERT INTO cirisnode.contributions (\
+                    contribution_id, contribution_type, domain, language, subject_kind, \
+                    author_id, payload, witness_set, submitted_at, \
+                    signature, signing_key_id, signature_verified, persist_row_hash, \
+                    takedown_legal_basis\
+                 ) VALUES ($1, 'proposal', 'd', 'en', 'arc_question', 'a', '{}'::jsonb, NULL, NOW(), \
+                           'sig', 'a', TRUE, 'h', 'dmca_512')",
+                &[&Uuid::new_v4()],
+            )
+            .await
+            .unwrap_err();
+        let code = err.as_db_error().map(|d| d.code().clone());
+        assert_eq!(
+            code,
+            Some(SqlState::CHECK_VIOLATION),
+            "expected CHECK violation (SQLSTATE 23514); got: {err:?}"
+        );
+    }
+
+    /// Same discipline for the key_grant column asymmetry.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn v054_check_rejects_mismatched_key_grant_columns() {
+        use crate::store::backend::Backend;
+        use tokio_postgres::error::SqlState;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let client = backend.pool().get().await.unwrap();
+        let err = client
+            .execute(
+                "INSERT INTO cirisnode.contributions (\
+                    contribution_id, contribution_type, domain, language, subject_kind, \
+                    author_id, payload, witness_set, submitted_at, \
+                    signature, signing_key_id, signature_verified, persist_row_hash, \
+                    key_grant_recipient_key_id\
+                 ) VALUES ($1, 'proposal', 'd', 'en', 'arc_question', 'a', '{}'::jsonb, NULL, NOW(), \
+                           'sig', 'a', TRUE, 'h', 'rec-1')",
+                &[&Uuid::new_v4()],
+            )
+            .await
+            .unwrap_err();
+        let code = err.as_db_error().map(|d| d.code().clone());
+        assert_eq!(
+            code,
+            Some(SqlState::CHECK_VIOLATION),
+            "expected CHECK violation (SQLSTATE 23514); got: {err:?}"
+        );
     }
 }

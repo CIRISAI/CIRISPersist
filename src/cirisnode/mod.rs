@@ -56,11 +56,14 @@
 //! - **v0.7.0**: release tag.
 
 pub mod federation_announcement;
+pub mod media_sharing;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod service;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub mod takedown_handler;
 pub mod types;
 pub mod verify;
 
@@ -70,7 +73,16 @@ pub use federation_announcement::{
     AuthorityClass, DeliveryAttestation, FederationAnnouncementPayload, TransportMedium,
     DELIVERY_ATTESTATION_DOMAIN, SUBJECT_KIND,
 };
-pub use service::NodeCoreService;
+pub use media_sharing::{
+    extract_key_grant_payload, extract_takedown_notice_payload, KeyGrantPayload, KeyGrantScope,
+    KeyValidityWindow, LegalBasis, MultimediaConfig, MultimediaConfigWire, TakedownNoticePayload,
+    WrapAlgorithm, KEY_GRANT_SUBJECT_KIND, TAKEDOWN_NOTICE_SUBJECT_KIND,
+};
+pub use service::{NodeCoreService, RetireKeyGrantsReport};
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub use takedown_handler::{
+    process_takedown_admission, process_takedown_admission_with_config, TakedownReport,
+};
 // v1.3.0 (CIRISPersist#47): convenience re-export of the
 // FederationDirectory trait so NodeCore consumers can use either
 // `ciris_persist::federation::FederationDirectory` (canonical) or

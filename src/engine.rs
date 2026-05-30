@@ -147,6 +147,13 @@ pub struct Engine {
     /// `None` = defaults (bootstrap-permissive, sweeper inactive).
     /// Cheaply clonable into the spawned sweeper task.
     replication_config: Option<Arc<crate::federation::ReplicationConfig>>,
+    /// v3.6.0 (CIRISPersist#134) — media-sharing operator config
+    /// (counter-notice window + immediate-eviction basis set). `None`
+    /// = persist defaults (14-day window; child-safety + terrorist
+    /// content classes evict immediately). Interior-mutable so the
+    /// runtime PyO3 setter can update without consuming the engine.
+    #[cfg(feature = "cirisnode")]
+    multimedia_config: Arc<std::sync::RwLock<Option<Arc<crate::cirisnode::MultimediaConfig>>>>,
 }
 
 /// v2.12.0 (CIRISPersist#112) — error from [`Engine::sign_hybrid`].
@@ -207,6 +214,8 @@ impl Engine {
             signer,
             local_signer,
             replication_config: None,
+            #[cfg(feature = "cirisnode")]
+            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
         })
     }
 
@@ -289,6 +298,8 @@ impl Engine {
             // v3.4.0 (#123) — cohabitation views do NOT spawn a
             // second sweeper; the singleton owns the JoinHandle.
             replication_config: None,
+            #[cfg(feature = "cirisnode")]
+            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -311,6 +322,8 @@ impl Engine {
             signer,
             local_signer,
             replication_config: None,
+            #[cfg(feature = "cirisnode")]
+            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -348,6 +361,32 @@ impl Engine {
     ) -> Self {
         self.replication_config = Some(cfg);
         self
+    }
+
+    /// v3.6.0 (CIRISPersist#134) — install / replace the media-sharing
+    /// operator config. `None` clears it (persist defaults apply).
+    ///
+    /// The
+    /// [`process_takedown_admission_with_config`](crate::cirisnode::takedown_handler::process_takedown_admission_with_config)
+    /// handler consults this when present; the v3.6.0 default keeps
+    /// child-safety / terrorist-content bases as immediate-eviction and
+    /// the counter-notice window at 14 days.
+    #[cfg(feature = "cirisnode")]
+    pub fn set_multimedia_config(&self, cfg: Option<crate::cirisnode::MultimediaConfig>) {
+        *self
+            .multimedia_config
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = cfg.map(Arc::new);
+    }
+
+    /// v3.6.0 (CIRISPersist#134) — snapshot of the installed
+    /// media-sharing config. `None` = persist defaults apply.
+    #[cfg(feature = "cirisnode")]
+    pub fn multimedia_config(&self) -> Option<Arc<crate::cirisnode::MultimediaConfig>> {
+        self.multimedia_config
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// v3.4.0 (CIRISPersist#123) — install / clear the trust-weighted

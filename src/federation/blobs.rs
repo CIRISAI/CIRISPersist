@@ -314,6 +314,63 @@ pub trait BlobStorage: Send + Sync {
                 ));
             }
 
+            // v3.6.0 (CIRISPersist#134) — perceptual-hash hook runs
+            // BEFORE the sign / commit. Inline-only (architect §6.5);
+            // External bodies have nothing to hash here. Default
+            // backend impl returns None so the hook is a no-op unless
+            // operator-config has installed a matcher.
+            if let (Some(matcher), BlobBody::Inline(inline_bytes)) =
+                (self.perceptual_hash_matcher(), &body)
+            {
+                match matcher.check(sha256, inline_bytes).await {
+                    Ok(crate::federation::HashMatchResult::Match {
+                        database,
+                        score,
+                        threshold,
+                    }) => match matcher.on_match_policy() {
+                        crate::federation::OnMatchPolicy::Refuse
+                        | crate::federation::OnMatchPolicy::ReportThenRefuse => {
+                            return Err(BlobError::HashMatchedKnownBad {
+                                database,
+                                score,
+                                threshold,
+                            });
+                        }
+                        crate::federation::OnMatchPolicy::AlertOnly => {
+                            tracing::warn!(
+                                database = ?database,
+                                score,
+                                threshold,
+                                sha256_prefix = &hex::encode(sha256)[..16],
+                                "ciris-persist v3.6.0 perceptual_hash matcher hit (alert-only)"
+                            );
+                        }
+                    },
+                    Ok(crate::federation::HashMatchResult::NoMatch) => {}
+                    Err(crate::federation::HashMatchError::Unreachable(detail)) => {
+                        match matcher.matcher_unreachable_policy() {
+                            crate::federation::MatcherUnreachablePolicy::FailClosed => {
+                                return Err(BlobError::Backend(format!(
+                                    "perceptual_hash matcher unreachable (fail-closed): {detail}"
+                                )));
+                            }
+                            crate::federation::MatcherUnreachablePolicy::FailOpen => {
+                                tracing::warn!(
+                                    detail = %detail,
+                                    sha256_prefix = &hex::encode(sha256)[..16],
+                                    "ciris-persist v3.6.0 perceptual_hash matcher unreachable (fail-open)"
+                                );
+                            }
+                        }
+                    }
+                    Err(crate::federation::HashMatchError::InputMalformed(detail)) => {
+                        return Err(BlobError::InvalidArgument(format!(
+                            "perceptual_hash matcher rejected body: {detail}"
+                        )));
+                    }
+                }
+            }
+
             let envelope = holds_bytes_attestation_envelope(sha256);
             let canonical_bytes = PythonJsonDumpsCanonicalizer
                 .canonicalize_value(&envelope)
@@ -341,6 +398,15 @@ pub trait BlobStorage: Send + Sync {
 
             self.put_blob(sha256, body, media_type, att).await
         }
+    }
+
+    /// v3.6.0 (CIRISPersist#134) — perceptual-hash matcher hook.
+    /// Default `None` (no hook installed). Backends override with an
+    /// `RwLock<Option<Arc<dyn PerceptualHashMatcher>>>` + a
+    /// `set_perceptual_hash_matcher` setter mirroring the v3.4.0
+    /// `set_admission_gate` pattern.
+    fn perceptual_hash_matcher(&self) -> Option<crate::federation::SharedMatcher> {
+        None
     }
 
     /// List the `key_id`s of every **currently-live** attester that
@@ -607,6 +673,22 @@ pub enum BlobError {
         threshold: f64,
     },
 
+    /// v3.6.0 (CIRISPersist#134) — a
+    /// [`PerceptualHashMatcher`](crate::federation::PerceptualHashMatcher)
+    /// returned a hit against one of the configured known-bad databases.
+    /// The blob row was NOT written.
+    #[error(
+        "hash matched known-bad database {database:?} (score {score} >= threshold {threshold})"
+    )]
+    HashMatchedKnownBad {
+        /// Which database the matcher hit.
+        database: crate::federation::HashDatabaseId,
+        /// Match score the matcher reported.
+        score: f64,
+        /// Threshold the matcher applied.
+        threshold: f64,
+    },
+
     /// Backend-level error (DB connection, serialization, etc.).
     #[error("backend: {0}")]
     Backend(String),
@@ -622,6 +704,7 @@ impl BlobError {
             BlobError::InvalidArgument(_) => "blob_invalid_argument",
             BlobError::AttestationEmissionFailed(_) => "blob_attestation_emission_failed",
             BlobError::TrustBelowThreshold { .. } => "blob_trust_below_threshold",
+            BlobError::HashMatchedKnownBad { .. } => "blob_hash_matched_known_bad",
             BlobError::Backend(_) => "blob_backend",
         }
     }
@@ -923,5 +1006,197 @@ mod tests {
             "Python-compat and JCS MUST diverge on non-ASCII; this is the trap \
              put_blob_signing closes by owning the canonicalizer choice"
         );
+    }
+
+    // ── v3.6.0 (CIRISPersist#134) — perceptual_hash hook tests ──────
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn hash_matched_known_bad_kind_string() {
+        let e = BlobError::HashMatchedKnownBad {
+            database: crate::federation::HashDatabaseId("ncmec".into()),
+            score: 0.9,
+            threshold: 0.5,
+        };
+        assert_eq!(e.kind(), "blob_hash_matched_known_bad");
+    }
+
+    /// Helper for the put_blob_signing matcher tests: a matcher that
+    /// returns Match for every call. Used to assert the trait
+    /// surface gates inline writes.
+    #[cfg(feature = "sqlite")]
+    struct AlwaysMatchTest;
+
+    #[cfg(feature = "sqlite")]
+    #[async_trait::async_trait]
+    impl crate::federation::PerceptualHashMatcher for AlwaysMatchTest {
+        async fn check(
+            &self,
+            _sha256: &[u8; 32],
+            _body: &[u8],
+        ) -> Result<crate::federation::HashMatchResult, crate::federation::HashMatchError> {
+            Ok(crate::federation::HashMatchResult::Match {
+                database: crate::federation::HashDatabaseId("test-ncmec".into()),
+                score: 0.99,
+                threshold: 0.5,
+            })
+        }
+        fn databases(&self) -> &[crate::federation::HashDatabaseId] {
+            &[]
+        }
+        fn on_match_policy(&self) -> crate::federation::OnMatchPolicy {
+            crate::federation::OnMatchPolicy::Refuse
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    async fn seed_signer_for(
+        backend: &crate::store::sqlite::SqliteBackend,
+        key_id: &str,
+    ) -> crate::signing::LocalSignerHardwareAdapter {
+        use crate::federation::FederationDirectory;
+        use ed25519_dalek::SigningKey;
+        let signing_key = SigningKey::from_bytes(&[0x77; 32]);
+        let pubkey_b64 = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(signing_key.verifying_key().to_bytes())
+        };
+        let record = crate::federation::types::KeyRecord {
+            key_id: key_id.into(),
+            pubkey_ed25519_base64: pubkey_b64,
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: crate::federation::types::algorithm::HYBRID.into(),
+            identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
+            identity_ref: key_id.into(),
+            valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
+            valid_until: None,
+            registration_envelope: serde_json::json!({"id": key_id}),
+            original_content_hash: "deadbeef".into(),
+            scrub_signature_classical: "c2lnbmF0dXJl".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: key_id.into(),
+            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+        };
+        backend
+            .put_public_key(crate::federation::types::SignedKeyRecord { record })
+            .await
+            .unwrap();
+        let local = std::sync::Arc::new(crate::signing::LocalSigner::from_parts(
+            signing_key,
+            key_id.into(),
+            None,
+            None,
+        ));
+        crate::signing::LocalSignerHardwareAdapter::new(local)
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn put_blob_signing_refuses_when_matcher_returns_match() {
+        use crate::store::backend::Backend;
+        let backend = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        backend.run_migrations().await.unwrap();
+        let signer = seed_signer_for(&backend, "test-key").await;
+        backend.set_perceptual_hash_matcher(Some(std::sync::Arc::new(AlwaysMatchTest)));
+
+        let body = b"some bytes".to_vec();
+        let sha = {
+            use sha2::Digest;
+            let mut s = [0u8; 32];
+            s.copy_from_slice(&sha2::Sha256::digest(&body));
+            s
+        };
+        let err = backend
+            .put_blob_signing(
+                &sha,
+                BlobBody::Inline(body),
+                None,
+                "test-key",
+                &signer,
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            BlobError::HashMatchedKnownBad { database, .. } => {
+                assert_eq!(database.0, "test-ncmec");
+            }
+            other => panic!("expected HashMatchedKnownBad, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn put_blob_signing_admits_when_matcher_returns_no_match() {
+        use crate::store::backend::Backend;
+        let backend = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        backend.run_migrations().await.unwrap();
+        let signer = seed_signer_for(&backend, "test-key").await;
+        backend.set_perceptual_hash_matcher(Some(std::sync::Arc::new(
+            crate::federation::NullPerceptualHashMatcher,
+        )));
+
+        let body = b"clean bytes".to_vec();
+        let sha = {
+            use sha2::Digest;
+            let mut s = [0u8; 32];
+            s.copy_from_slice(&sha2::Sha256::digest(&body));
+            s
+        };
+        backend
+            .put_blob_signing(
+                &sha,
+                BlobBody::Inline(body),
+                None,
+                "test-key",
+                &signer,
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn put_blob_signing_skips_matcher_for_external_body() {
+        use crate::store::backend::Backend;
+        let backend = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        backend.run_migrations().await.unwrap();
+        let signer = seed_signer_for(&backend, "test-key").await;
+        // Install the always-match matcher; external body must still
+        // admit because the matcher is skipped for non-Inline bodies.
+        backend.set_perceptual_hash_matcher(Some(std::sync::Arc::new(AlwaysMatchTest)));
+
+        // Sha is caller-asserted for External (per put_blob contract).
+        let sha = [0xAB; 32];
+        let ext = ExternalRef {
+            uri: "s3://bucket/key".into(),
+            size_bytes: 100,
+            media_type: None,
+        };
+        backend
+            .put_blob_signing(
+                &sha,
+                BlobBody::External(ext),
+                None,
+                "test-key",
+                &signer,
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .unwrap();
     }
 }

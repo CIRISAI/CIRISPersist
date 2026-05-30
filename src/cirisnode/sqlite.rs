@@ -250,6 +250,22 @@ impl NodeCoreService for SqliteNodeCoreBackend {
             .as_ref()
             .map(|p| p.authority_class.as_str().to_owned());
 
+        // v3.6.0 (CIRISPersist#134) — media-sharing extractors mirror
+        // the PG impl. Typed shape validators run BEFORE the SQLite
+        // trigger fires.
+        let takedown =
+            super::media_sharing::extract_takedown_notice_payload(&subject_kind, &env.payload)?;
+        let key_grant =
+            super::media_sharing::extract_key_grant_payload(&subject_kind, &env.payload)?;
+        let media_content_sha256: Option<String> = takedown
+            .as_ref()
+            .map(|p| p.content_sha256.clone())
+            .or_else(|| key_grant.as_ref().map(|p| p.content_sha256.clone()));
+        let takedown_legal_basis: Option<String> =
+            takedown.as_ref().map(|p| p.legal_basis.as_str().to_owned());
+        let key_grant_recipient_key_id: Option<String> =
+            key_grant.as_ref().map(|p| p.recipient_key_id.clone());
+
         let id_str = id.to_string();
         let ct_str = contribution_type_str(env.contribution_type).to_owned();
         let domain = env.subject.domain.clone();
@@ -275,8 +291,10 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                         contribution_id, contribution_type, domain, language, subject_kind, \
                         author_id, payload, witness_set, submitted_at, \
                         signature, signing_key_id, signature_verified, persist_row_hash, \
-                        announcement_priority, announcement_authority_class\
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?13, ?14)",
+                        announcement_priority, announcement_authority_class, \
+                        media_content_sha256, key_grant_recipient_key_id, takedown_legal_basis\
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?13, ?14, \
+                               ?15, ?16, ?17)",
                     params![
                         id_str,
                         ct_str,
@@ -292,6 +310,9 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                         sig_b64,
                         announcement_priority,
                         announcement_authority_class,
+                        media_content_sha256,
+                        key_grant_recipient_key_id,
+                        takedown_legal_basis,
                     ],
                 )
                 .map_err(|e| map_sqlite_error(e, "put_contribution"))?;
@@ -1454,6 +1475,329 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         .await
         .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
     }
+
+    // ── Media-sharing reads (v3.6.0, CIRISPersist#134) ─────────────
+
+    async fn list_takedowns_for(
+        &self,
+        content_sha256: &str,
+    ) -> Result<Vec<ContributionEnvelope>, Error> {
+        let sha = content_sha256.to_owned();
+        let conn = self.conn.clone();
+        let rows = tokio::task::spawn_blocking(move || -> Result<Vec<ContributionRow>, Error> {
+            let guard = conn.blocking_lock();
+            let mut stmt = guard
+                .prepare(
+                    "SELECT contribution_id, contribution_type, domain, language, subject_kind, \
+                            author_id, payload, witness_set, submitted_at, signature \
+                     FROM cirisnode_contributions \
+                     WHERE subject_kind = 'takedown_notice' \
+                       AND media_content_sha256 = ?1 \
+                     ORDER BY submitted_at DESC, contribution_id DESC",
+                )
+                .map_err(|e| map_sqlite_error(e, "list_takedowns_for prepare"))?;
+            let rows = stmt
+                .query_map([sha], read_contribution_row)
+                .map_err(|e| map_sqlite_error(e, "list_takedowns_for query"))?;
+            let out: Result<Vec<_>, _> = rows.collect();
+            out.map_err(|e| map_sqlite_error(e, "list_takedowns_for collect"))
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))??;
+        rows.into_iter().map(materialize_contribution).collect()
+    }
+
+    async fn list_key_grants_for(
+        &self,
+        recipient_key_id: &str,
+    ) -> Result<Vec<ContributionEnvelope>, Error> {
+        let recipient = recipient_key_id.to_owned();
+        let conn = self.conn.clone();
+        let rows = tokio::task::spawn_blocking(move || -> Result<Vec<ContributionRow>, Error> {
+            let guard = conn.blocking_lock();
+            let mut stmt = guard
+                .prepare(
+                    "SELECT contribution_id, contribution_type, domain, language, subject_kind, \
+                            author_id, payload, witness_set, submitted_at, signature \
+                     FROM cirisnode_contributions \
+                     WHERE subject_kind = 'key_grant' \
+                       AND key_grant_recipient_key_id = ?1 \
+                     ORDER BY submitted_at DESC, contribution_id DESC",
+                )
+                .map_err(|e| map_sqlite_error(e, "list_key_grants_for prepare"))?;
+            let rows = stmt
+                .query_map([recipient], read_contribution_row)
+                .map_err(|e| map_sqlite_error(e, "list_key_grants_for query"))?;
+            let out: Result<Vec<_>, _> = rows.collect();
+            out.map_err(|e| map_sqlite_error(e, "list_key_grants_for collect"))
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))??;
+        rows.into_iter().map(materialize_contribution).collect()
+    }
+
+    async fn list_key_grants_for_content(
+        &self,
+        content_sha256: &str,
+        recipient_key_id: &str,
+    ) -> Result<Vec<ContributionEnvelope>, Error> {
+        let sha = content_sha256.to_owned();
+        let recipient = recipient_key_id.to_owned();
+        let conn = self.conn.clone();
+        let rows = tokio::task::spawn_blocking(move || -> Result<Vec<ContributionRow>, Error> {
+            let guard = conn.blocking_lock();
+            let mut stmt = guard
+                .prepare(
+                    "SELECT contribution_id, contribution_type, domain, language, subject_kind, \
+                            author_id, payload, witness_set, submitted_at, signature \
+                     FROM cirisnode_contributions \
+                     WHERE subject_kind = 'key_grant' \
+                       AND media_content_sha256 = ?1 \
+                       AND key_grant_recipient_key_id = ?2 \
+                     ORDER BY submitted_at DESC, contribution_id DESC",
+                )
+                .map_err(|e| map_sqlite_error(e, "list_key_grants_for_content prepare"))?;
+            let rows = stmt
+                .query_map([sha, recipient], read_contribution_row)
+                .map_err(|e| map_sqlite_error(e, "list_key_grants_for_content query"))?;
+            let out: Result<Vec<_>, _> = rows.collect();
+            out.map_err(|e| map_sqlite_error(e, "list_key_grants_for_content collect"))
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))??;
+        rows.into_iter().map(materialize_contribution).collect()
+    }
+
+    async fn retire_key_grants(
+        &self,
+        actor_key_id: &str,
+        signer: &dyn ciris_keyring::HardwareSigner,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<super::RetireKeyGrantsReport, Error> {
+        // CEG 0.3 §5.6.8.4 — rotation_chain supersession (option b
+        // from CIRISRegistry#38): each prior grant is retired by
+        // emitting a fresh key_grant Contribution whose rotation_chain
+        // is extended by the prior contribution_id.
+        let actor = actor_key_id.to_owned();
+        let conn = self.conn.clone();
+        let priors = tokio::task::spawn_blocking(
+            move || -> Result<Vec<(String, String, String, String)>, Error> {
+                let guard = conn.blocking_lock();
+                let mut stmt = guard
+                    .prepare(
+                        "SELECT contribution_id, domain, language, payload \
+                         FROM cirisnode_contributions \
+                         WHERE subject_kind = 'key_grant' AND author_id = ?1",
+                    )
+                    .map_err(|e| map_sqlite_error(e, "retire_key_grants list prepare"))?;
+                let rows = stmt
+                    .query_map([actor], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    })
+                    .map_err(|e| map_sqlite_error(e, "retire_key_grants list query"))?;
+                let out: Result<Vec<_>, _> = rows.collect();
+                out.map_err(|e| map_sqlite_error(e, "retire_key_grants list collect"))
+            },
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))??;
+
+        let mut report = super::RetireKeyGrantsReport {
+            grants_seen: priors.len(),
+            ..Default::default()
+        };
+        for (prior_id, domain, language, payload_text) in priors {
+            let prior: super::media_sharing::KeyGrantPayload =
+                match serde_json::from_str(&payload_text) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        report.supersedes_failed += 1;
+                        tracing::warn!(
+                            error = %e,
+                            actor = %actor_key_id,
+                            contribution_id = %prior_id,
+                            "ciris-persist v3.6.0 retire_key_grants: prior payload decode failed"
+                        );
+                        continue;
+                    }
+                };
+            let outcome = emit_key_grant_supersession_sqlite(
+                self,
+                &prior_id,
+                actor_key_id,
+                &domain,
+                &language,
+                &prior,
+                signer,
+                now,
+            )
+            .await;
+            match outcome {
+                Ok(()) => report.supersedes_emitted += 1,
+                Err(e) => {
+                    report.supersedes_failed += 1;
+                    tracing::warn!(
+                        error = %e,
+                        actor = %actor_key_id,
+                        contribution_id = %prior_id,
+                        "ciris-persist v3.6.0 retire_key_grants: supersession emission failed"
+                    );
+                }
+            }
+        }
+        Ok(report)
+    }
+}
+
+/// Raw column tuple for the list_* media-sharing reads.
+type ContributionRow = (
+    String,         // contribution_id
+    String,         // contribution_type
+    String,         // domain
+    String,         // language
+    String,         // subject_kind
+    String,         // author_id
+    String,         // payload (JSON text)
+    Option<String>, // witness_set (JSON text)
+    String,         // submitted_at
+    String,         // signature
+);
+
+fn read_contribution_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContributionRow> {
+    Ok((
+        row.get::<_, String>(0)?,
+        row.get::<_, String>(1)?,
+        row.get::<_, String>(2)?,
+        row.get::<_, String>(3)?,
+        row.get::<_, String>(4)?,
+        row.get::<_, String>(5)?,
+        row.get::<_, String>(6)?,
+        row.get::<_, Option<String>>(7)?,
+        row.get::<_, String>(8)?,
+        row.get::<_, String>(9)?,
+    ))
+}
+
+fn materialize_contribution(raw: ContributionRow) -> Result<ContributionEnvelope, Error> {
+    let (
+        contribution_id,
+        ct_str,
+        domain,
+        language,
+        subject_kind,
+        author_id,
+        payload_text,
+        witness_set_text,
+        submitted_at_str,
+        signature_b64,
+    ) = raw;
+    let payload = json_value(&payload_text)?;
+    let witness_set = match witness_set_text {
+        None => None,
+        Some(s) => Some(
+            serde_json::from_str(&s)
+                .map_err(|e| Error::Backend(format!("witness_set decode: {e}")))?,
+        ),
+    };
+    let submitted_at = parse_datetime(&submitted_at_str)?;
+    Ok(ContributionEnvelope {
+        contribution_id,
+        contribution_type: contribution_type_from_str(&ct_str)?,
+        author_id,
+        subject: Cell {
+            domain,
+            language,
+            subject: Some(subject_kind),
+        },
+        payload,
+        witness_set,
+        signature: HybridSignature {
+            ed25519: signature_b64,
+            ml_dsa_65: None,
+            signed_at: submitted_at,
+        },
+        submitted_at,
+    })
+}
+
+/// v3.6.0 (CIRISPersist#134) — sibling of the PG-side
+/// `emit_key_grant_supersession`. Emits a fresh `key_grant` Contribution
+/// against the SQLite NodeCore backend with the rotation_chain
+/// extended by the prior contribution_id.
+///
+/// CEG 0.3 §5.6.8.4 — rotation_chain supersession (option b from
+/// CIRISRegistry#38).
+#[allow(clippy::too_many_arguments)]
+async fn emit_key_grant_supersession_sqlite(
+    backend: &SqliteNodeCoreBackend,
+    prior_contribution_id: &str,
+    actor_key_id: &str,
+    domain: &str,
+    language: &str,
+    prior: &super::media_sharing::KeyGrantPayload,
+    signer: &dyn ciris_keyring::HardwareSigner,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Error> {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+
+    let mut rotation_chain = prior.rotation_chain.clone();
+    rotation_chain.push(prior_contribution_id.to_owned());
+
+    let revocation_dek = B64.encode(Vec::<u8>::new());
+
+    let supersession_payload = super::media_sharing::KeyGrantPayload {
+        recipient_key_id: prior.recipient_key_id.clone(),
+        content_sha256: prior.content_sha256.clone(),
+        wrapped_dek_base64: revocation_dek,
+        wrap_algorithm: super::media_sharing::WrapAlgorithm::HpkeRfc9180BaseX25519AesGcm,
+        ratchet_version: prior.ratchet_version,
+        key_validity_window: super::media_sharing::KeyValidityWindow {
+            not_before: now,
+            not_after: now + chrono::Duration::seconds(1),
+        },
+        scope: prior.scope,
+        scope_id: prior.scope_id.clone(),
+        rotation_chain,
+    };
+    let payload_value = serde_json::to_value(&supersession_payload)
+        .map_err(|e| Error::Internal(format!("supersession serialize: {e}")))?;
+
+    let mut env = ContributionEnvelope {
+        contribution_id: uuid::Uuid::new_v4().to_string(),
+        contribution_type: ContributionType::Proposal,
+        author_id: actor_key_id.to_owned(),
+        subject: Cell {
+            domain: domain.to_owned(),
+            language: language.to_owned(),
+            subject: Some(super::media_sharing::KEY_GRANT_SUBJECT_KIND.to_owned()),
+        },
+        payload: payload_value,
+        witness_set: None,
+        signature: HybridSignature {
+            ed25519: String::new(),
+            ml_dsa_65: None,
+            signed_at: now,
+        },
+        submitted_at: now,
+    };
+    let canonical = super::verify::canonical_bytes_for_envelope(&env)?;
+    let sig_bytes = signer
+        .sign(&canonical)
+        .await
+        .map_err(|e| Error::Backend(format!("supersession sign: {e}")))?;
+    env.signature = HybridSignature {
+        ed25519: B64.encode(&sig_bytes),
+        ml_dsa_65: None,
+        signed_at: now,
+    };
+    use super::NodeCoreService;
+    backend.put_contribution(env).await
 }
 
 #[cfg(test)]
@@ -2447,5 +2791,409 @@ mod tests {
             }
             other => panic!("expected InvalidArgument, got {other:?}"),
         }
+    }
+
+    // ── Media-sharing tests (v3.6.0, CIRISPersist#134) ─────────────
+
+    fn fixture_sha_hex_sqlite(seed: u8) -> String {
+        let mut bytes = [0u8; 32];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = seed.wrapping_add(i as u8);
+        }
+        hex::encode(bytes)
+    }
+
+    fn build_takedown_contribution_sqlite(
+        author_key: &ed25519_dalek::SigningKey,
+        sha_hex: &str,
+        basis: crate::cirisnode::LegalBasis,
+    ) -> ContributionEnvelope {
+        let author = pubkey_b64(author_key);
+        let payload = crate::cirisnode::TakedownNoticePayload {
+            content_sha256: sha_hex.to_owned(),
+            perceptual_hash: None,
+            content_holder_key_ids: vec![],
+            claimant_key_id: author.clone(),
+            legal_basis: basis,
+            jurisdiction: "US".into(),
+            good_faith_statement: "good faith".into(),
+            claim_text: "claim".into(),
+            evidence_refs: vec![],
+            counter_notice_channel: None,
+            asserted_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::days(30),
+        };
+        let mut env = ContributionEnvelope {
+            contribution_id: Uuid::new_v4().to_string(),
+            contribution_type: ContributionType::Proposal,
+            author_id: author,
+            subject: Cell {
+                domain: format!("media-{}", Uuid::new_v4()),
+                language: "en".into(),
+                subject: Some(crate::cirisnode::TAKEDOWN_NOTICE_SUBJECT_KIND.into()),
+            },
+            payload: serde_json::to_value(&payload).unwrap(),
+            witness_set: None,
+            signature: HybridSignature {
+                ed25519: String::new(),
+                ml_dsa_65: None,
+                signed_at: Utc::now(),
+            },
+            submitted_at: Utc::now(),
+        };
+        env.signature = sign_envelope(&env, author_key);
+        env
+    }
+
+    fn build_key_grant_contribution_sqlite(
+        author_key: &ed25519_dalek::SigningKey,
+        sha_hex: &str,
+        recipient_key_id: &str,
+    ) -> ContributionEnvelope {
+        let author = pubkey_b64(author_key);
+        let payload = crate::cirisnode::KeyGrantPayload {
+            recipient_key_id: recipient_key_id.to_owned(),
+            content_sha256: sha_hex.to_owned(),
+            wrapped_dek_base64: {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD.encode([0u8; 48])
+            },
+            wrap_algorithm: crate::cirisnode::WrapAlgorithm::HpkeRfc9180BaseX25519AesGcm,
+            ratchet_version: 1,
+            key_validity_window: crate::cirisnode::KeyValidityWindow {
+                not_before: Utc::now(),
+                not_after: Utc::now() + chrono::Duration::days(30),
+            },
+            scope: crate::cirisnode::KeyGrantScope::SingleContent,
+            scope_id: sha_hex.to_owned(),
+            rotation_chain: vec![],
+        };
+        let mut env = ContributionEnvelope {
+            contribution_id: Uuid::new_v4().to_string(),
+            contribution_type: ContributionType::Proposal,
+            author_id: author,
+            subject: Cell {
+                domain: format!("media-{}", Uuid::new_v4()),
+                language: "en".into(),
+                subject: Some(crate::cirisnode::KEY_GRANT_SUBJECT_KIND.into()),
+            },
+            payload: serde_json::to_value(&payload).unwrap(),
+            witness_set: None,
+            signature: HybridSignature {
+                ed25519: String::new(),
+                ml_dsa_65: None,
+                signed_at: Utc::now(),
+            },
+            submitted_at: Utc::now(),
+        };
+        env.signature = sign_envelope(&env, author_key);
+        env
+    }
+
+    #[tokio::test]
+    async fn sqlite_takedown_notice_admits_via_put_contribution() {
+        let (_b, cn) = fresh_backend().await;
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xF1; 32]);
+        let sha_hex = fixture_sha_hex_sqlite(0x70);
+        let env = build_takedown_contribution_sqlite(
+            &author_key,
+            &sha_hex,
+            crate::cirisnode::LegalBasis::Dmca512,
+        );
+        cn.put_contribution(env).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_takedown_notice_payload_shape_validates() {
+        let (_b, cn) = fresh_backend().await;
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xF2; 32]);
+        let env = build_takedown_contribution_sqlite(
+            &author_key,
+            "not-hex",
+            crate::cirisnode::LegalBasis::Dmca512,
+        );
+        let err = cn.put_contribution(env).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn sqlite_key_grant_admits_via_put_contribution() {
+        let (_b, cn) = fresh_backend().await;
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xF3; 32]);
+        let sha_hex = fixture_sha_hex_sqlite(0x71);
+        let env = build_key_grant_contribution_sqlite(&author_key, &sha_hex, "recipient-key-1");
+        cn.put_contribution(env).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_key_grant_payload_shape_validates() {
+        let (_b, cn) = fresh_backend().await;
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xF4; 32]);
+        let sha_hex = fixture_sha_hex_sqlite(0x72);
+        let mut env = build_key_grant_contribution_sqlite(&author_key, &sha_hex, "rec");
+        if let Some(obj) = env.payload.as_object_mut() {
+            obj.insert(
+                "wrapped_dek_base64".into(),
+                serde_json::Value::String("!!not_base64!!".into()),
+            );
+        }
+        env.signature = sign_envelope(&env, &author_key);
+        let err = cn.put_contribution(env).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn sqlite_list_takedowns_for_returns_only_matching_sha() {
+        let (_b, cn) = fresh_backend().await;
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xF5; 32]);
+        let sha_a = fixture_sha_hex_sqlite(0x10);
+        let sha_b = fixture_sha_hex_sqlite(0x20);
+        cn.put_contribution(build_takedown_contribution_sqlite(
+            &author_key,
+            &sha_a,
+            crate::cirisnode::LegalBasis::Dmca512,
+        ))
+        .await
+        .unwrap();
+        cn.put_contribution(build_takedown_contribution_sqlite(
+            &author_key,
+            &sha_b,
+            crate::cirisnode::LegalBasis::DsaArticle16,
+        ))
+        .await
+        .unwrap();
+        let rows = cn.list_takedowns_for(&sha_a).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]
+                .payload
+                .get("content_sha256")
+                .and_then(|v| v.as_str()),
+            Some(sha_a.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_list_key_grants_for_returns_only_matching_recipient() {
+        let (_b, cn) = fresh_backend().await;
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xF6; 32]);
+        let sha = fixture_sha_hex_sqlite(0x30);
+        let recip = format!("rec-{}", Uuid::new_v4());
+        let other = format!("other-{}", Uuid::new_v4());
+        cn.put_contribution(build_key_grant_contribution_sqlite(
+            &author_key,
+            &sha,
+            &recip,
+        ))
+        .await
+        .unwrap();
+        cn.put_contribution(build_key_grant_contribution_sqlite(
+            &author_key,
+            &sha,
+            &other,
+        ))
+        .await
+        .unwrap();
+        let rows = cn.list_key_grants_for(&recip).await.unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_list_key_grants_for_content_filters_both_axes() {
+        let (_b, cn) = fresh_backend().await;
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xF7; 32]);
+        let sha_a = fixture_sha_hex_sqlite(0x40);
+        let sha_b = fixture_sha_hex_sqlite(0x50);
+        let recip_a = format!("rec-a-{}", Uuid::new_v4());
+        let recip_b = format!("rec-b-{}", Uuid::new_v4());
+        cn.put_contribution(build_key_grant_contribution_sqlite(
+            &author_key,
+            &sha_a,
+            &recip_a,
+        ))
+        .await
+        .unwrap();
+        cn.put_contribution(build_key_grant_contribution_sqlite(
+            &author_key,
+            &sha_a,
+            &recip_b,
+        ))
+        .await
+        .unwrap();
+        cn.put_contribution(build_key_grant_contribution_sqlite(
+            &author_key,
+            &sha_b,
+            &recip_a,
+        ))
+        .await
+        .unwrap();
+        let rows = cn
+            .list_key_grants_for_content(&sha_a, &recip_a)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    /// CEG 0.3 §5.6.8.4 — option (b) supersession: retire_key_grants
+    /// emits a FRESH key_grant Contribution with rotation_chain
+    /// extended by the prior contribution_id.
+    #[tokio::test]
+    async fn sqlite_retire_key_grants_emits_rotation_chain_not_withdraws() {
+        let (backend, cn) = fresh_backend().await;
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xF8; 32]);
+        let author = pubkey_b64(&author_key);
+
+        // Seed federation_keys for the actor so the put_contribution
+        // signature-verify path clears.
+        let key_record = crate::federation::types::KeyRecord {
+            key_id: author.clone(),
+            pubkey_ed25519_base64: author.clone(),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: crate::federation::types::algorithm::HYBRID.into(),
+            identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
+            identity_ref: author.clone(),
+            valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
+            valid_until: None,
+            registration_envelope: serde_json::json!({"id": author}),
+            original_content_hash: "deadbeef".into(),
+            scrub_signature_classical: "c2lnbmF0dXJl".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: author.clone(),
+            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+        };
+        use crate::federation::FederationDirectory;
+        backend
+            .put_public_key(crate::federation::types::SignedKeyRecord { record: key_record })
+            .await
+            .unwrap();
+
+        let sha_a = fixture_sha_hex_sqlite(0x60);
+        let sha_b = fixture_sha_hex_sqlite(0x61);
+        let prior_a = build_key_grant_contribution_sqlite(&author_key, &sha_a, "rec-1");
+        let prior_a_id = prior_a.contribution_id.clone();
+        let prior_b = build_key_grant_contribution_sqlite(&author_key, &sha_b, "rec-2");
+        let prior_b_id = prior_b.contribution_id.clone();
+        cn.put_contribution(prior_a).await.unwrap();
+        cn.put_contribution(prior_b).await.unwrap();
+
+        use crate::signing::{LocalSigner, LocalSignerHardwareAdapter};
+        let local = std::sync::Arc::new(LocalSigner::from_parts(
+            author_key.clone(),
+            author.clone(),
+            None,
+            None,
+        ));
+        let signer = LocalSignerHardwareAdapter::new(local);
+        let report = cn
+            .retire_key_grants(&author, &signer, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(report.grants_seen, 2);
+        assert_eq!(report.supersedes_emitted, 2);
+        assert_eq!(report.supersedes_failed, 0);
+
+        let recip_a_grants = cn.list_key_grants_for("rec-1").await.unwrap();
+        let supersedes_a = recip_a_grants
+            .iter()
+            .find(|g| {
+                g.payload
+                    .get("rotation_chain")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().any(|x| x.as_str() == Some(prior_a_id.as_str())))
+                    .unwrap_or(false)
+            })
+            .expect("supersession grant referencing prior_a_id");
+        assert_eq!(
+            supersedes_a
+                .payload
+                .get("wrapped_dek_base64")
+                .and_then(|v| v.as_str()),
+            Some(""),
+            "CEG 0.3 §5.6.8.4 revocation sentinel: empty DEK base64"
+        );
+        assert_eq!(
+            supersedes_a
+                .payload
+                .get("wrap_algorithm")
+                .and_then(|v| v.as_str()),
+            Some("hpke_rfc9180_base_x25519_aes_gcm"),
+            "CEG 0.3 §5.6.8.4 wrap_algorithm wire string"
+        );
+
+        let recip_b_grants = cn.list_key_grants_for("rec-2").await.unwrap();
+        assert!(
+            recip_b_grants.iter().any(|g| g
+                .payload
+                .get("rotation_chain")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().any(|x| x.as_str() == Some(prior_b_id.as_str())))
+                .unwrap_or(false)),
+            "supersession grant referencing prior_b_id"
+        );
+    }
+
+    /// V054 trigger discipline (SQLite): bare-SQL INSERT that
+    /// violates the takedown subject_kind / column asymmetry must
+    /// be rejected at the trigger.
+    #[tokio::test]
+    async fn sqlite_v054_trigger_rejects_mismatched_takedown_columns() {
+        let (backend, _cn) = fresh_backend().await;
+        let conn = backend.conn_handle();
+        let err = tokio::task::spawn_blocking(move || -> rusqlite::Result<usize> {
+            let guard = conn.blocking_lock();
+            guard.execute(
+                "INSERT INTO cirisnode_contributions (\
+                    contribution_id, contribution_type, domain, language, subject_kind, \
+                    author_id, payload, witness_set, submitted_at, \
+                    signature, signing_key_id, signature_verified, persist_row_hash, \
+                    takedown_legal_basis\
+                 ) VALUES ('id-1', 'proposal', 'd', 'en', 'arc_question', 'a', '{}', NULL, \
+                           '2026-01-01T00:00:00Z', 'sig', 'a', 1, 'h', 'dmca_512')",
+                [],
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap_err();
+        let detail = err.to_string();
+        assert!(
+            detail.contains("constitutional")
+                || detail.contains("constraint")
+                || detail.contains("takedown"),
+            "expected trigger violation; got: {detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_v054_trigger_rejects_mismatched_key_grant_columns() {
+        let (backend, _cn) = fresh_backend().await;
+        let conn = backend.conn_handle();
+        let err = tokio::task::spawn_blocking(move || -> rusqlite::Result<usize> {
+            let guard = conn.blocking_lock();
+            guard.execute(
+                "INSERT INTO cirisnode_contributions (\
+                    contribution_id, contribution_type, domain, language, subject_kind, \
+                    author_id, payload, witness_set, submitted_at, \
+                    signature, signing_key_id, signature_verified, persist_row_hash, \
+                    key_grant_recipient_key_id\
+                 ) VALUES ('id-2', 'proposal', 'd', 'en', 'arc_question', 'a', '{}', NULL, \
+                           '2026-01-01T00:00:00Z', 'sig', 'a', 1, 'h', 'rec-1')",
+                [],
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap_err();
+        let detail = err.to_string();
+        assert!(
+            detail.contains("constitutional")
+                || detail.contains("constraint")
+                || detail.contains("key_grant"),
+            "expected trigger violation; got: {detail}"
+        );
     }
 }

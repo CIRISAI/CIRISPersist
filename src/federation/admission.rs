@@ -359,6 +359,7 @@ pub fn default_reserved_prefix_rules() -> Vec<ReservedPrefixRule> {
     use super::types::identity_type;
     let substrate_persist = identity_type::SUBSTRATE_PERSIST.to_owned();
     let witness = identity_type::WITNESS.to_owned();
+    let trusted_publisher = identity_type::TRUSTED_PUBLISHER.to_owned();
     vec![
         ReservedPrefixRule {
             pattern_prefix: "system:".into(),
@@ -378,10 +379,36 @@ pub fn default_reserved_prefix_rules() -> Vec<ReservedPrefixRule> {
         },
         ReservedPrefixRule {
             pattern_prefix: "federation_directory:".into(),
-            required_identity_types: vec![substrate_persist],
+            required_identity_types: vec![substrate_persist.clone()],
         },
         ReservedPrefixRule {
             pattern_prefix: "transparency_log:cosigned:".into(),
+            required_identity_types: vec![witness.clone()],
+        },
+        // CEG 0.3 §5.6.8.3 + §11.5.3 — four new reserved-prefix
+        // families added for media-sharing admission.
+        //
+        // - content_rating:{scheme}:{rating} → emitted by trusted_publisher
+        //   (publisher-curated content ratings per Policy J).
+        // - content_class:{class} → emitted by substrate_persist.
+        // - cw_class:{class} → emitted by substrate_persist
+        //   (content-warning class).
+        // - age_assurance:{level} → emitted by witness (a registered
+        //   age-assurance provider).
+        ReservedPrefixRule {
+            pattern_prefix: "content_rating:".into(),
+            required_identity_types: vec![trusted_publisher],
+        },
+        ReservedPrefixRule {
+            pattern_prefix: "content_class:".into(),
+            required_identity_types: vec![substrate_persist.clone()],
+        },
+        ReservedPrefixRule {
+            pattern_prefix: "cw_class:".into(),
+            required_identity_types: vec![substrate_persist],
+        },
+        ReservedPrefixRule {
+            pattern_prefix: "age_assurance:".into(),
             required_identity_types: vec![witness],
         },
     ]
@@ -1028,8 +1055,9 @@ mod tests {
     #[test]
     fn default_reserved_prefix_rules_cover_ceg_persist_slice() {
         // Sanity: the default rules cover the CEG §5.3 substrate-
-        // self-report set + §7.6 witness rule. Regression-guards the
-        // table doc-comment.
+        // self-report set + §7.6 witness rule + CEG 0.3 §5.6.8.3
+        // four-family media-sharing set. Regression-guards the table
+        // doc-comment.
         let rules = default_reserved_prefix_rules();
         let prefixes: Vec<&str> = rules.iter().map(|r| r.pattern_prefix.as_str()).collect();
         for expected in &[
@@ -1039,11 +1067,116 @@ mod tests {
             "identity_continuity:",
             "federation_directory:",
             "transparency_log:cosigned:",
+            // CEG 0.3 §5.6.8.3 — four new families.
+            "content_rating:",
+            "content_class:",
+            "cw_class:",
+            "age_assurance:",
         ] {
             assert!(
                 prefixes.contains(expected),
                 "default rules missing {expected}; got {prefixes:?}"
             );
         }
+    }
+
+    // ── CEG 0.3 §5.6.8.3 + §11.5.3 — four new reserved-prefix tests ──
+
+    #[test]
+    fn reserved_prefix_content_rating_requires_trusted_publisher_emitter() {
+        // CEG 0.3 §11.5.3: only trusted_publisher may emit
+        // content_rating:* attestations.
+        let p = default_policy();
+        let err = p
+            .check(
+                attestation_type::SCORES,
+                Some("content_rating:mpa:pg13:v1"),
+                identity_type::AGENT,
+            )
+            .unwrap_err();
+        match err {
+            Error::ReservedPrefixEmitterMismatch {
+                prefix, required, ..
+            } => {
+                assert_eq!(prefix, "content_rating:");
+                assert_eq!(required, vec!["trusted_publisher".to_string()]);
+            }
+            other => panic!("expected ReservedPrefixEmitterMismatch, got {other:?}"),
+        }
+        // trusted_publisher passes.
+        p.check(
+            attestation_type::SCORES,
+            Some("content_rating:mpa:pg13:v1"),
+            identity_type::TRUSTED_PUBLISHER,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn reserved_prefix_content_class_requires_substrate_persist_emitter() {
+        let p = default_policy();
+        let err = p
+            .check(
+                attestation_type::SCORES,
+                Some("content_class:violence:v1"),
+                identity_type::AGENT,
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::ReservedPrefixEmitterMismatch { .. }));
+        p.check(
+            attestation_type::SCORES,
+            Some("content_class:violence:v1"),
+            identity_type::SUBSTRATE_PERSIST,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn reserved_prefix_cw_class_requires_substrate_persist_emitter() {
+        let p = default_policy();
+        let err = p
+            .check(
+                attestation_type::SCORES,
+                Some("cw_class:flashing_lights:v1"),
+                identity_type::WITNESS,
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::ReservedPrefixEmitterMismatch { .. }));
+        p.check(
+            attestation_type::SCORES,
+            Some("cw_class:flashing_lights:v1"),
+            identity_type::SUBSTRATE_PERSIST,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn reserved_prefix_age_assurance_requires_witness_emitter() {
+        // CEG 0.3 §5.6.8.3: age_assurance:* is witness-only (registered
+        // age-assurance provider).
+        let p = default_policy();
+        let err = p
+            .check(
+                attestation_type::SCORES,
+                Some("age_assurance:thirteen_plus:v1"),
+                identity_type::SUBSTRATE_PERSIST,
+            )
+            .unwrap_err();
+        match err {
+            Error::ReservedPrefixEmitterMismatch {
+                prefix, required, ..
+            } => {
+                assert_eq!(prefix, "age_assurance:");
+                assert_eq!(required, vec!["witness".to_string()]);
+            }
+            other => panic!("expected ReservedPrefixEmitterMismatch, got {other:?}"),
+        }
+        // witness passes.
+        p.check(
+            attestation_type::SCORES,
+            Some("age_assurance:thirteen_plus:v1"),
+            identity_type::WITNESS,
+        )
+        .unwrap();
     }
 }

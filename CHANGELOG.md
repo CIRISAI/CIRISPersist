@@ -5,6 +5,179 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.6.0] — 2026-05-30
+
+**CIRISPersist 3.6 — multimedia tier substrate (#134 / MEDIA_SHARING.md / CEG 0.3 §5.6.8 + §8.1.10 + §11.4 + §11.5).**
+
+Monolithic minor cut implementing the substrate execution site for CIRISNodeCore's MEDIA_SHARING.md (federation media-sharing tier). Shipped with persist-side decisions on 6 architecture ambiguities + the architect's 4-item addendum + 10 CEG 0.3 corrections post-Registry lockdown. 1051+ nextest green on the full feature set across the team's 4 cuts.
+
+### Three upstream issues filed + closed during this cut
+
+- **CIRISRegistry#38** — CEG codification: `takedown_notice` + `key_grant` payload locks, LegalBasis vocabulary + per-basis discipline, `retire_key_grants` emission primitive. **Closed in CEG 0.3.**
+- **CIRISNodeCore#24** — substrate-protective takedown override semantics + DMCA/DSA counter-notice scheduling. **Still open** — counter-notice carrier shape unresolved; persist retains TODO markers at the affected sites.
+- **CIRISRegistry#39** — perceptual-hash database access governance. **Closed in CEG 0.3 §11.5** with option (a): self-hosted PDQ against publicly-distributed feeds is the default operator path.
+
+### #1 — Two new Contribution `subject_kind` variants
+
+New module `src/cirisnode/media_sharing.rs`:
+
+- **`takedown_notice`** with `TakedownNoticePayload` carrying `content_sha256` (hex-64), `content_holder_key_ids`, `claimant_key_id`, `legal_basis`, `jurisdiction`, `good_faith_statement`, `claim_text`, `evidence_refs[]`, optional `perceptual_hash`, optional `counter_notice_channel`, `asserted_at`, optional `expires_at`.
+- **`key_grant`** with `KeyGrantPayload` carrying `recipient_key_id`, `content_sha256`, `wrapped_dek_base64`, `wrap_algorithm`, `ratchet_version`, `key_validity_window`, `scope`, optional `scope_id`, `rotation_chain[]`.
+- `WrapAlgorithm::HpkeRfc9180BaseX25519AesGcm` — v1 per CEG 0.3 §5.6.8.4 (HPKE RFC 9180 base mode, KEM X25519, AEAD AES-128-GCM). Open enum for future v2 ML-KEM hybrid additions.
+- `KeyGrantScope::{SingleContent, GroupMember, SubscriptionTier}`.
+
+Typed extractors `extract_takedown_notice_payload` + `extract_key_grant_payload` validate shape on admission (hex-64 SHA, base64 DEK, non-empty fields, vocabulary match) — typed `Error::InvalidArgument` on rejection.
+
+### #2 — `LegalBasis` discipline split (CEG 0.3 §5.6.8.4 locked)
+
+Closed 10-value set with three discipline categories:
+
+- **Immediate eviction (5)**: `TvecTerrorist`, `NcmecCsam`, `GifctCip`, `PerceptualHashCsam`, `CourtOrder`. Substrate-protective; takedown_handler triggers eviction at admission.
+- **Expeditious-with-counter-notice (4)**: `Dmca512` (10d default), `DsaArticle16` (14d), `OsaIllegalContent` (14d), `CommunityStandards` (30d). takedown_handler emits withdraws immediately + schedules eviction at the counter-notice deadline.
+- **Composes-with-age-gate (1)**: `AvmsdAgeInappropriate`. takedown_handler emits withdraws but **does NOT trigger eviction** — the blob stays in `federation_blobs`; the Policy J age-assurance gate filters at read time (per CEG §8.1.10).
+
+Methods: `LegalBasis::{as_str, from_wire_str, admits_counter_notice, requires_immediate_eviction, composes_with_age_gate, counter_notice_window_days}`.
+
+### #3 — Query surface (3 new methods on `NodeCoreService`)
+
+- `list_takedowns_for(content_sha256)` — all takedown_notice rows for a content.
+- `list_key_grants_for(recipient_key_id)` — all key_grants addressed to a recipient.
+- `list_key_grants_for_content(content_sha256, recipient_key_id)` — single-content key lookup.
+
+Both backends (PG + SQLite) + PyO3 `cirisnode_list_*_json` mirrors.
+
+### #4 — V054 migration
+
+`migrations/{postgres,sqlite}/lens/V054__media_sharing.sql`. Additive ALTER on `cirisnode.contributions`:
+- `media_content_sha256 TEXT NULL` (populated for both new subject_kinds)
+- `key_grant_recipient_key_id TEXT NULL` (key_grant only)
+- `takedown_legal_basis TEXT NULL` (takedown_notice only)
+
+Per-column shape CHECKs (hex-64 regex, basis vocabulary). Table-level CHECK enforcing the column-population ⇔ subject_kind asymmetry (PG); BEFORE INSERT/UPDATE triggers on SQLite. Partial indexes on each new column.
+
+New `cirisnode.scheduled_takedown_actions` table for counter-notice scheduling: `(notice_contribution_id PK FK, scheduled_eviction_at, status, inserted_at)` with partial index on `(scheduled_eviction_at) WHERE status='pending'`.
+
+`tests/qa_harness.rs` bound 53 → 54.
+
+### #5 — Perceptual-hash matcher hook at `put_blob_signing`
+
+New module `src/federation/perceptual_hash.rs`. Pluggable trait (no PhotoDNA / PDQ / Project Arachnid integrations in-tree per CEG §11.5):
+
+```rust
+#[async_trait]
+pub trait PerceptualHashMatcher: Send + Sync {
+    async fn check(&self, sha256: &[u8; 32], body: &[u8]) -> Result<HashMatchResult, HashMatchError>;
+    fn databases(&self) -> &[HashDatabaseId];
+    fn on_match_policy(&self) -> OnMatchPolicy;
+    fn matcher_unreachable_policy(&self) -> MatcherUnreachablePolicy;  // FailClosed default
+}
+```
+
+Default impl `NullPerceptualHashMatcher` returns no-match. Backends override via `RwLock<Option<Arc<dyn PerceptualHashMatcher>>>` + `set_perceptual_hash_matcher` setter (mirrors v3.4.0 `set_admission_gate`).
+
+New `BlobError::HashMatchedKnownBad { database, score, threshold }` + kind `blob_hash_matched_known_bad`. Matcher runs ONLY for `BlobBody::Inline` — `External` bodies skip per FSD §6.5 (the publisher routes the externally-stored bytes; matching is the publisher's responsibility).
+
+PyO3: `set_perceptual_hash_matcher(matcher: Option<Py<PyAny>>)` with a `PyPerceptualHashMatcher` adapter wrapping a Python-side sync `check(sha256_hex, body) -> dict | None` interface. Async matchers go through the Rust API; sync Python matchers use the adapter's `async move { sync_compute(...) }` escape hatch.
+
+### #6 — Takedown handler with `MultimediaConfig` operator knobs
+
+New `src/cirisnode/takedown_handler.rs`. `process_takedown_admission_with_config<B: BlobStorage + Sync>` orchestrates:
+
+1. `list_holders(content_sha256)` → enumerate holders.
+2. For each holder: emit `withdraws` attestation (via `emit_withdraws_attestation_helper` from v3.5.0 #125).
+3. Branch by config:
+   - **Immediate-set** (config.immediate_legal_bases.contains(basis)): `evict_actor` per holder. `holders_evicted` + `holders_evict_failed` counted.
+   - **Counter-notice-set** (basis.admits_counter_notice): schedule eviction at `now + counter_notice_window_days` in `scheduled_takedown_actions`. `scheduled_eviction_at` returned.
+   - **Age-gate-set** (config.age_gate_legal_bases.contains(basis)): withdraws emitted; no eviction; `age_gate_applied: true` on report.
+
+`TakedownReport { holders_seen, withdraws_emitted, withdraws_failed, holders_evicted, holders_evict_failed, scheduled_eviction_at, age_gate_applied }`. PyO3 mirror `cirisnode_process_takedown_admission_json`.
+
+**CEG §11.4 takedown-isn't-a-coup invariant**: `process_takedown_admission` MUST NOT touch `federation_keys`. Only `holds_bytes` attestations are withdrawn; only blob rows are evicted. Holder identity is preserved. Pinned by `process_takedown_admission_does_not_revoke_holder_key` test using `CourtOrder` (severest basis).
+
+`MultimediaConfig` operator-config:
+- `counter_notice_window_days: u32` (default 14)
+- `immediate_legal_bases: HashSet<LegalBasis>` (default the 5 immediate-removal bases)
+- `age_gate_legal_bases: HashSet<LegalBasis>` (default `{AvmsdAgeInappropriate}`)
+
+`Engine::set_multimedia_config(Option<MultimediaConfig>)` + `Engine::multimedia_config()`. PyO3: `set_multimedia_config_json` + `get_multimedia_config_json`.
+
+### #7 — `retire_key_grants` (CEG 0.3 §5.6.8.4 option b — rotation_chain supersession)
+
+New trait method on `NodeCoreService`:
+
+```rust
+async fn retire_key_grants(&self, actor_key_id, signer, now) -> Result<RetireKeyGrantsReport, Error>;
+```
+
+**Emission shape**: fresh `key_grant` Contribution with `rotation_chain` extended by the prior grant's `contribution_id`. NOT a `withdraws` attestation. The supersession carries:
+- Same `recipient_key_id` + `content_sha256` as the prior grant
+- `wrapped_dek_base64 = ""` (revocation sentinel — empty base64 round-trips to zero-length bytes)
+- `wrap_algorithm = HpkeRfc9180BaseX25519AesGcm`
+- `key_validity_window`: `not_before = now`, `not_after = now + 1s` (the supersession's window is bounded to wall-clock)
+
+`RetireKeyGrantsReport { grants_seen, supersedes_emitted, supersedes_failed }`.
+
+### #8 — `lookup_trusted_publisher_chain` on `FederationDirectory` (Policy J §11.5.3)
+
+New trait default-impl method composing existing primitives:
+
+```rust
+async fn lookup_trusted_publisher_chain(&self, content_sha256) -> Result<Vec<Attestation>, Error>;
+```
+
+Default implementation walks: `list_keys_by_identity_type(TRUSTED_PUBLISHER)` → for each → `list_attestations_by(key)` → filter to `scores` attestations with `dimension` starting with `content_rating:` AND `evidence_refs` containing the SHA. Empty Vec if not trusted-publisher-blessed. Backends with a `content_rating:*` evidence-ref index may override for O(log N); the default is O(P × A).
+
+### #9 — Reserved-prefix dimension families (CEG §5.6.8.3 + §11.5.3)
+
+`DimensionAdmissionPolicy::default_reserved_prefix_rules()` extended with 4 new family-to-identity-type mappings:
+
+- `content_rating:{scheme}:{rating}` → **`trusted_publisher`** (new identity_type)
+- `content_class:{class}` → `substrate_persist`
+- `cw_class:{class}` → `substrate_persist`
+- `age_assurance:{level}` → `witness`
+
+New `identity_type::TRUSTED_PUBLISHER = "trusted_publisher"` constant alongside `SUBSTRATE_PERSIST` and `WITNESS`. Emitter-mismatch rejection enforced at the v3.0.0 #102 reserved-prefix admission rule.
+
+### #10 — Five new external_content sub_kinds (CEG §5.6.8.1)
+
+`image`, `audio`, `video`, `film`, `model_3d` (+ Phase 2 `live_stream`). Persist treats sub_kinds as opaque payload — extractors do not pattern-match. Verified.
+
+### Test coverage — 28 new (1051 cumulative across the cuts)
+
+cirisnode::media_sharing tests (15): payload-shape validators, LegalBasis discipline locks, WrapAlgorithm wire round-trip, MultimediaConfig defaults + wire round-trip.
+
+cirisnode::takedown_handler tests (5): noop on no-holders, withdraws-per-holder, immediate-basis eviction, age-gate emits-no-eviction, takedown-isn't-a-coup (CEG §11.4).
+
+cirisnode PG + SQLite (10 each): subject_kind admission, payload shape rejection, 3 query-surface filters, retire_key_grants rotation_chain assertion (NOT withdraws), V054 CHECK/trigger rejection of mismatched columns.
+
+federation::perceptual_hash tests (3): null matcher admits, always-match reports, FailClosed default.
+
+federation::blobs tests (4): HashMatchedKnownBad kind string, put_blob_signing-refuses-on-match, admits-on-no-match, skips-matcher-for-external-body.
+
+federation::admission tests (4 new + 1 extended): 4 new reserved-prefix emitter-mismatch tests, `default_reserved_prefix_rules_cover_ceg_persist_slice` extended.
+
+`store::postgres` + `store::sqlite` tests (5): `lookup_trusted_publisher_chain` round-trip (PG + SQLite) + ignores-non-publisher-emitters (SQLite extra).
+
+### Memory backend parity — deferred to follow-up
+
+`MemoryBackend` does not currently implement `NodeCoreService` or `BlobStorage`. Adding them is ~600 lines of adjacent plumbing that doesn't carry #134 business logic. Filed as follow-up: "Memory backend parity for NodeCoreService + BlobStorage trait implementations."
+
+The [feedback_no_pg_only_no_deferral] discipline is preserved — both PG and SQLite carry full #134 parity; memory is a test-only fixture today.
+
+### Deviations (D5-D8 surfaced by builder, accepted)
+
+- **D5**: `lookup_trusted_publisher_chain` default impl now composes existing primitives (replacing the empty-Vec stub from the first cut). Backends may override with O(log N) when a `content_rating:*` evidence-ref index lands.
+- **D6**: `cw_class:self_harm:v1` test fixture changed to `cw_class:flashing_lights:v1` — `harm` is on the existing FSD-002 §1.10.1 anti-pattern list; dimension-naming admission rejects it independently of the reserved-prefix rule.
+- **D7**: `AvmsdAgeInappropriate` has no counter-notice window — the age-gate composition happens at receive-time per Policy J, not at takedown time.
+- **D8**: PyO3 `RetireKeyGrantsReport` JSON fields renamed `withdraws_emitted` → `supersedes_emitted`, `withdraws_failed` → `supersedes_failed`. **Wire-shape break for Python consumers** reading the prior `withdraws_*` keys. Per [feedback_clean_break_renames] the renames land in the same cut as the emission-shape change.
+
+### Mission citations
+
+- §1.3 lowest-stateful-library — payload validation lives at the substrate; takedown_handler orchestration composes existing v3.4.0 admission gate + v3.5.0 list_holders/list_held_by/evict_actor primitives; substrate owns the §11.4 invariant.
+- §1.5 parity — PG + SQLite full coverage. Memory deferred with explicit follow-up.
+- §1.6 fail-honest — D5-D8 surfaced as deviations; TODO markers for CIRISNodeCore#24 retained at the unblocked sites (counter-notice carrier shape + substrate-protective override); typed errors throughout.
+- CIRIS Accord §I autonomy — `MultimediaConfig` lets operators widen/narrow the discipline split; persist stores the discipline-execution; operators carry the policy authority.
+
 ## [3.5.4] — 2026-05-30
 
 **CIRISPersist 3.5.4 — CIRISVerify pin v4.3.0 → v4.4.2 (clean recovery of v3.5.3 PyPI gate).**

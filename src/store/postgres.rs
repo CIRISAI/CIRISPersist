@@ -103,6 +103,9 @@ pub struct PostgresBackend {
     /// historical pre-#123 behavior). Set via
     /// [`PostgresBackend::set_admission_gate`].
     admission_gate: std::sync::RwLock<Option<crate::federation::AdmissionGate>>,
+    /// v3.6.0 (CIRISPersist#134) — perceptual-hash matcher for the
+    /// `put_blob_signing` admission hook. `None` = no hook (default).
+    perceptual_hash_matcher: std::sync::RwLock<Option<crate::federation::SharedMatcher>>,
 }
 
 impl PostgresBackend {
@@ -184,6 +187,7 @@ impl PostgresBackend {
                 crate::federation::HardwareAttestationPolicy::default(),
             )),
             admission_gate: std::sync::RwLock::new(None),
+            perceptual_hash_matcher: std::sync::RwLock::new(None),
         })
     }
 
@@ -221,6 +225,7 @@ impl PostgresBackend {
                 crate::federation::HardwareAttestationPolicy::default(),
             )),
             admission_gate: std::sync::RwLock::new(None),
+            perceptual_hash_matcher: std::sync::RwLock::new(None),
         }
     }
 
@@ -244,6 +249,16 @@ impl PostgresBackend {
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
+    }
+
+    /// v3.6.0 (CIRISPersist#134) — install the perceptual-hash matcher
+    /// consulted by `put_blob_signing` for inline-body writes. `None`
+    /// removes the hook (the default state).
+    pub fn set_perceptual_hash_matcher(&self, matcher: Option<crate::federation::SharedMatcher>) {
+        *self
+            .perceptual_hash_matcher
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = matcher;
     }
 
     /// v2.5.0 (CIRISPersist#102 Ask 4) — install a per-axis
@@ -3017,6 +3032,13 @@ impl crate::federation::BlobStorage for PostgresBackend {
     fn inline_bytes_cap(&self) -> usize {
         self.inline_bytes_cap
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn perceptual_hash_matcher(&self) -> Option<crate::federation::SharedMatcher> {
+        self.perceptual_hash_matcher
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     async fn put_blob(
@@ -15511,5 +15533,152 @@ mod tests {
             !backend.has_blob(&shas[0]).await.unwrap(),
             "blob row deletion proceeds despite withdraws failure"
         );
+    }
+
+    // ── v3.6.0 (CIRISPersist#134, CEG 0.3 §11.5.3) — trusted-publisher chain ──
+
+    fn fix_trusted_publisher_key(
+        key_id: &str,
+        identity_type: &str,
+    ) -> crate::federation::KeyRecord {
+        crate::federation::KeyRecord {
+            key_id: key_id.into(),
+            pubkey_ed25519_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: crate::federation::types::algorithm::HYBRID.into(),
+            identity_type: identity_type.into(),
+            identity_ref: key_id.into(),
+            valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
+            valid_until: None,
+            registration_envelope: serde_json::json!({"id": key_id}),
+            original_content_hash: "deadbeef".into(),
+            scrub_signature_classical: "c2lnbmF0dXJl".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: key_id.into(),
+            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+        }
+    }
+
+    fn fix_content_rating_attestation(
+        att_id: &str,
+        attester: &str,
+        dimension: &str,
+        sha_hex: &str,
+    ) -> crate::federation::Attestation {
+        crate::federation::Attestation {
+            attestation_id: att_id.into(),
+            attesting_key_id: attester.into(),
+            attested_key_id: attester.into(),
+            attestation_type: crate::federation::types::attestation_type::SCORES.into(),
+            weight: Some(1.0),
+            asserted_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+            expires_at: None,
+            attestation_envelope: serde_json::json!({
+                "dimension": dimension,
+                "score": 1.0,
+                "confidence": 0.9,
+                "evidence_refs": [sha_hex],
+            }),
+            original_content_hash: "abc123".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: attester.into(),
+            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn lookup_trusted_publisher_chain_returns_empty_for_unblessed_content_pg() {
+        use crate::federation::FederationDirectory;
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        // SHA that no trusted_publisher has rated — must yield empty.
+        let sha_hex = format!(
+            "e{}",
+            uuid::Uuid::new_v4().as_simple().to_string().repeat(2)
+        );
+        // Truncate / pad to 64 chars hex.
+        let sha_hex = sha_hex.chars().take(64).collect::<String>();
+        let sha_hex = format!("{:0<64}", sha_hex);
+        let chain = backend
+            .lookup_trusted_publisher_chain(&sha_hex)
+            .await
+            .unwrap();
+        assert!(chain.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn lookup_trusted_publisher_chain_returns_chain_when_trusted_publisher_attests_pg() {
+        use crate::federation::FederationDirectory;
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        // Unique-per-run publisher + att IDs so reruns against the
+        // shared PG DB don't pollute (mirrors the existing
+        // feedback_hundred_percent_green discipline).
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let publisher_key = format!("pub-{}", &nonce[..16]);
+        // PG attestation_id column is UUID; use a fresh UUID here.
+        let att_id = uuid::Uuid::new_v4().to_string();
+        let sha_hex = format!("{:0<64}", nonce);
+        let sha_hex = sha_hex.chars().take(64).collect::<String>();
+        // Seed publisher key as trusted_publisher identity_type.
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: fix_trusted_publisher_key(
+                    &publisher_key,
+                    crate::federation::types::identity_type::TRUSTED_PUBLISHER,
+                ),
+            })
+            .await
+            .unwrap();
+        // Seed a content_rating attestation referencing the SHA.
+        backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: fix_content_rating_attestation(
+                    &att_id,
+                    &publisher_key,
+                    "content_rating:mpa:pg13:v1",
+                    &sha_hex,
+                ),
+            })
+            .await
+            .unwrap();
+        let chain = backend
+            .lookup_trusted_publisher_chain(&sha_hex)
+            .await
+            .unwrap();
+        assert!(
+            chain.iter().any(|a| a.attestation_id == att_id),
+            "chain must include the seeded attestation: {chain:?}"
+        );
+        for att in &chain {
+            let dim = att
+                .attestation_envelope
+                .get("dimension")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            assert!(
+                dim.starts_with("content_rating:"),
+                "every chain entry must be content_rating:* — got {dim:?}"
+            );
+        }
     }
 }

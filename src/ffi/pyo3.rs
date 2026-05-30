@@ -394,6 +394,11 @@ struct EngineCell {
     /// installed config's budget is finite. `None` otherwise.
     /// `close()` calls `.stop()` on the handle.
     sweeper: std::sync::Mutex<Option<crate::federation::EvictionSweeper>>,
+    /// v3.6.0 (CIRISPersist#134) — shared media-sharing config slot.
+    /// `Arc<RwLock<...>>` so every PyEngine handle's
+    /// `set_multimedia_config_json` mutates the same cell-level state.
+    #[cfg(feature = "cirisnode")]
+    multimedia_config: Arc<std::sync::RwLock<Option<Arc<crate::cirisnode::MultimediaConfig>>>>,
 }
 
 /// The one global slot. `OnceLock` initializes the `Mutex` once;
@@ -508,6 +513,13 @@ pub struct PyEngine {
     /// v1.9.0 (CIRISPersist#84) — shared change-feed subscription
     /// registry. Same `Arc` every handle holds.
     subscriptions: SubscriptionRegistry,
+    /// v3.6.0 (CIRISPersist#134) — media-sharing operator config.
+    /// `None` = persist defaults (14-day counter-notice window;
+    /// child-safety + terrorist content bases evict immediately).
+    /// Wrapped in `Arc<RwLock<...>>` so handles share the cell-level
+    /// state — `set_multimedia_config_json` mutates the shared slot.
+    #[cfg(feature = "cirisnode")]
+    multimedia_config: Arc<std::sync::RwLock<Option<Arc<crate::cirisnode::MultimediaConfig>>>>,
 }
 
 impl PyEngine {
@@ -528,6 +540,8 @@ impl PyEngine {
             construction_pid: cell.construction_pid,
             consumers: cell.consumers.clone(),
             subscriptions: cell.subscriptions.clone(),
+            #[cfg(feature = "cirisnode")]
+            multimedia_config: cell.multimedia_config.clone(),
         }
     }
 
@@ -1174,6 +1188,8 @@ impl PyEngine {
                 crate::federation::ReplicationConfig::default(),
             )),
             sweeper: std::sync::Mutex::new(None),
+            #[cfg(feature = "cirisnode")]
+            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
         });
         // v3.4.0 (#123) — auto-spawn sweeper on init when the operator
         // opted in AND the installed config has a finite budget. The
@@ -1450,6 +1466,8 @@ impl PyEngine {
             construction_pid: self.construction_pid,
             consumers: self.consumers.clone(),
             subscriptions: self.subscriptions.clone(),
+            #[cfg(feature = "cirisnode")]
+            multimedia_config: self.multimedia_config.clone(),
         })
     }
 
@@ -9694,6 +9712,390 @@ impl PyEngine {
         })
     }
 
+    // ── v3.6.0 (CIRISPersist#134) — media-sharing reads ───────────────
+
+    /// List takedown_notice Contributions for `content_sha256`. JSON
+    /// array of [`ContributionEnvelope`](crate::cirisnode::ContributionEnvelope).
+    #[cfg(feature = "cirisnode")]
+    fn cirisnode_list_takedowns_for_json(
+        &self,
+        py: Python<'_>,
+        content_sha256: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let sha = content_sha256.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        let rows = backend
+                            .list_takedowns_for(&sha)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&rows)
+                            .map_err(|e| PyRuntimeError::new_err(format!("takedowns encode: {e}")))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        let rows = backend
+                            .list_takedowns_for(&sha)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&rows)
+                            .map_err(|e| PyRuntimeError::new_err(format!("takedowns encode: {e}")))
+                    })
+                }
+            })
+        })
+    }
+
+    /// List key_grant Contributions for `recipient_key_id`. JSON
+    /// array of [`ContributionEnvelope`](crate::cirisnode::ContributionEnvelope).
+    #[cfg(feature = "cirisnode")]
+    fn cirisnode_list_key_grants_for_json(
+        &self,
+        py: Python<'_>,
+        recipient_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let recipient = recipient_key_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        let rows = backend
+                            .list_key_grants_for(&recipient)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&rows)
+                            .map_err(|e| PyRuntimeError::new_err(format!("key_grants encode: {e}")))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        let rows = backend
+                            .list_key_grants_for(&recipient)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&rows)
+                            .map_err(|e| PyRuntimeError::new_err(format!("key_grants encode: {e}")))
+                    })
+                }
+            })
+        })
+    }
+
+    /// List key_grant Contributions matching BOTH `content_sha256` AND
+    /// `recipient_key_id`. JSON array of
+    /// [`ContributionEnvelope`](crate::cirisnode::ContributionEnvelope).
+    #[cfg(feature = "cirisnode")]
+    fn cirisnode_list_key_grants_for_content_json(
+        &self,
+        py: Python<'_>,
+        content_sha256: &str,
+        recipient_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let sha = content_sha256.to_owned();
+            let recipient = recipient_key_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        let rows = backend
+                            .list_key_grants_for_content(&sha, &recipient)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&rows)
+                            .map_err(|e| PyRuntimeError::new_err(format!("key_grants encode: {e}")))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        let rows = backend
+                            .list_key_grants_for_content(&sha, &recipient)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&rows)
+                            .map_err(|e| PyRuntimeError::new_err(format!("key_grants encode: {e}")))
+                    })
+                }
+            })
+        })
+    }
+
+    /// v3.6.0 (CIRISPersist#134) — install / clear the media-sharing
+    /// operator config ([`MultimediaConfig`](crate::cirisnode::MultimediaConfig)).
+    /// Wire shape: see [`MultimediaConfigWire`](crate::cirisnode::MultimediaConfigWire).
+    ///
+    /// Pass `None` (Python None / empty string) to clear; persist
+    /// defaults then apply (14-day window; child-safety + terrorist
+    /// content classes evict immediately).
+    #[cfg(feature = "cirisnode")]
+    fn set_multimedia_config_json(&self, config_json: Option<&str>) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| match config_json {
+            None => {
+                *self
+                    .multimedia_config
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner()) = None;
+                Ok(())
+            }
+            Some(json) => {
+                let wire: crate::cirisnode::MultimediaConfigWire = serde_json::from_str(json)
+                    .map_err(|e| PyValueError::new_err(format!("MultimediaConfig decode: {e}")))?;
+                let cfg = wire
+                    .into_config()
+                    .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                *self
+                    .multimedia_config
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(cfg));
+                Ok(())
+            }
+        })
+    }
+
+    /// v3.6.0 (CIRISPersist#134) — snapshot of the currently-installed
+    /// media-sharing config as a JSON string. Returns the wire shape
+    /// (see [`MultimediaConfigWire`](crate::cirisnode::MultimediaConfigWire))
+    /// for the configured values, or `None` when no config is installed
+    /// (persist defaults apply).
+    #[cfg(feature = "cirisnode")]
+    fn get_multimedia_config_json(&self) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let guard = self
+                .multimedia_config
+                .read()
+                .unwrap_or_else(|p| p.into_inner());
+            match guard.as_ref() {
+                None => Ok(None),
+                Some(cfg) => {
+                    let wire = crate::cirisnode::MultimediaConfigWire::from_config(cfg);
+                    serde_json::to_string(&wire).map(Some).map_err(|e| {
+                        PyRuntimeError::new_err(format!("MultimediaConfig encode: {e}"))
+                    })
+                }
+            }
+        })
+    }
+
+    /// v3.6.0 (CIRISPersist#134) — emit a `withdraws` attestation
+    /// against every prior `key_grant` Contribution issued by
+    /// `actor_key_id`. Uses the engine's composed signer; the
+    /// supersession Contributions carry the prior contribution_ids in
+    /// `rotation_chain` per CEG 0.3 §5.6.8.4 (option b).
+    ///
+    /// Returns a JSON-encoded [`RetireKeyGrantsReport`](crate::cirisnode::RetireKeyGrantsReport):
+    /// `{"grants_seen": u, "supersedes_emitted": u, "supersedes_failed": u}`.
+    #[cfg(feature = "cirisnode")]
+    fn cirisnode_retire_key_grants_json(
+        &self,
+        py: Python<'_>,
+        actor_key_id: &str,
+        now_iso: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let actor = actor_key_id.to_owned();
+            let now = chrono::DateTime::parse_from_rfc3339(now_iso)
+                .map_err(|e| {
+                    PyValueError::new_err(format!("retire_key_grants now_iso parse: {e}"))
+                })?
+                .with_timezone(&chrono::Utc);
+            let signer = self.signer.clone();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        let report = backend
+                            .retire_key_grants(&actor, &*signer, now)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&report).map_err(|e| {
+                            PyRuntimeError::new_err(format!("retire_key_grants encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        let report = backend
+                            .retire_key_grants(&actor, &*signer, now)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&report).map_err(|e| {
+                            PyRuntimeError::new_err(format!("retire_key_grants encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v3.6.0 (CIRISPersist#134) — run the takedown-admission
+    /// orchestration on a JSON-encoded [`TakedownNoticePayload`](crate::cirisnode::TakedownNoticePayload).
+    /// Consults the installed [`MultimediaConfig`] (or persist defaults
+    /// when none is installed) for the immediate-eviction decision +
+    /// counter-notice window.
+    ///
+    /// Returns a JSON object:
+    /// `{"holders_seen": u, "withdraws_emitted": u, "withdraws_failed": u,
+    ///   "holders_evicted": u, "holders_evict_failed": u,
+    ///   "scheduled_eviction_at": "<rfc3339>" | null,
+    ///   "age_gate_applied": bool}`.
+    ///
+    /// `age_gate_applied` is `true` when the takedown emitted
+    /// withdraws but did NOT trigger eviction because the basis
+    /// composes with the Policy J age-gate per CEG §8.1.10
+    /// (today only [`LegalBasis::AvmsdAgeInappropriate`] qualifies).
+    /// Python callers need this to distinguish age-gated takedowns
+    /// from any other no-eviction outcome.
+    #[cfg(feature = "cirisnode")]
+    fn cirisnode_process_takedown_admission_json(
+        &self,
+        py: Python<'_>,
+        notice_payload_json: &str,
+        signer_key_id: &str,
+        now_iso: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let notice: crate::cirisnode::TakedownNoticePayload =
+                serde_json::from_str(notice_payload_json).map_err(|e| {
+                    PyValueError::new_err(format!("TakedownNoticePayload decode: {e}"))
+                })?;
+            let signer_kid = signer_key_id.to_owned();
+            let now = chrono::DateTime::parse_from_rfc3339(now_iso)
+                .map_err(|e| {
+                    PyValueError::new_err(format!("process_takedown_admission now_iso parse: {e}"))
+                })?
+                .with_timezone(&chrono::Utc);
+            let signer = self.signer.clone();
+            let cfg_snapshot = self
+                .multimedia_config
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    let cfg = cfg_snapshot.clone();
+                    runtime.block_on(async move {
+                        let report =
+                            crate::cirisnode::takedown_handler::process_takedown_admission_with_config(
+                                &*backend,
+                                &*backend,
+                                &*signer,
+                                &signer_kid,
+                                &notice,
+                                now,
+                                cfg.as_deref(),
+                            )
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serialize_takedown_report(&report)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    let cfg = cfg_snapshot.clone();
+                    runtime.block_on(async move {
+                        let report =
+                            crate::cirisnode::takedown_handler::process_takedown_admission_with_config(
+                                &*backend,
+                                &*backend,
+                                &*signer,
+                                &signer_kid,
+                                &notice,
+                                now,
+                                cfg.as_deref(),
+                            )
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serialize_takedown_report(&report)
+                    })
+                }
+            })
+        })
+    }
+
+    /// v3.6.0 (CIRISPersist#134) — install a Python-side perceptual
+    /// hash matcher on the underlying backend.
+    ///
+    /// `matcher` is any Python object that exposes a synchronous
+    /// `check(sha256_hex: str, body: bytes) -> dict | None` method.
+    /// Return shape:
+    ///
+    ///   - `None` → no match (admit the write).
+    ///   - `{"database": "<name>", "score": <float>, "threshold": <float>}`
+    ///     → match (refuse the write with
+    ///     [`BlobError::HashMatchedKnownBad`](crate::federation::BlobError::HashMatchedKnownBad)).
+    ///
+    /// Pass `None` (Python None) to clear the matcher.
+    ///
+    /// # Why sync, not async
+    ///
+    /// The trait surface in Rust is async (PhotoDNA / remote matchers
+    /// can take 50-500ms). The PyO3 adapter wraps the operator's
+    /// **sync** Python callable in an `async move { Python::with_gil(...) }`
+    /// block — matching the trait rustdoc's "escape hatch for sync
+    /// matchers" note. Operators wanting native-async matchers should
+    /// install via the Rust API (`SqliteBackend::set_perceptual_hash_matcher`
+    /// / `PostgresBackend::set_perceptual_hash_matcher`) where the
+    /// matcher can be a true async impl.
+    #[cfg(feature = "cirisnode")]
+    fn set_perceptual_hash_matcher(&self, matcher: Option<Py<PyAny>>) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let matcher_arc: Option<crate::federation::SharedMatcher> = match matcher {
+                None => None,
+                Some(m) => Some(Arc::new(PyPerceptualHashMatcher::new(m))),
+            };
+            match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    pg.set_perceptual_hash_matcher(matcher_arc);
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    sq.set_perceptual_hash_matcher(matcher_arc);
+                }
+            }
+            Ok(())
+        })
+    }
+
     // ── v0.8.0-α5: cirisgraph PyO3 surface (CIRISPersist#34) ──────────
     //
     // 7 methods wrapping GraphService. JSON-in / JSON-out across the
@@ -16244,6 +16646,35 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
 /// server-fault → RuntimeError. The `kind()` string travels in the
 /// message for `translate_error_kind`-style retry-policy routing if
 /// the consumer wants it.
+/// v3.6.0 (CIRISPersist#134) — JSON-encode a
+/// [`TakedownReport`](crate::cirisnode::takedown_handler::TakedownReport)
+/// for return across the PyO3 boundary. Field order matches the
+/// rustdoc on `cirisnode_process_takedown_admission_json`.
+#[cfg(feature = "cirisnode")]
+fn serialize_takedown_report(
+    report: &crate::cirisnode::takedown_handler::TakedownReport,
+) -> PyResult<String> {
+    let value = serde_json::json!({
+        "holders_seen": report.holders_seen,
+        "withdraws_emitted": report.withdraws_emitted,
+        "withdraws_failed": report.withdraws_failed,
+        "holders_evicted": report.holders_evicted,
+        "holders_evict_failed": report.holders_evict_failed,
+        "scheduled_eviction_at": report
+            .scheduled_eviction_at
+            .map(|t| t.to_rfc3339()),
+        // v3.6.0 (CIRISPersist#134) — Policy J age-gate observability.
+        // True when the takedown emitted withdraws but did NOT trigger
+        // eviction because the basis composes with the Policy J age
+        // gate per CEG §8.1.10. Python callers need this to
+        // distinguish age-gated takedowns from any other no-eviction
+        // outcome.
+        "age_gate_applied": report.age_gate_applied,
+    });
+    serde_json::to_string(&value)
+        .map_err(|e| PyRuntimeError::new_err(format!("TakedownReport encode: {e}")))
+}
+
 fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
     let kind = e.kind();
     tracing::warn!(error = %e, kind = kind, "blob storage error");
@@ -16254,6 +16685,8 @@ fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
         | crate::federation::BlobError::AttestationEmissionFailed(_) => PyValueError::new_err(kind),
         // v3.4.0 (CIRISPersist#123) — trust gate rejection.
         crate::federation::BlobError::TrustBelowThreshold { .. } => PyValueError::new_err(kind),
+        // v3.6.0 (CIRISPersist#134) — perceptual-hash matcher hit.
+        crate::federation::BlobError::HashMatchedKnownBad { .. } => PyValueError::new_err(kind),
         crate::federation::BlobError::Backend(_) => PyRuntimeError::new_err(kind),
     }
 }
@@ -17551,6 +17984,8 @@ mod tests {
                 crate::federation::ReplicationConfig::default(),
             )),
             sweeper: std::sync::Mutex::new(None),
+            #[cfg(feature = "cirisnode")]
+            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
         });
         *engine_slot() = Some(cell);
         sq
@@ -17696,6 +18131,8 @@ mod tests {
                 crate::federation::ReplicationConfig::default(),
             )),
             sweeper: std::sync::Mutex::new(None),
+            #[cfg(feature = "cirisnode")]
+            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
         });
         *engine_slot() = Some(cell);
 
@@ -17780,6 +18217,8 @@ mod tests {
                 crate::federation::ReplicationConfig::default(),
             )),
             sweeper: std::sync::Mutex::new(None),
+            #[cfg(feature = "cirisnode")]
+            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
         });
         (cell, sq)
     }
@@ -18455,6 +18894,115 @@ pub fn current_runtime_handle() -> Option<tokio::runtime::Handle> {
 }
 
 /// (maturin) generates the C entry that Python imports.
+/// v3.6.0 (CIRISPersist#134) — adapter that bridges a Python
+/// synchronous matcher object to the Rust async
+/// [`PerceptualHashMatcher`](crate::federation::PerceptualHashMatcher)
+/// trait.
+///
+/// Python contract: `matcher.check(sha256_hex: str, body: bytes) -> dict | None`.
+/// `None` → no match; `{"database": str, "score": float, "threshold": float}`
+/// → match. Any other return shape raises
+/// [`HashMatchError::InputMalformed`](crate::federation::HashMatchError::InputMalformed)
+/// and the persist write path translates to
+/// `BlobError::InvalidArgument`.
+///
+/// Python exceptions raised inside `check` translate to
+/// [`HashMatchError::Unreachable`](crate::federation::HashMatchError::Unreachable);
+/// the matcher's `MatcherUnreachablePolicy` (default `FailClosed`)
+/// decides admission.
+#[cfg(feature = "cirisnode")]
+struct PyPerceptualHashMatcher {
+    py_matcher: Py<PyAny>,
+}
+
+#[cfg(feature = "cirisnode")]
+impl PyPerceptualHashMatcher {
+    fn new(py_matcher: Py<PyAny>) -> Self {
+        Self { py_matcher }
+    }
+
+    /// Invoke `check` synchronously under the GIL.
+    fn check_sync(
+        &self,
+        sha256: &[u8; 32],
+        body: &[u8],
+    ) -> Result<crate::federation::HashMatchResult, crate::federation::HashMatchError> {
+        Python::attach(|py| {
+            let sha_hex = hex::encode(sha256);
+            let py_body = pyo3::types::PyBytes::new(py, body);
+            let result = self
+                .py_matcher
+                .bind(py)
+                .call_method1("check", (sha_hex, py_body))
+                .map_err(|e| {
+                    crate::federation::HashMatchError::Unreachable(format!(
+                        "Python matcher.check raised: {e}"
+                    ))
+                })?;
+            if result.is_none() {
+                return Ok(crate::federation::HashMatchResult::NoMatch);
+            }
+            let database: String = result
+                .get_item("database")
+                .and_then(|d| d.extract())
+                .map_err(|e| {
+                    crate::federation::HashMatchError::InputMalformed(format!(
+                        "matcher result missing 'database': {e}"
+                    ))
+                })?;
+            let score: f64 = result
+                .get_item("score")
+                .and_then(|d| d.extract())
+                .map_err(|e| {
+                    crate::federation::HashMatchError::InputMalformed(format!(
+                        "matcher result missing 'score': {e}"
+                    ))
+                })?;
+            let threshold: f64 = result
+                .get_item("threshold")
+                .and_then(|d| d.extract())
+                .map_err(|e| {
+                    crate::federation::HashMatchError::InputMalformed(format!(
+                        "matcher result missing 'threshold': {e}"
+                    ))
+                })?;
+            Ok(crate::federation::HashMatchResult::Match {
+                database: crate::federation::HashDatabaseId(database),
+                score,
+                threshold,
+            })
+        })
+    }
+}
+
+#[cfg(feature = "cirisnode")]
+#[async_trait::async_trait]
+impl crate::federation::PerceptualHashMatcher for PyPerceptualHashMatcher {
+    async fn check(
+        &self,
+        sha256: &[u8; 32],
+        body: &[u8],
+    ) -> Result<crate::federation::HashMatchResult, crate::federation::HashMatchError> {
+        // Architect's "escape hatch for sync matchers": wrap the sync
+        // Python callable in async. The Python matcher's compute
+        // cost runs on the calling task — operators wanting
+        // matcher-not-on-event-loop should write a native-async Rust
+        // matcher and install via the Rust API.
+        self.check_sync(sha256, body)
+    }
+
+    fn databases(&self) -> &[crate::federation::HashDatabaseId] {
+        // Python-side matchers introspect their own database list;
+        // the trait's `databases()` accessor returns an empty slice
+        // (rust-side consumers don't query Python for the introspection).
+        &[]
+    }
+
+    fn on_match_policy(&self) -> crate::federation::OnMatchPolicy {
+        crate::federation::OnMatchPolicy::Refuse
+    }
+}
+
 #[pymodule]
 fn ciris_persist(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEngine>()?;

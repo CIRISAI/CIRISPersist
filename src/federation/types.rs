@@ -116,6 +116,14 @@ pub mod identity_type {
     /// the 0.x interim per-region `registry_witnesses` table over to
     /// `federation_keys` rows with this identity_type, per CEG §10.3.
     pub const WITNESS: &str = "witness";
+    /// v3.6.0 (CIRISPersist#134, CEG 0.3 §11.5.3) — Policy J
+    /// trusted-publisher identity. Only `federation_keys` rows with
+    /// this identity_type may emit publisher-curated content ratings
+    /// (`content_rating:*` reserved-prefix attestations). The
+    /// admission gate in
+    /// [`super::admission::default_reserved_prefix_rules`] enforces
+    /// this.
+    pub const TRUSTED_PUBLISHER: &str = "trusted_publisher";
 }
 
 /// Algorithm strings matching persist's `algorithm` column.
