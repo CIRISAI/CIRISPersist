@@ -889,15 +889,17 @@ jobs:
     # before the wheel reaches PyPI — those are quality gates that
     # presence-of-wheel doesn't otherwise enforce. ios-build + darwin-test
     # are platform-specific build sanity, included for the same reason.
-    # v2.5.0 — `build-manifest` removed from this list. It's now soft
-    # (continue-on-error: true) because the hybrid signing secrets it
-    # needs (CIRIS_BUILD_ED25519_SECRET / CIRIS_BUILD_MLDSA_SECRET)
-    # aren't configured in the repo. With `build-manifest` in this
-    # `needs:` list, every v2.3.0 → v2.4.0 push had wheels green but
-    # publish skipped because manifest-signing failed on a missing
-    # secret. The other entries here remain hard quality gates.
+    # v3.6.6 — `build-manifest` re-added as a HARD gate. v2.5.0 made it
+    # soft because the hybrid-signing secrets weren't configured; with
+    # the secrets now in place + the v3.6.5 PyPI publish surviving a
+    # transient registry outage anyway (manifest job failed, soft-fail
+    # let publish proceed), the cryptographic-root-of-trust posture is
+    # restored. A red manifest job MUST block PyPI publish — otherwise
+    # the wheel's BuildManifest round-trip can't be verified by
+    # consumers checking `/v1/builds/<v>?project=ciris-persist`.
     needs:
       - pyo3-wheel
+      - build-manifest
       - lint
       - license-audit
       - linux-x86_64-test
@@ -1004,19 +1006,16 @@ jobs:
     name: Sign + register multi-target build manifests (CanonicalBuild v2)
     runs-on: ubuntu-latest
     needs: pyo3-wheel
-    # v2.5.0 — soft-fail when the hybrid-signing secrets aren't
-    # configured in the repo. The job still attempts signing on every
-    # run; when CIRIS_BUILD_ED25519_SECRET / CIRIS_BUILD_MLDSA_SECRET
-    # are present the job runs fully and a real failure remains
-    # visible (red job badge) — but in the unconfigured case the
-    # `exit 1` from the secrets-not-set guard doesn't block the
-    # downstream `publish-pypi` job that `needs:` this. Persist v2.3.0
-    # through v2.4.0 had all wheels green but never published because
-    # this job was hard-failing on a missing-secret guard introduced
-    # in the v2.0.3-v2.1.1 mobile-platform work. Configuring the
-    # secrets is operator-side; the soft-fail unblocks shipping in
-    # the interim.
-    continue-on-error: true
+    # v3.6.6 — hard-fail restored. The hybrid-signing secrets
+    # (CIRIS_BUILD_ED25519_SECRET / CIRIS_BUILD_MLDSA_SECRET) are now
+    # configured; a manifest failure means either the secrets rotated
+    # without CI being updated OR the registry is unreachable — both
+    # block PyPI publish so consumers always have a verifiable
+    # BuildManifest round-trip via /v1/builds/<v>?project=ciris-persist.
+    # v3.6.5's tag run was the last to ship with the v2.5.0 soft posture
+    # (registry was 503'ing during that publish; manifest never
+    # registered; PyPI published anyway). Hardening here so that mode
+    # can't recur.
     permissions:
       contents: read
       # v1.6.0 hardening — `gh run download` retry block below needs
