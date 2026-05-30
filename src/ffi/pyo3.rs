@@ -4412,8 +4412,28 @@ impl PyEngine {
                 PyValueError::new_err(format!("put_blob_signing attestation_id_uuid parse: {e}"))
             })?;
 
-            let signer = self.signer.clone();
+            // v3.6.5 (CIRISPersist#137) — prefer the in-memory local
+            // signer for the put_blob_signing hot path when its alias
+            // matches the caller-supplied `attesting_key_id`. The
+            // platform keyring signer (`self.signer`) goes through
+            // dbus/libsecret on Linux desktops, adding ~80ms per
+            // sign() call — the single largest fixed cost in the
+            // Python boundary's blob-ingest path. The local signer
+            // holds the Ed25519 secret in process memory and signs in
+            // ~14µs. When `attesting_key_id` doesn't match either
+            // signer's alias we fall back to `self.signer` — that
+            // path is unchanged.
             let attesting_key_id_owned = attesting_key_id.to_string();
+            let signer: Arc<dyn HardwareSigner> = match self
+                .local_signer
+                .as_ref()
+                .filter(|ls| ls.key_id() == attesting_key_id_owned.as_str())
+            {
+                Some(local) => Arc::new(crate::signing::LocalSignerHardwareAdapter::new(
+                    local.clone(),
+                )),
+                None => self.signer.clone(),
+            };
             let media_type_owned = media_type.map(str::to_owned);
 
             py.detach(move || match &self.backend {

@@ -5,6 +5,48 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.6.5] — 2026-05-30
+
+**CIRISPersist 3.6.5 — `put_blob_signing` PyO3 hot-path: prefer in-memory local signer (~1000× speedup, #137).**
+
+CIRISConformance's cross-wheel benchmark tier surfaced `put_blob_signing` as the first Python hot-path candidate for E2E native-Rust ingest: a flat ~82ms per-call cost, size-independent, ~50× the raw SQLite write. User-filed diagnosis (#137) framed it as a synchronous per-call round-trip waiting on something with fixed-latency cadence.
+
+### Root cause
+
+A native Rust micro-bench of the same `put_blob_signing` trait path runs in **91µs p50** — 900× faster than the Python boundary. The 80ms cost is entirely in the `signer.sign()` call within the trait's default impl. The PyO3 wrapper hardcodes `self.signer` — the platform keyring signer returned by `get_platform_signer(signing_key_id)`. On Linux desktops, that signer goes through dbus → libsecret/gnome-keyring → secret-service round-trip → ~80ms. Crypto itself is microseconds.
+
+Confirmed with an in-trait timing probe: `envelope+hash=0µs signer.sign=81431µs` per call.
+
+### Fix
+
+When the caller-supplied `attesting_key_id` matches the engine's local signer alias (loaded from `local_key_path` at Engine construction), use the local signer's in-memory `LocalSignerHardwareAdapter` instead of `self.signer`. The local signer holds the Ed25519 secret in process memory and signs in ~14µs. When `attesting_key_id` doesn't match the local signer's alias, fall back to `self.signer` — that path is unchanged.
+
+```rust
+let signer: Arc<dyn HardwareSigner> = match self
+    .local_signer
+    .as_ref()
+    .filter(|ls| ls.key_id() == attesting_key_id_owned.as_str())
+{
+    Some(local) => Arc::new(LocalSignerHardwareAdapter::new(local.clone())),
+    None => self.signer.clone(),
+};
+```
+
+### Measured speedup
+
+| blob size | v3.6.4 p50 | v3.6.5 p50 | Speedup |
+|---|---|---|---|
+| 256 B | 88.9 ms | 0.04 ms | **2222×** |
+| 1 KB | 84.2 ms | 0.07 ms | **1202×** |
+| 16 KB | 82.5 ms | 0.07 ms | **1178×** |
+| 256 KB | 83.6 ms | 0.72 ms | **116×** |
+
+Per-call throughput at 1KB jumps from ~12 blobs/s/thread to ~14,000 blobs/s/thread — above the criterion `ingest_pipeline` ~85K rows/s ceiling at multi-thread.
+
+### Scope
+
+The fix is `put_blob_signing` only. Other PyO3 methods (`local_sign_b64`, `evict_actor_json`, `cirisnode_*`) also use `self.signer.clone()` and share the same dbus-overhead profile; auditing + applying the same pattern to those is a follow-up (filed as part of the closure comment on #137). No behavior change beyond signer selection — caller can still drive the platform signer by passing its key_id as `attesting_key_id`.
+
 ## [3.6.4] — 2026-05-30
 
 **CIRISPersist 3.6.4 — `list_holders` local-truth TTL bypass restored (#130 reopen / child-safety fix in `cirisnode_process_takedown_admission`).**
