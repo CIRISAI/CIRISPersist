@@ -838,6 +838,59 @@ jobs:
             rm -rf "$tmpdir"
             echo "::endgroup::"
           done
+      # v3.6.9 (CIRISPersist#141) — macOS Mach-O parity gate. Mirrors
+      # the Linux readelf check above. The bug surfaced when CIRISVerify
+      # v4.4.1's target table silently activated rusqlite/bundled on
+      # macOS (the v4.4.1 hypothesis was "the cross-cdylib SIGSEGV is
+      # Linux-ELF-only" — turned out wrong: Mach-O has the same
+      # per-cdylib isolation behavior). CIRISVerify v4.4.3 dropped the
+      # macOS bundling; this gate makes any future regression
+      # immediately visible instead of latent.
+      #
+      # Checks via `otool -L` (LC_LOAD_DYLIB) and `nm -gU` (defined
+      # global externals) for the abi3 .so inside the macOS wheel:
+      #   - REQUIRE: /usr/lib/libsqlite3.dylib appears in LC_LOAD_DYLIB
+      #   - REJECT: any defined `sqlite3_*` symbol (statically embedded
+      #     libsqlite3 exposes its API as defined globals)
+      - name: verify wheel links libsqlite3 dynamically (macOS only)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for whl in target/wheels/*.whl; do
+            echo "::group::Inspect $whl"
+            tmpdir=$(mktemp -d)
+            unzip -qq "$whl" -d "$tmpdir"
+            so=$(find "$tmpdir" -maxdepth 4 -name '*.abi3.so' | head -1)
+            if [ -z "$so" ]; then
+              echo "::error::No abi3 cdylib found inside $whl"
+              ls -la "$tmpdir"
+              exit 1
+            fi
+            echo "Inspecting Mach-O cdylib: $so"
+            loads=$(otool -L "$so")
+            echo "LC_LOAD_DYLIB entries:"
+            echo "$loads"
+            if ! echo "$loads" | grep -qE '/usr/lib/libsqlite3\.dylib'; then
+              echo "::error::$whl missing /usr/lib/libsqlite3.dylib LC_LOAD_DYLIB entry"
+              echo "::error::libsqlite3 appears statically bundled — cross-cdylib SIGSEGV class (CIRISEdge#50) will recur on darwin"
+              echo "::error::Check that no transitive dep activates rusqlite/bundled or libsqlite3-sys/bundled"
+              exit 1
+            fi
+            # Reject statically-embedded sqlite3 by looking for defined
+            # global sqlite3_* symbols. A dynamically-linked cdylib has
+            # sqlite3_* as undefined externals (U) only; a statically-
+            # bundled one has them as defined globals (T / D / B).
+            if nm -gU "$so" 2>/dev/null | grep -qE ' [TDBSR] _sqlite3_'; then
+              defined_count=$(nm -gU "$so" 2>/dev/null | grep -cE ' [TDBSR] _sqlite3_' || true)
+              echo "::error::$whl contains $defined_count defined sqlite3_* symbols — libsqlite3 is statically embedded"
+              echo "::error::Cross-cdylib SIGSEGV (CIRISEdge#50) will recur on darwin"
+              exit 1
+            fi
+            echo "✓ $whl links /usr/lib/libsqlite3.dylib dynamically (no static sqlite3_* symbols)"
+            rm -rf "$tmpdir"
+            echo "::endgroup::"
+          done
       - name: confirm wheel shape
         # Reject anything that isn't cp310-abi3 — the v0.1.10 regression
         # showed mixed-mode maturin can silently emit cp31N-cp31N

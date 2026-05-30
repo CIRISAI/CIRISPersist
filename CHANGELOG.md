@@ -5,6 +5,34 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.6.9] — 2026-05-30
+
+**CIRISPersist 3.6.9 — CIRISVerify v4.4.3 pin bump + macOS Mach-O parity gate (#141).**
+
+Closes the cross-cdylib SIGSEGV class on darwin × sqlite (CIRISEdge#50 — Linux side already fixed by #136; the macOS side was latent because v4.4.1's target table silently activated `rusqlite/bundled` for macOS and persist had no Mach-O equivalent of the Linux readelf gate).
+
+### What landed
+
+**1. CIRISVerify pin v4.4.2 → v4.4.3.** Verify v4.4.3 dropped macOS from the `rusqlite/bundled` target table (CIRISVerify#45). Cargo's feature unification means as long as ANY consumer activates `rusqlite/bundled`, every consumer in the graph gets it — once verify stopped activating it on macOS, persist's macOS wheel stops inheriting it. Confirmed via `cargo tree --target=aarch64-apple-darwin -e features`: no `bundled` feature appears on darwin (or linux/iOS) post-bump. Android keeps `bundled` (NDK convention).
+
+**2. macOS Mach-O parity gate.** Mirrors the Linux `readelf` gate added in v3.6.2:
+
+- REQUIRES `/usr/lib/libsqlite3.dylib` in the wheel's `otool -L` LC_LOAD_DYLIB output
+- REJECTS any defined global `sqlite3_*` symbol via `nm -gU` (a statically-embedded libsqlite3 exposes its API as defined globals; a dynamically-linked one has them as undefined externals only)
+
+The gate would have caught the latent v3.5.2-onward macOS bundling immediately — no more silent regressions on darwin.
+
+### Sequencing of #141 closure
+
+| Step | Where | Cut |
+|---|---|---|
+| RCA: verify v4.4.1 silently bundles libsqlite3 on macOS | CIRISPersist#141 comment | n/a |
+| Upstream fix request | CIRISVerify#45 | n/a |
+| Verify v4.4.3 with macOS dropped from bundled target | upstream | verify v4.4.3 |
+| Pin bump + Mach-O gate | this cut | v3.6.9 |
+
+Expected CIRISConformance darwin × sqlite flip on next conformance run pinned to v3.6.9: `test_durable_send_enqueues_to_outbound_queue` returns clean instead of rc=-11.
+
 ## [3.6.8] — 2026-05-30
 
 **CIRISPersist 3.6.8 — local-signer fast-path extended to all sign-emitting PyO3 surfaces (#138, #140).**
