@@ -1248,10 +1248,23 @@ jobs:
           fi
           echo "Registry steward-key snapshot for ${REGISTRY_URL}:"
           curl -sf "${REGISTRY_URL}/v1/steward-key" | tee dist/steward-key.json | python3 -m json.tool
-          # Surface key_id to the step summary so it's grep-able
-          # later for cross-build cache-stability checks.
-          KID=$(python3 -c 'import json; print(json.load(open("dist/steward-key.json"))["classical"]["key_id"])')
+          # v3.6.6 — registry shipped M-of-N steward shape (per
+          # CIRISVerify#31). Old shape was `{classical: {key_id}}`;
+          # new shape is `{stewards: [{region, key_id, deployed}, ...],
+          # verification_policy: {threshold, of_total}}`. Pick the first
+          # deployed steward's key_id for the step-summary surfacing.
+          KID=$(python3 -c '
+          import json, sys
+          d = json.load(open("dist/steward-key.json"))
+          deployed = [s for s in d.get("stewards", []) if s.get("deployed")]
+          if not deployed:
+              print("::error::registry has no deployed stewards", file=sys.stderr)
+              sys.exit(1)
+          print(deployed[0]["key_id"])
+          ')
+          POLICY=$(python3 -c 'import json; p=json.load(open("dist/steward-key.json")).get("verification_policy",{}); print(f"{p.get(\"threshold\",\"?\")}-of-{p.get(\"of_total\",\"?\")} {p.get(\"scheme\",\"\")}")')
           echo "registry steward key_id=${KID}" >> "$GITHUB_STEP_SUMMARY"
+          echo "registry verification policy=${POLICY}" >> "$GITHUB_STEP_SUMMARY"
       - name: register multi-target build with CIRISRegistry
         # v0.9.2 (CIRISPersist#42) — replaces the prior custom
         # curl POST to /v1/verify/binary-manifest with the
