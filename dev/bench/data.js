@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780101632096,
+  "lastUpdate": 1780104604644,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -40505,6 +40505,288 @@ window.BENCHMARK_DATA = {
             "name": "storage_floor/next_sequence_full",
             "value": 1161,
             "range": "± 112",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "7a6860277ce48543b375a38bda107c5fce69ec73",
+          "message": "3.5.3 — wheel-tier completion of #132 (#133): CIRISVerify v4.3.0 + libsqlite3-dev in CI + readelf gate\n\nv3.5.2's source-tier fix narrowed rusqlite/bundled to Android-only in\npersist's Cargo.toml, but the published wheel STILL bundled libsqlite3.\nCIRISEdge#50 SIGSEGV still fired against the v3.5.2 wheel. Two RCs:\n\n1. ciris-verify-core v4.2.0 hardcoded `rusqlite = { features = [\"bundled\"] }`\n   at workspace root + a wide non-iOS override → transitive activation\n   defeated persist's target-narrowed override per cargo feature-union.\n2. Linux wheel-build runner had no libsqlite3-dev → pkg-config would\n   have failed anyway, libsqlite3-sys had nothing to link against.\n\nv3.5.3 lands:\n- Pin bump CIRISVerify v4.2.0 → v4.3.0 (6 Cargo.toml sites + pyproject\n  Requires-Dist). v4.3.0 removes bundled at workspace root + narrows\n  verify-core override to Android-only. `cargo tree -e features\n  --invert libsqlite3-sys` confirms bundled GONE from the feature graph.\n- CI installs libsqlite3-dev on Linux wheel-build runner. The existing\n  libtss2-dev step (v1.10.0) now also pulls libsqlite3-dev.\n- New post-build readelf/otool verification gate rejects any wheel\n  that doesn't have libsqlite3 as a NEEDED entry (Linux), dynamic-\n  link entry (macOS), or auditwheel sidecar. Future bundled\n  regressions get caught at wheel-build, not after PyPI publish.\n\nCloses CIRISEdge#50 at both source AND wheel tiers. Edge v1.0 RC\nunblocked at the wheel tier.",
+          "timestamp": "2026-05-29T20:06:03-05:00",
+          "tree_id": "57c44f3eb93069c4d2f521fa7e39d7f3e9275af9",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/7a6860277ce48543b375a38bda107c5fce69ec73"
+        },
+        "date": 1780104603312,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 28850770,
+            "range": "± 584704",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 1916222,
+            "range": "± 345230",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 2154,
+            "range": "± 43",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 4987,
+            "range": "± 70",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 10710,
+            "range": "± 120",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 38417,
+            "range": "± 862",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 5,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 22,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 133,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 439,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 496,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 1608,
+            "range": "± 30",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 6,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 75,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 227,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 1017,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 10,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 60805,
+            "range": "± 94212",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 146992,
+            "range": "± 56083",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 489823,
+            "range": "± 338652",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 6703,
+            "range": "± 238",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 7925,
+            "range": "± 472",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 12334,
+            "range": "± 443",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 28901,
+            "range": "± 887",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 646348,
+            "range": "± 4364",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 3442713,
+            "range": "± 67991",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 190231,
+            "range": "± 3781",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 554595,
+            "range": "± 18967",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 36337840,
+            "range": "± 720622",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 1854342,
+            "range": "± 184397",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 7603219,
+            "range": "± 225261",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 91490133,
+            "range": "± 1442244",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 5102118,
+            "range": "± 306168",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 19616027,
+            "range": "± 419596",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 103344,
+            "range": "± 9451",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 91488,
+            "range": "± 4045",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 15705,
+            "range": "± 720",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 46606,
+            "range": "± 1538",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 352926,
+            "range": "± 9825",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 1,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 590,
+            "range": "± 19",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 80,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 798,
+            "range": "± 44",
             "unit": "ns/iter"
           }
         ]
