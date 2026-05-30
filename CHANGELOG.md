@@ -5,7 +5,21 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [3.6.2] — 2026-05-29
+## [3.6.3] — 2026-05-29
+
+**CIRISPersist 3.6.3 — drop `auditwheel --plat` (v3.6.2 CI fix).**
+
+v3.6.2's auditwheel-repair step pinned `--plat manylinux_2_34_<arch>` from the matrix tag field, but the GitHub runner's glibc is newer than 2.34. Auditwheel correctly rejected: "too-recent versioned symbols." v3.6.2 tag CI failed at the wheel job; never reached PyPI.
+
+Fix: drop `--plat` from the auditwheel invocation. Auditwheel auto-detects the highest manylinux tag that fits the wheel's actual versioned symbol references — same behavior as maturin's previous internal auto-repair (which had been producing `manylinux_2_38` wheels on the same runners; v3.6.1 shipped with that tag).
+
+All of v3.6.2's #136 fix (auditwheel `--exclude libsqlite3.so.0` + tightened readelf gate) is unchanged. Only the `--plat` argument is removed.
+
+## [3.6.2] — 2026-05-29 — **DID NOT REACH PYPI**
+
+v3.6.2 tag CI failed at the auditwheel-repair step because the matrix-tag-derived `--plat manylinux_2_34_<arch>` is older than the runner's glibc. **v3.6.3 carries the entire v3.6.2 #136 work with the `--plat` argument dropped.**
+
+---
 
 **CIRISPersist 3.6.2 — wheel auditwheel-repair excludes libsqlite3 (#136 third-and-final iteration of the CIRISEdge#50 cross-cdylib SIGSEGV).**
 

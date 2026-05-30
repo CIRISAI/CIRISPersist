@@ -757,11 +757,17 @@ jobs:
           set -euo pipefail
           pip install auditwheel
           mkdir -p target/wheels/repaired
+          # `--plat` omitted: auditwheel auto-detects from the wheel's
+          # actual versioned symbol references. v3.6.1's maturin-internal
+          # auto-repair picked manylinux_2_38 on the same runners; matching
+          # that behavior here. Pinning `--plat manylinux_2_34_*` (the
+          # matrix.tag value) rejects the wheel because the runner's glibc
+          # is newer than 2.34. The matrix.tag field is now informational
+          # only (kept for parity with other CI configs).
           for whl in target/wheels/*linux_*.whl; do
             echo "::group::auditwheel repair $whl"
             auditwheel repair \
               --exclude libsqlite3.so.0 \
-              --plat ${{ matrix.tag }} \
               --wheel-dir target/wheels/repaired/ \
               "$whl"
             rm "$whl"
