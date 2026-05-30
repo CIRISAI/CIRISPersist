@@ -3225,14 +3225,36 @@ impl crate::federation::BlobStorage for SqliteBackend {
         // 4. Drop rows whose attester emitted a `withdraws` structural
         //    composer against the holds_bytes row's attestation_id
         //    (the ContentMiss feedback loop).
+        //
+        // v3.6.4 (CIRISPersist#130 reopen): when the blob is present in
+        // `federation_blobs` (local-truth: we have the bytes), the TTL
+        // filter is bypassed. Federation §10.1.2 TTL is a backstop for
+        // peer attestations going silently offline; for locally-held
+        // bytes the row's age says nothing about whether we still hold
+        // them. The `withdraws` mechanism remains the active eviction
+        // signal — ContentMiss feedback loop unchanged. This also
+        // closes a child-safety hole in the takedown handler, which
+        // queries `list_holders` and would otherwise leave stale-
+        // attested local content uneviction-able.
         let attestation_type = crate::federation::holds_bytes_attestation_type(sha256);
         let full_hex = hex::encode(sha256);
+        let sha_vec = sha256.to_vec();
         let now = chrono::Utc::now();
         let ttl = chrono::Duration::from_std(crate::federation::blobs::DEFAULT_HOLDS_BYTES_TTL)
             .expect("DEFAULT_HOLDS_BYTES_TTL fits chrono::Duration");
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<String>, rusqlite::Error> {
             let conn = conn.blocking_lock();
+
+            // v3.6.4 local-truth gate.
+            let blob_locally_held: bool = conn
+                .query_row(
+                    "SELECT 1 FROM federation_blobs WHERE sha256 = ?1",
+                    rusqlite::params![&sha_vec],
+                    |_| Ok(true),
+                )
+                .optional()?
+                .unwrap_or(false);
 
             // Step A: collect candidate holds_bytes rows.
             let mut stmt = conn.prepare(
@@ -3273,13 +3295,15 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 if !matches {
                     continue;
                 }
-                // (ii) TTL window
+                // (ii) TTL window — bypassed when blob is locally held
+                // (#130 reopen: federation TTL is a backstop for peer
+                // attestations; local-truth has definitive proof).
                 let asserted_at = match chrono::DateTime::parse_from_rfc3339(&asserted_at_str) {
                     Ok(t) => t.with_timezone(&chrono::Utc),
                     Err(_) => continue,
                 };
                 let expires_at = asserted_at + ttl;
-                if expires_at <= now {
+                if !blob_locally_held && expires_at <= now {
                     continue;
                 }
                 // (iii) ContentMiss withdraws — the attester emitted a
@@ -9612,6 +9636,45 @@ mod tests {
         assert_eq!(holders, vec!["host-a".to_string()]);
     }
 
+    // Regression for CIRISPersist#130 reopen: list_holders must
+    // report a locally-held blob's holder even when the holds_bytes
+    // attestation was emitted with a stale timestamp (older than the
+    // CEG §10.1.2 24h TTL). The bytes-on-disk in federation_blobs
+    // are definitive proof of holding; freshness window only applies
+    // to peer-discovered attestations where we lack the bytes.
+    //
+    // Closes the child-safety hole in cirisnode_process_takedown_-
+    // admission, which calls list_holders internally — stale-attested
+    // local content would otherwise evade NCMEC/CSAM/CourtOrder
+    // eviction.
+    #[tokio::test]
+    async fn blob_list_holders_stale_local_repro_130() {
+        use crate::federation::BlobStorage;
+        let backend = evict_test_backend_with_actors(&["actor-a"]).await;
+        let signer = test_signer_for("actor-a");
+        let bytes = b"signed payload".to_vec();
+        let sha = sha256_of(&bytes);
+        let stale_ts = chrono::Utc::now() - chrono::Duration::hours(48);
+        backend
+            .put_blob_signing(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                "actor-a",
+                &*signer,
+                stale_ts,
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .unwrap();
+        let holders = backend.list_holders(&sha).await.unwrap();
+        assert_eq!(
+            holders,
+            vec!["actor-a".to_string()],
+            "list_holders must include local writer even with stale attestation"
+        );
+    }
+
     #[tokio::test]
     async fn blob_list_holders_two_writers() {
         // Bootstrap a second host key.
@@ -9785,10 +9848,11 @@ mod tests {
 
     // ── v3.5.2 (CIRISPersist#130) — list_local_holders ──────────────
 
-    /// `list_local_holders` returns the holder for a stale (past-TTL)
-    /// attestation when the blob is locally held. The CEG §10.1.2 TTL
-    /// is a federation-discovery backstop — for local-truth queries
-    /// the substrate's audit chain is authoritative.
+    /// Stale (past-TTL) attestation for a locally-held blob: BOTH
+    /// `list_holders` AND `list_local_holders` report the holder
+    /// (v3.6.4 / #130 reopen — TTL bypass on local-truth applies to
+    /// both query surfaces; `list_local_holders` remains the
+    /// explicit-intent local-only path).
     #[tokio::test]
     async fn blob_list_local_holders_includes_stale_local_holding() {
         let backend = blob_test_backend().await;
@@ -9812,13 +9876,12 @@ mod tests {
             )
             .await
             .unwrap();
-        // Stale attestation: list_holders drops it (CEG §10.1.2)...
         let federation_holders = backend.list_holders(&sha).await.unwrap();
-        assert!(
-            federation_holders.is_empty(),
-            "list_holders must respect TTL for federation-discovery semantics"
+        assert_eq!(
+            federation_holders,
+            vec!["host-a".to_string()],
+            "list_holders bypasses TTL when bytes are locally held"
         );
-        // ...but list_local_holders returns it (local-truth semantics).
         let local_holders = backend.list_local_holders(&sha).await.unwrap();
         assert_eq!(local_holders, vec!["host-a".to_string()]);
     }
@@ -9891,9 +9954,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blob_list_holders_filters_out_expired_ttl() {
-        // CEG §10.1.2 — a holds_bytes attestation older than 24 hours
-        // is treated as stale; list_holders drops it.
+    async fn blob_list_holders_locally_held_bypasses_ttl() {
+        // v3.6.4 (CIRISPersist#130 reopen): a locally-held blob (row
+        // present in federation_blobs) reports its holder regardless
+        // of the holds_bytes attestation's age. CEG §10.1.2 TTL is a
+        // federation-discovery backstop; for local-truth, the bytes
+        // themselves are definitive. Closes the takedown-handler
+        // child-safety hole where stale-attested local content
+        // evaded eviction.
         let backend = blob_test_backend().await;
         let bytes = b"ttl-expired-blob".to_vec();
         let sha = sha256_of(&bytes);
@@ -9916,9 +9984,10 @@ mod tests {
             .await
             .unwrap();
         let holders = backend.list_holders(&sha).await.unwrap();
-        assert!(
-            holders.is_empty(),
-            "expected expired holder to be filtered out, got {holders:?}"
+        assert_eq!(
+            holders,
+            vec!["host-a".to_string()],
+            "locally-held blob reports holder regardless of attestation age, got {holders:?}"
         );
     }
 

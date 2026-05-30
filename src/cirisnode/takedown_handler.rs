@@ -391,6 +391,54 @@ mod tests {
         sha
     }
 
+    // v3.6.4 regression (CIRISPersist#130 reopen): a takedown for
+    // content with a stale holder attestation (older than the CEG
+    // §10.1.2 24h TTL) MUST still see the local holder and emit
+    // withdraws — the bytes are locally held; TTL is a
+    // federation-discovery backstop, not an eviction grace period.
+    // Without the local-truth bypass in list_holders, NCMEC/CSAM
+    // content held by a node whose attestation went stale evades
+    // takedown — a child-safety hole.
+    #[tokio::test]
+    async fn process_takedown_admission_evicts_stale_local_holder() {
+        let backend = seed_backend(&["holder-stale", "admin-key"]).await;
+        let h = test_signer(0x71, "holder-stale");
+        let admin = test_signer(0x72, "admin-key");
+        let payload = b"stale-but-locally-held";
+        let mut sha = [0u8; 32];
+        sha.copy_from_slice(&sha2::Sha256::digest(payload));
+        let stale_ts = Utc::now() - chrono::Duration::hours(48);
+        backend
+            .put_blob_signing(
+                &sha,
+                BlobBody::Inline(payload.to_vec()),
+                None,
+                "holder-stale",
+                &*h,
+                stale_ts,
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .unwrap();
+        let notice = fixture_notice(LegalBasis::NcmecCsam, &sha);
+        let report = process_takedown_admission(
+            &backend,
+            &backend,
+            &*admin,
+            "admin-key",
+            &notice,
+            Utc::now(),
+        )
+        .await
+        .expect("process_takedown_admission");
+        assert_eq!(
+            report.holders_seen, 1,
+            "stale-attested local holder must be visible to takedown"
+        );
+        assert_eq!(report.withdraws_emitted, 1);
+        assert_eq!(report.holders_evicted, 1);
+    }
+
     #[tokio::test]
     async fn process_takedown_admission_no_holders_is_noop() {
         let backend = seed_backend(&["admin-key"]).await;

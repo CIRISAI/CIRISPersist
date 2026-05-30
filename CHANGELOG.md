@@ -5,6 +5,52 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.6.4] — 2026-05-30
+
+**CIRISPersist 3.6.4 — `list_holders` local-truth TTL bypass restored (#130 reopen / child-safety fix in `cirisnode_process_takedown_admission`).**
+
+v3.5.1 added a local-held TTL bypass in `list_holders`. v3.5.2 reverted it ("corrected") and introduced a separate `list_local_holders` method. CIRISConformance reopened #130 against v3.6.3 because the documented `list_holders_json` surface still returns `[]` for locally-held blobs with stale attestations — and worse, the takedown handler (`cirisnode_process_takedown_admission`) internally calls `list_holders` for the holders-to-evict lookup. Result: a node locally holding NCMEC/CSAM/CourtOrder content with a stale (>24h) holder attestation reports `holders_seen: 0` and emits nothing — the content evades takedown eviction.
+
+### Fix
+
+Restore v3.5.1's bypass on both backends:
+
+- `src/store/sqlite.rs::list_holders` — query `federation_blobs` for the SHA; when present, skip the `expires_at <= now` filter.
+- `src/store/postgres.rs::list_holders` — same. Drop the `asserted_at > $cutoff` WHERE clause when blob is locally held.
+
+The `withdraws` filter remains active in both branches — it's the explicit eviction signal, not a freshness backstop.
+
+### Semantic split (post-fix)
+
+- `list_holders`: **live + local-truth**. TTL applies only to federation-discovered attestations (rows whose blob bytes we do NOT locally have). Locally-held blobs always report their attesters regardless of age.
+- `list_local_holders`: **strict local-truth**. Returns `[]` unless blob is in `federation_blobs`. Walks attestations without TTL. Kept as the explicit-intent surface for callers who want "ONLY local, no federation-discovered."
+
+Takedown handler unchanged — its `blob_storage.list_holders(&sha)` call now correctly sees local holders regardless of attestation age. CIRISConformance's two pinned xfails (`tests/test_200_fabric_eviction.py::test_list_holders_reports_local_holdings` + `tests/test_130_multimedia.py::test_takedown_evicts_local_holder`) flip to passing.
+
+### Tests updated
+
+Two pre-existing tests that pinned the wrong (federation-style TTL) semantic on locally-held blobs:
+
+- `blob_list_holders_locally_held_bypasses_ttl` (sqlite, was `..._filters_out_expired_ttl`) — now asserts holder IS reported.
+- `pg_blob_list_holders_locally_held_bypasses_ttl` (postgres, same rename) — same.
+
+### Tests added
+
+- `blob_list_holders_stale_local_repro_130` (sqlite) — put_blob_signing with 48h-old timestamp → list_holders reports the writer.
+- `process_takedown_admission_evicts_stale_local_holder` (cirisnode) — 48h-old holder attestation + NCMEC takedown → `holders_seen=1`, `withdraws_emitted=1`, `holders_evicted=1`. Closes the child-safety regression.
+
+### Python-level verification
+
+```python
+e = cp.Engine("sqlite::memory:", k, local_key_id=k, local_key_path=seed)
+kid = e.register_federation_key("agent", "ref", None, None, None)
+stale_ts = "2026-05-28T13:45:09.000Z"  # 2-day-old per user's original repro
+e.put_blob_signing(sha_hex, b64, None, None, kid, stale_ts, str(uuid.uuid4()))
+e.list_holders_json(sha_hex)
+# Before v3.6.4: []
+# After  v3.6.4: ["test-signer"]
+```
+
 ## [3.6.3] — 2026-05-29
 
 **CIRISPersist 3.6.3 — drop `auditwheel --plat` (v3.6.2 CI fix).**
