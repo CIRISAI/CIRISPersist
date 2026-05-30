@@ -5,7 +5,19 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [3.6.6] — 2026-05-30
+## [3.6.7] — 2026-05-30
+
+**CIRISPersist 3.6.7 — CI-only re-roll of v3.6.6 (shell-escape bug in the v3.6.6 steward-key parse).**
+
+No Rust changes. Functionally identical to v3.6.5 and v3.6.6.
+
+v3.6.6's POLICY line used `python3 -c 'f"{p.get(\"threshold\",\"?\")}..."'` — the `\"` escape sequences inside the single-quoted shell argument confuse Python's tokenizer ("unexpected character after line continuation character"). v3.6.7 consolidates KID + POLICY into a single heredoc'd Python block so shell quoting never touches the Python source.
+
+## [3.6.6] — 2026-05-30 — **DID NOT REACH PYPI**
+
+v3.6.6 tag CI failed at the build-manifest job's steward-key parse because of a shell-escape bug in the POLICY line (introduced in the v3.6.6 CI fix itself). The hard-gate posture worked as intended — the failure blocked PyPI publish. v3.6.7 re-rolls with the heredoc fix.
+
+---
 
 **CIRISPersist 3.6.6 — CI-only release: restore build-manifest hard-gate + adapt to M-of-N steward-key shape.**
 
