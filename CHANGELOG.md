@@ -5,7 +5,38 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [3.5.3] — 2026-05-29
+## [3.5.4] — 2026-05-30
+
+**CIRISPersist 3.5.4 — CIRISVerify pin v4.3.0 → v4.4.2 (clean recovery of v3.5.3 PyPI gate).**
+
+v3.5.3 source-tier + wheel-tier fixes were correct, but the pyproject.toml `Requires-Dist: ciris-verify>=4.3.0,<5` couldn't resolve at install time because **CIRISVerify v4.3.0 never reached PyPI** — its Windows release build failed on the same `bundled` narrowing (`sqlite3.lib` not on the MSVC runner). v3.5.3's tag CI failed on the linux-x86_64 (core) feature-test job at the `pip install ciris-verify>=4.3.0` step; PyPI publish was skipped. v3.5.3 main + tag remain in git history with this clarification.
+
+### What v3.5.4 lands
+
+- **CIRISVerify pin v4.3.0 → v4.4.2.** All 6 pin sites (base `ciris-keyring` / `ciris-verify-core` / `ciris-crypto` + the three per-target `[target.*]` tables for Linux TPM / iOS / Android). `pyproject.toml` `Requires-Dist`: `ciris-verify>=4.3.0,<5` → `>=4.4.2,<5`.
+- **No persist source change.** The bundled-Android-only Cargo.toml posture from v3.5.3 stands. CIRISVerify v4.4.x converged on a different target-narrowing (bundled on Android + Windows + macOS; dynamic on Linux + iOS), which is functionally compatible with persist's narrower posture — cargo feature-union of verify's `bundled` activation on macOS produces a bundled libsqlite3 in persist's darwin-aarch64 wheel, which matches verify's wheel exactly. Linux stays dynamic on both sides (where the cohab SIGSEGV lives).
+- **CI readelf gate from v3.5.3 stays.** `linux-x86_64` + `linux-aarch64` wheel jobs continue to install `libsqlite3-dev` and verify `libsqlite3` is a NEEDED entry post-build.
+
+### What v4.4.x recovery did upstream (informational)
+
+CIRISVerify v4.4.0–v4.4.2 landed in the same window:
+- **v4.4.0**: X25519 + key-grant wrap (CIRISVerify#44 — multimedia tier crypto).
+- **v4.4.1**: Target-narrowing `bundled` to `(Android, Windows, macOS)` — Linux + iOS stay dynamic (where the cohab SIGSEGV manifests). Cross.toml for arm64 + libsqlite3-dev install steps in the verify CI workflows.
+- **v4.4.2**: Fixed a self-inflicted Cargo.toml section-boundary bug where `android_system_properties` was orphaned under the wrong target table.
+
+CIRISEdge#50 cohab SIGSEGV stays closed under the v4.4.x posture. The federation now has cohabitation-safe verify across every wheel target.
+
+### CIRISEdge v1.0 RC pin
+
+v3.5.4 is the recommended pin for CIRISEdge v1.0 RC consumers. Same wheel shape as v3.5.3 was supposed to be; same readelf gate; same Cargo.toml posture. Verify v4.4.2 is on PyPI so the persist install resolves cleanly.
+
+## [3.5.3] — 2026-05-30 — **DID NOT REACH PYPI**
+
+v3.5.3 main + tag pushed but its tag CI failed at `pip install ciris-verify>=4.3.0,<5` because CIRISVerify v4.3.0 never reached PyPI (Windows release build failure). v3.5.4 carries the same fixes with the v4.4.2 pin that actually resolves.
+
+The v3.5.3 changelog body below describes the design intent; the actually-shipped behavior is in v3.5.4.
+
+---
 
 **CIRISPersist 3.5.3 — wheel-tier completion of #132 (#133): CIRISVerify v4.3.0 pin + libsqlite3-dev in CI + readelf verification gate.**
 
