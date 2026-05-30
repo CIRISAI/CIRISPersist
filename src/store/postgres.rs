@@ -3324,74 +3324,116 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .get_client()
             .await
             .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                // `asserted_at > cutoff` admits rows whose freshness
+                // window has NOT lapsed; rows whose asserted_at is at
+                // or before cutoff are TTL-expired.
+                "SELECT attestation_id::text, attesting_key_id, attestation_envelope \
+                 FROM cirislens.federation_attestations \
+                 WHERE attestation_type = $1 \
+                   AND asserted_at > $2 \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM cirislens.federation_attestations w \
+                     WHERE w.attestation_type = $3 \
+                       AND w.attesting_key_id = \
+                           cirislens.federation_attestations.attesting_key_id \
+                       AND w.attestation_envelope->>'references_attestation_id' = \
+                           cirislens.federation_attestations.attestation_id::text \
+                   )",
+                &[
+                    &attestation_type,
+                    &cutoff,
+                    &crate::federation::types::attestation_type::WITHDRAWS,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("list_holders query: {e}"))
+            })?;
 
-        // v3.5.1 (CIRISPersist#130) — bypass TTL when the blob is
-        // locally held. Federation §10.1.2 TTL is a backstop for
-        // peer attestations going stale; for blobs in our local
-        // `federation_blobs` table the bytes are definitively held
-        // + the holds_bytes attestations from any attester are
-        // reportable regardless of `asserted_at` age. The withdraws
-        // mechanism remains the active eviction signal.
+        let mut holders: Vec<String> = Vec::with_capacity(rows.len());
+        let mut seen = std::collections::HashSet::new();
+        for row in rows {
+            let envelope: serde_json::Value = row.safe_get_with(
+                "attestation_envelope",
+                crate::federation::BlobError::Backend,
+            )?;
+            let matches = envelope
+                .get("evidence_refs")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().any(|v| v.as_str() == Some(full_hex.as_str())))
+                .unwrap_or(false);
+            if !matches {
+                continue;
+            }
+            let key_id: String =
+                row.safe_get_with("attesting_key_id", crate::federation::BlobError::Backend)?;
+            if seen.insert(key_id.clone()) {
+                holders.push(key_id);
+            }
+        }
+        Ok(holders)
+    }
+
+    // v3.5.2 (CIRISPersist#130) — local-truth holder query, bypasses
+    // CEG §10.1.2 TTL. See trait docstring for the semantic split
+    // between this and `list_holders`. Returns empty if blob is not
+    // in `federation_blobs` (local-truth premise doesn't apply).
+    async fn list_local_holders(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Vec<String>, crate::federation::BlobError> {
+        let attestation_type = crate::federation::holds_bytes_attestation_type(sha256);
+        let full_hex = hex::encode(sha256);
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+
+        // Gate: blob must be locally present.
         let sha_vec = sha256.to_vec();
-        let blob_locally_held: bool = client
+        let blob_present: bool = client
             .query_opt(
                 "SELECT 1 FROM cirislens.federation_blobs WHERE sha256 = $1",
                 &[&sha_vec],
             )
             .await
-            .map_err(|e| crate::federation::BlobError::Backend(format!("local-hold lookup: {e}")))?
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!(
+                    "list_local_holders blob lookup: {e}"
+                ))
+            })?
             .is_some();
-
-        // Choose the SQL based on whether we bypass TTL. Both
-        // variants apply the withdraws filter; only the TTL
-        // predicate differs.
-        let rows = if blob_locally_held {
-            client
-                .query(
-                    "SELECT attestation_id::text, attesting_key_id, attestation_envelope \
-                     FROM cirislens.federation_attestations \
-                     WHERE attestation_type = $1 \
-                       AND NOT EXISTS ( \
-                         SELECT 1 FROM cirislens.federation_attestations w \
-                         WHERE w.attestation_type = $2 \
-                           AND w.attesting_key_id = \
-                               cirislens.federation_attestations.attesting_key_id \
-                           AND w.attestation_envelope->>'references_attestation_id' = \
-                               cirislens.federation_attestations.attestation_id::text \
-                       )",
-                    &[
-                        &attestation_type,
-                        &crate::federation::types::attestation_type::WITHDRAWS,
-                    ],
-                )
-                .await
-        } else {
-            client
-                .query(
-                    // `asserted_at > cutoff` admits rows whose freshness
-                    // window has NOT lapsed; rows whose asserted_at is at
-                    // or before cutoff are TTL-expired.
-                    "SELECT attestation_id::text, attesting_key_id, attestation_envelope \
-                     FROM cirislens.federation_attestations \
-                     WHERE attestation_type = $1 \
-                       AND asserted_at > $2 \
-                       AND NOT EXISTS ( \
-                         SELECT 1 FROM cirislens.federation_attestations w \
-                         WHERE w.attestation_type = $3 \
-                           AND w.attesting_key_id = \
-                               cirislens.federation_attestations.attesting_key_id \
-                           AND w.attestation_envelope->>'references_attestation_id' = \
-                               cirislens.federation_attestations.attestation_id::text \
-                       )",
-                    &[
-                        &attestation_type,
-                        &cutoff,
-                        &crate::federation::types::attestation_type::WITHDRAWS,
-                    ],
-                )
-                .await
+        if !blob_present {
+            return Ok(Vec::new());
         }
-        .map_err(|e| crate::federation::BlobError::Backend(format!("list_holders query: {e}")))?;
+
+        // Collect every holds_bytes attestation for this SHA prefix
+        // — NO TTL filter. The withdraws filter (NOT EXISTS) is
+        // applied inline same as list_holders.
+        let rows = client
+            .query(
+                "SELECT attestation_id::text, attesting_key_id, attestation_envelope \
+                 FROM cirislens.federation_attestations \
+                 WHERE attestation_type = $1 \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM cirislens.federation_attestations w \
+                     WHERE w.attestation_type = $2 \
+                       AND w.attesting_key_id = \
+                           cirislens.federation_attestations.attesting_key_id \
+                       AND w.attestation_envelope->>'references_attestation_id' = \
+                           cirislens.federation_attestations.attestation_id::text \
+                   )",
+                &[
+                    &attestation_type,
+                    &crate::federation::types::attestation_type::WITHDRAWS,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("list_local_holders query: {e}"))
+            })?;
 
         let mut holders: Vec<String> = Vec::with_capacity(rows.len());
         let mut seen = std::collections::HashSet::new();
@@ -12567,6 +12609,58 @@ mod tests {
             scrub_key_id: scrub_key_id.into(),
             scrub_timestamp,
         }
+    }
+
+    // ── v3.5.2 (CIRISPersist#130) — list_local_holders PG parity ─
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_blob_list_local_holders_includes_stale_local_holding() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::{BlobBody, BlobStorage};
+        let host = format!("pg-blob-localtruth-{}", uuid_like());
+        pg_blob_bootstrap_host(&backend, &host).await;
+        let bytes = pg_blob_payload("local-truth-stale");
+        let sha = pg_sha256_of(&bytes);
+        let backdated = chrono::Utc::now()
+            - chrono::Duration::from_std(crate::federation::blobs::DEFAULT_HOLDS_BYTES_TTL)
+                .unwrap()
+            - chrono::Duration::hours(1);
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                pg_blob_attestation_at(&host, &host, backdated),
+            )
+            .await
+            .unwrap();
+        // Stale: list_holders drops it (CEG §10.1.2)...
+        let federation_holders = backend.list_holders(&sha).await.unwrap();
+        assert!(federation_holders.is_empty());
+        // ...but list_local_holders returns it (local-truth).
+        let local_holders = backend.list_local_holders(&sha).await.unwrap();
+        assert_eq!(local_holders, vec![host]);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_blob_list_local_holders_returns_empty_when_blob_absent() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::BlobStorage;
+        let sha = pg_sha256_of(b"not-locally-held-pg");
+        let holders = backend.list_local_holders(&sha).await.unwrap();
+        assert!(holders.is_empty());
     }
 
     #[tokio::test]

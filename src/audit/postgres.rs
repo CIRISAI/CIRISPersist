@@ -1953,13 +1953,88 @@ mod tests {
 
     async fn pg_cleanup_tenant_merkle(backend: &PostgresBackend, tenant: &str) {
         let client = backend.pool().get().await.unwrap();
-        client
+
+        // v3.5.2 (CIRISPersist#128) — diagnostic instrumentation:
+        // when this DELETE fires "relation does not exist", we want
+        // a rich snapshot at the failure boundary. The eprintln only
+        // produces output on the actual failure path.
+        if let Err(e) = client
             .execute(
                 "DELETE FROM cirislens.merkle_sth_log WHERE tenant_id = $1",
                 &[&tenant],
             )
             .await
-            .unwrap();
+        {
+            eprintln!("=== #128 RCA: pg_cleanup_tenant_merkle DELETE FAILED ===");
+            eprintln!("    tenant={tenant}");
+            eprintln!("    error={e:?}");
+            // 1. Which tables exist in cirislens matching `merkle%`?
+            if let Ok(rows) = client
+                .query(
+                    "SELECT table_name FROM information_schema.tables \
+                     WHERE table_schema = 'cirislens' AND table_name LIKE 'merkle%'",
+                    &[],
+                )
+                .await
+            {
+                let names: Vec<String> = rows
+                    .iter()
+                    .map(|r| r.get::<_, String>("table_name"))
+                    .collect();
+                eprintln!("    cirislens merkle tables: {names:?}");
+            }
+            // 2. Connection identity: what DB / schema / search_path?
+            if let Ok(row) = client
+                .query_one(
+                    "SELECT current_database(), current_schema(), current_setting('search_path')",
+                    &[],
+                )
+                .await
+            {
+                let db: String = row.get(0);
+                let schema: String = row.get(1);
+                let sp: String = row.get(2);
+                eprintln!("    current_database={db}, current_schema={schema}, search_path={sp}");
+            }
+            // 3. Refinery schema_history snapshot.
+            if let Ok(rows) = client
+                .query(
+                    "SELECT version FROM ciris_persist_schema_history ORDER BY version DESC LIMIT 5",
+                    &[],
+                )
+                .await
+            {
+                let versions: Vec<i32> = rows.iter().map(|r| r.get::<_, i32>(0)).collect();
+                eprintln!("    schema_history top 5 versions: {versions:?}");
+            } else {
+                eprintln!("    ciris_persist_schema_history NOT readable");
+            }
+            // 4. Are we in a transaction? Could explain visibility.
+            if let Ok(row) = client
+                .query_one("SELECT (txid_current_if_assigned() IS NOT NULL)::text", &[])
+                .await
+            {
+                let in_tx: String = row.get(0);
+                eprintln!("    in_transaction: {in_tx}");
+            }
+            // 5. Backend connection state.
+            if let Ok(row) = client
+                .query_one(
+                    "SELECT pid, application_name, backend_start::text, state \
+                     FROM pg_stat_activity WHERE pid = pg_backend_pid()",
+                    &[],
+                )
+                .await
+            {
+                let pid: i32 = row.get(0);
+                let app: String = row.get(1);
+                let bs: String = row.get(2);
+                let state: Option<String> = row.get(3);
+                eprintln!("    backend pid={pid} app={app} since={bs} state={state:?}");
+            }
+            eprintln!("=== end #128 RCA ===");
+            panic!("merkle_sth_log DELETE failed: {e:?}");
+        }
         client
             .execute(
                 "DELETE FROM cirislens.merkle_leaves WHERE tenant_id = $1",

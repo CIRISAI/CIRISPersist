@@ -5,7 +5,81 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [3.5.1] — 2026-05-29
+## [3.5.2] — 2026-05-29
+
+**CIRISPersist 3.5.2 — RCA-driven triple-close: #132 libsqlite3 cross-cdylib SIGSEGV (blocks CIRISEdge v1.0 RC) + #130 `list_local_holders` (corrected) + #128 av26 schema-wipe race (real root cause found).**
+
+This release closes the three issues blocking CIRISEdge v1.0 RC, each with a real root cause + structural fix rather than a workaround.
+
+### #132 — libsqlite3 cross-cdylib SIGSEGV (CIRISEdge#50 RCA)
+
+**The bug.** When `ciris_persist.so` (Linux PyPI wheel) and `ciris_edge.so` were both loaded into the same Python process, each cdylib statically linked its own `libsqlite3-sys` (rusqlite's `bundled` feature). Two `sqlite3GlobalConfig` static globals, two heap allocators, two mutex tables. Edge had no direct rusqlite use, but the blanket impl `<SqliteBackend as OutboundQueue>` was monomorphized in edge's compilation — so `edge.so`'s libsqlite3 ended up operating on a `sqlite3*` connection allocated by `persist.so`'s libsqlite3. Edge's libsqlite3 was never `sqlite3_initialize`d → first `mallocWithAlarm` indirected through a NULL `xMalloc` slot → SIGSEGV in production.
+
+Same defect class for every trait edge consumes via blanket impl over a persist backend: `VerifyDirectory`, `RootingDirectory`, `EdgeDetectionAdmission`, `BlackholeRules`. CIRISEdge#50 has the full gdb stack + reproduction.
+
+**The fix — `bundled` is now Android-only.** Persist's `Cargo.toml` previously had `[target.'cfg(not(target_os = "ios"))'.dependencies]` adding `bundled` to every desktop target. v3.5.2 narrows that to `[target.'cfg(target_os = "android")']`:
+
+- **Linux / macOS / Windows / iOS**: link against the platform's system `libsqlite3.so.0` / `libsqlite3.dylib` dynamically. `dlopen` resolution is shared across cdylibs → ONE library instance, ONE initialization, ONE allocator.
+- **Android**: keep `bundled` (NDK libsqlite3 isn't guaranteed across vendor builds; Android's app-sandbox model makes static linking conventional).
+
+Same posture iOS already used (CIRISVerify v1.6.4 documented the libRPAC.dylib double-dylib trap that fixed the iOS case). #132 generalizes it to all desktop targets. Manylinux2_28 wheels guarantee `libsqlite3.so.0` is present; macOS ships `/usr/lib/libsqlite3.dylib` in every release.
+
+### #130 (corrected from v3.5.1) — `list_local_holders` separate API
+
+v3.5.1 tried to close #130 by bypassing the CEG §10.1.2 24-hour TTL filter in `list_holders` when the blob was locally held. **That broke two pre-existing tests (`pg_blob_list_holders_filters_out_expired_ttl` + `blob_list_holders_filters_out_expired_ttl`) that explicitly asserted the CEG-conformant behavior.** The CI matrix failed across all 6 linux-x86_64 feature jobs; PyPI publish was skipped. v3.5.1 never reached PyPI.
+
+**The correct fix.** Two legitimate but **distinct** semantics:
+
+- **Federation-discovery** (`list_holders`): "which peers _claim_ to hold this blob right now, per CEG §10.1.2 freshness?" — TTL filter is normative.
+- **Local-truth** (CIRISConformance #130 ask): "I have the bytes; which attestations in the substrate's audit chain claim holdings?" — TTL is the wrong filter.
+
+v3.5.2 reverts the TTL-bypass in `list_holders` (CEG §10.1.2 semantic restored) and introduces a new trait method + PyO3 mirror `list_local_holders` (sqlite + PG impls). Gate: blob must be in `federation_blobs`; if not, returns `[]`. No TTL filter. Withdraws filter still honored.
+
+5 new tests (3 sqlite + 2 PG); existing TTL filter tests restored to PASS.
+
+### #128 — `av26_concurrent_boot_advisory_lock` schema-wipe race (the real root cause)
+
+**v3.5.1's partial fix was incomplete.** The seed reallocation (`0xA1` → `0xC1`) + nextest test-group + `_pg` / `::pg_` / `::postgres::` / `postgres_tests::` filter caught most PG tests, but a 5-run gauntlet still showed 1-3 deterministic failures per run on different tests (`pg_merkle_hook_*`, `pg_lookup_trust_grant_*`, `maintenance_pg_maintain_umbrella_runs_all`). The failures rotated; pattern was non-obvious.
+
+**RCA via instrumented diagnostic.** Added a fail-path-only diagnostic in `pg_cleanup_tenant_merkle` that captures the schema state at the panic boundary, plus upgraded `merkle_store::pg_storage_err` to Debug-format the underlying tokio_postgres error (the previous Display format flattened it to "db error"). The diagnostic caught it in one run:
+
+```
+=== #128 RCA: pg_cleanup_tenant_merkle DELETE FAILED ===
+    error=... message: "relation \"cirislens.merkle_sth_log\" does not exist" ...
+    cirislens merkle tables: []
+    current_database=ciris_test_db, current_schema=public
+    ciris_persist_schema_history NOT readable
+=== end #128 RCA ===
+```
+
+The schema was empty. The culprit: **`tests/qa_harness.rs::av26_concurrent_boot_advisory_lock`** does `DROP SCHEMA cirislens CASCADE` + `DROP TABLE ciris_persist_schema_history` to simulate cold-start, then races 10 workers on `run_migrations`. While av26 was running, every other PG test saw `"relation cirislens.* does not exist"` errors. The test had `#[serial_test::serial(postgres)]` — but `serial_test` only serializes within a process, and nextest spawns one process per test, so the annotation was a cross-process no-op.
+
+**The fix.** Added `av26_concurrent_boot_advisory_lock` to the nextest postgres test-group filter — that's the cross-process serializer. Filter now matches by test-name pattern (`_pg$` / `_postgres$` / `::pg_` / `postgres_tests::` / `::postgres::`) **plus the explicit av26 entry**. `max-threads = 1` in the group then guarantees av26 runs in isolation from every other PG test.
+
+Verified: **3-run gauntlet 951/951 every run.** Was 1-3 random fails per run before.
+
+### Carry-forward from v3.5.1 (still in this release)
+
+- **#129 (trust_scoring_capsule)** — 7th PyCapsule + `AdmissionGate::scoring_arc` + `Engine::trust_scoring` accessor. Unchanged from v3.5.1's design.
+
+### Diagnostic instrumentation left in tree
+
+- `src/audit/postgres.rs::pg_cleanup_tenant_merkle` — fail-path-only logging captures schema state when the DELETE errors. Zero-cost on the success path; surfaces a rich snapshot on the failure path. Future #128-class issues debugged in minutes instead of hours.
+- `src/audit/merkle_store.rs::pg_storage_err` — Debug-formats the underlying error (was Display). The Display format flattened tokio_postgres errors to `"db error"` with no SQLSTATE / table / detail; Debug surfaces the full `DbError` struct. Strict improvement, no behavioral change.
+
+### Mission citations
+
+- §1.6 fail-honest — v3.5.1 violated this twice (#130 broke CEG, #128 partial fix shipped). v3.5.2's RCA-driven discipline + diagnostic instrumentation honors the directive [feedback_hundred_percent_green].
+- §1.5 parity — `list_local_holders` on both backends; #132 fix applies to every desktop target uniformly.
+- §1.3 lowest-stateful-library — #132 closes the cross-cdylib cohabitation trap that prevented CIRISEdge v1.0 RC from pinning persist.
+
+## [3.5.1] — 2026-05-29 — **WITHDRAWN**
+
+v3.5.1 tag CI failed; never reached PyPI. See v3.5.2 for the RCA and corrected fix. v3.5.1's `#129` and partial `#128` work was correct and is carried forward unchanged; only the `#130` part required rework.
+
+The v3.5.1 changelog body below describes the design intent, not the published behavior — the linux-x86_64 CI matrix runs (cirisnode / telemetry / secrets / cirisaudit / core / cirisgraph) all failed on the two `*_filters_out_expired_ttl` regressions, and PyPI publish was skipped.
+
+---
 
 **CIRISPersist 3.5.1 — `trust_scoring_capsule` cohabitation accessor (#129) + `list_holders` local-held bypass (#130) + partial `#128` parallel-test isolation fixes.**
 

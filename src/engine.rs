@@ -3868,56 +3868,6 @@ mod tests {
         );
     }
 
-    /// v3.5.1 (CIRISPersist#130) — `list_holders` reports local-held
-    /// blobs even when their `holds_bytes` attestation is past the
-    /// 24h federation TTL. The conformance harness uses a fixed
-    /// `now` timestamp on `put_blob_signing` (replay determinism);
-    /// without this fix, the TTL filter excludes the local holder
-    /// after 24h have elapsed in real time. Federation §10.1.2 TTL
-    /// is a backstop for peer attestations only — for locally-held
-    /// blobs the bytes are definitive proof of holding.
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn list_holders_includes_local_held_blob_with_stale_attestation_sqlite() {
-        use crate::federation::{BlobBody, BlobStorage, FederationDirectory};
-        let signer = test_signer();
-        let engine = Engine::with_signer(signer, "sqlite::memory:")
-            .await
-            .expect("construct engine");
-        let sq = engine.sqlite_backend().expect("sqlite present");
-        sq.put_public_key(sweeper_test_key("test-engine-steward"))
-            .await
-            .expect("seed signer key");
-        let bytes = vec![0xAB; 1024];
-        let sha = {
-            use sha2::{Digest, Sha256};
-            let mut out = [0u8; 32];
-            out.copy_from_slice(&Sha256::digest(&bytes));
-            out
-        };
-        // Stale timestamp — 48 hours in the past. Past the 24h
-        // DEFAULT_HOLDS_BYTES_TTL window.
-        let stale = chrono::Utc::now() - chrono::Duration::hours(48);
-        engine
-            .put_blob_signing(
-                &sha,
-                BlobBody::Inline(bytes),
-                None,
-                "test-engine-steward",
-                stale,
-                uuid::Uuid::new_v4(),
-            )
-            .await
-            .expect("put_blob_signing with stale asserted_at");
-        let holders = sq.list_holders(&sha).await.expect("list_holders");
-        assert_eq!(
-            holders,
-            vec!["test-engine-steward".to_string()],
-            "blob is locally held; list_holders must report the holder \
-             regardless of the 24h federation TTL"
-        );
-    }
-
     /// v3.4.0 (CIRISPersist#123) — `list_holders` filters out the
     /// holds_bytes attestation whose attester later emitted a
     /// `withdraws` referencing it. Confirms the eviction → withdraws

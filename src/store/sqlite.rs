@@ -3209,26 +3209,8 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let ttl = chrono::Duration::from_std(crate::federation::blobs::DEFAULT_HOLDS_BYTES_TTL)
             .expect("DEFAULT_HOLDS_BYTES_TTL fits chrono::Duration");
         let conn = self.conn.clone();
-        let sha_vec = sha256.to_vec();
         tokio::task::spawn_blocking(move || -> Result<Vec<String>, rusqlite::Error> {
             let conn = conn.blocking_lock();
-
-            // v3.5.1 (CIRISPersist#130) — bypass TTL when the blob is
-            // locally held. Federation §10.1.2 TTL is a backstop for
-            // peer attestations going stale; for blobs in our local
-            // `federation_blobs` table the bytes are definitively
-            // held + the holds_bytes attestations from any attester
-            // are reportable regardless of `asserted_at` age. The
-            // `withdraws` mechanism remains the active eviction
-            // signal; TTL just doesn't punish local-truth.
-            let blob_locally_held: bool = conn
-                .query_row(
-                    "SELECT 1 FROM federation_blobs WHERE sha256 = ?1",
-                    rusqlite::params![&sha_vec],
-                    |_| Ok(true),
-                )
-                .optional()?
-                .unwrap_or(false);
 
             // Step A: collect candidate holds_bytes rows.
             let mut stmt = conn.prepare(
@@ -3269,15 +3251,13 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 if !matches {
                     continue;
                 }
-                // (ii) TTL window — bypassed when the blob is locally
-                // held (#130: federation TTL is a backstop for peer
-                // attestations; local-held blobs have definitive truth).
+                // (ii) TTL window
                 let asserted_at = match chrono::DateTime::parse_from_rfc3339(&asserted_at_str) {
                     Ok(t) => t.with_timezone(&chrono::Utc),
                     Err(_) => continue,
                 };
                 let expires_at = asserted_at + ttl;
-                if !blob_locally_held && expires_at <= now {
+                if expires_at <= now {
                     continue;
                 }
                 // (iii) ContentMiss withdraws — the attester emitted a
@@ -3321,6 +3301,110 @@ impl crate::federation::BlobStorage for SqliteBackend {
         .await
         .map_err(|e| crate::federation::BlobError::Backend(format!("spawn_blocking join: {e}")))?
         .map_err(|e| crate::federation::BlobError::Backend(format!("list_holders: {e}")))
+    }
+
+    // v3.5.2 (CIRISPersist#130) — local-truth holder query, bypasses
+    // CEG §10.1.2 TTL. See trait docstring for the semantic split
+    // between this and `list_holders`. Returns empty if blob is not
+    // in `federation_blobs` (local-truth premise doesn't apply).
+    async fn list_local_holders(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Vec<String>, crate::federation::BlobError> {
+        let attestation_type = crate::federation::holds_bytes_attestation_type(sha256);
+        let full_hex = hex::encode(sha256);
+        let sha_vec = sha256.to_vec();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<String>, rusqlite::Error> {
+            let conn = conn.blocking_lock();
+
+            // Gate: blob must be locally present.
+            let blob_present: bool = conn
+                .query_row(
+                    "SELECT 1 FROM federation_blobs WHERE sha256 = ?1",
+                    rusqlite::params![&sha_vec],
+                    |_| Ok(true),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if !blob_present {
+                return Ok(Vec::new());
+            }
+
+            // Collect every holds_bytes attestation for this SHA
+            // prefix (NO TTL filter).
+            let mut stmt = conn.prepare(
+                "SELECT attestation_id, attesting_key_id, attestation_envelope \
+                 FROM federation_attestations \
+                 WHERE attestation_type = ?1",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![&attestation_type], |row| {
+                let attestation_id: String = row.get("attestation_id")?;
+                let key_id: String = row.get("attesting_key_id")?;
+                let env_text: String = row.get("attestation_envelope")?;
+                Ok((attestation_id, key_id, env_text))
+            })?;
+            let candidates: Vec<(String, String, String)> = rows.collect::<Result<_, _>>()?;
+            drop(stmt);
+
+            let mut holders: Vec<String> = Vec::new();
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for (attestation_id, key_id, env_text) in candidates {
+                // (i) full-SHA match on evidence_refs.
+                let env: serde_json::Value = match serde_json::from_str(&env_text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let matches = env
+                    .get("evidence_refs")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().any(|v| v.as_str() == Some(full_hex.as_str())))
+                    .unwrap_or(false);
+                if !matches {
+                    continue;
+                }
+
+                // (ii) withdraws filter — explicit eviction signal.
+                let mut withdraws_stmt = conn.prepare(
+                    "SELECT attestation_envelope FROM federation_attestations \
+                     WHERE attestation_type = ?1 AND attesting_key_id = ?2",
+                )?;
+                let withdraws_rows = withdraws_stmt.query_map(
+                    rusqlite::params![
+                        crate::federation::types::attestation_type::WITHDRAWS,
+                        &key_id
+                    ],
+                    |r| r.get::<_, String>("attestation_envelope"),
+                )?;
+                let mut withdrawn = false;
+                for w in withdraws_rows {
+                    let w_text = w?;
+                    let w_env: serde_json::Value = match serde_json::from_str(&w_text) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    if w_env
+                        .get("references_attestation_id")
+                        .and_then(|v| v.as_str())
+                        == Some(attestation_id.as_str())
+                    {
+                        withdrawn = true;
+                        break;
+                    }
+                }
+                if withdrawn {
+                    continue;
+                }
+
+                if seen.insert(key_id.clone()) {
+                    holders.push(key_id);
+                }
+            }
+            Ok(holders)
+        })
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| crate::federation::BlobError::Backend(format!("list_local_holders: {e}")))
     }
 
     async fn list_held_by(
@@ -9675,6 +9759,113 @@ mod tests {
             scrub_key_id: scrub_key_id.into(),
             scrub_timestamp,
         }
+    }
+
+    // ── v3.5.2 (CIRISPersist#130) — list_local_holders ──────────────
+
+    /// `list_local_holders` returns the holder for a stale (past-TTL)
+    /// attestation when the blob is locally held. The CEG §10.1.2 TTL
+    /// is a federation-discovery backstop — for local-truth queries
+    /// the substrate's audit chain is authoritative.
+    #[tokio::test]
+    async fn blob_list_local_holders_includes_stale_local_holding() {
+        let backend = blob_test_backend().await;
+        let bytes = b"local-truth-stale-blob".to_vec();
+        let sha = sha256_of(&bytes);
+        let backdated = chrono::Utc::now()
+            - chrono::Duration::from_std(crate::federation::blobs::DEFAULT_HOLDS_BYTES_TTL)
+                .unwrap()
+            - chrono::Duration::hours(1);
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                blob_attestation_at(
+                    "host-a",
+                    "host-a",
+                    uuid::Uuid::new_v4().to_string().as_str(),
+                    backdated,
+                ),
+            )
+            .await
+            .unwrap();
+        // Stale attestation: list_holders drops it (CEG §10.1.2)...
+        let federation_holders = backend.list_holders(&sha).await.unwrap();
+        assert!(
+            federation_holders.is_empty(),
+            "list_holders must respect TTL for federation-discovery semantics"
+        );
+        // ...but list_local_holders returns it (local-truth semantics).
+        let local_holders = backend.list_local_holders(&sha).await.unwrap();
+        assert_eq!(local_holders, vec!["host-a".to_string()]);
+    }
+
+    /// `list_local_holders` returns `[]` when the blob is not in
+    /// `federation_blobs` — the local-truth premise doesn't apply.
+    #[tokio::test]
+    async fn blob_list_local_holders_returns_empty_when_blob_absent() {
+        let backend = blob_test_backend().await;
+        let sha = sha256_of(b"not-locally-held");
+        let holders = backend.list_local_holders(&sha).await.unwrap();
+        assert!(holders.is_empty());
+    }
+
+    /// `list_local_holders` honors `withdraws` — explicit eviction
+    /// signals trump TTL bypass.
+    #[tokio::test]
+    async fn blob_list_local_holders_filters_on_withdraws() {
+        use crate::federation::types::{Attestation, SignedAttestation};
+        let backend = blob_test_backend().await;
+        let bytes = b"local-truth-withdrawn".to_vec();
+        let sha = sha256_of(&bytes);
+        let holds_id = uuid::Uuid::new_v4().to_string();
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                blob_attestation("host-a", "host-a", holds_id.as_str()),
+            )
+            .await
+            .unwrap();
+        // Sanity: present before withdraws.
+        assert_eq!(
+            backend.list_local_holders(&sha).await.unwrap(),
+            vec!["host-a".to_string()]
+        );
+        // host-a emits the WITHDRAWS pointing at the holds_bytes row.
+        let withdraws_envelope = serde_json::json!({
+            "kind": "withdraws",
+            "references_attestation_id": holds_id,
+            "references_attestation_type": crate::federation::holds_bytes_attestation_type(&sha),
+        });
+        let withdraws_id = uuid::Uuid::new_v4().to_string();
+        use crate::federation::FederationDirectory;
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: Attestation {
+                    attestation_id: withdraws_id,
+                    attesting_key_id: "host-a".into(),
+                    attested_key_id: "host-a".into(),
+                    attestation_type: crate::federation::types::attestation_type::WITHDRAWS.into(),
+                    weight: None,
+                    asserted_at: chrono::Utc::now(),
+                    expires_at: None,
+                    attestation_envelope: withdraws_envelope,
+                    original_content_hash: "abcdef02".into(),
+                    scrub_signature_classical: "c2ln".into(),
+                    scrub_signature_pqc: None,
+                    scrub_key_id: "host-a".into(),
+                    scrub_timestamp: chrono::Utc::now(),
+                    pqc_completed_at: None,
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .unwrap();
+        // Withdraws active: list_local_holders drops the row.
+        assert!(backend.list_local_holders(&sha).await.unwrap().is_empty());
     }
 
     #[tokio::test]

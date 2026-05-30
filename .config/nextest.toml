@@ -59,5 +59,15 @@ fail-fast = false
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'test(/_pg$/) + test(/::pg_/) + test(/postgres_tests::/) + test(/::postgres::/)'
+# v3.5.2 (CIRISPersist#128) — RCA found `av26_concurrent_boot_advisory_lock`
+# in tests/qa_harness.rs does `DROP SCHEMA cirislens CASCADE` to simulate
+# cold-start, then races 10 workers on run_migrations. While that's running,
+# OTHER PG tests see "relation cirislens.merkle_sth_log does not exist"
+# (and analogous failures on every other cirislens table). serial_test's
+# `#[serial(postgres)]` annotation only serializes within a process; nextest
+# spawns one process per test so the annotation is a no-op across the
+# process boundary. The test-group's max-threads=1 IS the cross-process
+# serializer — we just need to make sure av26 (and any future qa_harness
+# tests with similar destructive schema ops) is in the group.
+filter = 'test(/_pg$/) + test(/_postgres$/) + test(/::pg_/) + test(/postgres_tests::/) + test(/::postgres::/) + test(av26_concurrent_boot_advisory_lock)'
 test-group = "postgres"

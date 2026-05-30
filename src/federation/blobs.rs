@@ -378,6 +378,54 @@ pub trait BlobStorage: Send + Sync {
         sha256: &[u8; 32],
     ) -> impl Future<Output = Result<Vec<String>, BlobError>> + Send;
 
+    /// v3.5.2 (CIRISPersist#130) — **local-truth** holder query.
+    ///
+    /// Returns the `key_id`s of every attester this engine has a
+    /// `holds_bytes:sha256:<prefix>` attestation for, **regardless of
+    /// the CEG §10.1.2 24-hour TTL window**. The bytes are locally
+    /// held (verified by checking `federation_blobs`); the attestations
+    /// are read directly from the substrate; `withdraws` is still the
+    /// active eviction signal.
+    ///
+    /// # Why this exists alongside `list_holders`
+    ///
+    /// [`list_holders`](BlobStorage::list_holders) answers the
+    /// **federation-discovery** question: "which peers _claim_ to hold
+    /// this blob right now, per CEG §10.1.2 freshness?" Stale claims
+    /// are dropped because peers may have gone silently offline.
+    ///
+    /// `list_local_holders` answers the **local-truth** question:
+    /// "I have the bytes in `federation_blobs`; which attestations
+    /// from this substrate's audit chain claim holdings of them?"
+    /// The bytes' presence is definitive proof — TTL is a backstop
+    /// for peers, not for our own ground truth.
+    ///
+    /// Both APIs honor `withdraws`: an explicit eviction signal is
+    /// honored regardless of TTL.
+    ///
+    /// # Filter discipline
+    ///
+    /// 1. If the blob is NOT in `federation_blobs`, returns `Vec::new()`
+    ///    immediately. The local-truth premise doesn't apply — for
+    ///    federation-discovery, use [`list_holders`].
+    /// 2. WHERE `attestation_type` matches the full
+    ///    `holds_bytes:sha256:<8-hex-prefix>` for this SHA.
+    /// 3. AND `evidence_refs` (from the envelope) contains the full
+    ///    hex SHA (discriminates prefix collisions).
+    /// 4. **No TTL filter.** Stale local attestations are admitted.
+    /// 5. AND the attester has NOT emitted a `withdraws` against the
+    ///    holds_bytes row's `attestation_id`.
+    ///
+    /// # Use case
+    ///
+    /// FEDERATION_SCALING_MODEL §9.1 "whose bytes do I hold?" — the
+    /// substrate-truth side of the identity-aware-storage property.
+    /// CIRISConformance fabric-tier consumes this for the §9 audit.
+    fn list_local_holders(
+        &self,
+        sha256: &[u8; 32],
+    ) -> impl Future<Output = Result<Vec<String>, BlobError>> + Send;
+
     /// v3.5.0 (CIRISPersist#125) — the **inverse** of
     /// [`list_holders`](BlobStorage::list_holders): "whose bytes do I
     /// hold for actor X?". Returns the full SHA-256 of every blob this

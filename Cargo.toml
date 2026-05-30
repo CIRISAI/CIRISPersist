@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "3.5.1"
+version = "3.5.2"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -625,24 +625,56 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "signa
 futures-core = "0.3"
 tokio-stream = "0.1"
 
-# v0.9.0 — iOS-specific rusqlite override. Cargo MERGES the features
-# list from `[dependencies]` and from any matching
-# `[target.cfg(...)'.dependencies]` table that the current build
-# target matches. On non-iOS, this target table adds `bundled` →
-# resolved feature set is `bundled + chrono + serde_json`. On iOS,
-# this table doesn't apply, so the base `chrono + serde_json`
-# (system-linked libsqlite3) wins. Both produce the desired shape
-# per CIRISVerify v1.6.4's libRPAC fix.
+# v3.5.2 (CIRISPersist#132) — `bundled` is Android-only.
 #
-# Bug history (closed v0.9.0): v0.8.4 placed this target table
+# # The trap (CIRISEdge#50 RCA — cross-cdylib SIGSEGV)
+#
+# When persist.so (Linux PyPI wheel) and edge.so are both loaded into
+# the same Python process as separate cdylibs, EACH gets its own
+# statically-linked libsqlite3 (because both build with
+# `rusqlite/bundled`). Result: two `sqlite3GlobalConfig` static
+# globals, two heap allocators, two mutex tables.
+#
+# Edge has no direct rusqlite use, but the blanket impl
+# `<SqliteBackend as OutboundQueue>` is monomorphized in edge's
+# compilation — so edge.so's libsqlite3 ends up operating on a
+# `sqlite3*` connection allocated by persist.so's libsqlite3.
+# Edge's libsqlite3 was never `sqlite3_initialize`d (it sat
+# dormant); the first `mallocWithAlarm` indirects through a NULL
+# `xMalloc` slot → SIGSEGV in production. See CIRISPersist#132 for
+# the gdb stack + the four other traits (VerifyDirectory,
+# RootingDirectory, EdgeDetectionAdmission, BlackholeRules) that
+# have the same structural defect.
+#
+# # The fix — one libsqlite3 instance shared via dlopen
+#
+# Drop `bundled` on every desktop target (Linux / macOS / Windows)
+# AND on iOS. The base `[dependencies]` table has
+# `rusqlite = { features = ["chrono", "serde_json"] }` with no
+# `bundled` → rusqlite/libsqlite3-sys link against the platform's
+# libsqlite3 dynamically. Both persist.so and edge.so resolve
+# `libsqlite3.so.0` through the same `dlopen` call → ONE library
+# instance, ONE initialization, ONE allocator. Manylinux2_28 wheels
+# guarantee libsqlite3.so.0 is present. macOS ships
+# /usr/lib/libsqlite3.dylib in every release. Windows: same story.
+# iOS already used this pattern (avoiding the libRPAC.dylib double-
+# dylib trap CIRISVerify v1.6.4 documented); #132 extends it.
+#
+# Android keeps `bundled` because the NDK's libsqlite3 isn't
+# guaranteed across vendor builds and Android's app-sandbox model
+# makes statically-linked libsqlite3 the conventional posture.
+#
+# # Bug history (closed v0.9.0): v0.8.4 placed this target table
 # BEFORE `redb`/`tokio` in Cargo.toml — which silently swept those
 # deps into the iOS-excluded scope. iOS device builds compiled
 # fine on every other target, but tag CI's iOS job failed with
 # "cannot find module or crate `tokio`" — blocking PyPI publish.
 # Position now pinned at the END of `[dependencies]`, after every
 # platform-independent dep.
-[target.'cfg(not(target_os = "ios"))'.dependencies]
-rusqlite = { version = "0.31", features = ["bundled", "chrono", "serde_json"], optional = true }
+# Android rusqlite + keyring + openssl all live in the
+# single `[target.'cfg(target_os = "android")'.dependencies]` table
+# further down (line ~709). Keeping them coalesced avoids the
+# duplicate-key cargo error that bit v3.5.2 mid-prep.
 
 # v1.10.0 (CIRISPersist#87) — per-platform hardware-backed secure
 # storage for `secrets::migrate_to_hardware_key`. ciris-keyring's
@@ -677,6 +709,9 @@ ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v4.2.0"
 openssl = { version = "0.10", features = ["vendored"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
+# v3.5.2 (#132) — rusqlite `bundled` for Android. See comment block
+# before the iOS entry (~line 628) for the rationale.
+rusqlite = { version = "0.31", features = ["bundled", "chrono", "serde_json"], optional = true }
 ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v4.2.0", version = "4", features = ["pqc-ml-dsa", "android"] }
 # v2.0.3 — vendored openssl for Android cross-compilation. refinery-core
 # unconditionally pulls postgres-native-tls → native-tls → openssl-sys

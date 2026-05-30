@@ -198,8 +198,14 @@ mod pg_impl {
         }
     }
 
-    fn pg_storage_err(op: &str, e: impl std::fmt::Display) -> TransparencyError {
-        TransparencyError::Storage(format!("pg merkle store {op}: {e}"))
+    fn pg_storage_err(op: &str, e: impl std::fmt::Debug) -> TransparencyError {
+        // v3.5.2 (CIRISPersist#128) — Debug format on the raw error
+        // surfaces the SQLSTATE, table name, etc. that tokio_postgres'
+        // Display dumbs down to just "db error". Surfacing the
+        // detail is what let us track down `av26_concurrent_boot_
+        // advisory_lock` (qa_harness) DROPping cirislens.* during
+        // unrelated PG tests.
+        TransparencyError::Storage(format!("pg merkle store {op}: {e:?}"))
     }
 
     impl TransparencyStore<AuditLeaf> for PgMerkleStore {

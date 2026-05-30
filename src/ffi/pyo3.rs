@@ -4146,6 +4146,58 @@ impl PyEngine {
         })
     }
 
+    /// v3.5.2 (CIRISPersist#130) — Federation blob storage:
+    /// **local-truth** holder query. Returns a JSON array of
+    /// `attesting_key_id` strings for every holds_bytes attestation
+    /// the substrate has for this blob, **regardless of the CEG
+    /// §10.1.2 24-hour TTL window**. The bytes are locally held
+    /// (verified by checking `federation_blobs`); the substrate's
+    /// audit chain is the source of truth.
+    ///
+    /// Returns `[]` if the blob is not in `federation_blobs` (the
+    /// local-truth premise doesn't apply; use `list_holders_json` for
+    /// federation-discovery semantics).
+    ///
+    /// FEDERATION_SCALING_MODEL §9.1 "whose bytes do I hold?" — the
+    /// substrate-truth side of the identity-aware-storage property.
+    /// CIRISConformance fabric-tier consumes this for the §9 audit.
+    fn list_local_holders_json(&self, py: Python<'_>, sha256_hex: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let sha = parse_sha256_hex(sha256_hex)?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        let holders = backend
+                            .list_local_holders(&sha)
+                            .await
+                            .map_err(blob_err_to_py)?;
+                        serde_json::to_string(&holders).map_err(|e| {
+                            PyRuntimeError::new_err(format!("list_local_holders JSON encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        let holders = backend
+                            .list_local_holders(&sha)
+                            .await
+                            .map_err(blob_err_to_py)?;
+                        serde_json::to_string(&holders).map_err(|e| {
+                            PyRuntimeError::new_err(format!("list_local_holders JSON encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
     /// v3.5.0 (CIRISPersist#125) — Federation blob storage: "whose
     /// bytes do I hold for actor X?". Returns a JSON array of hex
     /// SHA-256 strings (64-char each, lowercase, unpadded — matches
