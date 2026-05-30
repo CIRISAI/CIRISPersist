@@ -5,6 +5,40 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.6.2] — 2026-05-29
+
+**CIRISPersist 3.6.2 — wheel auditwheel-repair excludes libsqlite3 (#136 third-and-final iteration of the CIRISEdge#50 cross-cdylib SIGSEGV).**
+
+v3.6.1 passed its readelf gate and shipped to PyPI, but CIRISEdge#50 still SEGV'd against the wheel. Root cause filed in #136:
+
+- maturin's auto-auditwheel mangled the libsqlite3 SONAME to `libsqlite3-eac351cf.so.0` and bundled it into the wheel's `.libs/` sidecar.
+- Edge's wheel links plain `libsqlite3.so.0` (system).
+- Two libsqlite3 instances are loaded into one Python process — distinct symbol tables, distinct `sqlite3GlobalConfig`, distinct prepared-statement caches.
+- When persist hands edge a `sqlite3*` handle via PyCapsule and edge calls into its libsqlite3, UB → SIGSEGV.
+
+The v3.5.2 source-tier fix + v3.5.3 libsqlite3-dev install were both necessary but not sufficient. The wheel tier still re-introduced bundling via auditwheel's default repair pass.
+
+### Fix — `auditwheel repair --exclude libsqlite3.so.0`
+
+Same pattern as `pyarrow` (excludes `libssl`/`libcrypto`/`libz`) and `psycopg2-binary` (excludes `libssl`) for libraries that need to be shared across cdylibs in one process:
+
+1. `maturin build --release --strip --auditwheel skip` — bypass maturin's default auto-repair on Linux.
+2. Explicit `auditwheel repair --exclude libsqlite3.so.0 --plat manylinux_2_34_<arch>` — repair everything else, leave `libsqlite3.so.0` as a plain NEEDED entry.
+3. Tightened readelf gate:
+   - REQUIRES plain `libsqlite3.so.0` NEEDED entry (the v3.6.1 gate accepted the mangled form).
+   - REJECTS `libsqlite3-<hash>.so.0` mangled SONAME explicitly.
+   - REJECTS `*.libs/libsqlite3*` sidecar presence explicitly.
+
+The Linux wheel now leaves libsqlite3 resolution to the dynamic loader, which unifies persist's NEEDED entry with edge's against `/usr/lib/x86_64-linux-gnu/libsqlite3.so.0`. One libsqlite3 instance, shared across cdylibs.
+
+### Production-host requirement
+
+Linux production hosts must have `libsqlite3.so.0` installed system-wide. Every manylinux base image includes it (`libsqlite3-0` package on Debian/Ubuntu, equivalents on RHEL/Alpine). macOS / Windows / Android wheels intentionally bundle libsqlite3 (per CIRISVerify v4.4.x posture — the cross-cdylib SIGSEGV class is Linux-specific). Persist's darwin-aarch64 wheel inherits the bundled posture transitively from verify — expected and correct.
+
+### Carry-forward from v3.6.1
+
+All of v3.6.1's #134 multimedia tier substrate + CIRISVerify v4.4.2 pin ships in v3.6.2 unchanged. The only delta is the wheel-build CI flow.
+
 ## [3.6.1] — 2026-05-30
 
 **CIRISPersist 3.6.1 — wheel-CI gate fix (the gate from v3.5.3 / #133 was over-strict for the CIRISVerify v4.4.x posture and blocked v3.5.4 + v3.6.0 from PyPI).**

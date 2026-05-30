@@ -720,32 +720,74 @@ jobs:
             sleep $((attempt * 5))
             [ "$attempt" = "3" ] && { echo "::error::pip install failed 3x"; exit 1; }
           done
+      # v3.6.2 (CIRISPersist#136) — `--auditwheel skip` on Linux so
+      # we can invoke `auditwheel repair --exclude libsqlite3.so.0`
+      # explicitly in the next step. Maturin's default auto-repair
+      # mangles the libsqlite3 SONAME to `libsqlite3-<hash>.so.0` and
+      # bundles it into a wheel sidecar, which creates per-wheel
+      # libsqlite3 instances that don't unify with the system
+      # libsqlite3 loaded by sibling cdylibs (e.g. CIRISEdge#50
+      # cohabitation). Two distinct sqlite3 globals + handle tables
+      # in one Python process → cross-cdylib SIGSEGV when a handle
+      # allocated by one .so is passed to the other.
+      #
+      # On macOS, `--auditwheel skip` is a no-op (auditwheel doesn't
+      # run there).
       - name: maturin build
-        run: maturin build --release --strip
+        run: maturin build --release --strip --auditwheel skip
+      # v3.6.2 (CIRISPersist#136) — explicit auditwheel-repair with
+      # libsqlite3 excluded from the bundling pass. This is the same
+      # pattern `pyarrow` uses (excludes libssl/libcrypto/libz) and
+      # `psycopg2-binary` uses (excludes libssl) for libraries that
+      # need to be shared across cdylibs in the same process. The
+      # exclude flag leaves `libsqlite3.so.0` as a plain NEEDED entry
+      # in the wheel's cdylib, which lets the dynamic loader unify
+      # it with whatever other cdylib (e.g. CIRISEdge) loads in the
+      # same Python process.
+      #
+      # Required: production hosts must have `libsqlite3.so.0`
+      # installed system-wide. Every manylinux base image includes
+      # it; macOS / Windows / Android have their own postures
+      # (covered upstream by CIRISVerify v4.4.x target-narrowed
+      # bundled feature).
+      - name: auditwheel repair (Linux, libsqlite3 excluded)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          pip install auditwheel
+          mkdir -p target/wheels/repaired
+          for whl in target/wheels/*linux_*.whl; do
+            echo "::group::auditwheel repair $whl"
+            auditwheel repair \
+              --exclude libsqlite3.so.0 \
+              --plat ${{ matrix.tag }} \
+              --wheel-dir target/wheels/repaired/ \
+              "$whl"
+            rm "$whl"
+            echo "::endgroup::"
+          done
+          mv target/wheels/repaired/*.whl target/wheels/
+          rmdir target/wheels/repaired
       # v3.5.3 (CIRISPersist#133) — wheel-tier libsqlite3 dynamic-link
       # verification. The source-tier #132 fix (Cargo.toml target-
       # narrowed `bundled`) requires libsqlite3-dev present at build
       # time so pkg-config succeeds. If pkg-config fails or any
       # transitive dep re-enables `bundled`, the wheel ends up with
       # libsqlite3 statically embedded and the cross-cdylib SIGSEGV
-      # class returns. Reject any wheel that doesn't have libsqlite3
-      # as a NEEDED entry OR as an auditwheel sidecar.
+      # class returns.
       #
       # v3.6.1 (CIRISPersist#133 follow-up) — gate is LINUX-ONLY.
       # The cross-cdylib SIGSEGV (CIRISEdge#50) is a Linux-specific
       # symbol-merging issue. CIRISVerify v4.4.x intentionally bundles
-      # libsqlite3 on macOS + Windows + Android (no symbol-merging
-      # exposure on those platforms; bundled is the conventional
-      # posture) and only stays dynamic on Linux + iOS where the
-      # cohabitation cdylib pattern actually trips. Persist's darwin
-      # wheel inherits bundled from verify transitively — that's
-      # expected and correct. Running the readelf gate on macOS rejects
-      # the intentional bundled posture and is wrong; v3.5.4 + v3.6.0
-      # both failed PyPI publish for exactly this reason. The gate is
-      # now Linux-only.
+      # libsqlite3 on macOS + Windows + Android.
       #
-      # Android wheels are produced by a different job (not this matrix)
-      # and intentionally bundle — skip them here.
+      # v3.6.2 (CIRISPersist#136) — gate now asserts the PLAIN
+      # libsqlite3.so.0 SONAME and rejects the auditwheel-mangled
+      # `libsqlite3-<hash>.so.0` + sidecar form. v3.6.1's wheel passed
+      # the older gate but still SEGVed in CIRISEdge#50 because
+      # auditwheel had mangled the SONAME. This gate now would have
+      # caught it.
       - name: verify wheel links libsqlite3 dynamically (Linux only)
         if: runner.os == 'Linux'
         shell: bash
@@ -765,20 +807,28 @@ jobs:
             needed_libs=$(readelf -d "$so" | awk '/NEEDED/ {print}')
             echo "NEEDED entries:"
             echo "$needed_libs"
-            if echo "$needed_libs" | grep -q 'libsqlite3'; then
-              echo "✓ $whl links libsqlite3 dynamically (NEEDED entry present)"
-            else
-              # auditwheel may bundle libsqlite3 into a sidecar — check.
-              sidecar=$(find "$tmpdir" -path '*.libs/*libsqlite3*' | head -1)
-              if [ -n "$sidecar" ]; then
-                echo "✓ $whl carries libsqlite3 via auditwheel sidecar: $sidecar"
-              else
-                echo "::error::$whl is missing libsqlite3 NEEDED entry AND auditwheel sidecar"
-                echo "::error::This means `bundled` is still effective on Linux; the cross-cdylib SIGSEGV class (CIRISEdge#50) returns"
-                echo "::error::Check that libsqlite3-dev is installed AND no transitive dep re-enables rusqlite/bundled"
-                exit 1
-              fi
+            # v3.6.2 — require PLAIN libsqlite3.so.0 NEEDED entry.
+            if ! echo "$needed_libs" | grep -qE 'NEEDED.*\[libsqlite3\.so\.0\]'; then
+              echo "::error::$whl missing PLAIN libsqlite3.so.0 NEEDED entry"
+              echo "::error::auditwheel --exclude libsqlite3.so.0 didn't take, or rusqlite/bundled re-enabled"
+              exit 1
             fi
+            # v3.6.2 — reject auditwheel-mangled SONAME (`libsqlite3-<hash>.so.0`).
+            # That form creates a per-wheel libsqlite3 instance which
+            # defeats cross-cdylib unification (CIRISEdge#50 root cause).
+            if echo "$needed_libs" | grep -qE 'libsqlite3-[a-f0-9]+\.so'; then
+              echo "::error::$whl has MANGLED libsqlite3 SONAME — auditwheel --exclude not effective"
+              echo "::error::Cross-cdylib SIGSEGV (CIRISEdge#50) will recur"
+              exit 1
+            fi
+            # v3.6.2 — reject auditwheel libsqlite3 sidecar.
+            sidecar=$(find "$tmpdir" -path '*.libs/*libsqlite3*' 2>/dev/null | head -1)
+            if [ -n "$sidecar" ]; then
+              echo "::error::$whl carries libsqlite3 in auditwheel sidecar: $sidecar"
+              echo "::error::libsqlite3 must come from system, not the wheel — sidecar defeats unification"
+              exit 1
+            fi
+            echo "✓ $whl links libsqlite3.so.0 dynamically (plain SONAME, no sidecar)"
             rm -rf "$tmpdir"
             echo "::endgroup::"
           done
