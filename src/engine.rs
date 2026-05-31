@@ -753,6 +753,7 @@ impl Engine {
             // producer-self-revocation (rule 1).
             subject_key_ids: Vec::new(),
             withdraws_admission_rule: None,
+            cohort_scope: "federation".to_string(),
         };
 
         let directory = self.federation_directory();

@@ -207,6 +207,7 @@ mod tests {
             persist_row_hash: String::new(),
             subject_key_ids: Vec::new(),
             withdraws_admission_rule: None,
+            cohort_scope: "federation".to_string(),
         }
     }
 

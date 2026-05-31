@@ -824,6 +824,7 @@ pub(crate) async fn emit_withdraws_attestation_helper(
         // (rule 2/3) doesn't apply on this path.
         subject_key_ids: Vec::new(),
         withdraws_admission_rule: None,
+        cohort_scope: "federation".to_string(),
     };
 
     directory

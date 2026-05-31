@@ -5,6 +5,51 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.9.0] — 2026-05-31
+
+**CIRISPersist 3.9.0 — CEG 0.4 / 0.6 schema foundation: `cohort_scope` column on `federation_attestations` + consent_record + canonical-binding + SLA-watcher state tables (V056).**
+
+Schema-foundation cut mirroring v3.7.0's discipline for `subject_key_ids[]`: lands the columns + struct fields + round-trip wiring so downstream consumers can start populating + reading the new fields. Admission-gate enforcement, SLA watcher loops, multi-subject any-binding evict, canonical-hash binding, and the §8.1.8.1 promotion ceremony are properly v3.10+ work — they need trust-graph walks, background tokio tasks, and retroactive admission flows that don't fit one minor cut.
+
+### V056 migration (both backends)
+
+- **`federation_attestations.cohort_scope`** TEXT NOT NULL DEFAULT `'federation'` CHECK in closed-set `{self, family, community, affiliations, species, biosphere, federation}` per CEG §4.2.4 + §8.1.8. Default preserves pre-v3.9.0 semantic (legacy attestations were effectively federation-tier visible). Partial index over non-federation rows (the narrow-cohort_scope read-filter hot path).
+- **`cirisnode_contributions.consent_record_*`** three nullable columns (`subject_key_id`, `stance`, `bilateral_pair_id`) with cross-column CHECK / trigger enforcing the `subject_kind = 'consent_record'` asymmetry (mirrors V054's takedown_notice/key_grant discipline).
+- **`cirisnode_consent_sla_watch`** (NEW) — background-task state table. One row per `(target_contribution, subject_key_id)` pair awaiting consent-SLA deadline. EvictionSweeper-shape watcher emits `hard_case:consent_sla_breach` on deadline pass.
+- **`cirisnode_revocation_promotion_watch`** (NEW) — local-tier revocation awaiting federation-tier promotion per CEG §10.1.3. Watcher emits `hard_case:revocation_promotion_overdue:v1`.
+- **`identity_canonical_binding`** (NEW) — proxy-chain index for the CEG §3.2.3 rule-3 withdraws admission. Populated by future admission of `identity:canonical_binding` attestations (CEG 0.6 §6.5).
+
+### Rust struct
+
+- `Attestation::cohort_scope: String` with `#[serde(default = "default_cohort_scope", skip_serializing_if = "is_default_cohort_scope")]` — federation-scope rows omit the field from canonical JSON output, preserving legacy `persist_row_hash` values across the v3.9.0 schema bump.
+- New `crate::federation::cohort_scope` module exposing the seven closed-set constants + `is_valid(&str)` predicate. Used by future admission-gate work (v3.10+).
+- 22 `Attestation { … }` construction sites updated to default `cohort_scope: "federation".to_string()`.
+
+### Round-trip
+
+- 5 SELECT statements feeding `row_to_attestation` extended with `cohort_scope` column on both backends.
+- INSERT paths bind `$18` / `?18` for the new column.
+- 824/824 tests green (sqlite + postgres + cirisnode + pyo3).
+
+### What's NOT in this cut (v3.10+ work)
+
+| Ask | Scope | Why deferred |
+|---|---|---|
+| #146 Ask 2 | 4-rule withdraws admission gate | Needs trust-graph walk + per-rule audit metadata; ~600 lines + new admission module |
+| #146 Ask 3 | Consent-SLA watcher background task | Schema is here (V056); needs new tokio module mirroring `EvictionSweeper` + admission hooks |
+| #146 Ask 4 | Multi-subject any-binding evict | Composes with Ask 2 |
+| #146 Ask 6 | Canonical-hash binding helper | Schema is here (V056); needs admission gate on `identity:canonical_binding` rows |
+| #146 read accessors | `list_attestations_for_subject`, `resolve_consent_state` | Mechanical extension; co-lands with #135 once NodeCore#19 Phase 4 unblocks |
+| #150 enforcement | cohort_scope admission gate + viewer-filter read + §8.1.8.1 promotion | Substantial; needs trust-hierarchy lookup paths shared with #146 admission gate |
+| #135 read accessors | `list_attestations` / `list_takedowns_for` / `list_key_grants_for` | Gated on CIRISNodeCore#19 Phase 4 (multimedia ingest landing the row shapes) |
+| #151 bulk cohort_scope reader | `list_peers_by_cohort_scope` on FederationKeyFilter | Independent; defer to v3.9.1 patch when convenient |
+| CIRISPersist#152 / CIRISRegistry#47 | self/family at-rest encryption + identity_occurrence + family subject_kinds | Gated on CEG 0.7 spec work |
+
+### Upstream issues filed in this cut
+
+- **CIRISRegistry#47** — CEG 0.7: codify `subject_kind: identity_occurrence` + `subject_kind: family`
+- **CIRISPersist#152** — Self/family at-rest encryption with automatic key-grant flow (gated on Registry#47)
+
 ## [3.8.0] — 2026-05-31
 
 **CIRISPersist 3.8.0 — CIRISVerify v4.7.1 pin + full wheel-surface roll: 5 verify surfaces exposed on `PyEngine` per Eric's "if it ain't on the FFI/Python interface, it doesn't exist" discipline.**

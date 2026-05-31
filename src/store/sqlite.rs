@@ -1383,8 +1383,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
-                    subject_key_ids, withdraws_admission_rule\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                    subject_key_ids, withdraws_admission_rule, cohort_scope\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
                 rusqlite::params![
                     row.attestation_id,
                     row.attesting_key_id,
@@ -1403,6 +1403,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.persist_row_hash,
                     subject_key_ids_json,
                     withdraws_admission_rule,
+                    row.cohort_scope,
                 ],
             )?;
             Ok(())
@@ -1435,7 +1436,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                         weight, asserted_at, expires_at, attestation_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope \
                      FROM federation_attestations \
                      WHERE attested_key_id = ?1 \
                      ORDER BY asserted_at DESC",
@@ -1462,7 +1463,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                         weight, asserted_at, expires_at, attestation_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope \
                      FROM federation_attestations \
                      WHERE attesting_key_id = ?1 \
                      ORDER BY asserted_at DESC",
@@ -1639,7 +1640,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                         weight, asserted_at, expires_at, attestation_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope \
                      FROM federation_attestations WHERE attestation_id = ?1",
                     [&id],
                     sqlite_row_to_attestation,
@@ -3040,6 +3041,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
             // self-attestation; subject-side authority does not apply.
             subject_key_ids: Vec::new(),
             withdraws_admission_rule: None,
+            cohort_scope: "federation".to_string(),
         };
         let persist_row_hash = crate::federation::types::compute_persist_row_hash(&attestation_row)
             .map_err(|e| crate::federation::BlobError::Backend(format!("persist_row_hash: {e}")))?;
@@ -4969,6 +4971,7 @@ fn sqlite_row_to_attestation(
         persist_row_hash: row.get("persist_row_hash")?,
         subject_key_ids,
         withdraws_admission_rule: withdraws_admission_rule.map(|v| v as u8),
+        cohort_scope: row.get("cohort_scope")?,
     })
 }
 
@@ -6586,7 +6589,7 @@ impl crate::read::ReadEngine for SqliteBackend {
                     attestation_type, weight, asserted_at, expires_at, \
                     attestation_envelope, original_content_hash, \
                     scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
-                    scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule \
+                    scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope \
              FROM federation_attestations {where_sql} \
              ORDER BY asserted_at DESC, attestation_id DESC LIMIT ?{p_limit}"
         );
@@ -8522,6 +8525,7 @@ mod tests {
             persist_row_hash: String::new(),
             subject_key_ids: Vec::new(),
             withdraws_admission_rule: None,
+            cohort_scope: "federation".to_string(),
         }
     }
 
@@ -9205,6 +9209,7 @@ mod tests {
             persist_row_hash: String::new(),
             subject_key_ids: Vec::new(),
             withdraws_admission_rule: None,
+            cohort_scope: "federation".to_string(),
         }
     }
 
@@ -10026,6 +10031,7 @@ mod tests {
                     persist_row_hash: String::new(),
                     subject_key_ids: Vec::new(),
                     withdraws_admission_rule: None,
+                    cohort_scope: "federation".to_string(),
                 },
             })
             .await
@@ -12623,6 +12629,7 @@ mod tests {
             persist_row_hash: String::new(),
             subject_key_ids: Vec::new(),
             withdraws_admission_rule: None,
+            cohort_scope: "federation".to_string(),
         }
     }
 
@@ -14070,6 +14077,7 @@ mod tests {
             persist_row_hash: String::new(),
             subject_key_ids: Vec::new(),
             withdraws_admission_rule: None,
+            cohort_scope: "federation".to_string(),
         }
     }
 

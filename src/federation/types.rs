@@ -378,6 +378,75 @@ pub struct Attestation {
     ///             before the admission gate landed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub withdraws_admission_rule: Option<u8>,
+    /// v3.9.0 (CIRISPersist#150, CEG 0.4 §4.2.4). Producer-side
+    /// visibility scope. Closed-set values: `self | family | community
+    /// | affiliations | species | biosphere | federation`. Default
+    /// `"federation"` (preserves pre-v3.9.0 semantic; producers
+    /// writing new content explicitly tag self/family/etc.). Orthogonal
+    /// to `subject_key_ids` (revocability authority) — see CEG §4.2.4.
+    ///
+    /// **v3.9.0 ships the schema + round-trip only.** Admission-gate
+    /// enforcement, the §8.1.8.1 promotion ceremony, and read-time
+    /// viewer-vs-scope filtering land in v3.10.0.
+    #[serde(
+        default = "default_cohort_scope",
+        skip_serializing_if = "is_default_cohort_scope"
+    )]
+    pub cohort_scope: String,
+}
+
+/// v3.9.0 (CIRISPersist#150) — default cohort_scope for backward compat.
+/// Pre-v3.9.0 attestations had no cohort_scope; reading them under the
+/// new schema returns the column DEFAULT 'federation', so the Rust
+/// default matches.
+fn default_cohort_scope() -> String {
+    "federation".to_string()
+}
+
+/// True iff the cohort_scope equals the default. Used by serde
+/// `skip_serializing_if` so legacy rows' canonical bytes /
+/// `persist_row_hash` stay stable across the v3.9.0 schema bump —
+/// federation-scope rows omit the field entirely from JSON output.
+fn is_default_cohort_scope(s: &String) -> bool {
+    s == "federation"
+}
+
+/// v3.9.0 (CIRISPersist#150) — closed-set cohort_scope values per
+/// CEG 0.4 §4.2.4. Producers MUST emit one of these or rely on the
+/// substrate-side default of `federation`. `global` is intentionally
+/// NOT a value — it's a §8.1.8 feed name aggregating
+/// `{species, biosphere, federation}`, not a wire enum value.
+pub mod cohort_scope {
+    /// Locally-held content (locality dividend per
+    /// FEDERATION_SCALING_MODEL §9.5). Never emits federation-tier
+    /// holds_bytes; substrate-local-only.
+    pub const SELF: &str = "self";
+    /// Content shared with a partnered family/group (CEG §8.1.8).
+    /// Visible to peers with `trust:partnered` or `trust:direct`.
+    pub const FAMILY: &str = "family";
+    /// Community-tier content per CEG §8.1.8. Visible to peers per
+    /// the community's policy_blob cohort_scope (#127 #48-A).
+    pub const COMMUNITY: &str = "community";
+    /// Affiliations tier (CEG §8.1.8).
+    pub const AFFILIATIONS: &str = "affiliations";
+    /// Species tier (CEG §8.1.8 — broader-than-community human
+    /// audience).
+    pub const SPECIES: &str = "species";
+    /// Biosphere tier (CEG §8.1.8 — including non-human stakeholders).
+    pub const BIOSPHERE: &str = "biosphere";
+    /// Federation-wide visibility (CEG §8.1.8). Status-quo
+    /// pre-v3.9.0 semantic.
+    pub const FEDERATION: &str = "federation";
+
+    /// True iff `s` is one of the closed-set values. Substrate
+    /// admission-gate work in v3.10.0+ uses this for early rejection
+    /// of malformed envelopes.
+    pub fn is_valid(s: &str) -> bool {
+        matches!(
+            s,
+            SELF | FAMILY | COMMUNITY | AFFILIATIONS | SPECIES | BIOSPHERE | FEDERATION
+        )
+    }
 }
 
 impl Attestation {
