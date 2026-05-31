@@ -16018,6 +16018,135 @@ impl PyEngine {
         pyo3::types::PyCapsule::new(py, scoring, Some(name))
             .map_err(|e| PyErr::new::<LensQueryError, _>(format!("trust_scoring_capsule: {e}")))
     }
+
+    // ── v3.8.0 (CIRISPersist#151) — CIRISVerify v4.7.0 wheel surfaces ──
+    //
+    // Per Eric's "if it ain't on the FFI/Python interface, it doesn't
+    // exist" rule, persist exposes verify's #50 wheel surfaces directly
+    // on PyEngine so Python users of `ciris-persist` get them natively
+    // (no parallel dep on `ciris_verify`'s Python bindings).
+    //
+    // Implementation lives in `src/ffi/wheel_*.rs`; these methods are
+    // thin delegates so the Rust-side surface can be exercised by
+    // `cargo test --lib ffi::wheel_*` without a Python interpreter.
+
+    // ── key_grant (HPKE-shape DEK wrap/unwrap, CIRISVerify v4.4.0) ──
+
+    /// v3.8.0 — wrap a 32-byte DEK for an X25519 recipient. Returns
+    /// the `KeyGrantWrap` JSON envelope. Composes with the substrate's
+    /// `subject_kind: key_grant` Contribution shape (CIRISPersist#134).
+    fn wrap_dek_for_recipient_b64(
+        &self,
+        recipient_x25519_pub_b64: &str,
+        dek_b64: &str,
+    ) -> PyResult<String> {
+        crate::ffi::wheel_key_grant::wrap_dek_for_recipient_json(recipient_x25519_pub_b64, dek_b64)
+    }
+
+    /// v3.8.0 — unwrap a `KeyGrantWrap` JSON envelope using the
+    /// recipient's X25519 private key. Returns the recovered DEK b64.
+    fn unwrap_dek_b64(&self, recipient_x25519_priv_b64: &str, wrap_json: &str) -> PyResult<String> {
+        crate::ffi::wheel_key_grant::unwrap_dek_json(recipient_x25519_priv_b64, wrap_json)
+    }
+
+    // ── hybrid_kex (X25519 + ML-KEM-768, CIRISVerify v4.6.0) ──
+
+    /// v3.8.0 — initiate side of hybrid X25519 + ML-KEM-768 KEX.
+    /// Returns the handshake message + session key as JSON (caller
+    /// MUST keep the session_key_b64 secret).
+    fn initiate_hybrid_kex_b64(
+        &self,
+        recipient_x25519_pub_b64: &str,
+        recipient_mlkem768_pub_b64: &str,
+    ) -> PyResult<String> {
+        crate::ffi::wheel_hybrid_kex::initiate_hybrid_kex_json(
+            recipient_x25519_pub_b64,
+            recipient_mlkem768_pub_b64,
+        )
+    }
+
+    /// v3.8.0 — respond side of hybrid KEX. Returns the matching session
+    /// key as JSON.
+    fn respond_hybrid_kex_b64(
+        &self,
+        recipient_x25519_priv_b64: &str,
+        recipient_mlkem768_priv_b64: &str,
+        recipient_mlkem768_pub_b64: &str,
+        handshake_msg_json: &str,
+    ) -> PyResult<String> {
+        crate::ffi::wheel_hybrid_kex::respond_hybrid_kex_json(
+            recipient_x25519_priv_b64,
+            recipient_mlkem768_priv_b64,
+            recipient_mlkem768_pub_b64,
+            handshake_msg_json,
+        )
+    }
+
+    /// v3.8.0 — initiate side of classical X25519-only KEX (fallback).
+    fn initiate_classical_kex_b64(&self, recipient_x25519_pub_b64: &str) -> PyResult<String> {
+        crate::ffi::wheel_hybrid_kex::initiate_classical_kex_json(recipient_x25519_pub_b64)
+    }
+
+    /// v3.8.0 — respond side of classical X25519-only KEX (fallback).
+    fn respond_classical_kex_b64(
+        &self,
+        recipient_x25519_priv_b64: &str,
+        handshake_msg_json: &str,
+    ) -> PyResult<String> {
+        crate::ffi::wheel_hybrid_kex::respond_classical_kex_json(
+            recipient_x25519_priv_b64,
+            handshake_msg_json,
+        )
+    }
+
+    // ── locale_merkle (RFC 6962-shape, CIRISVerify v4.7.0) ──
+
+    /// v3.8.0 — compute the per-locale leaf hash for a `LocaleLeaf`
+    /// JSON envelope. Returns the 32-byte SHA-256 as hex.
+    fn locale_leaf_hash_hex(&self, leaf_json: &str) -> PyResult<String> {
+        crate::ffi::wheel_locale_merkle::locale_leaf_hash_hex(leaf_json)
+    }
+
+    /// v3.8.0 — verify a `LocaleInclusionProof` against the expected
+    /// per-target Merkle root. Returns JSON `{"valid": true, ...}` on
+    /// success; raises with the structured reason on failure.
+    fn verify_locale_inclusion_json(
+        &self,
+        leaf_json: &str,
+        proof_json: &str,
+        expected_root_hex: &str,
+    ) -> PyResult<String> {
+        crate::ffi::wheel_locale_merkle::verify_locale_inclusion_json(
+            leaf_json,
+            proof_json,
+            expected_root_hex,
+        )
+    }
+
+    /// v3.8.0 — compute the RFC 6962-style Merkle root over a list
+    /// of `LocaleLeaf` JSON envelopes. Returns root as hex.
+    fn locale_merkle_root_hex(&self, leaves_json: &str) -> PyResult<String> {
+        crate::ffi::wheel_locale_merkle::locale_merkle_root_hex(leaves_json)
+    }
+
+    // ── skill_import (consumer-side manifest verification) ──
+
+    /// v3.8.0 — verify a `SkillImportManifest` against a trusted
+    /// steward Ed25519 + ML-DSA-65 pubkey pair. Returns JSON
+    /// `{"valid": true, "source": ..., ...}` on success; raises with
+    /// the structured reason on signature / canonicalization failure.
+    fn verify_skill_import_manifest_b64(
+        &self,
+        manifest_bytes_b64: &str,
+        steward_ed25519_pub_b64: &str,
+        steward_ml_dsa_65_pub_b64: &str,
+    ) -> PyResult<String> {
+        crate::ffi::wheel_skill_import::verify_skill_import_manifest_json(
+            manifest_bytes_b64,
+            steward_ed25519_pub_b64,
+            steward_ml_dsa_65_pub_b64,
+        )
+    }
 }
 
 /// v1.5.9 (CIRISPersist#59 #1) — encode a [`ClaimResult<Task>`] onto the
@@ -19054,6 +19183,11 @@ impl crate::federation::PerceptualHashMatcher for PyPerceptualHashMatcher {
 #[pymodule]
 fn ciris_persist(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEngine>()?;
+    // v3.8.0 (CIRISPersist#151) — register the stateful
+    // ReconsiderDosGuard wrapper (CIRISVerify v4.7.0 #50 F-AV-RECONSIDER-DOS).
+    // Stateless wheel surfaces (key_grant, hybrid_kex, locale_merkle,
+    // skill_import) are exposed as PyEngine methods further down.
+    m.add_class::<crate::ffi::wheel_reconsider_dos::PyReconsiderDosGuard>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add(
         "SUPPORTED_SCHEMA_VERSIONS",

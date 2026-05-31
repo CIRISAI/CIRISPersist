@@ -16,3 +16,26 @@
 
 #[cfg(feature = "pyo3")]
 pub mod pyo3;
+
+// v3.8.0 (CIRISPersist#151) — wheel-surface modules wrapping
+// CIRISVerify v4.7.0's #50 wheel surfaces. Each module is a thin
+// PyO3 wrapper exposed via PyEngine methods (and, where stateful,
+// via a PyClass). Per Eric's "if it ain't on the FFI/Python
+// interface, it doesn't exist" rule, the substrate exposes every
+// verify primitive its own ABI uses so downstream Python consumers
+// can call them through `ciris-persist` natively.
+
+#[cfg(feature = "pyo3")]
+pub mod wheel_hybrid_kex;
+
+#[cfg(feature = "pyo3")]
+pub mod wheel_key_grant;
+
+#[cfg(feature = "pyo3")]
+pub mod wheel_locale_merkle;
+
+#[cfg(feature = "pyo3")]
+pub mod wheel_reconsider_dos;
+
+#[cfg(feature = "pyo3")]
+pub mod wheel_skill_import;

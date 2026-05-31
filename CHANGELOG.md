@@ -5,6 +5,58 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.8.0] — 2026-05-31
+
+**CIRISPersist 3.8.0 — CIRISVerify v4.7.1 pin + full wheel-surface roll: 5 verify surfaces exposed on `PyEngine` per Eric's "if it ain't on the FFI/Python interface, it doesn't exist" discipline.**
+
+CIRISVerify v4.7.0 (commit 55244b3, CIRISVerify#50) shipped 5 wheel modules wrapping its own substrate primitives onto the `CIRISVerify` Python class; v4.7.1 followed with the patch series. Persist parallels that roll on `PyEngine` so Python callers using `ciris-persist` get every primitive natively — no `import ciris_verify` required for surfaces the substrate already pulls in transitively.
+
+### Verify pin
+
+- `v4.4.3` → `v4.7.1` (3 git deps: `ciris-keyring`, `ciris-verify-core`, `ciris-crypto`)
+- `ciris-crypto` feature set expanded: `+ hybrid-kex, + key-grant` (transitively pulls `x25519`, `ml-kem`, `kdf`, `random`, `aes-gcm`)
+- macOS rusqlite-without-bundled posture preserved (the v4.4.3 #141 fix is still in the target table)
+
+### Five new wheel surfaces on `PyEngine`
+
+| Surface | PyEngine methods | Underlying verify API |
+|---|---|---|
+| **key_grant** (HPKE wrap/unwrap, v4.4.0) | `wrap_dek_for_recipient_b64`, `unwrap_dek_b64` | `ciris_crypto::key_grant::{wrap_dek_for_recipient, unwrap_dek}` — same `x25519-aes256-gcm-hkdf-sha256` shape as CEG 0.3 §5.6.8.4 |
+| **hybrid_kex** (X25519 + ML-KEM-768, v4.6.0) | `initiate_hybrid_kex_b64`, `respond_hybrid_kex_b64`, `initiate_classical_kex_b64`, `respond_classical_kex_b64` | `ciris_crypto::hybrid_kex::{initiate_hybrid, respond_hybrid_with_public}` + classical fallback |
+| **locale_merkle** (RFC 6962, v4.7.0) | `locale_leaf_hash_hex`, `verify_locale_inclusion_json`, `locale_merkle_root_hex` | `ciris_verify_core::locale_merkle::{verify_locale_inclusion, merkle_root}` |
+| **skill_import** (consumer manifest verify, v4.7.0) | `verify_skill_import_manifest_b64` | `ciris_verify_core::skill_import::verify_skill_import_manifest` |
+| **reconsider_dos** (F-AV-RECONSIDER-DOS, v4.5.0) | New `PyReconsiderDosGuard` PyClass with `admit_filing` / `record_outcome` (stateful, lifecycle-managed) | `ciris_verify_core::reconsider_dos::ReconsiderDosGuard` |
+
+Total: **13 PyO3 methods on `PyEngine` + 1 new `PyReconsiderDosGuard` PyClass** wrapping verify's 13 new FFI symbols.
+
+### File layout
+
+Five new sibling modules under `src/ffi/wheel_*.rs` — each isolated, each with its own inline test suite. Total ~1500 lines of wrapper Rust:
+
+- `src/ffi/wheel_key_grant.rs` (~150 lines, 2 round-trip tests)
+- `src/ffi/wheel_hybrid_kex.rs` (~640 lines, 8 tests)
+- `src/ffi/wheel_locale_merkle.rs` (~140 lines, 3 tests)
+- `src/ffi/wheel_skill_import.rs` (~120 lines, 2 tests)
+- `src/ffi/wheel_reconsider_dos.rs` (~370 lines, 5 tests)
+
+PyEngine `#[pymethods]` impl block gains 13 thin delegates (~150 lines) — substrate `cargo test --lib` can exercise the surfaces without a Python interpreter, then the PyO3 wrapper is verified by the substrate's own pytest suite.
+
+### Wire conventions
+
+- All key / signature / ciphertext fields are **base64-encoded** in the JSON-string boundary — matches persist's existing `local_sign_b64` / `public_key_b64` idiom (verify's own sidecars use `list[int]` byte arrays; persist's wrapper deliberately diverges to base64 for boundary consistency).
+- Verify-side `KexError` / `KeyGrantError` / `VerifyError` map to `PyRuntimeError` with the structured reason; canonicalization / length / shape failures map to `PyValueError`. AEAD-discipline opaque failures preserved (`WrapUnverified` / `IntegrityError` carry no oracle leak).
+- Empty/missing inputs reject at the wrapper boundary before calling Rust — defensive against Python None / empty-string callers.
+
+### Why "full roll" matters
+
+Per CIRISConformance's `reference/comparison/04_crypto_transparency.md`: the platform-level claim is **breadth, not novelty** — "hybrid PQC is applied uniformly across signing *and* key exchange *and* the transparency log, in a deployed, cohabiting multi-wheel substrate." For that claim to hold, every consumer of `ciris-persist` MUST be able to reach the substrate's hybrid-KEX + key-grant + locale-Merkle + skill-import primitives without taking a separate dep on `ciris_verify`. v3.8.0 closes that. The substrate's Python surface now mirrors verify's own — both classes attached to the same Rust core via different cdylibs.
+
+### Tests + verification
+
+- 804/804 sqlite + cirisnode + pyo3 + postgres tests green at the pin bump alone (#137 fast-path + #146 schema + #141 macOS gate all still green)
+- 20+ new tests in the `wheel_*` modules: each round-trip + each error path
+- Build clean on `cargo build --features sqlite,postgres,pyo3,cirisnode --release`
+
 ## [3.7.0] — 2026-05-31
 
 **CIRISPersist 3.7.0 — CEG 0.6 substrate foundation: `subject_key_ids[]` JSONB column + `withdraws_admission_rule` audit metadata on `federation_attestations` (#146 Ask 1).**
