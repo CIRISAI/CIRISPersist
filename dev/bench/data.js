@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780186814220,
+  "lastUpdate": 1780241190174,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -9245,6 +9245,288 @@ window.BENCHMARK_DATA = {
             "name": "storage_floor/next_sequence_full",
             "value": 871,
             "range": "± 40",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "aedaca7427c67e7b004f7bcf93470bede3999368",
+          "message": "3.7.0 — CEG 0.6 substrate foundation: subject_key_ids[] + withdraws_admission_rule on federation_attestations (#146 Ask 1)\n\nCEG 0.6 (CIRISRegistry d8b53a0, 2026-05-31) is \"the missing half of\nconsent at the wire format\" — CEG ≤0.5 encoded only producer authority\n(attesting_key_id); CEG 0.6 adds subject authority via one optional\nenvelope field. This minor lands the schema + persistence; the\nadmission gate, SLA watcher, consent_record subject_kind, and\ncanonical-hash binding helper follow in v3.8.0 / v3.9.0 cuts.\n\nSchema (V055, both backends):\n - federation_attestations.subject_key_ids JSONB NOT NULL DEFAULT '[]'\n   (Postgres) / TEXT NOT NULL DEFAULT '[]' CHECK json_valid (SQLite).\n   GIN index on Postgres.\n - federation_attestations.withdraws_admission_rule SMALLINT NULL\n   CHECK 1..=4 (Postgres) / INTEGER (SQLite). Partial index on both.\n   NULL on non-withdraws; populated by the gate landing in v3.8.0.\n\nRust struct:\n - Attestation::subject_key_ids: Vec<String>, skip_serializing_if empty\n - Attestation::withdraws_admission_rule: Option<u8>, skip_serializing_if None\n - Backward-compat: empty/None serializes as absence so legacy rows'\n   canonical bytes and persist_row_hash are unchanged.\n\nRead/write paths (both backends):\n - 7 SELECT statements feeding row_to_attestation now include the\n   new columns\n - put_attestation INSERT writes them\n - holds_bytes INSERT uses the schema default (no code change)\n\nEach entry MAY be a federation_keys.key_id OR a canonical-hash\nidentifier (CEG 0.6 §4.2.2) — substrate does NOT FK-enforce, since\ncanonical-hash subjects (Discord user-ids, external party identifiers)\nare valid per the CEG 0.6 design.\n\nTests: 804/804 green (sqlite + postgres + cirisnode + pyo3). New\nregression put_attestation_round_trips_ceg06_subject_fields_sqlite\ncovers both federation-key + canonical-hash entries through the\npersist → read cycle.\n\n1+4 wire-format lockdown preserved: no new attestation_type. The field\nis on the envelope; CEG broadens the *admission rule* for withdraws\n(v3.8.0 work) — wire format unchanged.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-05-31T10:06:23-05:00",
+          "tree_id": "94e26ff77979066a5db4e1ce9380d77d69ac5ab9",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/aedaca7427c67e7b004f7bcf93470bede3999368"
+        },
+        "date": 1780241189006,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 40431341,
+            "range": "± 32722",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 2354947,
+            "range": "± 312015",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 2622,
+            "range": "± 34",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 6012,
+            "range": "± 29",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 12837,
+            "range": "± 59",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 45821,
+            "range": "± 523",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 36,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 182,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 525,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 600,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 2067,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 9,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 75,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 232,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 1020,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 15,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 55775,
+            "range": "± 2586",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 161837,
+            "range": "± 4059",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 578580,
+            "range": "± 5563",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 9432,
+            "range": "± 641",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 10544,
+            "range": "± 693",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 20027,
+            "range": "± 687",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 54377,
+            "range": "± 1421",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 1034746,
+            "range": "± 2343",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 5446574,
+            "range": "± 38397",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 347256,
+            "range": "± 16664",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 911886,
+            "range": "± 31266",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 50206566,
+            "range": "± 449626",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 1960217,
+            "range": "± 99358",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 8656083,
+            "range": "± 173689",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 123949323,
+            "range": "± 904806",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 5030651,
+            "range": "± 133881",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 21907045,
+            "range": "± 258289",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 109554,
+            "range": "± 8784",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 102107,
+            "range": "± 5306",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 27863,
+            "range": "± 2334",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 81082,
+            "range": "± 2106",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 587242,
+            "range": "± 13700",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 1,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 714,
+            "range": "± 58",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 126,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 1383,
+            "range": "± 121",
             "unit": "ns/iter"
           }
         ]
