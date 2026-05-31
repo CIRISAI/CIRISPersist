@@ -145,6 +145,8 @@ mod tests {
             scrub_timestamp: chrono::Utc::now(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
         }
     }
 

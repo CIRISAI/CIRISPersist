@@ -351,6 +351,33 @@ pub struct Attestation {
     pub pqc_completed_at: Option<DateTime<Utc>>,
     /// **Server-computed.** See [`KeyRecord::persist_row_hash`].
     pub persist_row_hash: String,
+    /// v3.7.0 (CIRISPersist#146, CEG 0.6 §4.2). Optional list of
+    /// consent-holder key_ids for this attestation. Each entry MAY be
+    /// a `federation_keys.key_id` OR a canonical-hash identifier
+    /// (CEG 0.6 §4.2.2). Default `[]` = status quo (producer-only
+    /// authority). The substrate does NOT FK-enforce that entries
+    /// resolve to `federation_keys` rows — canonical-hash subjects
+    /// (Discord user-ids, external party identifiers) are valid
+    /// entries per the CEG 0.6 design.
+    ///
+    /// The 4-rule broadened `withdraws` admission gate (CEG §3.2.3)
+    /// reads this field at admission time; see
+    /// [`Self::withdraws_admission_rule`] for the per-rule audit
+    /// metadata recorded post-admission.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subject_key_ids: Vec<String>,
+    /// v3.7.0 (CIRISPersist#146, CEG 0.6 §3.2.3). Per-rule audit
+    /// metadata: which of the 4 admission rules admitted this
+    /// withdraws.
+    ///
+    /// `Some(1)` — producer self-revocation (`issuer.key_id == T.attesting_key_id`).
+    /// `Some(2)` — subject self-revocation (`issuer.key_id ∈ T.subject_key_ids`, CEG 0.6 NEW).
+    /// `Some(3)` — `delegates_to` proxy chain with `consent_revocation` scope (CEG 0.6 NEW).
+    /// `Some(4)` — `delegates_to` chain via any of 1-3.
+    /// `None`    — non-withdraws row, or pre-v3.8.0 withdraws written
+    ///             before the admission gate landed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withdraws_admission_rule: Option<u8>,
 }
 
 impl Attestation {

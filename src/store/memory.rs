@@ -2421,6 +2421,8 @@ mod tests {
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
         }
     }
 
@@ -3305,6 +3307,8 @@ mod tests {
             scrub_timestamp: asserted_at.parse().unwrap(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
         }
     }
 
@@ -3479,6 +3483,8 @@ mod tests {
             scrub_timestamp: chrono::Utc::now(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
         };
         backend
             .put_attestation(SignedAttestation { attestation: att })

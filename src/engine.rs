@@ -747,6 +747,12 @@ impl Engine {
             scrub_timestamp: now,
             pqc_completed_at: None,
             persist_row_hash: String::new(),
+            // v3.7.0 (CIRISPersist#146, CEG 0.6) — legacy withdraws
+            // emission path predates subject-side authority. v3.8.0
+            // adds rule-2/3 admission; this site keeps emitting
+            // producer-self-revocation (rule 1).
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
         };
 
         let directory = self.federation_directory();

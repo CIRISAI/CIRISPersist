@@ -819,6 +819,11 @@ pub(crate) async fn emit_withdraws_attestation_helper(
         scrub_timestamp: now,
         pqc_completed_at: None,
         persist_row_hash: String::new(),
+        // v3.7.0 (CIRISPersist#146, CEG 0.6) — evict_actor emits a
+        // producer-self-revocation withdraws; subject-side authority
+        // (rule 2/3) doesn't apply on this path.
+        subject_key_ids: Vec::new(),
+        withdraws_admission_rule: None,
     };
 
     directory

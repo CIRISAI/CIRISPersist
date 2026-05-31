@@ -1571,14 +1571,24 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // `Some(f64)` and `None` bind as `Option<f64>` against
         // `FLOAT8` (which DOES have a built-in serializer),
         // then PG widens to NUMERIC for storage.
+        // v3.7.0 (CIRISPersist#146, CEG 0.6) — subject_key_ids JSONB +
+        // withdraws_admission_rule SMALLINT (NULL on non-withdraws).
+        let subject_key_ids_jsonb = serde_json::Value::Array(
+            row.subject_key_ids
+                .iter()
+                .map(|s| serde_json::Value::String(s.clone()))
+                .collect(),
+        );
+        let withdraws_admission_rule: Option<i16> = row.withdraws_admission_rule.map(|v| v as i16);
         client
             .execute(
                 "INSERT INTO cirislens.federation_attestations (\
                     attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                     weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash\
-                 ) VALUES ($1, $2, $3, $4, $5::float8::numeric, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                    subject_key_ids, withdraws_admission_rule\
+                 ) VALUES ($1, $2, $3, $4, $5::float8::numeric, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
                 &[
                     &attestation_uuid,
                     &row.attesting_key_id,
@@ -1595,6 +1605,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.scrub_timestamp,
                     &row.pqc_completed_at,
                     &row.persist_row_hash,
+                    &subject_key_ids_jsonb,
+                    &withdraws_admission_rule,
                 ],
             )
             .await
@@ -1630,7 +1642,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
                     weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule \
                  FROM cirislens.federation_attestations \
                  WHERE attested_key_id = $1 \
                  ORDER BY asserted_at DESC",
@@ -1657,7 +1669,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
                     weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule \
                  FROM cirislens.federation_attestations \
                  WHERE attesting_key_id = $1 \
                  ORDER BY asserted_at DESC",
@@ -1845,7 +1857,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
                     weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule \
                  FROM cirislens.federation_attestations WHERE attestation_id = $1::uuid",
                 &[&attestation_id],
             )
@@ -3120,6 +3132,10 @@ impl crate::federation::BlobStorage for PostgresBackend {
             scrub_timestamp: attestation.scrub_timestamp,
             pqc_completed_at: None,
             persist_row_hash: String::new(),
+            // v3.7.0 (CIRISPersist#146, CEG 0.6) — holds_bytes is a
+            // self-attestation; subject-side authority does not apply.
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
         };
         let attestation_envelope_jsonb = attestation_row.attestation_envelope.clone();
         let persist_row_hash = crate::federation::types::compute_persist_row_hash(&attestation_row)
@@ -4719,6 +4735,13 @@ fn pg_row_to_attestation(
 ) -> Result<crate::federation::Attestation, crate::federation::Error> {
     let mk_err = crate::federation::Error::Backend;
     let original_content_hash: Vec<u8> = row.safe_get_with("original_content_hash", mk_err)?;
+    // v3.7.0 (CIRISPersist#146, CEG 0.6) — subject_key_ids JSONB is
+    // stored as a JSON array of strings; deserialize directly.
+    let subject_key_ids: serde_json::Value = row.safe_get_with("subject_key_ids", mk_err)?;
+    let subject_key_ids: Vec<String> = serde_json::from_value(subject_key_ids)
+        .map_err(|e| crate::federation::Error::Backend(format!("subject_key_ids decode: {e}")))?;
+    let withdraws_admission_rule: Option<i16> =
+        row.safe_get_with("withdraws_admission_rule", mk_err)?;
     Ok(crate::federation::Attestation {
         attestation_id: row.safe_get_with("attestation_id", mk_err)?,
         attesting_key_id: row.safe_get_with("attesting_key_id", mk_err)?,
@@ -4735,6 +4758,8 @@ fn pg_row_to_attestation(
         scrub_timestamp: row.safe_get_with("scrub_timestamp", mk_err)?,
         pqc_completed_at: row.safe_get_with("pqc_completed_at", mk_err)?,
         persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
+        subject_key_ids,
+        withdraws_admission_rule: withdraws_admission_rule.map(|v| v as u8),
     })
 }
 
@@ -6465,7 +6490,7 @@ impl crate::read::ReadEngine for PostgresBackend {
             "SELECT attestation_id::text AS attestation_id, attesting_key_id, attested_key_id, \
                     attestation_type, weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule \
              FROM cirislens.federation_attestations \
              {where_sql} \
              ORDER BY asserted_at DESC, attestation_id DESC \
@@ -12074,6 +12099,8 @@ mod tests {
             scrub_timestamp: chrono::Utc::now(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
         }
     }
 
@@ -12372,6 +12399,8 @@ mod tests {
             scrub_timestamp: asserted_at,
             pqc_completed_at: None,
             persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
         }
     }
 
@@ -13533,6 +13562,8 @@ mod tests {
             scrub_timestamp: asserted_at,
             pqc_completed_at: None,
             persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
         }
     }
 
@@ -14187,6 +14218,8 @@ mod tests {
             scrub_timestamp: chrono::Utc::now(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
         };
         backend
             .put_attestation(crate::federation::SignedAttestation { attestation: att })
@@ -15453,6 +15486,8 @@ mod tests {
             scrub_timestamp: chrono::Utc::now(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
         };
         backend
             .put_attestation(crate::federation::SignedAttestation {
@@ -15627,6 +15662,8 @@ mod tests {
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
         }
     }
 

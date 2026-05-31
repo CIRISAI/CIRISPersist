@@ -5,6 +5,49 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.7.0] — 2026-05-31
+
+**CIRISPersist 3.7.0 — CEG 0.6 substrate foundation: `subject_key_ids[]` JSONB column + `withdraws_admission_rule` audit metadata on `federation_attestations` (#146 Ask 1).**
+
+First cut of the CEG 0.6 substrate work. CEG 0.6 (CIRISRegistry commit d8b53a0, 2026-05-31) is "the missing half of consent at the wire format" — CEG ≤0.5 encoded only **producer authority** (`attesting_key_id`); CEG 0.6 adds **subject authority** via one optional envelope field. This minor lands the schema + persistence; the admission gate, SLA watcher, `consent_record` subject_kind, and canonical-hash binding helper follow in v3.8.0 / v3.9.0 cuts per #146.
+
+### What's in this cut
+
+**Schema (V055 migrations, both backends)**:
+
+- `federation_attestations.subject_key_ids JSONB NOT NULL DEFAULT '[]'::jsonb` (Postgres) / `TEXT NOT NULL DEFAULT '[]' CHECK(json_valid)` (SQLite). GIN index on Postgres; SQLite uses `json_each` at query time for v3.7.0.
+- `federation_attestations.withdraws_admission_rule SMALLINT NULL CHECK 1..=4` (Postgres) / `INTEGER` (SQLite). Partial index on both. NULL on non-withdraws rows; populated by the 4-rule admission gate landing in v3.8.0.
+- Both columns default-empty per CEG §4.2.5 — `'[]'` / NULL is the status-quo shape; all CEG ≤0.5 consumers that don't read the fields see existing behavior unchanged.
+
+**Rust struct**:
+
+- `Attestation::subject_key_ids: Vec<String>` with `#[serde(default, skip_serializing_if = "Vec::is_empty")]` — empty vec serializes to absence, preserving pre-v3.7.0 canonical bytes / `persist_row_hash` for legacy rows.
+- `Attestation::withdraws_admission_rule: Option<u8>` with `#[serde(default, skip_serializing_if = "Option::is_none")]` — same backward-compat discipline.
+- Each entry MAY be a `federation_keys.key_id` OR a canonical-hash identifier (CEG 0.6 §4.2.2) — substrate does NOT FK-enforce, since canonical-hash subjects (Discord user-ids, external party identifiers) are valid per the CEG 0.6 design.
+
+**Read + write paths** (both backends):
+
+- 7 SELECT statements that feed `row_to_attestation` now include `subject_key_ids, withdraws_admission_rule`
+- `put_attestation` INSERT writes the new columns (legacy callers default to empty + None)
+- `holds_bytes` INSERT uses the schema default (no code change; the column has `DEFAULT '[]'::jsonb`)
+
+**Tests**: 804/804 green (sqlite + postgres + cirisnode + pyo3). New regression `put_attestation_round_trips_ceg06_subject_fields_sqlite` confirms both federation-key and canonical-hash entries survive the persist → read cycle.
+
+### What's NOT in this cut (filed for v3.8.0+)
+
+Per the #146 acceptance list, remaining asks land in subsequent cuts:
+
+- **Ask 2** — 4-rule broadened `withdraws` admission gate (v3.8.0)
+- **Ask 3** — Consent-SLA watcher background task emitting `hard_case:consent_sla_breach` + `hard_case:consent_revocation_promotion_overdue` (v3.9.0)
+- **Ask 4** — Multi-subject revocation evict (any-subject-binding) semantics (v3.8.0, composes with Ask 2)
+- **Ask 5** — `consent_record` subject_kind admission with locked payload (v3.8.0)
+- **Ask 6** — Canonical-hash binding helper (`identity:canonical_binding:*` admission) (v3.9.0)
+- Read accessors: `list_attestations_for_subject` + `resolve_consent_state` (v3.9.0)
+
+### Why this is additive (1+4 wire-format lockdown preserved)
+
+Per CEG §3 1+4 lockdown: no new `attestation_type`. The field lives on the envelope; the wire-format `scores` workhorse + 4 structural composers (`delegates_to`, `supersedes`, `withdraws`, `recants`) are unchanged. CEG 0.6 broadens the *admission rule* for `withdraws` (CEG §3.2.3); v3.7.0 lands the data shape, v3.8.0 lands the rule itself.
+
 ## [3.6.9] — 2026-05-30
 
 **CIRISPersist 3.6.9 — CIRISVerify v4.4.3 pin bump + macOS Mach-O parity gate (#141).**

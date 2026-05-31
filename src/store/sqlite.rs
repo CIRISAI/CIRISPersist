@@ -1367,6 +1367,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let attestation_envelope_text = serde_json::to_string(&row.attestation_envelope)
             .map_err(|e| crate::federation::Error::Backend(format!("envelope serialize: {e}")))?;
 
+        // v3.7.0 (CIRISPersist#146, CEG 0.6) — serialize subject_key_ids
+        // to canonical JSON TEXT; sqlite stores JSON-as-TEXT validated
+        // by the json1 CHECK on the column.
+        let subject_key_ids_json = serde_json::to_string(&row.subject_key_ids).map_err(|e| {
+            crate::federation::Error::Backend(format!("subject_key_ids serialize: {e}"))
+        })?;
+        let withdraws_admission_rule: Option<i64> = row.withdraws_admission_rule.map(|v| v as i64);
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
             let conn = conn.blocking_lock();
@@ -1375,8 +1382,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                     weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                    subject_key_ids, withdraws_admission_rule\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 rusqlite::params![
                     row.attestation_id,
                     row.attesting_key_id,
@@ -1393,6 +1401,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.scrub_timestamp.to_rfc3339(),
                     row.pqc_completed_at.map(|t| t.to_rfc3339()),
                     row.persist_row_hash,
+                    subject_key_ids_json,
+                    withdraws_admission_rule,
                 ],
             )?;
             Ok(())
@@ -1425,7 +1435,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                         weight, asserted_at, expires_at, attestation_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule \
                      FROM federation_attestations \
                      WHERE attested_key_id = ?1 \
                      ORDER BY asserted_at DESC",
@@ -1452,7 +1462,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                         weight, asserted_at, expires_at, attestation_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule \
                      FROM federation_attestations \
                      WHERE attesting_key_id = ?1 \
                      ORDER BY asserted_at DESC",
@@ -1629,7 +1639,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                         weight, asserted_at, expires_at, attestation_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule \
                      FROM federation_attestations WHERE attestation_id = ?1",
                     [&id],
                     sqlite_row_to_attestation,
@@ -3026,6 +3036,10 @@ impl crate::federation::BlobStorage for SqliteBackend {
             scrub_timestamp: attestation.scrub_timestamp,
             pqc_completed_at: None,
             persist_row_hash: String::new(),
+            // v3.7.0 (CIRISPersist#146, CEG 0.6) — holds_bytes is a
+            // self-attestation; subject-side authority does not apply.
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
         };
         let persist_row_hash = crate::federation::types::compute_persist_row_hash(&attestation_row)
             .map_err(|e| crate::federation::BlobError::Backend(format!("persist_row_hash: {e}")))?;
@@ -4925,6 +4939,18 @@ fn sqlite_row_to_attestation(
     let expires_at: Option<String> = row.get("expires_at")?;
     let scrub_timestamp: String = row.get("scrub_timestamp")?;
     let pqc_completed_at: Option<String> = row.get("pqc_completed_at")?;
+    // v3.7.0 (CIRISPersist#146, CEG 0.6) — subject_key_ids is stored
+    // as TEXT containing a JSON array; deserialize at read time.
+    let subject_key_ids_text: String = row.get("subject_key_ids")?;
+    let subject_key_ids: Vec<String> =
+        serde_json::from_str(&subject_key_ids_text).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            )
+        })?;
+    let withdraws_admission_rule: Option<i64> = row.get("withdraws_admission_rule")?;
     Ok(crate::federation::Attestation {
         attestation_id: row.get("attestation_id")?,
         attesting_key_id: row.get("attesting_key_id")?,
@@ -4941,6 +4967,8 @@ fn sqlite_row_to_attestation(
         scrub_timestamp: parse_rfc3339(&scrub_timestamp),
         pqc_completed_at: pqc_completed_at.as_deref().map(parse_rfc3339),
         persist_row_hash: row.get("persist_row_hash")?,
+        subject_key_ids,
+        withdraws_admission_rule: withdraws_admission_rule.map(|v| v as u8),
     })
 }
 
@@ -6558,7 +6586,7 @@ impl crate::read::ReadEngine for SqliteBackend {
                     attestation_type, weight, asserted_at, expires_at, \
                     attestation_envelope, original_content_hash, \
                     scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
-                    scrub_timestamp, pqc_completed_at, persist_row_hash \
+                    scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule \
              FROM federation_attestations {where_sql} \
              ORDER BY asserted_at DESC, attestation_id DESC LIMIT ?{p_limit}"
         );
@@ -8492,7 +8520,56 @@ mod tests {
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
         }
+    }
+
+    // v3.7.0 (CIRISPersist#146, CEG 0.6) — round-trip a SignedAttestation
+    // with non-empty subject_key_ids + a withdraws_admission_rule and
+    // confirm the values survive the persist → read cycle.
+    #[tokio::test]
+    async fn put_attestation_round_trips_ceg06_subject_fields_sqlite() {
+        use crate::federation::FederationDirectory;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("host-a", "primitive-a", "host-a"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("subject-1", "primitive-s1", "subject-1"),
+            })
+            .await
+            .unwrap();
+        let canonical_hash = format!("sha256:{}", "0".repeat(64));
+        let mut row = fed_attestation("att-ceg06", "host-a", "host-a", "host-a");
+        row.subject_key_ids = vec!["subject-1".into(), canonical_hash.clone()];
+        row.withdraws_admission_rule = None; // scores row; rule only set on withdraws
+
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: row.clone(),
+            })
+            .await
+            .unwrap();
+
+        let got = backend
+            .list_attestations_for("host-a")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|a| a.attestation_id == "att-ceg06")
+            .expect("attestation round-tripped");
+        assert_eq!(
+            got.subject_key_ids,
+            vec!["subject-1".to_string(), canonical_hash.clone()],
+            "subject_key_ids round-trip (federation-key + canonical-hash entries)"
+        );
+        assert_eq!(got.withdraws_admission_rule, None);
     }
 
     fn fed_revocation(id: &str, revoked: &str, revoking: &str, scrub_key_id: &str) -> Revocation {
@@ -9126,6 +9203,8 @@ mod tests {
             scrub_timestamp: asserted_at.parse().unwrap(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
         }
     }
 
@@ -9945,6 +10024,8 @@ mod tests {
                     scrub_timestamp: chrono::Utc::now(),
                     pqc_completed_at: None,
                     persist_row_hash: String::new(),
+                    subject_key_ids: Vec::new(),
+                    withdraws_admission_rule: None,
                 },
             })
             .await
@@ -12540,6 +12621,8 @@ mod tests {
             scrub_timestamp: asserted_at,
             pqc_completed_at: None,
             persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
         }
     }
 
@@ -13985,6 +14068,8 @@ mod tests {
             scrub_timestamp: chrono::Utc::now(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
         }
     }
 
