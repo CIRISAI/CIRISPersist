@@ -13655,7 +13655,10 @@ mod tests {
 
         // Two peers in family-acme, one in a different cohort.
         for id in ["peer-fam-1", "peer-fam-2"] {
-            backend.add_peer_record(id, "AAAA", "agent", None).await.unwrap();
+            backend
+                .add_peer_record(id, "AAAA", "agent", None)
+                .await
+                .unwrap();
             backend
                 .update_peer_policy(
                     id,
@@ -13716,13 +13719,20 @@ mod tests {
         assert_ne!(p1.items[0].key_id, p2.items[0].key_id, "distinct pages");
 
         // Soft-removed peers are excluded (membership is a live property).
-        backend.remove_peer_record("peer-fam-2", false).await.unwrap();
+        backend
+            .remove_peer_record("peer-fam-2", false)
+            .await
+            .unwrap();
         let fam_live = backend
             .list_federation_keys(mk("family-acme"), None, 100)
             .await
             .unwrap();
         assert_eq!(
-            fam_live.items.iter().map(|k| k.key_id.as_str()).collect::<Vec<_>>(),
+            fam_live
+                .items
+                .iter()
+                .map(|k| k.key_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["peer-fam-1"],
             "soft-removed peer must drop out of the cohort filter"
         );

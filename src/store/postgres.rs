@@ -14363,7 +14363,10 @@ mod tests {
         let fam_b = format!("peer-fam-b-{}", uuid_like());
         let other = format!("peer-other-{}", uuid_like());
         for id in [&fam_a, &fam_b] {
-            backend.add_peer_record(id, "AAAA", "agent", None).await.unwrap();
+            backend
+                .add_peer_record(id, "AAAA", "agent", None)
+                .await
+                .unwrap();
             backend
                 .update_peer_policy(
                     id,
@@ -14372,7 +14375,10 @@ mod tests {
                 .await
                 .unwrap();
         }
-        backend.add_peer_record(&other, "BBBB", "agent", None).await.unwrap();
+        backend
+            .add_peer_record(&other, "BBBB", "agent", None)
+            .await
+            .unwrap();
         backend
             .update_peer_policy(
                 &other,
@@ -14405,7 +14411,10 @@ mod tests {
         assert_eq!(ids, vec![fam_a.as_str(), fam_b.as_str()]);
 
         // Multi-page: limit=1 → page + cursor + distinct second page.
-        let p1 = backend.list_federation_keys(mk(&cohort), None, 1).await.unwrap();
+        let p1 = backend
+            .list_federation_keys(mk(&cohort), None, 1)
+            .await
+            .unwrap();
         assert_eq!(p1.items.len(), 1);
         let cursor = p1.next_cursor.clone().expect("next_cursor");
         let p2 = backend
@@ -14422,7 +14431,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            fam_live.items.iter().map(|k| k.key_id.as_str()).collect::<Vec<_>>(),
+            fam_live
+                .items
+                .iter()
+                .map(|k| k.key_id.as_str())
+                .collect::<Vec<_>>(),
             vec![fam_a.as_str()],
         );
     }
