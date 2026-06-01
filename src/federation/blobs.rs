@@ -222,6 +222,43 @@ pub trait BlobStorage: Send + Sync {
         attestation: PutBlobAttestation,
     ) -> impl Future<Output = Result<(), BlobError>> + Send;
 
+    /// v3.9.2 (CIRISPersist#153 Ask 5, CEG 0.7 §10.1.4) — store blob
+    /// bytes **without** emitting a `holds_bytes:sha256:*` directory
+    /// attestation.
+    ///
+    /// The structural-invisibility primitive for
+    /// [`cohort_scope`](crate::federation::types::cohort_scope)
+    /// `self` / `family` content: the bytes are persisted locally
+    /// (and readable via [`get_blob`](BlobStorage::get_blob) /
+    /// streamable as the operator's own data) but the substrate
+    /// announces nothing — no `holds_bytes` row is created, so a
+    /// non-member peer walking the federation directory cannot
+    /// discover the bytes exist. This is the difference between
+    /// [`put_blob`](BlobStorage::put_blob) (federation-tier: bytes +
+    /// holds_bytes announcement) and local-only storage.
+    ///
+    /// Validation is identical to [`put_blob`] for the bytes
+    /// themselves — inline-size cap + hash-on-write — but there is no
+    /// attestation, no signer, and (deliberately) no
+    /// [`AdmissionGate`](crate::federation::AdmissionGate) trust check:
+    /// local content is the operator's own data, and the substrate is
+    /// never the right place to refuse it (the #149 anti-recommendation
+    /// — "Don't block local writes ever").
+    ///
+    /// Idempotent on SHA collision (first-write-wins on
+    /// `storage_kind` / `external_ref`), exactly as [`put_blob`].
+    /// Callers normally reach this via
+    /// [`put_blob_signing_scoped`](BlobStorage::put_blob_signing_scoped),
+    /// which dispatches here when
+    /// [`suppresses_holds_bytes`](crate::federation::types::cohort_scope::suppresses_holds_bytes)
+    /// is true.
+    fn store_blob_local(
+        &self,
+        sha256: &[u8; 32],
+        body: BlobBody,
+        media_type: Option<&str>,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
     /// Read a blob by its SHA-256.
     ///
     /// Returns the [`BlobBody`] variant matching the row's stored
@@ -397,6 +434,74 @@ pub trait BlobStorage: Send + Sync {
             };
 
             self.put_blob(sha256, body, media_type, att).await
+        }
+    }
+
+    /// v3.9.2 (CIRISPersist#153 Ask 5, CEG 0.7 §10.1.4) — cohort-scope-
+    /// aware blob write. The substrate-side enforcement of the
+    /// structural-invisibility privacy claim.
+    ///
+    /// Dispatches on
+    /// [`cohort_scope::suppresses_holds_bytes`](crate::federation::types::cohort_scope::suppresses_holds_bytes):
+    ///
+    /// - `self` / `family` → [`store_blob_local`](BlobStorage::store_blob_local):
+    ///   bytes are persisted, **no** `holds_bytes` attestation is
+    ///   emitted, the signer is never invoked (there is no attestation
+    ///   to sign). The content is structurally invisible to the
+    ///   federation.
+    /// - every other (validated) scope → [`put_blob_signing`](BlobStorage::put_blob_signing):
+    ///   the federation-tier path that signs + emits the `holds_bytes`
+    ///   announcement exactly as today.
+    ///
+    /// `cohort_scope` MUST be one of the closed-set values
+    /// ([`cohort_scope::is_valid`](crate::federation::types::cohort_scope::is_valid));
+    /// an unknown value (e.g. the §8.1.8 feed-name `global`) is
+    /// rejected with [`BlobError::InvalidArgument`] — the same closed
+    /// set the v3.9.1 attestation admission gate enforces, applied here
+    /// at the blob-write boundary.
+    ///
+    /// # Default impl
+    ///
+    /// Composed from the two existing surfaces; no per-backend override
+    /// is intended.
+    #[allow(clippy::too_many_arguments)]
+    fn put_blob_signing_scoped<'s>(
+        &'s self,
+        cohort_scope: &'s str,
+        sha256: &'s [u8; 32],
+        body: BlobBody,
+        media_type: Option<&'s str>,
+        attesting_key_id: &'s str,
+        signer: &'s dyn ciris_keyring::HardwareSigner,
+        now: chrono::DateTime<chrono::Utc>,
+        attestation_id: uuid::Uuid,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send + 's
+    where
+        Self: Sync,
+    {
+        async move {
+            if !crate::federation::types::cohort_scope::is_valid(cohort_scope) {
+                return Err(BlobError::InvalidArgument(format!(
+                    "cohort_scope {cohort_scope:?} is not in the closed set \
+                     {{self, family, community, affiliations, species, biosphere, federation}}"
+                )));
+            }
+            if crate::federation::types::cohort_scope::suppresses_holds_bytes(cohort_scope) {
+                // Structurally invisible (CEG §10.1.4): store the bytes,
+                // announce nothing. No signer, no holds_bytes row.
+                self.store_blob_local(sha256, body, media_type).await
+            } else {
+                self.put_blob_signing(
+                    sha256,
+                    body,
+                    media_type,
+                    attesting_key_id,
+                    signer,
+                    now,
+                    attestation_id,
+                )
+                .await
+            }
         }
     }
 

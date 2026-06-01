@@ -1264,4 +1264,31 @@ mod tests {
             Error::CohortScopeRejected { .. }
         ));
     }
+
+    // ── #153 Ask 5: structural-invisibility classification ─────────
+
+    #[test]
+    fn cohort_scope_suppresses_holds_bytes_only_for_self_and_family() {
+        use crate::federation::types::cohort_scope as cs;
+        // self + family are structurally invisible — no holds_bytes.
+        assert!(cs::suppresses_holds_bytes(cs::SELF));
+        assert!(cs::suppresses_holds_bytes(cs::FAMILY));
+        // everything else federates and emits holds_bytes per status quo
+        // (CEG 0.8 §8.1.13.3 is explicit that community is NOT suppressed).
+        for scope in [
+            cs::COMMUNITY,
+            cs::AFFILIATIONS,
+            cs::SPECIES,
+            cs::BIOSPHERE,
+            cs::FEDERATION,
+        ] {
+            assert!(
+                !cs::suppresses_holds_bytes(scope),
+                "{scope:?} must federate (emit holds_bytes)"
+            );
+        }
+        // unknown values are not suppressors (they're rejected upstream
+        // by is_valid / the admission gate).
+        assert!(!cs::suppresses_holds_bytes("global"));
+    }
 }

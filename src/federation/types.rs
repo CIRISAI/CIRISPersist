@@ -447,6 +447,33 @@ pub mod cohort_scope {
             SELF | FAMILY | COMMUNITY | AFFILIATIONS | SPECIES | BIOSPHERE | FEDERATION
         )
     }
+
+    /// v3.9.2 (CIRISPersist#153 Ask 5, CEG 0.7 §10.1.4) — the
+    /// structural-invisibility classification.
+    ///
+    /// True iff content tagged with this `cohort_scope` is
+    /// **structurally invisible** to the federation: the substrate
+    /// MUST NOT emit a `holds_bytes:sha256:*` directory attestation
+    /// for it, and MUST NOT propagate it beyond the self-collective /
+    /// family scope via any directory or discovery surface. A
+    /// non-member peer cannot issue a ContentFetch for it and cannot
+    /// even discover the bytes exist — the `holds_bytes` row *is* the
+    /// discovery surface, so not emitting it is the privacy primitive
+    /// (the ciris.ai/cewp "the wire format can't carry them" claim).
+    ///
+    /// True for [`SELF`] and [`FAMILY`]. False for `community` /
+    /// `affiliations` / `species` / `biosphere` / `federation`, which
+    /// federate per status quo and emit `holds_bytes` normally — CEG
+    /// 0.8 §8.1.13.3 is explicit that community content is NOT
+    /// suppressed (communities can be large; per-member byte-level
+    /// invisibility is infeasible, and the community privacy property
+    /// is cohort-filtered visibility, not byte-level invisibility).
+    ///
+    /// This is the locality dividend of FEDERATION_SCALING_MODEL §9.5:
+    /// self/family bytes never cost the federation a directory entry.
+    pub fn suppresses_holds_bytes(s: &str) -> bool {
+        matches!(s, SELF | FAMILY)
+    }
 }
 
 impl Attestation {

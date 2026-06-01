@@ -5,6 +5,34 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.9.2] — 2026-06-01
+
+**CIRISPersist 3.9.2 — `holds_bytes` suppression for `cohort_scope: self | family`: the structural-invisibility primitive (CIRISPersist#153 Ask 5, CEG 0.7 §10.1.4).**
+
+The substrate-side enforcement of the ciris.ai/cewp privacy claim — *"self and family content never emits the attestation that would tell the rest of the network it exists."* The `holds_bytes:sha256:*` directory attestation **is** the discovery surface a peer walks to learn a blob exists; not emitting it is the privacy primitive. This cut makes persist own that decision instead of trusting consumers to withhold the announcement.
+
+### Enforcement
+
+- **`cohort_scope::suppresses_holds_bytes(&str) -> bool`** (NEW) — the structural-invisibility classification: `true` for `self` and `family`, `false` for `community` / `affiliations` / `species` / `biosphere` / `federation`. CEG 0.8 §8.1.13.3 is explicit that community content is NOT suppressed (communities can be large; byte-level invisibility is infeasible — their privacy property is cohort-filtered visibility). This is the FEDERATION_SCALING_MODEL §9.5 locality dividend: self/family bytes never cost the federation a directory entry.
+- **`BlobStorage::store_blob_local`** (NEW, both backends) — stores blob bytes with the same inline-cap + hash-on-write validation as `put_blob`, but emits **no** `holds_bytes` attestation. No signer, and deliberately **no `AdmissionGate` trust check** — local content is the operator's own data, and the substrate is never the right place to refuse it (the #149 anti-recommendation).
+- **`BlobStorage::put_blob_signing_scoped`** (NEW, default method) — cohort-scope-aware write. Dispatches `self`/`family` → `store_blob_local` (structurally invisible), every other validated scope → `put_blob_signing` (federation-tier signed announcement, unchanged). An out-of-closed-set scope (e.g. the §8.1.8 feed-name `global`) is rejected with `BlobError::InvalidArgument`, mirroring the v3.9.1 attestation admission gate at the blob-write boundary.
+- **PyO3 `store_blob_local_json`** (NEW) — wheel-surface primitive; the `put_blob_json` payload minus the `attestation` field. Lets a consumer store `self`/`family` bytes without announcing them.
+
+### Also
+
+- **Fix:** the v3.9.1 `Error::CohortScopeRejected` variant is now handled in the PyO3 `federation_err_to_py` mapper (caller-fault → `ValueError`/4xx). v3.9.1 verified sqlite+postgres but not the `pyo3` feature, whose exhaustive `match` on `federation::Error` would have failed the wheel build; folded in here so the branch HEAD is green across every feature axis.
+
+### Tests
+
+- Unit: `suppresses_holds_bytes` true only for self/family; false for the five federating scopes and for unknown values.
+- Both backends: `store_blob_local` persists bytes (readable via `get_blob`) with an empty `list_holders` (nothing announced).
+- Dispatch (sqlite, backend-agnostic default method): `self` suppresses holds_bytes; `federation` emits holds_bytes (`list_holders == [host]`); `global` → `InvalidArgument` with nothing stored.
+- 546/546 sqlite lib tests green; postgres + pyo3 targets compile; clippy clean across `sqlite` / `pyo3`.
+
+### What's still v3.10+ (the rest of #153 / #152)
+
+The `family` + `identity_occurrence` admission tables and consensus-protocol gate (#153 Asks 1-3), the at-rest **DEK cascade** that wraps content keys to new members via HPKE `key_grant` (#153 Ask 4 / #152), forward-secrecy-on-removal (#153 Ask 6), and the Policy-L read accessors (#153 Ask 7) remain deferred — they need the new identity/family substrate tables, a membership-change watcher task, and the consumer hardware-enclave unwrap path. This cut lands the one load-bearing primitive those build on: bytes that are never announced.
+
 ## [3.9.1] — 2026-06-01
 
 **CIRISPersist 3.9.1 — `cohort_scope` admission-gate validation: the first enforcement slice on the v3.9.0 schema foundation (CIRISPersist#150 Ask 3).**

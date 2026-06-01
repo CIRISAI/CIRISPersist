@@ -4101,6 +4101,48 @@ impl PyEngine {
         })
     }
 
+    /// v3.9.2 (CIRISPersist#153 Ask 5, CEG 0.7 §10.1.4) — store blob
+    /// bytes WITHOUT emitting a `holds_bytes` directory attestation.
+    ///
+    /// The wheel-surface primitive for `cohort_scope: self | family`
+    /// content: the bytes are persisted locally (readable via
+    /// `get_blob_json`) but the substrate announces nothing — no
+    /// `holds_bytes` row, so non-member peers cannot discover the bytes
+    /// exist. The payload is the same shape as `put_blob_json` **minus
+    /// the `attestation` field** (there is no attestation to sign):
+    /// `{"sha256": "<hex>", "body": {"inline": "<b64>"}|{"external":
+    /// {...}}, "media_type": "...|null"}`.
+    fn store_blob_local_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let (sha256, body, media_type) = parse_store_blob_local_payload(payload_json)?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .store_blob_local(&sha256, body, media_type.as_deref())
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .store_blob_local(&sha256, body, media_type.as_deref())
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
     /// Federation blob storage: read a blob by SHA-256 (hex).
     ///
     /// Returns `None` when no row exists; otherwise a JSON string of
@@ -16790,6 +16832,9 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::ReservedPrefixEmitterMismatch { .. } => {
             PyValueError::new_err(kind)
         }
+        // v3.9.1 (CIRISPersist#150 Ask 3) — cohort_scope admission
+        // rejection is caller-fault malformed-content; ValueError (4xx).
+        crate::federation::Error::CohortScopeRejected { .. } => PyValueError::new_err(kind),
         // v2.5.0 (CIRISPersist#102 Ask 4 + Ask 8) — all the new
         // admission-hook rejections are caller-fault malformed-
         // content; ValueError (4xx).
@@ -16956,6 +17001,39 @@ fn parse_put_blob_payload(json: &str) -> PyResult<PutBlobPayload> {
         media_type: wire.media_type,
         attestation,
     })
+}
+
+/// v3.9.2 (CIRISPersist#153 Ask 5) — wire shape for
+/// `store_blob_local_json`: `put_blob_json` minus the `attestation`
+/// field (local-only storage emits no holds_bytes attestation).
+#[derive(serde::Deserialize)]
+struct StoreBlobLocalJsonWire {
+    sha256: String,
+    body: PutBlobWireBody,
+    #[serde(default)]
+    media_type: Option<String>,
+}
+
+/// v3.9.2 (CIRISPersist#153 Ask 5) — decode the `store_blob_local_json`
+/// payload into the trait-call argument shape.
+fn parse_store_blob_local_payload(
+    json: &str,
+) -> PyResult<([u8; 32], crate::federation::BlobBody, Option<String>)> {
+    let wire: StoreBlobLocalJsonWire = serde_json::from_str(json)
+        .map_err(|e| PyValueError::new_err(format!("store_blob_local_json decode: {e}")))?;
+    let sha = parse_sha256_hex(&wire.sha256)?;
+    let body = match wire.body {
+        PutBlobWireBody::Inline(b64) => {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            let bytes = B64.decode(&b64).map_err(|e| {
+                PyValueError::new_err(format!("store_blob_local_json inline base64 decode: {e}"))
+            })?;
+            crate::federation::BlobBody::Inline(bytes)
+        }
+        PutBlobWireBody::External(e) => crate::federation::BlobBody::External(e),
+    };
+    Ok((sha, body, wire.media_type))
 }
 
 /// v2.3 (CIRISPersist#103) — parse a 64-char hex string into a

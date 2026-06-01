@@ -3248,6 +3248,64 @@ impl crate::federation::BlobStorage for PostgresBackend {
         Ok(())
     }
 
+    // v3.9.2 (CIRISPersist#153 Ask 5, CEG 0.7 §10.1.4) — store blob
+    // bytes WITHOUT a holds_bytes attestation (structural invisibility
+    // for cohort_scope self/family). Same byte-validation as put_blob;
+    // no attestation, no admission gate (local content is the
+    // operator's own data — #149 anti-rec).
+    async fn store_blob_local(
+        &self,
+        sha256: &[u8; 32],
+        body: crate::federation::BlobBody,
+        media_type: Option<&str>,
+    ) -> Result<(), crate::federation::BlobError> {
+        let cap = self.inline_bytes_cap();
+        if let crate::federation::BlobBody::Inline(ref bytes) = body {
+            if bytes.len() > cap {
+                return Err(crate::federation::BlobError::InlineSizeExceeded {
+                    size: bytes.len(),
+                    cap,
+                });
+            }
+            crate::federation::blobs::verify_inline_hash(sha256, bytes)?;
+        }
+        let storage_kind = body.storage_kind();
+        let size_bytes_i64 = i64::try_from(body.size_bytes()).map_err(|_| {
+            crate::federation::BlobError::InvalidArgument(
+                "size_bytes exceeds i64 — federation_blobs.size_bytes is BIGINT".into(),
+            )
+        })?;
+        let (bytes_inline_opt, external_ref_opt) = match &body {
+            crate::federation::BlobBody::Inline(b) => (Some(b.clone()), None),
+            crate::federation::BlobBody::External(e) => (None, Some(e.uri.clone())),
+        };
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let sha_vec = sha256.to_vec();
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_blobs (\
+                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type\
+                 ) VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT (sha256) DO NOTHING",
+                &[
+                    &sha_vec,
+                    &storage_kind,
+                    &bytes_inline_opt,
+                    &external_ref_opt,
+                    &size_bytes_i64,
+                    &media_type,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("store_blob_local insert: {e}"))
+            })?;
+        Ok(())
+    }
+
     async fn get_blob(
         &self,
         sha256: &[u8; 32],
@@ -11791,6 +11849,36 @@ mod tests {
             .expect("put inline");
         let got = backend.get_blob(&sha).await.expect("get").expect("present");
         assert_eq!(got, BlobBody::Inline(bytes));
+    }
+
+    /// v3.9.2 (CIRISPersist#153 Ask 5) — store_blob_local persists the
+    /// bytes but emits NO holds_bytes attestation (structural
+    /// invisibility for cohort_scope self/family). Parity with the
+    /// sqlite `store_blob_local_persists_bytes_without_announcing` test.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn blob_pg_store_blob_local_persists_without_announcing() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::{BlobBody, BlobStorage};
+        let bytes = pg_blob_payload("local-only");
+        let sha = pg_sha256_of(&bytes);
+        backend
+            .store_blob_local(&sha, BlobBody::Inline(bytes.clone()), None)
+            .await
+            .expect("store_blob_local");
+        // Bytes readable locally.
+        let got = backend.get_blob(&sha).await.expect("get").expect("present");
+        assert_eq!(got, BlobBody::Inline(bytes));
+        // Nothing announced — no holds_bytes attestation.
+        assert!(
+            backend.list_holders(&sha).await.unwrap().is_empty(),
+            "self/family content must emit no holds_bytes attestation"
+        );
     }
 
     #[tokio::test]

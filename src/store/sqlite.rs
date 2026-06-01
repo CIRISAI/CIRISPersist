@@ -3142,6 +3142,71 @@ impl crate::federation::BlobStorage for SqliteBackend {
         Ok(())
     }
 
+    // v3.9.2 (CIRISPersist#153 Ask 5, CEG 0.7 §10.1.4) — store blob
+    // bytes WITHOUT a holds_bytes attestation (structural invisibility
+    // for cohort_scope self/family). Same byte-validation as put_blob;
+    // no attestation, no admission gate (local content is the
+    // operator's own data — #149 anti-rec).
+    async fn store_blob_local(
+        &self,
+        sha256: &[u8; 32],
+        body: crate::federation::BlobBody,
+        media_type: Option<&str>,
+    ) -> Result<(), crate::federation::BlobError> {
+        let cap = self.inline_bytes_cap();
+        if let crate::federation::BlobBody::Inline(ref bytes) = body {
+            if bytes.len() > cap {
+                return Err(crate::federation::BlobError::InlineSizeExceeded {
+                    size: bytes.len(),
+                    cap,
+                });
+            }
+            crate::federation::blobs::verify_inline_hash(sha256, bytes)?;
+        }
+
+        let storage_kind = body.storage_kind().to_owned();
+        let size_bytes_i64 = i64::try_from(body.size_bytes()).map_err(|_| {
+            crate::federation::BlobError::InvalidArgument(
+                "size_bytes exceeds i64 — federation_blobs.size_bytes is INTEGER".into(),
+            )
+        })?;
+        let (bytes_inline_opt, external_ref_opt) = match &body {
+            crate::federation::BlobBody::Inline(b) => (Some(b.clone()), None),
+            crate::federation::BlobBody::External(e) => (None, Some(e.uri.clone())),
+        };
+        let sha_vec = sha256.to_vec();
+        let media_type_owned = media_type.map(str::to_owned);
+        // V053 last_accessed_at literal-default sentinel — write the
+        // real wall-clock so a fresh blob matches its first_seen_at.
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO federation_blobs (\
+                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
+                    last_accessed_at, access_count\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0) \
+                 ON CONFLICT (sha256) DO NOTHING",
+                rusqlite::params![
+                    sha_vec,
+                    storage_kind,
+                    bytes_inline_opt,
+                    external_ref_opt,
+                    size_bytes_i64,
+                    media_type_owned,
+                    now_iso,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| crate::federation::BlobError::Backend(format!("store_blob_local: {e}")))?;
+        Ok(())
+    }
+
     async fn get_blob(
         &self,
         sha256: &[u8; 32],
@@ -9844,6 +9909,121 @@ mod tests {
             vec!["actor-a".to_string()],
             "list_holders must include local writer even with stale attestation"
         );
+    }
+
+    // ── #153 Ask 5: holds_bytes suppression for self/family ────────
+
+    /// store_blob_local persists the bytes but emits NO holds_bytes
+    /// attestation — the structural-invisibility primitive. get_blob
+    /// returns the bytes; list_holders is empty (nothing announced).
+    #[tokio::test]
+    async fn store_blob_local_persists_bytes_without_announcing() {
+        use crate::federation::BlobStorage;
+        let backend = blob_test_backend().await;
+        let bytes = b"family photo".to_vec();
+        let sha = sha256_of(&bytes);
+        backend
+            .store_blob_local(&sha, BlobBody::Inline(bytes.clone()), None)
+            .await
+            .unwrap();
+        // Bytes are stored + readable locally.
+        match backend.get_blob(&sha).await.unwrap() {
+            Some(BlobBody::Inline(got)) => assert_eq!(got, bytes),
+            other => panic!("expected inline bytes, got {other:?}"),
+        }
+        // But nothing is announced to the federation.
+        assert!(
+            backend.list_holders(&sha).await.unwrap().is_empty(),
+            "self/family content must emit no holds_bytes attestation"
+        );
+    }
+
+    /// put_blob_signing_scoped("self", ...) dispatches to local-only
+    /// storage: bytes stored, no holds_bytes, signer never consulted.
+    #[tokio::test]
+    async fn put_blob_signing_scoped_self_suppresses_holds_bytes() {
+        use crate::federation::BlobStorage;
+        let backend = blob_test_backend().await;
+        let signer = test_signer_for("host-a");
+        let bytes = b"self journal entry".to_vec();
+        let sha = sha256_of(&bytes);
+        backend
+            .put_blob_signing_scoped(
+                crate::federation::types::cohort_scope::SELF,
+                &sha,
+                BlobBody::Inline(bytes.clone()),
+                None,
+                "host-a",
+                &*signer,
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .unwrap();
+        assert!(backend.has_blob(&sha).await.unwrap());
+        assert!(
+            backend.list_holders(&sha).await.unwrap().is_empty(),
+            "cohort_scope=self must not announce holds_bytes"
+        );
+    }
+
+    /// put_blob_signing_scoped("federation", ...) takes the
+    /// federation-tier path: bytes stored AND holds_bytes announced.
+    #[tokio::test]
+    async fn put_blob_signing_scoped_federation_emits_holds_bytes() {
+        use crate::federation::BlobStorage;
+        let backend = blob_test_backend().await;
+        let signer = test_signer_for("host-a");
+        let bytes = b"public corpus doc".to_vec();
+        let sha = sha256_of(&bytes);
+        backend
+            .put_blob_signing_scoped(
+                crate::federation::types::cohort_scope::FEDERATION,
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                "host-a",
+                &*signer,
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.list_holders(&sha).await.unwrap(),
+            vec!["host-a".to_string()],
+            "cohort_scope=federation must announce holds_bytes"
+        );
+    }
+
+    /// An out-of-closed-set cohort_scope (`global`) is rejected at the
+    /// blob-write boundary, mirroring the v3.9.1 attestation gate.
+    #[tokio::test]
+    async fn put_blob_signing_scoped_rejects_invalid_cohort_scope() {
+        use crate::federation::BlobStorage;
+        let backend = blob_test_backend().await;
+        let signer = test_signer_for("host-a");
+        let bytes = b"x".to_vec();
+        let sha = sha256_of(&bytes);
+        let err = backend
+            .put_blob_signing_scoped(
+                "global",
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                "host-a",
+                &*signer,
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::federation::BlobError::InvalidArgument(_)
+        ));
+        // Nothing stored on rejection.
+        assert!(!backend.has_blob(&sha).await.unwrap());
     }
 
     #[tokio::test]
