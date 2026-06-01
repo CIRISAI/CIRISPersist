@@ -6439,6 +6439,20 @@ impl crate::read::ReadEngine for PostgresBackend {
                 "pqc_completed_at IS NULL".to_owned()
             });
         }
+        // v3.9.3 (CIRISPersist#151) — peer-level cohort_scope membership.
+        // EXISTS-join the sibling federation_peer_metadata row, matching
+        // the policy_blob JSONB `cohort_scope` slot; exclude soft-removed
+        // peers (removed_at IS NULL — membership is a live property).
+        if let Some(cs) = &filter.cohort_scope {
+            params.push(Box::new(cs.clone()));
+            where_parts.push(format!(
+                "EXISTS (SELECT 1 FROM cirislens.federation_peer_metadata pm \
+                     WHERE pm.key_id = cirislens.federation_keys.key_id \
+                       AND pm.removed_at IS NULL \
+                       AND pm.policy_blob->>'cohort_scope' = ${})",
+                params.len()
+            ));
+        }
         if let Some(c) = &cursor {
             if c.version != "v1" {
                 return Err(crate::read::Error::InvalidCursor(format!(
@@ -14326,6 +14340,91 @@ mod tests {
         assert_eq!(meta.1, "untrusted");
         assert_eq!(meta.4.as_deref(), Some("rns://abc"));
         assert!(meta.5.is_none());
+    }
+
+    /// v3.9.3 (CIRISPersist#151) — bulk peer-level cohort_scope filter
+    /// on list_federation_keys. Parity with the sqlite test; uses a
+    /// per-run unique cohort label so the shared PG DB's leftover peers
+    /// can't bleed into the assertions.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn list_federation_keys_filters_by_cohort_scope_pg() {
+        use crate::federation::FederationDirectory;
+        use crate::read::{FederationKeyFilter, ReadEngine};
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let cohort = format!("family-{}", uuid_like());
+        let other_cohort = format!("community-{}", uuid_like());
+        let fam_a = format!("peer-fam-a-{}", uuid_like());
+        let fam_b = format!("peer-fam-b-{}", uuid_like());
+        let other = format!("peer-other-{}", uuid_like());
+        for id in [&fam_a, &fam_b] {
+            backend.add_peer_record(id, "AAAA", "agent", None).await.unwrap();
+            backend
+                .update_peer_policy(
+                    id,
+                    crate::federation::PeerPolicyBlob(serde_json::json!({"cohort_scope": cohort})),
+                )
+                .await
+                .unwrap();
+        }
+        backend.add_peer_record(&other, "BBBB", "agent", None).await.unwrap();
+        backend
+            .update_peer_policy(
+                &other,
+                crate::federation::PeerPolicyBlob(
+                    serde_json::json!({"cohort_scope": other_cohort}),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let mk = |scope: &str| FederationKeyFilter {
+            cohort_scope: Some(scope.to_string()),
+            ..Default::default()
+        };
+
+        // Empty match (a cohort nobody is in).
+        let none = backend
+            .list_federation_keys(mk(&format!("nope-{}", uuid_like())), None, 100)
+            .await
+            .unwrap();
+        assert!(none.items.is_empty());
+
+        // Multi match: exactly the two peers in this run's cohort.
+        let fam_all = backend
+            .list_federation_keys(mk(&cohort), None, 100)
+            .await
+            .unwrap();
+        let mut ids: Vec<&str> = fam_all.items.iter().map(|k| k.key_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![fam_a.as_str(), fam_b.as_str()]);
+
+        // Multi-page: limit=1 → page + cursor + distinct second page.
+        let p1 = backend.list_federation_keys(mk(&cohort), None, 1).await.unwrap();
+        assert_eq!(p1.items.len(), 1);
+        let cursor = p1.next_cursor.clone().expect("next_cursor");
+        let p2 = backend
+            .list_federation_keys(mk(&cohort), Some(cursor), 1)
+            .await
+            .unwrap();
+        assert_eq!(p2.items.len(), 1);
+        assert_ne!(p1.items[0].key_id, p2.items[0].key_id);
+
+        // Soft-removed peers drop out.
+        backend.remove_peer_record(&fam_b, false).await.unwrap();
+        let fam_live = backend
+            .list_federation_keys(mk(&cohort), None, 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            fam_live.items.iter().map(|k| k.key_id.as_str()).collect::<Vec<_>>(),
+            vec![fam_a.as_str()],
+        );
     }
 
     #[tokio::test]

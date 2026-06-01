@@ -5,6 +5,28 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.9.3] — 2026-06-01
+
+**CIRISPersist 3.9.3 — bulk peer-level `cohort_scope` filter on `list_federation_keys` (CIRISPersist#151).**
+
+Answers *"which key_ids belong to cohort X?"* in one indexed query at the wheel surface, replacing the O(N) per-key `peer_metadata_for` fan-out consumers fall back to today. This is the **peer-level** `cohort_scope` — the free-form membership label in `federation_peer_metadata.policy_blob` (e.g. `"family-acme"`) — distinct from the v3.9.0/3.9.1 **envelope-level** closed-set `cohort_scope` on `federation_attestations`.
+
+### Read surface (Option A — the preferred shape from the issue)
+
+- **`FederationKeyFilter.cohort_scope: Option<String>`** (NEW) — composes AND-style with the existing `agent_id_hash` / `algorithm` / `revoked` / `pqc_completed` filters. `#[serde(default)]` so existing payloads are unaffected; `engine.list_federation_keys({"cohort_scope": "family-acme"}, cursor, limit)` now returns exactly the matching peers as a `FederationKeyListPage`.
+- **Both backends** EXISTS-join the sibling `federation_peer_metadata` row and match the `policy_blob` JSON slot — Postgres `policy_blob->>'cohort_scope'`, SQLite `json_extract(policy_blob, '$.cohort_scope')`. Because cohort membership is a *live* property, **soft-removed peers (`removed_at IS NULL`) are excluded**.
+- **Cursor pagination preserved** — large cohorts page in O(limit) per call on the existing `(valid_from DESC, key_id DESC)` cursor.
+- **PyO3** — no binding change needed; `list_federation_keys` already deserializes `FederationKeyFilter` from `filter_json`, so the new key flows through automatically (docstring updated).
+
+### Migration
+
+- **V057** (both backends) — a functional **partial** index over the peer-metadata `cohort_scope` JSON path (`WHERE removed_at IS NULL AND policy_blob IS NOT NULL`), keeping the cohort lookup O(log N). Idempotent (`CREATE INDEX IF NOT EXISTS`); the `subject_key_ids[]` reader can reuse the same SQL pattern.
+
+### Tests
+
+- Both backends: empty match, multi-match (exactly the cohort's peers, not others), multi-page cursor (limit=1 → distinct pages), and soft-removed-peer exclusion. The PG test uses a per-run unique cohort label so the shared CI DB's leftover peers can't bleed in.
+- 547/547 sqlite lib tests green; postgres + pyo3 targets compile; clippy clean across `sqlite` / `pyo3`.
+
 ## [3.9.2] — 2026-06-01
 
 **CIRISPersist 3.9.2 — `holds_bytes` suppression for `cohort_scope: self | family`: the structural-invisibility primitive (CIRISPersist#153 Ask 5, CEG 0.7 §10.1.4).**

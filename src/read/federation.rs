@@ -47,6 +47,24 @@ pub struct FederationKeyFilter {
     /// `pqc_completed_at IS NOT NULL`; `Some(false)` returns only
     /// hybrid-pending keys.
     pub pqc_completed: Option<bool>,
+
+    /// v3.9.3 (CIRISPersist#151) — filter to keys whose **peer**
+    /// declares this `cohort_scope` in its
+    /// `federation_peer_metadata.policy_blob` (the peer-level
+    /// membership slot, e.g. `"family-acme"` — distinct from the
+    /// envelope-level closed-set `cohort_scope` on
+    /// `federation_attestations`).
+    ///
+    /// Answers "which key_ids belong to cohort X?" in one indexed
+    /// query instead of an O(N) per-key `peer_metadata_for` fan-out.
+    /// Matches via an `EXISTS` join against
+    /// `federation_peer_metadata` (Postgres `policy_blob->>'cohort_scope'`,
+    /// SQLite `json_extract(policy_blob, '$.cohort_scope')`), and —
+    /// because membership is a *live* property — **excludes
+    /// soft-removed peers** (`removed_at IS NULL`). A V057 functional
+    /// index over the JSON path keeps it O(log N).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cohort_scope: Option<String>,
 }
 
 /// Opaque cursor for [`super::ReadEngine::list_federation_keys`].

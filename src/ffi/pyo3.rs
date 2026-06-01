@@ -7474,6 +7474,12 @@ impl PyEngine {
 
     /// Bulk-list federation_keys with filter + cursor pagination.
     /// Returns JSON-encoded `FederationKeyListPage`.
+    ///
+    /// v3.9.3 (CIRISPersist#151) — `filter_json` accepts a
+    /// `cohort_scope` key, e.g. `{"cohort_scope": "family-acme"}`, to
+    /// list every live peer whose `policy_blob` declares that cohort in
+    /// one indexed query (soft-removed peers excluded) — replacing the
+    /// O(N) per-key `peer_metadata_for` fan-out.
     fn list_federation_keys(
         &self,
         py: Python<'_>,
