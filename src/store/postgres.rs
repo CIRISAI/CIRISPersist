@@ -1474,6 +1474,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             &attesting_identity_type,
         )?;
 
+        // v3.9.1 (CIRISPersist#150 Ask 3, CEG 0.4 §4.2.4) — cohort_scope
+        // admission-gate validation. Rejects out-of-closed-set values
+        // (notably `global`, a §8.1.8 feed-name, never a wire value)
+        // BEFORE persist_row_hash + INSERT so rejected rows leave no
+        // trace. The V056 CHECK constraint is the defense-in-depth
+        // backstop for direct-SQL bypass.
+        crate::federation::admission::check_cohort_scope(&row.cohort_scope)?;
+
         // v3.0.0 (CIRISPersist#116, CEG 0.2 §6.1) — structural-composer
         // dedup on `(references_attestation_id, attestation_type,
         // attesting_key_id)`. A second put with the same triple is a
@@ -12235,6 +12243,107 @@ mod tests {
             }
             other => panic!("expected DimensionRejected, got {other:?}"),
         }
+    }
+
+    /// v3.9.1 (CIRISPersist#150 Ask 3) — the cohort_scope admission
+    /// gate rejects an out-of-closed-set value (`global`) with the
+    /// typed `CohortScopeRejected`, leaving no row behind.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_put_attestation_rejects_invalid_cohort_scope() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+        let steward = format!("pg-cs-bad-stw-§150-{}", uuid_like());
+        let agent_k = format!("pg-cs-bad-agt-§150-{}", uuid_like());
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &steward,
+                    "registry",
+                    crate::federation::types::identity_type::STEWARD,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &agent_k,
+                    "primitive-cs-bad",
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await
+            .unwrap();
+        let mut att = pg_scores_attestation(&steward, &agent_k, &steward, "identity_binding:v1");
+        att.cohort_scope = "global".to_string();
+        let err = backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: att })
+            .await
+            .unwrap_err();
+        match err {
+            crate::federation::Error::CohortScopeRejected { ref cohort_scope } => {
+                assert_eq!(cohort_scope, "global");
+                assert_eq!(err.kind(), "federation_cohort_scope_rejected");
+            }
+            other => panic!("expected CohortScopeRejected, got {other:?}"),
+        }
+        // Rejected before INSERT — no row leaked through.
+        assert!(backend
+            .list_attestations_for(&agent_k)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// v3.9.1 (CIRISPersist#150 Ask 3) — a valid narrow cohort_scope
+    /// (`self`) is admitted and round-trips through the read path.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_put_attestation_accepts_self_cohort_scope() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+        let steward = format!("pg-cs-self-stw-§150-{}", uuid_like());
+        let agent_k = format!("pg-cs-self-agt-§150-{}", uuid_like());
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &steward,
+                    "registry",
+                    crate::federation::types::identity_type::STEWARD,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &agent_k,
+                    "primitive-cs-self",
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await
+            .unwrap();
+        let mut att = pg_scores_attestation(&steward, &agent_k, &steward, "identity_binding:v1");
+        att.cohort_scope = crate::federation::types::cohort_scope::SELF.to_string();
+        backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+        let rows = backend.list_attestations_for(&agent_k).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cohort_scope, "self");
     }
 
     #[tokio::test]

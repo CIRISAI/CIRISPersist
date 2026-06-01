@@ -5,6 +5,27 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.9.1] — 2026-06-01
+
+**CIRISPersist 3.9.1 — `cohort_scope` admission-gate validation: the first enforcement slice on the v3.9.0 schema foundation (CIRISPersist#150 Ask 3).**
+
+v3.9.0 landed the `cohort_scope` column + struct + `is_valid()` predicate as schema foundation, with the admission/read enforcement explicitly deferred to v3.10+. This cut takes the one piece of that enforcement that is **trust-graph-free and self-contained**: validating the producer-side `cohort_scope` value at attestation write time.
+
+### Enforcement
+
+- **`admission::check_cohort_scope`** (NEW, re-exported at `crate::federation::check_cohort_scope`) — rejects any `cohort_scope` outside the closed set `{self, family, community, affiliations, species, biosphere, federation}` via the existing `types::cohort_scope::is_valid` predicate. Notably rejects `global`, which is a CEG §8.1.8 *feed-name* (aggregating `{species, biosphere, federation}`), **never** a wire value — exactly as the V056 migration comment promised ("Producers writing `global` get rejected at the admission gate").
+- **`put_attestation` admission hook (both backends)** — the check runs immediately after the dimension-admission `check()`, BEFORE `persist_row_hash` computation + INSERT, so a rejected row leaves no trace. The V056 `CHECK (cohort_scope IN (...))` constraint remains the defense-in-depth backstop for direct-SQL bypass.
+- **`Error::CohortScopeRejected { cohort_scope }`** (NEW) — typed, machine-readable rejection (`kind() == "federation_cohort_scope_rejected"`), distinct from `InvalidArgument` so consumers can pattern-match the cohort_scope outcome deterministically. Mirrors the `ReservedPrefixEmitterMismatch` / `DimensionRejected` admission-error discipline.
+
+### Tests
+
+- Unit (`admission.rs`): every closed-set value admits; `global` rejects with the pinned `kind()` token; empty / mis-cased / `partnered` (a §4.2.4 peer-policy value, not an envelope value) reject.
+- Integration (both backends): `put_attestation` with `cohort_scope = "global"` → `CohortScopeRejected`, no row persisted; `cohort_scope = "self"` admits and round-trips through `list_attestations_for`.
+
+### What's still v3.10+ (unchanged from 3.9.0)
+
+The caller-vs-scope admission rules (#150 Ask 3 — `self` requires `attesting_key_id == local_key_id`, `family` requires `trust:partnered`/`trust:direct`, …), read-time viewer filtering (Ask 4), the §8.1.8.1 promotion ceremony (Ask 5), the PyO3 surface (Ask 6), and the #153 `holds_bytes` suppression / at-rest DEK cascade for `cohort_scope: self|family` all remain deferred — they need `federation_keys` / trust-graph walks, background tokio tasks, and the consumer-tier wheel surface that don't fit a patch cut. This cut is the value-validation floor those layers build on.
+
 ## [3.9.0] — 2026-05-31
 
 **CIRISPersist 3.9.0 — CEG 0.4 / 0.6 schema foundation: `cohort_scope` column on `federation_attestations` + consent_record + canonical-binding + SLA-watcher state tables (V056).**

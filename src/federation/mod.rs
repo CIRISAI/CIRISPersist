@@ -77,8 +77,8 @@ pub(crate) mod serde_bytes_b64 {
 }
 
 pub use admission::{
-    AttestationLadderTransitionPolicy, DimensionAdmissionPolicy, DimensionRejectionReason,
-    ReservedPrefixRule, ATTESTATION_LADDER_MECHANISMS,
+    check_cohort_scope, AttestationLadderTransitionPolicy, DimensionAdmissionPolicy,
+    DimensionRejectionReason, ReservedPrefixRule, ATTESTATION_LADDER_MECHANISMS,
 };
 pub use blackhole::{BlackholeRecord, BlackholeRules, RETICULUM_IDENTITY_HASH_LEN};
 pub use blobs::{
@@ -910,6 +910,26 @@ pub enum Error {
         threshold: f64,
     },
 
+    /// v3.9.1 (CIRISPersist#150 Ask 3, CEG 0.4 §4.2.4). The submitted
+    /// attestation's `cohort_scope` is outside the closed set
+    /// `{self, family, community, affiliations, species, biosphere,
+    /// federation}` — most commonly `global`, which is a §8.1.8
+    /// feed-name (`{species, biosphere, federation}` aggregate), not a
+    /// wire value. Rejected at admission by
+    /// [`admission::check_cohort_scope`]; the row is not stored.
+    /// Distinct from [`Error::InvalidArgument`] so consumers can
+    /// pattern-match the cohort_scope rejection deterministically. The
+    /// V056 `CHECK (cohort_scope IN (...))` constraint is the
+    /// defense-in-depth backstop for rows that bypass this hook.
+    #[error(
+        "cohort_scope {cohort_scope:?} is not in the closed set \
+         {{self, family, community, affiliations, species, biosphere, federation}}"
+    )]
+    CohortScopeRejected {
+        /// The rejected `cohort_scope` value as submitted.
+        cohort_scope: String,
+    },
+
     /// Backend-level error (DB connection, serialization, etc.).
     /// String-typed because each backend has its own error tree.
     #[error("backend: {0}")]
@@ -945,6 +965,7 @@ impl Error {
                 "federation_hard_remove_with_active_attestations"
             }
             Error::TrustBelowThreshold { .. } => "federation_trust_below_threshold",
+            Error::CohortScopeRejected { .. } => "federation_cohort_scope_rejected",
             Error::Backend(_) => "federation_backend",
         }
     }

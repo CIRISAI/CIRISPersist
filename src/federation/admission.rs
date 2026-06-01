@@ -645,6 +645,42 @@ pub fn envelope_dimension(envelope: &serde_json::Value) -> Option<&str> {
     envelope.get("dimension").and_then(|v| v.as_str())
 }
 
+/// v3.9.1 (CIRISPersist#150 Ask 3, CEG 0.4 §4.2.4) — admission-gate
+/// validation of the producer-side `cohort_scope` field.
+///
+/// Rejects any value outside the closed set
+/// `{self, family, community, affiliations, species, biosphere,
+/// federation}` ([`crate::federation::types::cohort_scope::is_valid`])
+/// BEFORE the row is hashed and inserted, so a malformed envelope —
+/// notably `global`, which is a §8.1.8 *feed-name* aggregating
+/// `{species, biosphere, federation}` and **never** a wire value —
+/// leaves no trace. Returns [`Error::CohortScopeRejected`] on a bad
+/// value; the row is not stored.
+///
+/// This is the trust-graph-free first layer of #150 Ask 3 (the
+/// caller-vs-scope admission rules that need `federation_keys` /
+/// trust-graph walks are deferred to the v3.10+ enforcement cut). It
+/// is the application-layer companion to the V056 `CHECK
+/// (cohort_scope IN (...))` constraint: the constraint is
+/// defense-in-depth for rows that bypass this hook (direct SQL); this
+/// hook produces the machine-readable typed rejection consumers
+/// pattern-match on (`kind() == "federation_cohort_scope_rejected"`).
+///
+/// `self`-tier locality enforcement (a `cohort_scope: self`
+/// attestation MUST NOT emit `holds_bytes` to peers — the
+/// FEDERATION_SCALING_MODEL §9.5 locality dividend) is a separate,
+/// emission-side concern tracked by #153 Ask 5 and is not part of this
+/// value-validation layer.
+pub fn check_cohort_scope(cohort_scope: &str) -> Result<(), Error> {
+    if crate::federation::types::cohort_scope::is_valid(cohort_scope) {
+        Ok(())
+    } else {
+        Err(Error::CohortScopeRejected {
+            cohort_scope: cohort_scope.to_string(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1178,5 +1214,54 @@ mod tests {
             identity_type::WITNESS,
         )
         .unwrap();
+    }
+
+    // ── #150 Ask 3: cohort_scope admission-gate validation ─────────
+
+    #[test]
+    fn cohort_scope_admits_every_closed_set_value() {
+        use crate::federation::types::cohort_scope as cs;
+        for scope in [
+            cs::SELF,
+            cs::FAMILY,
+            cs::COMMUNITY,
+            cs::AFFILIATIONS,
+            cs::SPECIES,
+            cs::BIOSPHERE,
+            cs::FEDERATION,
+        ] {
+            check_cohort_scope(scope)
+                .unwrap_or_else(|e| panic!("closed-set value {scope:?} must admit, got {e:?}"));
+        }
+    }
+
+    #[test]
+    fn cohort_scope_rejects_global_feed_name() {
+        // `global` is a §8.1.8 feed-name (aggregates species/biosphere/
+        // federation), NEVER a wire value — it must be rejected.
+        let err = check_cohort_scope("global").unwrap_err();
+        match err {
+            Error::CohortScopeRejected { ref cohort_scope } => {
+                assert_eq!(cohort_scope, "global");
+                assert_eq!(err.kind(), "federation_cohort_scope_rejected");
+            }
+            other => panic!("expected CohortScopeRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cohort_scope_rejects_garbage_and_empty() {
+        assert!(matches!(
+            check_cohort_scope("").unwrap_err(),
+            Error::CohortScopeRejected { .. }
+        ));
+        assert!(matches!(
+            check_cohort_scope("Self").unwrap_err(),
+            Error::CohortScopeRejected { .. }
+        ));
+        assert!(matches!(
+            check_cohort_scope("partnered").unwrap_err(),
+            Error::CohortScopeRejected { .. }
+        ));
     }
 }
