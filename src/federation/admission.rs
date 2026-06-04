@@ -705,6 +705,59 @@ pub fn check_observed_region(observed_region: &str) -> Result<(), Error> {
     }
 }
 
+/// v3.12.0 (CIRISPersist#153 Ask 1, CEG 0.7 §5.6.8.8) — admission-gate
+/// validation of the producer-side `device_class` field on an
+/// `identity_occurrence` Contribution.
+///
+/// Rejects any value outside the closed set `{phone, laptop, server,
+/// embedded, agent, service}`
+/// ([`crate::federation::types::device_class::is_valid`]) BEFORE the
+/// row is hashed and inserted. Returns [`Error::DeviceClassRejected`]
+/// on a bad value (stable `kind()` token
+/// `federation_device_class_rejected`).
+///
+/// Application-layer companion to the V059 `CHECK (device_class IN
+/// (...))` constraint: the constraint is defense-in-depth for direct-
+/// SQL bypass; this hook produces the typed rejection consumers
+/// pattern-match on.
+pub fn check_device_class(device_class: &str) -> Result<(), Error> {
+    if crate::federation::types::device_class::is_valid(device_class) {
+        Ok(())
+    } else {
+        Err(Error::DeviceClassRejected {
+            device_class: device_class.to_string(),
+        })
+    }
+}
+
+/// v3.12.0 (CIRISPersist#153 Ask 2, CEG 0.7 §5.6.8.9) — admission-gate
+/// validation of the producer-side `consensus_protocol` field on a
+/// `family` Contribution.
+///
+/// `consensus_protocol` is OPEN vocabulary per the spec — operators
+/// MAY extend with their own protocol names. This gate verifies the
+/// string parses into one of the canonical shapes
+/// ([`crate::federation::types::consensus_protocol::is_canonical_form`]):
+/// the three bare forms (`founder_only`, `unanimous`, `majority`), or
+/// one of the three prefixed forms with a non-empty tail
+/// (`quorum:m/n`, `weighted:rubric`, `custom:id`). Returns
+/// [`Error::ConsensusProtocolMalformed`] on a malformed string
+/// (stable `kind()` token `federation_consensus_protocol_malformed`).
+///
+/// **Not** the consensus-protocol enforcement gate — full signature
+/// counting against the named protocol is the v3.13+ admission gate
+/// (#153 Ask 3). This is the value-validation floor that enforcement
+/// composes on top of.
+pub fn check_consensus_protocol_form(consensus_protocol: &str) -> Result<(), Error> {
+    if crate::federation::types::consensus_protocol::is_canonical_form(consensus_protocol) {
+        Ok(())
+    } else {
+        Err(Error::ConsensusProtocolMalformed {
+            consensus_protocol: consensus_protocol.to_string(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

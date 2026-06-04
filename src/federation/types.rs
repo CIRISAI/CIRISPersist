@@ -574,6 +574,197 @@ impl Revocation {
     }
 }
 
+// ─── CEG 0.7 (CIRISPersist#153 Asks 1-2, v3.12.0) ──────────────────
+//
+// §5.6.8.8 identity_occurrence + §5.6.8.9 family substrate types.
+// "Participants that ARE me" (occurrences across my devices/agents)
+// vs "trusted nodes that compose with me" (other people's identities,
+// shared household devices). Wire-format-stable per Registry#47
+// ratified-locked on 2026-05-31.
+
+/// §5.6.8.8 `device_class` closed-set vocabulary.
+///
+/// Every `IdentityOccurrence` row carries a value from this set;
+/// out-of-set producers are rejected at admission
+/// ([`crate::federation::admission::check_device_class`]) and by the
+/// V059 `CHECK` constraint.
+pub mod device_class {
+    /// Mobile device (iOS / Android / etc.); typically hardware-rooted.
+    pub const PHONE: &str = "phone";
+    /// Personal computing device (macOS / Linux / Windows).
+    pub const LAPTOP: &str = "laptop";
+    /// Always-on infrastructure node (home server, VPS, etc.).
+    pub const SERVER: &str = "server";
+    /// IoT / hardware peripheral / signing dongle.
+    pub const EMBEDDED: &str = "embedded";
+    /// An AI agent acting on the identity's behalf (composes with
+    /// CIRISAgent#840 self-attestation pattern).
+    pub const AGENT: &str = "agent";
+    /// Background service / scheduled job / API integration acting
+    /// on the identity's behalf.
+    pub const SERVICE: &str = "service";
+
+    /// True iff `s` is one of the six closed-set values.
+    pub fn is_valid(s: &str) -> bool {
+        matches!(s, PHONE | LAPTOP | SERVER | EMBEDDED | AGENT | SERVICE)
+    }
+
+    /// All six values in spec order.
+    pub const ALL: [&str; 6] = [PHONE, LAPTOP, SERVER, EMBEDDED, AGENT, SERVICE];
+}
+
+/// §5.6.8.9 `consensus_protocol` canonical-kinds vocabulary.
+///
+/// OPEN vocab per the spec — operators MAY extend with their own
+/// protocol names. The substrate's value-validation gate
+/// ([`crate::federation::admission::check_consensus_protocol_form`])
+/// verifies the string matches one of the canonical shapes; full
+/// signature-counting against the protocol is the v3.13+ admission
+/// gate (#153 Ask 3).
+pub mod consensus_protocol {
+    /// Original founders are the sole admission authority.
+    pub const FOUNDER_ONLY: &str = "founder_only";
+    /// Every current member must sign the admission.
+    pub const UNANIMOUS: &str = "unanimous";
+    /// > 50% of current members must sign.
+    pub const MAJORITY: &str = "majority";
+    /// Prefix for `quorum:{m}/{n}` shape (e.g., `quorum:2/3`).
+    pub const QUORUM_PREFIX: &str = "quorum:";
+    /// Prefix for `weighted:{rubric}` shape.
+    pub const WEIGHTED_PREFIX: &str = "weighted:";
+    /// Prefix for `custom:{family_specific_id}` shape.
+    pub const CUSTOM_PREFIX: &str = "custom:";
+
+    /// True iff `s` parses into one of the canonical-kinds shapes:
+    /// the three bare forms (`founder_only`, `unanimous`, `majority`),
+    /// or one of the three prefixed forms with a non-empty tail
+    /// (`quorum:{m}/{n}` where m, n parse as integers; `weighted:rubric`;
+    /// `custom:id`). Returns false for empty strings, unprefixed
+    /// names not in the bare set, and `quorum:` strings whose tail
+    /// is not `{int}/{int}`.
+    pub fn is_canonical_form(s: &str) -> bool {
+        if matches!(s, FOUNDER_ONLY | UNANIMOUS | MAJORITY) {
+            return true;
+        }
+        if let Some(tail) = s.strip_prefix(QUORUM_PREFIX) {
+            // tail must be `{m}/{n}` with both as non-negative ints,
+            // m <= n, n > 0 (a 0-of-0 quorum is meaningless).
+            if let Some((m_s, n_s)) = tail.split_once('/') {
+                if let (Ok(m), Ok(n)) = (m_s.parse::<u32>(), n_s.parse::<u32>()) {
+                    return n > 0 && m <= n;
+                }
+            }
+            return false;
+        }
+        if let Some(tail) = s.strip_prefix(WEIGHTED_PREFIX) {
+            return !tail.is_empty();
+        }
+        if let Some(tail) = s.strip_prefix(CUSTOM_PREFIX) {
+            return !tail.is_empty();
+        }
+        false
+    }
+}
+
+/// `federation_identity_occurrences` row — the §5.6.8.8 wire-format
+/// binding "this `occurrence_key_id` is also `identity_key_id`."
+///
+/// One identity may admit unbounded occurrences (the substrate
+/// carries no hard cap; operator policy MAY impose limits). The
+/// composite primary key `(identity_key_id, occurrence_key_id)`
+/// makes the binding idempotent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IdentityOccurrence {
+    /// The root identity's `federation_keys.key_id`.
+    pub identity_key_id: String,
+    /// The participant's signing key — also a
+    /// `federation_keys.key_id`.
+    pub occurrence_key_id: String,
+    /// Closed-set value per [`device_class`].
+    pub device_class: String,
+    /// Opaque base64 attestation blob (TPM / Secure Enclave /
+    /// StrongBox / SGX / etc.). `None` for software-only occurrences.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware_attestation: Option<String>,
+    /// When the binding was asserted (RFC-3339 canonical per §0.5).
+    pub asserted_at: DateTime<Utc>,
+    /// When the binding expires. `None` = indefinite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<DateTime<Utc>>,
+    /// **Server-computed.** See [`KeyRecord::persist_row_hash`].
+    pub persist_row_hash: String,
+}
+
+/// Wraps an [`IdentityOccurrence`] payload for write submission.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignedIdentityOccurrence {
+    /// The identity-occurrence binding being submitted.
+    pub identity_occurrence: IdentityOccurrence,
+}
+
+/// One member of a [`Family`] — an IDENTITY key plus when they
+/// joined plus an optional role tag.
+///
+/// Note: member entries are IDENTITY keys (NOT occurrence keys), per
+/// the §5.6.8.9 worked example. Shared household devices have their
+/// own identity_keys and join the family as members in their own
+/// right rather than as occurrences of any single person.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FamilyMember {
+    /// The member's `federation_keys.key_id` (identity key, not
+    /// occurrence key).
+    pub key_id: String,
+    /// When the member joined (RFC-3339 canonical per §0.5).
+    pub joined_at: DateTime<Utc>,
+    /// `founder` / `member` / operator-defined. Open vocab.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+}
+
+/// `federation_families` row — the §5.6.8.9 wire-format primitive
+/// "a group of trusted nodes" for `cohort_scope: family` visibility
+/// scoping.
+///
+/// Content scoped `cohort_scope: family` lands in substrate, is
+/// wrapped under the family DEK by the v3.13+ at-rest cascade
+/// (CIRISPersist#152), and is delivered to all current members via
+/// `key_grant` per §5.6.8.4 — but never emits `holds_bytes:sha256:*`
+/// to non-members (the structural-invisibility primitive shipped in
+/// v3.9.2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Family {
+    /// The family's own `federation_keys.key_id`.
+    pub family_key_id: String,
+    /// Human-readable (e.g. `"Acme Household"`); non-unique.
+    pub family_name: String,
+    /// Roster of identity keys + join times + roles. Storage shape
+    /// is `members JSONB` in postgres / `members TEXT (json)` in
+    /// sqlite; consumers normalize via this typed projection.
+    pub members: Vec<FamilyMember>,
+    /// When the family was founded (RFC-3339 canonical per §0.5).
+    pub founded_at: DateTime<Utc>,
+    /// Per [`consensus_protocol::is_canonical_form`]. Open vocab;
+    /// canonical kinds: `founder_only`, `unanimous`, `majority`,
+    /// `quorum:m/n`, `weighted:rubric`, `custom:id`.
+    pub consensus_protocol: String,
+    /// Structural lock per §5.6.8.9: if `true`, the
+    /// `consensus_protocol` field may NOT be amended via the
+    /// protocol's own rules — replacement requires an out-of-band
+    /// ceremony. HUMANITY_ACCORD per §9 is the canonical entrenched
+    /// instance.
+    #[serde(default)]
+    pub consensus_protocol_entrenched: bool,
+    /// **Server-computed.** See [`KeyRecord::persist_row_hash`].
+    pub persist_row_hash: String,
+}
+
+/// Wraps a [`Family`] payload for write submission.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignedFamily {
+    /// The family record being submitted.
+    pub family: Family,
+}
+
 /// One hybrid-pending federation row — minimum fields the sweep
 /// needs to recompute the cold-path bound-signature input. Returned
 /// by [`super::FederationDirectory::list_hybrid_pending_keys`] /

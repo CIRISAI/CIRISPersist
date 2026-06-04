@@ -78,9 +78,9 @@ pub(crate) mod serde_bytes_b64 {
 }
 
 pub use admission::{
-    check_cohort_scope, check_observed_region, AttestationLadderTransitionPolicy,
-    DimensionAdmissionPolicy, DimensionRejectionReason, ReservedPrefixRule,
-    ATTESTATION_LADDER_MECHANISMS,
+    check_cohort_scope, check_consensus_protocol_form, check_device_class, check_observed_region,
+    AttestationLadderTransitionPolicy, DimensionAdmissionPolicy, DimensionRejectionReason,
+    ReservedPrefixRule, ATTESTATION_LADDER_MECHANISMS,
 };
 pub use blackhole::{BlackholeRecord, BlackholeRules, RETICULUM_IDENTITY_HASH_LEN};
 pub use blobs::{
@@ -119,9 +119,10 @@ pub use topology::{
     WithdrawalEntry, MAX_DELEGATION_DEPTH,
 };
 pub use types::{
-    Attestation, HybridPendingRow, KeyRecord, PeerMetadataRow, PeerPolicyBlob, Revocation,
-    SignedAttestation, SignedKeyRecord, SignedRevocation, TrustClass, TrustFilter, TrustGrant,
-    TrustRelationship, TrustRow, TrustType,
+    Attestation, Family, FamilyMember, HybridPendingRow, IdentityOccurrence, KeyRecord,
+    PeerMetadataRow, PeerPolicyBlob, Revocation, SignedAttestation, SignedFamily,
+    SignedIdentityOccurrence, SignedKeyRecord, SignedRevocation, TrustClass, TrustFilter,
+    TrustGrant, TrustRelationship, TrustRow, TrustType,
 };
 
 /// Federation directory trait — the registry/lens/agent's read+write
@@ -291,6 +292,89 @@ pub trait FederationDirectory: Send + Sync {
     /// `effective_at` DESC. Consumers walk this list and apply their
     /// policy ("is K revoked at time T?").
     async fn revocations_for(&self, revoked_key_id: &str) -> Result<Vec<Revocation>, Error>;
+
+    // ── CEG 0.7 identity_occurrence + family (v3.12.0, #153) ───────
+
+    /// v3.12.0 (CIRISPersist#153 Ask 1, CEG 0.7 §5.6.8.8) — admit an
+    /// `identity_occurrence` binding (this `occurrence_key_id` IS
+    /// also `identity_key_id`).
+    ///
+    /// Runs `check_device_class` admission before computing
+    /// `persist_row_hash` and INSERTing. Idempotent on
+    /// `(identity_key_id, occurrence_key_id)` PK collision with
+    /// matching content; errors on collision with differing content.
+    ///
+    /// This cut admits the row on value-validation only. The full
+    /// self-vouch / single-vouch admission per §5.6.8.8
+    /// ("`attesting_key_id == identity_key_id` OR
+    /// `attesting_key_id ∈ current occurrences of identity_key_id`")
+    /// is the v3.13+ admission gate that needs the trust-graph walk.
+    async fn put_identity_occurrence(
+        &self,
+        occurrence: SignedIdentityOccurrence,
+    ) -> Result<(), Error>;
+
+    /// v3.12.0 — list every currently-stored occurrence of
+    /// `identity_key_id`. The DEK-cascade fan-out path
+    /// (#152 v3.13+): when a `cohort_scope: self` Contribution
+    /// lands, substrate wraps the DEK to every row this returns.
+    ///
+    /// Filtering by `valid_until` is **caller-side** — the substrate
+    /// returns every row, expired or not, and consumers walk the list
+    /// applying their freshness policy. Same shape as
+    /// `revocations_for`.
+    async fn list_identity_occurrences_for(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<IdentityOccurrence>, Error>;
+
+    /// v3.12.0 — reverse lookup: which identity does this
+    /// `occurrence_key_id` speak for? Returns `None` if the key is
+    /// not bound as an occurrence.
+    ///
+    /// Use by consumers asking "is this signing key co-self with X?"
+    /// — `lookup_identity_for_occurrence(K)?.identity_key_id == X`.
+    /// Returns the full row so the caller can also see the
+    /// `device_class` / `hardware_attestation` / freshness fields.
+    async fn lookup_identity_for_occurrence(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Option<IdentityOccurrence>, Error>;
+
+    /// v3.12.0 (CIRISPersist#153 Ask 2, CEG 0.7 §5.6.8.9) — admit a
+    /// `family` row.
+    ///
+    /// Runs `check_consensus_protocol_form` admission before computing
+    /// `persist_row_hash` and INSERTing. Idempotent on `family_key_id`
+    /// PK collision with matching content; errors on collision with
+    /// differing content.
+    ///
+    /// This cut admits on value-validation (closed-set CHECK +
+    /// consensus_protocol canonical-form). The full consensus-protocol
+    /// enforcement (signature-counting per the protocol's rule,
+    /// rejection of in-protocol amendment when entrenched, retroactive
+    /// `key_grant` emission on member-add) is the v3.13+ admission
+    /// gate.
+    async fn put_family(&self, family: SignedFamily) -> Result<(), Error>;
+
+    /// v3.12.0 — fetch a single family by `family_key_id`. Returns
+    /// `None` if absent.
+    async fn lookup_family(&self, family_key_id: &str) -> Result<Option<Family>, Error>;
+
+    /// v3.12.0 — list every family that `member_identity_key_id`
+    /// belongs to (the DEK-cascade fan-out path for
+    /// `cohort_scope: family` content + the membership-change-
+    /// ceremony propagation walker).
+    ///
+    /// Scans the `members` JSONB / TEXT field; postgres uses the
+    /// V059 GIN index for O(log N), sqlite falls back to a full scan
+    /// (acceptable for the family-count cardinality the substrate
+    /// expects — a single identity in 10s of families, not 10s of
+    /// thousands).
+    async fn list_families_for_member(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<Family>, Error>;
 
     // ── Cold-path PQC fill-in (writer contract step 4) ─────────────
     //
@@ -971,6 +1055,41 @@ pub enum Error {
         submitted_signed_timestamp: chrono::DateTime<chrono::Utc>,
     },
 
+    /// v3.12.0 (CIRISPersist#153 Ask 1, CEG 0.7 §5.6.8.8). The submitted
+    /// identity_occurrence's `device_class` is outside the closed set
+    /// `{phone, laptop, server, embedded, agent, service}`. Rejected at
+    /// admission by [`admission::check_device_class`]; the row is not
+    /// stored. The V059 `CHECK` constraint is the defense-in-depth
+    /// backstop for direct-SQL bypass.
+    #[error(
+        "device_class {device_class:?} is not in the closed set \
+         {{phone, laptop, server, embedded, agent, service}}"
+    )]
+    DeviceClassRejected {
+        /// The rejected `device_class` value as submitted.
+        device_class: String,
+    },
+
+    /// v3.12.0 (CIRISPersist#153 Ask 2, CEG 0.7 §5.6.8.9). The submitted
+    /// family's `consensus_protocol` does not parse into a canonical
+    /// shape — `founder_only` / `unanimous` / `majority` / `quorum:m/n`
+    /// / `weighted:rubric` / `custom:id`. Rejected at admission by
+    /// [`admission::check_consensus_protocol_form`]; the row is not
+    /// stored.
+    ///
+    /// **NOT** the consensus-protocol enforcement error — full
+    /// signature-counting against the protocol is the v3.13+ admission
+    /// gate, which surfaces a distinct error kind. This is the
+    /// value-validation floor (malformed protocol-string syntax).
+    #[error(
+        "consensus_protocol {consensus_protocol:?} does not parse into a canonical shape \
+         (founder_only / unanimous / majority / quorum:m/n / weighted:rubric / custom:id)"
+    )]
+    ConsensusProtocolMalformed {
+        /// The malformed `consensus_protocol` value as submitted.
+        consensus_protocol: String,
+    },
+
     /// Backend-level error (DB connection, serialization, etc.).
     /// String-typed because each backend has its own error tree.
     #[error("backend: {0}")]
@@ -1009,6 +1128,8 @@ impl Error {
             Error::CohortScopeRejected { .. } => "federation_cohort_scope_rejected",
             Error::RegionRejected { .. } => "federation_region_rejected",
             Error::RevocationRollback { .. } => "federation_revocation_rollback",
+            Error::DeviceClassRejected { .. } => "federation_device_class_rejected",
+            Error::ConsensusProtocolMalformed { .. } => "federation_consensus_protocol_malformed",
             Error::Backend(_) => "federation_backend",
         }
     }

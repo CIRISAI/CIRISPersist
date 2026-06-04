@@ -1812,6 +1812,188 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         rows.into_iter().map(pg_row_to_revocation).collect()
     }
 
+    // ── CEG 0.7 identity_occurrence + family (v3.12.0, #153) ───────
+
+    async fn put_identity_occurrence(
+        &self,
+        occurrence: crate::federation::SignedIdentityOccurrence,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = occurrence.identity_occurrence;
+        crate::federation::check_device_class(&row.device_class)?;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_identity_occurrences (\
+                    identity_key_id, occurrence_key_id, device_class, \
+                    hardware_attestation, asserted_at, valid_until, persist_row_hash\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                &[
+                    &row.identity_key_id,
+                    &row.occurrence_key_id,
+                    &row.device_class,
+                    &row.hardware_attestation,
+                    &row.asserted_at,
+                    &row.valid_until,
+                    &row.persist_row_hash,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("foreign key") {
+                    crate::federation::Error::InvalidArgument(format!(
+                        "FK constraint violated on identity_occurrence insert: {msg}"
+                    ))
+                } else {
+                    crate::federation::Error::Backend(format!("insert identity_occurrence: {msg}"))
+                }
+            })?;
+        Ok(())
+    }
+
+    async fn list_identity_occurrences_for(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<crate::federation::IdentityOccurrence>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT identity_key_id, occurrence_key_id, device_class, \
+                    hardware_attestation, asserted_at, valid_until, persist_row_hash \
+                 FROM cirislens.federation_identity_occurrences \
+                 WHERE identity_key_id = $1 \
+                 ORDER BY occurrence_key_id ASC",
+                &[&identity_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_identity_occurrences_for: {e}"))
+            })?;
+        rows.into_iter()
+            .map(pg_row_to_identity_occurrence)
+            .collect()
+    }
+
+    async fn lookup_identity_for_occurrence(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Option<crate::federation::IdentityOccurrence>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let row_opt = client
+            .query_opt(
+                "SELECT identity_key_id, occurrence_key_id, device_class, \
+                    hardware_attestation, asserted_at, valid_until, persist_row_hash \
+                 FROM cirislens.federation_identity_occurrences \
+                 WHERE occurrence_key_id = $1 LIMIT 1",
+                &[&occurrence_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("lookup_identity_for_occurrence: {e}"))
+            })?;
+        row_opt.map(pg_row_to_identity_occurrence).transpose()
+    }
+
+    async fn put_family(
+        &self,
+        family: crate::federation::SignedFamily,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = family.family;
+        crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let members_value = serde_json::to_value(&row.members)
+            .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_families (\
+                    family_key_id, family_name, members, founded_at, \
+                    consensus_protocol, consensus_protocol_entrenched, persist_row_hash\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                &[
+                    &row.family_key_id,
+                    &row.family_name,
+                    &members_value,
+                    &row.founded_at,
+                    &row.consensus_protocol,
+                    &row.consensus_protocol_entrenched,
+                    &row.persist_row_hash,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("foreign key") {
+                    crate::federation::Error::InvalidArgument(format!(
+                        "FK constraint violated on family insert: {msg}"
+                    ))
+                } else {
+                    crate::federation::Error::Backend(format!("insert family: {msg}"))
+                }
+            })?;
+        Ok(())
+    }
+
+    async fn lookup_family(
+        &self,
+        family_key_id: &str,
+    ) -> Result<Option<crate::federation::Family>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let row_opt = client
+            .query_opt(
+                "SELECT family_key_id, family_name, members, founded_at, \
+                    consensus_protocol, consensus_protocol_entrenched, persist_row_hash \
+                 FROM cirislens.federation_families WHERE family_key_id = $1",
+                &[&family_key_id],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("lookup_family: {e}")))?;
+        row_opt.map(pg_row_to_family).transpose()
+    }
+
+    async fn list_families_for_member(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<crate::federation::Family>, crate::federation::Error> {
+        // Uses the V059 GIN jsonb_path_ops index — the `@>` containment
+        // operator is the matching shape (members @> [{"key_id": "X"}]).
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let containment = serde_json::json!([{ "key_id": member_identity_key_id }]);
+        let rows = client
+            .query(
+                "SELECT family_key_id, family_name, members, founded_at, \
+                    consensus_protocol, consensus_protocol_entrenched, persist_row_hash \
+                 FROM cirislens.federation_families \
+                 WHERE members @> $1 \
+                 ORDER BY family_key_id ASC",
+                &[&containment],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_families_for_member: {e}"))
+            })?;
+        rows.into_iter().map(pg_row_to_family).collect()
+    }
+
     async fn attach_key_pqc_signature(
         &self,
         key_id: &str,
@@ -4874,6 +5056,45 @@ fn pg_row_to_revocation(
         scrub_timestamp: row.safe_get_with("scrub_timestamp", mk_err)?,
         pqc_completed_at: row.safe_get_with("pqc_completed_at", mk_err)?,
         observed_region: row.safe_get_with("observed_region", mk_err)?,
+        persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
+    })
+}
+
+/// v3.12.0 (CIRISPersist#153 Ask 1) — Postgres row →
+/// [`crate::federation::IdentityOccurrence`].
+fn pg_row_to_identity_occurrence(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::IdentityOccurrence, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    Ok(crate::federation::IdentityOccurrence {
+        identity_key_id: row.safe_get_with("identity_key_id", mk_err)?,
+        occurrence_key_id: row.safe_get_with("occurrence_key_id", mk_err)?,
+        device_class: row.safe_get_with("device_class", mk_err)?,
+        hardware_attestation: row.safe_get_with("hardware_attestation", mk_err)?,
+        asserted_at: row.safe_get_with("asserted_at", mk_err)?,
+        valid_until: row.safe_get_with("valid_until", mk_err)?,
+        persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
+    })
+}
+
+/// v3.12.0 (CIRISPersist#153 Ask 2) — Postgres row →
+/// [`crate::federation::Family`]. `members` deserialized from JSONB
+/// via serde.
+fn pg_row_to_family(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::Family, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    let members_value: serde_json::Value = row.safe_get_with("members", mk_err)?;
+    let members: Vec<crate::federation::FamilyMember> = serde_json::from_value(members_value)
+        .map_err(|e| crate::federation::Error::Backend(format!("members deserialize: {e}")))?;
+    Ok(crate::federation::Family {
+        family_key_id: row.safe_get_with("family_key_id", mk_err)?,
+        family_name: row.safe_get_with("family_name", mk_err)?,
+        members,
+        founded_at: row.safe_get_with("founded_at", mk_err)?,
+        consensus_protocol: row.safe_get_with("consensus_protocol", mk_err)?,
+        consensus_protocol_entrenched: row
+            .safe_get_with("consensus_protocol_entrenched", mk_err)?,
         persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
     })
 }

@@ -1591,6 +1591,203 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(format!("revocations_for: {e}")))
     }
 
+    // ── CEG 0.7 identity_occurrence + family (v3.12.0, #153) ───────
+
+    async fn put_identity_occurrence(
+        &self,
+        occurrence: crate::federation::SignedIdentityOccurrence,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = occurrence.identity_occurrence;
+        crate::federation::check_device_class(&row.device_class)?;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO federation_identity_occurrences (\
+                    identity_key_id, occurrence_key_id, device_class, \
+                    hardware_attestation, asserted_at, valid_until, persist_row_hash\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    row.identity_key_id,
+                    row.occurrence_key_id,
+                    row.device_class,
+                    row.hardware_attestation,
+                    row.asserted_at.to_rfc3339(),
+                    row.valid_until.map(|t| t.to_rfc3339()),
+                    row.persist_row_hash,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("FOREIGN KEY") {
+                crate::federation::Error::InvalidArgument(format!(
+                    "FK constraint violated on identity_occurrence insert: {msg}"
+                ))
+            } else {
+                crate::federation::Error::Backend(format!("insert identity_occurrence: {msg}"))
+            }
+        })?;
+        Ok(())
+    }
+
+    async fn list_identity_occurrences_for(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<crate::federation::IdentityOccurrence>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let key = identity_key_id.to_owned();
+        tokio::task::spawn_blocking(
+            move || -> Result<Vec<crate::federation::IdentityOccurrence>, rusqlite::Error> {
+                let conn = conn.blocking_lock();
+                let mut stmt = conn.prepare(
+                    "SELECT identity_key_id, occurrence_key_id, device_class, \
+                        hardware_attestation, asserted_at, valid_until, persist_row_hash \
+                     FROM federation_identity_occurrences \
+                     WHERE identity_key_id = ?1 \
+                     ORDER BY occurrence_key_id ASC",
+                )?;
+                let rows = stmt.query_map([&key], sqlite_row_to_identity_occurrence)?;
+                rows.collect()
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("list_identity_occurrences_for: {e}"))
+        })
+    }
+
+    async fn lookup_identity_for_occurrence(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Option<crate::federation::IdentityOccurrence>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let key = occurrence_key_id.to_owned();
+        tokio::task::spawn_blocking(
+            move || -> Result<Option<crate::federation::IdentityOccurrence>, rusqlite::Error> {
+                let conn = conn.blocking_lock();
+                conn.query_row(
+                    "SELECT identity_key_id, occurrence_key_id, device_class, \
+                        hardware_attestation, asserted_at, valid_until, persist_row_hash \
+                     FROM federation_identity_occurrences \
+                     WHERE occurrence_key_id = ?1 LIMIT 1",
+                    [&key],
+                    sqlite_row_to_identity_occurrence,
+                )
+                .optional()
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("lookup_identity_for_occurrence: {e}"))
+        })
+    }
+
+    async fn put_family(
+        &self,
+        family: crate::federation::SignedFamily,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = family.family;
+        crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let members_json = serde_json::to_string(&row.members)
+            .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO federation_families (\
+                    family_key_id, family_name, members, founded_at, \
+                    consensus_protocol, consensus_protocol_entrenched, persist_row_hash\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    row.family_key_id,
+                    row.family_name,
+                    members_json,
+                    row.founded_at.to_rfc3339(),
+                    row.consensus_protocol,
+                    row.consensus_protocol_entrenched as i64,
+                    row.persist_row_hash,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("FOREIGN KEY") {
+                crate::federation::Error::InvalidArgument(format!(
+                    "FK constraint violated on family insert: {msg}"
+                ))
+            } else {
+                crate::federation::Error::Backend(format!("insert family: {msg}"))
+            }
+        })?;
+        Ok(())
+    }
+
+    async fn lookup_family(
+        &self,
+        family_key_id: &str,
+    ) -> Result<Option<crate::federation::Family>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let key = family_key_id.to_owned();
+        tokio::task::spawn_blocking(
+            move || -> Result<Option<crate::federation::Family>, rusqlite::Error> {
+                let conn = conn.blocking_lock();
+                conn.query_row(
+                    "SELECT family_key_id, family_name, members, founded_at, \
+                        consensus_protocol, consensus_protocol_entrenched, persist_row_hash \
+                     FROM federation_families WHERE family_key_id = ?1",
+                    [&key],
+                    sqlite_row_to_family,
+                )
+                .optional()
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| crate::federation::Error::Backend(format!("lookup_family: {e}")))
+    }
+
+    async fn list_families_for_member(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<crate::federation::Family>, crate::federation::Error> {
+        // sqlite full-scan with members membership check via json_each.
+        // EXISTS subquery against json_each unrolls the array and matches
+        // any entry whose key_id == the target.
+        let conn = self.conn.clone();
+        let key = member_identity_key_id.to_owned();
+        tokio::task::spawn_blocking(
+            move || -> Result<Vec<crate::federation::Family>, rusqlite::Error> {
+                let conn = conn.blocking_lock();
+                let mut stmt = conn.prepare(
+                    "SELECT family_key_id, family_name, members, founded_at, \
+                        consensus_protocol, consensus_protocol_entrenched, persist_row_hash \
+                     FROM federation_families \
+                     WHERE EXISTS ( \
+                         SELECT 1 FROM json_each(federation_families.members) \
+                         WHERE json_extract(value, '$.key_id') = ?1 \
+                     ) \
+                     ORDER BY family_key_id ASC",
+                )?;
+                let rows = stmt.query_map([&key], sqlite_row_to_family)?;
+                rows.collect()
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| crate::federation::Error::Backend(format!("list_families_for_member: {e}")))
+    }
+
     async fn attach_key_pqc_signature(
         &self,
         key_id: &str,
@@ -5092,6 +5289,51 @@ fn sqlite_row_to_revocation(
         scrub_timestamp: parse_rfc3339(&scrub_timestamp),
         pqc_completed_at: pqc_completed_at.as_deref().map(parse_rfc3339),
         observed_region,
+        persist_row_hash: row.get("persist_row_hash")?,
+    })
+}
+
+/// v3.12.0 (CIRISPersist#153 Ask 1) — SQLite row →
+/// [`crate::federation::IdentityOccurrence`].
+fn sqlite_row_to_identity_occurrence(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::IdentityOccurrence> {
+    let asserted_at: String = row.get("asserted_at")?;
+    let valid_until: Option<String> = row.get("valid_until")?;
+    Ok(crate::federation::IdentityOccurrence {
+        identity_key_id: row.get("identity_key_id")?,
+        occurrence_key_id: row.get("occurrence_key_id")?,
+        device_class: row.get("device_class")?,
+        hardware_attestation: row.get("hardware_attestation")?,
+        asserted_at: parse_rfc3339(&asserted_at),
+        valid_until: valid_until.as_deref().map(parse_rfc3339),
+        persist_row_hash: row.get("persist_row_hash")?,
+    })
+}
+
+/// v3.12.0 (CIRISPersist#153 Ask 2) — SQLite row →
+/// [`crate::federation::Family`]. `members` decoded from JSON TEXT
+/// via serde (sqlite's `json_extract` is for individual paths, not
+/// whole-array reconstruction).
+fn sqlite_row_to_family(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::federation::Family> {
+    let members_text: String = row.get("members")?;
+    let members: Vec<crate::federation::FamilyMember> = serde_json::from_str(&members_text)
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            )
+        })?;
+    let founded_at: String = row.get("founded_at")?;
+    let entrenched: i64 = row.get("consensus_protocol_entrenched")?;
+    Ok(crate::federation::Family {
+        family_key_id: row.get("family_key_id")?,
+        family_name: row.get("family_name")?,
+        members,
+        founded_at: parse_rfc3339(&founded_at),
+        consensus_protocol: row.get("consensus_protocol")?,
+        consensus_protocol_entrenched: entrenched != 0,
         persist_row_hash: row.get("persist_row_hash")?,
     })
 }
@@ -9202,6 +9444,273 @@ mod tests {
             revs[0].observed_region,
             crate::federation::verify_coord::region::EU
         );
+    }
+
+    // ─── v3.12.0 CEG 0.7 identity_occurrence + family tests (#153) ─
+
+    fn fed_identity_occurrence(
+        identity_key_id: &str,
+        occurrence_key_id: &str,
+        device_class: &str,
+    ) -> crate::federation::IdentityOccurrence {
+        crate::federation::IdentityOccurrence {
+            identity_key_id: identity_key_id.into(),
+            occurrence_key_id: occurrence_key_id.into(),
+            device_class: device_class.into(),
+            hardware_attestation: None,
+            asserted_at: "2026-06-04T00:00:00Z".parse().unwrap(),
+            valid_until: None,
+            persist_row_hash: String::new(),
+        }
+    }
+
+    fn fed_family(
+        family_key_id: &str,
+        family_name: &str,
+        members: Vec<&str>,
+        consensus_protocol: &str,
+    ) -> crate::federation::Family {
+        crate::federation::Family {
+            family_key_id: family_key_id.into(),
+            family_name: family_name.into(),
+            members: members
+                .into_iter()
+                .map(|k| crate::federation::FamilyMember {
+                    key_id: k.into(),
+                    joined_at: "2026-06-04T00:00:00Z".parse().unwrap(),
+                    role: None,
+                })
+                .collect(),
+            founded_at: "2026-06-04T00:00:00Z".parse().unwrap(),
+            consensus_protocol: consensus_protocol.into(),
+            consensus_protocol_entrenched: false,
+            persist_row_hash: String::new(),
+        }
+    }
+
+    /// Round-trip an identity_occurrence: write → list_for → reverse
+    /// lookup. Covers the column + serde + index plumbing end-to-end.
+    #[tokio::test]
+    async fn identity_occurrence_round_trip() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("alice-root", "alice", "alice-root"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("alice-phone", "alice", "alice-root"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("alice-laptop", "alice", "alice-root"),
+            })
+            .await
+            .unwrap();
+
+        backend
+            .put_identity_occurrence(crate::federation::SignedIdentityOccurrence {
+                identity_occurrence: fed_identity_occurrence(
+                    "alice-root",
+                    "alice-phone",
+                    crate::federation::types::device_class::PHONE,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_identity_occurrence(crate::federation::SignedIdentityOccurrence {
+                identity_occurrence: fed_identity_occurrence(
+                    "alice-root",
+                    "alice-laptop",
+                    crate::federation::types::device_class::LAPTOP,
+                ),
+            })
+            .await
+            .unwrap();
+
+        let occs = backend
+            .list_identity_occurrences_for("alice-root")
+            .await
+            .unwrap();
+        assert_eq!(occs.len(), 2);
+        assert_eq!(occs[0].occurrence_key_id, "alice-laptop"); // lex ASC
+        assert_eq!(occs[1].occurrence_key_id, "alice-phone");
+        for o in &occs {
+            assert_eq!(o.identity_key_id, "alice-root");
+            assert_eq!(o.persist_row_hash.len(), 64);
+        }
+
+        let rev = backend
+            .lookup_identity_for_occurrence("alice-phone")
+            .await
+            .unwrap()
+            .expect("alice-phone is bound");
+        assert_eq!(rev.identity_key_id, "alice-root");
+        assert_eq!(rev.device_class, "phone");
+
+        // Unbound key returns None.
+        let none = backend
+            .lookup_identity_for_occurrence("not-bound")
+            .await
+            .unwrap();
+        assert!(none.is_none());
+    }
+
+    /// device_class outside the closed-set is rejected at admission
+    /// with the typed `DeviceClassRejected` error + stable kind token;
+    /// the row is not stored.
+    #[tokio::test]
+    async fn put_identity_occurrence_rejects_out_of_closed_set_device_class() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("alice-root", "alice", "alice-root"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("alice-watch", "alice", "alice-root"),
+            })
+            .await
+            .unwrap();
+        let bad = fed_identity_occurrence("alice-root", "alice-watch", "wearable");
+        let err = backend
+            .put_identity_occurrence(crate::federation::SignedIdentityOccurrence {
+                identity_occurrence: bad,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_device_class_rejected");
+        assert!(matches!(
+            err,
+            crate::federation::Error::DeviceClassRejected { ref device_class }
+                if device_class == "wearable"
+        ));
+        assert!(backend
+            .list_identity_occurrences_for("alice-root")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Round-trip a family: write → lookup → list_families_for_member.
+    /// Covers JSON members column + GIN/EXISTS membership index path.
+    #[tokio::test]
+    async fn family_round_trip() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in [
+            "acme-household",
+            "alice-root",
+            "bob-root",
+            "roku-livingroom",
+        ] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, "acme", "acme-household"),
+                })
+                .await
+                .unwrap();
+        }
+        backend
+            .put_family(crate::federation::SignedFamily {
+                family: fed_family(
+                    "acme-household",
+                    "Acme Household",
+                    vec!["alice-root", "bob-root", "roku-livingroom"],
+                    crate::federation::types::consensus_protocol::FOUNDER_ONLY,
+                ),
+            })
+            .await
+            .unwrap();
+
+        let got = backend
+            .lookup_family("acme-household")
+            .await
+            .unwrap()
+            .expect("family exists");
+        assert_eq!(got.family_name, "Acme Household");
+        assert_eq!(got.members.len(), 3);
+        assert_eq!(got.consensus_protocol, "founder_only");
+        assert!(!got.consensus_protocol_entrenched);
+        assert_eq!(got.persist_row_hash.len(), 64);
+
+        // Membership index works on both forward (alice) and shared
+        // (roku) key_ids.
+        let alice_families = backend
+            .list_families_for_member("alice-root")
+            .await
+            .unwrap();
+        assert_eq!(alice_families.len(), 1);
+        assert_eq!(alice_families[0].family_key_id, "acme-household");
+
+        let roku_families = backend
+            .list_families_for_member("roku-livingroom")
+            .await
+            .unwrap();
+        assert_eq!(roku_families.len(), 1);
+
+        // Non-member returns empty.
+        let none = backend
+            .list_families_for_member("not-a-member")
+            .await
+            .unwrap();
+        assert!(none.is_empty());
+    }
+
+    /// consensus_protocol that doesn't parse into a canonical shape is
+    /// rejected at admission. Tests the bare-form / quorum:m/n / prefix
+    /// closed-set decision.
+    #[tokio::test]
+    async fn put_family_rejects_malformed_consensus_protocol() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("bad-family", "bad", "bad-family"),
+            })
+            .await
+            .unwrap();
+        for cp in [
+            "",
+            "Founder_Only",   // case-sensitive
+            "quorum:",        // empty tail
+            "quorum:2",       // missing /N
+            "quorum:foo/bar", // non-numeric
+            "quorum:3/2",     // m > n
+            "quorum:0/0",     // n=0
+            "weighted:",      // empty rubric
+            "custom:",        // empty id
+            "raffle",         // unknown bare form
+        ] {
+            let bad = fed_family("bad-family", "bad", vec![], cp);
+            let err = backend
+                .put_family(crate::federation::SignedFamily { family: bad })
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.kind(),
+                "federation_consensus_protocol_malformed",
+                "expected malformed for {cp:?}, got {err:?}"
+            );
+            assert!(backend.lookup_family("bad-family").await.unwrap().is_none());
+        }
+
+        // Canonical quorum:m/n with m<=n and n>0 admits.
+        let good = fed_family("bad-family", "now valid", vec![], "quorum:2/3");
+        backend
+            .put_family(crate::federation::SignedFamily { family: good })
+            .await
+            .unwrap();
+        assert!(backend.lookup_family("bad-family").await.unwrap().is_some());
     }
 
     // ─── Admission-gate tests (v2.4.0, CIRISPersist#102 Ask 3) ──────

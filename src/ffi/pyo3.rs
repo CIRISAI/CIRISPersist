@@ -4237,6 +4237,280 @@ impl PyEngine {
         })
     }
 
+    // ── CEG 0.7 identity_occurrence + family (v3.12.0, #153) ───────
+
+    /// v3.12.0 (CIRISPersist#153 Ask 1, CEG 0.7 §5.6.8.8) — admit an
+    /// `identity_occurrence` binding (this `occurrence_key_id` IS
+    /// also `identity_key_id`).
+    ///
+    /// `payload_json` shape:
+    /// ```json
+    /// {
+    ///   "identity_key_id":      "<key_id>",
+    ///   "occurrence_key_id":    "<key_id>",
+    ///   "device_class":         "phone"|"laptop"|"server"|"embedded"|"agent"|"service",
+    ///   "hardware_attestation": "<b64>|null",
+    ///   "asserted_at":          "<rfc3339>",
+    ///   "valid_until":          "<rfc3339>|null"
+    /// }
+    /// ```
+    fn put_identity_occurrence_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let occurrence: crate::federation::IdentityOccurrence =
+                serde_json::from_str(payload_json).map_err(|e| {
+                    PyValueError::new_err(format!("identity_occurrence decode: {e}"))
+                })?;
+            let signed = crate::federation::SignedIdentityOccurrence {
+                identity_occurrence: occurrence,
+            };
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        backend
+                            .put_identity_occurrence(signed)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        backend
+                            .put_identity_occurrence(signed)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
+    /// v3.12.0 — list every currently-stored occurrence of
+    /// `identity_key_id`. Returns a JSON array of `IdentityOccurrence`
+    /// objects (the shape `put_identity_occurrence_json` writes).
+    fn list_identity_occurrences_for_json(
+        &self,
+        py: Python<'_>,
+        identity_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let identity_key_id = identity_key_id.to_owned();
+            py.detach(move || {
+                let rows: Vec<crate::federation::IdentityOccurrence> = match &self.backend {
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .list_identity_occurrences_for(&identity_key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .list_identity_occurrences_for(&identity_key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&rows).map_err(|e| {
+                    PyValueError::new_err(format!("identity_occurrences serialize: {e}"))
+                })
+            })
+        })
+    }
+
+    /// v3.12.0 — reverse lookup: which identity does this
+    /// `occurrence_key_id` speak for? Returns JSON `IdentityOccurrence`
+    /// object or `None` (null) if the key is not bound.
+    fn lookup_identity_for_occurrence_json(
+        &self,
+        py: Python<'_>,
+        occurrence_key_id: &str,
+    ) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let occurrence_key_id = occurrence_key_id.to_owned();
+            py.detach(move || {
+                let row: Option<crate::federation::IdentityOccurrence> = match &self.backend {
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .lookup_identity_for_occurrence(&occurrence_key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .lookup_identity_for_occurrence(&occurrence_key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                row.map(|r| {
+                    serde_json::to_string(&r).map_err(|e| {
+                        PyValueError::new_err(format!("identity_occurrence serialize: {e}"))
+                    })
+                })
+                .transpose()
+            })
+        })
+    }
+
+    /// v3.12.0 (CIRISPersist#153 Ask 2, CEG 0.7 §5.6.8.9) — admit a
+    /// `family` row.
+    ///
+    /// `payload_json` shape:
+    /// ```json
+    /// {
+    ///   "family_key_id":                "<key_id>",
+    ///   "family_name":                  "Acme Household",
+    ///   "members": [
+    ///     {"key_id": "<id>", "joined_at": "<rfc3339>", "role": "founder"}
+    ///   ],
+    ///   "founded_at":                   "<rfc3339>",
+    ///   "consensus_protocol":           "founder_only"|"unanimous"|"majority"|
+    ///                                   "quorum:m/n"|"weighted:rubric"|"custom:id",
+    ///   "consensus_protocol_entrenched": false
+    /// }
+    /// ```
+    fn put_family_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let family: crate::federation::Family = serde_json::from_str(payload_json)
+                .map_err(|e| PyValueError::new_err(format!("family decode: {e}")))?;
+            let signed = crate::federation::SignedFamily { family };
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        backend
+                            .put_family(signed)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        backend
+                            .put_family(signed)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
+    /// v3.12.0 — fetch a single family by `family_key_id`. Returns
+    /// JSON `Family` object or `None` (null).
+    fn lookup_family_json(&self, py: Python<'_>, family_key_id: &str) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let family_key_id = family_key_id.to_owned();
+            py.detach(move || {
+                let row: Option<crate::federation::Family> = match &self.backend {
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .lookup_family(&family_key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .lookup_family(&family_key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                row.map(|r| {
+                    serde_json::to_string(&r)
+                        .map_err(|e| PyValueError::new_err(format!("family serialize: {e}")))
+                })
+                .transpose()
+            })
+        })
+    }
+
+    /// v3.12.0 — list every family that `member_identity_key_id` belongs
+    /// to. Returns JSON array of `Family` objects.
+    fn list_families_for_member_json(
+        &self,
+        py: Python<'_>,
+        member_identity_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let member_identity_key_id = member_identity_key_id.to_owned();
+            py.detach(move || {
+                let rows: Vec<crate::federation::Family> = match &self.backend {
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .list_families_for_member(&member_identity_key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .list_families_for_member(&member_identity_key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&rows)
+                    .map_err(|e| PyValueError::new_err(format!("families serialize: {e}")))
+            })
+        })
+    }
+
     /// Federation blob storage: read a blob by SHA-256 (hex).
     ///
     /// Returns `None` when no row exists; otherwise a JSON string of
@@ -16939,6 +17213,13 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // rejections are caller-fault malformed-content; ValueError (4xx).
         crate::federation::Error::RegionRejected { .. }
         | crate::federation::Error::RevocationRollback { .. } => PyValueError::new_err(kind),
+        // v3.12.0 (CIRISPersist#153 Asks 1-2) — CEG 0.7
+        // identity_occurrence + family admission rejections are
+        // caller-fault malformed-content; ValueError (4xx).
+        crate::federation::Error::DeviceClassRejected { .. }
+        | crate::federation::Error::ConsensusProtocolMalformed { .. } => {
+            PyValueError::new_err(kind)
+        }
         // v2.5.0 (CIRISPersist#102 Ask 4 + Ask 8) — all the new
         // admission-hook rejections are caller-fault malformed-
         // content; ValueError (4xx).

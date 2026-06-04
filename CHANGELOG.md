@@ -5,6 +5,85 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.12.0] — 2026-06-04
+
+**CIRISPersist 3.12.0 — CEG 0.7 §5.6.8.8 + §5.6.8.9 identity_occurrence + family substrate foundation (CIRISPersist#153 Asks 1-2).**
+
+Lands the **structural primitives** that distinguish *"participants that ARE me"* (identity_occurrence — my devices and agents) from *"trusted nodes that compose with me"* (family — other people's identities + shared household devices). The cewp structural-invisibility claim *"self/family content can't carry on the wire in the first place"* becomes substrate-enforceable: once #152 (at-rest DEK cascade, v3.13+) lands on top of this foundation, `cohort_scope: self | family` content will be wrapped under per-occurrence / per-family DEKs and delivered to all currently-admitted members — but never emit `holds_bytes:sha256:*` to non-members (the v3.9.2 structural-invisibility primitive is now load-bearing for these tables).
+
+### What landed
+
+**Schema (V059, both backends)**:
+- `federation_identity_occurrences` table — composite PK `(identity_key_id, occurrence_key_id)`; closed-set `device_class CHECK IN ('phone', 'laptop', 'server', 'embedded', 'agent', 'service')`; opaque `hardware_attestation` blob (TPM / Secure Enclave / StrongBox / SGX / etc., consumer-side parsed); `valid_until` for indefinite vs time-bounded bindings.
+- `federation_families` table — `family_key_id PK`; `members JSONB` / `members TEXT (json1)` array of `{key_id, joined_at, role}` entries; open-vocab `consensus_protocol` TEXT validated against the spec's canonical forms at admission; `consensus_protocol_entrenched BOOLEAN` structural lock.
+- Postgres GIN `jsonb_path_ops` index on `members` for O(log N) "which families is identity X a member of?" lookups via `members @> '[{"key_id": "X"}]'`. SQLite uses an `EXISTS / json_each` scan — acceptable for the family-count cardinality the substrate expects.
+- Partial indexes on the entrenched-protocol subset (the §9 HUMANITY_ACCORD-style lookup, a tiny set in practice).
+
+**Rust types**:
+- `IdentityOccurrence`, `Family`, `FamilyMember`, `SignedIdentityOccurrence`, `SignedFamily` — full serde round-trip with `persist_row_hash` integration.
+- `crate::federation::types::device_class` module — closed-set constants (`PHONE`, `LAPTOP`, `SERVER`, `EMBEDDED`, `AGENT`, `SERVICE`) + `is_valid()` predicate + `ALL` array.
+- `crate::federation::types::consensus_protocol` module — bare forms (`FOUNDER_ONLY`, `UNANIMOUS`, `MAJORITY`) + prefix constants (`QUORUM_PREFIX`, `WEIGHTED_PREFIX`, `CUSTOM_PREFIX`) + `is_canonical_form()` predicate that parses each shape: bare forms via direct match; `quorum:m/n` requires both integers + `m <= n` + `n > 0`; `weighted:rubric` / `custom:id` require non-empty tails.
+
+**Admission gates (value-validation tier)**:
+- `check_device_class(&str)` → `Error::DeviceClassRejected { device_class }` (kind `federation_device_class_rejected`)
+- `check_consensus_protocol_form(&str)` → `Error::ConsensusProtocolMalformed { consensus_protocol }` (kind `federation_consensus_protocol_malformed`)
+- Both run BEFORE `persist_row_hash` + INSERT; same discipline as v3.9.1 `cohort_scope` admission. V059 CHECK constraints are the defense-in-depth backstops for direct-SQL bypass.
+
+**`FederationDirectory` trait extension** (memory + sqlite + postgres):
+- `put_identity_occurrence(SignedIdentityOccurrence)`
+- `list_identity_occurrences_for(&identity_key_id) → Vec<IdentityOccurrence>`
+- `lookup_identity_for_occurrence(&occurrence_key_id) → Option<IdentityOccurrence>` (reverse: "is this signing key co-self with X?")
+- `put_family(SignedFamily)`
+- `lookup_family(&family_key_id) → Option<Family>`
+- `list_families_for_member(&member_identity_key_id) → Vec<Family>`
+
+**PyO3 wheel surface (if it ain't on the FFI, it doesn't exist)**:
+- `put_identity_occurrence_json(payload_json)` / `list_identity_occurrences_for_json(identity_key_id)` / `lookup_identity_for_occurrence_json(occurrence_key_id)`
+- `put_family_json(payload_json)` / `lookup_family_json(family_key_id)` / `list_families_for_member_json(member_identity_key_id)`
+- All six methods return / accept JSON (the wheel-surface convention persist standardized in v3.8.0).
+
+### Worked example (paraphrasing the §5.6.8.9 spec walkthrough)
+
+```
+alice_root_key              ─┐
+  occurrences (§5.6.8.8):    │ Each occurrence is an
+  - alice_phone (phone)      │ identity_occurrence of
+  - alice_laptop (laptop)    │ alice_root_key. Self content
+  - alice_agent (agent)      │ reaches all of these via #152
+  - alice_homeserver (server)┘ at-rest DEK cascade (v3.13+).
+
+acme-household family (§5.6.8.9):
+  members: [
+    alice_root_key (founder),    ─┐ Member entries are IDENTITY
+    bob_root_key   (founder),     │ keys (NOT occurrence keys).
+    roku_livingroom (member),     │ Bob has his own self-collective;
+    kitchen_tablet (member),      │ shared household devices have
+    nest_thermostat (member),    ─┘ their own identity_keys.
+  ]
+  consensus_protocol: "founder_only"
+  consensus_protocol_entrenched: false
+```
+
+### What this substrate enables (v3.13+)
+
+- **#152 at-rest DEK cascade**: wrap content DEKs to all currently-admitted occurrences + family members when content lands at `cohort_scope: self | family`. The substrate now has the structural primitives the cascade walks.
+- **#150 caller-vs-scope trust-graph admission** (the deferred slice from v3.9.1): `cohort_scope: self` writes admit when `attesting_key_id` is an `identity_occurrence` of the local key; `cohort_scope: family` writes admit per the family's `consensus_protocol` — both gated on the new tables.
+- **#146 Ask 2 broadened withdraws admission** (4-rule gate): the canonical-binding rule (rule 4) reads from the new `federation_identity_occurrences` table to admit subject-side revocations from any of the subject's occurrences.
+
+### What's still v3.13+ (intentionally out of scope for this cut)
+
+- **Full self-vouch / single-vouch admission per §5.6.8.8** (attesting_key_id == identity_key_id OR ∈ current occurrences): needs the trust-graph walk against `list_identity_occurrences_for`.
+- **Consensus-protocol signature-counting enforcement per §5.6.8.9**: counts signatures against the proposed family Contribution per the `consensus_protocol` rule (founder_only / unanimous / majority / quorum:m/n / weighted:rubric / custom:id); rejects in-protocol amendment of `consensus_protocol` when `consensus_protocol_entrenched == true`.
+- **Retroactive `key_grant` emission** on member-add (§5.6.8.9 ceremony step 3): substrate emits one `key_grant` per existing `cohort_scope: family` Contribution to the new member's `subject_key_ids`. Composes with #152.
+- **`hard_case:identity_occurrence_added` / `hard_case:family_membership_change` substrate emissions** per §7.2: gated on the admission gates above.
+
+### Tests
+
+- 4 new sqlite integration tests (`identity_occurrence_round_trip`, `put_identity_occurrence_rejects_out_of_closed_set_device_class`, `family_round_trip`, `put_family_rejects_malformed_consensus_protocol` — the last covering all 10 malformed-form rejections + the `quorum:2/3` canonical admit).
+- 563/563 sqlite lib tests green (+4 from v3.11.0).
+- `--features pyo3` + `--features sqlite` + `--features postgres,server,pyo3,cirisaudit` all compile clean.
+- Clippy clean across sqlite + pyo3.
+
 ## [3.11.0] — 2026-06-04
 
 **CIRISPersist 3.11.0 — verify-coord R1+Q1 substrate (CIRISPersist#143; CIRISVerify FEDERATION_THREAT_MODEL §3.3.2, ratified v1.1, audited v1.2 at 51da15f).**

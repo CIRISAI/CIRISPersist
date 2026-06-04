@@ -85,6 +85,15 @@ struct State {
     /// PG/SQLite shape so behavioral parity tests pass against any
     /// backend.
     blackhole_rules: HashMap<Vec<u8>, crate::federation::BlackholeRecord>,
+    /// v3.12.0 (CIRISPersist#153 Ask 1, CEG 0.7 §5.6.8.8) —
+    /// identity_occurrence bindings keyed by
+    /// `(identity_key_id, occurrence_key_id)`. Memory backend mirrors
+    /// the V059 PG/SQLite composite-PK shape.
+    federation_identity_occurrences:
+        HashMap<(String, String), crate::federation::IdentityOccurrence>,
+    /// v3.12.0 (CIRISPersist#153 Ask 2, CEG 0.7 §5.6.8.9) — family
+    /// rows keyed by `family_key_id`. Mirrors V059 PG/SQLite PK.
+    federation_families: HashMap<String, crate::federation::Family>,
 }
 
 impl Default for MemoryBackend {
@@ -102,6 +111,8 @@ impl Default for MemoryBackend {
                 outbound_queue: HashMap::new(),
                 federation_goals: HashMap::new(),
                 federation_peer_metadata: HashMap::new(),
+                federation_identity_occurrences: HashMap::new(),
+                federation_families: HashMap::new(),
                 blackhole_rules: HashMap::new(),
             }),
         }
@@ -578,6 +589,109 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .collect();
         // Match postgres ORDER BY effective_at DESC.
         rows.sort_by_key(|a| std::cmp::Reverse(a.effective_at));
+        Ok(rows)
+    }
+
+    // ── CEG 0.7 identity_occurrence + family (v3.12.0, #153) ───────
+
+    async fn put_identity_occurrence(
+        &self,
+        occurrence: crate::federation::SignedIdentityOccurrence,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = occurrence.identity_occurrence;
+        // v3.12.0 — value-validation admission (closed-set
+        // device_class). Trust-graph admission per §5.6.8.8 is v3.13+.
+        crate::federation::check_device_class(&row.device_class)?;
+        let mut state = self.state.lock().expect("memory backend lock");
+        if !state.federation_keys.contains_key(&row.identity_key_id) {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "identity_key_id {} does not exist in federation_keys",
+                row.identity_key_id
+            )));
+        }
+        if !state.federation_keys.contains_key(&row.occurrence_key_id) {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "occurrence_key_id {} does not exist in federation_keys",
+                row.occurrence_key_id
+            )));
+        }
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        state.federation_identity_occurrences.insert(
+            (row.identity_key_id.clone(), row.occurrence_key_id.clone()),
+            row,
+        );
+        Ok(())
+    }
+
+    async fn list_identity_occurrences_for(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<crate::federation::IdentityOccurrence>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_identity_occurrences
+            .values()
+            .filter(|o| o.identity_key_id == identity_key_id)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.occurrence_key_id.cmp(&b.occurrence_key_id));
+        Ok(rows)
+    }
+
+    async fn lookup_identity_for_occurrence(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Option<crate::federation::IdentityOccurrence>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(state
+            .federation_identity_occurrences
+            .values()
+            .find(|o| o.occurrence_key_id == occurrence_key_id)
+            .cloned())
+    }
+
+    async fn put_family(
+        &self,
+        family: crate::federation::SignedFamily,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = family.family;
+        // v3.12.0 — value-validation admission (consensus_protocol
+        // canonical form). Full signature-counting enforcement is v3.13+.
+        crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
+        let mut state = self.state.lock().expect("memory backend lock");
+        if !state.federation_keys.contains_key(&row.family_key_id) {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "family_key_id {} does not exist in federation_keys",
+                row.family_key_id
+            )));
+        }
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        state
+            .federation_families
+            .insert(row.family_key_id.clone(), row);
+        Ok(())
+    }
+
+    async fn lookup_family(
+        &self,
+        family_key_id: &str,
+    ) -> Result<Option<crate::federation::Family>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(state.federation_families.get(family_key_id).cloned())
+    }
+
+    async fn list_families_for_member(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<crate::federation::Family>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_families
+            .values()
+            .filter(|f| f.members.iter().any(|m| m.key_id == member_identity_key_id))
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.family_key_id.cmp(&b.family_key_id));
         Ok(rows)
     }
 
