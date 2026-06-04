@@ -5,6 +5,22 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.12.1] — 2026-06-04
+
+**Hotfix: V059 postgres partial-index predicate referenced `NOW()`, which is STABLE not IMMUTABLE — postgres rejected the index definition with sqlstate 42P17 (`invalid_object_definition`).**
+
+The V059 reverse-lookup partial index on `federation_identity_occurrences (occurrence_key_id)` was `WHERE valid_until IS NULL OR valid_until > NOW()`. Postgres requires partial-index predicates to reference only IMMUTABLE functions — `NOW()` is STABLE (it changes per transaction), so the migration failed at apply time. Local sqlite tests passed because sqlite's V059 already used the correct shape (only `WHERE valid_until IS NULL`); the CI postgres test target (cirisaudit / secrets / core / cirisnode / cirisgraph / telemetry feature axes) caught the divergence.
+
+### Fix
+
+Postgres V059 now uses the same dual-index shape as sqlite — one partial `WHERE valid_until IS NULL` for the common indefinite-binding case + one full-rows index for expired-row lookups. No application code change; no Rust changes; no migration version bump needed beyond v3.12.1 as a hotfix.
+
+### Tests
+
+- 563/563 sqlite lib tests green (unchanged — sqlite was always correct).
+- Postgres test target now applies V059 cleanly.
+- `--features postgres,server,pyo3,cirisaudit` compiles clean.
+
 ## [3.12.0] — 2026-06-04
 
 **CIRISPersist 3.12.0 — CEG 0.7 §5.6.8.8 + §5.6.8.9 identity_occurrence + family substrate foundation (CIRISPersist#153 Asks 1-2).**

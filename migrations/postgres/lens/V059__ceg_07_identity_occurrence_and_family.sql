@@ -64,11 +64,19 @@ CREATE INDEX IF NOT EXISTS federation_identity_occurrences_by_identity
     ON cirislens.federation_identity_occurrences (identity_key_id);
 
 -- Reverse lookup: "which identity does this occurrence speak for?"
--- (the consumer's "is this key co-self with X?" check). Partial on
--- live (non-expired) rows so the index covers the hot path.
-CREATE INDEX IF NOT EXISTS federation_identity_occurrences_by_occurrence
+-- (the consumer's "is this key co-self with X?" check). Postgres
+-- partial-index predicates MUST only reference IMMUTABLE functions —
+-- `NOW()` is STABLE not IMMUTABLE, so the index definition with
+-- `OR valid_until > NOW()` was rejected (sqlstate 42P17). The
+-- partial covers the common case (indefinite occurrence) and the
+-- companion all-rows index below handles expired-row lookups —
+-- matching the sqlite V059 shape exactly.
+CREATE INDEX IF NOT EXISTS federation_identity_occurrences_by_occurrence_live
     ON cirislens.federation_identity_occurrences (occurrence_key_id)
-    WHERE valid_until IS NULL OR valid_until > NOW();
+    WHERE valid_until IS NULL;
+
+CREATE INDEX IF NOT EXISTS federation_identity_occurrences_by_occurrence_all
+    ON cirislens.federation_identity_occurrences (occurrence_key_id);
 
 -- ─── §5.6.8.9 federation_families ──────────────────────────────────
 --
