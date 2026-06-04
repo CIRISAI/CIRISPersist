@@ -14,6 +14,18 @@
 //! Phase 2: swift-bridge (iOS) + uniffi (Android).
 //! Phase 3: optional uniffi unification.
 
+// v3.13.0 (CIRISPersist#157) — ABI-stable async-executor capsule.
+// C-ABI vtable + opaque data; consumer cohabitating wheels (edge,
+// nodecore, lenscore) get an executor handle that dispatches through
+// persist's tokio regardless of which crate's tokio called. Closes
+// the cross-tokio aliasing class behind CIRISEdge#58 / CIRISPersist#156.
+//
+// Available without the `pyo3` feature so non-Python consumers (Rust
+// binaries linking persist as an rlib) can also use the capsule shape
+// — though the only current packaging surface is the PyCapsule on
+// PyEngine in src/ffi/pyo3.rs.
+pub mod executor_capsule;
+
 #[cfg(feature = "pyo3")]
 pub mod pyo3;
 

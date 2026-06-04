@@ -16322,6 +16322,27 @@ impl PyEngine {
     /// ```
     ///
     /// Name tag: `ciris_persist::runtime_handle`.
+    ///
+    /// # Deprecation (v3.13.0, CIRISPersist#157)
+    ///
+    /// This surface is structurally unsound under cdylib cohabitation
+    /// — `tokio::runtime::Handle` carries dispatch tables from
+    /// whichever tokio crate compiled it, and a `Handle` produced
+    /// inside `ciris_persist.abi3.so`'s tokio crate, when invoked
+    /// from a consumer's cohabiting wheel that statically linked a
+    /// different tokio, can deadlock or panic depending on whose
+    /// per-thread current-runtime context was set last. CIRISEdge#58
+    /// / CIRISPersist#156 were the user-facing symptoms. Same class
+    /// as the libsqlite3 SIGSEGV at CIRISPersist#141.
+    ///
+    /// New consumers SHOULD migrate to
+    /// [`Self::executor_capsule_py`] — an ABI-stable C-vtable surface
+    /// whose function pointers live inside persist's `.so`, so
+    /// `spawn(...)` always dispatches through persist's tokio
+    /// regardless of which crate's tokio the caller compiled
+    /// against. Existing consumers continue to work at v3.13.x; a
+    /// future major version removes this method (tracked at
+    /// CIRISPersist#157 T9).
     #[pyo3(name = "runtime_handle_capsule")]
     fn runtime_handle_capsule_py<'py>(
         &self,
@@ -16332,6 +16353,100 @@ impl PyEngine {
             .expect("static name has no NUL bytes");
         pyo3::types::PyCapsule::new(py, handle, Some(name))
             .map_err(|e| PyErr::new::<LensQueryError, _>(format!("runtime_handle_capsule: {e}")))
+    }
+
+    /// v3.13.0 (CIRISPersist#157) — ABI-stable async-executor capsule.
+    ///
+    /// Returns a `PyCapsule` wrapping a
+    /// [`crate::ffi::executor_capsule::AsyncExecutor`] backed by
+    /// persist's own tokio runtime. The capsule's vtable function
+    /// pointers live inside `ciris_persist.abi3.so`; the consumer
+    /// invokes `vtable.spawn(data, task)` from its own code, control
+    /// transfers into persist's `.so`, and the spawn lands on
+    /// persist's tokio's worker pool. Worker thread-local tokio
+    /// context = persist's tokio throughout the future's lifetime.
+    ///
+    /// **Replaces** [`Self::runtime_handle_capsule_py`] — the
+    /// pre-#157 surface that handed out a `tokio::runtime::Handle`,
+    /// which is NOT cross-cdylib safe (Handle's `spawn` dispatch
+    /// resolves to the caller's tokio crate, not persist's). See the
+    /// deprecation note on `runtime_handle_capsule` for the failure
+    /// mode and CIRISEdge#58 / CIRISPersist#156 for the
+    /// reproduction.
+    ///
+    /// # Consumer pattern (CIRISEdge `run_async`)
+    ///
+    /// ```ignore
+    /// use ciris_persist::ffi::executor_capsule::{
+    ///     AsyncExecutor, ASYNC_EXECUTOR_ABI_VERSION, TaskOpaque,
+    /// };
+    /// use std::ffi::CStr;
+    /// use std::pin::Pin;
+    /// use std::sync::mpsc;
+    ///
+    /// // Receive + ABI-version check.
+    /// let cap: Bound<PyCapsule> = engine
+    ///     .call_method0("executor_capsule")?
+    ///     .downcast_into()?;
+    /// // SAFETY: persist v3.13.0+'s executor_capsule wraps
+    /// // `AsyncExecutor` with name tag
+    /// // `ciris_persist::executor_capsule_v1`.
+    /// let exec: &AsyncExecutor = unsafe {
+    ///     cap.pointer_checked(Some(c"ciris_persist::executor_capsule_v1"))?
+    ///         .cast()
+    ///         .as_ref()
+    /// };
+    /// assert_eq!(exec.vtable.abi_version, ASYNC_EXECUTOR_ABI_VERSION);
+    ///
+    /// // Spawn an async block. The block uses ONLY persist's API +
+    /// // std primitives (mpsc channel for result delivery). No
+    /// // consumer-side tokio primitives — those would resolve to
+    /// // the consumer's tokio thread-local, which is unset on
+    /// // persist's worker threads.
+    /// let (tx, rx) = mpsc::channel::<u64>();
+    /// type BoxedFut = Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
+    /// let fut: BoxedFut = Box::pin(async move {
+    ///     // ... persist API calls that return a result T ...
+    ///     let _ = tx.send(42);
+    /// });
+    /// let wrapped: Box<BoxedFut> = Box::new(fut);
+    /// let task_ptr = Box::into_raw(wrapped) as *mut TaskOpaque;
+    /// unsafe { (exec.vtable.spawn)(exec.data, task_ptr) };
+    ///
+    /// // Block on the std::sync::mpsc channel (no async involved
+    /// // on this side of the bridge).
+    /// let result = rx.recv_timeout(Duration::from_secs(5))?;
+    /// ```
+    ///
+    /// # ABI version
+    ///
+    /// `vtable.abi_version` is `1` at v3.13.0. Consumers MUST verify
+    /// the version matches their compile-time
+    /// [`ASYNC_EXECUTOR_ABI_VERSION`](crate::ffi::executor_capsule::ASYNC_EXECUTOR_ABI_VERSION).
+    /// Persist bumps the constant on any breaking change to the
+    /// vtable layout.
+    ///
+    /// # Lifetime
+    ///
+    /// The capsule holds an `Arc<tokio::runtime::Runtime>` clone of
+    /// persist's engine runtime. Capsule outliving / outlasted by
+    /// `PyEngine` are both fine; the runtime stays alive as long as
+    /// either holds an Arc. The capsule's destructor (Python GC)
+    /// invokes the vtable's `drop` function, which decrements
+    /// persist's Arc — if it was the last one, the runtime shuts
+    /// down on the persist side.
+    ///
+    /// Name tag: `ciris_persist::executor_capsule_v1`.
+    #[pyo3(name = "executor_capsule")]
+    fn executor_capsule_py<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyCapsule>> {
+        // Delegate to the executor_capsule module — the unsafe
+        // PyCapsule::new_with_destructor lives there, scoped under
+        // that module's `#![allow(unsafe_code)]` for FFI surfaces.
+        crate::ffi::executor_capsule::build_capsule_with_destructor(py, self.runtime.clone())
+            .map_err(|e| PyErr::new::<LensQueryError, _>(format!("executor_capsule: {e}")))
     }
 
     /// v2.11.0 (CIRISPersist#115) — cross-module accessor for the blob
@@ -19713,7 +19828,7 @@ fn ciris_persist(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 /// hook since process start. Returns 0 if the hook was never armed
 /// (env var unset) or if no panics have fired.
 #[cfg(feature = "debug-tools")]
-#[pyo3::pyfunction]
+#[pyfunction]
 fn panic_count() -> u64 {
     crate::debug::PANIC_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -19725,7 +19840,7 @@ fn panic_count() -> u64 {
 /// Returns `True` if the hook is active, `False` if the env var was
 /// absent at call time.
 #[cfg(feature = "debug-tools")]
-#[pyo3::pyfunction]
+#[pyfunction]
 fn install_panic_logger() -> bool {
     crate::debug::install_panic_logger()
 }

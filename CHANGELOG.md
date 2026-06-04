@@ -5,6 +5,70 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.13.0] — 2026-06-04
+
+**CIRISPersist 3.13.0 — ABI-stable `executor_capsule` (CIRISPersist#157 T1+T2, closes the cross-tokio aliasing class behind CIRISEdge#58 / CIRISPersist#156 residual deadlock).**
+
+Replaces the structurally-unsound `runtime_handle_capsule` (which hands out `tokio::runtime::Handle` — a Rust type whose dispatch resolves to the **caller's** tokio crate, not persist's) with a C-ABI vtable surface whose function pointers live inside `ciris_persist.abi3.so`. When the consumer calls `vtable.spawn(...)`, control transfers into persist's `.so` and the spawn lands on persist's tokio worker pool — the only tokio that knows the runtime exists.
+
+Same structural class as CIRISPersist#141 (libsqlite3 cross-cdylib SIGSEGV); different primitive, same root cause: a stateful crate duplicated across the static-vs-wheel boundary with a value of that crate's type passed through the FFI.
+
+### What's new
+
+**`src/ffi/executor_capsule.rs`** (NEW, ~330 LOC):
+- `AsyncExecutor` (`#[repr(C)]` — `data: *mut c_void` + `vtable: &'static AsyncExecutorVTable`)
+- `AsyncExecutorVTable` (`#[repr(C)]` — `abi_version: u32`, `_reserved: u32`, `spawn`/`drop` `unsafe extern "C" fn`s)
+- `TaskOpaque` — type-erased thin pointer to `Box<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>`
+- `ASYNC_EXECUTOR_ABI_VERSION = 1` — consumers MUST verify at capsule-receive time
+- `PERSIST_EXECUTOR_VTABLE` — the canonical vtable instance whose spawn impl calls `persist's tokio::runtime::Runtime::spawn`
+- `build_persist_executor(runtime)` — Rust-side constructor
+- `build_capsule_with_destructor(py, runtime)` — Python-side packager (PyCapsule with vtable-routed GC destructor)
+
+**PyO3 surface**:
+- `PyEngine.executor_capsule()` — returns `PyCapsule` with name tag `ciris_persist::executor_capsule_v1`
+- `PyEngine.runtime_handle_capsule()` — deprecated, kept for v3.13.x; removal scheduled at next persist major (#157 T9)
+
+**Contract documented in module docs**:
+- Capsule round-trip is safe across the cdylib boundary; the vtable function pointers always dispatch to persist's tokio
+- The spawned future MUST NOT call the consumer crate's own tokio primitives (`tokio::time::sleep`, `tokio::sync::Notify`, etc.) — those resolve to the consumer's thread-local current-runtime, which is unset on persist's worker threads → panic
+- Either use persist's public API (which uses persist's tokio internally) or pure `std::*` primitives (mpsc channels are the canonical result-delivery pattern)
+- Lifetime: capsule holds an `Arc<Runtime>` clone; outliving / outlasted by `PyEngine` are both fine; GC calls `vtable.drop` which decrements
+
+### Tests
+
+- 4 new unit tests in `src/ffi/executor_capsule`:
+  - `abi_version_pinned_at_1` — version constant pinned
+  - `vtable_layout_is_c_repr` — `abi_version` field is at offset 0 (consumers read it via `&'static AsyncExecutorVTable`)
+  - `spawn_drop_round_trip_via_vtable` — current-thread runtime end-to-end
+  - `spawn_via_multi_thread_runtime_actually_runs` — multi-thread runtime + spawn-through-vtable + receive on `std::sync::mpsc` (the canonical CIRISEdge `run_async` pattern)
+- 569/569 sqlite lib tests green (+4 from v3.12.2). Clippy clean across sqlite + pyo3 + debug-tools axes.
+
+### Consumer migration path (CIRISEdge#59 T4)
+
+```rust
+// Receive + ABI-version check.
+let cap: Bound<PyCapsule> = engine.call_method0("executor_capsule")?.downcast_into()?;
+let exec: &AsyncExecutor = unsafe {
+    cap.pointer_checked(Some(c"ciris_persist::executor_capsule_v1"))?
+        .cast()
+        .as_ref()
+};
+assert_eq!(exec.vtable.abi_version, ciris_persist::ASYNC_EXECUTOR_ABI_VERSION);
+
+// Spawn — uses ONLY persist's API + std primitives.
+let (tx, rx) = std::sync::mpsc::channel::<T>();
+type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+let fut: BoxedFut = Box::pin(async move { /* ... */ let _ = tx.send(result); });
+let wrapped: Box<BoxedFut> = Box::new(fut);
+let task_ptr = Box::into_raw(wrapped) as *mut TaskOpaque;
+unsafe { (exec.vtable.spawn)(exec.data, task_ptr) };
+
+// Block on plain std mpsc — no async on this side of the bridge.
+let result = rx.recv_timeout(Duration::from_secs(5))?;
+```
+
+Edge can pin to either the v3.13.0 tag or a git ref of `main` once T4 lands — the wheel is not on the critical path.
+
 ## [3.12.2] — 2026-06-04
 
 **Diagnostic harness for cohabitation races + migration-timing log (CIRISPersist#156).**
