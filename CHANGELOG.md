@@ -5,6 +5,20 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.10.0] — 2026-06-03
+
+**CIRISPersist 3.10.0 — CIRISVerify v4.8.0 pin (parallel attestation race + heartbeat hardening).**
+
+Rolls the verify pin v4.7.1 → v4.8.0 across all six dependency sites (`ciris-keyring` × 4 platform-conditional rows + `ciris-verify-core` + `ciris-crypto`). v4.8.0 is operational hardening: the v4.7.x sequential failover in `ResilientRegistryClient` (primary → fallback1 → fallback2) collapses to a parallel race across all registry endpoints under a 10s `RACE_BUDGET`, the per-platform `build_async_http_client` factory pins `connect_timeout` / `total_timeout` / `tcp_keepalive(30s)` per call class (Probe 2s/2s, Normal 5s/10s, DoH 3s/5s), and a `HeartbeatGuard` RAII ticker emits a 5s `tracing::warn!` phase tag through the attestation lifecycle. Eric's S21U / Verizon LTE 90-second hang on v4.7.1 is the closed-issue regression (CIRISVerify#52); the budget hierarchy now sums to ≤13s under the 15s startup ceiling.
+
+No persist API change. The bump is pulled in to surface v4.8.0's robustness for downstream consumers (CIRISEngine / CIRISAgent / CIRISLens) that re-export the verify surfaces persist already wires through the wheel.
+
+This cut also rolls up three already-shipped enforcement slices that landed on `main` in the same window — the **roll-up CHANGELOG entries for 3.9.1 / 3.9.2 / 3.9.3 immediately below** carry the architectural detail; the headline of 3.10.0 is the verify pin bump itself and the closure of the three enforcement issues (#150 Ask 3, #151, #153 Ask 5).
+
+### Tests
+
+- 547/547 sqlite lib tests green; `--features pyo3` + `--features sqlite` both compile clean against v4.8.0; clippy clean.
+
 ## [3.9.3] — 2026-06-01
 
 **CIRISPersist 3.9.3 — bulk peer-level `cohort_scope` filter on `list_federation_keys` (CIRISPersist#151).**
