@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "3.12.1"
+version = "3.12.2"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -166,6 +166,20 @@ cirisaudit     = []
 # in cirisgraph.consolidation_locks. Depends on cirisgraph for the
 # summary-node write path. Threat model AV-52 / AV-53 / AV-54.
 telemetry      = ["cirisgraph"]  # no `postgres` or `sqlite` requirement — pairs with either via cirisgraph
+
+# v3.12.x (CIRISPersist#156) — diagnostic harness for cohabitation
+# races. Mirrors CIRISEdge's `debug-tools` feature gate shape:
+# release wheels ship with this OFF and carry zero diagnostic surface
+# (panic-hook code is not compiled in; `CIRIS_PERSIST_PANIC_LOG` is
+# never read; `panic_count`/`install_panic_logger` pyfunctions don't
+# exist on the module). See `tools/README.md` for the two-layer
+# opt-in (feature gate + env var) and security posture.
+#
+# Build:
+#   maturin build --profile panic-debug \
+#     --features "pyo3 extension-module debug-tools" \
+#     --skip-auditwheel --strip false --include-debuginfo
+debug-tools    = ["dep:backtrace"]
 
 # v0.8.3 (CIRISPersist#37) — incident records. Absorbs the agent's
 # IncidentManagementService: correlation-keyed deduplication on
@@ -478,6 +492,15 @@ async-trait   = "0.1"
 # to 0.x because the API is stable but pre-1.0.
 fs4           = "0.13"
 libc          = "0.2"
+# v3.12.x (CIRISPersist#156) — opt-in raw-IP unwinder for the
+# `debug-tools` diagnostic panic hook. Captures backtraces WITHOUT
+# invoking the symbol resolver at panic time (the resolver aborts
+# under concurrent cohabitation panics — see src/debug/mod.rs for the
+# rationale). Symbols resolve post-mortem via
+# `addr2line --exe <wheel>/ciris_persist.abi3.so <offset>` on the
+# panic-debug profile build. `optional = true` so release wheels do
+# not link the crate.
+backtrace     = { version = "0.3", optional = true }
 serde         = { version = "1", features = ["derive"] }
 # v0.1.20 — `arbitrary_precision` preserves the agent's wire number
 # tokens verbatim through deserialize → serialize. Closes
@@ -857,6 +880,30 @@ required-features = ["sqlite", "cirislens_sequence"]
 # per-build footprint several-fold. The `test` profile inherits this.
 [profile.dev]
 debug = "line-tables-only"
+
+# v3.12.x (CIRISPersist#156) — full-DWARF profile for the cohabitation
+# diagnostic harness (mirrors CIRISEdge's `panic-debug`). Inherits
+# release optimization (so the wheel matches what consumers see in
+# production) but keeps full debug info so the raw-IP backtrace
+# captured by `src/debug/mod.rs` resolves cleanly via
+# `addr2line --exe <wheel>/ciris_persist.abi3.so <offset>`. NEVER
+# publish a panic-debug wheel: the binary is 4-5× larger than
+# release-stripped and ships symbols that release wheels deliberately
+# drop. Build invocation in tools/README.md.
+#
+# The profile alone does NOT enable the `debug-tools` code surface —
+# that requires explicitly passing `--features debug-tools` to
+# maturin or cargo. The two-layer opt-in (profile + feature) is
+# intentional: you can build a panic-debug-profile wheel WITHOUT the
+# panic-hook scaffolding (useful for `rust-gdb attach` without the
+# in-process instrumentation), and you can build a release-profile
+# wheel WITH the panic hook (the hook works without DWARF, just with
+# less-useful backtraces).
+[profile.panic-debug]
+inherits = "release"
+debug = "full"
+strip = "none"
+incremental = false
 
 [profile.release]
 lto = "thin"

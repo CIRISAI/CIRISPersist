@@ -41,12 +41,17 @@
 pub mod audit;
 #[cfg(feature = "cirisnode")]
 pub mod cirisnode;
+// v3.12.x (CIRISPersist#156) — diagnostic harness panic hook.
+// Compiled only under `--features debug-tools`; release wheels ship
+// without this module. See src/debug/mod.rs + tools/README.md.
 #[cfg(feature = "cirislens_continuity_awareness")]
 pub mod continuity_awareness;
 #[cfg(feature = "cirislens_correlations")]
 pub mod correlations;
 #[cfg(feature = "cirislens_creation_ceremonies")]
 pub mod creation_ceremonies;
+#[cfg(feature = "debug-tools")]
+pub mod debug;
 #[cfg(feature = "cirislens_deferral_reports")]
 pub mod deferral_reports;
 pub mod derived;

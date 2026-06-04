@@ -5,6 +5,45 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.12.2] — 2026-06-04
+
+**Diagnostic harness for cohabitation races + migration-timing log (CIRISPersist#156).**
+
+Adds the substrate-side toolchain to robustly investigate the v3.12.x sqlite cohab regression (#156) and any similar future race. Mirrors the CIRISEdge `tools/` harness shape on the persist side — same `race_repro.py` classifier, same panic-hook architecture, same `panic-debug` profile name — so the two harnesses can run in parallel against the same scenario for two-sided correlation.
+
+### What's new
+
+**`debug-tools` Cargo feature (default OFF)**:
+- `src/debug/mod.rs` — opt-in panic hook armed by `CIRIS_PERSIST_PANIC_LOG`. Captures every background-thread panic with a raw-IP + `dladdr` backtrace into a per-pid log file. Symbol resolution is deferred to post-mortem `addr2line` because the symbol resolver aborts under concurrent cohabitation panics (same lesson learned in edge's harness).
+- `panic_count()` + `install_panic_logger()` PyO3 functions, only compiled when the feature is on. Release wheels carry **zero** diagnostic surface — the strings `panic_count` / `install_panic_logger` / `CIRIS_PERSIST_PANIC_LOG` are not present in the binary.
+- Two-layer opt-in: feature gate + env var. Even a debug-tools wheel is silent at runtime unless `CIRIS_PERSIST_PANIC_LOG` is exported.
+- `dep:backtrace` added as an optional dep gated on the feature.
+
+**`src/store/migration_timing.rs`** (always-compiled, env-var-armed):
+- `CIRIS_PERSIST_MIGRATION_TIMING_LOG=/path/to/log` → one JSON-Lines entry per `run_migrations()` call recording `unix_ms`, `backend`, `total_wall_us`, `applied_count`, `applied_versions`.
+- Quantifies how many microseconds each refinery `run()` adds to first-Engine-open. The #156 hypothesis (V058+V059 shifted boot timing enough to make a Leviculum-side race deterministic) is now directly measurable: pin v3.11.0 vs v3.12.1, run the harness, compare distributions.
+- Always-compiled because the cost is one `std::env::var` lookup per Engine open. Operators can use it in production to monitor migration-apply latency growth across releases.
+
+**`[profile.panic-debug]`** in `Cargo.toml`:
+- Inherits release optimization but keeps full DWARF (`debug = "full"`, `strip = "none"`, `incremental = false`). The `addr2line --exe <wheel>/ciris_persist.abi3.so <offset>` post-mortem flow resolves panic-log raw-IP entries against this. Documented invocation in `tools/README.md`.
+
+**`tools/`** harness directory (new, mirrors CIRISEdge layout):
+- `race_repro.py` — drives a scenario in N fresh subprocesses, classifies fast/hung/panicked/other, surfaces panic backtraces + gdb hang dumps + migration-timing distributions. Adds `--migration-timing-log` over edge's harness shape.
+- `debug_attach.sh` — gdb `thread apply all bt` wrapper for live hang triage (`CIRIS_GDB_FILTER_TOKIO=1` strips tokio noise).
+- `scenarios/sqlite_inmemory_cohab.py` — direct repro of #156 (sqlite::memory: + edge `init_edge_runtime` race).
+- `scenarios/engine_construction_timing.py` — pure constructor timing (no edge); for cross-version comparison.
+- `scenarios/concurrent_boot_advisory_lock.py` — Python-driven sibling of the qa_harness av26 test (N parallel postgres engines, asserts lock holds).
+- `tools/README.md` — full architecture + workflow + security posture (two-layer opt-in, ptrace permission, tokio filter env vars).
+
+### Tests
+
+- 565/565 sqlite lib tests green with `--features sqlite,debug-tools` (2 new tests covering migration_timing format + silent-no-op without env var).
+- Clippy clean across all feature axes.
+
+### What this enables
+
+The #156 substrate-side investigation can now produce signed data: run the harness against v3.11.0 vs v3.12.1, get the `total_wall_us` distribution delta, decide whether the boot-time shift is the cause. If the panic-hook captures a Leviculum stack frame, the cause is confirmed downstream. If neither shifts the picture, the hypothesis is wrong and a different angle is needed. Concrete next step.
+
 ## [3.12.1] — 2026-06-04
 
 **Hotfix: V059 postgres partial-index predicate referenced `NOW()`, which is STABLE not IMMUTABLE — postgres rejected the index definition with sqlstate 42P17 (`invalid_object_definition`).**

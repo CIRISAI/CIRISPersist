@@ -864,11 +864,39 @@ impl Backend for PostgresBackend {
         // lock is at session scope, so it persists across all of
         // them. If a single migration fails, refinery rolls back its
         // transaction; we drop the connection below; lock releases.
-        let migration_result = embedded::migrations::runner()
+        //
+        // v3.12.x (CIRISPersist#156) — wrap the `run_async` call in
+        // the migration-timing diagnostic. The diagnostic silently
+        // no-ops without `CIRIS_PERSIST_MIGRATION_TIMING_LOG` set;
+        // when set, it appends one JSON-Lines entry per migration
+        // apply documenting total_wall_us + applied_count +
+        // applied_versions. See `crate::store::migration_timing`.
+        let migration_started = std::time::Instant::now();
+        let report_result = embedded::migrations::runner()
             .set_migration_table_name("ciris_persist_schema_history")
             .run_async(&mut lock_client)
-            .await
-            .map_err(|e| migration_error("migrations", e));
+            .await;
+        let elapsed = migration_started.elapsed();
+        let migration_result = match report_result {
+            Ok(report) => {
+                let applied = report.applied_migrations();
+                let applied_versions = applied
+                    .iter()
+                    .map(|m| m.version().to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                crate::store::migration_timing::append(
+                    &crate::store::migration_timing::MigrationTiming {
+                        backend: "postgres",
+                        elapsed,
+                        applied_count: applied.len(),
+                        applied_versions,
+                    },
+                );
+                Ok(())
+            }
+            Err(e) => Err(migration_error("migrations", e)),
+        };
 
         // Best-effort explicit unlock — graceful path. The drop below
         // is the actual guarantee (session ends → lock releases),

@@ -566,10 +566,20 @@ impl Backend for SqliteBackend {
         // concurrent readers but writers serialize on the database
         // file lock anyway), refinery's idempotent IF NOT EXISTS
         // semantics on its schema_history table cover the race.
+        //
+        // v3.12.x (CIRISPersist#156) — wrap the `run()` call in the
+        // migration-timing diagnostic (silently no-ops without the
+        // env var; quantifies the v3.11.0 → v3.12.x boot-time delta
+        // for cohabitation race triage). See
+        // `crate::store::migration_timing` for the format.
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<(), refinery::Error> {
             let mut conn = conn.blocking_lock();
-            embedded::migrations::runner().run(&mut *conn)?;
+            let timing =
+                crate::store::migration_timing::MigrationTiming::from_run("sqlite", || {
+                    embedded::migrations::runner().run(&mut *conn)
+                })?;
+            crate::store::migration_timing::append(&timing);
             Ok(())
         })
         .await

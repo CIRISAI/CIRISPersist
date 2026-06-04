@@ -19689,5 +19689,43 @@ fn ciris_persist(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Python regression suite. Off in release wheels.
     #[cfg(feature = "test-panic")]
     m.add_function(pyo3::wrap_pyfunction!(_test_inject_panic, m)?)?;
+
+    // v3.12.x (CIRISPersist#156) — diagnostic surface, gated under the
+    // `debug-tools` Cargo feature. Default release wheels (where the
+    // feature is OFF) compile without this code: no `panic_count` /
+    // `install_panic_logger` pyfunctions exist on the module, and the
+    // `CIRIS_PERSIST_PANIC_LOG` env var is never read.
+    //
+    // Harness wheels built with `--features debug-tools` auto-install
+    // the panic hook on `import ciris_persist` if the env var is set,
+    // and expose `panic_count` / `install_panic_logger` pyfunctions.
+    #[cfg(feature = "debug-tools")]
+    {
+        crate::debug::install_panic_logger();
+        m.add_function(pyo3::wrap_pyfunction!(panic_count, m)?)?;
+        m.add_function(pyo3::wrap_pyfunction!(install_panic_logger, m)?)?;
+    }
     Ok(())
+}
+
+/// v3.12.x (CIRISPersist#156) — diagnostic counter exposed to Python.
+/// Counts every panic captured by the [`crate::debug::install_panic_logger`]
+/// hook since process start. Returns 0 if the hook was never armed
+/// (env var unset) or if no panics have fired.
+#[cfg(feature = "debug-tools")]
+#[pyo3::pyfunction]
+fn panic_count() -> u64 {
+    crate::debug::PANIC_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// v3.12.x (CIRISPersist#156) — manually arm the panic-logging hook.
+/// Normally fires automatically on `import ciris_persist` when
+/// `CIRIS_PERSIST_PANIC_LOG` is set; exposed so harnesses can install
+/// it post-import (e.g., after toggling the env var from Python).
+/// Returns `True` if the hook is active, `False` if the env var was
+/// absent at call time.
+#[cfg(feature = "debug-tools")]
+#[pyo3::pyfunction]
+fn install_panic_logger() -> bool {
+    crate::debug::install_panic_logger()
 }

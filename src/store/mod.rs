@@ -11,6 +11,12 @@
 pub mod backend;
 pub mod decompose;
 pub mod memory;
+// v3.12.x (CIRISPersist#156) — always-compiled migration-timing
+// diagnostic. Sibling to the `debug-tools`-gated panic hook in
+// `crate::debug`. Gated on `postgres` OR `sqlite` since the type
+// references `refinery::Report`.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub mod migration_timing;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(feature = "sqlite")]
