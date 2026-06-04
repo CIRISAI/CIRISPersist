@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780533595224,
+  "lastUpdate": 1780535670494,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -10373,6 +10373,288 @@ window.BENCHMARK_DATA = {
             "name": "storage_floor/next_sequence_full",
             "value": 1406,
             "range": "± 234",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "2c9e34eedaa29d84d4ac8764f1d85f3b1e08588c",
+          "message": "3.11.0 — verify-coord R1+Q1 substrate (#143, F-AV-FRONTRUN + F-AV-ROLLBACK closure)\n\nPins CIRISVerify FEDERATION_THREAT_MODEL §3.3.2 constants (ratified\nv1.1, audited v1.2 at 51da15f) into the substrate as wire-format-\nnormative values, and lands the deterministic 3-tier merge comparator\n+ anti-rollback admission gate the spec requires.\n\nConstants (in crate::federation::verify_coord):\n - R1: τ_normal=60s, τ_partial=300s\n - Q1: bounded_staleness=300s, N_regions=3, quorum_write_threshold=2\n - F-AV-13: revocation_cache_ttl=30s (= τ_normal/2)\n - Region closed set: {us, eu, apac}\n\nComparator (compare_for_merge): pure function over MergeBallot —\n 1. quorum_weight DESC (more regions wins)\n 2. signed_timestamp DESC (later wins — F-AV-FRONTRUN closure)\n 3. canonical_bytes_hash ASC (deterministic tie-break)\nStrict total order; antisymmetric. 9 unit tests pin each tier\ndominance pair + the antisymmetry contract.\n\nAnti-rollback (F-AV-ROLLBACK closure): put_revocation (both backends)\nruns check_revocation_anti_rollback BEFORE persist_row_hash + INSERT.\nA submitted revocation with signed_timestamp <= existing latest for\nthe same revoked_key_id rejects with typed Error::RevocationRollback\n(kind \"federation_revocation_rollback\"). Sufficient minority of\nregions can't ratify a rollback — the rollback never enters quorum.\n\nSchema (V058, both backends):\n - federation_revocations.observed_region TEXT NOT NULL DEFAULT 'us'\n   CHECK IN ('us', 'eu', 'apac'). DEFAULT + skip_serializing_if\n   keeps pre-v3.11 persist_row_hash stable (V056 cohort_scope\n   discipline).\n - New table federation_revocation_quorum_state: per-region\n   first-observation timestamps + quorum_reached_at +\n   denormalized quorum_weight (1..=3, comparator reads it directly).\n - Partial indexes on non-default region rows + committed-quorum subset.\n\nAdmission gate: check_observed_region rejects out-of-closed-set\nvalues with Error::RegionRejected (kind \"federation_region_rejected\").\nMirrors v3.9.1 cohort_scope discipline. V058 CHECK is the\ndefense-in-depth backstop for direct-SQL bypass.\n\nSpec-field mapping: signed_timestamp() → scrub_timestamp;\ncanonical_bytes_hash() → original_content_hash. Named accessors so\nthe spec mapping is verbatim without duplicating columns.\n\nPyO3 wheel surface (if it ain't on the FFI, it doesn't exist):\n - verify_coord_constants_json() → JSON dict of all constants\n - verify_coord_check_observed_region(s) — pre-validation\n - verify_coord_compare_for_merge(a_json, b_json) → -1/0/1\nAll static methods on PyEngine.\n\nAlso: pre-existing red fix (v3.10.0 CI failure)\n\nav26_concurrent_boot_advisory_lock had a hardcoded `expected 1..=53`\nupper bound on ciris_persist_schema_history rows that drifted as\nmigrations were added. Replaced with the dynamic\nembedded_lens_migration_count() helper so the test tracks the live\nmigration set instead of bit-rotting each release. The check still\ndiscriminates \"single lock-serialized boot's worth\" from\n\"N_WORKERS×migrations\" (would mean the lock didn't hold).\n100%-green discipline: pre-existing reds get fixed in the same cut\nthey're surfaced in.\n\nTests: 559/559 sqlite lib tests green (+12 from v3.10.0 — 9\nverify_coord + 3 admission integration). --features pyo3 +\n--features sqlite + --features postgres,server,pyo3,cirisaudit all\ncompile clean. Clippy clean across sqlite + pyo3.\n\nWhat's still v3.12+ (the consumer half + Front A):\n - Cross-region quorum-write worker (substrate stores bookkeeping;\n   the gossip-observer that writes per-region timestamps is follow-on)\n - F-AV-13 cache TTL enforcement in consumer code\n - CEG 0.7 family / identity_occurrence (#153 Asks 1-4/6/7) + CEG 0.8\n   community / location_proof (#154) — Front A of the parallel cut\n   plan, now executable since Registry#47 + #48 are ratified-locked.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-06-03T19:55:05-05:00",
+          "tree_id": "b465a16ecbc6a322b7c949b9285e469da6bd2a25",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/2c9e34eedaa29d84d4ac8764f1d85f3b1e08588c"
+        },
+        "date": 1780535669457,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 40434317,
+            "range": "± 115238",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 1825083,
+            "range": "± 144453",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 2511,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 5988,
+            "range": "± 29",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 12927,
+            "range": "± 51",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 45575,
+            "range": "± 402",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 9,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 35,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 205,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 522,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 598,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 2064,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 9,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 73,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 232,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 1030,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 15,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 56135,
+            "range": "± 1988",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 162394,
+            "range": "± 2610",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 576816,
+            "range": "± 4850",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 8844,
+            "range": "± 1018",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 10176,
+            "range": "± 679",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 19554,
+            "range": "± 1008",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 52427,
+            "range": "± 1365",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 1222920,
+            "range": "± 5747",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 7049313,
+            "range": "± 117793",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 401182,
+            "range": "± 27654",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 1274110,
+            "range": "± 67278",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 66354708,
+            "range": "± 623138",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 2315640,
+            "range": "± 64834",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 11021902,
+            "range": "± 285237",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 165176968,
+            "range": "± 921158",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 5946004,
+            "range": "± 306281",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 28559792,
+            "range": "± 395810",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 167767,
+            "range": "± 19862",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 154646,
+            "range": "± 13214",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 34514,
+            "range": "± 2829",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 107314,
+            "range": "± 2388",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 749136,
+            "range": "± 4022",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 1,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 681,
+            "range": "± 60",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 122,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 1359,
+            "range": "± 124",
             "unit": "ns/iter"
           }
         ]
