@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780535670494,
+  "lastUpdate": 1780537936605,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -10655,6 +10655,288 @@ window.BENCHMARK_DATA = {
             "name": "storage_floor/next_sequence_full",
             "value": 1359,
             "range": "± 124",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "3b35db1baefca5eee5547de6015bcb55e2fe543a",
+          "message": "3.12.0 — CEG 0.7 §5.6.8.8 + §5.6.8.9 identity_occurrence + family substrate foundation (#153 Asks 1-2)\n\nLands the structural primitives that distinguish \"participants that\nARE me\" (identity_occurrence — my devices and agents) from \"trusted\nnodes that compose with me\" (family — other people's identities +\nshared household devices). Front A of the parallel cut plan, now\nexecutable since Registry#47 ratified-locked on 2026-05-31.\n\nSchema (V059, both backends):\n - federation_identity_occurrences: composite PK (identity_key_id,\n   occurrence_key_id); closed-set device_class CHECK IN ('phone',\n   'laptop', 'server', 'embedded', 'agent', 'service'); opaque\n   hardware_attestation blob; valid_until for indefinite vs\n   time-bounded bindings.\n - federation_families: family_key_id PK; members JSONB / TEXT-json\n   array of {key_id, joined_at, role}; open-vocab consensus_protocol\n   validated at admission; consensus_protocol_entrenched structural\n   lock.\n - Postgres GIN jsonb_path_ops index on members for O(log N) \"which\n   families is identity X a member of?\" via `members @> ...`. SQLite\n   EXISTS / json_each scan; acceptable for the cardinality.\n - Partial indexes on the entrenched-protocol subset (§9\n   HUMANITY_ACCORD-style lookup, tiny set in practice).\n\nRust types (in federation::types):\n - IdentityOccurrence, Family, FamilyMember, SignedIdentityOccurrence,\n   SignedFamily — full serde + persist_row_hash integration.\n - device_class module: closed-set constants + is_valid + ALL.\n - consensus_protocol module: bare-form constants + prefix constants\n   + is_canonical_form predicate (parses founder_only/unanimous/\n   majority/quorum:m/n with m<=n,n>0/weighted:rubric/custom:id).\n\nAdmission gates (value-validation tier; trust-graph is v3.13+):\n - check_device_class -> Error::DeviceClassRejected\n   (kind federation_device_class_rejected)\n - check_consensus_protocol_form -> Error::ConsensusProtocolMalformed\n   (kind federation_consensus_protocol_malformed)\n Both run BEFORE persist_row_hash + INSERT; V059 CHECK constraints\n are the defense-in-depth backstops for direct-SQL bypass.\n\nFederationDirectory trait (memory + sqlite + postgres):\n - put_identity_occurrence / list_identity_occurrences_for /\n   lookup_identity_for_occurrence (reverse: \"is this signing key\n   co-self with X?\")\n - put_family / lookup_family / list_families_for_member\n\nPyO3 wheel surface (if it ain't on the FFI, it doesn't exist):\n - put_identity_occurrence_json + list_identity_occurrences_for_json\n   + lookup_identity_for_occurrence_json\n - put_family_json + lookup_family_json + list_families_for_member_json\n\nWhat this substrate enables (v3.13+):\n - #152 at-rest DEK cascade: wrap content DEKs to all currently-\n   admitted occurrences + family members when content lands at\n   cohort_scope:self|family.\n - #150 caller-vs-scope trust-graph admission (the deferred slice\n   from v3.9.1): cohort_scope:self writes admit when attesting_key_id\n   is an identity_occurrence of the local key; cohort_scope:family\n   writes admit per the family's consensus_protocol.\n - #146 Ask 2 broadened withdraws admission (4-rule gate): the\n   canonical-binding rule (rule 4) reads from\n   federation_identity_occurrences to admit subject-side revocations\n   from any of the subject's occurrences.\n\nWhat's still v3.13+ (intentionally out of scope for #153 Asks 1-2):\n - Full self-vouch / single-vouch admission per §5.6.8.8 (needs\n   trust-graph walk against list_identity_occurrences_for)\n - Consensus-protocol signature-counting per §5.6.8.9 (founder_only\n   / unanimous / majority / quorum:m/n / weighted:rubric / custom:id\n   enforcement; consensus_protocol_entrenched amendment rejection)\n - Retroactive key_grant emission on member-add (§5.6.8.9 step 3)\n - hard_case:identity_occurrence_added /\n   hard_case:family_membership_change substrate emissions per §7.2\n\nTests:\n - 4 new sqlite integration tests\n   (identity_occurrence_round_trip, device_class rejection, family\n   round_trip, 10 malformed consensus_protocol rejections + the\n   quorum:2/3 canonical admit).\n - 563/563 sqlite lib tests green (+4 from v3.11.0).\n - --features pyo3 + --features sqlite + --features\n   postgres,server,pyo3,cirisaudit all compile clean.\n - Clippy clean across sqlite + pyo3.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-06-03T20:32:33-05:00",
+          "tree_id": "7553ffa136cad0deeecebd0ffa0292ff9d993789",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/3b35db1baefca5eee5547de6015bcb55e2fe543a"
+        },
+        "date": 1780537934966,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 40424217,
+            "range": "± 41339",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 2727428,
+            "range": "± 235222",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 2531,
+            "range": "± 19",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 5946,
+            "range": "± 28",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 13061,
+            "range": "± 174",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 46067,
+            "range": "± 217",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 35,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 203,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 522,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 597,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 2064,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 9,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 75,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 231,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 1023,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 15,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 55074,
+            "range": "± 4132",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 161759,
+            "range": "± 7453",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 576791,
+            "range": "± 11622",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 9883,
+            "range": "± 900",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 11511,
+            "range": "± 637",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 20342,
+            "range": "± 922",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 53816,
+            "range": "± 1821",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 1226119,
+            "range": "± 13990",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 4614047,
+            "range": "± 65536",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 292573,
+            "range": "± 15426",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 797723,
+            "range": "± 64091",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 43311959,
+            "range": "± 255148",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 1812490,
+            "range": "± 111780",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 7229385,
+            "range": "± 136515",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 107698595,
+            "range": "± 615340",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 4344362,
+            "range": "± 311728",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 19622597,
+            "range": "± 622086",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 106651,
+            "range": "± 12379",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 103049,
+            "range": "± 7829",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 22766,
+            "range": "± 1720",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 68989,
+            "range": "± 1702",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 500747,
+            "range": "± 3289",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 1,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 677,
+            "range": "± 54",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 119,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 1472,
+            "range": "± 133",
             "unit": "ns/iter"
           }
         ]
