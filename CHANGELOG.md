@@ -5,6 +5,72 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.11.0] — 2026-06-04
+
+**CIRISPersist 3.11.0 — verify-coord R1+Q1 substrate (CIRISPersist#143; CIRISVerify FEDERATION_THREAT_MODEL §3.3.2, ratified v1.1, audited v1.2 at 51da15f).**
+
+Closes the F-AV-FRONTRUN + F-AV-ROLLBACK substrate-tier gaps from the federation threat model. R1 (τ_propagate) makes per-revocation regional observation accountable; Q1 (quorum-write) gives the substrate the deterministic 3-tier merge inputs and the anti-rollback monotonicity gate the spec requires at admission — before quorum is asked.
+
+### Constants (immutable per CIRISVerify v1.1 spec)
+
+The Rust substrate pins these in `crate::federation::verify_coord` as wire-format-normative:
+
+| Layer | Constant | Value |
+|---|---|---|
+| R1 | `TAU_NORMAL` | 60s (fresh-path propagation deadline) |
+| R1 | `TAU_PARTIAL` | 300s (degraded-path settle window) |
+| Q1 | `BOUNDED_STALENESS` | 300s (= τ_partial) |
+| Q1 | `N_REGIONS` | 3 (`us` / `eu` / `apac`) |
+| Q1 | `QUORUM_WRITE_THRESHOLD` | 2 (= ⌈2N/3⌉) |
+| F-AV-13 | `REVOCATION_CACHE_TTL` | 30s (= τ_normal / 2) |
+
+PyO3 surface: `PyEngine.verify_coord_constants_json()` exposes the same values as a JSON dict so consumers (verify-coord workers, regional gossip relays, edge caches) pin against the substrate's authoritative values instead of redefining.
+
+### Q1 deterministic 3-tier merge comparator
+
+`verify_coord::compare_for_merge(a, b)` is a pure function over `MergeBallot { quorum_weight, signed_timestamp, canonical_bytes_hash }` — the strict total order the federation relies on for cross-region convergence without coordination:
+
+1. **Tier 1** — higher `quorum_weight` wins (a revocation acknowledged by more regions is more authoritative)
+2. **Tier 2** — later `signed_timestamp` wins (anti-rollback monotonic; F-AV-FRONTRUN closure)
+3. **Tier 3** — lex-lower `canonical_bytes_hash` wins (pure deterministic tie-break; rare)
+
+PyO3 surface: `PyEngine.verify_coord_compare_for_merge(a_json, b_json) -> -1 | 0 | 1` exposes the comparator for consumer-side ranking without going through the full table.
+
+### Anti-rollback admission (F-AV-ROLLBACK closure)
+
+`put_revocation` (both backends) runs the anti-rollback check **before** `persist_row_hash` is computed and **before** INSERT: a new revocation against a target with `signed_timestamp <= existing_latest_signed_timestamp` is rejected with the typed `Error::RevocationRollback { revoked_key_id, existing_signed_timestamp, submitted_signed_timestamp }` (stable `kind()` token `federation_revocation_rollback`). The spec is explicit that anti-rollback is at admission — a sufficient minority of regions cannot ratify a rollback because the rollback never enters the quorum gate.
+
+### Schema (V058, both backends)
+
+- `federation_revocations.observed_region TEXT NOT NULL DEFAULT 'us'` with closed-set CHECK `IN ('us', 'eu', 'apac')`. DEFAULT 'us' + `#[serde(skip_serializing_if = "is_default_observed_region")]` preserves the pre-v3.11 `persist_row_hash` for legacy rows (same backward-compat discipline V056 used for `cohort_scope`).
+- New table `federation_revocation_quorum_state` — per-revocation per-region first-observation timestamps + `quorum_reached_at` + denormalized `quorum_weight` (1..=3). The comparator reads `quorum_weight` in one column-load instead of three NULL-checks.
+- Partial indexes on the non-default region rows (`WHERE observed_region != 'us'`) + on the committed-quorum subset (`WHERE quorum_reached_at IS NOT NULL`) — keeps the index small while covering the read paths the Q1 merge + F-AV-13 cache TTL gates need.
+
+### Admission-gate validation
+
+- `check_observed_region(&str)` rejects out-of-closed-set values with `Error::RegionRejected { observed_region }` (stable token `federation_region_rejected`). Mirrors v3.9.1 `check_cohort_scope` discipline.
+- PyO3: `PyEngine.verify_coord_check_observed_region(s)` for consumer-side pre-validation.
+
+### Mapping spec-named fields to existing columns
+
+The spec's `signed_timestamp` is mapped to `Revocation::scrub_timestamp` (the signing time pinned into the scrub envelope); the spec's `canonical_bytes_hash` is mapped to `Revocation::original_content_hash` (SHA-256 hex of the canonical revocation envelope). Named accessors `Revocation::signed_timestamp()` and `Revocation::canonical_bytes_hash()` make the spec mapping verbatim in the substrate API without storing the same value twice on the row.
+
+### Also: pre-existing red fix (v3.10.0 CI failure)
+
+`av26_concurrent_boot_advisory_lock` had a hardcoded `expected 1..=53` upper bound on `ciris_persist_schema_history` rows that drifted as migrations were added. Replaced with the dynamic `embedded_lens_migration_count()` query so the test tracks the live migration set instead of bit-rotting on every release. The check still discriminates "single lock-serialized boot's worth" from "N_WORKERS × migrations" (which would mean the lock didn't hold). 100%-green discipline: pre-existing reds get fixed in the same cut they're surfaced in.
+
+### Tests
+
+- 9 verify_coord module tests: constants pinning, region closed-set, all three tier-dominance pairs, antisymmetry (the determinism contract).
+- 3 sqlite integration tests: out-of-closed-set region rejection + no row persisted; anti-rollback with equal / earlier / later signed_timestamps; non-default region round-trip.
+- 559/559 sqlite lib tests green; `--features pyo3` + `--features sqlite` + `--features postgres,server,pyo3,cirisaudit` all compile clean; clippy clean across sqlite + pyo3.
+
+### What's still v3.12+
+
+- Cross-region quorum-write path (the actual region-ACK gossip — substrate just stores the bookkeeping; the worker that observes `holds_bytes` propagation and writes the per-region timestamps is a follow-on).
+- F-AV-13 cache TTL enforcement in consumers (substrate exposes the constant; consumers honor).
+- CEG 0.7 family / identity_occurrence substrate (#153 Asks 1-4 / 6 / 7) and CEG 0.8 community / location_proof (#154) — Front A of the parallel cut plan, executable now that Registry#47 + #48 are ratified-locked.
+
 ## [3.10.0] — 2026-06-03
 
 **CIRISPersist 3.10.0 — CIRISVerify v4.8.0 pin (parallel attestation race + heartbeat hardening).**

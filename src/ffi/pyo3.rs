@@ -4143,6 +4143,100 @@ impl PyEngine {
         })
     }
 
+    /// v3.11.0 (CIRISPersist#143, CIRISVerify FEDERATION_THREAT_MODEL
+    /// §3.3.2) — verify-coord R1+Q1 constants as a JSON dict for
+    /// consumer code that needs to pin τ_normal / τ_partial /
+    /// quorum_threshold / cache TTL etc. against the substrate's
+    /// authoritative values.
+    ///
+    /// Shape:
+    /// ```json
+    /// {
+    ///   "tau_normal_secs":          60,
+    ///   "tau_partial_secs":         300,
+    ///   "bounded_staleness_secs":   300,
+    ///   "n_regions":                3,
+    ///   "quorum_write_threshold":   2,
+    ///   "revocation_cache_ttl_secs": 30,
+    ///   "regions":                  ["us", "eu", "apac"]
+    /// }
+    /// ```
+    #[staticmethod]
+    fn verify_coord_constants_json() -> PyResult<String> {
+        use crate::federation::verify_coord;
+        let v = serde_json::json!({
+            "tau_normal_secs":          verify_coord::TAU_NORMAL.as_secs(),
+            "tau_partial_secs":         verify_coord::TAU_PARTIAL.as_secs(),
+            "bounded_staleness_secs":   verify_coord::BOUNDED_STALENESS.as_secs(),
+            "n_regions":                verify_coord::N_REGIONS,
+            "quorum_write_threshold":   verify_coord::QUORUM_WRITE_THRESHOLD,
+            "revocation_cache_ttl_secs": verify_coord::REVOCATION_CACHE_TTL.as_secs(),
+            "regions":                  verify_coord::region::ALL,
+        });
+        Ok(v.to_string())
+    }
+
+    /// v3.11.0 (CIRISPersist#143) — validate a producer-side
+    /// `observed_region` value against the closed set
+    /// `{us, eu, apac}` without writing a row. Raises `ValueError`
+    /// (kind = `federation_region_rejected`) on a bad value;
+    /// returns `None` on admit.
+    #[staticmethod]
+    fn verify_coord_check_observed_region(observed_region: &str) -> PyResult<()> {
+        crate::federation::check_observed_region(observed_region).map_err(federation_err_to_py)
+    }
+
+    /// v3.11.0 (CIRISPersist#143) — Q1 deterministic 3-tier merge
+    /// comparator exposed for consumer code that needs to score-rank
+    /// competing revocations without going through the full
+    /// `federation_revocations` table.
+    ///
+    /// `a_json` / `b_json` shape:
+    /// ```json
+    /// {
+    ///   "quorum_weight":         <int 1..=3>,
+    ///   "signed_timestamp":      "<RFC-3339>",
+    ///   "canonical_bytes_hash":  "<hex>"
+    /// }
+    /// ```
+    ///
+    /// Returns:
+    /// - `-1` if `a` wins (a sorts first in winning order)
+    /// - `1` if `b` wins
+    /// - `0` if exactly equal on all three tiers (rare: identical
+    ///   ballots)
+    #[staticmethod]
+    fn verify_coord_compare_for_merge(a_json: &str, b_json: &str) -> PyResult<i32> {
+        use crate::federation::verify_coord;
+        #[derive(serde::Deserialize)]
+        struct WireBallot {
+            quorum_weight: u8,
+            signed_timestamp: chrono::DateTime<chrono::Utc>,
+            canonical_bytes_hash: String,
+        }
+        let a: WireBallot = serde_json::from_str(a_json)
+            .map_err(|e| PyValueError::new_err(format!("a_json decode: {e}")))?;
+        let b: WireBallot = serde_json::from_str(b_json)
+            .map_err(|e| PyValueError::new_err(format!("b_json decode: {e}")))?;
+        let ord = verify_coord::compare_for_merge(
+            &verify_coord::MergeBallot {
+                quorum_weight: a.quorum_weight,
+                signed_timestamp: a.signed_timestamp,
+                canonical_bytes_hash: &a.canonical_bytes_hash,
+            },
+            &verify_coord::MergeBallot {
+                quorum_weight: b.quorum_weight,
+                signed_timestamp: b.signed_timestamp,
+                canonical_bytes_hash: &b.canonical_bytes_hash,
+            },
+        );
+        Ok(match ord {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        })
+    }
+
     /// Federation blob storage: read a blob by SHA-256 (hex).
     ///
     /// Returns `None` when no row exists; otherwise a JSON string of
@@ -16841,6 +16935,10 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // v3.9.1 (CIRISPersist#150 Ask 3) — cohort_scope admission
         // rejection is caller-fault malformed-content; ValueError (4xx).
         crate::federation::Error::CohortScopeRejected { .. } => PyValueError::new_err(kind),
+        // v3.11.0 (CIRISPersist#143) — verify-coord R1/Q1 admission
+        // rejections are caller-fault malformed-content; ValueError (4xx).
+        crate::federation::Error::RegionRejected { .. }
+        | crate::federation::Error::RevocationRollback { .. } => PyValueError::new_err(kind),
         // v2.5.0 (CIRISPersist#102 Ask 4 + Ask 8) — all the new
         // admission-hook rejections are caller-fault malformed-
         // content; ValueError (4xx).

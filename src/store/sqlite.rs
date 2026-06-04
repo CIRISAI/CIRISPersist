@@ -1499,6 +1499,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             }
         }
 
+        // v3.11.0 (CIRISPersist#143) — region closed-set gate +
+        // anti-rollback monotonicity. Both run BEFORE persist_row_hash
+        // is computed and BEFORE INSERT, so a rejected row leaves no
+        // trace (same discipline as v3.9.1 cohort_scope admission).
+        crate::federation::check_observed_region(&row.observed_region)?;
+        check_revocation_anti_rollback_sqlite(&self.conn, &row.revoked_key_id, row.scrub_timestamp)
+            .await?;
+
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
@@ -1517,8 +1525,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     revocation_id, revoked_key_id, revoking_key_id, reason, \
                     revoked_at, effective_at, revocation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
+                    persist_row_hash\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 rusqlite::params![
                     row.revocation_id,
                     row.revoked_key_id,
@@ -1533,6 +1542,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.scrub_key_id,
                     row.scrub_timestamp.to_rfc3339(),
                     row.pqc_completed_at.map(|t| t.to_rfc3339()),
+                    row.observed_region,
                     row.persist_row_hash,
                 ],
             )?;
@@ -1566,7 +1576,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     "SELECT revocation_id, revoked_key_id, revoking_key_id, reason, \
                         revoked_at, effective_at, revocation_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
+                        persist_row_hash \
                      FROM federation_revocations \
                      WHERE revoked_key_id = ?1 \
                      ORDER BY effective_at DESC",
@@ -1716,7 +1727,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     "SELECT revocation_id, revoked_key_id, revoking_key_id, reason, \
                         revoked_at, effective_at, revocation_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
+                        persist_row_hash \
                      FROM federation_revocations WHERE revocation_id = ?1",
                     [&id],
                     sqlite_row_to_revocation,
@@ -5064,6 +5076,7 @@ fn sqlite_row_to_revocation(
     let effective_at: String = row.get("effective_at")?;
     let scrub_timestamp: String = row.get("scrub_timestamp")?;
     let pqc_completed_at: Option<String> = row.get("pqc_completed_at")?;
+    let observed_region: String = row.get("observed_region")?;
     Ok(crate::federation::Revocation {
         revocation_id: row.get("revocation_id")?,
         revoked_key_id: row.get("revoked_key_id")?,
@@ -5078,8 +5091,49 @@ fn sqlite_row_to_revocation(
         scrub_key_id: row.get("scrub_key_id")?,
         scrub_timestamp: parse_rfc3339(&scrub_timestamp),
         pqc_completed_at: pqc_completed_at.as_deref().map(parse_rfc3339),
+        observed_region,
         persist_row_hash: row.get("persist_row_hash")?,
     })
+}
+
+/// v3.11.0 (CIRISPersist#143, F-AV-ROLLBACK closure) — anti-rollback
+/// admission check for sqlite. Reads the latest `scrub_timestamp` for
+/// the target `revoked_key_id`; rejects with
+/// [`crate::federation::Error::RevocationRollback`] if `submitted_ts`
+/// is not strictly later. First revocation against a target always
+/// admits (no prior row → no rollback possible).
+async fn check_revocation_anti_rollback_sqlite(
+    conn: &Arc<Mutex<Connection>>,
+    revoked_key_id: &str,
+    submitted_ts: chrono::DateTime<chrono::Utc>,
+) -> Result<(), crate::federation::Error> {
+    let conn = conn.clone();
+    let revoked_key_id_owned = revoked_key_id.to_owned();
+    let latest = tokio::task::spawn_blocking(move || -> Result<Option<String>, rusqlite::Error> {
+        let conn = conn.blocking_lock();
+        conn.query_row(
+            "SELECT scrub_timestamp FROM federation_revocations \
+             WHERE revoked_key_id = ?1 ORDER BY scrub_timestamp DESC LIMIT 1",
+            rusqlite::params![revoked_key_id_owned],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+    })
+    .await
+    .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+    .map_err(|e| crate::federation::Error::Backend(format!("anti-rollback lookup: {e}")))?;
+
+    if let Some(latest_ts_str) = latest {
+        let existing = parse_rfc3339(&latest_ts_str);
+        if submitted_ts <= existing {
+            return Err(crate::federation::Error::RevocationRollback {
+                revoked_key_id: revoked_key_id.to_owned(),
+                existing_signed_timestamp: existing,
+                submitted_signed_timestamp: submitted_ts,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// v2.10.0 (CIRISPersist#114) — SQLite row → `Goal` projection.
@@ -6762,7 +6816,7 @@ impl crate::read::ReadEngine for SqliteBackend {
                     revoked_at, effective_at, revocation_envelope, \
                     original_content_hash, scrub_signature_classical, \
                     scrub_signature_pqc, scrub_key_id, scrub_timestamp, \
-                    pqc_completed_at, persist_row_hash \
+                    pqc_completed_at, observed_region, persist_row_hash \
              FROM federation_revocations {where_sql} \
              ORDER BY revoked_at DESC, revocation_id DESC LIMIT ?{p_limit}"
         );
@@ -8678,6 +8732,7 @@ mod tests {
             scrub_key_id: scrub_key_id.into(),
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,
+            observed_region: crate::federation::verify_coord::region::US.into(),
             persist_row_hash: String::new(),
         }
     }
@@ -8984,6 +9039,169 @@ mod tests {
         assert_eq!(revs.len(), 1);
         assert_eq!(revs[0].revocation_id, "rev-1");
         assert_eq!(revs[0].persist_row_hash.len(), 64);
+        // v3.11.0 (CIRISPersist#143) — default region round-trips.
+        assert_eq!(
+            revs[0].observed_region,
+            crate::federation::verify_coord::region::US
+        );
+    }
+
+    // ─── v3.11.0 verify-coord R1+Q1 admission tests (#143) ─────────
+
+    /// Region outside the closed-set `{us, eu, apac}` is rejected at
+    /// admission with the typed `RegionRejected` error + stable kind
+    /// token; the row is not stored.
+    #[tokio::test]
+    async fn put_revocation_rejects_out_of_closed_set_region() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("registry-steward", "registry", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-bad", "primitive-bad", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        let mut rev = fed_revocation("rev-eu1", "k-bad", "registry-steward", "registry-steward");
+        rev.observed_region = "us-east-1".into();
+        let err = backend
+            .put_revocation(SignedRevocation { revocation: rev })
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_region_rejected");
+        assert!(
+            matches!(
+                err,
+                crate::federation::Error::RegionRejected { ref observed_region }
+                    if observed_region == "us-east-1"
+            ),
+            "expected RegionRejected, got {err:?}"
+        );
+        // No row persisted.
+        assert!(backend.revocations_for("k-bad").await.unwrap().is_empty());
+    }
+
+    /// Anti-rollback: a second revocation against the same target with
+    /// an earlier-or-equal `signed_timestamp` is rejected BEFORE the
+    /// quorum gate (F-AV-ROLLBACK closure).
+    #[tokio::test]
+    async fn put_revocation_anti_rollback_rejects_non_monotonic_signed_timestamp() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("registry-steward", "registry", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-bad", "primitive-bad", "registry-steward"),
+            })
+            .await
+            .unwrap();
+
+        // First revocation at T0 — admits.
+        let t0: chrono::DateTime<chrono::Utc> = "2026-06-03T12:00:00Z".parse().unwrap();
+        let mut rev0 = fed_revocation("rev-0", "k-bad", "registry-steward", "registry-steward");
+        rev0.scrub_timestamp = t0;
+        backend
+            .put_revocation(SignedRevocation { revocation: rev0 })
+            .await
+            .unwrap();
+
+        // Replay at the same T0 — rolled back (must be strictly later).
+        let mut rev_equal =
+            fed_revocation("rev-equal", "k-bad", "registry-steward", "registry-steward");
+        rev_equal.scrub_timestamp = t0;
+        let err = backend
+            .put_revocation(SignedRevocation {
+                revocation: rev_equal,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_revocation_rollback");
+        assert!(matches!(
+            err,
+            crate::federation::Error::RevocationRollback { .. }
+        ));
+
+        // Earlier T-1 — also rolled back.
+        let t_minus = t0 - chrono::Duration::seconds(1);
+        let mut rev_earlier = fed_revocation(
+            "rev-earlier",
+            "k-bad",
+            "registry-steward",
+            "registry-steward",
+        );
+        rev_earlier.scrub_timestamp = t_minus;
+        let err = backend
+            .put_revocation(SignedRevocation {
+                revocation: rev_earlier,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::federation::Error::RevocationRollback { .. }
+        ));
+
+        // Strictly later T+1 — admits.
+        let t_plus = t0 + chrono::Duration::seconds(1);
+        let mut rev_later =
+            fed_revocation("rev-later", "k-bad", "registry-steward", "registry-steward");
+        rev_later.scrub_timestamp = t_plus;
+        backend
+            .put_revocation(SignedRevocation {
+                revocation: rev_later,
+            })
+            .await
+            .unwrap();
+
+        // Both legitimate rows persisted; the two rejected attempts left
+        // no trace.
+        let revs = backend.revocations_for("k-bad").await.unwrap();
+        assert_eq!(revs.len(), 2);
+        let ids: std::collections::HashSet<&str> =
+            revs.iter().map(|r| r.revocation_id.as_str()).collect();
+        assert!(ids.contains("rev-0"));
+        assert!(ids.contains("rev-later"));
+    }
+
+    /// Non-default region round-trips cleanly (column write + read).
+    #[tokio::test]
+    async fn put_revocation_non_default_region_round_trips() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("registry-steward", "registry", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-bad", "primitive-bad", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        let mut rev = fed_revocation("rev-eu", "k-bad", "registry-steward", "registry-steward");
+        rev.observed_region = crate::federation::verify_coord::region::EU.into();
+        backend
+            .put_revocation(SignedRevocation { revocation: rev })
+            .await
+            .unwrap();
+        let revs = backend.revocations_for("k-bad").await.unwrap();
+        assert_eq!(revs.len(), 1);
+        assert_eq!(
+            revs[0].observed_region,
+            crate::federation::verify_coord::region::EU
+        );
     }
 
     // ─── Admission-gate tests (v2.4.0, CIRISPersist#102 Ask 3) ──────

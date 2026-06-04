@@ -53,6 +53,7 @@ pub mod sqlite_open;
 pub mod topology;
 pub mod trust_grant;
 pub mod types;
+pub mod verify_coord;
 
 /// Base64-string serde codec for `Vec<u8>` byte fields. Mirrors the
 /// private module of the same name in `crate::audit::types` — kept
@@ -77,8 +78,9 @@ pub(crate) mod serde_bytes_b64 {
 }
 
 pub use admission::{
-    check_cohort_scope, AttestationLadderTransitionPolicy, DimensionAdmissionPolicy,
-    DimensionRejectionReason, ReservedPrefixRule, ATTESTATION_LADDER_MECHANISMS,
+    check_cohort_scope, check_observed_region, AttestationLadderTransitionPolicy,
+    DimensionAdmissionPolicy, DimensionRejectionReason, ReservedPrefixRule,
+    ATTESTATION_LADDER_MECHANISMS,
 };
 pub use blackhole::{BlackholeRecord, BlackholeRules, RETICULUM_IDENTITY_HASH_LEN};
 pub use blobs::{
@@ -930,6 +932,45 @@ pub enum Error {
         cohort_scope: String,
     },
 
+    /// v3.11.0 (CIRISPersist#143, CIRISVerify FEDERATION_THREAT_MODEL
+    /// §3.3.2 R1). The submitted revocation's `observed_region` is
+    /// outside the closed set `{us, eu, apac}`. Rejected at admission
+    /// by [`admission::check_observed_region`]; the row is not stored.
+    /// Distinct from [`Error::InvalidArgument`] so consumers can
+    /// pattern-match the region-closed-set rejection deterministically.
+    #[error("observed_region {observed_region:?} is not in the closed set {{us, eu, apac}}")]
+    RegionRejected {
+        /// The rejected `observed_region` value as submitted.
+        observed_region: String,
+    },
+
+    /// v3.11.0 (CIRISPersist#143, CIRISVerify FEDERATION_THREAT_MODEL
+    /// §3.3.2 Q1, F-AV-ROLLBACK closure). The submitted revocation's
+    /// `signed_timestamp` is **not strictly later than** the most-
+    /// recent existing revocation for the same `revoked_key_id`. The
+    /// spec's anti-rollback contract is enforced **at admission**,
+    /// before quorum is asked — a sufficient minority of regions
+    /// cannot ratify a rollback because the rollback never enters the
+    /// quorum gate.
+    ///
+    /// `existing_signed_timestamp` is the latest already-stored
+    /// timestamp the gate compared against; `submitted_signed_timestamp`
+    /// is the rejected row's. Equal timestamps reject too (strictly
+    /// greater is required).
+    #[error(
+        "anti-rollback: revocation for {revoked_key_id:?} signed_timestamp \
+         {submitted_signed_timestamp} is not strictly later than existing \
+         {existing_signed_timestamp}"
+    )]
+    RevocationRollback {
+        /// The `revoked_key_id` the new revocation targets.
+        revoked_key_id: String,
+        /// The latest signed_timestamp already on file for this target.
+        existing_signed_timestamp: chrono::DateTime<chrono::Utc>,
+        /// The submitted (rejected) signed_timestamp.
+        submitted_signed_timestamp: chrono::DateTime<chrono::Utc>,
+    },
+
     /// Backend-level error (DB connection, serialization, etc.).
     /// String-typed because each backend has its own error tree.
     #[error("backend: {0}")]
@@ -966,6 +1007,8 @@ impl Error {
             }
             Error::TrustBelowThreshold { .. } => "federation_trust_below_threshold",
             Error::CohortScopeRejected { .. } => "federation_cohort_scope_rejected",
+            Error::RegionRejected { .. } => "federation_region_rejected",
+            Error::RevocationRollback { .. } => "federation_revocation_rollback",
             Error::Backend(_) => "federation_backend",
         }
     }

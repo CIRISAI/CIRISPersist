@@ -681,6 +681,30 @@ pub fn check_cohort_scope(cohort_scope: &str) -> Result<(), Error> {
     }
 }
 
+/// v3.11.0 (CIRISPersist#143, CIRISVerify FEDERATION_THREAT_MODEL
+/// §3.3.2 R1) — admission-gate validation of the producer-side
+/// `observed_region` field on a revocation.
+///
+/// Rejects any value outside the closed set
+/// `{us, eu, apac}` ([`crate::federation::verify_coord::region::is_valid`])
+/// BEFORE the row is hashed and inserted, so a malformed envelope
+/// leaves no trace. Returns [`Error::RegionRejected`] on a bad value
+/// (stable `kind()` token `federation_region_rejected`).
+///
+/// Application-layer companion to the V058 `CHECK (observed_region IN
+/// (...))` constraint: the constraint is the defense-in-depth backstop
+/// for direct-SQL bypass; this hook produces the typed rejection
+/// consumers pattern-match on.
+pub fn check_observed_region(observed_region: &str) -> Result<(), Error> {
+    if crate::federation::verify_coord::region::is_valid(observed_region) {
+        Ok(())
+    } else {
+        Err(Error::RegionRejected {
+            observed_region: observed_region.to_string(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -599,9 +599,12 @@ async fn av26_concurrent_boot_advisory_lock() {
         errors.join("\n  ")
     );
 
-    // Sanity: schema_history table should have one row per migration
-    // script (V001 + V003 currently). Exactly one set, not N_WORKERS
-    // sets — proves the lock serialized correctly.
+    // Sanity: schema_history table should have one row per embedded
+    // migration script — exactly one set, not N_WORKERS sets — proving
+    // the lock serialized correctly. v3.11.0: count comes from the
+    // backend's `embedded_lens_migration_count()` helper instead of a
+    // hardcoded number, so the test doesn't drift each time a
+    // migration is added.
     let backend = PostgresBackend::connect(&dsn).await.unwrap();
     let client = backend.pool().get().await.unwrap();
     let row = client
@@ -612,10 +615,15 @@ async fn av26_concurrent_boot_advisory_lock() {
         .await
         .expect("schema_history count");
     let count: i64 = row.get(0);
-    assert!(
-        (1..=53).contains(&count),
-        "schema_history has {count} rows; expected 1..=53 (one per migration), \
-         not N_WORKERS×migrations — that would mean the lock didn't hold"
+    let expected = ciris_persist::store::postgres::embedded_lens_migration_count() as i64;
+    assert_eq!(
+        count,
+        expected,
+        "schema_history has {count} rows; expected exactly {expected} (one per \
+         embedded migration). Any other value means either an unexpected migration \
+         landed (count > expected) or the advisory lock didn't hold (would yield \
+         N_WORKERS×{expected} = {} rows).",
+        N_WORKERS as i64 * expected
     );
 
     println!(

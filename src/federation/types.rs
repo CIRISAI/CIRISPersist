@@ -516,14 +516,61 @@ pub struct Revocation {
     /// When the PQC components were attached. `None` while pending.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pqc_completed_at: Option<DateTime<Utc>>,
+
+    /// v3.11.0 (CIRISPersist#143, CIRISVerify FEDERATION_THREAT_MODEL
+    /// §3.3.2 R1) — region that first observed this revocation
+    /// (closed set: `us` / `eu` / `apac`, see
+    /// [`crate::federation::verify_coord::region`]). Drives the Q1
+    /// quorum-write tracking + R1 τ_propagate accounting.
+    ///
+    /// `#[serde(default, skip_serializing_if = …)]`: the default
+    /// value [`crate::federation::verify_coord::region::US`] is
+    /// skipped from canonical bytes so pre-v3.11 rows (which had no
+    /// region field) and explicit `us` rows hash identically — the
+    /// same backward-compat discipline v3.9.0 used for `cohort_scope`.
+    #[serde(
+        default = "default_observed_region",
+        skip_serializing_if = "is_default_observed_region"
+    )]
+    pub observed_region: String,
+
     /// **Server-computed.** See [`KeyRecord::persist_row_hash`].
     pub persist_row_hash: String,
+}
+
+fn default_observed_region() -> String {
+    crate::federation::verify_coord::region::US.to_owned()
+}
+
+fn is_default_observed_region(s: &str) -> bool {
+    s == crate::federation::verify_coord::region::US
 }
 
 impl Revocation {
     /// True iff PQC components have been attached.
     pub fn is_pqc_complete(&self) -> bool {
         self.scrub_signature_pqc.is_some() && self.pqc_completed_at.is_some()
+    }
+
+    /// v3.11.0 (CIRISPersist#143) — the **signed_timestamp** the Q1
+    /// merge comparator reads (tier 2). Mapped from
+    /// [`Revocation::scrub_timestamp`], the timestamp pinned into the
+    /// signed scrub envelope.
+    ///
+    /// Exposed as a named accessor so the spec mapping
+    /// (`signed_timestamp` in CIRISVerify FEDERATION_THREAT_MODEL
+    /// §3.3.2) is verbatim in the substrate API, without storing the
+    /// same value twice on the row.
+    pub fn signed_timestamp(&self) -> DateTime<Utc> {
+        self.scrub_timestamp
+    }
+
+    /// v3.11.0 (CIRISPersist#143) — the **canonical_bytes_hash** the
+    /// Q1 merge comparator reads (tier 3, deterministic tie-break).
+    /// Mapped from [`Revocation::original_content_hash`], the hex
+    /// SHA-256 of the canonical revocation envelope.
+    pub fn canonical_bytes_hash(&self) -> &str {
+        &self.original_content_hash
     }
 }
 

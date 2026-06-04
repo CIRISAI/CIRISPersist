@@ -2442,6 +2442,7 @@ mod tests {
             scrub_key_id: scrub_key_id.into(),
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,
+            observed_region: crate::federation::verify_coord::region::US.into(),
             persist_row_hash: String::new(),
         }
     }

@@ -47,6 +47,19 @@ mod embedded {
     refinery::embed_migrations!("migrations/postgres/lens");
 }
 
+/// v3.11.0 — count of embedded `migrations/postgres/lens/*` scripts
+/// the backend ships. Public so the `av26_concurrent_boot_advisory_lock`
+/// QA harness can assert on the live migration set instead of a
+/// hardcoded number that drifts each release.
+///
+/// Returns the same count refinery walks at runtime —
+/// `embedded::migrations::runner().get_migrations().len()` — and is
+/// stable as long as the `embed_migrations!` macro stays sourced
+/// from the same directory.
+pub fn embedded_lens_migration_count() -> usize {
+    embedded::migrations::runner().get_migrations().len()
+}
+
 /// Postgres advisory-lock namespace for the migration phase.
 ///
 /// `pg_advisory_lock(bigint)` takes a single int8; the bytes spell
@@ -1702,12 +1715,19 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             }
         }
 
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-
+        // v3.11.0 (CIRISPersist#143) — region closed-set gate +
+        // anti-rollback monotonicity. Both run BEFORE persist_row_hash
+        // is computed and BEFORE INSERT (same discipline as v3.9.1
+        // cohort_scope admission).
+        crate::federation::check_observed_region(&row.observed_region)?;
         let client = self
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        check_revocation_anti_rollback_postgres(&client, &row.revoked_key_id, row.scrub_timestamp)
+            .await?;
+
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
             crate::federation::Error::InvalidArgument(format!(
@@ -1733,8 +1753,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     revocation_id, revoked_key_id, revoking_key_id, reason, \
                     revoked_at, effective_at, revocation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
+                    persist_row_hash\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
                 &[
                     &revocation_uuid,
                     &row.revoked_key_id,
@@ -1749,6 +1770,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.scrub_key_id,
                     &row.scrub_timestamp,
                     &row.pqc_completed_at,
+                    &row.observed_region,
                     &row.persist_row_hash,
                 ],
             )
@@ -1779,7 +1801,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "SELECT revocation_id::text, revoked_key_id, revoking_key_id, reason, \
                     revoked_at, effective_at, revocation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, persist_row_hash \
                  FROM cirislens.federation_revocations \
                  WHERE revoked_key_id = $1 \
                  ORDER BY effective_at DESC",
@@ -1924,7 +1946,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "SELECT revocation_id::text, revoked_key_id, revoking_key_id, reason, \
                     revoked_at, effective_at, revocation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, persist_row_hash \
                  FROM cirislens.federation_revocations WHERE revocation_id = $1::uuid",
                 &[&revocation_id],
             )
@@ -4851,8 +4873,42 @@ fn pg_row_to_revocation(
         scrub_key_id: row.safe_get_with("scrub_key_id", mk_err)?,
         scrub_timestamp: row.safe_get_with("scrub_timestamp", mk_err)?,
         pqc_completed_at: row.safe_get_with("pqc_completed_at", mk_err)?,
+        observed_region: row.safe_get_with("observed_region", mk_err)?,
         persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
     })
+}
+
+/// v3.11.0 (CIRISPersist#143, F-AV-ROLLBACK closure) — anti-rollback
+/// admission check for postgres. Reads the latest `scrub_timestamp`
+/// for the target `revoked_key_id`; rejects with
+/// [`crate::federation::Error::RevocationRollback`] if `submitted_ts`
+/// is not strictly later. First revocation against a target always
+/// admits (no prior row → no rollback possible).
+async fn check_revocation_anti_rollback_postgres(
+    client: &deadpool_postgres::Object,
+    revoked_key_id: &str,
+    submitted_ts: chrono::DateTime<chrono::Utc>,
+) -> Result<(), crate::federation::Error> {
+    let row = client
+        .query_opt(
+            "SELECT scrub_timestamp FROM cirislens.federation_revocations \
+             WHERE revoked_key_id = $1 ORDER BY scrub_timestamp DESC LIMIT 1",
+            &[&revoked_key_id],
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("anti-rollback lookup: {e}")))?;
+
+    if let Some(r) = row {
+        let existing: chrono::DateTime<chrono::Utc> = r.get(0);
+        if submitted_ts <= existing {
+            return Err(crate::federation::Error::RevocationRollback {
+                revoked_key_id: revoked_key_id.to_owned(),
+                existing_signed_timestamp: existing,
+                submitted_signed_timestamp: submitted_ts,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// v2.10.0 (CIRISPersist#114) — Postgres row → [`crate::federation::Goal`].
@@ -6662,7 +6718,7 @@ impl crate::read::ReadEngine for PostgresBackend {
             "SELECT revocation_id::text AS revocation_id, revoked_key_id, revoking_key_id, reason, \
                     revoked_at, effective_at, revocation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, persist_row_hash \
              FROM cirislens.federation_revocations \
              {where_sql} \
              ORDER BY revoked_at DESC, revocation_id DESC \
@@ -10397,6 +10453,7 @@ mod tests {
             scrub_key_id: revoking_id.clone(),
             scrub_timestamp: now,
             pqc_completed_at: None,
+            observed_region: crate::federation::verify_coord::region::US.into(),
             persist_row_hash: String::new(),
         };
         backend
@@ -13679,6 +13736,7 @@ mod tests {
                     scrub_key_id: steward.clone(),
                     scrub_timestamp: chrono::Utc::now(),
                     pqc_completed_at: None,
+                    observed_region: crate::federation::verify_coord::region::US.into(),
                     persist_row_hash: String::new(),
                 },
             })
