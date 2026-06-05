@@ -40,17 +40,20 @@
 
 // Trait surfaces consumers compose against. Federation peers
 // implement against these, not concrete backend types.
+pub use crate::ceg::ReadEngine;
 pub use crate::derived::DerivedSchema;
 pub use crate::federation::FederationDirectory;
 pub use crate::outbound::OutboundQueue;
-pub use crate::read::ReadEngine;
 pub use crate::store::Backend;
 
 // Federation read primitive types (v0.5.0, CIRISPersist#23).
 // Sections A/B/F/E ship in v0.5.0 — trace listing, trace detail,
 // Coherence Ratchet inputs, scoring factor aggregates. Sections
 // C/D/G/H/I land in v0.5.1 after lens validates the v0.5.0 batch.
-pub use crate::read::{
+//
+// v4.0 (FSD §3): these re-exports follow the read surface to its new
+// `crate::ceg` home; the exported names are unchanged.
+pub use crate::ceg::{
     AuditChainAggregate, CoherencePoint, DeviationMetric, DivergenceRow, HashChainGap,
     OverrideRateRow, RecoveryEvent, ScoringFactorAggregate, TemporalDriftRow, TimeWindow,
     TraceComponentRow, TraceCursor, TraceDetail, TraceEnvelopeRefs, TraceFilter, TraceListPage,

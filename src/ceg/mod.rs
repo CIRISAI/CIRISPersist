@@ -1,0 +1,399 @@
+//! CEG (Coherence Epistemic Graph) read surface — typed read primitives
+//! for lens, lens-core, and sovereign-mode agents (v0.5.0+,
+//! CIRISPersist#23).
+//!
+//! # v4.0 reorganization (FSD §3)
+//!
+//! v4.0 rehomes the v3.x `src/read/` modules under topic-named `ceg/`
+//! namespaces. This commit (the "module reorg" cut) is a **pure
+//! mechanical move + re-export** — no behaviour change. The flat
+//! re-exports below preserve every type the v3.x surface exposed, and
+//! `crate::read` remains a thin façade shim that re-exports this module
+//! so existing `crate::read::*` / `ciris_persist::read::*` import paths
+//! still resolve. The CallerScope / Filter / Aggregate / Cache
+//! primitives the FSD §4–§7 describe land in LATER v4.0 commits.
+//!
+//! Topic axis ages better than version axis as the CEG accumulates —
+//! CEG version provenance lives in each module's header doc + `git log`,
+//! not in directory names (FSD §3.1).
+//!
+//! # Mission alignment (MISSION.md §2 — read surface)
+//!
+//! Persist holds the substrate; consumers compose policy. This module
+//! defines the [`ReadEngine`] trait — typed read primitives covering
+//! the surfaces lens, lens-core, and sovereign-mode agents need to
+//! retire the historical `cirislens_reader` direct-SQL carve-out
+//! ([`crate::store::Backend::fetch_trace_events_page`] docstring names
+//! that carve-out; v0.5.0 onward replaces it).
+//!
+//! ## Surface duality (CIRISPersist v0.4.1 precedent)
+//!
+//! Each primitive lands as **both**:
+//!
+//! - **Rust-public**: trait method on [`ReadEngine`] (this file) +
+//!   re-exported through [`crate::prelude`]. Lens-core (Rust rlib path)
+//!   and sovereign-mode agents (in-process Rust) consume these directly.
+//! - **PyO3**: thin wrapper on `Engine` (lens FastAPI / sovereign-mode
+//!   Python path). Same shape `verify_hybrid_via_directory` established
+//!   in v0.4.1.
+//!
+//! Single source of truth — no Python-only reimplementation drifting
+//! from Rust.
+//!
+//! ## Audience
+//!
+//! Three consumer tiers, all with the same surface:
+//!
+//! 1. **Lens API (Python, PyO3 path)** — drives `/repository/traces`,
+//!    `/coherence-ratchet/*`, scoring endpoints, dashboards.
+//! 2. **CIRISLensCore (Rust rlib path)** — same primitives, same single-
+//!    source-of-truth pattern.
+//! 3. **Sovereign-mode agents (PyO3 self-read)** — compute their own
+//!    scores locally, observe their own drift, verify their own peers.
+//!    No centralization assumed.
+//!
+//! ## Scope by release
+//!
+//! - **v0.5.0** — Sections A (trace listing) + B (trace detail) +
+//!   F (Coherence Ratchet inputs) + E (scoring factor aggregates),
+//!   per `FSD/V0_5_0_FEDERATION_READ_PRIMITIVES.md`.
+//! - **v0.5.5** — Remaining sections from CIRISPersist#23: C (task-
+//!   grouped listing), D (LLM call surface), G (corpus shape),
+//!   H (privacy / scrub observability), I (federation observability
+//!   bulk lists). Additive only; no schema changes. Issue closed.
+//!
+//! ## Cursor pagination contract
+//!
+//! All list primitives return [`TraceCursor`]-backed pages. No
+//! `OFFSET/LIMIT`. Same shape v0.2.0's
+//! [`crate::store::Backend::fetch_trace_events_page`] established for
+//! per-row cursors; the read primitives use `(ts, trace_id)` tuple
+//! cursors for per-trace ordering.
+//!
+//! ## Threat-model invariants
+//!
+//! - **AV-9 (cross-agent dedup)** — every trace-scoped read carries
+//!   `agent_id_hash` in the result so callers can authorize at their
+//!   layer. A malicious peer cannot read another peer's traces via
+//!   `trace_id` alone.
+//! - **AV-15 (FFI sanitization)** — error kinds use closed-set
+//!   `&'static str` tokens; no attacker-controlled strings cross the
+//!   boundary.
+//! - **AV-43 (read-side adversary)** — added to THREAT_MODEL.md in
+//!   v0.5.0. Aggregates return computed statistics, not per-trace
+//!   content; smallest-window callers apply k-anonymity policy at
+//!   their layer.
+
+use std::future::Future;
+
+// ── Topic namespaces (FSD §3.1) ────────────────────────────────────
+
+pub mod aggregates;
+pub mod list;
+pub mod types;
+
+// Placeholder topic homes — staked out this commit so later v4.0 cuts
+// (CallerScope predicate, identity/family/community reads, streaming,
+// the structural-invisibility gate) have a module to land in.
+pub mod cohort_scope;
+pub mod community;
+pub mod family;
+pub mod identity;
+pub mod streaming;
+pub mod structural_invisibility;
+
+// ── Flat re-exports (FSD §3.2 — the surface consumers use) ──────────
+//
+// The topic subpath documents subject area; this flat re-export is the
+// public surface. These names match the v3.x `crate::read::*` exports
+// exactly so the move is behaviour-neutral.
+
+pub use aggregates::corpus::{CorpusShape, CorpusShapeFilter};
+pub use aggregates::llm::{
+    AgentCostStats, DomainCostStats, LlmCostAggregate, ModelCostStats, TotalCostStats,
+};
+pub use aggregates::scoring::{
+    AuditChainAggregate, CoherencePoint, DivergenceRow, HashChainGap, OverrideRateRow,
+    RecoveryEvent, ScoringFactorAggregate, TemporalDriftRow,
+};
+pub use aggregates::scrub::ScrubAggregate;
+pub use list::federation::{
+    AttestationCursor, AttestationFilter, AttestationListPage, FederationKeyCursor,
+    FederationKeyFilter, FederationKeyListPage, RevocationCursor, RevocationFilter,
+    RevocationListPage,
+};
+pub use list::llm::{LlmCallCursor, LlmCallFilter, LlmCallListPage};
+pub use list::tasks::{TaskClass, TaskCursor, TaskFilter, TaskGroup, TaskListPage};
+pub use list::traces::{
+    TraceComponentRow, TraceDetail, TraceEnvelopeRefs, TraceListPage, TraceSummary,
+};
+pub use types::{DeviationMetric, TimeWindow, TraceCursor, TraceFilter};
+
+/// Federation read primitives — typed read surface lens / lens-core /
+/// sovereign agents consume.
+///
+/// Every method is async; the futures are constrained `Send` so backends
+/// can be used from `tokio::spawn`-style multi-threaded contexts (matches
+/// [`crate::store::Backend`] / [`crate::federation::FederationDirectory`]
+/// / [`crate::derived::DerivedSchema`] convention).
+///
+/// Backends that don't implement a given primitive (Memory backend for
+/// most SQL-heavy aggregates; SQLite for the v0.5.0 batch) return
+/// [`Error::NotImplemented`] rather than panicking — callers handle
+/// "this backend can't do that" as a typed error.
+pub trait ReadEngine: Send + Sync {
+    // ── Section A — Trace listing (CIRISPersist#23 §A) ─────────────
+
+    /// Page through trace summaries. Each [`TraceSummary`] is one row
+    /// per `trace_id` with denormalized DMA / conscience / action /
+    /// cost fields synthesized from the trace's component rows.
+    ///
+    /// Drives `/repository/traces`, dashboards, scoring corpus filters.
+    /// Cursor-paged; no OFFSET/LIMIT.
+    fn list_trace_summaries(
+        &self,
+        filter: TraceFilter,
+        cursor: Option<TraceCursor>,
+        limit: i64,
+    ) -> impl Future<Output = Result<TraceListPage, Error>> + Send;
+
+    /// Single-trace summary lookup. Returns `None` if the trace_id
+    /// isn't in the backing store.
+    fn get_trace_summary(
+        &self,
+        trace_id: &str,
+    ) -> impl Future<Output = Result<Option<TraceSummary>, Error>> + Send;
+
+    // ── Section B — Trace detail (CIRISPersist#23 §B) ──────────────
+
+    /// Full trace reconstruction: summary + all per-component data
+    /// (ordered by `ts`) + LLM call rows (chronological) + the
+    /// envelope-level scrub + signature refs.
+    ///
+    /// Drives `/repository/traces/{trace_id}` and trace-detail
+    /// explorers. Single round-trip; not paged (one trace fits in
+    /// one round-trip per spec).
+    fn get_trace_detail(
+        &self,
+        trace_id: &str,
+    ) -> impl Future<Output = Result<Option<TraceDetail>, Error>> + Send;
+
+    // ── Section C — Task-grouped listing (CIRISPersist#23 §C) ──────
+
+    /// Page through tasks, each task carrying its component traces.
+    /// Drives task-axis views (qa-eval / discord / wakeup-ritual /
+    /// real-user pages) where the visible-page axis is task, not trace.
+    ///
+    /// Task ordering: `earliest_at DESC, task_id DESC` (newest-first
+    /// triage). Trace ordering within a task: `thought_depth ASC`
+    /// then `started_at ASC`. Cursor-paged; no OFFSET/LIMIT.
+    ///
+    /// `task_class` derivation is canonical via [`TaskClass::from_task_id`]
+    /// — every federation peer sees the same class for a given task_id.
+    fn list_tasks(
+        &self,
+        filter: TaskFilter,
+        cursor: Option<TaskCursor>,
+        limit: i64,
+    ) -> impl Future<Output = Result<TaskListPage, Error>> + Send;
+
+    // ── Section D — LLM call surface (CIRISPersist#23 §D) ──────────
+
+    /// Page through LLM call rows on `cirislens.trace_llm_calls`.
+    /// Used by cost / latency / model-breakdown dashboards and
+    /// prompt-hash analysis. Cursor-paged; newest-first.
+    fn list_llm_calls(
+        &self,
+        filter: LlmCallFilter,
+        cursor: Option<LlmCallCursor>,
+        limit: i64,
+    ) -> impl Future<Output = Result<LlmCallListPage, Error>> + Send;
+
+    /// Roll up LLM call costs by model, by agent, by deployment
+    /// domain, plus window-level totals. Replaces the lens-side raw
+    /// SQL cost-aggregation pass.
+    fn aggregate_llm_costs(
+        &self,
+        filter: LlmCallFilter,
+    ) -> impl Future<Output = Result<LlmCostAggregate, Error>> + Send;
+
+    // ── Section G — Corpus shape (CIRISPersist#23 §G) ──────────────
+
+    /// Corpus-shape rollup for a window. Returns distinct-trace
+    /// counts broken down by task_class, QA language / question num,
+    /// agent name + template, primary model, deployment region.
+    /// Drives `scripts/corpus_shape.py` and cohort dashboards.
+    fn corpus_shape(
+        &self,
+        filter: CorpusShapeFilter,
+    ) -> impl Future<Output = Result<CorpusShape, Error>> + Send;
+
+    // ── Section H — Privacy / scrub observability (CIRISPersist#23 §H) ──
+
+    /// Scrub-stats aggregate for a window. Drives privacy dashboards.
+    /// `envelopes_scrubbed` + `by_trace_level` are populated from
+    /// `cirislens.trace_events.pii_scrubbed`;
+    /// `fields_scrubbed_total` + `by_entity_type` are gated on the
+    /// v0.6.0 post-ingest classification pipeline (CIRISPersist#19).
+    fn aggregate_scrub_stats(
+        &self,
+        window: TimeWindow,
+    ) -> impl Future<Output = Result<ScrubAggregate, Error>> + Send;
+
+    // ── Section I — Federation observability bulk (CIRISPersist#23 §I) ──
+
+    /// Page through `cirislens.federation_keys`. Cursor-paged
+    /// newest-first by `(valid_from DESC, key_id DESC)`. Filters
+    /// compose AND-style; `revoked` and `pqc_completed` are SQL-side
+    /// EXISTS predicates / `pqc_completed_at IS NULL` checks.
+    fn list_federation_keys(
+        &self,
+        filter: FederationKeyFilter,
+        cursor: Option<FederationKeyCursor>,
+        limit: i64,
+    ) -> impl Future<Output = Result<FederationKeyListPage, Error>> + Send;
+
+    /// Page through `cirislens.federation_attestations`. Newest-first
+    /// by `(asserted_at, attestation_id)`.
+    fn list_attestations(
+        &self,
+        filter: AttestationFilter,
+        cursor: Option<AttestationCursor>,
+        limit: i64,
+    ) -> impl Future<Output = Result<AttestationListPage, Error>> + Send;
+
+    /// Page through `cirislens.federation_revocations`. Newest-first
+    /// by `(revoked_at, revocation_id)`.
+    fn list_revocations(
+        &self,
+        filter: RevocationFilter,
+        cursor: Option<RevocationCursor>,
+        limit: i64,
+    ) -> impl Future<Output = Result<RevocationListPage, Error>> + Send;
+
+    // ── Section F — Coherence Ratchet inputs (CIRISPersist#23 §F) ──
+
+    /// Cross-agent divergence z-scores within a deployment domain.
+    /// Lens computes detection from these inputs; persist provides
+    /// the windowed peer-mean reference.
+    fn cross_agent_divergence(
+        &self,
+        deployment_domain: &str,
+        window: TimeWindow,
+        metric: DeviationMetric,
+    ) -> impl Future<Output = Result<Vec<DivergenceRow>, Error>> + Send;
+
+    /// Temporal drift between a baseline window and a comparison
+    /// window for a single agent. Returns one row per metric.
+    fn temporal_drift(
+        &self,
+        agent_id_hash: &str,
+        baseline: TimeWindow,
+        comparison: TimeWindow,
+    ) -> impl Future<Output = Result<Vec<TemporalDriftRow>, Error>> + Send;
+
+    /// Hash-chain gaps over a window — sequence-number discontinuities
+    /// in the agent's audit_log timeline. Each gap is `(start, end)`.
+    fn hash_chain_gaps(
+        &self,
+        agent_id_hash: &str,
+        window: TimeWindow,
+    ) -> impl Future<Output = Result<Vec<HashChainGap>, Error>> + Send;
+
+    /// Conscience-override rates per agent within a deployment domain,
+    /// with the domain-average reference for ratio computation.
+    fn conscience_override_rates(
+        &self,
+        deployment_domain: &str,
+        window: TimeWindow,
+    ) -> impl Future<Output = Result<Vec<OverrideRateRow>, Error>> + Send;
+
+    // ── Section E — Scoring factor aggregates (CIRISPersist#23 §E) ─
+
+    /// One bundled aggregate primitive returning everything any
+    /// single CIRIS Capacity Score factor calculation needs in one
+    /// DB round-trip. Composes the granular sub-primitives below.
+    ///
+    /// `baseline_window` is optional — when provided, the
+    /// `drift_z_score` field is computed against the baseline; when
+    /// absent, drift is `None`.
+    fn aggregate_scoring_factors(
+        &self,
+        agent_id_hash: &str,
+        window: TimeWindow,
+        baseline_window: Option<TimeWindow>,
+    ) -> impl Future<Output = Result<ScoringFactorAggregate, Error>> + Send;
+
+    /// Batch variant: fleet-wide score sweep in one round-trip.
+    /// Returns one [`ScoringFactorAggregate`] per agent in input order.
+    fn aggregate_scoring_factors_batch(
+        &self,
+        agent_id_hashes: &[String],
+        window: TimeWindow,
+        baseline_window: Option<TimeWindow>,
+    ) -> impl Future<Output = Result<Vec<ScoringFactorAggregate>, Error>> + Send;
+
+    /// Granular: count traces matching a filter. Used by analysts
+    /// composing narrower questions than the bundled aggregate.
+    fn count_traces(&self, filter: TraceFilter) -> impl Future<Output = Result<i64, Error>> + Send;
+
+    /// Granular: count conscience overrides matching a filter.
+    fn count_overrides(
+        &self,
+        filter: TraceFilter,
+    ) -> impl Future<Output = Result<i64, Error>> + Send;
+
+    /// Granular: count identity changes (agent_id_hash transitions
+    /// per agent_name) matching a filter.
+    fn count_identity_changes(
+        &self,
+        filter: TraceFilter,
+    ) -> impl Future<Output = Result<i64, Error>> + Send;
+
+    /// Granular: audit-chain aggregate (total signed entries +
+    /// detected gaps) for a filter window.
+    fn aggregate_audit_chain(
+        &self,
+        filter: TraceFilter,
+    ) -> impl Future<Output = Result<AuditChainAggregate, Error>> + Send;
+}
+
+/// Read-primitive errors. Distinct from [`crate::store::Error`] — read
+/// primitives have their own typed failure surface for cursor parse,
+/// invalid window, etc.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// Caller passed invalid arguments (malformed cursor, inverted
+    /// time window, empty agent_id_hash list, negative limit, etc.).
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+
+    /// Cursor failed to parse / is from an incompatible version.
+    #[error("invalid cursor: {0}")]
+    InvalidCursor(String),
+
+    /// Backend-level error (DB connection, serialization, etc.).
+    /// String-typed because each backend has its own error tree.
+    #[error("backend: {0}")]
+    Backend(String),
+
+    /// Surface declared on the trait but the backend doesn't yet
+    /// implement it. Memory + Phase-1 SQLite return this for the
+    /// SQL-heavy primitives.
+    #[error("not implemented: {0}")]
+    NotImplemented(&'static str),
+}
+
+impl Error {
+    /// Stable string-token for telemetry / structured logging.
+    /// THREAT_MODEL.md AV-15: this is what crosses HTTP / PyO3
+    /// boundaries; verbose `Display` form goes to tracing only.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Error::InvalidArgument(_) => "read_invalid_argument",
+            Error::InvalidCursor(_) => "read_invalid_cursor",
+            Error::Backend(_) => "read_backend",
+            Error::NotImplemented(_) => "read_not_implemented",
+        }
+    }
+}

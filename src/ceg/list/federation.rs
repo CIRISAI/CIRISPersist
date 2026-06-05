@@ -1,5 +1,7 @@
 //! Section I — Federation observability bulk primitives.
 //!
+//! Moved from `src/read/federation.rs` in v4.0 (FSD §3.3).
+//!
 //! The existing federation directory primitives (`lookup_public_key`,
 //! `list_attestations_for`, `revocations_for`) are point-lookup
 //! shaped — keyed on a single identity or key_id. Monitoring dashboards
@@ -8,11 +10,11 @@
 //!
 //! Three list primitives, each cursor-paged newest-first:
 //!
-//! - [`super::ReadEngine::list_federation_keys`] — over
+//! - [`crate::ceg::ReadEngine::list_federation_keys`] — over
 //!   `cirislens.federation_keys`.
-//! - [`super::ReadEngine::list_attestations`] — over
+//! - [`crate::ceg::ReadEngine::list_attestations`] — over
 //!   `cirislens.federation_attestations`.
-//! - [`super::ReadEngine::list_revocations`] — over
+//! - [`crate::ceg::ReadEngine::list_revocations`] — over
 //!   `cirislens.federation_revocations`.
 //!
 //! Item types reuse the existing [`crate::federation::KeyRecord`],
@@ -26,7 +28,7 @@ use crate::federation::{Attestation, KeyRecord, Revocation};
 
 // ─── Federation keys ───────────────────────────────────────────────
 
-/// Filter for [`super::ReadEngine::list_federation_keys`]. Composes
+/// Filter for [`crate::ceg::ReadEngine::list_federation_keys`]. Composes
 /// AND-style; every field is optional.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FederationKeyFilter {
@@ -67,7 +69,7 @@ pub struct FederationKeyFilter {
     pub cohort_scope: Option<String>,
 }
 
-/// Opaque cursor for [`super::ReadEngine::list_federation_keys`].
+/// Opaque cursor for [`crate::ceg::ReadEngine::list_federation_keys`].
 ///
 /// Ordered by `(valid_from DESC, key_id DESC)` — newest-registered
 /// first. Tuple cursor for unique tiebreak.
@@ -103,7 +105,7 @@ pub struct FederationKeyListPage {
 
 // ─── Attestations ──────────────────────────────────────────────────
 
-/// Filter for [`super::ReadEngine::list_attestations`]. Composes
+/// Filter for [`crate::ceg::ReadEngine::list_attestations`]. Composes
 /// AND-style.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttestationFilter {
@@ -121,7 +123,7 @@ pub struct AttestationFilter {
     pub pqc_completed: Option<bool>,
 }
 
-/// Opaque cursor for [`super::ReadEngine::list_attestations`].
+/// Opaque cursor for [`crate::ceg::ReadEngine::list_attestations`].
 ///
 /// Ordered by `(asserted_at DESC, attestation_id DESC)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,7 +158,7 @@ pub struct AttestationListPage {
 
 // ─── Revocations ───────────────────────────────────────────────────
 
-/// Filter for [`super::ReadEngine::list_revocations`]. Composes
+/// Filter for [`crate::ceg::ReadEngine::list_revocations`]. Composes
 /// AND-style.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RevocationFilter {
@@ -170,7 +172,7 @@ pub struct RevocationFilter {
     pub pqc_completed: Option<bool>,
 }
 
-/// Opaque cursor for [`super::ReadEngine::list_revocations`].
+/// Opaque cursor for [`crate::ceg::ReadEngine::list_revocations`].
 ///
 /// Ordered by `(revoked_at DESC, revocation_id DESC)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

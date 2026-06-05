@@ -41,6 +41,10 @@
 pub mod audit;
 #[cfg(feature = "cirisnode")]
 pub mod cirisnode;
+// v4.0 (FSD §3) — CEG topic-namespace read surface. The v3.x `read`
+// modules rehome here; `pub mod read` below stays as a façade shim
+// re-exporting `ceg` until the later v4.0 commit removes it.
+pub mod ceg;
 // v3.12.x (CIRISPersist#156) — diagnostic harness panic hook.
 // Compiled only under `--features debug-tools`; release wheels ship
 // without this module. See src/debug/mod.rs + tools/README.md.
