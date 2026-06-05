@@ -7189,6 +7189,104 @@ impl crate::read::ReadEngine for PostgresBackend {
         Ok(crate::read::AttestationListPage { items, next_cursor })
     }
 
+    /// #135 + part of #150 — list every attestation whose subject is
+    /// `target` (`attested_key_id = target`), newest-first, cursor-paged.
+    /// Scope-gates (§4.3) on the attestation's own `(cohort_scope,
+    /// attested_key_id)` — `attested_key_id` is the cohort-membership
+    /// target (V056 added `cohort_scope` only; there is no separate
+    /// `cohort_target_id` column on `federation_attestations`, so the
+    /// subject doubles as the membership target, mirroring
+    /// `list_attestations`). Uses
+    /// `idx_federation_attestations_v060_by_target
+    /// (attested_key_id, cohort_scope, asserted_at DESC)`.
+    async fn list_attestations_for(
+        &self,
+        target: &str,
+        cursor: Option<crate::read::AttestationCursor>,
+        limit: i64,
+        scope: crate::scope::CallerScope,
+    ) -> Result<crate::read::AttestationListPage, crate::read::Error> {
+        if !(1..=10_000).contains(&limit) {
+            return Err(crate::read::Error::InvalidArgument(format!(
+                "limit must be in [1, 10000], got {limit}"
+            )));
+        }
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
+
+        let mut where_parts: Vec<String> = Vec::new();
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        // The by-target predicate — the leading index column.
+        params.push(Box::new(target.to_owned()));
+        where_parts.push(format!("attested_key_id = ${}", params.len()));
+        // §4.3 scope gate on the attestation's own cohort_scope /
+        // attested_key_id (subject doubles as membership target).
+        {
+            let (frag, sparams) = crate::store::scope_bind::scope_predicate_pg(
+                &scope,
+                "cohort_scope",
+                "attested_key_id",
+                params.len(),
+            );
+            where_parts.push(frag);
+            params.extend(sparams);
+        }
+        if let Some(c) = &cursor {
+            if c.version != "v1" {
+                return Err(crate::read::Error::InvalidCursor(format!(
+                    "AttestationCursor version {} unsupported; v0.5.5 ships v1",
+                    c.version
+                )));
+            }
+            params.push(Box::new(c.last_asserted_at));
+            let p_at = params.len();
+            params.push(Box::new(c.last_attestation_id.clone()));
+            let p_id = params.len();
+            where_parts.push(format!(
+                "(asserted_at, attestation_id::text) < (${p_at}, ${p_id})"
+            ));
+        }
+        let where_sql = format!("WHERE {}", where_parts.join(" AND "));
+        params.push(Box::new(limit));
+        let p_limit = params.len();
+        let sql = format!(
+            // weight::float8 — NUMERIC has no native ToSql/FromSql f64
+            // round-trip in tokio_postgres; cast at the DB so the row
+            // decoder reads an f8.
+            "SELECT attestation_id::text AS attestation_id, attesting_key_id, attested_key_id, \
+                    attestation_type, weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope \
+             FROM cirislens.federation_attestations \
+             {where_sql} \
+             ORDER BY asserted_at DESC, attestation_id DESC \
+             LIMIT ${p_limit}"
+        );
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let rows = client
+            .query(&sql, &params_ref[..])
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("list_attestations_for: {e}")))?;
+        let items: Result<Vec<crate::federation::Attestation>, crate::federation::Error> =
+            rows.into_iter().map(pg_row_to_attestation).collect();
+        let items =
+            items.map_err(|e| crate::read::Error::Backend(format!("decode Attestation: {e}")))?;
+        let next_cursor = if items.len() == limit as usize {
+            let last = &items[items.len() - 1];
+            Some(crate::read::AttestationCursor::from_trailing(
+                last.asserted_at,
+                last.attestation_id.clone(),
+            ))
+        } else {
+            None
+        };
+        Ok(crate::read::AttestationListPage { items, next_cursor })
+    }
+
     /// Section I: list federation_revocations.
     async fn list_revocations(
         &self,
@@ -17144,5 +17242,148 @@ mod tests {
                 "every chain entry must be content_rating:* — got {dim:?}"
             );
         }
+    }
+
+    // #135 + part of #150 — list_attestations_for on Postgres: by-target
+    // filtering, newest-first, cursor paging, and the §4.3 scope gate.
+    // Backend parity with the SQLite
+    // `re_list_attestations_for_by_target_scope_and_cursor` test — same
+    // target + scope variants yield the same logical page shape. Gated
+    // behind CIRIS_PERSIST_TEST_PG_URL; skipped when unset.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn parity_list_attestations_for_scope_variants() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        use crate::federation::FederationDirectory;
+        use crate::read::ReadEngine;
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        // Unique keys per run so the shared test DB stays parallel-safe.
+        let suffix = uuid_like();
+        let emit_a = format!("emit-a-{suffix}");
+        let tgt_1 = format!("tgt-1-{suffix}");
+        let tgt_2 = format!("tgt-2-{suffix}");
+        for (id, iref) in [
+            (&emit_a, "primitive-a"),
+            (&tgt_1, "primitive-t1"),
+            (&tgt_2, "primitive-t2"),
+        ] {
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord {
+                    record: pg_admission_key(
+                        id,
+                        iref,
+                        crate::federation::types::identity_type::AGENT,
+                    ),
+                })
+                .await
+                .unwrap();
+        }
+
+        // mk: a scored attestation targeting `attested` with an explicit
+        // asserted_at + cohort_scope.
+        let mk = |attested: &str, at: chrono::DateTime<chrono::Utc>, scope: &str| {
+            let mut a = pg_scores_attestation(&emit_a, attested, &emit_a, "identity_binding:v1");
+            a.asserted_at = at;
+            a.cohort_scope = scope.to_string();
+            crate::federation::SignedAttestation { attestation: a }
+        };
+        let t = |d: u32| chrono::Utc.with_ymd_and_hms(2026, 5, d, 0, 0, 0).unwrap();
+
+        // tgt-1: three federation rows + one self row; tgt-2: one row.
+        backend
+            .put_attestation(mk(&tgt_1, t(1), "federation"))
+            .await
+            .unwrap();
+        backend
+            .put_attestation(mk(&tgt_1, t(2), "federation"))
+            .await
+            .unwrap();
+        backend
+            .put_attestation(mk(&tgt_1, t(3), "federation"))
+            .await
+            .unwrap();
+        backend
+            .put_attestation(mk(&tgt_1, t(4), "self"))
+            .await
+            .unwrap();
+        backend
+            .put_attestation(mk(&tgt_2, t(5), "federation"))
+            .await
+            .unwrap();
+
+        // Unauthenticated: broad-tier only, newest-first, no other target.
+        // UFCS — `list_attestations_for` exists on both ReadEngine (this,
+        // 4-arg) and the legacy FederationDirectory (1-arg) in scope.
+        let page = ReadEngine::list_attestations_for(
+            &backend,
+            &tgt_1,
+            None,
+            100,
+            crate::scope::CallerScope::Unauthenticated,
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.items.len(), 3, "broad-tier rows only (self hidden)");
+        assert!(page.items.iter().all(|a| a.attested_key_id == tgt_1));
+        // Newest-first by asserted_at.
+        assert!(page.items[0].asserted_at >= page.items[1].asserted_at);
+        assert!(page.items[1].asserted_at >= page.items[2].asserted_at);
+        assert!(page.items.iter().all(|a| a.cohort_scope == "federation"));
+
+        // Cursor paging: limit=2 then continue.
+        let p1 = ReadEngine::list_attestations_for(
+            &backend,
+            &tgt_1,
+            None,
+            2,
+            crate::scope::CallerScope::Unauthenticated,
+        )
+        .await
+        .unwrap();
+        assert_eq!(p1.items.len(), 2);
+        assert!(p1.next_cursor.is_some());
+        let p2 = ReadEngine::list_attestations_for(
+            &backend,
+            &tgt_1,
+            p1.next_cursor,
+            2,
+            crate::scope::CallerScope::Unauthenticated,
+        )
+        .await
+        .unwrap();
+        assert_eq!(p2.items.len(), 1);
+        assert!(p2.next_cursor.is_none());
+
+        // Authenticated, identity == tgt_1: the self row resolves.
+        let auth_self = crate::scope::CallerScope::Authenticated {
+            admission: crate::scope::admission::CallerAdmission::for_test(&tgt_1, &tgt_1, [], []),
+        };
+        let page = ReadEngine::list_attestations_for(&backend, &tgt_1, None, 100, auth_self)
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 4, "self row visible to its own subject");
+        assert_eq!(
+            page.items[0].cohort_scope, "self",
+            "self row sorts first by clock"
+        );
+
+        // Authenticated, different identity: self row hidden again.
+        let auth_other = crate::scope::CallerScope::Authenticated {
+            admission: crate::scope::admission::CallerAdmission::for_test(
+                "someone-else",
+                "someone-else",
+                [],
+                [],
+            ),
+        };
+        let page = ReadEngine::list_attestations_for(&backend, &tgt_1, None, 100, auth_other)
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 3, "self row hidden from non-owner reader");
     }
 }

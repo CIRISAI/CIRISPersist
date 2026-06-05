@@ -2190,6 +2190,16 @@ impl crate::read::ReadEngine for MemoryBackend {
         Err(memory_read_unsupported("list_attestations"))
     }
 
+    async fn list_attestations_for(
+        &self,
+        _target: &str,
+        _cursor: Option<crate::read::AttestationCursor>,
+        _limit: i64,
+        _scope: crate::scope::CallerScope,
+    ) -> Result<crate::read::AttestationListPage, crate::read::Error> {
+        Err(memory_read_unsupported("list_attestations_for"))
+    }
+
     async fn list_revocations(
         &self,
         _filter: crate::read::RevocationFilter,

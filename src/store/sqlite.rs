@@ -7077,6 +7077,95 @@ impl crate::read::ReadEngine for SqliteBackend {
         })()
     }
 
+    /// #135 + part of #150 — list every attestation whose subject is
+    /// `target` (`attested_key_id = target`), newest-first, cursor-paged.
+    /// Scope-gates (§4.3) on the attestation's own `(cohort_scope,
+    /// attested_key_id)`. `federation_attestations` carries `cohort_scope`
+    /// (V056) but no separate `cohort_target_id`, so the subject doubles
+    /// as the membership target (mirrors `list_attestations`). Uses
+    /// `idx_federation_attestations_v060_by_target
+    /// (attested_key_id, cohort_scope, asserted_at DESC)`.
+    async fn list_attestations_for(
+        &self,
+        target: &str,
+        cursor: Option<crate::read::AttestationCursor>,
+        limit: i64,
+        scope: crate::scope::CallerScope,
+    ) -> Result<crate::read::AttestationListPage, crate::read::Error> {
+        if !(1..=10_000).contains(&limit) {
+            return Err(crate::read::Error::InvalidArgument(format!(
+                "limit must be in [1, 10000], got {limit}"
+            )));
+        }
+        let mut parts: Vec<String> = Vec::new();
+        let mut binds: Vec<SqlValue> = Vec::new();
+        // The by-target predicate — the leading index column.
+        binds.push(SqlValue::Text(target.to_owned()));
+        parts.push(format!("attested_key_id = ?{}", binds.len()));
+        // §4.3 scope gate on the attestation's own cohort_scope /
+        // attested_key_id (subject doubles as membership target).
+        {
+            let (frag, sbinds) = crate::store::scope_bind::scope_predicate_sqlite(
+                &scope,
+                "cohort_scope",
+                "attested_key_id",
+                binds.len(),
+            );
+            parts.push(frag);
+            binds.extend(sbinds);
+        }
+        if let Some(c) = &cursor {
+            if c.version != "v1" {
+                return Err(crate::read::Error::InvalidCursor(format!(
+                    "AttestationCursor version {} unsupported; v1 only",
+                    c.version
+                )));
+            }
+            binds.push(SqlValue::Text(c.last_asserted_at.to_rfc3339()));
+            let p_at = binds.len();
+            binds.push(SqlValue::Text(c.last_attestation_id.clone()));
+            let p_id = binds.len();
+            parts.push(format!(
+                "(asserted_at, attestation_id) < (?{p_at}, ?{p_id})"
+            ));
+        }
+        let where_sql = format!("WHERE {}", parts.join(" AND "));
+        binds.push(SqlValue::Integer(limit));
+        let p_limit = binds.len();
+        let sql = format!(
+            "SELECT attestation_id, attesting_key_id, attested_key_id, \
+                    attestation_type, weight, asserted_at, expires_at, \
+                    attestation_envelope, original_content_hash, \
+                    scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
+                    scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope \
+             FROM federation_attestations {where_sql} \
+             ORDER BY asserted_at DESC, attestation_id DESC LIMIT ?{p_limit}"
+        );
+        let conn = self.conn.clone();
+        let limit_usize = limit as usize;
+        (move || -> Result<crate::read::AttestationListPage, crate::read::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(sqlite_read_err("list_attestations_for prepare"))?;
+            let items: Vec<crate::federation::Attestation> = stmt
+                .query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)
+                .map_err(sqlite_read_err("list_attestations_for query"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sqlite_read_err("list_attestations_for row"))?;
+            let next_cursor = if items.len() == limit_usize {
+                let last = &items[items.len() - 1];
+                Some(crate::read::AttestationCursor::from_trailing(
+                    last.asserted_at,
+                    last.attestation_id.clone(),
+                ))
+            } else {
+                None
+            };
+            Ok(crate::read::AttestationListPage { items, next_cursor })
+        })()
+    }
+
     async fn list_revocations(
         &self,
         filter: crate::read::RevocationFilter,
@@ -9045,8 +9134,7 @@ mod tests {
             .await
             .unwrap();
 
-        let got = backend
-            .list_attestations_for("host-a")
+        let got = crate::federation::FederationDirectory::list_attestations_for(&backend, "host-a")
             .await
             .unwrap()
             .into_iter()
@@ -9284,10 +9372,16 @@ mod tests {
             .expect("row exists");
         assert_eq!(key1.persist_row_hash, key2.persist_row_hash);
 
-        let att1 = backend.list_attestations_for("k-target").await.unwrap();
+        let att1 =
+            crate::federation::FederationDirectory::list_attestations_for(&backend, "k-target")
+                .await
+                .unwrap();
         assert_eq!(att1.len(), 1);
         assert_eq!(att1[0].persist_row_hash.len(), 64);
-        let att2 = backend.list_attestations_for("k-target").await.unwrap();
+        let att2 =
+            crate::federation::FederationDirectory::list_attestations_for(&backend, "k-target")
+                .await
+                .unwrap();
         assert_eq!(att1[0].persist_row_hash, att2[0].persist_row_hash);
 
         let rev1 = backend.revocations_for("k-target").await.unwrap();
@@ -9331,7 +9425,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(by.len(), 1);
-        let for_a = backend.list_attestations_for("k-a").await.unwrap();
+        let for_a = crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+            .await
+            .unwrap();
         assert_eq!(for_a.len(), 1);
         assert_eq!(for_a[0].attestation_id, "att-1");
         assert_eq!(for_a[0].persist_row_hash.len(), 64);
@@ -10272,11 +10368,12 @@ mod tests {
             crate::federation::Error::AccordDimensionRequiresAccordHolder { .. }
         ));
         // No row leaked through.
-        assert!(backend
-            .list_attestations_for("k-a")
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -10317,7 +10414,9 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .unwrap();
-        let rows = backend.list_attestations_for("k-a").await.unwrap();
+        let rows = crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
     }
 
@@ -10390,11 +10489,12 @@ mod tests {
             other => panic!("expected CohortScopeRejected, got {other:?}"),
         }
         // Rejected before INSERT — no row leaked through.
-        assert!(backend
-            .list_attestations_for("k-a")
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// v3.9.1 (CIRISPersist#150 Ask 3) — a valid narrow cohort_scope
@@ -10421,7 +10521,9 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .unwrap();
-        let rows = backend.list_attestations_for("k-a").await.unwrap();
+        let rows = crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].cohort_scope, "self");
     }
@@ -10497,7 +10599,9 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .unwrap();
-        let rows = backend.list_attestations_for("k-a").await.unwrap();
+        let rows = crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
     }
 
@@ -10534,7 +10638,9 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .unwrap();
-        let rows = backend.list_attestations_for("k-a").await.unwrap();
+        let rows = crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
     }
 
@@ -10610,10 +10716,12 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: w2 })
             .await
             .unwrap();
-        let rows = backend
-            .list_attestations_for("registry-steward")
-            .await
-            .unwrap();
+        let rows = crate::federation::FederationDirectory::list_attestations_for(
+            &backend,
+            "registry-steward",
+        )
+        .await
+        .unwrap();
         let withdraws_rows: Vec<_> = rows
             .iter()
             .filter(|r| r.attestation_type == crate::federation::types::attestation_type::WITHDRAWS)
@@ -13079,6 +13187,191 @@ mod tests {
             .unwrap();
         assert_eq!(revs.items.len(), 1);
         assert_eq!(revs.items[0].revocation_id, "rev-1");
+    }
+
+    // #135 + part of #150 — list_attestations_for: by-target filtering,
+    // newest-first ordering, cursor paging, and the §4.3 scope gate.
+    #[tokio::test]
+    async fn re_list_attestations_for_by_target_scope_and_cursor() {
+        use crate::read::ReadEngine;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        // Keys: two emitters + two subjects (targets).
+        for (id, scrub) in [
+            ("emit-a", "emit-a"),
+            ("emit-b", "emit-b"),
+            ("tgt-1", "emit-a"),
+            ("tgt-2", "emit-a"),
+        ] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(id, id, scrub),
+                })
+                .await
+                .unwrap();
+        }
+
+        // Helper: a federation-scope (broad-tier) attestation targeting
+        // `attested`, with a distinct asserted_at for stable ordering.
+        let mk = |id: &str, attesting: &str, attested: &str, at: &str, scope: &str| {
+            let mut a = fed_attestation(id, attesting, attested, "emit-a");
+            a.asserted_at = at.parse().unwrap();
+            a.cohort_scope = scope.to_string();
+            SignedAttestation { attestation: a }
+        };
+
+        // tgt-1: three federation-scope rows (newest last by clock).
+        backend
+            .put_attestation(mk(
+                "a1",
+                "emit-a",
+                "tgt-1",
+                "2026-05-01T00:00:00Z",
+                "federation",
+            ))
+            .await
+            .unwrap();
+        backend
+            .put_attestation(mk(
+                "a2",
+                "emit-b",
+                "tgt-1",
+                "2026-05-02T00:00:00Z",
+                "federation",
+            ))
+            .await
+            .unwrap();
+        backend
+            .put_attestation(mk(
+                "a3",
+                "emit-a",
+                "tgt-1",
+                "2026-05-03T00:00:00Z",
+                "federation",
+            ))
+            .await
+            .unwrap();
+        // A `self`-scope row whose subject IS tgt-1 (write-gate allows
+        // self with no membership). Visible only to a caller whose
+        // identity == tgt-1.
+        backend
+            .put_attestation(mk(
+                "a-self",
+                "emit-a",
+                "tgt-1",
+                "2026-05-04T00:00:00Z",
+                "self",
+            ))
+            .await
+            .unwrap();
+        // A different target — must never appear in tgt-1 listings.
+        backend
+            .put_attestation(mk(
+                "b1",
+                "emit-a",
+                "tgt-2",
+                "2026-05-05T00:00:00Z",
+                "federation",
+            ))
+            .await
+            .unwrap();
+
+        // Unauthenticated caller: only broad-tier (federation) rows for
+        // tgt-1, newest-first, no `self` leak, no other target.
+        // UFCS — `list_attestations_for` exists on both ReadEngine (this,
+        // 4-arg) and the legacy FederationDirectory (1-arg) in scope.
+        let page = ReadEngine::list_attestations_for(
+            &backend,
+            "tgt-1",
+            None,
+            100,
+            crate::scope::CallerScope::Unauthenticated,
+        )
+        .await
+        .unwrap();
+        let ids: Vec<&str> = page
+            .items
+            .iter()
+            .map(|a| a.attestation_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["a3", "a2", "a1"], "newest-first, broad-tier only");
+        assert!(page.next_cursor.is_none());
+
+        // Cursor paging: limit=2 then continue.
+        let p1 = ReadEngine::list_attestations_for(
+            &backend,
+            "tgt-1",
+            None,
+            2,
+            crate::scope::CallerScope::Unauthenticated,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            p1.items
+                .iter()
+                .map(|a| a.attestation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a3", "a2"]
+        );
+        assert!(p1.next_cursor.is_some());
+        let p2 = ReadEngine::list_attestations_for(
+            &backend,
+            "tgt-1",
+            p1.next_cursor,
+            2,
+            crate::scope::CallerScope::Unauthenticated,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            p2.items
+                .iter()
+                .map(|a| a.attestation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a1"]
+        );
+        assert!(p2.next_cursor.is_none());
+
+        // Authenticated caller whose identity == tgt-1: the `self` row
+        // now resolves (target-membership = own identity) and sorts
+        // first by clock.
+        let auth_self = crate::scope::CallerScope::Authenticated {
+            admission: crate::scope::admission::CallerAdmission::for_test("tgt-1", "tgt-1", [], []),
+        };
+        let page = ReadEngine::list_attestations_for(&backend, "tgt-1", None, 100, auth_self)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|a| a.attestation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-self", "a3", "a2", "a1"],
+            "self row resolves for its own subject identity"
+        );
+
+        // Authenticated caller with a DIFFERENT identity: the `self` row
+        // does not resolve (target != reader identity) — broad-tier only.
+        let auth_other = crate::scope::CallerScope::Authenticated {
+            admission: crate::scope::admission::CallerAdmission::for_test(
+                "someone-else",
+                "someone-else",
+                [],
+                [],
+            ),
+        };
+        let page = ReadEngine::list_attestations_for(&backend, "tgt-1", None, 100, auth_other)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|a| a.attestation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a3", "a2", "a1"],
+            "self row hidden from a non-owner authenticated reader"
+        );
     }
 
     #[tokio::test]
