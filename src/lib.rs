@@ -89,6 +89,7 @@ pub mod retention;
 #[cfg(feature = "cirislens_scheduled_tasks")]
 pub mod scheduled_tasks;
 pub mod schema;
+pub mod scope;
 pub mod scrub;
 #[cfg(feature = "secrets")]
 pub mod secrets;

@@ -46,6 +46,12 @@ pub use crate::federation::FederationDirectory;
 pub use crate::outbound::OutboundQueue;
 pub use crate::store::Backend;
 
+// v4.0 CallerScope substrate (CIRISPersist#150, FSD §4). The read-side
+// cohort_scope admission primitive: scope variant, substrate-built
+// admission set + its sole builder, the §4.3 SQL predicate emitter, and
+// the structured refusal reason Commit E folds into the read `Error`.
+pub use crate::scope::{build_caller_admission, CallerAdmission, CallerScope, ScopeRefusalReason};
+
 // Federation read primitive types (v0.5.0, CIRISPersist#23).
 // Sections A/B/F/E ship in v0.5.0 — trace listing, trace detail,
 // Coherence Ratchet inputs, scoring factor aggregates. Sections
