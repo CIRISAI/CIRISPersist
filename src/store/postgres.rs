@@ -5764,6 +5764,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         filter: crate::read::TraceFilter,
         cursor: Option<crate::read::TraceCursor>,
         limit: i64,
+        scope: crate::scope::CallerScope,
     ) -> Result<crate::read::TraceListPage, crate::read::Error> {
         if !(1..=10_000).contains(&limit) {
             return Err(crate::read::Error::InvalidArgument(format!(
@@ -5840,6 +5841,19 @@ impl crate::read::ReadEngine for PostgresBackend {
             where_parts.push(format!("cognitive_state = ${}", params.len()));
         }
 
+        // §4.3 scope gate — AND-composed onto the trace WHERE. The
+        // predicate's `$n` placeholders are rebased onto the next free
+        // slot (params.len()) and its params appended in bind order.
+        {
+            let (frag, sparams) = crate::store::scope_bind::scope_predicate_pg(
+                &scope,
+                "cohort_scope",
+                "cohort_target_id",
+                params.len(),
+            );
+            where_parts.push(frag);
+            params.extend(sparams);
+        }
         let where_sql = if where_parts.is_empty() {
             String::new()
         } else {
@@ -5904,6 +5918,7 @@ impl crate::read::ReadEngine for PostgresBackend {
     async fn get_trace_summary(
         &self,
         trace_id: &str,
+        scope: crate::scope::CallerScope,
     ) -> Result<Option<crate::read::TraceSummary>, crate::read::Error> {
         let client = self
             .pool
@@ -5911,16 +5926,28 @@ impl crate::read::ReadEngine for PostgresBackend {
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
+        // §4.3 scope gate — trace_id is $1, scope placeholders rebase to $2+.
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
+            vec![Box::new(trace_id.to_owned())];
+        let (scope_frag, sparams) = crate::store::scope_bind::scope_predicate_pg(
+            &scope,
+            "cohort_scope",
+            "cohort_target_id",
+            params.len(),
+        );
+        params.extend(sparams);
         let sql = format!(
             "SELECT {select} \
              FROM cirislens.trace_events \
-             WHERE trace_id = $1 \
+             WHERE trace_id = $1 AND {scope_frag} \
              GROUP BY trace_id",
             select = TRACE_SUMMARY_SELECT,
         );
 
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
         let row_opt = client
-            .query_opt(&sql, &[&trace_id])
+            .query_opt(&sql, &params_ref[..])
             .await
             .map_err(|e| crate::read::Error::Backend(format!("get_trace_summary: {e}")))?;
         match row_opt {
@@ -5947,10 +5974,13 @@ impl crate::read::ReadEngine for PostgresBackend {
     async fn get_trace_detail(
         &self,
         trace_id: &str,
+        scope: crate::scope::CallerScope,
     ) -> Result<Option<crate::read::TraceDetail>, crate::read::Error> {
-        // Compose against §A's summary path. Returns early on absent
-        // trace — saves the two follow-on round-trips.
-        let summary = match self.get_trace_summary(trace_id).await? {
+        // Compose against §A's summary path — which applies the §4.3 scope
+        // gate. Returns early on an absent OR scope-invisible trace; the
+        // component/llm sub-reads below are keyed by the already-admitted
+        // trace_id and inherit the gate.
+        let summary = match self.get_trace_summary(trace_id, scope).await? {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -6079,6 +6109,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         filter: crate::read::TaskFilter,
         cursor: Option<crate::read::TaskCursor>,
         limit: i64,
+        scope: crate::scope::CallerScope,
     ) -> Result<crate::read::TaskListPage, crate::read::Error> {
         if !(1..=10_000).contains(&limit) {
             return Err(crate::read::Error::InvalidArgument(format!(
@@ -6144,6 +6175,20 @@ impl crate::read::ReadEngine for PostgresBackend {
                 }
             };
             where_parts.push(predicate.to_owned());
+        }
+
+        // §4.3 scope gate on the task-page trace rows. The per-task
+        // trace-summary sub-query (below) is keyed by already-admitted
+        // task_ids and inherits this gate.
+        {
+            let (frag, sparams) = crate::store::scope_bind::scope_predicate_pg(
+                &scope,
+                "cohort_scope",
+                "cohort_target_id",
+                params.len(),
+            );
+            where_parts.push(frag);
+            params.extend(sparams);
         }
 
         let where_sql = format!("WHERE {}", where_parts.join(" AND "));
@@ -6289,6 +6334,10 @@ impl crate::read::ReadEngine for PostgresBackend {
         filter: crate::read::LlmCallFilter,
         cursor: Option<crate::read::LlmCallCursor>,
         limit: i64,
+        // `trace_llm_calls` carries no per-row cohort_scope; visibility is
+        // inherited from the parent trace and gated at the trace layer.
+        // `scope` no-op in v4.0 (FSD §8).
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::LlmCallListPage, crate::read::Error> {
         if !(1..=10_000).contains(&limit) {
             return Err(crate::read::Error::InvalidArgument(format!(
@@ -6388,6 +6437,8 @@ impl crate::read::ReadEngine for PostgresBackend {
     async fn aggregate_llm_costs(
         &self,
         filter: crate::read::LlmCallFilter,
+        // No-op — see [`Self::list_llm_calls`].
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::LlmCostAggregate, crate::read::Error> {
         let client = self
             .pool
@@ -6547,6 +6598,7 @@ impl crate::read::ReadEngine for PostgresBackend {
     async fn corpus_shape(
         &self,
         filter: crate::read::CorpusShapeFilter,
+        scope: crate::scope::CallerScope,
     ) -> Result<crate::read::CorpusShape, crate::read::Error> {
         let client = self
             .pool
@@ -6572,6 +6624,19 @@ impl crate::read::ReadEngine for PostgresBackend {
         if let Some(d) = &filter.deployment_domain {
             params.push(Box::new(d.clone()));
             where_parts.push(format!("deployment_domain = ${}", params.len()));
+        }
+        // §4.3 scope gate. `where_sql` + `params_ref` are reused across
+        // every corpus sub-query, so composing here gates the whole
+        // rollup uniformly.
+        {
+            let (frag, sparams) = crate::store::scope_bind::scope_predicate_pg(
+                &scope,
+                "cohort_scope",
+                "cohort_target_id",
+                params.len(),
+            );
+            where_parts.push(frag);
+            params.extend(sparams);
         }
         let where_sql = format!("WHERE {}", where_parts.join(" AND "));
         let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
@@ -6784,6 +6849,7 @@ impl crate::read::ReadEngine for PostgresBackend {
     async fn aggregate_scrub_stats(
         &self,
         window: crate::read::TimeWindow,
+        scope: crate::scope::CallerScope,
     ) -> Result<crate::read::ScrubAggregate, crate::read::Error> {
         let client = self
             .pool
@@ -6791,12 +6857,23 @@ impl crate::read::ReadEngine for PostgresBackend {
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
-        let sql = "WITH traces AS ( \
+        // §4.3 scope gate — ts window is $1/$2, scope placeholders at $3+.
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
+            vec![Box::new(window.since), Box::new(window.until)];
+        let (scope_frag, sparams) = crate::store::scope_bind::scope_predicate_pg(
+            &scope,
+            "cohort_scope",
+            "cohort_target_id",
+            params.len(),
+        );
+        params.extend(sparams);
+        let sql = format!(
+            "WITH traces AS ( \
                        SELECT trace_id, \
                               BOOL_OR(pii_scrubbed) AS scrubbed, \
                               MAX(trace_level) AS trace_level \
                        FROM cirislens.trace_events \
-                       WHERE ts >= $1 AND ts < $2 \
+                       WHERE ts >= $1 AND ts < $2 AND {scope_frag} \
                        GROUP BY trace_id \
                    ) \
                    SELECT COUNT(*) FILTER (WHERE scrubbed)::bigint AS total_scrubbed, \
@@ -6806,10 +6883,13 @@ impl crate::read::ReadEngine for PostgresBackend {
                               AS c_detailed, \
                           COUNT(*) FILTER (WHERE scrubbed AND trace_level = 'full_traces')::bigint \
                               AS c_full \
-                   FROM traces";
+                   FROM traces"
+        );
 
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
         let row = client
-            .query_one(sql, &[&window.since, &window.until])
+            .query_one(&sql, &params_ref[..])
             .await
             .map_err(|e| crate::read::Error::Backend(format!("aggregate_scrub_stats: {e}")))?;
 
@@ -6844,6 +6924,9 @@ impl crate::read::ReadEngine for PostgresBackend {
         filter: crate::read::FederationKeyFilter,
         cursor: Option<crate::read::FederationKeyCursor>,
         limit: i64,
+        // `federation_keys` is the federation-tier directory — no per-row
+        // cohort_scope/target. `scope` no-op in v4.0 (FSD §8).
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::FederationKeyListPage, crate::read::Error> {
         if !(1..=10_000).contains(&limit) {
             return Err(crate::read::Error::InvalidArgument(format!(
@@ -6957,6 +7040,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         filter: crate::read::AttestationFilter,
         cursor: Option<crate::read::AttestationCursor>,
         limit: i64,
+        scope: crate::scope::CallerScope,
     ) -> Result<crate::read::AttestationListPage, crate::read::Error> {
         if !(1..=10_000).contains(&limit) {
             return Err(crate::read::Error::InvalidArgument(format!(
@@ -6989,6 +7073,18 @@ impl crate::read::ReadEngine for PostgresBackend {
             } else {
                 "pqc_completed_at IS NULL".to_owned()
             });
+        }
+        // §4.3 scope gate — federation_attestations carries cohort_scope
+        // (V056) + attested_key_id (target identity, V055).
+        {
+            let (frag, sparams) = crate::store::scope_bind::scope_predicate_pg(
+                &scope,
+                "cohort_scope",
+                "attested_key_id",
+                params.len(),
+            );
+            where_parts.push(frag);
+            params.extend(sparams);
         }
         if let Some(c) = &cursor {
             if c.version != "v1" {
@@ -7051,6 +7147,9 @@ impl crate::read::ReadEngine for PostgresBackend {
         filter: crate::read::RevocationFilter,
         cursor: Option<crate::read::RevocationCursor>,
         limit: i64,
+        // Revocations are federation-tier transparency events; `scope`
+        // no-op in v4.0 (FSD §8).
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::RevocationListPage, crate::read::Error> {
         if !(1..=10_000).contains(&limit) {
             return Err(crate::read::Error::InvalidArgument(format!(
@@ -7150,6 +7249,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         deployment_domain: &str,
         window: crate::read::TimeWindow,
         metric: crate::read::DeviationMetric,
+        scope: crate::scope::CallerScope,
     ) -> Result<Vec<crate::read::DivergenceRow>, crate::read::Error> {
         use crate::read::DeviationMetric;
         let client = self
@@ -7158,21 +7258,36 @@ impl crate::read::ReadEngine for PostgresBackend {
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
+        // §4.3 scope gate — domain/since/until are $1/$2/$3, scope at $4+.
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
+            Box::new(deployment_domain.to_owned()),
+            Box::new(window.since),
+            Box::new(window.until),
+        ];
+        let (scope_frag, sparams) = crate::store::scope_bind::scope_predicate_pg(
+            &scope,
+            "cohort_scope",
+            "cohort_target_id",
+            params.len(),
+        );
+        params.extend(sparams);
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+
         let rows = if matches!(metric, DeviationMetric::ConscienceOverrideRate) {
             // CONSCIENCE_RESULT can fire multiple times per trace
             // (recursive retries); BOOL_OR(action_was_overridden)
             // collapses to one bool per (agent_id_hash, trace_id) so
             // the per-agent rate is over distinct traces.
-            client
-                .query(
-                    "WITH per_trace AS ( \
+            let sql = format!(
+                "WITH per_trace AS ( \
                         SELECT agent_id_hash, MIN(agent_name) AS agent_name, trace_id, \
                                BOOL_OR( \
                                  (event_type = 'CONSCIENCE_RESULT' \
                                    AND (payload->>'action_was_overridden')::bool) \
                                ) AS was_overridden \
                         FROM cirislens.trace_events \
-                        WHERE deployment_domain = $1 AND ts >= $2 AND ts < $3 \
+                        WHERE deployment_domain = $1 AND ts >= $2 AND ts < $3 AND {scope_frag} \
                         GROUP BY agent_id_hash, trace_id \
                      ), \
                      per_agent AS ( \
@@ -7197,13 +7312,11 @@ impl crate::read::ReadEngine for PostgresBackend {
                         CASE WHEN ds.s IS NULL OR ds.s = 0.0 THEN 0.0::float8 \
                              ELSE (pa.rate - ds.m) / ds.s \
                         END \
-                     ) DESC, pa.agent_id_hash ASC",
-                    &[&deployment_domain, &window.since, &window.until],
-                )
-                .await
-                .map_err(|e| {
-                    crate::read::Error::Backend(format!("cross_agent_divergence override: {e}"))
-                })?
+                     ) DESC, pa.agent_id_hash ASC"
+            );
+            client.query(&sql, &params_ref[..]).await.map_err(|e| {
+                crate::read::Error::Backend(format!("cross_agent_divergence override: {e}"))
+            })?
         } else {
             let (event_type_filter, field_path): (&str, &str) = match metric {
                 DeviationMetric::CsdmaPlausibility => ("DMA_RESULTS", "csdma_plausibility_score"),
@@ -7218,7 +7331,7 @@ impl crate::read::ReadEngine for PostgresBackend {
                            AVG((payload->>'{field_path}')::float8) AS mean, \
                            COUNT(*) FILTER (WHERE payload ? '{field_path}') AS sample_count \
                     FROM cirislens.trace_events \
-                    WHERE deployment_domain = $1 AND ts >= $2 AND ts < $3 \
+                    WHERE deployment_domain = $1 AND ts >= $2 AND ts < $3 AND {scope_frag} \
                           AND event_type = '{event_type_filter}' \
                           AND payload ? '{field_path}' \
                     GROUP BY agent_id_hash \
@@ -7240,7 +7353,7 @@ impl crate::read::ReadEngine for PostgresBackend {
                 ) DESC, pa.agent_id_hash ASC",
             );
             client
-                .query(&sql, &[&deployment_domain, &window.since, &window.until])
+                .query(&sql, &params_ref[..])
                 .await
                 .map_err(|e| crate::read::Error::Backend(format!("cross_agent_divergence: {e}")))?
         };
@@ -7269,6 +7382,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         agent_id_hash: &str,
         baseline: crate::read::TimeWindow,
         comparison: crate::read::TimeWindow,
+        scope: crate::scope::CallerScope,
     ) -> Result<Vec<crate::read::TemporalDriftRow>, crate::read::Error> {
         use crate::read::DeviationMetric;
         let client = self
@@ -7276,6 +7390,17 @@ impl crate::read::ReadEngine for PostgresBackend {
             .get()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
+
+        // §4.3 scope gate — positional params are $1..$5, scope at $6+.
+        // The fragment is stable; fresh boxed params are minted per metric
+        // iteration (boxed ToSql is not Clone).
+        let scope_frag = crate::store::scope_bind::scope_predicate_pg(
+            &scope,
+            "cohort_scope",
+            "cohort_target_id",
+            5,
+        )
+        .0;
 
         let metrics = [
             (
@@ -7316,19 +7441,28 @@ impl crate::read::ReadEngine for PostgresBackend {
                  WHERE agent_id_hash = $1 \
                        AND event_type = '{et}' \
                        AND payload ? '{field}' \
+                       AND {scope_frag} \
                        AND ((ts >= $2 AND ts < $3) OR (ts >= $4 AND ts < $5))",
             );
+            let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
+                Box::new(agent_id_hash.to_owned()),
+                Box::new(baseline.since),
+                Box::new(baseline.until),
+                Box::new(comparison.since),
+                Box::new(comparison.until),
+            ];
+            // Mint fresh boxed scope params for this iteration.
+            let (_f, sparams) = crate::store::scope_bind::scope_predicate_pg(
+                &scope,
+                "cohort_scope",
+                "cohort_target_id",
+                5,
+            );
+            params.extend(sparams);
+            let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                params.iter().map(|p| p.as_ref() as _).collect();
             let row = client
-                .query_one(
-                    &sql,
-                    &[
-                        &agent_id_hash,
-                        &baseline.since,
-                        &baseline.until,
-                        &comparison.since,
-                        &comparison.until,
-                    ],
-                )
+                .query_one(&sql, &params_ref[..])
                 .await
                 .map_err(|e| crate::read::Error::Backend(format!("temporal_drift query: {e}")))?;
 
@@ -7372,6 +7506,10 @@ impl crate::read::ReadEngine for PostgresBackend {
         &self,
         agent_id_hash: &str,
         window: crate::read::TimeWindow,
+        // Reads the agent's audit-log timeline keyed by `agent_id_hash`
+        // (AV-9 agent-ownership), not cohort-scoped content. `scope`
+        // no-op in v4.0 (FSD §8).
+        _scope: crate::scope::CallerScope,
     ) -> Result<Vec<crate::read::HashChainGap>, crate::read::Error> {
         let client = self
             .pool
@@ -7422,6 +7560,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         &self,
         deployment_domain: &str,
         window: crate::read::TimeWindow,
+        scope: crate::scope::CallerScope,
     ) -> Result<Vec<crate::read::OverrideRateRow>, crate::read::Error> {
         let client = self
             .pool
@@ -7429,9 +7568,21 @@ impl crate::read::ReadEngine for PostgresBackend {
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
-        let rows = client
-            .query(
-                "WITH per_trace AS ( \
+        // §4.3 scope gate — domain/since/until are $1/$2/$3, scope at $4+.
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
+            Box::new(deployment_domain.to_owned()),
+            Box::new(window.since),
+            Box::new(window.until),
+        ];
+        let (scope_frag, sparams) = crate::store::scope_bind::scope_predicate_pg(
+            &scope,
+            "cohort_scope",
+            "cohort_target_id",
+            params.len(),
+        );
+        params.extend(sparams);
+        let sql = format!(
+            "WITH per_trace AS ( \
                     SELECT agent_id_hash, MIN(agent_name) AS agent_name, \
                            MIN(deployment_domain) AS deployment_domain, trace_id, \
                            BOOL_OR( \
@@ -7439,7 +7590,7 @@ impl crate::read::ReadEngine for PostgresBackend {
                                AND (payload->>'action_was_overridden')::bool) \
                            ) AS was_overridden \
                     FROM cirislens.trace_events \
-                    WHERE deployment_domain = $1 AND ts >= $2 AND ts < $3 \
+                    WHERE deployment_domain = $1 AND ts >= $2 AND ts < $3 AND {scope_frag} \
                     GROUP BY agent_id_hash, trace_id \
                  ), \
                  per_agent AS ( \
@@ -7464,9 +7615,12 @@ impl crate::read::ReadEngine for PostgresBackend {
                         END AS override_rate, \
                         COALESCE(d.domain_avg_rate, 0.0::float8) AS domain_avg_rate \
                  FROM per_agent pa CROSS JOIN dom d \
-                 ORDER BY override_rate DESC, pa.agent_id_hash ASC",
-                &[&deployment_domain, &window.since, &window.until],
-            )
+                 ORDER BY override_rate DESC, pa.agent_id_hash ASC"
+        );
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let rows = client
+            .query(&sql, &params_ref[..])
             .await
             .map_err(|e| crate::read::Error::Backend(format!("conscience_override_rates: {e}")))?;
 
@@ -7510,12 +7664,27 @@ impl crate::read::ReadEngine for PostgresBackend {
         agent_id_hash: &str,
         window: crate::read::TimeWindow,
         baseline_window: Option<crate::read::TimeWindow>,
+        scope: crate::scope::CallerScope,
     ) -> Result<crate::read::ScoringFactorAggregate, crate::read::Error> {
         let client = self
             .pool
             .get()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
+
+        // §4.3 scope gate. main / gaps / recovery sub-queries bind
+        // [agent, since, until] at $1..$3 (scope $4+); the decay query
+        // also binds bucket_secs at $4 (scope $5+). Each sub-query mints
+        // its own scope params at the right offset (boxed ToSql is not
+        // Clone).
+        let scope_at = |offset: usize| {
+            crate::store::scope_bind::scope_predicate_pg(
+                &scope,
+                "cohort_scope",
+                "cohort_target_id",
+                offset,
+            )
+        };
 
         // v0.5.1 (CIRISPersist#24) — NULL-safety on the SUM aggregates.
         //
@@ -7544,8 +7713,9 @@ impl crate::read::ReadEngine for PostgresBackend {
         // COUNT(*) and GREATEST(...)::bigint stay un-COALESCE'd:
         // SQL semantics guarantee non-NULL on empty input (COUNT → 0,
         // GREATEST → 0 by the literal).
-        let main = client
-            .query_one(
+        let main = {
+            let (scope_frag, sparams) = scope_at(3);
+            let sql = format!(
                 "WITH per_trace AS ( \
                     SELECT trace_id, MIN(agent_name) AS agent_name, \
                            BOOL_OR( \
@@ -7563,7 +7733,7 @@ impl crate::read::ReadEngine for PostgresBackend {
                            BOOL_OR(audit_sequence_number IS NOT NULL) AS has_audit_seq, \
                            BOOL_OR(audit_signature IS NOT NULL) AS has_audit_sig \
                     FROM cirislens.trace_events \
-                    WHERE agent_id_hash = $1 AND ts >= $2 AND ts < $3 \
+                    WHERE agent_id_hash = $1 AND ts >= $2 AND ts < $3 AND {scope_frag} \
                     GROUP BY trace_id \
                  ) \
                  SELECT \
@@ -7579,13 +7749,20 @@ impl crate::read::ReadEngine for PostgresBackend {
                       SUM(CASE WHEN conscience_failed AND action_succeeded THEN 1 ELSE 0 END), \
                       0 \
                     )::bigint AS unsafe_action_count \
-                 FROM per_trace",
-                &[&agent_id_hash, &window.since, &window.until],
-            )
-            .await
-            .map_err(|e| {
+                 FROM per_trace"
+            );
+            let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
+                Box::new(agent_id_hash.to_owned()),
+                Box::new(window.since),
+                Box::new(window.until),
+            ];
+            params.extend(sparams);
+            let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                params.iter().map(|p| p.as_ref() as _).collect();
+            client.query_one(&sql, &params_ref[..]).await.map_err(|e| {
                 crate::read::Error::Backend(format!("aggregate_scoring_factors main: {e}"))
-            })?;
+            })?
+        };
 
         let trace_count: i64 = main.safe_get("trace_count")?;
         let identity_changes: i64 = main.safe_get("identity_changes")?;
@@ -7615,28 +7792,40 @@ impl crate::read::ReadEngine for PostgresBackend {
         };
 
         // Audit-chain gaps via LAG window — cheap, single round-trip.
-        let gaps_row = client
-            .query_one(
+        let gaps_row = {
+            let (scope_frag, sparams) = scope_at(3);
+            let sql = format!(
                 "WITH ordered AS ( \
                     SELECT audit_sequence_number AS seq, \
                            LAG(audit_sequence_number) OVER w AS prev_seq \
                     FROM cirislens.trace_events \
-                    WHERE agent_id_hash = $1 AND ts >= $2 AND ts < $3 \
+                    WHERE agent_id_hash = $1 AND ts >= $2 AND ts < $3 AND {scope_frag} \
                           AND audit_sequence_number IS NOT NULL \
                     WINDOW w AS (ORDER BY audit_sequence_number) \
                  ) \
                  SELECT COUNT(*)::bigint AS gap_count \
                  FROM ordered \
-                 WHERE prev_seq IS NOT NULL AND seq > prev_seq + 1",
-                &[&agent_id_hash, &window.since, &window.until],
-            )
-            .await
-            .map_err(|e| crate::read::Error::Backend(format!("audit_chain_gaps count: {e}")))?;
+                 WHERE prev_seq IS NOT NULL AND seq > prev_seq + 1"
+            );
+            let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
+                Box::new(agent_id_hash.to_owned()),
+                Box::new(window.since),
+                Box::new(window.until),
+            ];
+            params.extend(sparams);
+            let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                params.iter().map(|p| p.as_ref() as _).collect();
+            client
+                .query_one(&sql, &params_ref[..])
+                .await
+                .map_err(|e| crate::read::Error::Backend(format!("audit_chain_gaps count: {e}")))?
+        };
         let audit_chain_gaps: i64 = gaps_row.safe_get("gap_count")?;
 
         // Recovery events: top 50 most-recent override → next-pass pairs.
-        let recovery_rows = client
-            .query(
+        let recovery_rows = {
+            let (scope_frag, sparams) = scope_at(3);
+            let sql = format!(
                 "WITH per_trace AS ( \
                     SELECT trace_id, MIN(ts) AS started_at, MAX(ts) AS completed_at, \
                            BOOL_OR( \
@@ -7649,7 +7838,7 @@ impl crate::read::ReadEngine for PostgresBackend {
                                   ELSE TRUE END \
                            ) AS coherence_passed \
                     FROM cirislens.trace_events \
-                    WHERE agent_id_hash = $1 AND ts >= $2 AND ts < $3 \
+                    WHERE agent_id_hash = $1 AND ts >= $2 AND ts < $3 AND {scope_frag} \
                     GROUP BY trace_id \
                  ), \
                  ordered AS ( \
@@ -7670,11 +7859,21 @@ impl crate::read::ReadEngine for PostgresBackend {
                        AND next_trace_id IS NOT NULL \
                        AND next_coherence_passed = TRUE \
                  ORDER BY override_at DESC \
-                 LIMIT 50",
-                &[&agent_id_hash, &window.since, &window.until],
-            )
-            .await
-            .map_err(|e| crate::read::Error::Backend(format!("recovery_events: {e}")))?;
+                 LIMIT 50"
+            );
+            let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
+                Box::new(agent_id_hash.to_owned()),
+                Box::new(window.since),
+                Box::new(window.until),
+            ];
+            params.extend(sparams);
+            let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                params.iter().map(|p| p.as_ref() as _).collect();
+            client
+                .query(&sql, &params_ref[..])
+                .await
+                .map_err(|e| crate::read::Error::Backend(format!("recovery_events: {e}")))?
+        };
 
         let mut recovery_events: Vec<crate::read::RecoveryEvent> =
             Vec::with_capacity(recovery_rows.len());
@@ -7692,8 +7891,10 @@ impl crate::read::ReadEngine for PostgresBackend {
         // (or 1-minute buckets for sub-hour windows).
         let window_secs = (window.until - window.since).num_seconds().max(1);
         let bucket_secs = (window_secs / 24).max(60);
-        let decay_rows = client
-            .query(
+        let decay_rows = {
+            // bucket_secs binds at $4, so the scope predicate rebases to $5+.
+            let (scope_frag, sparams) = scope_at(4);
+            let sql = format!(
                 "WITH per_trace AS ( \
                     SELECT trace_id, MIN(ts) AS started_at, \
                            BOOL_AND( \
@@ -7702,7 +7903,7 @@ impl crate::read::ReadEngine for PostgresBackend {
                                   ELSE TRUE END \
                            ) AS coherence_passed \
                     FROM cirislens.trace_events \
-                    WHERE agent_id_hash = $1 AND ts >= $2 AND ts < $3 \
+                    WHERE agent_id_hash = $1 AND ts >= $2 AND ts < $3 AND {scope_frag} \
                     GROUP BY trace_id \
                  ) \
                  SELECT \
@@ -7714,11 +7915,22 @@ impl crate::read::ReadEngine for PostgresBackend {
                       AS coherence_passed_count \
                  FROM per_trace \
                  GROUP BY bucket_at \
-                 ORDER BY bucket_at ASC",
-                &[&agent_id_hash, &window.since, &window.until, &bucket_secs],
-            )
-            .await
-            .map_err(|e| crate::read::Error::Backend(format!("coherence_decay: {e}")))?;
+                 ORDER BY bucket_at ASC"
+            );
+            let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
+                Box::new(agent_id_hash.to_owned()),
+                Box::new(window.since),
+                Box::new(window.until),
+                Box::new(bucket_secs),
+            ];
+            params.extend(sparams);
+            let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                params.iter().map(|p| p.as_ref() as _).collect();
+            client
+                .query(&sql, &params_ref[..])
+                .await
+                .map_err(|e| crate::read::Error::Backend(format!("coherence_decay: {e}")))?
+        };
 
         let mut coherence_decay_series: Vec<crate::read::CoherencePoint> =
             Vec::with_capacity(decay_rows.len());
@@ -7738,7 +7950,9 @@ impl crate::read::ReadEngine for PostgresBackend {
         // CSDMA significance from temporal_drift. Other metrics' drift
         // is in temporal_drift's own primitive surface.
         let drift_z_score = if let Some(base) = baseline_window {
-            let drift_rows = self.temporal_drift(agent_id_hash, base, window).await?;
+            let drift_rows = self
+                .temporal_drift(agent_id_hash, base, window, scope.clone())
+                .await?;
             drift_rows
                 .iter()
                 .find(|r| r.deviation_metric == crate::read::DeviationMetric::CsdmaPlausibility)
@@ -7779,6 +7993,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         agent_id_hashes: &[String],
         window: crate::read::TimeWindow,
         baseline_window: Option<crate::read::TimeWindow>,
+        scope: crate::scope::CallerScope,
     ) -> Result<Vec<crate::read::ScoringFactorAggregate>, crate::read::Error> {
         if agent_id_hashes.is_empty() {
             return Ok(Vec::new());
@@ -7786,7 +8001,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         let mut out = Vec::with_capacity(agent_id_hashes.len());
         for aid in agent_id_hashes {
             out.push(
-                self.aggregate_scoring_factors(aid, window, baseline_window)
+                self.aggregate_scoring_factors(aid, window, baseline_window, scope.clone())
                     .await?,
             );
         }
@@ -7797,13 +8012,14 @@ impl crate::read::ReadEngine for PostgresBackend {
     async fn count_traces(
         &self,
         filter: crate::read::TraceFilter,
+        scope: crate::scope::CallerScope,
     ) -> Result<i64, crate::read::Error> {
         let client = self
             .pool
             .get()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
-        let (where_sql, params) = build_filter_where(&filter)?;
+        let (where_sql, params) = build_scope_filter_where(&filter, &scope)?;
         let sql = format!(
             "SELECT COUNT(DISTINCT trace_id)::bigint AS n \
              FROM cirislens.trace_events {where_sql}",
@@ -7823,13 +8039,14 @@ impl crate::read::ReadEngine for PostgresBackend {
     async fn count_overrides(
         &self,
         filter: crate::read::TraceFilter,
+        scope: crate::scope::CallerScope,
     ) -> Result<i64, crate::read::Error> {
         let client = self
             .pool
             .get()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
-        let (where_sql, params) = build_filter_where(&filter)?;
+        let (where_sql, params) = build_scope_filter_where(&filter, &scope)?;
         let sql = format!(
             "SELECT COUNT(*)::bigint AS n FROM ( \
                 SELECT trace_id \
@@ -7858,13 +8075,14 @@ impl crate::read::ReadEngine for PostgresBackend {
     async fn count_identity_changes(
         &self,
         filter: crate::read::TraceFilter,
+        scope: crate::scope::CallerScope,
     ) -> Result<i64, crate::read::Error> {
         let client = self
             .pool
             .get()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
-        let (where_sql, params) = build_filter_where(&filter)?;
+        let (where_sql, params) = build_scope_filter_where(&filter, &scope)?;
         let sql = format!(
             "SELECT GREATEST(COUNT(DISTINCT agent_name) - 1, 0)::bigint AS n \
              FROM cirislens.trace_events {where_sql}",
@@ -7886,13 +8104,14 @@ impl crate::read::ReadEngine for PostgresBackend {
     async fn aggregate_audit_chain(
         &self,
         filter: crate::read::TraceFilter,
+        scope: crate::scope::CallerScope,
     ) -> Result<crate::read::AuditChainAggregate, crate::read::Error> {
         let client = self
             .pool
             .get()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
-        let (where_sql, params) = build_filter_where(&filter)?;
+        let (where_sql, params) = build_scope_filter_where(&filter, &scope)?;
         let totals_sql = format!(
             "SELECT \
                 COUNT(*) FILTER (WHERE audit_sequence_number IS NOT NULL)::bigint \
@@ -8105,6 +8324,37 @@ fn build_filter_where(
         format!("WHERE {}", where_parts.join(" AND "))
     };
     Ok((where_sql, params))
+}
+
+/// [`build_filter_where`] + the §4.3 cohort_scope gate AND-composed in.
+/// The predicate's `$n` placeholders are rebased onto the next free slot
+/// and its params appended after the filter params, so the `where_sql` +
+/// `params` are reusable across the count / audit-chain sub-queries.
+#[allow(clippy::type_complexity)]
+fn build_scope_filter_where(
+    filter: &crate::read::TraceFilter,
+    scope: &crate::scope::CallerScope,
+) -> Result<
+    (
+        String,
+        Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+    ),
+    crate::read::Error,
+> {
+    let (where_sql, mut params) = build_filter_where(filter)?;
+    let (frag, sparams) = crate::store::scope_bind::scope_predicate_pg(
+        scope,
+        "cohort_scope",
+        "cohort_target_id",
+        params.len(),
+    );
+    params.extend(sparams);
+    let composed = if where_sql.is_empty() {
+        format!("WHERE {frag}")
+    } else {
+        format!("{where_sql} AND {frag}")
+    };
+    Ok((composed, params))
 }
 
 // ─── DerivedSchema impl (v0.4.3, CIRISPersist#18) ──────────────────
@@ -9095,7 +9345,7 @@ mod tests {
         .await;
 
         let s = backend
-            .get_trace_summary(&tid)
+            .get_trace_summary(&tid, crate::scope::CallerScope::Unauthenticated)
             .await
             .unwrap()
             .expect("summary present");
@@ -9139,7 +9389,10 @@ mod tests {
 
         use crate::read::ReadEngine;
         let opt = backend
-            .get_trace_summary("trace-does-not-exist-xyz-§a")
+            .get_trace_summary(
+                "trace-does-not-exist-xyz-§a",
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert!(opt.is_none());
@@ -9199,7 +9452,12 @@ mod tests {
 
         // Page 1: limit=2 → first 2 newest.
         let p1 = backend
-            .list_trace_summaries(filter.clone(), None, 2)
+            .list_trace_summaries(
+                filter.clone(),
+                None,
+                2,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(p1.items.len(), 2);
@@ -9209,7 +9467,12 @@ mod tests {
 
         // Page 2: limit=2 → next 2.
         let p2 = backend
-            .list_trace_summaries(filter.clone(), Some(c1), 2)
+            .list_trace_summaries(
+                filter.clone(),
+                Some(c1),
+                2,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(p2.items.len(), 2);
@@ -9220,7 +9483,12 @@ mod tests {
         // Page 3: limit=2 → 1 row remaining; next_cursor MUST be None
         // because items.len() < limit (cleanly signals end of stream).
         let p3 = backend
-            .list_trace_summaries(filter.clone(), Some(c2), 2)
+            .list_trace_summaries(
+                filter.clone(),
+                Some(c2),
+                2,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(p3.items.len(), 1);
@@ -9296,6 +9564,7 @@ mod tests {
                 },
                 None,
                 100,
+                crate::scope::CallerScope::Unauthenticated,
             )
             .await
             .unwrap();
@@ -9324,20 +9593,33 @@ mod tests {
         let f = crate::read::TraceFilter::default();
 
         let too_low = backend
-            .list_trace_summaries(f.clone(), None, 0)
+            .list_trace_summaries(
+                f.clone(),
+                None,
+                0,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap_err();
         assert!(matches!(too_low, crate::read::Error::InvalidArgument(_)));
 
         let too_high = backend
-            .list_trace_summaries(f.clone(), None, 10_001)
+            .list_trace_summaries(
+                f.clone(),
+                None,
+                10_001,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap_err();
         assert!(matches!(too_high, crate::read::Error::InvalidArgument(_)));
 
         // limit=1 accepts (no error); result count depends on DB
         // state, just check it didn't error.
-        let _ok = backend.list_trace_summaries(f, None, 1).await.unwrap();
+        let _ok = backend
+            .list_trace_summaries(f, None, 1, crate::scope::CallerScope::Unauthenticated)
+            .await
+            .unwrap();
     }
 
     // ─── ReadEngine §B tests (v0.5.0, CIRISPersist#23) ──────────────
@@ -9408,7 +9690,7 @@ mod tests {
             .unwrap();
 
         let detail = backend
-            .get_trace_detail(&tid)
+            .get_trace_detail(&tid, crate::scope::CallerScope::Unauthenticated)
             .await
             .unwrap()
             .expect("detail present");
@@ -9483,7 +9765,10 @@ mod tests {
 
         use crate::read::ReadEngine;
         let opt = backend
-            .get_trace_detail("trace-does-not-exist-§b-xyz")
+            .get_trace_detail(
+                "trace-does-not-exist-§b-xyz",
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert!(opt.is_none());
@@ -9517,7 +9802,7 @@ mod tests {
         )
         .await;
         let detail = backend
-            .get_trace_detail(&tid)
+            .get_trace_detail(&tid, crate::scope::CallerScope::Unauthenticated)
             .await
             .unwrap()
             .expect("detail present even without LLM calls");
@@ -9727,7 +10012,15 @@ mod tests {
             agent_id_hash: Some(aid.clone()),
             ..Default::default()
         };
-        let page = backend.list_tasks(filter, None, 100).await.unwrap();
+        let page = backend
+            .list_tasks(
+                filter,
+                None,
+                100,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
         assert_eq!(page.items.len(), 3, "three tasks for this agent");
 
         // Newest-first ordering: other_task (latest) → wakeup → qa.
@@ -9801,14 +10094,27 @@ mod tests {
             ..Default::default()
         };
 
-        let p1 = backend.list_tasks(filter.clone(), None, 2).await.unwrap();
+        let p1 = backend
+            .list_tasks(
+                filter.clone(),
+                None,
+                2,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
         assert_eq!(p1.items.len(), 2);
         assert_eq!(p1.items[0].task_id, task_ids[0]);
         assert_eq!(p1.items[1].task_id, task_ids[1]);
         let c1 = p1.next_cursor.expect("cursor for page 2");
 
         let p2 = backend
-            .list_tasks(filter.clone(), Some(c1), 2)
+            .list_tasks(
+                filter.clone(),
+                Some(c1),
+                2,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(p2.items.len(), 2);
@@ -9817,7 +10123,12 @@ mod tests {
         let c2 = p2.next_cursor.expect("cursor for page 3");
 
         let p3 = backend
-            .list_tasks(filter.clone(), Some(c2), 2)
+            .list_tasks(
+                filter.clone(),
+                Some(c2),
+                2,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(p3.items.len(), 1);
@@ -9867,7 +10178,15 @@ mod tests {
             task_class: Some(crate::read::TaskClass::QaEval),
             ..Default::default()
         };
-        let page = backend.list_tasks(filter, None, 100).await.unwrap();
+        let page = backend
+            .list_tasks(
+                filter,
+                None,
+                100,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
         assert_eq!(page.items.len(), 2, "only QaEval tasks");
         let ids: Vec<&str> = page.items.iter().map(|t| t.task_id.as_str()).collect();
         assert!(ids.contains(&qa_a.as_str()));
@@ -9882,7 +10201,15 @@ mod tests {
             task_class: Some(crate::read::TaskClass::Discord),
             ..Default::default()
         };
-        let page = backend.list_tasks(filter, None, 100).await.unwrap();
+        let page = backend
+            .list_tasks(
+                filter,
+                None,
+                100,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].task_id, discord);
 
@@ -9893,7 +10220,15 @@ mod tests {
             task_class: Some(crate::read::TaskClass::Other),
             ..Default::default()
         };
-        let page = backend.list_tasks(filter, None, 100).await.unwrap();
+        let page = backend
+            .list_tasks(
+                filter,
+                None,
+                100,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
         assert!(page.items.is_empty(), "no Other tasks in fixture");
     }
 
@@ -9910,12 +10245,22 @@ mod tests {
         use crate::read::ReadEngine;
 
         let res = backend
-            .list_tasks(crate::read::TaskFilter::default(), None, 0)
+            .list_tasks(
+                crate::read::TaskFilter::default(),
+                None,
+                0,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await;
         assert!(matches!(res, Err(crate::read::Error::InvalidArgument(_))));
 
         let res = backend
-            .list_tasks(crate::read::TaskFilter::default(), None, 10_001)
+            .list_tasks(
+                crate::read::TaskFilter::default(),
+                None,
+                10_001,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await;
         assert!(matches!(res, Err(crate::read::Error::InvalidArgument(_))));
     }
@@ -10037,7 +10382,15 @@ mod tests {
             agent_id_hash: Some(aid.clone()),
             ..Default::default()
         };
-        let page = backend.list_llm_calls(filter, None, 100).await.unwrap();
+        let page = backend
+            .list_llm_calls(
+                filter,
+                None,
+                100,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
         assert_eq!(page.items.len(), 1);
         let r = &page.items[0];
         assert_eq!(r.trace_id, tid);
@@ -10091,7 +10444,12 @@ mod tests {
         };
 
         let p1 = backend
-            .list_llm_calls(filter.clone(), None, 2)
+            .list_llm_calls(
+                filter.clone(),
+                None,
+                2,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(p1.items.len(), 2);
@@ -10099,14 +10457,27 @@ mod tests {
         let c1 = p1.next_cursor.expect("page 2 cursor");
 
         let p2 = backend
-            .list_llm_calls(filter.clone(), Some(c1), 2)
+            .list_llm_calls(
+                filter.clone(),
+                Some(c1),
+                2,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(p2.items.len(), 2);
         assert_eq!(p2.items[0].trace_id, tids[2]);
         let c2 = p2.next_cursor.expect("page 3 cursor");
 
-        let p3 = backend.list_llm_calls(filter, Some(c2), 2).await.unwrap();
+        let p3 = backend
+            .list_llm_calls(
+                filter,
+                Some(c2),
+                2,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
         assert_eq!(p3.items.len(), 1);
         assert_eq!(p3.items[0].trace_id, tids[4]);
         assert!(p3.next_cursor.is_none());
@@ -10193,7 +10564,10 @@ mod tests {
             agent_id_hash: Some(aid_a.clone()),
             ..Default::default()
         };
-        let agg = backend.aggregate_llm_costs(only_a).await.unwrap();
+        let agg = backend
+            .aggregate_llm_costs(only_a, crate::scope::CallerScope::Unauthenticated)
+            .await
+            .unwrap();
         assert_eq!(agg.totals.call_count, 2);
         assert_eq!(agg.totals.prompt_tokens, 1800);
         assert_eq!(agg.totals.completion_tokens, 350);
@@ -10215,7 +10589,10 @@ mod tests {
             agent_id_hash: Some(aid_b),
             ..Default::default()
         };
-        let agg_b = backend.aggregate_llm_costs(only_b).await.unwrap();
+        let agg_b = backend
+            .aggregate_llm_costs(only_b, crate::scope::CallerScope::Unauthenticated)
+            .await
+            .unwrap();
         assert_eq!(agg_b.totals.call_count, 1);
         let _ = filter; // touch to silence unused-var lint on the broader filter
     }
@@ -10241,7 +10618,10 @@ mod tests {
             time_window: Some(crate::read::TimeWindow::new(since, until).unwrap()),
             ..Default::default()
         };
-        let agg = backend.aggregate_llm_costs(filter).await.unwrap();
+        let agg = backend
+            .aggregate_llm_costs(filter, crate::scope::CallerScope::Unauthenticated)
+            .await
+            .unwrap();
         assert_eq!(agg.totals.call_count, 0);
         assert_eq!(agg.totals.prompt_tokens, 0);
         assert_eq!(agg.totals.completion_tokens, 0);
@@ -10302,12 +10682,15 @@ mod tests {
         }
 
         let shape = backend
-            .corpus_shape(crate::read::CorpusShapeFilter {
-                time_window: window,
-                agent_id_hash: Some(aid),
-                agent_name: None,
-                deployment_domain: None,
-            })
+            .corpus_shape(
+                crate::read::CorpusShapeFilter {
+                    time_window: window,
+                    agent_id_hash: Some(aid),
+                    agent_name: None,
+                    deployment_domain: None,
+                },
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
 
@@ -10368,12 +10751,15 @@ mod tests {
         let since = chrono::Utc::now() + chrono::Duration::days(365);
         let until = since + chrono::Duration::hours(1);
         let shape = backend
-            .corpus_shape(crate::read::CorpusShapeFilter {
-                time_window: crate::read::TimeWindow::new(since, until).unwrap(),
-                agent_id_hash: None,
-                agent_name: None,
-                deployment_domain: None,
-            })
+            .corpus_shape(
+                crate::read::CorpusShapeFilter {
+                    time_window: crate::read::TimeWindow::new(since, until).unwrap(),
+                    agent_id_hash: None,
+                    agent_name: None,
+                    deployment_domain: None,
+                },
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(shape.total_traces, 0);
@@ -10486,12 +10872,15 @@ mod tests {
         .await;
 
         let shape = backend
-            .corpus_shape(crate::read::CorpusShapeFilter {
-                time_window: window,
-                agent_id_hash: Some(aid),
-                agent_name: None,
-                deployment_domain: None,
-            })
+            .corpus_shape(
+                crate::read::CorpusShapeFilter {
+                    time_window: window,
+                    agent_id_hash: Some(aid),
+                    agent_name: None,
+                    deployment_domain: None,
+                },
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(shape.total_traces, 2);
@@ -10612,7 +11001,10 @@ mod tests {
         // these counts", not "exactly these counts" (other tests may
         // share the window). Tighten by clamping the window to just our
         // fixture range.
-        let agg = backend.aggregate_scrub_stats(window).await.unwrap();
+        let agg = backend
+            .aggregate_scrub_stats(window, crate::scope::CallerScope::Unauthenticated)
+            .await
+            .unwrap();
         assert!(
             agg.envelopes_scrubbed >= 3,
             "at least 3 scrubbed; got {}",
@@ -10654,7 +11046,10 @@ mod tests {
         let since = chrono::Utc::now() + chrono::Duration::days(365);
         let until = since + chrono::Duration::hours(1);
         let window = crate::read::TimeWindow::new(since, until).unwrap();
-        let agg = backend.aggregate_scrub_stats(window).await.unwrap();
+        let agg = backend
+            .aggregate_scrub_stats(window, crate::scope::CallerScope::Unauthenticated)
+            .await
+            .unwrap();
         assert_eq!(agg.envelopes_scrubbed, 0);
         assert_eq!(agg.fields_scrubbed_total, 0);
         assert!(agg.by_entity_type.is_empty());
@@ -10820,7 +11215,12 @@ mod tests {
 
         // Page 1
         let p1 = backend
-            .list_federation_keys(filter.clone(), None, 2)
+            .list_federation_keys(
+                filter.clone(),
+                None,
+                2,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(p1.items.len(), 2);
@@ -10834,7 +11234,12 @@ mod tests {
         // Some(cursor) and the consumer fetches one more page that
         // yields zero items. Page 3 below is the empty-tail probe.
         let p2 = backend
-            .list_federation_keys(filter.clone(), Some(c1), 2)
+            .list_federation_keys(
+                filter.clone(),
+                Some(c1),
+                2,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(p2.items.len(), 2);
@@ -10844,7 +11249,12 @@ mod tests {
 
         // Page 3 — empty tail, cursor None.
         let p3 = backend
-            .list_federation_keys(filter.clone(), Some(c2), 2)
+            .list_federation_keys(
+                filter.clone(),
+                Some(c2),
+                2,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert!(p3.items.is_empty(), "no more items past 4-key fixture");
@@ -10858,7 +11268,12 @@ mod tests {
             ..Default::default()
         };
         let pqc_page = backend
-            .list_federation_keys(pqc_filter, None, 100)
+            .list_federation_keys(
+                pqc_filter,
+                None,
+                100,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(pqc_page.items.len(), 2, "two pqc-complete keys");
@@ -10942,6 +11357,7 @@ mod tests {
                 },
                 None,
                 100,
+                crate::scope::CallerScope::Unauthenticated,
             )
             .await
             .unwrap();
@@ -10964,7 +11380,12 @@ mod tests {
 
         for limit in [0i64, -1, 10_001] {
             let res = backend
-                .list_federation_keys(crate::read::FederationKeyFilter::default(), None, limit)
+                .list_federation_keys(
+                    crate::read::FederationKeyFilter::default(),
+                    None,
+                    limit,
+                    crate::scope::CallerScope::Unauthenticated,
+                )
                 .await;
             assert!(
                 matches!(res, Err(crate::read::Error::InvalidArgument(_))),
@@ -11028,6 +11449,7 @@ mod tests {
                 &dom,
                 window,
                 crate::read::DeviationMetric::CsdmaPlausibility,
+                crate::scope::CallerScope::Unauthenticated,
             )
             .await
             .unwrap();
@@ -11109,6 +11531,7 @@ mod tests {
                 &dom,
                 window,
                 crate::read::DeviationMetric::ConscienceOverrideRate,
+                crate::scope::CallerScope::Unauthenticated,
             )
             .await
             .unwrap();
@@ -11190,7 +11613,12 @@ mod tests {
             until: now + chrono::Duration::minutes(15),
         };
         let rows = backend
-            .temporal_drift(&aid, baseline, comparison)
+            .temporal_drift(
+                &aid,
+                baseline,
+                comparison,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         // Find the CSDMA row.
@@ -11276,7 +11704,10 @@ mod tests {
             since: now - chrono::Duration::minutes(1),
             until: now + chrono::Duration::hours(1),
         };
-        let gaps = backend.hash_chain_gaps(&aid, window).await.unwrap();
+        let gaps = backend
+            .hash_chain_gaps(&aid, window, crate::scope::CallerScope::Unauthenticated)
+            .await
+            .unwrap();
         assert_eq!(gaps.len(), 1);
         let g = &gaps[0];
         assert_eq!(g.gap_start_seq, 2);
@@ -11345,7 +11776,7 @@ mod tests {
             until: now + chrono::Duration::hours(1),
         };
         let rows = backend
-            .conscience_override_rates(&dom, window)
+            .conscience_override_rates(&dom, window, crate::scope::CallerScope::Unauthenticated)
             .await
             .unwrap();
         assert_eq!(rows.len(), 2);
@@ -11409,7 +11840,12 @@ mod tests {
             until: now + chrono::Duration::hours(1),
         };
         let agg = backend
-            .aggregate_scoring_factors(&aid, window, None)
+            .aggregate_scoring_factors(
+                &aid,
+                window,
+                None,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
 
@@ -11475,7 +11911,12 @@ mod tests {
         };
 
         let agg = backend
-            .aggregate_scoring_factors(&aid, window, None)
+            .aggregate_scoring_factors(
+                &aid,
+                window,
+                None,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .expect("MUST NOT panic on empty window");
 
@@ -11539,7 +11980,12 @@ mod tests {
         };
 
         let agg = backend
-            .aggregate_scoring_factors(&aid, window, Some(baseline))
+            .aggregate_scoring_factors(
+                &aid,
+                window,
+                Some(baseline),
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .expect("MUST NOT panic on empty baseline");
 
@@ -11572,6 +12018,7 @@ mod tests {
                     until: chrono::Utc::now(),
                 },
                 None,
+                crate::scope::CallerScope::Unauthenticated,
             )
             .await
             .unwrap();
@@ -11603,7 +12050,12 @@ mod tests {
             until: now + chrono::Duration::hours(1),
         };
         let aggs = backend
-            .aggregate_scoring_factors_batch(&[aid_a.clone(), aid_b.clone()], window, None)
+            .aggregate_scoring_factors_batch(
+                &[aid_a.clone(), aid_b.clone()],
+                window,
+                None,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(aggs.len(), 2);
@@ -11644,10 +12096,13 @@ mod tests {
         }
 
         let n = backend
-            .count_traces(crate::read::TraceFilter {
-                agent_id_hash: Some(aid.clone()),
-                ..Default::default()
-            })
+            .count_traces(
+                crate::read::TraceFilter {
+                    agent_id_hash: Some(aid.clone()),
+                    ..Default::default()
+                },
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(n, 3);
@@ -11686,10 +12141,13 @@ mod tests {
             .await;
         }
         let n = backend
-            .count_overrides(crate::read::TraceFilter {
-                agent_id_hash: Some(aid),
-                ..Default::default()
-            })
+            .count_overrides(
+                crate::read::TraceFilter {
+                    agent_id_hash: Some(aid),
+                    ..Default::default()
+                },
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(n, 2);
@@ -11728,10 +12186,13 @@ mod tests {
         .await;
 
         let agg = backend
-            .aggregate_audit_chain(crate::read::TraceFilter {
-                agent_id_hash: Some(aid),
-                ..Default::default()
-            })
+            .aggregate_audit_chain(
+                crate::read::TraceFilter {
+                    agent_id_hash: Some(aid),
+                    ..Default::default()
+                },
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(agg.audit_total, 0);
@@ -11758,7 +12219,12 @@ mod tests {
             last_trace_id: "x".into(),
         };
         let err = backend
-            .list_trace_summaries(crate::read::TraceFilter::default(), Some(bad_cursor), 10)
+            .list_trace_summaries(
+                crate::read::TraceFilter::default(),
+                Some(bad_cursor),
+                10,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, crate::read::Error::InvalidCursor(_)));
@@ -14929,14 +15395,24 @@ mod tests {
 
         // Empty match (a cohort nobody is in).
         let none = backend
-            .list_federation_keys(mk(&format!("nope-{}", uuid_like())), None, 100)
+            .list_federation_keys(
+                mk(&format!("nope-{}", uuid_like())),
+                None,
+                100,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert!(none.items.is_empty());
 
         // Multi match: exactly the two peers in this run's cohort.
         let fam_all = backend
-            .list_federation_keys(mk(&cohort), None, 100)
+            .list_federation_keys(
+                mk(&cohort),
+                None,
+                100,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         let mut ids: Vec<&str> = fam_all.items.iter().map(|k| k.key_id.as_str()).collect();
@@ -14945,13 +15421,23 @@ mod tests {
 
         // Multi-page: limit=1 → page + cursor + distinct second page.
         let p1 = backend
-            .list_federation_keys(mk(&cohort), None, 1)
+            .list_federation_keys(
+                mk(&cohort),
+                None,
+                1,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(p1.items.len(), 1);
         let cursor = p1.next_cursor.clone().expect("next_cursor");
         let p2 = backend
-            .list_federation_keys(mk(&cohort), Some(cursor), 1)
+            .list_federation_keys(
+                mk(&cohort),
+                Some(cursor),
+                1,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(p2.items.len(), 1);
@@ -14960,7 +15446,12 @@ mod tests {
         // Soft-removed peers drop out.
         backend.remove_peer_record(&fam_b, false).await.unwrap();
         let fam_live = backend
-            .list_federation_keys(mk(&cohort), None, 100)
+            .list_federation_keys(
+                mk(&cohort),
+                None,
+                100,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(

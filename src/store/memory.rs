@@ -2002,34 +2002,43 @@ impl IsNoneOrZero for Option<i64> {
 // and Memory backend remains for the lighter Backend trait surfaces
 // (insert / dedup / federation directory).
 
+/// Memory-backend read surface (FSD §8).
+///
+/// The [`MemoryBackend`] is a non-SQL, sovereign-mode Pi-class store; it
+/// holds no `trace_events` / `federation_*` relational tables, so the
+/// SQL-heavy CEG read primitives have nothing to read. v4.0 removed
+/// `Error::NotImplemented`, so these honestly surface
+/// [`Error::Backend`](crate::read::Error::Backend) — "this backend has no
+/// relational read substrate" — rather than the retired escape-hatch
+/// variant. The Postgres + SQLite backends are the two that implement
+/// every primitive for real (MISSION §1.5). Every method accepts the
+/// v4.0 `scope: CallerScope` arg for signature parity; it is unused here
+/// because there is no row substrate to gate.
 impl crate::read::ReadEngine for MemoryBackend {
     async fn list_trace_summaries(
         &self,
         _filter: crate::read::TraceFilter,
         _cursor: Option<crate::read::TraceCursor>,
         _limit: i64,
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::TraceListPage, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "list_trace_summaries (memory backend; use postgres for federation reads)",
-        ))
+        Err(memory_read_unsupported("list_trace_summaries"))
     }
 
     async fn get_trace_summary(
         &self,
         _trace_id: &str,
+        _scope: crate::scope::CallerScope,
     ) -> Result<Option<crate::read::TraceSummary>, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "get_trace_summary (memory backend; use postgres for federation reads)",
-        ))
+        Err(memory_read_unsupported("get_trace_summary"))
     }
 
     async fn get_trace_detail(
         &self,
         _trace_id: &str,
+        _scope: crate::scope::CallerScope,
     ) -> Result<Option<crate::read::TraceDetail>, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "get_trace_detail (memory backend; use postgres for federation reads)",
-        ))
+        Err(memory_read_unsupported("get_trace_detail"))
     }
 
     async fn list_tasks(
@@ -2037,10 +2046,9 @@ impl crate::read::ReadEngine for MemoryBackend {
         _filter: crate::read::TaskFilter,
         _cursor: Option<crate::read::TaskCursor>,
         _limit: i64,
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::TaskListPage, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "list_tasks (memory backend; use postgres for federation reads)",
-        ))
+        Err(memory_read_unsupported("list_tasks"))
     }
 
     async fn list_llm_calls(
@@ -2048,37 +2056,33 @@ impl crate::read::ReadEngine for MemoryBackend {
         _filter: crate::read::LlmCallFilter,
         _cursor: Option<crate::read::LlmCallCursor>,
         _limit: i64,
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::LlmCallListPage, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "list_llm_calls (memory backend; use postgres for federation reads)",
-        ))
+        Err(memory_read_unsupported("list_llm_calls"))
     }
 
     async fn aggregate_llm_costs(
         &self,
         _filter: crate::read::LlmCallFilter,
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::LlmCostAggregate, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "aggregate_llm_costs (memory backend; use postgres for federation reads)",
-        ))
+        Err(memory_read_unsupported("aggregate_llm_costs"))
     }
 
     async fn corpus_shape(
         &self,
         _filter: crate::read::CorpusShapeFilter,
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::CorpusShape, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "corpus_shape (memory backend; use postgres for federation reads)",
-        ))
+        Err(memory_read_unsupported("corpus_shape"))
     }
 
     async fn aggregate_scrub_stats(
         &self,
         _window: crate::read::TimeWindow,
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::ScrubAggregate, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "aggregate_scrub_stats (memory backend; use postgres for federation reads)",
-        ))
+        Err(memory_read_unsupported("aggregate_scrub_stats"))
     }
 
     async fn list_federation_keys(
@@ -2086,10 +2090,9 @@ impl crate::read::ReadEngine for MemoryBackend {
         _filter: crate::read::FederationKeyFilter,
         _cursor: Option<crate::read::FederationKeyCursor>,
         _limit: i64,
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::FederationKeyListPage, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "list_federation_keys (memory backend; use postgres for federation reads)",
-        ))
+        Err(memory_read_unsupported("list_federation_keys"))
     }
 
     async fn list_attestations(
@@ -2097,10 +2100,9 @@ impl crate::read::ReadEngine for MemoryBackend {
         _filter: crate::read::AttestationFilter,
         _cursor: Option<crate::read::AttestationCursor>,
         _limit: i64,
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::AttestationListPage, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "list_attestations (memory backend; use postgres for federation reads)",
-        ))
+        Err(memory_read_unsupported("list_attestations"))
     }
 
     async fn list_revocations(
@@ -2108,10 +2110,9 @@ impl crate::read::ReadEngine for MemoryBackend {
         _filter: crate::read::RevocationFilter,
         _cursor: Option<crate::read::RevocationCursor>,
         _limit: i64,
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::RevocationListPage, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "list_revocations (memory backend; use postgres for federation reads)",
-        ))
+        Err(memory_read_unsupported("list_revocations"))
     }
 
     async fn cross_agent_divergence(
@@ -2119,10 +2120,9 @@ impl crate::read::ReadEngine for MemoryBackend {
         _deployment_domain: &str,
         _window: crate::read::TimeWindow,
         _metric: crate::read::DeviationMetric,
+        _scope: crate::scope::CallerScope,
     ) -> Result<Vec<crate::read::DivergenceRow>, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "cross_agent_divergence (memory backend)",
-        ))
+        Err(memory_read_unsupported("cross_agent_divergence"))
     }
 
     async fn temporal_drift(
@@ -2130,30 +2130,27 @@ impl crate::read::ReadEngine for MemoryBackend {
         _agent_id_hash: &str,
         _baseline: crate::read::TimeWindow,
         _comparison: crate::read::TimeWindow,
+        _scope: crate::scope::CallerScope,
     ) -> Result<Vec<crate::read::TemporalDriftRow>, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "temporal_drift (memory backend)",
-        ))
+        Err(memory_read_unsupported("temporal_drift"))
     }
 
     async fn hash_chain_gaps(
         &self,
         _agent_id_hash: &str,
         _window: crate::read::TimeWindow,
+        _scope: crate::scope::CallerScope,
     ) -> Result<Vec<crate::read::HashChainGap>, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "hash_chain_gaps (memory backend)",
-        ))
+        Err(memory_read_unsupported("hash_chain_gaps"))
     }
 
     async fn conscience_override_rates(
         &self,
         _deployment_domain: &str,
         _window: crate::read::TimeWindow,
+        _scope: crate::scope::CallerScope,
     ) -> Result<Vec<crate::read::OverrideRateRow>, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "conscience_override_rates (memory backend)",
-        ))
+        Err(memory_read_unsupported("conscience_override_rates"))
     }
 
     async fn aggregate_scoring_factors(
@@ -2161,10 +2158,9 @@ impl crate::read::ReadEngine for MemoryBackend {
         _agent_id_hash: &str,
         _window: crate::read::TimeWindow,
         _baseline: Option<crate::read::TimeWindow>,
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::ScoringFactorAggregate, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "aggregate_scoring_factors (memory backend)",
-        ))
+        Err(memory_read_unsupported("aggregate_scoring_factors"))
     }
 
     async fn aggregate_scoring_factors_batch(
@@ -2172,47 +2168,52 @@ impl crate::read::ReadEngine for MemoryBackend {
         _agent_id_hashes: &[String],
         _window: crate::read::TimeWindow,
         _baseline: Option<crate::read::TimeWindow>,
+        _scope: crate::scope::CallerScope,
     ) -> Result<Vec<crate::read::ScoringFactorAggregate>, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "aggregate_scoring_factors_batch (memory backend)",
-        ))
+        Err(memory_read_unsupported("aggregate_scoring_factors_batch"))
     }
 
     async fn count_traces(
         &self,
         _filter: crate::read::TraceFilter,
+        _scope: crate::scope::CallerScope,
     ) -> Result<i64, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "count_traces (memory backend)",
-        ))
+        Err(memory_read_unsupported("count_traces"))
     }
 
     async fn count_overrides(
         &self,
         _filter: crate::read::TraceFilter,
+        _scope: crate::scope::CallerScope,
     ) -> Result<i64, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "count_overrides (memory backend)",
-        ))
+        Err(memory_read_unsupported("count_overrides"))
     }
 
     async fn count_identity_changes(
         &self,
         _filter: crate::read::TraceFilter,
+        _scope: crate::scope::CallerScope,
     ) -> Result<i64, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "count_identity_changes (memory backend)",
-        ))
+        Err(memory_read_unsupported("count_identity_changes"))
     }
 
     async fn aggregate_audit_chain(
         &self,
         _filter: crate::read::TraceFilter,
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::AuditChainAggregate, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "aggregate_audit_chain (memory backend)",
-        ))
+        Err(memory_read_unsupported("aggregate_audit_chain"))
     }
+}
+
+/// The memory backend has no relational read substrate; every CEG read
+/// primitive surfaces this stable [`Error::Backend`](crate::read::Error::Backend)
+/// (v4.0 dropped `NotImplemented`). The `read_backend` kind token crosses
+/// the boundary; the per-method context goes to the message.
+fn memory_read_unsupported(method: &str) -> crate::read::Error {
+    crate::read::Error::Backend(format!(
+        "{method}: memory backend has no relational read substrate; use postgres or sqlite for CEG reads"
+    ))
 }
 
 // ─── DerivedSchema impl (v0.4.3, CIRISPersist#18) ──────────────────

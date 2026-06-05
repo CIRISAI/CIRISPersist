@@ -745,6 +745,51 @@ impl PyEngine {
             None => self.signer.clone(),
         }
     }
+
+    /// v4.0 (FSD §11) — map this PyEngine's backend dispatch to the
+    /// crate-level [`crate::engine::BackendDispatch`] so a thin
+    /// [`crate::engine::Engine`] view can be built for
+    /// admission resolution. Cheap — each arm clones an `Arc`.
+    fn engine_dispatch(&self) -> crate::engine::BackendDispatch {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+        }
+    }
+
+    /// v4.0 (FSD §11) — resolve a [`crate::scope::CallerScope`] from the
+    /// optional caller occurrence-key id at the PyO3 boundary.
+    ///
+    /// `None` → [`CallerScope::Unauthenticated`](crate::scope::CallerScope::Unauthenticated).
+    /// `Some(occ)` → [`CallerScope::Authenticated`](crate::scope::CallerScope::Authenticated)
+    /// with substrate-resolved admission via
+    /// [`build_caller_admission`](crate::scope::build_caller_admission)
+    /// (AV-44: the admission set is substrate-built from the federation
+    /// chain, never caller-asserted; the caller supplies only the
+    /// occurrence-key string).
+    ///
+    /// `async`, called from within the read methods' `runtime.block_on`
+    /// closure. Thin (MISSION §2) — no business logic; it only resolves.
+    async fn resolve_scope(
+        dispatch: crate::engine::BackendDispatch,
+        signer: Arc<dyn ciris_keyring::HardwareSigner>,
+        caller_occurrence_key_id: Option<String>,
+    ) -> PyResult<crate::scope::CallerScope> {
+        match caller_occurrence_key_id {
+            None => Ok(crate::scope::CallerScope::Unauthenticated),
+            Some(occ) => {
+                let engine = crate::engine::Engine::from_shared(dispatch, signer);
+                let admission = crate::scope::build_caller_admission(&engine, &occ)
+                    .await
+                    .map_err(|e| {
+                        PyValueError::new_err(format!("caller admission resolution failed: {}", e))
+                    })?;
+                Ok(crate::scope::CallerScope::Authenticated { admission })
+            }
+        }
+    }
 }
 
 #[pymethods]
@@ -7232,13 +7277,14 @@ impl PyEngine {
 
     /// Lens-bleeding endpoint /repository/traces driver.
     /// Returns a JSON string of `TraceListPage`.
-    #[pyo3(signature = (filter_json, cursor_json=None, limit=100))]
+    #[pyo3(signature = (filter_json, cursor_json=None, limit=100, caller_occurrence_key_id=None))]
     fn list_trace_summaries(
         &self,
         py: Python<'_>,
         filter_json: &str,
         cursor_json: Option<&str>,
         limit: i64,
+        caller_occurrence_key_id: Option<String>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -7252,13 +7298,17 @@ impl PyEngine {
                         PyValueError::new_err(format!("TraceCursor JSON decode: {e}"))
                     })?),
                 };
+            let dispatch = self.engine_dispatch();
+            let signer = self.signer.clone();
             py.detach(move || match &self.backend {
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope =
+                            Self::resolve_scope(dispatch, signer, caller_occurrence_key_id).await?;
                         let page = backend
-                            .list_trace_summaries(filter, cursor, limit)
+                            .list_trace_summaries(filter, cursor, limit, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&page).map_err(|e| {
@@ -7271,8 +7321,10 @@ impl PyEngine {
                     let backend = sq.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope =
+                            Self::resolve_scope(dispatch, signer, caller_occurrence_key_id).await?;
                         let page = backend
-                            .list_trace_summaries(filter, cursor, limit)
+                            .list_trace_summaries(filter, cursor, limit, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&page).map_err(|e| {
@@ -7286,18 +7338,32 @@ impl PyEngine {
 
     /// Single-trace summary lookup. Returns JSON-encoded
     /// `TraceSummary` or `None`.
-    fn get_trace_summary(&self, py: Python<'_>, trace_id: &str) -> PyResult<Option<String>> {
+    #[pyo3(signature = (trace_id, caller_occurrence_key_id=None))]
+    fn get_trace_summary(
+        &self,
+        py: Python<'_>,
+        trace_id: &str,
+        caller_occurrence_key_id: Option<String>,
+    ) -> PyResult<Option<String>> {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let trace_id = trace_id.to_owned();
+            let dispatch = self.engine_dispatch();
+            let signer = self.signer.clone();
             py.detach(move || match &self.backend {
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let opt = backend
-                            .get_trace_summary(&trace_id)
+                            .get_trace_summary(&trace_id, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         match opt {
@@ -7313,8 +7379,14 @@ impl PyEngine {
                     let backend = sq.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let opt = backend
-                            .get_trace_summary(&trace_id)
+                            .get_trace_summary(&trace_id, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         match opt {
@@ -7333,18 +7405,32 @@ impl PyEngine {
 
     /// Full trace reconstruction. Returns JSON-encoded `TraceDetail`
     /// or `None`. Drives `/repository/traces/{trace_id}`.
-    fn get_trace_detail(&self, py: Python<'_>, trace_id: &str) -> PyResult<Option<String>> {
+    #[pyo3(signature = (trace_id, caller_occurrence_key_id=None))]
+    fn get_trace_detail(
+        &self,
+        py: Python<'_>,
+        trace_id: &str,
+        caller_occurrence_key_id: Option<String>,
+    ) -> PyResult<Option<String>> {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let trace_id = trace_id.to_owned();
+            let dispatch = self.engine_dispatch();
+            let signer = self.signer.clone();
             py.detach(move || match &self.backend {
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let opt = backend
-                            .get_trace_detail(&trace_id)
+                            .get_trace_detail(&trace_id, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         match opt {
@@ -7360,8 +7446,14 @@ impl PyEngine {
                     let backend = sq.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let opt = backend
-                            .get_trace_detail(&trace_id)
+                            .get_trace_detail(&trace_id, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         match opt {
@@ -7607,6 +7699,7 @@ impl PyEngine {
         filter_json: &str,
         cursor_json: Option<&str>,
         limit: i64,
+        caller_occurrence_key_id: Option<String>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -7620,13 +7713,21 @@ impl PyEngine {
                         PyValueError::new_err(format!("TaskCursor JSON decode: {e}"))
                     })?),
                 };
+            let dispatch = self.engine_dispatch();
+            let signer = self.signer.clone();
             py.detach(move || match &self.backend {
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let page = backend
-                            .list_tasks(filter, cursor, limit)
+                            .list_tasks(filter, cursor, limit, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&page).map_err(|e| {
@@ -7639,8 +7740,14 @@ impl PyEngine {
                     let backend = sq.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let page = backend
-                            .list_tasks(filter, cursor, limit)
+                            .list_tasks(filter, cursor, limit, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&page).map_err(|e| {
@@ -7663,6 +7770,7 @@ impl PyEngine {
         filter_json: &str,
         cursor_json: Option<&str>,
         limit: i64,
+        caller_occurrence_key_id: Option<String>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -7675,13 +7783,21 @@ impl PyEngine {
                     PyValueError::new_err(format!("LlmCallCursor JSON decode: {e}"))
                 })?),
             };
+            let dispatch = self.engine_dispatch();
+            let signer = self.signer.clone();
             py.detach(move || match &self.backend {
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let page = backend
-                            .list_llm_calls(filter, cursor, limit)
+                            .list_llm_calls(filter, cursor, limit, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&page).map_err(|e| {
@@ -7694,8 +7810,14 @@ impl PyEngine {
                     let backend = sq.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let page = backend
-                            .list_llm_calls(filter, cursor, limit)
+                            .list_llm_calls(filter, cursor, limit, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&page).map_err(|e| {
@@ -7709,19 +7831,33 @@ impl PyEngine {
 
     /// Cost rollup by model / agent / deployment domain + window
     /// totals. Returns JSON-encoded `LlmCostAggregate`.
-    fn aggregate_llm_costs(&self, py: Python<'_>, filter_json: &str) -> PyResult<String> {
+    #[pyo3(signature = (filter_json, caller_occurrence_key_id=None))]
+    fn aggregate_llm_costs(
+        &self,
+        py: Python<'_>,
+        filter_json: &str,
+        caller_occurrence_key_id: Option<String>,
+    ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::read::LlmCallFilter = serde_json::from_str(filter_json)
                 .map_err(|e| PyValueError::new_err(format!("LlmCallFilter JSON decode: {e}")))?;
+            let dispatch = self.engine_dispatch();
+            let signer = self.signer.clone();
             py.detach(move || match &self.backend {
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let agg = backend
-                            .aggregate_llm_costs(filter)
+                            .aggregate_llm_costs(filter, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&agg).map_err(|e| {
@@ -7734,8 +7870,14 @@ impl PyEngine {
                     let backend = sq.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let agg = backend
-                            .aggregate_llm_costs(filter)
+                            .aggregate_llm_costs(filter, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&agg).map_err(|e| {
@@ -7753,7 +7895,13 @@ impl PyEngine {
     /// task_class, QA language / question_num, agent name / version,
     /// primary model, deployment region. Returns JSON-encoded
     /// `CorpusShape`.
-    fn corpus_shape(&self, py: Python<'_>, filter_json: &str) -> PyResult<String> {
+    #[pyo3(signature = (filter_json, caller_occurrence_key_id=None))]
+    fn corpus_shape(
+        &self,
+        py: Python<'_>,
+        filter_json: &str,
+        caller_occurrence_key_id: Option<String>,
+    ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
@@ -7761,12 +7909,23 @@ impl PyEngine {
                 .map_err(|e| {
                     PyValueError::new_err(format!("CorpusShapeFilter JSON decode: {e}"))
                 })?;
+            let dispatch = self.engine_dispatch();
+            let signer = self.signer.clone();
             py.detach(move || match &self.backend {
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
-                        let shape = backend.corpus_shape(filter).await.map_err(read_err_to_py)?;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
+                        let shape = backend
+                            .corpus_shape(filter, scope)
+                            .await
+                            .map_err(read_err_to_py)?;
                         serde_json::to_string(&shape).map_err(|e| {
                             PyRuntimeError::new_err(format!("CorpusShape encode: {e}"))
                         })
@@ -7777,7 +7936,16 @@ impl PyEngine {
                     let backend = sq.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
-                        let shape = backend.corpus_shape(filter).await.map_err(read_err_to_py)?;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
+                        let shape = backend
+                            .corpus_shape(filter, scope)
+                            .await
+                            .map_err(read_err_to_py)?;
                         serde_json::to_string(&shape).map_err(|e| {
                             PyRuntimeError::new_err(format!("CorpusShape encode: {e}"))
                         })
@@ -7798,6 +7966,7 @@ impl PyEngine {
         py: Python<'_>,
         since_iso8601: &str,
         until_iso8601: &str,
+        caller_occurrence_key_id: Option<String>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -7809,13 +7978,21 @@ impl PyEngine {
                 .map_err(|e| PyValueError::new_err(format!("until RFC3339: {e}")))?
                 .with_timezone(&chrono::Utc);
             let window = crate::read::TimeWindow::new(since, until).map_err(read_err_to_py)?;
+            let dispatch = self.engine_dispatch();
+            let signer = self.signer.clone();
             py.detach(move || match &self.backend {
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let agg = backend
-                            .aggregate_scrub_stats(window)
+                            .aggregate_scrub_stats(window, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&agg).map_err(|e| {
@@ -7828,8 +8005,14 @@ impl PyEngine {
                     let backend = sq.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let agg = backend
-                            .aggregate_scrub_stats(window)
+                            .aggregate_scrub_stats(window, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&agg).map_err(|e| {
@@ -7857,6 +8040,7 @@ impl PyEngine {
         filter_json: &str,
         cursor_json: Option<&str>,
         limit: i64,
+        caller_occurrence_key_id: Option<String>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -7871,13 +8055,21 @@ impl PyEngine {
                     PyValueError::new_err(format!("FederationKeyCursor JSON decode: {e}"))
                 })?),
             };
+            let dispatch = self.engine_dispatch();
+            let signer = self.signer.clone();
             py.detach(move || match &self.backend {
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let page = backend
-                            .list_federation_keys(filter, cursor, limit)
+                            .list_federation_keys(filter, cursor, limit, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&page).map_err(|e| {
@@ -7890,8 +8082,14 @@ impl PyEngine {
                     let backend = sq.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let page = backend
-                            .list_federation_keys(filter, cursor, limit)
+                            .list_federation_keys(filter, cursor, limit, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&page).map_err(|e| {
@@ -7911,6 +8109,7 @@ impl PyEngine {
         filter_json: &str,
         cursor_json: Option<&str>,
         limit: i64,
+        caller_occurrence_key_id: Option<String>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -7925,13 +8124,21 @@ impl PyEngine {
                     PyValueError::new_err(format!("AttestationCursor JSON decode: {e}"))
                 })?),
             };
+            let dispatch = self.engine_dispatch();
+            let signer = self.signer.clone();
             py.detach(move || match &self.backend {
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let page = backend
-                            .list_attestations(filter, cursor, limit)
+                            .list_attestations(filter, cursor, limit, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&page).map_err(|e| {
@@ -7944,8 +8151,14 @@ impl PyEngine {
                     let backend = sq.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let page = backend
-                            .list_attestations(filter, cursor, limit)
+                            .list_attestations(filter, cursor, limit, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&page).map_err(|e| {
@@ -7965,6 +8178,7 @@ impl PyEngine {
         filter_json: &str,
         cursor_json: Option<&str>,
         limit: i64,
+        caller_occurrence_key_id: Option<String>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -7977,13 +8191,21 @@ impl PyEngine {
                     PyValueError::new_err(format!("RevocationCursor JSON decode: {e}"))
                 })?),
             };
+            let dispatch = self.engine_dispatch();
+            let signer = self.signer.clone();
             py.detach(move || match &self.backend {
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let page = backend
-                            .list_revocations(filter, cursor, limit)
+                            .list_revocations(filter, cursor, limit, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&page).map_err(|e| {
@@ -7996,8 +8218,14 @@ impl PyEngine {
                     let backend = sq.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let page = backend
-                            .list_revocations(filter, cursor, limit)
+                            .list_revocations(filter, cursor, limit, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&page).map_err(|e| {
@@ -8022,6 +8250,7 @@ impl PyEngine {
         deployment_domain: &str,
         window_json: &str,
         metric: &str,
+        caller_occurrence_key_id: Option<String>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -8032,13 +8261,21 @@ impl PyEngine {
             let metric: crate::read::DeviationMetric =
                 serde_json::from_str(&format!("\"{metric}\""))
                     .map_err(|e| PyValueError::new_err(format!("DeviationMetric decode: {e}")))?;
+            let dispatch = self.engine_dispatch();
+            let signer = self.signer.clone();
             py.detach(move || match &self.backend {
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let rows = backend
-                            .cross_agent_divergence(&domain, window, metric)
+                            .cross_agent_divergence(&domain, window, metric, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&rows).map_err(|e| {
@@ -8051,8 +8288,14 @@ impl PyEngine {
                     let backend = sq.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let rows = backend
-                            .cross_agent_divergence(&domain, window, metric)
+                            .cross_agent_divergence(&domain, window, metric, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&rows).map_err(|e| {
@@ -8072,6 +8315,7 @@ impl PyEngine {
         agent_id_hash: &str,
         baseline_json: &str,
         comparison_json: &str,
+        caller_occurrence_key_id: Option<String>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -8081,13 +8325,21 @@ impl PyEngine {
                 .map_err(|e| PyValueError::new_err(format!("baseline TimeWindow decode: {e}")))?;
             let comparison: crate::read::TimeWindow = serde_json::from_str(comparison_json)
                 .map_err(|e| PyValueError::new_err(format!("comparison TimeWindow decode: {e}")))?;
+            let dispatch = self.engine_dispatch();
+            let signer = self.signer.clone();
             py.detach(move || match &self.backend {
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let rows = backend
-                            .temporal_drift(&aid, baseline, comparison)
+                            .temporal_drift(&aid, baseline, comparison, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&rows).map_err(|e| {
@@ -8100,8 +8352,14 @@ impl PyEngine {
                     let backend = sq.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let rows = backend
-                            .temporal_drift(&aid, baseline, comparison)
+                            .temporal_drift(&aid, baseline, comparison, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&rows).map_err(|e| {
@@ -8120,6 +8378,7 @@ impl PyEngine {
         py: Python<'_>,
         agent_id_hash: &str,
         window_json: &str,
+        caller_occurrence_key_id: Option<String>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -8127,13 +8386,21 @@ impl PyEngine {
             let aid = agent_id_hash.to_owned();
             let window: crate::read::TimeWindow = serde_json::from_str(window_json)
                 .map_err(|e| PyValueError::new_err(format!("TimeWindow decode: {e}")))?;
+            let dispatch = self.engine_dispatch();
+            let signer = self.signer.clone();
             py.detach(move || match &self.backend {
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let rows = backend
-                            .hash_chain_gaps(&aid, window)
+                            .hash_chain_gaps(&aid, window, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&rows).map_err(|e| {
@@ -8146,8 +8413,14 @@ impl PyEngine {
                     let backend = sq.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let rows = backend
-                            .hash_chain_gaps(&aid, window)
+                            .hash_chain_gaps(&aid, window, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&rows).map_err(|e| {
@@ -8166,6 +8439,7 @@ impl PyEngine {
         py: Python<'_>,
         deployment_domain: &str,
         window_json: &str,
+        caller_occurrence_key_id: Option<String>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -8173,13 +8447,21 @@ impl PyEngine {
             let domain = deployment_domain.to_owned();
             let window: crate::read::TimeWindow = serde_json::from_str(window_json)
                 .map_err(|e| PyValueError::new_err(format!("TimeWindow decode: {e}")))?;
+            let dispatch = self.engine_dispatch();
+            let signer = self.signer.clone();
             py.detach(move || match &self.backend {
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let rows = backend
-                            .conscience_override_rates(&domain, window)
+                            .conscience_override_rates(&domain, window, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&rows).map_err(|e| {
@@ -8192,8 +8474,14 @@ impl PyEngine {
                     let backend = sq.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let rows = backend
-                            .conscience_override_rates(&domain, window)
+                            .conscience_override_rates(&domain, window, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&rows).map_err(|e| {
@@ -8210,13 +8498,14 @@ impl PyEngine {
     /// Bundled scoring factor aggregate. Replaces api/scoring.py's
     /// raw SQL. Returns JSON-encoded `ScoringFactorAggregate`.
     /// `baseline_window_json=None` → `drift_z_score` is None.
-    #[pyo3(signature = (agent_id_hash, window_json, baseline_window_json=None))]
+    #[pyo3(signature = (agent_id_hash, window_json, baseline_window_json=None, caller_occurrence_key_id=None))]
     fn aggregate_scoring_factors(
         &self,
         py: Python<'_>,
         agent_id_hash: &str,
         window_json: &str,
         baseline_window_json: Option<&str>,
+        caller_occurrence_key_id: Option<String>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -8230,13 +8519,21 @@ impl PyEngine {
                     PyValueError::new_err(format!("baseline TimeWindow decode: {e}"))
                 })?),
             };
+            let dispatch = self.engine_dispatch();
+            let signer = self.signer.clone();
             py.detach(move || match &self.backend {
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let agg = backend
-                            .aggregate_scoring_factors(&aid, window, baseline)
+                            .aggregate_scoring_factors(&aid, window, baseline, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&agg).map_err(|e| {
@@ -8249,8 +8546,14 @@ impl PyEngine {
                     let backend = sq.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let agg = backend
-                            .aggregate_scoring_factors(&aid, window, baseline)
+                            .aggregate_scoring_factors(&aid, window, baseline, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&agg).map_err(|e| {
@@ -8265,13 +8568,14 @@ impl PyEngine {
     /// Batch variant — fleet-wide score sweep. `agent_id_hashes_json`
     /// is a JSON array of strings. Returns JSON array of
     /// `ScoringFactorAggregate` in input order.
-    #[pyo3(signature = (agent_id_hashes_json, window_json, baseline_window_json=None))]
+    #[pyo3(signature = (agent_id_hashes_json, window_json, baseline_window_json=None, caller_occurrence_key_id=None))]
     fn aggregate_scoring_factors_batch(
         &self,
         py: Python<'_>,
         agent_id_hashes_json: &str,
         window_json: &str,
         baseline_window_json: Option<&str>,
+        caller_occurrence_key_id: Option<String>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -8286,13 +8590,21 @@ impl PyEngine {
                     PyValueError::new_err(format!("baseline TimeWindow decode: {e}"))
                 })?),
             };
+            let dispatch = self.engine_dispatch();
+            let signer = self.signer.clone();
             py.detach(move || match &self.backend {
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let aggs = backend
-                            .aggregate_scoring_factors_batch(&aids, window, baseline)
+                            .aggregate_scoring_factors_batch(&aids, window, baseline, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&aggs).map_err(|e| {
@@ -8305,8 +8617,14 @@ impl PyEngine {
                     let backend = sq.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let aggs = backend
-                            .aggregate_scoring_factors_batch(&aids, window, baseline)
+                            .aggregate_scoring_factors_batch(&aids, window, baseline, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&aggs).map_err(|e| {
@@ -8319,46 +8637,33 @@ impl PyEngine {
     }
 
     /// Granular: count distinct trace_id matching filter.
-    fn count_traces(&self, py: Python<'_>, filter_json: &str) -> PyResult<i64> {
+    #[pyo3(signature = (filter_json, caller_occurrence_key_id=None))]
+    fn count_traces(
+        &self,
+        py: Python<'_>,
+        filter_json: &str,
+        caller_occurrence_key_id: Option<String>,
+    ) -> PyResult<i64> {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
                 .map_err(|e| PyValueError::new_err(format!("TraceFilter decode: {e}")))?;
+            let dispatch = self.engine_dispatch();
+            let signer = self.signer.clone();
             py.detach(move || match &self.backend {
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
-                        backend.count_traces(filter).await.map_err(read_err_to_py)
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend = sq.clone();
-                    runtime.block_on(async move {
-                        use crate::read::ReadEngine;
-                        backend.count_traces(filter).await.map_err(read_err_to_py)
-                    })
-                }
-            })
-        })
-    }
-
-    /// Granular: count traces where conscience overrode the action.
-    fn count_overrides(&self, py: Python<'_>, filter_json: &str) -> PyResult<i64> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
-                .map_err(|e| PyValueError::new_err(format!("TraceFilter decode: {e}")))?;
-            py.detach(move || match &self.backend {
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         backend
-                            .count_overrides(filter)
+                            .count_traces(filter, scope)
                             .await
                             .map_err(read_err_to_py)
                     })
@@ -8368,8 +8673,67 @@ impl PyEngine {
                     let backend = sq.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         backend
-                            .count_overrides(filter)
+                            .count_traces(filter, scope)
+                            .await
+                            .map_err(read_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
+    /// Granular: count traces where conscience overrode the action.
+    #[pyo3(signature = (filter_json, caller_occurrence_key_id=None))]
+    fn count_overrides(
+        &self,
+        py: Python<'_>,
+        filter_json: &str,
+        caller_occurrence_key_id: Option<String>,
+    ) -> PyResult<i64> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
+                .map_err(|e| PyValueError::new_err(format!("TraceFilter decode: {e}")))?;
+            let dispatch = self.engine_dispatch();
+            let signer = self.signer.clone();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
+                        backend
+                            .count_overrides(filter, scope)
+                            .await
+                            .map_err(read_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
+                        backend
+                            .count_overrides(filter, scope)
                             .await
                             .map_err(read_err_to_py)
                     })
@@ -8379,19 +8743,33 @@ impl PyEngine {
     }
 
     /// Granular: count agent_name changes (identity changes).
-    fn count_identity_changes(&self, py: Python<'_>, filter_json: &str) -> PyResult<i64> {
+    #[pyo3(signature = (filter_json, caller_occurrence_key_id=None))]
+    fn count_identity_changes(
+        &self,
+        py: Python<'_>,
+        filter_json: &str,
+        caller_occurrence_key_id: Option<String>,
+    ) -> PyResult<i64> {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
                 .map_err(|e| PyValueError::new_err(format!("TraceFilter decode: {e}")))?;
+            let dispatch = self.engine_dispatch();
+            let signer = self.signer.clone();
             py.detach(move || match &self.backend {
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         backend
-                            .count_identity_changes(filter)
+                            .count_identity_changes(filter, scope)
                             .await
                             .map_err(read_err_to_py)
                     })
@@ -8401,8 +8779,14 @@ impl PyEngine {
                     let backend = sq.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         backend
-                            .count_identity_changes(filter)
+                            .count_identity_changes(filter, scope)
                             .await
                             .map_err(read_err_to_py)
                     })
@@ -8413,19 +8797,33 @@ impl PyEngine {
 
     /// Granular: audit-chain aggregate.
     /// Returns JSON-encoded `AuditChainAggregate`.
-    fn aggregate_audit_chain(&self, py: Python<'_>, filter_json: &str) -> PyResult<String> {
+    #[pyo3(signature = (filter_json, caller_occurrence_key_id=None))]
+    fn aggregate_audit_chain(
+        &self,
+        py: Python<'_>,
+        filter_json: &str,
+        caller_occurrence_key_id: Option<String>,
+    ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let filter: crate::read::TraceFilter = serde_json::from_str(filter_json)
                 .map_err(|e| PyValueError::new_err(format!("TraceFilter decode: {e}")))?;
+            let dispatch = self.engine_dispatch();
+            let signer = self.signer.clone();
             py.detach(move || match &self.backend {
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let agg = backend
-                            .aggregate_audit_chain(filter)
+                            .aggregate_audit_chain(filter, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&agg).map_err(|e| {
@@ -8438,8 +8836,14 @@ impl PyEngine {
                     let backend = sq.clone();
                     runtime.block_on(async move {
                         use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
                         let agg = backend
-                            .aggregate_audit_chain(filter)
+                            .aggregate_audit_chain(filter, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&agg).map_err(|e| {
@@ -17277,7 +17681,11 @@ fn read_err_to_py(e: crate::read::Error) -> PyErr {
         crate::read::Error::InvalidArgument(_) => PyValueError::new_err(kind),
         crate::read::Error::InvalidCursor(_) => PyValueError::new_err(kind),
         crate::read::Error::Backend(_) => PyRuntimeError::new_err(kind),
-        crate::read::Error::NotImplemented(_) => PyRuntimeError::new_err(kind),
+        // v4.0 — scope refusal is a caller-fault (the caller's admission
+        // doesn't reach the requested cohort). Surface as ValueError with
+        // the stable `read_scope_refused` token (AV-15); the per-reason
+        // detail goes to tracing only.
+        crate::read::Error::ScopeRefused(_) => PyValueError::new_err(kind),
     }
 }
 

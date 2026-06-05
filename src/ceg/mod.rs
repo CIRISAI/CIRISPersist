@@ -86,6 +86,8 @@
 
 use std::future::Future;
 
+use crate::scope::CallerScope;
+
 // ── Topic namespaces (FSD §3.1) ────────────────────────────────────
 
 pub mod aggregates;
@@ -137,10 +139,30 @@ pub use types::{DeviationMetric, TimeWindow, TraceCursor, TraceFilter};
 /// [`crate::store::Backend`] / [`crate::federation::FederationDirectory`]
 /// / [`crate::derived::DerivedSchema`] convention).
 ///
-/// Backends that don't implement a given primitive (Memory backend for
-/// most SQL-heavy aggregates; SQLite for the v0.5.0 batch) return
-/// [`Error::NotImplemented`] rather than panicking — callers handle
-/// "this backend can't do that" as a typed error.
+/// # v4.0 — scope-aware reads (FSD §8)
+///
+/// Every method takes a trailing [`CallerScope`] (FSD §8.1). The
+/// [`CallerScope`] is a *load-bearing argument*: read methods whose
+/// query touches a cohort-scoped table (`trace_events` via its
+/// `cohort_scope` / `cohort_target_id` columns; `federation_attestations`
+/// via `cohort_scope` / `attested_key_id`) AND-compose the §4.3
+/// [`cohort_scope_sql_predicate`](crate::scope::cohort_scope_sql_predicate)
+/// into their WHERE so suppressed rows never leave the backend (Layer 1
+/// of the §9 defense-in-depth). Methods reading non-cohort-scoped tables
+/// (the pure `federation_keys` / `federation_revocations` lists, the
+/// audit-chain-gap reads keyed by `agent_id_hash`) accept `scope` and
+/// apply the existing agent-ownership / AV-9 authorization model; for
+/// those the predicate is a documented no-op in v4.0.
+///
+/// Both backends implement every method (MISSION §1.5 / anti-pattern
+/// #4). There is no `NotImplemented` escape hatch — backend-shape
+/// differences (Postgres CTE vs SQLite correlated subquery) are
+/// implementation details, not error states (FSD §8.2).
+///
+/// Internal scope-bypassed reads (cache miss-path, integrity checks,
+/// write-path-internal lookups) plumb through `pub(crate)` `*_internal`
+/// siblings on the concrete backends (FSD §8.1), NOT a third
+/// [`CallerScope`] variant.
 pub trait ReadEngine: Send + Sync {
     // ── Section A — Trace listing (CIRISPersist#23 §A) ─────────────
 
@@ -149,19 +171,22 @@ pub trait ReadEngine: Send + Sync {
     /// cost fields synthesized from the trace's component rows.
     ///
     /// Drives `/repository/traces`, dashboards, scoring corpus filters.
-    /// Cursor-paged; no OFFSET/LIMIT.
+    /// Cursor-paged; no OFFSET/LIMIT. Scope-gated (§4.3) on
+    /// `trace_events.cohort_scope` / `cohort_target_id`.
     fn list_trace_summaries(
         &self,
         filter: TraceFilter,
         cursor: Option<TraceCursor>,
         limit: i64,
+        scope: CallerScope,
     ) -> impl Future<Output = Result<TraceListPage, Error>> + Send;
 
     /// Single-trace summary lookup. Returns `None` if the trace_id
-    /// isn't in the backing store.
+    /// isn't in the backing store *or is not visible to `scope`*.
     fn get_trace_summary(
         &self,
         trace_id: &str,
+        scope: CallerScope,
     ) -> impl Future<Output = Result<Option<TraceSummary>, Error>> + Send;
 
     // ── Section B — Trace detail (CIRISPersist#23 §B) ──────────────
@@ -172,10 +197,12 @@ pub trait ReadEngine: Send + Sync {
     ///
     /// Drives `/repository/traces/{trace_id}` and trace-detail
     /// explorers. Single round-trip; not paged (one trace fits in
-    /// one round-trip per spec).
+    /// one round-trip per spec). Scope-gated on the trace's
+    /// `cohort_scope` / `cohort_target_id`.
     fn get_trace_detail(
         &self,
         trace_id: &str,
+        scope: CallerScope,
     ) -> impl Future<Output = Result<Option<TraceDetail>, Error>> + Send;
 
     // ── Section C — Task-grouped listing (CIRISPersist#23 §C) ──────
@@ -190,11 +217,13 @@ pub trait ReadEngine: Send + Sync {
     ///
     /// `task_class` derivation is canonical via [`TaskClass::from_task_id`]
     /// — every federation peer sees the same class for a given task_id.
+    /// Scope-gated on `trace_events.cohort_scope` / `cohort_target_id`.
     fn list_tasks(
         &self,
         filter: TaskFilter,
         cursor: Option<TaskCursor>,
         limit: i64,
+        scope: CallerScope,
     ) -> impl Future<Output = Result<TaskListPage, Error>> + Send;
 
     // ── Section D — LLM call surface (CIRISPersist#23 §D) ──────────
@@ -202,19 +231,26 @@ pub trait ReadEngine: Send + Sync {
     /// Page through LLM call rows on `cirislens.trace_llm_calls`.
     /// Used by cost / latency / model-breakdown dashboards and
     /// prompt-hash analysis. Cursor-paged; newest-first.
+    ///
+    /// `trace_llm_calls` carries no per-row cohort_scope; visibility is
+    /// inherited from the parent trace, which lens-core gates at the
+    /// trace layer. `scope` is accepted for surface uniformity and is a
+    /// documented no-op here (v4.0).
     fn list_llm_calls(
         &self,
         filter: LlmCallFilter,
         cursor: Option<LlmCallCursor>,
         limit: i64,
+        scope: CallerScope,
     ) -> impl Future<Output = Result<LlmCallListPage, Error>> + Send;
 
     /// Roll up LLM call costs by model, by agent, by deployment
     /// domain, plus window-level totals. Replaces the lens-side raw
-    /// SQL cost-aggregation pass.
+    /// SQL cost-aggregation pass. `scope` no-op (see [`Self::list_llm_calls`]).
     fn aggregate_llm_costs(
         &self,
         filter: LlmCallFilter,
+        scope: CallerScope,
     ) -> impl Future<Output = Result<LlmCostAggregate, Error>> + Send;
 
     // ── Section G — Corpus shape (CIRISPersist#23 §G) ──────────────
@@ -223,9 +259,11 @@ pub trait ReadEngine: Send + Sync {
     /// counts broken down by task_class, QA language / question num,
     /// agent name + template, primary model, deployment region.
     /// Drives `scripts/corpus_shape.py` and cohort dashboards.
+    /// Scope-gated on `trace_events.cohort_scope` / `cohort_target_id`.
     fn corpus_shape(
         &self,
         filter: CorpusShapeFilter,
+        scope: CallerScope,
     ) -> impl Future<Output = Result<CorpusShape, Error>> + Send;
 
     // ── Section H — Privacy / scrub observability (CIRISPersist#23 §H) ──
@@ -235,9 +273,11 @@ pub trait ReadEngine: Send + Sync {
     /// `cirislens.trace_events.pii_scrubbed`;
     /// `fields_scrubbed_total` + `by_entity_type` are gated on the
     /// v0.6.0 post-ingest classification pipeline (CIRISPersist#19).
+    /// Scope-gated on `trace_events.cohort_scope` / `cohort_target_id`.
     fn aggregate_scrub_stats(
         &self,
         window: TimeWindow,
+        scope: CallerScope,
     ) -> impl Future<Output = Result<ScrubAggregate, Error>> + Send;
 
     // ── Section I — Federation observability bulk (CIRISPersist#23 §I) ──
@@ -246,66 +286,88 @@ pub trait ReadEngine: Send + Sync {
     /// newest-first by `(valid_from DESC, key_id DESC)`. Filters
     /// compose AND-style; `revoked` and `pqc_completed` are SQL-side
     /// EXISTS predicates / `pqc_completed_at IS NULL` checks.
+    ///
+    /// `federation_keys` is the federation-tier directory — it carries
+    /// no per-row cohort_scope/target. `scope` is accepted for surface
+    /// uniformity and is a documented no-op in v4.0 (federation keys are
+    /// federation-visible by construction).
     fn list_federation_keys(
         &self,
         filter: FederationKeyFilter,
         cursor: Option<FederationKeyCursor>,
         limit: i64,
+        scope: CallerScope,
     ) -> impl Future<Output = Result<FederationKeyListPage, Error>> + Send;
 
     /// Page through `cirislens.federation_attestations`. Newest-first
-    /// by `(asserted_at, attestation_id)`.
+    /// by `(asserted_at, attestation_id)`. Scope-gated (§4.3) on
+    /// `federation_attestations.cohort_scope` / `attested_key_id`.
     fn list_attestations(
         &self,
         filter: AttestationFilter,
         cursor: Option<AttestationCursor>,
         limit: i64,
+        scope: CallerScope,
     ) -> impl Future<Output = Result<AttestationListPage, Error>> + Send;
 
     /// Page through `cirislens.federation_revocations`. Newest-first
-    /// by `(revoked_at, revocation_id)`.
+    /// by `(revoked_at, revocation_id)`. Revocations are federation-tier
+    /// transparency events; `scope` no-op in v4.0.
     fn list_revocations(
         &self,
         filter: RevocationFilter,
         cursor: Option<RevocationCursor>,
         limit: i64,
+        scope: CallerScope,
     ) -> impl Future<Output = Result<RevocationListPage, Error>> + Send;
 
     // ── Section F — Coherence Ratchet inputs (CIRISPersist#23 §F) ──
 
     /// Cross-agent divergence z-scores within a deployment domain.
     /// Lens computes detection from these inputs; persist provides
-    /// the windowed peer-mean reference.
+    /// the windowed peer-mean reference. Scope-gated on
+    /// `trace_events.cohort_scope` / `cohort_target_id`.
     fn cross_agent_divergence(
         &self,
         deployment_domain: &str,
         window: TimeWindow,
         metric: DeviationMetric,
+        scope: CallerScope,
     ) -> impl Future<Output = Result<Vec<DivergenceRow>, Error>> + Send;
 
     /// Temporal drift between a baseline window and a comparison
     /// window for a single agent. Returns one row per metric.
+    /// Scope-gated on `trace_events.cohort_scope` / `cohort_target_id`.
     fn temporal_drift(
         &self,
         agent_id_hash: &str,
         baseline: TimeWindow,
         comparison: TimeWindow,
+        scope: CallerScope,
     ) -> impl Future<Output = Result<Vec<TemporalDriftRow>, Error>> + Send;
 
     /// Hash-chain gaps over a window — sequence-number discontinuities
     /// in the agent's audit_log timeline. Each gap is `(start, end)`.
+    ///
+    /// Reads the per-agent audit-log timeline keyed by `agent_id_hash`
+    /// (AV-9 agent-ownership model), not the cohort-scoped
+    /// `trace_events` content. `scope` is accepted for surface
+    /// uniformity and is a documented no-op in v4.0.
     fn hash_chain_gaps(
         &self,
         agent_id_hash: &str,
         window: TimeWindow,
+        scope: CallerScope,
     ) -> impl Future<Output = Result<Vec<HashChainGap>, Error>> + Send;
 
     /// Conscience-override rates per agent within a deployment domain,
     /// with the domain-average reference for ratio computation.
+    /// Scope-gated on `trace_events.cohort_scope` / `cohort_target_id`.
     fn conscience_override_rates(
         &self,
         deployment_domain: &str,
         window: TimeWindow,
+        scope: CallerScope,
     ) -> impl Future<Output = Result<Vec<OverrideRateRow>, Error>> + Send;
 
     // ── Section E — Scoring factor aggregates (CIRISPersist#23 §E) ─
@@ -316,45 +378,57 @@ pub trait ReadEngine: Send + Sync {
     ///
     /// `baseline_window` is optional — when provided, the
     /// `drift_z_score` field is computed against the baseline; when
-    /// absent, drift is `None`.
+    /// absent, drift is `None`. Scope-gated on `trace_events`.
     fn aggregate_scoring_factors(
         &self,
         agent_id_hash: &str,
         window: TimeWindow,
         baseline_window: Option<TimeWindow>,
+        scope: CallerScope,
     ) -> impl Future<Output = Result<ScoringFactorAggregate, Error>> + Send;
 
     /// Batch variant: fleet-wide score sweep in one round-trip.
     /// Returns one [`ScoringFactorAggregate`] per agent in input order.
+    /// Threads the caller's `scope` through each per-agent aggregate.
     fn aggregate_scoring_factors_batch(
         &self,
         agent_id_hashes: &[String],
         window: TimeWindow,
         baseline_window: Option<TimeWindow>,
+        scope: CallerScope,
     ) -> impl Future<Output = Result<Vec<ScoringFactorAggregate>, Error>> + Send;
 
     /// Granular: count traces matching a filter. Used by analysts
     /// composing narrower questions than the bundled aggregate.
-    fn count_traces(&self, filter: TraceFilter) -> impl Future<Output = Result<i64, Error>> + Send;
+    /// Scope-gated on `trace_events.cohort_scope` / `cohort_target_id`.
+    fn count_traces(
+        &self,
+        filter: TraceFilter,
+        scope: CallerScope,
+    ) -> impl Future<Output = Result<i64, Error>> + Send;
 
     /// Granular: count conscience overrides matching a filter.
+    /// Scope-gated on `trace_events`.
     fn count_overrides(
         &self,
         filter: TraceFilter,
+        scope: CallerScope,
     ) -> impl Future<Output = Result<i64, Error>> + Send;
 
     /// Granular: count identity changes (agent_id_hash transitions
-    /// per agent_name) matching a filter.
+    /// per agent_name) matching a filter. Scope-gated on `trace_events`.
     fn count_identity_changes(
         &self,
         filter: TraceFilter,
+        scope: CallerScope,
     ) -> impl Future<Output = Result<i64, Error>> + Send;
 
     /// Granular: audit-chain aggregate (total signed entries +
-    /// detected gaps) for a filter window.
+    /// detected gaps) for a filter window. Scope-gated on `trace_events`.
     fn aggregate_audit_chain(
         &self,
         filter: TraceFilter,
+        scope: CallerScope,
     ) -> impl Future<Output = Result<AuditChainAggregate, Error>> + Send;
 }
 
@@ -377,23 +451,34 @@ pub enum Error {
     #[error("backend: {0}")]
     Backend(String),
 
-    /// Surface declared on the trait but the backend doesn't yet
-    /// implement it. Memory + Phase-1 SQLite return this for the
-    /// SQL-heavy primitives.
-    #[error("not implemented: {0}")]
-    NotImplemented(&'static str),
+    /// The cohort_scope admission gate (§4.3) refused the read. Carries
+    /// a structured [`ScopeRefusalReason`](crate::scope::ScopeRefusalReason)
+    /// so consumers can distinguish *why* — wrong identity vs no family
+    /// membership vs no community membership vs boundary-auth failure are
+    /// different conditions with different remediations (FSD §8.2).
+    ///
+    /// New in v4.0. Replaces the v3.x `NotImplemented` escape hatch as
+    /// the trait's structured-failure direction: both backends implement
+    /// every method, so "not implemented" is no longer an error state.
+    #[error("scope refused: {0}")]
+    ScopeRefused(#[from] crate::scope::ScopeRefusalReason),
 }
 
 impl Error {
     /// Stable string-token for telemetry / structured logging.
     /// THREAT_MODEL.md AV-15: this is what crosses HTTP / PyO3
     /// boundaries; verbose `Display` form goes to tracing only.
+    ///
+    /// `read_scope_refused` is the single boundary-crossing token for a
+    /// scope refusal; callers needing machine-distinguishable detail read
+    /// [`ScopeRefusalReason::kind`](crate::scope::ScopeRefusalReason::kind)
+    /// off the inner reason (FSD §8.2).
     pub fn kind(&self) -> &'static str {
         match self {
             Error::InvalidArgument(_) => "read_invalid_argument",
             Error::InvalidCursor(_) => "read_invalid_cursor",
             Error::Backend(_) => "read_backend",
-            Error::NotImplemented(_) => "read_not_implemented",
+            Error::ScopeRefused(_) => "read_scope_refused",
         }
     }
 }
