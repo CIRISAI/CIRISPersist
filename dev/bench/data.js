@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780601049120,
+  "lastUpdate": 1780628322050,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -11783,6 +11783,264 @@ window.BENCHMARK_DATA = {
             "name": "storage_floor/next_sequence_full",
             "value": 867,
             "range": "± 49",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "3f87cd3d8a44400a28e24096ac9f6f6bd15feb9e",
+          "message": "3.14.0 — inline-sync SQLite rewrite closes #158 cohab race\n\nRoot-cause for #158: tokio::task::spawn_blocking requires a current\ntokio runtime context (thread-local). Under the executor_capsule\ncohab path (#157), the polling chain crosses cdylib boundaries in a\nway that breaks tokio's thread-local invariant. Five fix attempts\nduring triage demonstrated the class:\n\n 1. handle: Handle field on SqliteBackend — ABI break (struct\n    layout mismatch with consumer wheels' static-linked persist\n    copy → SIGSEGV in Arc::clone at wrong offset)\n 2. OnceLock<Handle> module static — per-DSO statics, consumer\n    .so's copy never written\n 3. #[no_mangle] extern \"C\" + dlsym(RTLD_DEFAULT) — Python imports\n    with RTLD_LOCAL; symbols not globally visible\n 4. sys.setdlopenflags(RTLD_GLOBAL) — dlsym works, but Handle's\n    private Inner struct isn't ABI-stable across tokio patches\n    (1.52.1 vs 1.52.3); JoinHandle hangs on cross-DSO waker mismatch\n 5. Inline-sync rewrite (this cut) — eliminates the tokio-context\n    dependency entirely; persist's sqlite path stops calling\n    tokio primitives\n\nCommunity precedent: tokio-rusqlite, deadpool-sqlite, and Alice\n(Tokio maintainer) on users.rust-lang.org all converge on the same\npattern: short rusqlite calls inline in async fn bodies are\nacceptable for the multi-thread runtime case, no spawn_blocking\nrequired.\n\nMechanical changes (203 sites across 35 files):\n - Arc<tokio::sync::Mutex<Connection>> → Arc<parking_lot::Mutex<Connection>>\n   (parking_lot is sync, runtime-agnostic; already a persist dep)\n - tokio::task::spawn_blocking(closure).await.map_err(JoinError)?\n   → (closure)() (inline closure invocation)\n - conn.blocking_lock() → conn.lock() (parking_lot's sync lock)\n - #![allow(clippy::redundant_closure_call)] at module level for the\n   files that have the (closure)() pattern; clippy flag is intentional\n   because each closure's typed return signature is load-bearing for\n   error propagation and removing it would be a much larger diff\n\nPublic surface change: SqliteBackend::conn_handle() and\n::from_conn_handle() take/return parking_lot::Mutex now instead of\ntokio::sync::Mutex. Consumers that statically link persist must\nrebuild against v3.14.0; consumers via PyEngine Python API need no\nchange.\n\niOS happiness preserved:\n - parking_lot::Mutex uses pthread primitives on iOS\n - rusqlite's call shape unchanged → libsqlite3-sys → dlopen'd Apple\n   system libsqlite3 (#132's `bundled` drop is preserved)\n - No new dependencies; no new FFI surface\n\nTests:\n - 569/569 sqlite lib tests green (no change in test count;\n   transformation purely mechanical)\n - cargo clippy clean across sqlite + pyo3 feature axes\n - tools/race_repro.py against CIRISEdge 1.1.9 cohab scenario:\n   100/100 fast, 0 hung, 0 panic (was 20/20 hung on v3.13.0,\n   20/20 SIGSEGV on v3.13.1)\n\nWhat's still ahead:\n - Edge bumps persist pin v3.13.0 → v3.14.0 and rebuilds (#59 T4)\n - The executor_capsule (#157) keeps its current v1 shape; sqlite's\n   cross-tokio-aliasing class is closed without needing v2 ABI\n - Postgres path was never affected; postgres tests stayed green\n   throughout\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-06-04T21:39:47-05:00",
+          "tree_id": "d842cfc96b78912163a0012ff7b9362548d09f3b",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/3f87cd3d8a44400a28e24096ac9f6f6bd15feb9e"
+        },
+        "date": 1780628320332,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 45681321,
+            "range": "± 33350",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 2126714,
+            "range": "± 75012",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 2388,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 5621,
+            "range": "± 16",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 12108,
+            "range": "± 85",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 43358,
+            "range": "± 784",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 7,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 32,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 144,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 507,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 577,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 1991,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 7,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 67,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 215,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 915,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 13,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 48500,
+            "range": "± 1930",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 149517,
+            "range": "± 3667",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 548875,
+            "range": "± 2016",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 7525,
+            "range": "± 629",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 8805,
+            "range": "± 299",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 13092,
+            "range": "± 746",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 23439,
+            "range": "± 808",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 1051573,
+            "range": "± 2953",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 5994467,
+            "range": "± 124230",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 324252,
+            "range": "± 7892",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 920494,
+            "range": "± 38406",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 56843544,
+            "range": "± 271407",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 2368770,
+            "range": "± 139519",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 9365256,
+            "range": "± 304288",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 140075467,
+            "range": "± 1416434",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 5955852,
+            "range": "± 248719",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 24623704,
+            "range": "± 420143",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 100525,
+            "range": "± 2982",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 93723,
+            "range": "± 3193",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 9727,
+            "range": "± 195",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 64845,
+            "range": "± 1045",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 596284,
+            "range": "± 2216",
             "unit": "ns/iter"
           }
         ]
