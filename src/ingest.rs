@@ -414,6 +414,37 @@ where
                             VerifyMode::Full => crate::store::VerificationSource::Persist,
                             VerifyMode::TrustPreVerified => crate::store::VerificationSource::Edge,
                         };
+
+                        // v4.0 (CIRISPersist#160, FSD §4.4 / §12.0 item 1)
+                        // — self-target resolution. `decompose` copied
+                        // the producer-declared (cohort_scope, target)
+                        // from the verified CompleteTrace onto every row.
+                        // For a `self`-scoped row the target is the OWNER
+                        // IDENTITY, which the substrate MUST resolve from
+                        // the verified signer (the scrub_key_id — the
+                        // Ed25519-verified deployment key) and stamp
+                        // itself; a caller-supplied self-target is NEVER
+                        // trusted (the §4.6 write-gate lands in Commit F).
+                        //
+                        // Ordering: this runs in the decompose stage,
+                        // strictly AFTER the step-2 verify gate
+                        // (MISSION §4 verify-before-persist) and BEFORE
+                        // the step-5 insert — no mutation is admitted
+                        // until authenticity passed. Singleton-identity
+                        // fallback (FSD §4.4): an occurrence key not yet
+                        // bound as an IdentityOccurrence IS its own
+                        // identity, so we stamp the signer key itself.
+                        if row.cohort_scope == crate::federation::types::cohort_scope::SELF {
+                            let signer = env_for_row.scrub_key_id.as_str();
+                            let resolved = self
+                                .backend
+                                .resolve_identity_for_occurrence(signer)
+                                .await
+                                .map_err(IngestError::Store)?
+                                .unwrap_or_else(|| signer.to_owned());
+                            row.cohort_target_id = Some(resolved);
+                        }
+
                         env_idx += 1;
                     }
                     events_to_insert.extend(d.events);
@@ -721,6 +752,8 @@ mod tests {
                 },
             ],
             deployment_profile: None,
+            cohort_scope: "federation".into(),
+            cohort_target_id: None,
             signature: String::new(),
             signature_key_id: key_id.into(),
         };
@@ -748,6 +781,199 @@ mod tests {
             key_id.to_owned(),
             sk.verifying_key(),
         )
+    }
+
+    /// v4.0 (CIRISPersist#160) — sign a one-component batch carrying a
+    /// producer-declared `(cohort_scope, cohort_target_id)`. Because
+    /// cohort_scope is NOT in the signed canonical allowlist
+    /// (`canonical_payload_value`), the same Ed25519 signature verifies
+    /// regardless of the cohort values — proving the canonical-bytes
+    /// invariant end-to-end through the ingest path.
+    fn make_signed_batch_bytes_with_cohort(
+        cohort_scope: &str,
+        cohort_target_id: Option<&str>,
+    ) -> (Vec<u8>, String, ed25519_dalek::VerifyingKey) {
+        let sk = SigningKey::from_bytes(&[0x42; 32]);
+        let key_id = "ciris-agent-key:test";
+
+        let mut trace = CompleteTrace {
+            trace_id: "trace-cohort-1".into(),
+            thought_id: "th-1".into(),
+            task_id: None,
+            agent_id_hash: "deadbeef".into(),
+            started_at: "2026-04-30T00:15:53.123456Z".parse().unwrap(),
+            completed_at: "2026-04-30T00:16:12.789012Z".parse().unwrap(),
+            trace_level: crate::schema::TraceLevel::Generic,
+            trace_schema_version: SchemaVersion::parse("2.7.0").unwrap(),
+            components: vec![crate::schema::TraceComponent {
+                component_type: crate::schema::ComponentType::Observation,
+                event_type: crate::schema::ReasoningEventType::ThoughtStart,
+                timestamp: "2026-04-30T00:15:53.123Z".parse().unwrap(),
+                data: {
+                    let mut m = serde_json::Map::new();
+                    m.insert("attempt_index".into(), 0.into());
+                    m
+                },
+                agent_id_hash: None,
+            }],
+            deployment_profile: None,
+            cohort_scope: cohort_scope.to_owned(),
+            cohort_target_id: cohort_target_id.map(str::to_owned),
+            signature: String::new(),
+            signature_key_id: key_id.into(),
+        };
+        // Sign over the canonical allowlist — cohort fields excluded.
+        let payload = canonical_payload_value(&trace);
+        let bytes = PythonJsonDumpsCanonicalizer
+            .canonicalize_value(&payload)
+            .unwrap();
+        let sig = sk.sign(&bytes);
+        trace.signature = BASE64.encode(sig.to_bytes());
+
+        let trace_json = serde_json::to_value(&trace).unwrap();
+        let envelope = serde_json::json!({
+            "events": [{
+                "event_type": "complete_trace",
+                "trace_level": "generic",
+                "trace": trace_json,
+            }],
+            "batch_timestamp": "2026-04-30T15:00:00+00:00",
+            "consent_timestamp": "2025-01-01T00:00:00Z",
+            "trace_level": "generic",
+            "trace_schema_version": "2.7.0",
+        });
+        (
+            envelope.to_string().into_bytes(),
+            key_id.to_owned(),
+            sk.verifying_key(),
+        )
+    }
+
+    /// v4.0 (CIRISPersist#160, FSD §4.3) — a `community`-scoped trace
+    /// with a producer-supplied target lands with that exact
+    /// (cohort_scope, cohort_target_id) on every row. For family /
+    /// community the substrate records the producer's target as-is
+    /// (Commit F's write-gate validates membership separately).
+    #[tokio::test]
+    async fn cohort_community_target_round_trips() {
+        let (bytes, key_id, vkey) =
+            make_signed_batch_bytes_with_cohort("community", Some("community-key:lens-alpha"));
+        let backend = MemoryBackend::new();
+        backend.add_public_key(&key_id, vkey);
+
+        let (signer, signer_key_id) = make_test_signer().await;
+        let pipeline = IngestPipeline {
+            backend: &backend,
+            canonicalizer: &PythonJsonDumpsCanonicalizer,
+            scrubber: &NullScrubber,
+            signer: &*signer,
+            signer_key_id: &signer_key_id,
+        };
+
+        let summary = pipeline.receive_and_persist(&bytes).await.unwrap();
+        assert_eq!(summary.signatures_verified, 1, "signature still verifies");
+
+        let snap = backend.snapshot_events();
+        assert!(!snap.is_empty());
+        for row in &snap {
+            assert_eq!(row.cohort_scope, "community");
+            assert_eq!(
+                row.cohort_target_id.as_deref(),
+                Some("community-key:lens-alpha"),
+                "producer-supplied community target is recorded verbatim"
+            );
+        }
+    }
+
+    /// v4.0 (CIRISPersist#160, FSD §4.4 / §12.0 item 1) — a `self`-scoped
+    /// trace's target is RESOLVED FROM THE VERIFIED SIGNER, not trusted
+    /// from the caller. Here the scrub signer key is not bound as an
+    /// IdentityOccurrence, so the singleton-identity fallback applies:
+    /// the substrate stamps the signer key itself as the owner identity.
+    /// Critically, a caller-supplied bogus self-target is OVERWRITTEN.
+    #[tokio::test]
+    async fn cohort_self_target_resolved_from_signer_singleton() {
+        // Caller tries to claim someone else's identity as the self
+        // target — the substrate must ignore it and stamp the signer.
+        let (bytes, key_id, vkey) =
+            make_signed_batch_bytes_with_cohort("self", Some("victim-identity-forged"));
+        let backend = MemoryBackend::new();
+        backend.add_public_key(&key_id, vkey);
+
+        let (signer, signer_key_id) = make_test_signer().await;
+        let pipeline = IngestPipeline {
+            backend: &backend,
+            canonicalizer: &PythonJsonDumpsCanonicalizer,
+            scrubber: &NullScrubber,
+            signer: &*signer,
+            signer_key_id: &signer_key_id,
+        };
+
+        pipeline.receive_and_persist(&bytes).await.unwrap();
+
+        let snap = backend.snapshot_events();
+        assert!(!snap.is_empty());
+        for row in &snap {
+            assert_eq!(row.cohort_scope, "self");
+            // Resolved from the verified signer (the scrub_key_id),
+            // NOT the caller-supplied "victim-identity-forged".
+            assert_eq!(
+                row.cohort_target_id.as_deref(),
+                Some(signer_key_id.as_str()),
+                "self-target must be resolved from the verified signer (singleton fallback), \
+                 never trusting the caller-supplied value"
+            );
+            assert_ne!(
+                row.cohort_target_id.as_deref(),
+                Some("victim-identity-forged"),
+                "caller-supplied self-target must be overwritten"
+            );
+            // The signer is the scrub envelope's key — the verified
+            // deployment key.
+            assert_eq!(row.scrub_key_id.as_deref(), Some(signer_key_id.as_str()));
+        }
+    }
+
+    /// v4.0 (CIRISPersist#160, FSD §12.0 item 1) — BACKWARD-COMPAT: a
+    /// trace that carries NO cohort fields (every current producer)
+    /// lands as 'federation' / NULL, preserving pre-v4.0 behavior.
+    #[tokio::test]
+    async fn cohort_absent_defaults_to_federation() {
+        // make_signed_batch_bytes builds a federation/None trace whose
+        // JSON omits the cohort keys (skip_serializing_if).
+        let (bytes, key_id, vkey) = make_signed_batch_bytes();
+        // Confirm the wire body really has no cohort keys.
+        let body = String::from_utf8(bytes.clone()).unwrap();
+        assert!(
+            !body.contains("cohort_scope") && !body.contains("cohort_target_id"),
+            "fixture must omit cohort fields on the wire"
+        );
+
+        let backend = MemoryBackend::new();
+        backend.add_public_key(&key_id, vkey);
+        let (signer, signer_key_id) = make_test_signer().await;
+        let pipeline = IngestPipeline {
+            backend: &backend,
+            canonicalizer: &PythonJsonDumpsCanonicalizer,
+            scrubber: &NullScrubber,
+            signer: &*signer,
+            signer_key_id: &signer_key_id,
+        };
+
+        pipeline.receive_and_persist(&bytes).await.unwrap();
+
+        let snap = backend.snapshot_events();
+        assert!(!snap.is_empty());
+        for row in &snap {
+            assert_eq!(
+                row.cohort_scope, "federation",
+                "absent cohort_scope lands as the federation default"
+            );
+            assert_eq!(
+                row.cohort_target_id, None,
+                "absent cohort_target_id lands as NULL"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1128,6 +1354,8 @@ mod tests {
                 deployment_region: Some("US".into()),
                 deployment_trust_mode: "federated_peer".into(),
             }),
+            cohort_scope: "federation".into(),
+            cohort_target_id: None,
             signature: String::new(),
             signature_key_id: key_id.into(),
         };
@@ -1250,6 +1478,8 @@ mod tests {
             trace_schema_version: SchemaVersion::parse("2.7.0").unwrap(),
             components: vec![],
             deployment_profile: None,
+            cohort_scope: "federation".into(),
+            cohort_target_id: None,
             signature: "AAAA".into(),
             signature_key_id: "k".into(),
         };

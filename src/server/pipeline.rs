@@ -576,6 +576,8 @@ mod tests {
             trace_schema_version: SchemaVersion::parse("2.7.0").unwrap(),
             components,
             deployment_profile: None,
+            cohort_scope: "federation".into(),
+            cohort_target_id: None,
             signature: String::new(),
             signature_key_id: AGENT_KEY_ID.into(),
         };

@@ -1989,6 +1989,8 @@ mod tests {
                 agent_id_hash: None,
             }],
             deployment_profile: None,
+            cohort_scope: "federation".into(),
+            cohort_target_id: None,
             signature: String::new(),
             signature_key_id: agent_key_id.into(),
         };
@@ -2167,6 +2169,8 @@ mod tests {
                 agent_id_hash: None,
             }],
             deployment_profile: None,
+            cohort_scope: "federation".into(),
+            cohort_target_id: None,
             signature: String::new(),
             signature_key_id: agent_key_id.into(),
         };
@@ -2514,6 +2518,8 @@ mod tests {
                 agent_id_hash: None,
             }],
             deployment_profile: None,
+            cohort_scope: "federation".into(),
+            cohort_target_id: None,
             signature: String::new(),
             signature_key_id: agent_key_id.clone(),
         };

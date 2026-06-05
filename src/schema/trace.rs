@@ -279,11 +279,71 @@ pub struct CompleteTrace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment_profile: Option<DeploymentProfile>,
 
+    /// v4.0 (CIRISPersist#160, FSD §12.0 item 1) — OPTIONAL producer
+    /// cohort_scope: the CEG visibility/routing axis (CEG 0.4 wire
+    /// format; 0.10 §10.1.4 admission semantics) the producer's
+    /// distribution policy formed for this trace. Closed-set values
+    /// `self | family | community | affiliations | species | biosphere
+    /// | federation` (see [`crate::federation::types::cohort_scope`]).
+    ///
+    /// **Canonical-bytes-safe (MISSION §3, anti-pattern #6).** This
+    /// field is NOT part of the signed canonical bytes — the
+    /// canonicalizer (`verify::ed25519::canonical_payload_value` /
+    /// `…_v279`) reconstructs from an explicit field allowlist that
+    /// does NOT include this field, so adding it cannot change any
+    /// existing trace's signed bytes. The `serde(default,
+    /// skip_serializing_if)` pair additionally keeps the *serialized
+    /// JSON* byte-identical for every producer that omits it (today:
+    /// all of them): a trace without this field round-trips to the
+    /// exact same JSON before and after this struct change. The
+    /// substrate records the producer's value (or the default
+    /// `'federation'`) into `trace_events.cohort_scope` at ingest
+    /// (FSD §4.3, §12). Mirrors the `default_cohort_scope` /
+    /// `is_default_cohort_scope` discipline on
+    /// [`crate::federation::types::Attestation`].
+    #[serde(
+        default = "default_trace_cohort_scope",
+        skip_serializing_if = "is_default_trace_cohort_scope"
+    )]
+    pub cohort_scope: String,
+    /// v4.0 (CIRISPersist#160, FSD §12.0 item 1) — OPTIONAL scope
+    /// **target** (FSD §4.3): the `family_id` / `community_id` the
+    /// producer policy routed this trace to. `None` for the broad
+    /// belonging-tiers (`affiliations` / `species` / `biosphere` /
+    /// `federation`). For `cohort_scope == 'self'` the substrate
+    /// IGNORES any caller-supplied value and resolves the owner
+    /// identity from the verified signer at ingest (FSD §4.4, §12.0);
+    /// never trust a caller-supplied self-target.
+    ///
+    /// Canonical-bytes-safe for the same reason as
+    /// [`Self::cohort_scope`]: not in the signed allowlist; `serde`
+    /// default `None` + `skip_serializing_if` keep omitting producers'
+    /// JSON byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cohort_target_id: Option<String>,
+
     /// Base64-encoded Ed25519 signature over the canonical bytes
     /// (TRACE_WIRE_FORMAT.md §8).
     pub signature: String,
     /// Key identifier for verification lookup.
     pub signature_key_id: String,
+}
+
+/// v4.0 (CIRISPersist#160) — default `cohort_scope` for a trace whose
+/// producer omitted the field. Matches the `trace_events.cohort_scope`
+/// column DEFAULT (`'federation'`, FSD §12), so existing producers
+/// (none of which emit cohort_scope today) ride the federation tier,
+/// which is the pre-v4.0 substrate behavior.
+fn default_trace_cohort_scope() -> String {
+    "federation".to_string()
+}
+
+/// True iff `cohort_scope` equals the default. Used by serde
+/// `skip_serializing_if` so a trace that omits the field serializes
+/// byte-identically before and after the v4.0 schema bump (MISSION §3
+/// byte-exactness). Mirrors `federation::types::is_default_cohort_scope`.
+fn is_default_trace_cohort_scope(s: &str) -> bool {
+    s == "federation"
 }
 
 /// JSON-type-name for error messages.
@@ -613,5 +673,117 @@ mod tests {
         );
         assert_eq!(dedup_key.3, ReasoningEventType::ConscienceResult);
         assert_eq!(dedup_key.4, 2);
+    }
+
+    /// v4.0 (CIRISPersist#160, FSD §12.0 item 1) — CANONICAL-BYTES /
+    /// JSON BYTE-EXACTNESS proof (MISSION §3, anti-pattern #6).
+    ///
+    /// A trace whose producer OMITS the new optional `cohort_scope` /
+    /// `cohort_target_id` fields (i.e. EVERY current producer) MUST:
+    ///   (a) deserialize with the defaults `'federation'` / `None`, and
+    ///   (b) re-serialize to JSON byte-IDENTICAL to the input — so the
+    ///       wire bytes a producer round-trips through `CompleteTrace`
+    ///       are unchanged by this schema bump, and any path that
+    ///       re-serializes the trace (extract, decompose fixtures)
+    ///       produces the same bytes as before the field was added.
+    ///
+    /// This is the `skip_serializing_if` guarantee: federation-default
+    /// scope + None target serialize to *nothing*, so the field's
+    /// existence is invisible on the wire until a producer opts in.
+    #[test]
+    fn cohort_scope_omitted_round_trips_byte_identical() {
+        // A wire body with NO cohort_scope / cohort_target_id keys.
+        let wire = serde_json::json!({
+            "trace_id": "trace-cohort-omitted",
+            "thought_id": "th_x",
+            "agent_id_hash": "deadbeef",
+            "started_at": "2026-04-30T00:15:53.123456Z",
+            "completed_at": "2026-04-30T00:16:12.789012Z",
+            "trace_level": "generic",
+            "trace_schema_version": "2.7.0",
+            "components": [],
+            "signature": "AAAA",
+            "signature_key_id": "ciris-agent-key:dead"
+        });
+
+        // The byte-exactness invariant is about the struct's serialized
+        // form, not key ordering between a hand-built Value and the
+        // struct. Serialize the struct, deserialize, re-serialize — and
+        // assert the output is identical AND carries neither cohort key.
+        // That is the `skip_serializing_if` guarantee: a producer that
+        // omits the fields produces the exact same bytes round-trip
+        // after round-trip, with the fields invisible.
+        let trace: CompleteTrace = serde_json::from_value(wire).unwrap();
+        // (a) defaults landed.
+        assert_eq!(
+            trace.cohort_scope, "federation",
+            "omitted cohort_scope must default to 'federation'"
+        );
+        assert_eq!(
+            trace.cohort_target_id, None,
+            "omitted cohort_target_id must default to None"
+        );
+
+        // (b) serialize the struct — the default scope + None target
+        // are dropped entirely (skip_serializing_if).
+        let serialized = serde_json::to_string(&trace).unwrap();
+        assert!(
+            !serialized.contains("cohort_scope"),
+            "default cohort_scope must NOT appear on the wire: {serialized}"
+        );
+        assert!(
+            !serialized.contains("cohort_target_id"),
+            "None cohort_target_id must NOT appear on the wire: {serialized}"
+        );
+
+        // (c) byte-stable round-trip: re-deserialize + re-serialize is
+        // byte-identical, proving the struct's wire form is fixed by
+        // this schema bump for omitting producers.
+        let reparsed: CompleteTrace = serde_json::from_str(&serialized).unwrap();
+        let reserialized = serde_json::to_string(&reparsed).unwrap();
+        assert_eq!(
+            serialized, reserialized,
+            "a trace omitting cohort fields must round-trip byte-identically \
+             (MISSION §3 byte-exactness)"
+        );
+    }
+
+    /// v4.0 — the SIGNED canonical bytes (verify path) are unaffected
+    /// by the new fields regardless of their value. The canonicalizer
+    /// reconstructs from an explicit field allowlist that excludes
+    /// cohort_scope, so a producer that sets cohort_scope produces the
+    /// SAME signed bytes as one that omits it — existing signatures
+    /// verify unchanged.
+    #[test]
+    fn cohort_scope_does_not_enter_signed_canonical_bytes() {
+        let mut base = CompleteTrace {
+            trace_id: "trace-canon".into(),
+            thought_id: "th_x".into(),
+            task_id: None,
+            agent_id_hash: "deadbeef".into(),
+            started_at: "2026-04-30T00:15:53.123456Z".parse().unwrap(),
+            completed_at: "2026-04-30T00:16:12.789012Z".parse().unwrap(),
+            trace_level: crate::schema::TraceLevel::Generic,
+            trace_schema_version: SchemaVersion::parse("2.7.0").unwrap(),
+            components: vec![],
+            deployment_profile: None,
+            cohort_scope: "federation".into(),
+            cohort_target_id: None,
+            signature: String::new(),
+            signature_key_id: "k".into(),
+        };
+        let canon_default = crate::verify::ed25519::canonical_payload_value(&base);
+
+        // Flip to a scoped value with a target — the signed bytes must
+        // be unchanged (the field is not in the allowlist).
+        base.cohort_scope = "community".into();
+        base.cohort_target_id = Some("community-key:xyz".into());
+        let canon_scoped = crate::verify::ed25519::canonical_payload_value(&base);
+
+        assert_eq!(
+            canon_default, canon_scoped,
+            "cohort_scope / cohort_target_id must NOT enter the signed \
+             canonical bytes — existing signatures must still verify"
+        );
     }
 }

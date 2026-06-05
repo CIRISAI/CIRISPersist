@@ -166,6 +166,19 @@ pub fn decompose(trace: &CompleteTrace) -> Result<Decomposed, Error> {
             scrub_signature: None,
             scrub_key_id: None,
             scrub_timestamp: None,
+            // v4.0 cohort_scope (CIRISPersist#160, V060, FSD §4.3 /
+            // §12.0 item 1). Carried verbatim from the CompleteTrace
+            // envelope's producer-declared (cohort_scope, target),
+            // same per-trace-constant shape as deployment_profile
+            // above. Producers omitting the field ride the struct
+            // default ('federation' / None). For `self`-scoped traces
+            // the IngestPipeline OVERWRITES `cohort_target_id` with the
+            // owner identity resolved from the verified signer (FSD
+            // §4.4) — decompose itself has no backend, so it copies the
+            // wire value here and the pipeline does the substrate
+            // resolution (never trusting a caller-supplied self-target).
+            cohort_scope: trace.cohort_scope.clone(),
+            cohort_target_id: trace.cohort_target_id.clone(),
         };
         events.push(event_row);
 
@@ -399,6 +412,8 @@ mod tests {
                 ),
             ],
             deployment_profile: None,
+            cohort_scope: "federation".into(),
+            cohort_target_id: None,
             signature: "AAAA".into(),
             signature_key_id: "ciris-agent-key:dead".into(),
         }

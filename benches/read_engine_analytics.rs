@@ -87,6 +87,8 @@ fn bench_event(
         scrub_signature: Some("scrub-sig".to_owned()),
         scrub_key_id: Some("scrub-key".to_owned()),
         scrub_timestamp: None,
+        cohort_scope: "federation".to_string(),
+        cohort_target_id: None,
     }
 }
 

@@ -47,27 +47,78 @@ CREATE TABLE cirislens.federation_communities (
 CREATE INDEX idx_federation_communities_members_gin
     ON cirislens.federation_communities USING GIN (members);
 
--- ── Part B: DAS covering indexes ───────────────────────────────────
+-- ── Part B(i): trace_events cohort_scope + target ──────────────────
 --
--- The scrub_key_id leading/INCLUDE column is what makes the §4.3
--- EXISTS-join inner indexable without a heap fetch.
+-- CIRISPersist#160 (FSD §12.0 item 1): the v3.x `trace_events` table
+-- carried NO cohort_scope column, so the §9 community-lens flow had no
+-- trace-read gate. Add TWO columns so the §4.3 predicate can gate at
+-- trace-read time:
+--   - cohort_scope     — the CEG visibility/routing axis the producer
+--                        policy formed (CEG 0.4 wire / 0.10 §10.1.4
+--                        admission). Closed-set CHECK mirroring V056's
+--                        federation_attestations.cohort_scope discipline.
+--   - cohort_target_id — the §4.3 scope TARGET (family_id / community_id
+--                        the producer routed to; or, for `self`, the
+--                        owner identity the substrate resolves from the
+--                        verified signer at write). NULL for the broad
+--                        belonging-tiers.
 --
--- NB — schema reconciliation vs FSD §12 draft DDL: the v3.x
+-- Default 'federation' + NULL target is backward-compat-safe: existing
+-- rows predate any scope and are federation-visible today, so the
+-- column DEFAULT preserves current behavior. The trace wire format
+-- gains OPTIONAL cohort_scope + cohort_target_id envelope fields
+-- (serde default / skip_serializing_if) so existing canonical bytes /
+-- signatures are unchanged; producers that omit them ride the default.
+
+ALTER TABLE cirislens.trace_events
+    ADD COLUMN IF NOT EXISTS cohort_scope TEXT NOT NULL DEFAULT 'federation';
+ALTER TABLE cirislens.trace_events
+    ADD COLUMN IF NOT EXISTS cohort_target_id TEXT;
+
+-- Closed-set enforcement — same discipline as V056's
+-- federation_attestations_cohort_scope_closed_set (idempotent guard so
+-- a re-run is a no-op).
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_constraint
+        WHERE conname = 'trace_events_cohort_scope_closed_set'
+          AND conrelid = 'cirislens.trace_events'::regclass
+    ) THEN
+        ALTER TABLE cirislens.trace_events
+            ADD CONSTRAINT trace_events_cohort_scope_closed_set
+                CHECK (cohort_scope IN (
+                    'self', 'family', 'community',
+                    'affiliations', 'species', 'biosphere', 'federation'
+                ));
+    END IF;
+END$$;
+
+COMMENT ON COLUMN cirislens.trace_events.cohort_scope IS
+    'v4.0 (CIRISPersist#160, CEG 0.4 §4.2.4 / 0.10 §10.1.4). Producer-formed visibility/routing axis. Closed-set; default ''federation'' (backward-compat). The §4.3 read-gate filters (cohort_scope, cohort_target_id) against the reader''s resolved admission.';
+COMMENT ON COLUMN cirislens.trace_events.cohort_target_id IS
+    'v4.0 (CIRISPersist#160, FSD §4.3). Scope target: family_id / community_id the producer routed to, or — for cohort_scope=''self'' — the owner identity the substrate resolved from the verified signer at write. NULL for the broad belonging-tiers.';
+
+-- ── Part B(ii): DAS covering indexes ───────────────────────────────
+--
+-- The §4.3 predicate is now pure set-membership on (cohort_scope,
+-- cohort_target_id) — no emitter join — so the covering index LEADS
+-- with those two columns to make the scope filter index-only, then
+-- windows on ts and groups on deployment_domain.
+--
+-- NB — schema reconciliation vs the FSD §12 first-draft DDL: the v3.x
 -- `trace_events` table stores DMA/conscience/action/fragility scalars
--- inside the `payload` JSON (see V042 functional-index lineage), NOT
--- as physical columns, and carries no `cohort_scope` column;
--- `federation_attestations` exposes its subject as `attested_key_id`
--- (the singular `subject_key_id` / `asserter_key_id` /
--- `attestation_kind` names in the FSD draft do not exist on the
--- physical table — V055 added a plural `subject_key_ids` JSONB array).
--- These indexes therefore cover the §4.3 read-side predicate using the
--- columns that actually exist: `(ts, deployment_domain, scrub_key_id)`
--- on trace_events (the scope-predicate EXISTS join keys on scrub_key_id
--- and windows on ts) and the real `attested_key_id` / `cohort_scope` /
--- `scrub_key_id` columns on federation_attestations.
+-- inside the `payload` JSON (see V042 functional-index lineage), NOT as
+-- physical columns, so the INCLUDE list carries only columns that
+-- actually exist. `federation_attestations` exposes its subject as
+-- `attested_key_id` (the singular `subject_key_id` / `asserter_key_id`
+-- / `attestation_kind` names in the FSD draft do not exist — V055 added
+-- a plural `subject_key_ids` JSONB array); its indexes use the real
+-- `attested_key_id` / `cohort_scope` / `scrub_key_id` columns.
 
 CREATE INDEX IF NOT EXISTS idx_trace_events_v060_repository_stats
-ON cirislens.trace_events (ts, deployment_domain, scrub_key_id);
+ON cirislens.trace_events (cohort_scope, cohort_target_id, ts, deployment_domain)
+INCLUDE (trace_id, agent_id_hash, scrub_key_id);
 
 CREATE INDEX IF NOT EXISTS idx_federation_attestations_v060_by_target
 ON cirislens.federation_attestations (attested_key_id, cohort_scope, asserted_at DESC);

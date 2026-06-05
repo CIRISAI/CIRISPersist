@@ -245,6 +245,32 @@ pub trait Backend: Send + Sync {
     fn add_graph_node(&self, _n: &GraphNode) -> impl Future<Output = Result<(), Error>> + Send {
         async { Err(Error::NotImplemented("add_graph_node (Phase 3)")) }
     }
+
+    /// v4.0 (CIRISPersist#160, FSD §4.4) — resolve the IDENTITY a
+    /// signing/occurrence key speaks for, for the trace-ingest
+    /// `self`-target stamping path (FSD §12.0 item 1).
+    ///
+    /// Returns the `identity_key_id` bound to `occurrence_key_id` via
+    /// `federation_identity_occurrences` (V059), or `None` when the
+    /// key is not (yet) bound as an occurrence of any identity — the
+    /// **singleton-identity fallback** (FSD §4.4): a fresh sovereign
+    /// deployment IS its own identity, so the caller treats `None` as
+    /// "identity == occurrence" and stamps the occurrence key itself.
+    ///
+    /// Default impl returns `Ok(None)` (always singleton) so backends
+    /// without a federation directory degrade to the sovereign posture.
+    /// The Postgres / SQLite / Memory backends override to consult
+    /// their [`crate::federation::FederationDirectory`] impl.
+    ///
+    /// This is a *resolution* method (MISSION §1.7): it reports what
+    /// the federation chain has admitted about the key, never arbitrates
+    /// it.
+    fn resolve_identity_for_occurrence(
+        &self,
+        _occurrence_key_id: &str,
+    ) -> impl Future<Output = Result<Option<String>, Error>> + Send {
+        async { Ok(None) }
+    }
 }
 
 /// Report of a batch insert.

@@ -204,6 +204,21 @@ impl MemoryBackend {
 }
 
 impl Backend for MemoryBackend {
+    /// v4.0 (CIRISPersist#160, FSD §4.4) — delegate to the
+    /// `FederationDirectory` occurrence→identity lookup; `None` means
+    /// the singleton-identity fallback (occurrence == identity).
+    async fn resolve_identity_for_occurrence(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Option<String>, Error> {
+        use crate::federation::FederationDirectory;
+        let io = self
+            .lookup_identity_for_occurrence(occurrence_key_id)
+            .await
+            .map_err(|e| Error::Backend(format!("resolve_identity_for_occurrence: {e}")))?;
+        Ok(io.map(|o| o.identity_key_id))
+    }
+
     async fn insert_trace_events_batch(
         &self,
         rows: &[TraceEventRow],
@@ -2314,6 +2329,8 @@ mod tests {
             deployment_type: None,
             deployment_region: None,
             deployment_trust_mode: None,
+            cohort_scope: "federation".to_string(),
+            cohort_target_id: None,
         }
     }
 
@@ -2470,6 +2487,8 @@ mod tests {
                 },
             ],
             deployment_profile: None,
+            cohort_scope: "federation".into(),
+            cohort_target_id: None,
             signature: "AAAA".into(),
             signature_key_id: "ciris-agent-key:dead".into(),
         };
@@ -3177,6 +3196,8 @@ mod tests {
             deployment_type: None,
             deployment_region: None,
             deployment_trust_mode: None,
+            cohort_scope: "federation".to_string(),
+            cohort_target_id: None,
         }
     }
 
@@ -3329,6 +3350,8 @@ mod tests {
                 deployment_type: None,
                 deployment_region: None,
                 deployment_trust_mode: None,
+                cohort_scope: "federation".to_string(),
+                cohort_target_id: None,
             };
             backend.insert_trace_events_batch(&[row]).await.unwrap();
         }
