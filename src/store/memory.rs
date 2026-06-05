@@ -2154,6 +2154,14 @@ impl crate::read::ReadEngine for MemoryBackend {
         Err(memory_read_unsupported("aggregate_llm_costs"))
     }
 
+    async fn get_repository_statistics(
+        &self,
+        _filter: crate::ceg::RepositoryFilter,
+        _scope: crate::scope::CallerScope,
+    ) -> Result<crate::ceg::RepositoryStatistics, crate::read::Error> {
+        Err(memory_read_unsupported("get_repository_statistics"))
+    }
+
     async fn corpus_shape(
         &self,
         _filter: crate::read::CorpusShapeFilter,

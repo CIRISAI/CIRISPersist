@@ -12,10 +12,12 @@
 //! commits; this module currently re-homes only the relocated v3.x
 //! shapes so the move is behaviour-neutral.
 
+pub mod aggregate;
 pub mod cursor;
 pub mod filter;
 pub mod window;
 
+pub use aggregate::Aggregate;
 pub use cursor::TraceCursor;
-pub use filter::{DeviationMetric, TraceFilter};
+pub use filter::{canonical_window_bytes, DeviationMetric, Filter, TraceFilter};
 pub use window::TimeWindow;

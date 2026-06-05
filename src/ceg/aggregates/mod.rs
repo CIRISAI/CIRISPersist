@@ -11,5 +11,6 @@
 
 pub mod corpus;
 pub mod llm;
+pub mod repository;
 pub mod scoring;
 pub mod scrub;

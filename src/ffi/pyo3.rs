@@ -7900,6 +7900,76 @@ impl PyEngine {
     /// primary model, deployment region. Returns JSON-encoded
     /// `CorpusShape`.
     #[pyo3(signature = (filter_json, caller_occurrence_key_id=None))]
+    /// #159: repository statistics over the trace corpus (FSD §6.2,
+    /// §11.1). `filter_json` decodes to a `RepositoryFilter`;
+    /// `caller_occurrence_key_id` builds the scope exactly as the other
+    /// read wrappers do (`None` → Unauthenticated; `Some` → Authenticated
+    /// with substrate-resolved admission — AV-44 forge surface closed by
+    /// construction, no admission fields cross the boundary).
+    ///
+    /// Returns JSON-encoded `RepositoryStatistics` (the §11.3
+    /// serialization-controlled shape — every nested struct + the
+    /// `sample_count` / `cache_hit` / `evaluated_at_unix_ms` fields
+    /// round-trip through serde). Raises `ValueError` on filter decode
+    /// error; `RuntimeError` on backend failure (mirroring the rest of
+    /// the read surface).
+    fn get_repository_statistics(
+        &self,
+        py: Python<'_>,
+        filter_json: &str,
+        caller_occurrence_key_id: Option<String>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let filter: crate::ceg::RepositoryFilter = serde_json::from_str(filter_json)
+                .map_err(|e| PyValueError::new_err(format!("RepositoryFilter JSON decode: {e}")))?;
+            let dispatch = self.engine_dispatch();
+            let signer = self.signer.clone();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
+                        let stats = backend
+                            .get_repository_statistics(filter, scope)
+                            .await
+                            .map_err(read_err_to_py)?;
+                        serde_json::to_string(&stats).map_err(|e| {
+                            PyRuntimeError::new_err(format!("RepositoryStatistics encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
+                        let stats = backend
+                            .get_repository_statistics(filter, scope)
+                            .await
+                            .map_err(read_err_to_py)?;
+                        serde_json::to_string(&stats).map_err(|e| {
+                            PyRuntimeError::new_err(format!("RepositoryStatistics encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
     fn corpus_shape(
         &self,
         py: Python<'_>,

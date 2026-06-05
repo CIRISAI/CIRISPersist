@@ -73,6 +73,15 @@ pub use crate::ceg::{
     TraceSummary,
 };
 
+// v4.0 (#159, FSD §5/§6) — the repository-statistics aggregate surface:
+// the `Filter` + `Aggregate` traits, the driving `RepositoryFilter`, and
+// the `RepositoryStatistics` result + its nested shapes.
+pub use crate::ceg::{
+    ActionAggregates, Aggregate, ConscienceAggregates, ConsciencePerCheck, DomainBreakdown, Filter,
+    FragilityAggregates, RepositoryFilter, RepositoryStatistics, ScoreAggregates,
+    ScoreDistribution, Totals,
+};
+
 // Lens-derived schema types (v0.4.3, CIRISPersist#18). Lens-core
 // writes detection events; RATCHET writes calibration bundles; both
 // flow through Engine.put_* (PyO3) or DerivedSchema impls (rlib).

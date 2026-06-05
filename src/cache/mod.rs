@@ -282,6 +282,72 @@ impl<T> Cache<T> {
         Ok(value)
     }
 
+    /// Read-only probe for an async caller (FSD §7.3 cache-miss path).
+    ///
+    /// [`get_or_compute`](Self::get_or_compute) takes a *synchronous*
+    /// `FnOnce`; an aggregate read whose recompute is an `async` backend
+    /// query cannot run it inside that closure. The async caller instead
+    /// does: `try_get` (hit → return cached); on miss run the async query
+    /// then [`store`](Self::store). This split records hits/misses and
+    /// honours TTL identically to `get_or_compute` — a TTL-expired entry
+    /// is dropped and reported as a miss (§7.4 fail-honest: nothing stale
+    /// is returned; the caller recomputes).
+    ///
+    /// Returns `Some(Arc<T>)` on a live hit (records a hit), `None` on
+    /// absent-or-expired (records a miss).
+    pub fn try_get(&self, key: &CacheKey) -> Option<Arc<T>> {
+        let now = Instant::now();
+        let ttl = self.config.ttl;
+        let mut inner = self.inner.lock().expect("cache mutex poisoned");
+        let got = inner.lru.get(key, ttl, now);
+        if got.evicted_ttl > 0 {
+            inner.deregister(key);
+            self.stats.record_eviction_ttl(got.evicted_ttl);
+            self.refresh_residency(&inner);
+        }
+        match got.hit {
+            Some(value) => {
+                self.stats.record_hit();
+                self.refresh_residency(&inner);
+                Some(value)
+            }
+            None => {
+                self.stats.record_miss();
+                None
+            }
+        }
+    }
+
+    /// Store a freshly-computed value after a [`try_get`](Self::try_get)
+    /// miss (FSD §7.3). Mirrors the store half of
+    /// [`get_or_compute`](Self::get_or_compute): inserts, maintains the
+    /// §7.3 reverse index, and folds any capacity eviction into stats.
+    /// Returns the shared `Arc<T>` so the caller hands back the same
+    /// instance a concurrent hit would have seen.
+    pub fn store(&self, key: CacheKey, value: T, byte_size: usize) -> Arc<T> {
+        let now = Instant::now();
+        let value = Arc::new(value);
+        let mut inner = self.inner.lock().expect("cache mutex poisoned");
+        inner.deregister(&key);
+        let out = inner.lru.insert(
+            key.clone(),
+            CacheEntry {
+                value: Arc::clone(&value),
+                byte_size,
+                inserted_at: now,
+            },
+        );
+        if inner.lru.contains_resident(&key) {
+            inner.register(&key);
+        }
+        if out.evicted_lru > 0 {
+            self.reconcile_index(&mut inner);
+            self.stats.record_eviction_lru(out.evicted_lru);
+        }
+        self.refresh_residency(&inner);
+        value
+    }
+
     /// Evict every cached aggregate whose window overlaps the bucket the
     /// write landed in (§7.3). `write_unix_ms` is the timestamp of the
     /// row that changed; the cache looks up `bucket_of(write_unix_ms)`

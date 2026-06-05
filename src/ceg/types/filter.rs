@@ -103,3 +103,66 @@ impl DeviationMetric {
         }
     }
 }
+
+/// Filter primitives — the composable shape substrate read primitives
+/// accept (FSD §5.1).
+///
+/// Each primitive defines its own concrete filter (e.g.
+/// [`crate::ceg::RepositoryFilter`], [`TraceFilter`]); the trait exists
+/// to unify the `time-window + scope + agent-id-hash` shape so the
+/// substrate can write *one* cache helper that works across every
+/// primitive. It does **not** let consumers compose arbitrary filters.
+pub trait Filter {
+    /// The window the filter selects.
+    fn window(&self) -> &TimeWindow;
+    /// `agent_id_hash` discriminators (empty = all agents).
+    fn agent_id_hashes(&self) -> &[String];
+    /// `deployment_domain` discriminators (empty = all domains).
+    fn deployment_domains(&self) -> &[String];
+    /// `cohort_scope` discriminators (empty = scope-default).
+    fn cohort_scope_in(&self) -> &[String];
+
+    /// Cache-key digest — the cache substrate folds this into its
+    /// [`CacheKey`](crate::cache::CacheKey) so two callers with
+    /// identical `(method, filter, scope, bucket)` share an entry.
+    ///
+    /// The default impl hashes `(type_tag, window, agent_id_hashes,
+    /// deployment_domains, cohort_scope_in)`. **It is correct ONLY when
+    /// an implementer's discriminating state is fully captured by those
+    /// fields.** A filter with additional result-changing fields —
+    /// `task_classes`, `fragility_only`, any future discriminator — MUST
+    /// override this method to fold those fields into the hash, or two
+    /// distinct filters collide on one cache entry and the second serves
+    /// the first's answer (FSD §5.1).
+    fn cache_key_digest(&self) -> [u8; 32] {
+        let mut h = <sha2::Sha256 as sha2::Digest>::new();
+        sha2::Digest::update(&mut h, b"Filter:default:v4.0\0");
+        for chunk in canonical_window_bytes(self.window()) {
+            sha2::Digest::update(&mut h, [chunk]);
+        }
+        for a in self.agent_id_hashes() {
+            sha2::Digest::update(&mut h, a.as_bytes());
+            sha2::Digest::update(&mut h, b"\0");
+        }
+        for d in self.deployment_domains() {
+            sha2::Digest::update(&mut h, d.as_bytes());
+            sha2::Digest::update(&mut h, b"\0");
+        }
+        for s in self.cohort_scope_in() {
+            sha2::Digest::update(&mut h, s.as_bytes());
+            sha2::Digest::update(&mut h, b"\0");
+        }
+        sha2::Digest::finalize(h).into()
+    }
+}
+
+/// Canonical byte encoding of a [`TimeWindow`] for cache-key digests —
+/// the two unix-millisecond bounds, little-endian. Shared by the
+/// [`Filter::cache_key_digest`] default impl and every concrete
+/// override so a window hashes identically everywhere.
+pub fn canonical_window_bytes(w: &TimeWindow) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out[..8].copy_from_slice(&w.since.timestamp_millis().to_le_bytes());
+    out[8..].copy_from_slice(&w.until.timestamp_millis().to_le_bytes());
+    out
+}
