@@ -471,6 +471,37 @@ impl Backend for PostgresBackend {
         Ok(io.map(|o| o.identity_key_id))
     }
 
+    /// v4.0 (CIRISPersist#160, FSD §4.6) — family-half of the writer
+    /// admission for the write-path cohort_scope gate.
+    async fn admission_family_key_ids(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<String>, Error> {
+        use crate::federation::FederationDirectory;
+        let families = self
+            .list_families_for_member(member_identity_key_id)
+            .await
+            .map_err(|e| Error::Backend(format!("admission_family_key_ids: {e}")))?;
+        Ok(families.into_iter().map(|f| f.family_key_id).collect())
+    }
+
+    /// v4.0 (CIRISPersist#160, FSD §4.6) — community-half of the writer
+    /// admission for the write-path cohort_scope gate.
+    async fn admission_community_key_ids(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<String>, Error> {
+        use crate::federation::FederationDirectory;
+        let communities = self
+            .list_communities_for_member(member_identity_key_id)
+            .await
+            .map_err(|e| Error::Backend(format!("admission_community_key_ids: {e}")))?;
+        Ok(communities
+            .into_iter()
+            .map(|c| c.community_key_id)
+            .collect())
+    }
+
     async fn insert_trace_events_batch(
         &self,
         rows: &[TraceEventRow],
@@ -1544,6 +1575,23 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // trace. The V056 CHECK constraint is the defense-in-depth
         // backstop for direct-SQL bypass.
         crate::federation::admission::check_cohort_scope(&row.cohort_scope)?;
+
+        // v4.0 (CIRISPersist#160 comment 4, FSD §4.6) — AV-45 write-path
+        // cohort_scope admission gate. The writer (`attesting_key_id`)
+        // must be a MEMBER of the target cohort they stamp. Attestations
+        // carry a `cohort_scope` label but no `cohort_target_id`, so
+        // `self` + broad belonging-tiers pass while `family` / `community`
+        // are refused (a downgrade with no provable membership target).
+        // Runs BEFORE persist_row_hash + INSERT so a refused row leaves
+        // no trace (verify-then-gate-then-persist, MISSION §1.6).
+        crate::federation::FederationDirectory::check_write_cohort_scope_for(
+            self,
+            &row.attesting_key_id,
+            "put_attestation",
+            &row.cohort_scope,
+            None,
+        )
+        .await?;
 
         // v3.0.0 (CIRISPersist#116, CEG 0.2 §6.1) — structural-composer
         // dedup on `(references_attestation_id, attestation_type,

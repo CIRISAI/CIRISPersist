@@ -188,6 +188,41 @@ impl MemoryBackend {
         rec.roles = roles;
     }
 
+    /// v4.0 (CIRISPersist#160, FSD §4.6) — test helper: declare a
+    /// community whose roster contains `member_identity_key_ids`, so the
+    /// write-path cohort_scope gate sees the writer as a member. Inserts
+    /// directly into the in-memory roster (skips the `put_community` FK +
+    /// admission path — pure membership fixture for the AV-45 ingest
+    /// tests). Used by the trace-ingest write-gate tests.
+    pub fn add_community_membership(
+        &self,
+        community_key_id: &str,
+        member_identity_key_ids: &[&str],
+    ) {
+        let now = chrono::Utc::now();
+        let members = member_identity_key_ids
+            .iter()
+            .map(|k| crate::federation::types::CommunityMember {
+                key_id: (*k).to_owned(),
+                joined_at: now,
+                role: None,
+            })
+            .collect();
+        let community = crate::federation::Community {
+            community_key_id: community_key_id.to_owned(),
+            community_name: format!("test-community:{community_key_id}"),
+            members,
+            founded_at: now,
+            consensus_protocol: "founder_only".to_owned(),
+            policy_blob: None,
+            persist_row_hash: String::new(),
+        };
+        let mut state = self.state.lock().expect("memory backend lock");
+        state
+            .federation_communities
+            .insert(community_key_id.to_owned(), community);
+    }
+
     /// Snapshot of inserted event rows. For tests.
     pub fn snapshot_events(&self) -> Vec<TraceEventRow> {
         let state = self.state.lock().expect("memory backend lock");
@@ -217,6 +252,37 @@ impl Backend for MemoryBackend {
             .await
             .map_err(|e| Error::Backend(format!("resolve_identity_for_occurrence: {e}")))?;
         Ok(io.map(|o| o.identity_key_id))
+    }
+
+    /// v4.0 (CIRISPersist#160, FSD §4.6) — family-half of the writer
+    /// admission; delegates to the `FederationDirectory` fan-out.
+    async fn admission_family_key_ids(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<String>, Error> {
+        use crate::federation::FederationDirectory;
+        let families = self
+            .list_families_for_member(member_identity_key_id)
+            .await
+            .map_err(|e| Error::Backend(format!("admission_family_key_ids: {e}")))?;
+        Ok(families.into_iter().map(|f| f.family_key_id).collect())
+    }
+
+    /// v4.0 (CIRISPersist#160, FSD §4.6) — community-half of the writer
+    /// admission; delegates to the `FederationDirectory` fan-out.
+    async fn admission_community_key_ids(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<String>, Error> {
+        use crate::federation::FederationDirectory;
+        let communities = self
+            .list_communities_for_member(member_identity_key_id)
+            .await
+            .map_err(|e| Error::Backend(format!("admission_community_key_ids: {e}")))?;
+        Ok(communities
+            .into_iter()
+            .map(|c| c.community_key_id)
+            .collect())
     }
 
     async fn insert_trace_events_batch(
@@ -491,6 +557,25 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         attestation: crate::federation::SignedAttestation,
     ) -> Result<(), crate::federation::Error> {
         let mut row = attestation.attestation;
+
+        // v4.0 (CIRISPersist#160 comment 4, FSD §4.6) — AV-45 write-path
+        // cohort_scope admission gate. Runs BEFORE the state lock is
+        // taken (the resolution fan-out acquires the lock itself; holding
+        // it across the await would not be `Send`). The writer
+        // (`attesting_key_id`) must be a member of the target cohort they
+        // stamp. `self` + broad tiers pass with no read; family/community
+        // (no `cohort_target_id` field on attestations) are refused as a
+        // downgrade with no provable membership. A refusal returns before
+        // any row is pushed (verify-then-gate-then-persist).
+        crate::federation::FederationDirectory::check_write_cohort_scope_for(
+            self,
+            &row.attesting_key_id,
+            "put_attestation",
+            &row.cohort_scope,
+            None,
+        )
+        .await?;
+
         let mut state = self.state.lock().expect("memory backend lock");
         // FK enforcement parity with postgres: both attesting_key_id
         // and attested_key_id must exist in federation_keys.

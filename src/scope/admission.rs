@@ -154,6 +154,35 @@ pub async fn build_caller_admission(
     })
 }
 
+impl CallerAdmission {
+    /// v4.0 (CIRISPersist#160 comment 4, FSD §4.6) — crate-internal
+    /// constructor from already-resolved admission parts.
+    ///
+    /// [`build_caller_admission`] is the `Engine`-based resolution path
+    /// used on the read side. The trace-ingest write path
+    /// (`IngestPipeline`) holds only a `Backend` (no `Engine`), so it
+    /// resolves the writer's identity / family / community sets through
+    /// the `Backend` admission fan-out methods and assembles the
+    /// `CallerAdmission` here. The constructor stays `pub(crate)` so the
+    /// AV-44 forge-resistance seal is intact — no external crate can
+    /// reach this path (FSD §13). Membership semantics are identical to
+    /// the read-side builder; only the resolution plumbing differs.
+    pub(crate) fn from_resolved(
+        occurrence_key_id: impl Into<KeyId>,
+        identity_key_id: impl Into<KeyId>,
+        family_key_ids: impl IntoIterator<Item = KeyId>,
+        community_key_ids: impl IntoIterator<Item = KeyId>,
+    ) -> Self {
+        Self {
+            occurrence_key_id: occurrence_key_id.into(),
+            identity_key_id: identity_key_id.into(),
+            family_key_ids: family_key_ids.into_iter().collect(),
+            community_key_ids: community_key_ids.into_iter().collect(),
+            _seal: AdmissionSeal,
+        }
+    }
+}
+
 #[cfg(test)]
 impl CallerAdmission {
     /// Test-only direct constructor. The seal blocks *external*

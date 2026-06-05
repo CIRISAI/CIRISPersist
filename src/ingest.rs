@@ -89,6 +89,22 @@ pub enum IngestError {
     #[error("sign: {0}")]
     Sign(String),
 
+    /// v4.0 (CIRISPersist#160 comment 4, FSD §4.6) — AV-45 write-path
+    /// cohort_scope admission refusal. The trace claimed a
+    /// `(cohort_scope, cohort_target_id)` the verified writer is not a
+    /// member of (a visibility-downgrade attempt — e.g. stamping
+    /// `community: C` for a community the writer doesn't belong to). The
+    /// gate runs AFTER the step-2 verify gate and BEFORE the insert; a
+    /// refusal means ZERO rows persist for the whole batch (mirrors the
+    /// verify-rejection discipline, MISSION §1.6). Lens → HTTP 403.
+    ///
+    /// Carries the structured [`ScopeRefusalReason`](crate::scope::ScopeRefusalReason);
+    /// `kind()` surfaces the stable per-reason token
+    /// (`scope_no_family_membership` / `scope_no_community_membership` /
+    /// `scope_invalid_cohort_scope`).
+    #[error("scope: {0}")]
+    ScopeRefused(#[from] crate::scope::ScopeRefusalReason),
+
     /// v1.1.0 (CIRISPersist#33 part 3) — `PipelineEnvelope` failed one
     /// of the FSD §4.3 wire-shape / consistency invariants. Lens →
     /// HTTP 422. Each invariant carries a stable kind token so
@@ -120,6 +136,10 @@ impl IngestError {
             IngestError::Scrub(e) => e.kind(),
             IngestError::Store(e) => e.kind(),
             IngestError::Sign(_) => "sign_keyring",
+            // AV-15: the single stable boundary token for the write-side
+            // cohort_scope refusal. The per-reason detail (which membership
+            // failed) is available via the inner `ScopeRefusalReason::kind`.
+            IngestError::ScopeRefused(_) => "write_scope_refused",
             IngestError::PipelineInvariant { kind, .. } => kind,
         }
     }
@@ -146,6 +166,9 @@ impl IngestError {
         match self {
             IngestError::Schema(e) => e.detail(),
             IngestError::PipelineInvariant { detail, .. } => Some(detail.clone()),
+            // The per-reason machine token (e.g. `scope_no_community_membership`)
+            // is the actionable detail for a write-scope refusal.
+            IngestError::ScopeRefused(r) => Some(r.kind().to_string()),
             IngestError::Verify(_)
             | IngestError::Scrub(_)
             | IngestError::Store(_)
@@ -374,6 +397,13 @@ where
         let mut events_to_insert = Vec::new();
         let mut llm_calls_to_insert = Vec::new();
         let mut env_idx = 0usize;
+        // v4.0 (FSD §4.6) — write-path cohort_scope gate: resolved
+        // writer admission, keyed on the signer (`scrub_key_id`). Built
+        // lazily on the first family/community row so all-self / all-broad
+        // / all-federation batches pay no admission reads. Same signer
+        // signs every component of a batch in this pipeline, so the cache
+        // is hit for every row after the first family/community one.
+        let mut writer_admission_cache: Option<(String, crate::scope::CallerAdmission)> = None;
         for event in &env.events {
             match event {
                 BatchEvent::CompleteTrace { trace, .. } => {
@@ -443,6 +473,58 @@ where
                                 .map_err(IngestError::Store)?
                                 .unwrap_or_else(|| signer.to_owned());
                             row.cohort_target_id = Some(resolved);
+                        }
+
+                        // v4.0 (CIRISPersist#160 comment 4, FSD §4.6) —
+                        // AV-45 write-path cohort_scope admission gate.
+                        // A writer claiming (cohort_scope, target) must be
+                        // a MEMBER of the target it names. Symmetric to the
+                        // §4.3 read-gate; same `CallerAdmission`, opposite
+                        // direction.
+                        //
+                        // Ordering (load-bearing, MISSION §4): this runs
+                        // strictly AFTER the step-2 verify gate and AFTER
+                        // D2's self-target resolution, and BEFORE the
+                        // step-5 insert. A refusal returns `Err` here, so
+                        // `events_to_insert` is dropped without ever
+                        // reaching `insert_trace_events_batch` — ZERO rows
+                        // persist for the whole batch (mirrors the
+                        // signature-mismatch zero-writes discipline).
+                        //
+                        // `self` + the broad belonging-tiers are no-op
+                        // passes (the gate needs no membership set for
+                        // them); only `family` / `community` consult the
+                        // writer's resolved admission. We build that
+                        // admission lazily — once per batch on first need
+                        // — from the verified signer (`scrub_key_id`), so
+                        // an all-`self`/all-broad/all-federation batch
+                        // (every current producer) pays no extra reads.
+                        let scope = row.cohort_scope.as_str();
+                        if scope == crate::federation::types::cohort_scope::FAMILY
+                            || scope == crate::federation::types::cohort_scope::COMMUNITY
+                        {
+                            let admission = self
+                                .writer_admission(
+                                    &mut writer_admission_cache,
+                                    env_for_row.scrub_key_id.as_str(),
+                                )
+                                .await?;
+                            if let Err(reason) = crate::federation::admission::DimensionAdmissionPolicy::check_write_cohort_scope(
+                                admission,
+                                scope,
+                                row.cohort_target_id.as_deref(),
+                            ) {
+                                // §9.3 — Layer-1 write-side refusal counter.
+                                tracing::warn!(
+                                    metric = "persist_refused_write_scope_total",
+                                    write_path = "trace_ingest",
+                                    scope = %scope,
+                                    reason = %reason.kind(),
+                                    target = ?row.cohort_target_id,
+                                    "ciris-persist: write-path cohort_scope refused (AV-45)"
+                                );
+                                return Err(IngestError::ScopeRefused(reason));
+                            }
                         }
 
                         env_idx += 1;
@@ -604,6 +686,59 @@ where
             }
         }
         Ok(envelopes)
+    }
+
+    /// v4.0 (CIRISPersist#160 comment 4, FSD §4.6) — resolve (and cache)
+    /// the verified writer's [`CallerAdmission`](crate::scope::CallerAdmission)
+    /// for the write-path cohort_scope gate.
+    ///
+    /// The writer's occurrence key is `signer` (the `scrub_key_id` — the
+    /// Ed25519-verified deployment key). Resolution mirrors the read-side
+    /// [`build_caller_admission`](crate::scope::build_caller_admission)
+    /// but through the `Backend` admission fan-out methods (the ingest
+    /// pipeline holds no `Engine`):
+    ///
+    /// 1. `signer → identity` via `resolve_identity_for_occurrence`
+    ///    (singleton fallback: unbound occurrence IS its own identity,
+    ///    FSD §4.4).
+    /// 2. `identity → family_key_ids` / `community_key_ids` via the
+    ///    `admission_*_key_ids` fan-out.
+    ///
+    /// Cached per batch on the signer string; same signer signs every
+    /// component, so at most one resolution per batch.
+    async fn writer_admission<'c>(
+        &self,
+        cache: &'c mut Option<(String, crate::scope::CallerAdmission)>,
+        signer: &str,
+    ) -> Result<&'c crate::scope::CallerAdmission, IngestError> {
+        let needs_build = !matches!(cache, Some((k, _)) if k == signer);
+        if needs_build {
+            let identity = self
+                .backend
+                .resolve_identity_for_occurrence(signer)
+                .await
+                .map_err(IngestError::Store)?
+                .unwrap_or_else(|| signer.to_owned());
+            let families = self
+                .backend
+                .admission_family_key_ids(&identity)
+                .await
+                .map_err(IngestError::Store)?;
+            let communities = self
+                .backend
+                .admission_community_key_ids(&identity)
+                .await
+                .map_err(IngestError::Store)?;
+            let admission = crate::scope::CallerAdmission::from_resolved(
+                signer.to_owned(),
+                identity,
+                families,
+                communities,
+            );
+            *cache = Some((signer.to_owned(), admission));
+        }
+        // Safe: just populated above when the key didn't match.
+        Ok(&cache.as_ref().expect("writer admission populated").1)
     }
 
     async fn verify_complete_trace(
@@ -849,11 +984,11 @@ mod tests {
         )
     }
 
-    /// v4.0 (CIRISPersist#160, FSD §4.3) — a `community`-scoped trace
-    /// with a producer-supplied target lands with that exact
-    /// (cohort_scope, cohort_target_id) on every row. For family /
-    /// community the substrate records the producer's target as-is
-    /// (Commit F's write-gate validates membership separately).
+    /// v4.0 (CIRISPersist#160, FSD §4.3 + §4.6) — a `community`-scoped
+    /// trace whose writer IS a member of the named community lands with
+    /// that exact (cohort_scope, cohort_target_id) on every row. The
+    /// Commit-F write-gate passes (membership held); the substrate
+    /// records the producer's target verbatim.
     #[tokio::test]
     async fn cohort_community_target_round_trips() {
         let (bytes, key_id, vkey) =
@@ -862,6 +997,10 @@ mod tests {
         backend.add_public_key(&key_id, vkey);
 
         let (signer, signer_key_id) = make_test_signer().await;
+        // FSD §4.6 — make the verified WRITER (the signer; unbound, so
+        // identity == occurrence == signer_key_id) a member of the named
+        // community so the write-gate admits the row.
+        backend.add_community_membership("community-key:lens-alpha", &[signer_key_id.as_str()]);
         let pipeline = IngestPipeline {
             backend: &backend,
             canonicalizer: &PythonJsonDumpsCanonicalizer,
@@ -882,6 +1021,81 @@ mod tests {
                 Some("community-key:lens-alpha"),
                 "producer-supplied community target is recorded verbatim"
             );
+        }
+    }
+
+    /// v4.0 (CIRISPersist#160 comment 4, FSD §4.6) — AV-45 write-gate:
+    /// a verified writer that stamps `cohort_scope: community` for a
+    /// community it is NOT a member of is REFUSED, and ZERO rows persist
+    /// (mirrors `signature_mismatch_rejected_no_writes`). This is the
+    /// visibility-downgrade attempt the gate exists to block.
+    #[tokio::test]
+    async fn write_gate_refuses_non_member_community_zero_writes() {
+        let (bytes, key_id, vkey) =
+            make_signed_batch_bytes_with_cohort("community", Some("community-key:not-mine"));
+        let backend = MemoryBackend::new();
+        backend.add_public_key(&key_id, vkey);
+
+        let (signer, signer_key_id) = make_test_signer().await;
+        // The writer (signer) is a member of a DIFFERENT community —
+        // not the one the trace claims.
+        backend.add_community_membership("community-key:mine", &[signer_key_id.as_str()]);
+        let pipeline = IngestPipeline {
+            backend: &backend,
+            canonicalizer: &PythonJsonDumpsCanonicalizer,
+            scrubber: &NullScrubber,
+            signer: &*signer,
+            signer_key_id: &signer_key_id,
+        };
+
+        let err = pipeline.receive_and_persist(&bytes).await.unwrap_err();
+        match err {
+            IngestError::ScopeRefused(crate::scope::ScopeRefusalReason::NoCommunityMembership) => {}
+            other => panic!("expected ScopeRefused(NoCommunityMembership), got {other:?}"),
+        }
+        // Stable boundary token + per-reason detail.
+        assert_eq!(err.kind(), "write_scope_refused");
+        assert_eq!(
+            err.detail().as_deref(),
+            Some("scope_no_community_membership")
+        );
+        // Zero writes — the refusal short-circuits before the insert.
+        assert!(
+            backend.snapshot_events().is_empty(),
+            "a refused cohort_scope downgrade must produce zero rows"
+        );
+    }
+
+    /// v4.0 (CIRISPersist#160 comment 4, FSD §4.6) — AV-45 write-gate
+    /// pass case: a verified writer that IS a member of the claimed
+    /// community persists normally (companion to the refusal test).
+    #[tokio::test]
+    async fn write_gate_admits_member_community_persists() {
+        let (bytes, key_id, vkey) =
+            make_signed_batch_bytes_with_cohort("community", Some("community-key:mine"));
+        let backend = MemoryBackend::new();
+        backend.add_public_key(&key_id, vkey);
+
+        let (signer, signer_key_id) = make_test_signer().await;
+        backend.add_community_membership("community-key:mine", &[signer_key_id.as_str()]);
+        let pipeline = IngestPipeline {
+            backend: &backend,
+            canonicalizer: &PythonJsonDumpsCanonicalizer,
+            scrubber: &NullScrubber,
+            signer: &*signer,
+            signer_key_id: &signer_key_id,
+        };
+
+        let summary = pipeline.receive_and_persist(&bytes).await.unwrap();
+        assert_eq!(summary.signatures_verified, 1);
+        let snap = backend.snapshot_events();
+        assert!(
+            !snap.is_empty(),
+            "member-claimed community row must persist"
+        );
+        for row in &snap {
+            assert_eq!(row.cohort_scope, "community");
+            assert_eq!(row.cohort_target_id.as_deref(), Some("community-key:mine"));
         }
     }
 
