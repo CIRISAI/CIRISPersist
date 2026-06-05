@@ -8,13 +8,20 @@
 //!   ON CONFLICT (task_id) DO UPDATE … → ON CONFLICT (task_id) DO UPDATE …
 //!   ON CONFLICT (task_id) DO NOTHING  → INSERT OR IGNORE
 //!
-//! Threading: `tokio::task::spawn_blocking` + `conn.blocking_lock()`
+//! Threading: `tokio::task::spawn_blocking` + `conn.lock()`
 //! per the existing pattern (mirrors `src/incident/sqlite.rs`).
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
 
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
-use tokio::sync::Mutex;
 
 use super::service::TaskService;
 use super::types::{Task, TaskCursor, TaskFilter, TaskListPage, TaskStatus, TaskUpsertOutcome};
@@ -231,8 +238,8 @@ impl TaskService for SqliteTaskBackend {
         let agent_occurrence = task.agent_occurrence_id.clone();
 
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<TaskUpsertOutcome, Error> {
-            let mut guard = conn.blocking_lock();
+        (move || -> Result<TaskUpsertOutcome, Error> {
+            let mut guard = conn.lock();
             let tx = guard
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|e| map_sqlite_error(e, "upsert_task begin"))?;
@@ -328,9 +335,7 @@ impl TaskService for SqliteTaskBackend {
                 }
                 Err(e) => Err(map_sqlite_error(e, "upsert_task insert")),
             }
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn get_task(&self, task_id: &str) -> Result<Option<Task>, Error> {
@@ -339,8 +344,8 @@ impl TaskService for SqliteTaskBackend {
         }
         let conn = self.conn.clone();
         let task_id_owned = task_id.to_owned();
-        tokio::task::spawn_blocking(move || -> Result<Option<Task>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Option<Task>, Error> {
+            let guard = conn.lock();
             let row_opt = guard
                 .query_row(
                     "SELECT task_id, channel_id, description, status, priority, \
@@ -358,9 +363,7 @@ impl TaskService for SqliteTaskBackend {
                 None => Ok(None),
                 Some(r) => Ok(Some(r?)),
             }
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn list_tasks(
@@ -441,8 +444,8 @@ impl TaskService for SqliteTaskBackend {
         );
         let conn = self.conn.clone();
         let limit_usize = limit as usize;
-        tokio::task::spawn_blocking(move || -> Result<TaskListPage, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<TaskListPage, Error> {
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare(&sql)
                 .map_err(|e| map_sqlite_error(e, "list_tasks prepare"))?;
@@ -463,9 +466,7 @@ impl TaskService for SqliteTaskBackend {
                 None
             };
             Ok(TaskListPage { items, next_cursor })
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn update_task_status(
@@ -482,8 +483,8 @@ impl TaskService for SqliteTaskBackend {
         let status_sql = new_status.as_sql_str().to_owned();
         let task_id_owned = task_id.to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<bool, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<bool, Error> {
+            let guard = conn.lock();
             // COALESCE($outcome, outcome_json) — preserve existing
             // outcome if caller didn't supply one. Caller can pass
             // serde_json::Value::Null explicitly via Some(Value::Null)
@@ -499,9 +500,7 @@ impl TaskService for SqliteTaskBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "update_task_status exec"))?;
             Ok(changed > 0)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn try_claim_shared_task(&self, task: Task) -> Result<ClaimResult<Task>, Error> {
@@ -517,15 +516,14 @@ impl TaskService for SqliteTaskBackend {
         let task_id_for_lookup = task.task_id.clone();
 
         let conn = self.conn.clone();
-        let (won, row): (bool, Task) =
-            tokio::task::spawn_blocking(move || -> Result<(bool, Task), Error> {
-                let mut guard = conn.blocking_lock();
-                let tx = guard
-                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                    .map_err(|e| map_sqlite_error(e, "try_claim_shared_task begin"))?;
-                let changed = tx
-                    .execute(
-                        "INSERT OR IGNORE INTO cirislens_tasks (\
+        let (won, row): (bool, Task) = (move || -> Result<(bool, Task), Error> {
+            let mut guard = conn.lock();
+            let tx = guard
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| map_sqlite_error(e, "try_claim_shared_task begin"))?;
+            let changed = tx
+                .execute(
+                    "INSERT OR IGNORE INTO cirislens_tasks (\
                             task_id, channel_id, description, status, priority, \
                             created_at, updated_at, parent_task_id, context_json, outcome_json, \
                             retry_count, signed_by, signature, signed_at, \
@@ -533,32 +531,32 @@ impl TaskService for SqliteTaskBackend {
                             agent_occurrence_id, images_json\
                          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
                                    ?14, ?15, ?16, ?17, ?18)",
-                        params![
-                            task.task_id,
-                            task.channel_id,
-                            task.description,
-                            status_sql,
-                            task.priority,
-                            created_at_str,
-                            updated_at_str,
-                            task.parent_task_id,
-                            context_str,
-                            outcome_str,
-                            task.retry_count,
-                            task.signed_by,
-                            task.signature,
-                            signed_at_str,
-                            updated_info_int,
-                            task.updated_info_content,
-                            task.agent_occurrence_id,
-                            images_str,
-                        ],
-                    )
-                    .map_err(|e| map_sqlite_error(e, "try_claim_shared_task insert"))?;
-                let won = changed > 0;
-                // Re-read the row — winner gets back their own row,
-                // loser gets back the EXISTING row.
-                let row = tx
+                    params![
+                        task.task_id,
+                        task.channel_id,
+                        task.description,
+                        status_sql,
+                        task.priority,
+                        created_at_str,
+                        updated_at_str,
+                        task.parent_task_id,
+                        context_str,
+                        outcome_str,
+                        task.retry_count,
+                        task.signed_by,
+                        task.signature,
+                        signed_at_str,
+                        updated_info_int,
+                        task.updated_info_content,
+                        task.agent_occurrence_id,
+                        images_str,
+                    ],
+                )
+                .map_err(|e| map_sqlite_error(e, "try_claim_shared_task insert"))?;
+            let won = changed > 0;
+            // Re-read the row — winner gets back their own row,
+            // loser gets back the EXISTING row.
+            let row = tx
                     .query_row(
                         "SELECT task_id, channel_id, description, status, priority, \
                                 created_at, updated_at, parent_task_id, context_json, outcome_json, \
@@ -570,12 +568,10 @@ impl TaskService for SqliteTaskBackend {
                         |row| Ok(decode_task_row(row)),
                     )
                     .map_err(|e| map_sqlite_error(e, "try_claim_shared_task readback"))??;
-                tx.commit()
-                    .map_err(|e| map_sqlite_error(e, "try_claim_shared_task commit"))?;
-                Ok((won, row))
-            })
-            .await
-            .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))??;
+            tx.commit()
+                .map_err(|e| map_sqlite_error(e, "try_claim_shared_task commit"))?;
+            Ok((won, row))
+        })()?;
 
         if won {
             Ok(ClaimResult::Stored(row))
@@ -590,8 +586,8 @@ impl TaskService for SqliteTaskBackend {
         }
         let task_id_owned = task_id.to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<bool, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<bool, Error> {
+            let guard = conn.lock();
             // SQLite needs PRAGMA foreign_keys=ON for the self-FK to
             // be enforced. The store opens connections with FK on
             // already (see store::sqlite::SqliteBackend); we don't
@@ -603,9 +599,7 @@ impl TaskService for SqliteTaskBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "delete_task exec"))?;
             Ok(changed > 0)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 }
 

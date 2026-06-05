@@ -37,14 +37,21 @@
 //! impl; the `AuditRecord` builder is duplicated locally per FSD
 //! §7.1's "audit-write is the load-bearing accountability surface"
 //! discipline — the builder is independent of backend.
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
 
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::crypto;
@@ -272,8 +279,8 @@ impl SqliteSecretsBackend {
         let trace_id = rec.trace_id;
         let thought_id = rec.thought_id;
         let success_int: i64 = if success { 1 } else { 0 };
-        tokio::task::spawn_blocking(move || -> Result<(), SecretsError> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<(), SecretsError> {
+            let guard = conn.lock();
             guard
                 .execute(
                     "INSERT INTO cirislens_secrets_access_log (\
@@ -294,9 +301,7 @@ impl SqliteSecretsBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "access_log insert"))?;
             Ok(())
-        })
-        .await
-        .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     /// Look up the current active master key. "active" means
@@ -311,9 +316,9 @@ impl SqliteSecretsBackend {
     /// this DB-unrepresentable), surfaces as Internal.
     async fn active_master_key(&self) -> Result<MasterKey, SecretsError> {
         let conn = self.conn.clone();
-        let (key_ref, key_kind, descriptor) = tokio::task::spawn_blocking(
-            move || -> Result<(String, String, Option<String>), SecretsError> {
-                let guard = conn.blocking_lock();
+        let (key_ref, key_kind, descriptor) =
+            (move || -> Result<(String, String, Option<String>), SecretsError> {
+                let guard = conn.lock();
                 let mut stmt = guard
                     .prepare(
                         "SELECT key_ref, key_kind, descriptor \
@@ -356,10 +361,7 @@ impl SqliteSecretsBackend {
                     ));
                 }
                 Ok((key_ref, key_kind, descriptor))
-            },
-        )
-        .await
-        .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))??;
+            })()?;
 
         let bytes = match software_keys_get(&key_ref) {
             Some(b) => b,
@@ -372,11 +374,8 @@ impl SqliteSecretsBackend {
             // *software* key has no such recovery path (its bytes
             // lived only in memory), so that case stays fatal.
             None if key_kind == "hardware" => {
-                let (master, _descriptor) = tokio::task::spawn_blocking(
-                    crate::secrets::hardware::derive_hardware_master_key,
-                )
-                .await
-                .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))??;
+                let (master, _descriptor) =
+                    (crate::secrets::hardware::derive_hardware_master_key)()?;
                 software_keys_put(key_ref.clone(), master.clone())?;
                 master
             }
@@ -418,8 +417,8 @@ impl SecretsService for SqliteSecretsBackend {
         let key_ref = master.key_ref.clone();
         let salt_vec = salt.to_vec();
         let nonce_vec = nonce.to_vec();
-        let result = tokio::task::spawn_blocking(move || -> Result<(), SecretsError> {
-            let guard = conn.blocking_lock();
+        let result = (move || -> Result<(), SecretsError> {
+            let guard = conn.lock();
             guard
                 .execute(
                     "INSERT INTO cirislens_secrets_secrets (\
@@ -439,9 +438,7 @@ impl SecretsService for SqliteSecretsBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "store_secret"))?;
             Ok(())
-        })
-        .await
-        .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))?;
+        })();
 
         let success = result.is_ok();
         let err_msg = result.as_ref().err().map(|e| e.to_string());
@@ -465,9 +462,9 @@ impl SecretsService for SqliteSecretsBackend {
     ) -> Result<Option<String>, SecretsError> {
         let conn = self.conn.clone();
         let key_owned = key.to_owned();
-        let row_opt = tokio::task::spawn_blocking(
+        let row_opt = (
             move || -> Result<Option<(String, Vec<u8>, String, Vec<u8>, Vec<u8>)>, SecretsError> {
-                let guard = conn.blocking_lock();
+                let guard = conn.lock();
                 guard
                     .query_row(
                         "SELECT secret_uuid, encrypted_value, encryption_key_ref, salt, nonce \
@@ -487,10 +484,7 @@ impl SecretsService for SqliteSecretsBackend {
                     )
                     .optional()
                     .map_err(|e| map_sqlite_error(e, "retrieve_secret lookup"))
-            },
-        )
-        .await
-        .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))??;
+            })()?;
 
         let (audit, plaintext) = match row_opt {
             None => (
@@ -522,7 +516,7 @@ impl SecretsService for SqliteSecretsBackend {
                 let uuid_str = uuid.to_string();
                 let now = fmt_datetime(Utc::now());
                 let _ = tokio::task::spawn_blocking(move || -> Result<(), SecretsError> {
-                    let guard = conn.blocking_lock();
+                    let guard = conn.lock();
                     guard
                         .execute(
                             "UPDATE cirislens_secrets_secrets \
@@ -551,9 +545,9 @@ impl SecretsService for SqliteSecretsBackend {
             .map_err(|e| SecretsError::InvalidArgument(format!("uuid parse: {e}")))?;
         let conn = self.conn.clone();
         let uuid_str = parsed_uuid.to_string();
-        let row_opt = tokio::task::spawn_blocking(
-            move || -> Result<Option<(Vec<u8>, String, Vec<u8>, Vec<u8>)>, SecretsError> {
-                let guard = conn.blocking_lock();
+        let row_opt =
+            (move || -> Result<Option<(Vec<u8>, String, Vec<u8>, Vec<u8>)>, SecretsError> {
+                let guard = conn.lock();
                 guard
                     .query_row(
                         "SELECT encrypted_value, encryption_key_ref, salt, nonce \
@@ -571,10 +565,7 @@ impl SecretsService for SqliteSecretsBackend {
                     )
                     .optional()
                     .map_err(|e| map_sqlite_error(e, "recall_secret lookup"))
-            },
-        )
-        .await
-        .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))??;
+            })()?;
 
         let result = match row_opt {
             None => Some(SecretRecallResult {
@@ -602,7 +593,7 @@ impl SecretsService for SqliteSecretsBackend {
                             let now = fmt_datetime(Utc::now());
                             let _ =
                                 tokio::task::spawn_blocking(move || -> Result<(), SecretsError> {
-                                    let guard = conn.blocking_lock();
+                                    let guard = conn.lock();
                                     guard
                                         .execute(
                                             "UPDATE cirislens_secrets_secrets \
@@ -692,8 +683,8 @@ impl SecretsService for SqliteSecretsBackend {
         );
 
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<SecretReference>, SecretsError> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Vec<SecretReference>, SecretsError> {
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare(&sql)
                 .map_err(|e| map_sqlite_error(e, "list_stored_secrets prepare"))?;
@@ -746,9 +737,7 @@ impl SecretsService for SqliteSecretsBackend {
                 });
             }
             Ok(out)
-        })
-        .await
-        .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn forget_secret(&self, uuid: &str, accessor: String) -> Result<bool, SecretsError> {
@@ -756,17 +745,15 @@ impl SecretsService for SqliteSecretsBackend {
             .map_err(|e| SecretsError::InvalidArgument(format!("uuid parse: {e}")))?;
         let conn = self.conn.clone();
         let uuid_str = parsed_uuid.to_string();
-        let n = tokio::task::spawn_blocking(move || -> Result<usize, SecretsError> {
-            let guard = conn.blocking_lock();
+        let n = (move || -> Result<usize, SecretsError> {
+            let guard = conn.lock();
             guard
                 .execute(
                     "DELETE FROM cirislens_secrets_secrets WHERE secret_uuid = ?1",
                     params![uuid_str],
                 )
                 .map_err(|e| map_sqlite_error(e, "forget_secret"))
-        })
-        .await
-        .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))??;
+        })()?;
 
         let _ = self
             .secrets_audit(
@@ -845,9 +832,9 @@ impl SecretsService for SqliteSecretsBackend {
 
     async fn get_filter_config(&self) -> Result<FilterConfig, SecretsError> {
         let conn = self.conn.clone();
-        let row_opt = tokio::task::spawn_blocking(
-            move || -> Result<Option<(String, String, i32, String, String)>, SecretsError> {
-                let guard = conn.blocking_lock();
+        let row_opt =
+            (move || -> Result<Option<(String, String, i32, String, String)>, SecretsError> {
+                let guard = conn.lock();
                 guard
                     .query_row(
                         "SELECT config_id, config_value, version, updated_at, updated_by \
@@ -865,10 +852,7 @@ impl SecretsService for SqliteSecretsBackend {
                     )
                     .optional()
                     .map_err(|e| map_sqlite_error(e, "get_filter_config"))
-            },
-        )
-        .await
-        .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))??;
+            })()?;
         match row_opt {
             None => Ok(FilterConfig {
                 config_id: "global".into(),
@@ -907,12 +891,11 @@ impl SecretsService for SqliteSecretsBackend {
 
         let conn = self.conn.clone();
         let config_id = updates.config_id.clone();
-        let (new_version, updated_at_str) =
-            tokio::task::spawn_blocking(move || -> Result<(i32, String), SecretsError> {
-                let guard = conn.blocking_lock();
-                guard
-                    .query_row(
-                        "INSERT INTO cirislens_secrets_filter_config (\
+        let (new_version, updated_at_str) = (move || -> Result<(i32, String), SecretsError> {
+            let guard = conn.lock();
+            guard
+                .query_row(
+                    "INSERT INTO cirislens_secrets_filter_config (\
                             config_id, config_value, version, updated_at, updated_by\
                          ) VALUES (?1, ?2, 1, ?3, ?4) \
                          ON CONFLICT (config_id) DO UPDATE \
@@ -921,13 +904,11 @@ impl SecretsService for SqliteSecretsBackend {
                              updated_at = excluded.updated_at, \
                              updated_by = excluded.updated_by \
                          RETURNING version, updated_at",
-                        params![config_id, config_value_str, now, accessor],
-                        |row| Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?)),
-                    )
-                    .map_err(|e| map_sqlite_error(e, "update_filter_config"))
-            })
-            .await
-            .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))??;
+                    params![config_id, config_value_str, now, accessor],
+                    |row| Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?)),
+                )
+                .map_err(|e| map_sqlite_error(e, "update_filter_config"))
+        })()?;
         let updated_at = parse_datetime(&updated_at_str)?;
         Ok(FilterUpdateResult {
             new_version,
@@ -938,7 +919,7 @@ impl SecretsService for SqliteSecretsBackend {
     async fn get_service_stats(&self) -> Result<SecretsServiceStats, SecretsError> {
         let conn = self.conn.clone();
         let (total, active_filters, matches, last_filter_update, last_rotation, rotation_count) =
-            tokio::task::spawn_blocking(
+            (
                 move || -> Result<
                     (
                         i64,
@@ -950,7 +931,7 @@ impl SecretsService for SqliteSecretsBackend {
                     ),
                     SecretsError,
                 > {
-                    let guard = conn.blocking_lock();
+                    let guard = conn.lock();
                     let total: i64 = guard
                         .query_row(
                             "SELECT COUNT(*) FROM cirislens_secrets_secrets",
@@ -1010,10 +991,7 @@ impl SecretsService for SqliteSecretsBackend {
                         last_rotation,
                         rotation_count,
                     ))
-                },
-            )
-            .await
-            .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))??;
+                })()?;
 
         let last_filter_update = match last_filter_update {
             Some(s) => Some(parse_datetime(&s)?),
@@ -1049,15 +1027,13 @@ impl SecretsService for SqliteSecretsBackend {
     async fn is_healthy(&self) -> Result<bool, SecretsError> {
         // Quick connectivity probe + active-key check.
         let conn = self.conn.clone();
-        let probed = tokio::task::spawn_blocking(move || -> Result<(), SecretsError> {
-            let guard = conn.blocking_lock();
+        let probed = (move || -> Result<(), SecretsError> {
+            let guard = conn.lock();
             guard
                 .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
                 .map_err(|e| map_sqlite_error(e, "is_healthy probe"))?;
             Ok(())
-        })
-        .await
-        .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))?;
+        })();
         probed?;
         Ok(self.active_master_key().await.is_ok())
     }
@@ -1077,8 +1053,8 @@ impl SecretsService for SqliteSecretsBackend {
             None => None,
         };
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<AccessLogEntry>, SecretsError> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Vec<AccessLogEntry>, SecretsError> {
+            let guard = conn.lock();
             let mut rows_out: Vec<AccessLogEntry> = Vec::new();
             if let Some(uuid_filter) = secret_uuid_str {
                 let mut stmt = guard
@@ -1191,9 +1167,7 @@ impl SecretsService for SqliteSecretsBackend {
                 }
             }
             Ok(rows_out)
-        })
-        .await
-        .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn reencrypt_all(
@@ -1217,146 +1191,143 @@ impl SecretsService for SqliteSecretsBackend {
         let conn = self.conn.clone();
         let new_key_ref_for_tx = new_key_ref.clone();
         let now_for_tx = fmt_datetime(Utc::now());
-        let (reencrypted, failures) =
-            tokio::task::spawn_blocking(move || -> Result<(u64, Vec<String>), SecretsError> {
-                // Read every secret up front under a brief lock, then
-                // release it. Each row is self-describing (per-row
-                // `encryption_key_ref`), so a partially-migrated table
-                // stays fully decryptable.
-                let rows: Vec<(String, Vec<u8>, String, Vec<u8>, Vec<u8>)> = {
-                    let guard = conn.blocking_lock();
-                    let mut stmt = guard
-                        .prepare(
-                            "SELECT secret_uuid, encrypted_value, encryption_key_ref, \
+        let (reencrypted, failures) = (move || -> Result<(u64, Vec<String>), SecretsError> {
+            // Read every secret up front under a brief lock, then
+            // release it. Each row is self-describing (per-row
+            // `encryption_key_ref`), so a partially-migrated table
+            // stays fully decryptable.
+            let rows: Vec<(String, Vec<u8>, String, Vec<u8>, Vec<u8>)> = {
+                let guard = conn.lock();
+                let mut stmt = guard
+                    .prepare(
+                        "SELECT secret_uuid, encrypted_value, encryption_key_ref, \
                                     salt, nonce \
                              FROM cirislens_secrets_secrets",
-                        )
-                        .map_err(|e| map_sqlite_error(e, "reencrypt_all prepare load"))?;
-                    let iter = stmt
-                        .query_map([], |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                row.get::<_, Vec<u8>>(1)?,
-                                row.get::<_, String>(2)?,
-                                row.get::<_, Vec<u8>>(3)?,
-                                row.get::<_, Vec<u8>>(4)?,
-                            ))
-                        })
-                        .map_err(|e| map_sqlite_error(e, "reencrypt_all query load"))?;
-                    let mut acc = Vec::new();
-                    for r in iter {
-                        acc.push(r.map_err(|e| map_sqlite_error(e, "reencrypt_all row"))?);
-                    }
-                    acc
-                };
-
-                // v1.10.1 (#88 review, perf H2) — re-encrypt in
-                // bounded chunks. The CPU-bound decrypt/derive/encrypt
-                // (PBKDF2, ~100 ms/secret) runs with the connection
-                // lock released; only a chunk's UPDATE batch reclaims
-                // the lock + an `IMMEDIATE` transaction, so SQLite's
-                // single-writer lock — and the connection mutex every
-                // other persist op shares — is freed between chunks.
-                struct Prepared {
-                    uuid: String,
-                    ct: Vec<u8>,
-                    salt: Vec<u8>,
-                    nonce: Vec<u8>,
+                    )
+                    .map_err(|e| map_sqlite_error(e, "reencrypt_all prepare load"))?;
+                let iter = stmt
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Vec<u8>>(3)?,
+                            row.get::<_, Vec<u8>>(4)?,
+                        ))
+                    })
+                    .map_err(|e| map_sqlite_error(e, "reencrypt_all query load"))?;
+                let mut acc = Vec::new();
+                for r in iter {
+                    acc.push(r.map_err(|e| map_sqlite_error(e, "reencrypt_all row"))?);
                 }
-                let mut reencrypted: u64 = 0;
-                let mut failures: Vec<String> = Vec::new();
+                acc
+            };
 
-                for chunk in rows.chunks(crate::secrets::REENCRYPT_CHUNK_SIZE) {
-                    // Phase A — crypto, connection lock NOT held.
-                    let mut prepared: Vec<Prepared> = Vec::with_capacity(chunk.len());
-                    for (uuid_str, ct, old_key_ref, old_salt, old_nonce) in chunk {
-                        let old_bytes = match software_keys_get(old_key_ref) {
-                            Some(b) => b,
-                            None => {
-                                failures.push(uuid_str.clone());
-                                continue;
-                            }
-                        };
-                        let old_sk = match crypto::derive_secret_key(&old_bytes, old_salt) {
-                            Ok(k) => k,
-                            Err(_) => {
-                                failures.push(uuid_str.clone());
-                                continue;
-                            }
-                        };
-                        let plaintext = match crypto::decrypt(&old_sk, old_nonce, ct) {
-                            Ok(p) => p,
-                            Err(_) => {
-                                failures.push(uuid_str.clone());
-                                continue;
-                            }
-                        };
-                        let new_salt = crypto::random_salt()?;
-                        let new_nonce = crypto::random_nonce()?;
-                        let new_sk = crypto::derive_secret_key(&new_master_bytes, &new_salt)?;
-                        let new_ct = crypto::encrypt(&new_sk, &new_nonce, &plaintext)?;
-                        prepared.push(Prepared {
-                            uuid: uuid_str.clone(),
-                            ct: new_ct,
-                            salt: new_salt.to_vec(),
-                            nonce: new_nonce.to_vec(),
-                        });
-                    }
-                    if prepared.is_empty() {
-                        continue;
-                    }
-                    // Phase B — reclaim the lock for a short IMMEDIATE
-                    // transaction, just the chunk's UPDATE batch.
-                    let mut guard = conn.blocking_lock();
-                    let tx = guard
-                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                        .map_err(|e| map_sqlite_error(e, "reencrypt_all begin chunk tx"))?;
-                    for p in &prepared {
-                        tx.execute(
-                            "UPDATE cirislens_secrets_secrets \
+            // v1.10.1 (#88 review, perf H2) — re-encrypt in
+            // bounded chunks. The CPU-bound decrypt/derive/encrypt
+            // (PBKDF2, ~100 ms/secret) runs with the connection
+            // lock released; only a chunk's UPDATE batch reclaims
+            // the lock + an `IMMEDIATE` transaction, so SQLite's
+            // single-writer lock — and the connection mutex every
+            // other persist op shares — is freed between chunks.
+            struct Prepared {
+                uuid: String,
+                ct: Vec<u8>,
+                salt: Vec<u8>,
+                nonce: Vec<u8>,
+            }
+            let mut reencrypted: u64 = 0;
+            let mut failures: Vec<String> = Vec::new();
+
+            for chunk in rows.chunks(crate::secrets::REENCRYPT_CHUNK_SIZE) {
+                // Phase A — crypto, connection lock NOT held.
+                let mut prepared: Vec<Prepared> = Vec::with_capacity(chunk.len());
+                for (uuid_str, ct, old_key_ref, old_salt, old_nonce) in chunk {
+                    let old_bytes = match software_keys_get(old_key_ref) {
+                        Some(b) => b,
+                        None => {
+                            failures.push(uuid_str.clone());
+                            continue;
+                        }
+                    };
+                    let old_sk = match crypto::derive_secret_key(&old_bytes, old_salt) {
+                        Ok(k) => k,
+                        Err(_) => {
+                            failures.push(uuid_str.clone());
+                            continue;
+                        }
+                    };
+                    let plaintext = match crypto::decrypt(&old_sk, old_nonce, ct) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            failures.push(uuid_str.clone());
+                            continue;
+                        }
+                    };
+                    let new_salt = crypto::random_salt()?;
+                    let new_nonce = crypto::random_nonce()?;
+                    let new_sk = crypto::derive_secret_key(&new_master_bytes, &new_salt)?;
+                    let new_ct = crypto::encrypt(&new_sk, &new_nonce, &plaintext)?;
+                    prepared.push(Prepared {
+                        uuid: uuid_str.clone(),
+                        ct: new_ct,
+                        salt: new_salt.to_vec(),
+                        nonce: new_nonce.to_vec(),
+                    });
+                }
+                if prepared.is_empty() {
+                    continue;
+                }
+                // Phase B — reclaim the lock for a short IMMEDIATE
+                // transaction, just the chunk's UPDATE batch.
+                let mut guard = conn.lock();
+                let tx = guard
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|e| map_sqlite_error(e, "reencrypt_all begin chunk tx"))?;
+                for p in &prepared {
+                    tx.execute(
+                        "UPDATE cirislens_secrets_secrets \
                              SET encrypted_value = ?1, encryption_key_ref = ?2, \
                                  salt = ?3, nonce = ?4 \
                              WHERE secret_uuid = ?5",
-                            params![p.ct, new_key_ref_for_tx, p.salt, p.nonce, p.uuid],
-                        )
-                        .map_err(|e| map_sqlite_error(e, "reencrypt update"))?;
-                    }
-                    tx.commit()
-                        .map_err(|e| map_sqlite_error(e, "commit chunk"))?;
-                    drop(guard);
-                    reencrypted += prepared.len() as u64;
+                        params![p.ct, new_key_ref_for_tx, p.salt, p.nonce, p.uuid],
+                    )
+                    .map_err(|e| map_sqlite_error(e, "reencrypt update"))?;
                 }
+                tx.commit()
+                    .map_err(|e| map_sqlite_error(e, "commit chunk"))?;
+                drop(guard);
+                reencrypted += prepared.len() as u64;
+            }
 
-                // Flip the active master key only on a fully-clean
-                // pass. v1.10.1 (#87 review H1) — a partial failure
-                // must NOT deactivate the old key: its un-migrated
-                // secrets are still under it, and a retry can finish.
-                if failures.is_empty() {
-                    let mut guard = conn.blocking_lock();
-                    let tx = guard
-                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                        .map_err(|e| map_sqlite_error(e, "reencrypt_all begin key-flip tx"))?;
-                    tx.execute(
-                        "UPDATE cirislens_secrets_master_key_meta \
+            // Flip the active master key only on a fully-clean
+            // pass. v1.10.1 (#87 review H1) — a partial failure
+            // must NOT deactivate the old key: its un-migrated
+            // secrets are still under it, and a retry can finish.
+            if failures.is_empty() {
+                let mut guard = conn.lock();
+                let tx = guard
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|e| map_sqlite_error(e, "reencrypt_all begin key-flip tx"))?;
+                tx.execute(
+                    "UPDATE cirislens_secrets_master_key_meta \
                          SET deactivated_at = ?1, rotated_to = ?2 \
                          WHERE deactivated_at IS NULL AND key_ref != ?2",
-                        params![now_for_tx, new_key_ref_for_tx],
-                    )
-                    .map_err(|e| map_sqlite_error(e, "deactivate old key"))?;
-                    tx.execute(
-                        "UPDATE cirislens_secrets_master_key_meta \
+                    params![now_for_tx, new_key_ref_for_tx],
+                )
+                .map_err(|e| map_sqlite_error(e, "deactivate old key"))?;
+                tx.execute(
+                    "UPDATE cirislens_secrets_master_key_meta \
                          SET activated_at = COALESCE(activated_at, ?1) \
                          WHERE key_ref = ?2",
-                        params![now_for_tx, new_key_ref_for_tx],
-                    )
-                    .map_err(|e| map_sqlite_error(e, "activate new key"))?;
-                    tx.commit()
-                        .map_err(|e| map_sqlite_error(e, "commit key-flip"))?;
-                }
-                Ok((reencrypted, failures))
-            })
-            .await
-            .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))??;
+                    params![now_for_tx, new_key_ref_for_tx],
+                )
+                .map_err(|e| map_sqlite_error(e, "activate new key"))?;
+                tx.commit()
+                    .map_err(|e| map_sqlite_error(e, "commit key-flip"))?;
+            }
+            Ok((reencrypted, failures))
+        })()?;
 
         let failure_msg = if failures.is_empty() {
             None
@@ -1418,58 +1389,55 @@ impl SecretsService for SqliteSecretsBackend {
         // visible to a concurrent `active_master_key()` without its
         // bytes. The loser path evicts them on rollback.
         software_keys_put(new_key_ref.clone(), key_bytes)?;
-        let outcome =
-            tokio::task::spawn_blocking(move || -> Result<RotateOutcome, SecretsError> {
-                let mut guard = conn.blocking_lock();
-                let tx = guard
-                    .transaction()
-                    .map_err(|e| map_sqlite_error(e, "begin rotate tx"))?;
-                tx.execute(
-                    "INSERT INTO cirislens_secrets_master_key_meta (\
+        let outcome = (move || -> Result<RotateOutcome, SecretsError> {
+            let mut guard = conn.lock();
+            let tx = guard
+                .transaction()
+                .map_err(|e| map_sqlite_error(e, "begin rotate tx"))?;
+            tx.execute(
+                "INSERT INTO cirislens_secrets_master_key_meta (\
                     key_ref, key_kind, descriptor, created_at\
                  ) VALUES (?1, 'software', NULL, ?2)",
-                    params![new_key_ref_for_db, now],
-                )
-                .map_err(|e| map_sqlite_error(e, "rotate_master_key insert"))?;
+                params![new_key_ref_for_db, now],
+            )
+            .map_err(|e| map_sqlite_error(e, "rotate_master_key insert"))?;
 
-                // If there is no current ACTIVE key, activate this one
-                // (first-use path). Otherwise leave it staged.
-                let n: i64 = tx
-                    .query_row(
-                        "SELECT COUNT(*) FROM cirislens_secrets_master_key_meta \
+            // If there is no current ACTIVE key, activate this one
+            // (first-use path). Otherwise leave it staged.
+            let n: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM cirislens_secrets_master_key_meta \
                      WHERE activated_at IS NOT NULL AND deactivated_at IS NULL \
                        AND key_ref != ?1",
-                        params![new_key_ref_for_db],
-                        |row| row.get(0),
-                    )
-                    .map_err(|e| map_sqlite_error(e, "rotate count"))?;
-                let first_use = n == 0;
-                if first_use {
-                    match tx.execute(
-                        "UPDATE cirislens_secrets_master_key_meta \
+                    params![new_key_ref_for_db],
+                    |row| row.get(0),
+                )
+                .map_err(|e| map_sqlite_error(e, "rotate count"))?;
+            let first_use = n == 0;
+            if first_use {
+                match tx.execute(
+                    "UPDATE cirislens_secrets_master_key_meta \
                      SET activated_at = ?1 WHERE key_ref = ?2",
-                        params![now, new_key_ref_for_db],
-                    ) {
-                        Ok(_) => {}
-                        Err(e) if is_unique_violation(&e) => {
-                            // Lost the concurrent first-use bootstrap
-                            // race — V043 rejected the activation.
-                            drop(tx);
-                            return Ok(RotateOutcome::LostRace);
-                        }
-                        Err(e) => return Err(map_sqlite_error(e, "rotate activate")),
+                    params![now, new_key_ref_for_db],
+                ) {
+                    Ok(_) => {}
+                    Err(e) if is_unique_violation(&e) => {
+                        // Lost the concurrent first-use bootstrap
+                        // race — V043 rejected the activation.
+                        drop(tx);
+                        return Ok(RotateOutcome::LostRace);
                     }
+                    Err(e) => return Err(map_sqlite_error(e, "rotate activate")),
                 }
-                match tx.commit() {
-                    Ok(()) => Ok(RotateOutcome::Won),
-                    Err(e) if first_use && commit_is_unique_violation(&e) => {
-                        Ok(RotateOutcome::LostRace)
-                    }
-                    Err(e) => Err(map_sqlite_error(e, "rotate commit")),
+            }
+            match tx.commit() {
+                Ok(()) => Ok(RotateOutcome::Won),
+                Err(e) if first_use && commit_is_unique_violation(&e) => {
+                    Ok(RotateOutcome::LostRace)
                 }
-            })
-            .await
-            .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))??;
+                Err(e) => Err(map_sqlite_error(e, "rotate commit")),
+            }
+        })()?;
 
         match outcome {
             RotateOutcome::Won => {
@@ -1514,10 +1482,7 @@ impl SecretsService for SqliteSecretsBackend {
         // Derive the hardware-rooted master key — CIRISVerify owns the
         // derivation (HKDF over a hardware-sealed seed). Blocking I/O
         // (TPM + filesystem), so it runs on a blocking thread.
-        let (master, descriptor) =
-            tokio::task::spawn_blocking(crate::secrets::hardware::derive_hardware_master_key)
-                .await
-                .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))??;
+        let (master, descriptor) = (crate::secrets::hardware::derive_hardware_master_key)()?;
 
         let new_key_ref = Uuid::new_v4().to_string();
         let conn = self.conn.clone();
@@ -1527,8 +1492,8 @@ impl SecretsService for SqliteSecretsBackend {
         // Record the new key as `hardware`, not yet active —
         // `reencrypt_all` activates it once every secret is
         // re-encrypted (same staging as `rotate_master_key`).
-        tokio::task::spawn_blocking(move || -> Result<(), SecretsError> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<(), SecretsError> {
+            let guard = conn.lock();
             guard
                 .execute(
                     "INSERT INTO cirislens_secrets_master_key_meta (\
@@ -1538,9 +1503,7 @@ impl SecretsService for SqliteSecretsBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "migrate_to_hardware_key insert"))?;
             Ok(())
-        })
-        .await
-        .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))??;
+        })()?;
         software_keys_put(new_key_ref.clone(), master)?;
 
         let ref_out = MasterKeyRef::Hardware {
@@ -1611,57 +1574,54 @@ impl SecretsService for SqliteSecretsBackend {
             String,
             Option<String>,
         );
-        let (won, row): (bool, ClaimRow) =
-            tokio::task::spawn_blocking(move || -> Result<(bool, ClaimRow), SecretsError> {
-                let guard = conn.blocking_lock();
-                let changed = guard
-                    .execute(
-                        "INSERT OR IGNORE INTO cirislens_secrets_secrets (\
+        let (won, row): (bool, ClaimRow) = (move || -> Result<(bool, ClaimRow), SecretsError> {
+            let guard = conn.lock();
+            let changed = guard
+                .execute(
+                    "INSERT OR IGNORE INTO cirislens_secrets_secrets (\
                             secret_uuid, encrypted_value, encryption_key_ref, salt, nonce, \
                             description, sensitivity_level, detected_pattern, \
                             auto_decapsulate_for_actions, content_hmac \
                          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                        params![
-                            secret_uuid_str,
-                            ciphertext,
-                            key_ref,
-                            salt_vec,
-                            nonce_vec,
-                            description_owned,
-                            sensitivity_tag,
-                            "manual",
-                            actions_json,
-                            content_hmac_for_tx,
-                        ],
-                    )
-                    .map_err(|e| map_sqlite_error(e, "try_claim_secret insert"))?;
-                let won = changed > 0;
-                let row = guard
-                    .query_row(
-                        "SELECT secret_uuid, description, context_hint, sensitivity_level, \
+                    params![
+                        secret_uuid_str,
+                        ciphertext,
+                        key_ref,
+                        salt_vec,
+                        nonce_vec,
+                        description_owned,
+                        sensitivity_tag,
+                        "manual",
+                        actions_json,
+                        content_hmac_for_tx,
+                    ],
+                )
+                .map_err(|e| map_sqlite_error(e, "try_claim_secret insert"))?;
+            let won = changed > 0;
+            let row = guard
+                .query_row(
+                    "SELECT secret_uuid, description, context_hint, sensitivity_level, \
                                 detected_pattern, auto_decapsulate_for_actions, \
                                 created_at, last_accessed \
                          FROM cirislens_secrets_secrets \
                          WHERE content_hmac = ?1",
-                        params![content_hmac_for_tx],
-                        |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, Option<String>>(2)?,
-                                row.get::<_, String>(3)?,
-                                row.get::<_, String>(4)?,
-                                row.get::<_, String>(5)?,
-                                row.get::<_, String>(6)?,
-                                row.get::<_, Option<String>>(7)?,
-                            ))
-                        },
-                    )
-                    .map_err(|e| map_sqlite_error(e, "try_claim_secret conflict-recovery"))?;
-                Ok((won, row))
-            })
-            .await
-            .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))??;
+                    params![content_hmac_for_tx],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, Option<String>>(7)?,
+                        ))
+                    },
+                )
+                .map_err(|e| map_sqlite_error(e, "try_claim_secret conflict-recovery"))?;
+            Ok((won, row))
+        })()?;
 
         let (uuid_str, desc, ctx_hint, sens_str, pattern, actions_str, created_str, accessed_str) =
             row;
@@ -1773,8 +1733,8 @@ impl SecretsService for SqliteSecretsBackend {
             AlreadyClaimed(ClaimRow),
             UuidConflict,
         }
-        let outcome_enum = tokio::task::spawn_blocking(move || -> Result<Outcome, SecretsError> {
-            let guard = conn.blocking_lock();
+        let outcome_enum = (move || -> Result<Outcome, SecretsError> {
+            let guard = conn.lock();
             let changed = guard
                 .execute(
                     "INSERT OR IGNORE INTO cirislens_secrets_secrets (\
@@ -1855,9 +1815,7 @@ impl SecretsService for SqliteSecretsBackend {
                 Some(row) => Ok(Outcome::AlreadyClaimed(row)),
                 None => Ok(Outcome::UuidConflict),
             }
-        })
-        .await
-        .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))??;
+        })()?;
 
         let (result, audit_uuid) = match outcome_enum {
             Outcome::Stored(row) => {
@@ -2633,8 +2591,8 @@ mod tests {
         // V043 partial unique index guarantees it; this confirms the
         // rows agree with the index.
         let conn = conn_handle.clone();
-        let active: i64 = tokio::task::spawn_blocking(move || {
-            conn.blocking_lock()
+        let active: i64 = (move || {
+            conn.lock()
                 .query_row(
                     "SELECT COUNT(*) FROM cirislens_secrets_master_key_meta \
                      WHERE activated_at IS NOT NULL AND deactivated_at IS NULL",
@@ -2642,9 +2600,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap()
-        })
-        .await
-        .unwrap();
+        })();
         assert_eq!(active, 1, "exactly one active master key expected");
 
         // encrypt/decrypt round-trips under the active key.

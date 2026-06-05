@@ -39,14 +39,22 @@
 //!   `V001__trace_events.sql` is the conflict target — same shape as
 //!   the postgres index (THREAT_MODEL.md AV-9, includes
 //!   `agent_id_hash`).
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
+// each closure's typed return signature load-bearing for error
 
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use ed25519_dalek::VerifyingKey;
+use parking_lot::Mutex;
 use rusqlite::{params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
-use tokio::sync::Mutex;
 
 use super::backend::{Backend, InsertReport, PublicKeySample};
 use super::types::{TraceEventRow, TraceLlmCallRow};
@@ -94,7 +102,7 @@ impl SqliteBackend {
     /// Shared connection handle. Used by sibling modules
     /// (cirisgraph SQLite impl in v0.8.4+) that ride on the same
     /// underlying SQLite file/in-memory connection.
-    pub fn conn_handle(&self) -> std::sync::Arc<tokio::sync::Mutex<Connection>> {
+    pub fn conn_handle(&self) -> std::sync::Arc<parking_lot::Mutex<Connection>> {
         self.conn.clone()
     }
 
@@ -105,7 +113,7 @@ impl SqliteBackend {
     /// reopening the file. NO pragmas are applied — the caller has
     /// already initialized the connection via
     /// [`SqliteBackend::open`] / [`SqliteBackend::open_in_memory`].
-    pub fn from_conn_handle(conn: std::sync::Arc<tokio::sync::Mutex<Connection>>) -> Self {
+    pub fn from_conn_handle(conn: std::sync::Arc<parking_lot::Mutex<Connection>>) -> Self {
         Self {
             conn,
             inline_bytes_cap: std::sync::atomic::AtomicUsize::new(
@@ -209,9 +217,7 @@ impl SqliteBackend {
     /// [`SqliteBackend::open_in_memory`] for ephemeral tests.
     pub async fn open(path: impl Into<String>) -> Result<Self, Error> {
         let path = path.into();
-        let conn = tokio::task::spawn_blocking(move || Connection::open(path))
-            .await
-            .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        let conn = (move || Connection::open(path))()
             .map_err(|e| Error::Backend(format!("sqlite open: {e}")))?;
         Self::with_connection_settings(conn).await
     }
@@ -219,9 +225,7 @@ impl SqliteBackend {
     /// Open an in-memory SQLite database (for tests + sovereign-mode
     /// dev scratch).
     pub async fn open_in_memory() -> Result<Self, Error> {
-        let conn = tokio::task::spawn_blocking(Connection::open_in_memory)
-            .await
-            .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        let conn = (Connection::open_in_memory)()
             .map_err(|e| Error::Backend(format!("sqlite open in-memory: {e}")))?;
         Self::with_connection_settings(conn).await
     }
@@ -229,7 +233,7 @@ impl SqliteBackend {
     /// Apply the pragmas every SqliteBackend connection runs at boot.
     /// Centralized so file-backed and in-memory share the same shape.
     async fn with_connection_settings(conn: Connection) -> Result<Self, Error> {
-        let conn = tokio::task::spawn_blocking(move || -> Result<Connection, rusqlite::Error> {
+        let conn = (move || -> Result<Connection, rusqlite::Error> {
             // Foreign keys are off by default in SQLite for backwards
             // compat — turn them on so any future FK constraints we
             // declare actually fire. None today, but good hygiene.
@@ -250,9 +254,7 @@ impl SqliteBackend {
                  PRAGMA busy_timeout = 30000;",
             )?;
             Ok(conn)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
         .map_err(|e| Error::Backend(format!("sqlite pragmas: {e}")))?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -285,8 +287,8 @@ impl Backend for SqliteBackend {
         let total = owned.len();
 
         let conn = self.conn.clone();
-        let inserted = tokio::task::spawn_blocking(move || -> Result<usize, rusqlite::Error> {
-            let mut conn = conn.blocking_lock();
+        let inserted = (move || -> Result<usize, rusqlite::Error> {
+            let mut conn = conn.lock();
             let tx = conn.transaction()?;
             let mut inserted = 0usize;
 
@@ -400,9 +402,7 @@ impl Backend for SqliteBackend {
 
             tx.commit()?;
             Ok(inserted)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
         .map_err(|e| Error::Backend(format!("insert trace_events: {e}")))?;
 
         Ok(InsertReport {
@@ -417,8 +417,8 @@ impl Backend for SqliteBackend {
         }
         let owned: Vec<TraceLlmCallRow> = rows.to_vec();
         let conn = self.conn.clone();
-        let inserted = tokio::task::spawn_blocking(move || -> Result<usize, rusqlite::Error> {
-            let mut conn = conn.blocking_lock();
+        let inserted = (move || -> Result<usize, rusqlite::Error> {
+            let mut conn = conn.lock();
             let tx = conn.transaction()?;
             let mut inserted = 0usize;
 
@@ -472,9 +472,7 @@ impl Backend for SqliteBackend {
 
             tx.commit()?;
             Ok(inserted)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
         .map_err(|e| Error::Backend(format!("insert trace_llm_calls: {e}")))?;
         Ok(inserted)
     }
@@ -485,21 +483,18 @@ impl Backend for SqliteBackend {
         // release. Same shape as PostgresBackend post-cutover.
         let key_id = key_id.to_owned();
         let conn = self.conn.clone();
-        let b64_opt =
-            tokio::task::spawn_blocking(move || -> Result<Option<String>, rusqlite::Error> {
-                let conn = conn.blocking_lock();
-                conn.query_row(
-                    "SELECT pubkey_ed25519_base64 FROM federation_keys \
+        let b64_opt = (move || -> Result<Option<String>, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT pubkey_ed25519_base64 FROM federation_keys \
                      WHERE key_id = ?1 \
                        AND (valid_until IS NULL OR valid_until > CURRENT_TIMESTAMP)",
-                    [&key_id],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()
-            })
-            .await
-            .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
-            .map_err(|e| Error::Backend(format!("lookup_public_key: {e}")))?;
+                [&key_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+        })()
+        .map_err(|e| Error::Backend(format!("lookup_public_key: {e}")))?;
 
         let Some(b64) = b64_opt else {
             return Ok(None);
@@ -526,30 +521,26 @@ impl Backend for SqliteBackend {
         let conn = self.conn.clone();
         let lim = i64::try_from(limit).unwrap_or(i64::MAX);
 
-        let (size, sample) = tokio::task::spawn_blocking(
-            move || -> Result<(usize, Vec<String>), rusqlite::Error> {
-                let conn = conn.blocking_lock();
-                let total: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM federation_keys \
+        let (size, sample) = (move || -> Result<(usize, Vec<String>), rusqlite::Error> {
+            let conn = conn.lock();
+            let total: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM federation_keys \
                      WHERE valid_until IS NULL OR valid_until > CURRENT_TIMESTAMP",
-                    [],
-                    |r| r.get(0),
-                )?;
-                let mut stmt = conn.prepare(
-                    "SELECT key_id FROM federation_keys \
+                [],
+                |r| r.get(0),
+            )?;
+            let mut stmt = conn.prepare(
+                "SELECT key_id FROM federation_keys \
                      WHERE valid_until IS NULL OR valid_until > CURRENT_TIMESTAMP \
                      ORDER BY key_id LIMIT ?1",
-                )?;
-                let rows = stmt.query_map([lim], |r| r.get::<_, String>(0))?;
-                let mut sample = Vec::new();
-                for r in rows {
-                    sample.push(r?);
-                }
-                Ok((usize::try_from(total.max(0)).unwrap_or(0), sample))
-            },
-        )
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+            )?;
+            let rows = stmt.query_map([lim], |r| r.get::<_, String>(0))?;
+            let mut sample = Vec::new();
+            for r in rows {
+                sample.push(r?);
+            }
+            Ok((usize::try_from(total.max(0)).unwrap_or(0), sample))
+        })()
         .map_err(|e| Error::Backend(format!("sample_public_keys: {e}")))?;
 
         Ok(PublicKeySample { size, sample })
@@ -573,17 +564,15 @@ impl Backend for SqliteBackend {
         // for cohabitation race triage). See
         // `crate::store::migration_timing` for the format.
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), refinery::Error> {
-            let mut conn = conn.blocking_lock();
+        (move || -> Result<(), refinery::Error> {
+            let mut conn = conn.lock();
             let timing =
                 crate::store::migration_timing::MigrationTiming::from_run("sqlite", || {
                     embedded::migrations::runner().run(&mut *conn)
                 })?;
             crate::store::migration_timing::append(&timing);
             Ok(())
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
         .map_err(|e| Error::Migration {
             sqlstate: None,
             detail: format!("sqlite migrations: {e}"),
@@ -600,96 +589,92 @@ impl Backend for SqliteBackend {
         let agent = agent_id_hash.to_owned();
         let key = signature_key_id.to_owned();
         let conn = self.conn.clone();
-        let summary = tokio::task::spawn_blocking(
-            move || -> Result<super::types::DeleteSummary, rusqlite::Error> {
-                let mut conn = conn.blocking_lock();
-                let tx = conn.transaction()?;
-                // Per-key DSAR scope: both agent_id_hash AND
-                // signing_key_id must match. Same shape as postgres.
-                // Step 1: collect matching trace_ids.
-                let trace_ids: Vec<String> = {
-                    let mut stmt = tx.prepare(
-                        "SELECT DISTINCT trace_id FROM trace_events \
+        let summary = (move || -> Result<super::types::DeleteSummary, rusqlite::Error> {
+            let mut conn = conn.lock();
+            let tx = conn.transaction()?;
+            // Per-key DSAR scope: both agent_id_hash AND
+            // signing_key_id must match. Same shape as postgres.
+            // Step 1: collect matching trace_ids.
+            let trace_ids: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT DISTINCT trace_id FROM trace_events \
                          WHERE agent_id_hash = ?1 AND signing_key_id = ?2",
+                )?;
+                let rows = stmt.query_map([&agent, &key], |r| r.get::<_, String>(0))?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+
+            // Step 2: delete LLM call rows joined by trace_id.
+            let mut trace_llm_calls_deleted = 0u64;
+            if !trace_ids.is_empty() {
+                let mut stmt = tx.prepare("DELETE FROM trace_llm_calls WHERE trace_id = ?1")?;
+                for tid in &trace_ids {
+                    trace_llm_calls_deleted += stmt.execute([tid])? as u64;
+                }
+            }
+
+            // Step 3: delete trace_events rows. Same key-scope
+            // filter as step 1.
+            let trace_events_deleted = tx.execute(
+                "DELETE FROM trace_events \
+                     WHERE agent_id_hash = ?1 AND signing_key_id = ?2",
+                [&agent, &key],
+            )? as u64;
+
+            let mut federation_keys_deleted = 0u64;
+            let mut federation_attestations_deleted = 0u64;
+            let mut federation_revocations_deleted = 0u64;
+
+            if include_federation_key {
+                // Per-key federation_keys cascade: the single
+                // key_id matching (agent_id_hash, signature_key_id).
+                let target_key_ids: Vec<String> = {
+                    let mut stmt = tx.prepare(
+                        "SELECT key_id FROM federation_keys \
+                             WHERE identity_type = 'agent' \
+                               AND identity_ref = ?1 \
+                               AND key_id = ?2",
                     )?;
                     let rows = stmt.query_map([&agent, &key], |r| r.get::<_, String>(0))?;
                     rows.collect::<Result<Vec<_>, _>>()?
                 };
 
-                // Step 2: delete LLM call rows joined by trace_id.
-                let mut trace_llm_calls_deleted = 0u64;
-                if !trace_ids.is_empty() {
-                    let mut stmt = tx.prepare("DELETE FROM trace_llm_calls WHERE trace_id = ?1")?;
-                    for tid in &trace_ids {
-                        trace_llm_calls_deleted += stmt.execute([tid])? as u64;
-                    }
-                }
-
-                // Step 3: delete trace_events rows. Same key-scope
-                // filter as step 1.
-                let trace_events_deleted = tx.execute(
-                    "DELETE FROM trace_events \
-                     WHERE agent_id_hash = ?1 AND signing_key_id = ?2",
-                    [&agent, &key],
-                )? as u64;
-
-                let mut federation_keys_deleted = 0u64;
-                let mut federation_attestations_deleted = 0u64;
-                let mut federation_revocations_deleted = 0u64;
-
-                if include_federation_key {
-                    // Per-key federation_keys cascade: the single
-                    // key_id matching (agent_id_hash, signature_key_id).
-                    let target_key_ids: Vec<String> = {
-                        let mut stmt = tx.prepare(
-                            "SELECT key_id FROM federation_keys \
-                             WHERE identity_type = 'agent' \
-                               AND identity_ref = ?1 \
-                               AND key_id = ?2",
-                        )?;
-                        let rows = stmt.query_map([&agent, &key], |r| r.get::<_, String>(0))?;
-                        rows.collect::<Result<Vec<_>, _>>()?
-                    };
-
-                    if !target_key_ids.is_empty() {
-                        // Per-key DELETE (sqlite doesn't have ANY/array
-                        // params; iterate). Same row-count-summing
-                        // shape as the trace_llm_calls loop above.
-                        let mut rev_stmt = tx.prepare(
-                            "DELETE FROM federation_revocations \
+                if !target_key_ids.is_empty() {
+                    // Per-key DELETE (sqlite doesn't have ANY/array
+                    // params; iterate). Same row-count-summing
+                    // shape as the trace_llm_calls loop above.
+                    let mut rev_stmt = tx.prepare(
+                        "DELETE FROM federation_revocations \
                              WHERE revoked_key_id = ?1 \
                                 OR revoking_key_id = ?1 \
                                 OR scrub_key_id    = ?1",
-                        )?;
-                        let mut att_stmt = tx.prepare(
-                            "DELETE FROM federation_attestations \
+                    )?;
+                    let mut att_stmt = tx.prepare(
+                        "DELETE FROM federation_attestations \
                              WHERE attesting_key_id = ?1 \
                                 OR attested_key_id  = ?1 \
                                 OR scrub_key_id     = ?1",
-                        )?;
-                        let mut key_stmt =
-                            tx.prepare("DELETE FROM federation_keys WHERE key_id = ?1")?;
-                        for kid in &target_key_ids {
-                            federation_revocations_deleted += rev_stmt.execute([kid])? as u64;
-                            federation_attestations_deleted += att_stmt.execute([kid])? as u64;
-                            federation_keys_deleted += key_stmt.execute([kid])? as u64;
-                        }
+                    )?;
+                    let mut key_stmt =
+                        tx.prepare("DELETE FROM federation_keys WHERE key_id = ?1")?;
+                    for kid in &target_key_ids {
+                        federation_revocations_deleted += rev_stmt.execute([kid])? as u64;
+                        federation_attestations_deleted += att_stmt.execute([kid])? as u64;
+                        federation_keys_deleted += key_stmt.execute([kid])? as u64;
                     }
                 }
+            }
 
-                tx.commit()?;
-                Ok(super::types::DeleteSummary {
-                    trace_events_deleted,
-                    trace_llm_calls_deleted,
-                    federation_keys_deleted,
-                    federation_attestations_deleted,
-                    federation_revocations_deleted,
-                    deleted_at: chrono::Utc::now(),
-                })
-            },
-        )
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+            tx.commit()?;
+            Ok(super::types::DeleteSummary {
+                trace_events_deleted,
+                trace_llm_calls_deleted,
+                federation_keys_deleted,
+                federation_attestations_deleted,
+                federation_revocations_deleted,
+                deleted_at: chrono::Utc::now(),
+            })
+        })()
         .map_err(|e| Error::Backend(format!("dsar tx: {e}")))?;
         Ok(summary)
     }
@@ -702,8 +687,8 @@ impl Backend for SqliteBackend {
     ) -> Result<Vec<(i64, TraceEventRow)>, Error> {
         let agent = agent_id_hash.map(str::to_owned);
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<(i64, TraceEventRow)>, Error> {
-            let conn = conn.blocking_lock();
+        (move || -> Result<Vec<(i64, TraceEventRow)>, Error> {
+            let conn = conn.lock();
             let cols = "event_id, trace_id, thought_id, task_id, step_point, event_type, \
                         attempt_index, ts, agent_name, agent_id_hash, cognitive_state, \
                         trace_level, payload, cost_llm_calls, cost_tokens, cost_usd, \
@@ -755,9 +740,7 @@ impl Backend for SqliteBackend {
             };
             let _ = sql; // hold for diagnostics if needed
             Ok(rows)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 }
 
@@ -799,23 +782,20 @@ impl SqliteBackend {
         let trace_id = trace_id.to_owned();
         let thought_id = thought_id.to_owned();
         let conn = self.conn.clone();
-        let row_opt =
-            tokio::task::spawn_blocking(move || -> Result<Option<String>, rusqlite::Error> {
-                let conn = conn.blocking_lock();
-                conn.query_row(
-                    "SELECT extracted_features \
+        let row_opt = (move || -> Result<Option<String>, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT extracted_features \
                      FROM trace_events \
                      WHERE trace_id = ?1 AND thought_id = ?2 \
                        AND extracted_features IS NOT NULL \
                      LIMIT 1",
-                    rusqlite::params![trace_id, thought_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
-            })
-            .await
-            .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
-            .map_err(|e| Error::Backend(format!("read_features: {e}")))?;
+                rusqlite::params![trace_id, thought_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+        })()
+        .map_err(|e| Error::Backend(format!("read_features: {e}")))?;
         match row_opt {
             None => Ok(None),
             Some(text) => {
@@ -846,23 +826,20 @@ impl SqliteBackend {
         let trace_id = trace_id.to_owned();
         let thought_id = thought_id.to_owned();
         let conn = self.conn.clone();
-        let row_opt =
-            tokio::task::spawn_blocking(move || -> Result<Option<String>, rusqlite::Error> {
-                let conn = conn.blocking_lock();
-                conn.query_row(
-                    "SELECT classifications \
+        let row_opt = (move || -> Result<Option<String>, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT classifications \
                      FROM trace_events \
                      WHERE trace_id = ?1 AND thought_id = ?2 \
                        AND classifications IS NOT NULL \
                      LIMIT 1",
-                    rusqlite::params![trace_id, thought_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
-            })
-            .await
-            .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
-            .map_err(|e| Error::Backend(format!("read_classifications: {e}")))?;
+                rusqlite::params![trace_id, thought_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+        })()
+        .map_err(|e| Error::Backend(format!("read_classifications: {e}")))?;
         match row_opt {
             None => Ok(Vec::new()),
             Some(text) => {
@@ -895,8 +872,8 @@ impl SqliteBackend {
         let trace_id = trace_id.to_owned();
         let thought_id = thought_id.to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
-            let conn = conn.blocking_lock();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
             conn.execute(
                 "UPDATE trace_events \
                  SET extracted_features = ?1 \
@@ -904,9 +881,7 @@ impl SqliteBackend {
                 rusqlite::params![features_json, trace_id, thought_id],
             )?;
             Ok(())
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
         .map_err(|e| Error::Backend(format!("write_features: {e}")))?;
         Ok(())
     }
@@ -932,8 +907,8 @@ impl SqliteBackend {
         let trace_id = trace_id.to_owned();
         let thought_id = thought_id.to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
-            let conn = conn.blocking_lock();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
             conn.execute(
                 "UPDATE trace_events \
                  SET classifications = ?1 \
@@ -941,9 +916,7 @@ impl SqliteBackend {
                 rusqlite::params![cls_json, trace_id, thought_id],
             )?;
             Ok(())
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
         .map_err(|e| Error::Backend(format!("write_classifications: {e}")))?;
         Ok(())
     }
@@ -1060,19 +1033,16 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let conn = self.conn.clone();
         let key_id = row.key_id.clone();
         let row_hash = row.persist_row_hash.clone();
-        let conflict_check =
-            tokio::task::spawn_blocking(move || -> Result<Option<String>, rusqlite::Error> {
-                let conn = conn.blocking_lock();
-                conn.query_row(
-                    "SELECT persist_row_hash FROM federation_keys WHERE key_id = ?1",
-                    [&key_id],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()
-            })
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
-            .map_err(|e| crate::federation::Error::Backend(format!("conflict check: {e}")))?;
+        let conflict_check = (move || -> Result<Option<String>, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT persist_row_hash FROM federation_keys WHERE key_id = ?1",
+                [&key_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("conflict check: {e}")))?;
 
         if let Some(existing_hash) = conflict_check {
             if existing_hash == row_hash {
@@ -1096,8 +1066,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 })?)
             };
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
-            let conn = conn.blocking_lock();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
             conn.execute(
                 "INSERT INTO federation_keys (\
                     key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
@@ -1128,9 +1098,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 ],
             )?;
             Ok(())
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
         .map_err(|e| crate::federation::Error::Backend(format!("insert federation_keys: {e}")))?;
         Ok(())
     }
@@ -1141,9 +1109,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<Option<crate::federation::KeyRecord>, crate::federation::Error> {
         let conn = self.conn.clone();
         let key_id = key_id.to_owned();
-        tokio::task::spawn_blocking(
+        (
             move || -> Result<Option<crate::federation::KeyRecord>, rusqlite::Error> {
-                let conn = conn.blocking_lock();
+                let conn = conn.lock();
                 conn.query_row(
                     "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
                         identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
@@ -1155,10 +1123,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     sqlite_row_to_key_record,
                 )
                 .optional()
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+            })()
         .map_err(|e| crate::federation::Error::Backend(format!("lookup federation_keys: {e}")))
     }
 
@@ -1168,9 +1133,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<Vec<crate::federation::KeyRecord>, crate::federation::Error> {
         let conn = self.conn.clone();
         let identity_ref = identity_ref.to_owned();
-        tokio::task::spawn_blocking(
+        (
             move || -> Result<Vec<crate::federation::KeyRecord>, rusqlite::Error> {
-                let conn = conn.blocking_lock();
+                let conn = conn.lock();
                 let mut stmt = conn.prepare(
                     "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
                         identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
@@ -1181,10 +1146,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 )?;
                 let rows = stmt.query_map([&identity_ref], sqlite_row_to_key_record)?;
                 rows.collect()
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+            })()
         .map_err(|e| crate::federation::Error::Backend(format!("lookup_keys_for_identity: {e}")))
     }
 
@@ -1198,9 +1160,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<Vec<crate::federation::KeyRecord>, crate::federation::Error> {
         let conn = self.conn.clone();
         let identity_type = identity_type.to_owned();
-        tokio::task::spawn_blocking(
+        (
             move || -> Result<Vec<crate::federation::KeyRecord>, rusqlite::Error> {
-                let conn = conn.blocking_lock();
+                let conn = conn.lock();
                 let mut stmt = conn.prepare(
                     "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
                         identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
@@ -1212,10 +1174,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 )?;
                 let rows = stmt.query_map([&identity_type], sqlite_row_to_key_record)?;
                 rows.collect()
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+            })()
         .map_err(|e| {
             crate::federation::Error::Backend(format!("list_keys_by_identity_type: {e}"))
         })
@@ -1246,17 +1205,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let attesting_identity_type = {
             let conn = self.conn.clone();
             let attesting = row.attesting_key_id.clone();
-            tokio::task::spawn_blocking(move || -> Result<Option<String>, rusqlite::Error> {
-                let conn = conn.blocking_lock();
+            (move || -> Result<Option<String>, rusqlite::Error> {
+                let conn = conn.lock();
                 conn.query_row(
                     "SELECT identity_type FROM federation_keys WHERE key_id = ?1",
                     [&attesting],
                     |r| r.get::<_, String>(0),
                 )
                 .optional()
-            })
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+            })()
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("lookup attesting identity_type: {e}"))
             })?
@@ -1298,42 +1255,37 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 let attestation_type_owned = row.attestation_type.clone();
                 let attesting_owned = row.attesting_key_id.clone();
                 let ref_id_owned = ref_id.to_owned();
-                let dup_exists =
-                    tokio::task::spawn_blocking(move || -> Result<bool, rusqlite::Error> {
-                        let conn = conn.blocking_lock();
-                        let mut stmt = conn.prepare(
-                            "SELECT attestation_envelope FROM federation_attestations \
+                let dup_exists = (move || -> Result<bool, rusqlite::Error> {
+                    let conn = conn.lock();
+                    let mut stmt = conn.prepare(
+                        "SELECT attestation_envelope FROM federation_attestations \
                          WHERE attestation_type = ?1 AND attesting_key_id = ?2",
-                        )?;
-                        let rows = stmt.query_map(
-                            rusqlite::params![attestation_type_owned, attesting_owned],
-                            |r| r.get::<_, String>(0),
-                        )?;
-                        for env_text in rows {
-                            let env_text = env_text?;
-                            let env: serde_json::Value = match serde_json::from_str(&env_text) {
-                                Ok(v) => v,
-                                Err(_) => continue,
-                            };
-                            let existing_ref =
+                    )?;
+                    let rows = stmt.query_map(
+                        rusqlite::params![attestation_type_owned, attesting_owned],
+                        |r| r.get::<_, String>(0),
+                    )?;
+                    for env_text in rows {
+                        let env_text = env_text?;
+                        let env: serde_json::Value = match serde_json::from_str(&env_text) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                        let existing_ref =
                             crate::federation::precedence::references_attestation_id_from_envelope(
                                 &env,
                             );
-                            if existing_ref == Some(ref_id_owned.as_str()) {
-                                return Ok(true);
-                            }
+                        if existing_ref == Some(ref_id_owned.as_str()) {
+                            return Ok(true);
                         }
-                        Ok(false)
-                    })
-                    .await
-                    .map_err(|e| {
-                        crate::federation::Error::Backend(format!("spawn_blocking join: {e}"))
-                    })?
-                    .map_err(|e| {
-                        crate::federation::Error::Backend(format!(
-                            "dedup lookup structural composer: {e}"
-                        ))
-                    })?;
+                    }
+                    Ok(false)
+                })()
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!(
+                        "dedup lookup structural composer: {e}"
+                    ))
+                })?;
                 if dup_exists {
                     return Ok(());
                 }
@@ -1393,8 +1345,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         })?;
         let withdraws_admission_rule: Option<i64> = row.withdraws_admission_rule.map(|v| v as i64);
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
-            let conn = conn.blocking_lock();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
             conn.execute(
                 "INSERT INTO federation_attestations (\
                     attestation_id, attesting_key_id, attested_key_id, attestation_type, \
@@ -1425,9 +1377,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 ],
             )?;
             Ok(())
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
         .map_err(|e| {
             let msg = e.to_string();
             if msg.contains("FOREIGN KEY") {
@@ -1447,9 +1397,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
         let conn = self.conn.clone();
         let key = attested_key_id.to_owned();
-        tokio::task::spawn_blocking(
+        (
             move || -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
-                let conn = conn.blocking_lock();
+                let conn = conn.lock();
                 let mut stmt = conn.prepare(
                     "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                         weight, asserted_at, expires_at, attestation_envelope, \
@@ -1461,10 +1411,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 )?;
                 let rows = stmt.query_map([&key], sqlite_row_to_attestation)?;
                 rows.collect()
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+            })()
         .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_for: {e}")))
     }
 
@@ -1474,9 +1421,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
         let conn = self.conn.clone();
         let key = attesting_key_id.to_owned();
-        tokio::task::spawn_blocking(
+        (
             move || -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
-                let conn = conn.blocking_lock();
+                let conn = conn.lock();
                 let mut stmt = conn.prepare(
                     "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                         weight, asserted_at, expires_at, attestation_envelope, \
@@ -1488,10 +1435,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 )?;
                 let rows = stmt.query_map([&key], sqlite_row_to_attestation)?;
                 rows.collect()
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+            })()
         .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_by: {e}")))
     }
 
@@ -1528,8 +1472,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             .map_err(|e| crate::federation::Error::Backend(format!("envelope serialize: {e}")))?;
 
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
-            let conn = conn.blocking_lock();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
             conn.execute(
                 "INSERT INTO federation_revocations (\
                     revocation_id, revoked_key_id, revoking_key_id, reason, \
@@ -1557,9 +1501,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 ],
             )?;
             Ok(())
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
         .map_err(|e| {
             let msg = e.to_string();
             if msg.contains("FOREIGN KEY") {
@@ -1579,11 +1521,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<Vec<crate::federation::Revocation>, crate::federation::Error> {
         let conn = self.conn.clone();
         let key = revoked_key_id.to_owned();
-        tokio::task::spawn_blocking(
-            move || -> Result<Vec<crate::federation::Revocation>, rusqlite::Error> {
-                let conn = conn.blocking_lock();
-                let mut stmt = conn.prepare(
-                    "SELECT revocation_id, revoked_key_id, revoking_key_id, reason, \
+        (move || -> Result<Vec<crate::federation::Revocation>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT revocation_id, revoked_key_id, revoking_key_id, reason, \
                         revoked_at, effective_at, revocation_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                         scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
@@ -1591,13 +1532,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                      FROM federation_revocations \
                      WHERE revoked_key_id = ?1 \
                      ORDER BY effective_at DESC",
-                )?;
-                let rows = stmt.query_map([&key], sqlite_row_to_revocation)?;
-                rows.collect()
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+            )?;
+            let rows = stmt.query_map([&key], sqlite_row_to_revocation)?;
+            rows.collect()
+        })()
         .map_err(|e| crate::federation::Error::Backend(format!("revocations_for: {e}")))
     }
 
@@ -1611,8 +1549,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         crate::federation::check_device_class(&row.device_class)?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
-            let conn = conn.blocking_lock();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
             conn.execute(
                 "INSERT INTO federation_identity_occurrences (\
                     identity_key_id, occurrence_key_id, device_class, \
@@ -1629,9 +1567,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 ],
             )?;
             Ok(())
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
         .map_err(|e| {
             let msg = e.to_string();
             if msg.contains("FOREIGN KEY") {
@@ -1651,22 +1587,18 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<Vec<crate::federation::IdentityOccurrence>, crate::federation::Error> {
         let conn = self.conn.clone();
         let key = identity_key_id.to_owned();
-        tokio::task::spawn_blocking(
-            move || -> Result<Vec<crate::federation::IdentityOccurrence>, rusqlite::Error> {
-                let conn = conn.blocking_lock();
-                let mut stmt = conn.prepare(
-                    "SELECT identity_key_id, occurrence_key_id, device_class, \
+        (move || -> Result<Vec<crate::federation::IdentityOccurrence>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT identity_key_id, occurrence_key_id, device_class, \
                         hardware_attestation, asserted_at, valid_until, persist_row_hash \
                      FROM federation_identity_occurrences \
                      WHERE identity_key_id = ?1 \
                      ORDER BY occurrence_key_id ASC",
-                )?;
-                let rows = stmt.query_map([&key], sqlite_row_to_identity_occurrence)?;
-                rows.collect()
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+            )?;
+            let rows = stmt.query_map([&key], sqlite_row_to_identity_occurrence)?;
+            rows.collect()
+        })()
         .map_err(|e| {
             crate::federation::Error::Backend(format!("list_identity_occurrences_for: {e}"))
         })
@@ -1678,22 +1610,18 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<Option<crate::federation::IdentityOccurrence>, crate::federation::Error> {
         let conn = self.conn.clone();
         let key = occurrence_key_id.to_owned();
-        tokio::task::spawn_blocking(
-            move || -> Result<Option<crate::federation::IdentityOccurrence>, rusqlite::Error> {
-                let conn = conn.blocking_lock();
-                conn.query_row(
-                    "SELECT identity_key_id, occurrence_key_id, device_class, \
+        (move || -> Result<Option<crate::federation::IdentityOccurrence>, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT identity_key_id, occurrence_key_id, device_class, \
                         hardware_attestation, asserted_at, valid_until, persist_row_hash \
                      FROM federation_identity_occurrences \
                      WHERE occurrence_key_id = ?1 LIMIT 1",
-                    [&key],
-                    sqlite_row_to_identity_occurrence,
-                )
-                .optional()
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+                [&key],
+                sqlite_row_to_identity_occurrence,
+            )
+            .optional()
+        })()
         .map_err(|e| {
             crate::federation::Error::Backend(format!("lookup_identity_for_occurrence: {e}"))
         })
@@ -1709,8 +1637,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let members_json = serde_json::to_string(&row.members)
             .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
-            let conn = conn.blocking_lock();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
             conn.execute(
                 "INSERT INTO federation_families (\
                     family_key_id, family_name, members, founded_at, \
@@ -1727,9 +1655,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 ],
             )?;
             Ok(())
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
         .map_err(|e| {
             let msg = e.to_string();
             if msg.contains("FOREIGN KEY") {
@@ -1749,21 +1675,17 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<Option<crate::federation::Family>, crate::federation::Error> {
         let conn = self.conn.clone();
         let key = family_key_id.to_owned();
-        tokio::task::spawn_blocking(
-            move || -> Result<Option<crate::federation::Family>, rusqlite::Error> {
-                let conn = conn.blocking_lock();
-                conn.query_row(
-                    "SELECT family_key_id, family_name, members, founded_at, \
+        (move || -> Result<Option<crate::federation::Family>, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT family_key_id, family_name, members, founded_at, \
                         consensus_protocol, consensus_protocol_entrenched, persist_row_hash \
                      FROM federation_families WHERE family_key_id = ?1",
-                    [&key],
-                    sqlite_row_to_family,
-                )
-                .optional()
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+                [&key],
+                sqlite_row_to_family,
+            )
+            .optional()
+        })()
         .map_err(|e| crate::federation::Error::Backend(format!("lookup_family: {e}")))
     }
 
@@ -1776,11 +1698,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // any entry whose key_id == the target.
         let conn = self.conn.clone();
         let key = member_identity_key_id.to_owned();
-        tokio::task::spawn_blocking(
-            move || -> Result<Vec<crate::federation::Family>, rusqlite::Error> {
-                let conn = conn.blocking_lock();
-                let mut stmt = conn.prepare(
-                    "SELECT family_key_id, family_name, members, founded_at, \
+        (move || -> Result<Vec<crate::federation::Family>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT family_key_id, family_name, members, founded_at, \
                         consensus_protocol, consensus_protocol_entrenched, persist_row_hash \
                      FROM federation_families \
                      WHERE EXISTS ( \
@@ -1788,13 +1709,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                          WHERE json_extract(value, '$.key_id') = ?1 \
                      ) \
                      ORDER BY family_key_id ASC",
-                )?;
-                let rows = stmt.query_map([&key], sqlite_row_to_family)?;
-                rows.collect()
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+            )?;
+            let rows = stmt.query_map([&key], sqlite_row_to_family)?;
+            rows.collect()
+        })()
         .map_err(|e| crate::federation::Error::Backend(format!("list_families_for_member: {e}")))
     }
 
@@ -1830,8 +1748,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let mldsa = pubkey_ml_dsa_65_base64.to_owned();
         let pqc_sig = scrub_signature_pqc.to_owned();
         let now_str = now.to_rfc3339();
-        let n = tokio::task::spawn_blocking(move || -> Result<usize, rusqlite::Error> {
-            let conn = conn.blocking_lock();
+        let n = (move || -> Result<usize, rusqlite::Error> {
+            let conn = conn.lock();
             conn.execute(
                 "UPDATE federation_keys \
                  SET pubkey_ml_dsa_65_base64 = ?1, scrub_signature_pqc = ?2, \
@@ -1839,9 +1757,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                  WHERE key_id = ?5 AND pqc_completed_at IS NULL",
                 rusqlite::params![mldsa, pqc_sig, now_str, new_hash, key_id],
             )
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
         .map_err(|e| crate::federation::Error::Backend(format!("attach_key_pqc_signature: {e}")))?;
         if n == 0 {
             return Err(crate::federation::Error::Conflict(
@@ -1859,9 +1775,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // Read existing row to recompute hash + check pending state.
         let conn_for_read = self.conn.clone();
         let id = attestation_id.to_owned();
-        let row_opt = tokio::task::spawn_blocking(
+        let row_opt = (
             move || -> Result<Option<crate::federation::Attestation>, rusqlite::Error> {
-                let conn = conn_for_read.blocking_lock();
+                let conn = conn_for_read.lock();
                 conn.query_row(
                     "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                         weight, asserted_at, expires_at, attestation_envelope, \
@@ -1872,10 +1788,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     sqlite_row_to_attestation,
                 )
                 .optional()
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+            })()
         .map_err(|e| crate::federation::Error::Backend(format!("attach lookup: {e}")))?;
         let mut row = row_opt.ok_or_else(|| {
             crate::federation::Error::InvalidArgument(format!(
@@ -1898,17 +1811,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let attestation_id = attestation_id.to_owned();
         let pqc_sig = scrub_signature_pqc.to_owned();
         let now_str = now.to_rfc3339();
-        let n = tokio::task::spawn_blocking(move || -> Result<usize, rusqlite::Error> {
-            let conn = conn.blocking_lock();
+        let n = (move || -> Result<usize, rusqlite::Error> {
+            let conn = conn.lock();
             conn.execute(
                 "UPDATE federation_attestations \
                  SET scrub_signature_pqc = ?1, pqc_completed_at = ?2, persist_row_hash = ?3 \
                  WHERE attestation_id = ?4 AND pqc_completed_at IS NULL",
                 rusqlite::params![pqc_sig, now_str, new_hash, attestation_id],
             )
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
         .map_err(|e| {
             crate::federation::Error::Backend(format!("attach_attestation_pqc_signature: {e}"))
         })?;
@@ -1927,9 +1838,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<(), crate::federation::Error> {
         let conn_for_read = self.conn.clone();
         let id = revocation_id.to_owned();
-        let row_opt = tokio::task::spawn_blocking(
-            move || -> Result<Option<crate::federation::Revocation>, rusqlite::Error> {
-                let conn = conn_for_read.blocking_lock();
+        let row_opt =
+            (move || -> Result<Option<crate::federation::Revocation>, rusqlite::Error> {
+                let conn = conn_for_read.lock();
                 conn.query_row(
                     "SELECT revocation_id, revoked_key_id, revoking_key_id, reason, \
                         revoked_at, effective_at, revocation_envelope, \
@@ -1941,11 +1852,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     sqlite_row_to_revocation,
                 )
                 .optional()
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
-        .map_err(|e| crate::federation::Error::Backend(format!("attach lookup: {e}")))?;
+            })()
+            .map_err(|e| crate::federation::Error::Backend(format!("attach lookup: {e}")))?;
         let mut row = row_opt.ok_or_else(|| {
             crate::federation::Error::InvalidArgument(format!(
                 "federation_revocations row {revocation_id} does not exist"
@@ -1967,17 +1875,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let revocation_id = revocation_id.to_owned();
         let pqc_sig = scrub_signature_pqc.to_owned();
         let now_str = now.to_rfc3339();
-        let n = tokio::task::spawn_blocking(move || -> Result<usize, rusqlite::Error> {
-            let conn = conn.blocking_lock();
+        let n = (move || -> Result<usize, rusqlite::Error> {
+            let conn = conn.lock();
             conn.execute(
                 "UPDATE federation_revocations \
                  SET scrub_signature_pqc = ?1, pqc_completed_at = ?2, persist_row_hash = ?3 \
                  WHERE revocation_id = ?4 AND pqc_completed_at IS NULL",
                 rusqlite::params![pqc_sig, now_str, new_hash, revocation_id],
             )
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
         .map_err(|e| {
             crate::federation::Error::Backend(format!("attach_revocation_pqc_signature: {e}"))
         })?;
@@ -1994,28 +1900,24 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         limit: i64,
     ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
         let conn = self.conn.clone();
-        let rows = tokio::task::spawn_blocking(
-            move || -> Result<Vec<(String, String, String)>, rusqlite::Error> {
-                let conn = conn.blocking_lock();
-                let mut stmt = conn.prepare(
-                    "SELECT key_id, registration_envelope, scrub_signature_classical \
+        let rows = (move || -> Result<Vec<(String, String, String)>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT key_id, registration_envelope, scrub_signature_classical \
                      FROM federation_keys \
                      WHERE pqc_completed_at IS NULL \
                      ORDER BY valid_from ASC \
                      LIMIT ?1",
-                )?;
-                let iter = stmt.query_map([limit], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })?;
-                iter.collect()
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+            )?;
+            let iter = stmt.query_map([limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            iter.collect()
+        })()
         .map_err(|e| crate::federation::Error::Backend(format!("list_hybrid_pending_keys: {e}")))?;
         rows.into_iter()
             .map(|(id, envelope_text, classical_sig_b64)| {
@@ -2039,28 +1941,24 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         limit: i64,
     ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
         let conn = self.conn.clone();
-        let rows = tokio::task::spawn_blocking(
-            move || -> Result<Vec<(String, String, String)>, rusqlite::Error> {
-                let conn = conn.blocking_lock();
-                let mut stmt = conn.prepare(
-                    "SELECT attestation_id, attestation_envelope, scrub_signature_classical \
+        let rows = (move || -> Result<Vec<(String, String, String)>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT attestation_id, attestation_envelope, scrub_signature_classical \
                      FROM federation_attestations \
                      WHERE pqc_completed_at IS NULL \
                      ORDER BY asserted_at ASC \
                      LIMIT ?1",
-                )?;
-                let iter = stmt.query_map([limit], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })?;
-                iter.collect()
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+            )?;
+            let iter = stmt.query_map([limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            iter.collect()
+        })()
         .map_err(|e| {
             crate::federation::Error::Backend(format!("list_hybrid_pending_attestations: {e}"))
         })?;
@@ -2086,28 +1984,24 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         limit: i64,
     ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
         let conn = self.conn.clone();
-        let rows = tokio::task::spawn_blocking(
-            move || -> Result<Vec<(String, String, String)>, rusqlite::Error> {
-                let conn = conn.blocking_lock();
-                let mut stmt = conn.prepare(
-                    "SELECT revocation_id, revocation_envelope, scrub_signature_classical \
+        let rows = (move || -> Result<Vec<(String, String, String)>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT revocation_id, revocation_envelope, scrub_signature_classical \
                      FROM federation_revocations \
                      WHERE pqc_completed_at IS NULL \
                      ORDER BY revoked_at ASC \
                      LIMIT ?1",
-                )?;
-                let iter = stmt.query_map([limit], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })?;
-                iter.collect()
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+            )?;
+            let iter = stmt.query_map([limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            iter.collect()
+        })()
         .map_err(|e| {
             crate::federation::Error::Backend(format!("list_hybrid_pending_revocations: {e}"))
         })?;
@@ -2151,8 +2045,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let now_text = chrono::Utc::now().to_rfc3339();
 
         let conn = self.conn.clone();
-        let n = tokio::task::spawn_blocking(move || -> Result<usize, rusqlite::Error> {
-            let conn = conn.blocking_lock();
+        let n = (move || -> Result<usize, rusqlite::Error> {
+            let conn = conn.lock();
             conn.execute(
                 "UPDATE federation_keys \
                  SET trust_type = ?2, \
@@ -2172,9 +2066,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     expires_at_text,
                 ],
             )
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
         .map_err(|e| crate::federation::Error::Backend(format!("grant_trust UPDATE: {e}")))?;
         if n == 0 {
             return Err(crate::federation::Error::InvalidArgument(format!(
@@ -2207,8 +2099,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let key_owned = key.to_owned();
         let now_text = chrono::Utc::now().to_rfc3339();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<usize, rusqlite::Error> {
-            let conn = conn.blocking_lock();
+        (move || -> Result<usize, rusqlite::Error> {
+            let conn = conn.lock();
             conn.execute(
                 "UPDATE federation_keys \
                  SET expires_at = ?2 \
@@ -2217,9 +2109,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                    AND (expires_at IS NULL OR julianday(expires_at) > julianday(?2))",
                 rusqlite::params![key_owned, now_text],
             )
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
         .map_err(|e| crate::federation::Error::Backend(format!("revoke_trust: {e}")))?;
         let _ = revoked_by;
         Ok(())
@@ -2231,22 +2121,18 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<Option<crate::federation::TrustRow>, crate::federation::Error> {
         let key_owned = key.to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(
-            move || -> Result<Option<crate::federation::TrustRow>, rusqlite::Error> {
-                let conn = conn.blocking_lock();
-                conn.query_row(
-                    "SELECT key_id, trust_type, trust_relationship, trust_domains, \
+        (move || -> Result<Option<crate::federation::TrustRow>, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT key_id, trust_type, trust_relationship, trust_domains, \
                             trusted_by, trusted_at, expires_at \
                      FROM federation_keys \
                      WHERE key_id = ?1 AND trusted_by IS NOT NULL",
-                    [&key_owned],
-                    sqlite_row_to_trust_row,
-                )
-                .optional()
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+                [&key_owned],
+                sqlite_row_to_trust_row,
+            )
+            .optional()
+        })()
         .map_err(|e| crate::federation::Error::Backend(format!("lookup_trust: {e}")))
     }
 
@@ -2288,20 +2174,16 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         );
         let domain_filter = filter.domain;
         let conn = self.conn.clone();
-        let rows = tokio::task::spawn_blocking(
-            move || -> Result<Vec<crate::federation::TrustRow>, rusqlite::Error> {
-                let conn = conn.blocking_lock();
-                let mut stmt = conn.prepare(&sql)?;
-                let params_dyn: Vec<&dyn rusqlite::ToSql> =
-                    params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
-                let rows = stmt
-                    .query_map(params_dyn.as_slice(), sqlite_row_to_trust_row)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        let rows = (move || -> Result<Vec<crate::federation::TrustRow>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(&sql)?;
+            let params_dyn: Vec<&dyn rusqlite::ToSql> =
+                params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+            let rows = stmt
+                .query_map(params_dyn.as_slice(), sqlite_row_to_trust_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })()
         .map_err(|e| crate::federation::Error::Backend(format!("list_trusted_keys: {e}")))?;
         let filtered: Vec<crate::federation::TrustRow> = match domain_filter {
             Some(domain) => rows
@@ -2340,19 +2222,16 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let goal_id_text = goal.goal_id.to_string();
         let conn = self.conn.clone();
         let goal_for_conflict = goal.clone();
-        let conflict_check =
-            tokio::task::spawn_blocking(move || -> Result<Option<String>, rusqlite::Error> {
-                let conn = conn.blocking_lock();
-                conn.query_row(
-                    "SELECT persist_row_hash FROM goals WHERE goal_id = ?1",
-                    [&goal_for_conflict.goal_id.to_string()],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()
-            })
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
-            .map_err(|e| crate::federation::Error::Backend(format!("conflict check: {e}")))?;
+        let conflict_check = (move || -> Result<Option<String>, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT persist_row_hash FROM goals WHERE goal_id = ?1",
+                [&goal_for_conflict.goal_id.to_string()],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("conflict check: {e}")))?;
 
         if let Some(existing_hash) = conflict_check {
             if existing_hash == new_hash {
@@ -2371,8 +2250,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let retired_at_text = goal.retired_at.map(|t| t.to_rfc3339());
         let new_hash_owned = new_hash;
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
-            let conn = conn.blocking_lock();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
             conn.execute(
                 "INSERT INTO goals (\
                     goal_id, declared_by_key_id, declared_at, goal_text, \
@@ -2396,9 +2275,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 ],
             )?;
             Ok(())
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
         .map_err(|e| {
             let msg = e.to_string();
             // FK violation → InvalidArgument (matches memory shape).
@@ -2419,22 +2296,18 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<Option<crate::federation::Goal>, crate::federation::Error> {
         let conn = self.conn.clone();
         let goal_id_text = goal_id.to_string();
-        tokio::task::spawn_blocking(
-            move || -> Result<Option<crate::federation::Goal>, rusqlite::Error> {
-                let conn = conn.blocking_lock();
-                conn.query_row(
-                    "SELECT goal_id, declared_by_key_id, declared_at, goal_text, \
+        (move || -> Result<Option<crate::federation::Goal>, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT goal_id, declared_by_key_id, declared_at, goal_text, \
                             scope_kind, scope_cohort_id, meta_dimension, meta_rationale, \
                             meta_deliberation, retired_at \
                      FROM goals WHERE goal_id = ?1",
-                    [&goal_id_text],
-                    sqlite_row_to_goal,
-                )
-                .optional()
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+                [&goal_id_text],
+                sqlite_row_to_goal,
+            )
+            .optional()
+        })()
         .map_err(|e| crate::federation::Error::Backend(format!("get_goal: {e}")))
     }
 
@@ -2477,20 +2350,16 @@ impl crate::federation::FederationDirectory for SqliteBackend {
              ORDER BY declared_at, goal_id"
         );
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(
-            move || -> Result<Vec<crate::federation::Goal>, rusqlite::Error> {
-                let conn = conn.blocking_lock();
-                let mut stmt = conn.prepare(&sql)?;
-                let params_dyn: Vec<&dyn rusqlite::ToSql> =
-                    params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
-                let rows = stmt
-                    .query_map(params_dyn.as_slice(), sqlite_row_to_goal)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        (move || -> Result<Vec<crate::federation::Goal>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(&sql)?;
+            let params_dyn: Vec<&dyn rusqlite::ToSql> =
+                params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+            let rows = stmt
+                .query_map(params_dyn.as_slice(), sqlite_row_to_goal)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })()
         .map_err(|e| crate::federation::Error::Backend(format!("list_goals: {e}")))
     }
 
@@ -2506,8 +2375,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let goal_id_text = goal_id.to_string();
         let retired_at_text = retired_at.to_rfc3339();
         let conn = self.conn.clone();
-        let existed = tokio::task::spawn_blocking(move || -> Result<bool, rusqlite::Error> {
-            let conn = conn.blocking_lock();
+        let existed = (move || -> Result<bool, rusqlite::Error> {
+            let conn = conn.lock();
             // First check existence so a missing row returns
             // InvalidArgument rather than silently no-opping.
             let exists: Option<i64> = conn
@@ -2525,9 +2394,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 rusqlite::params![goal_id_text, retired_at_text],
             )?;
             Ok(true)
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
         .map_err(|e| crate::federation::Error::Backend(format!("retire_goal: {e}")))?;
         if !existed {
             return Err(crate::federation::Error::InvalidArgument(format!(
@@ -2623,9 +2490,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let transport_owned = meta.transport_identity.clone();
 
         let conn = self.conn.clone();
-        let outcome = tokio::task::spawn_blocking(
+        let outcome = (
             move || -> Result<Result<(), crate::federation::Error>, rusqlite::Error> {
-                let mut conn = conn.blocking_lock();
+                let mut conn = conn.lock();
                 let tx = conn.transaction()?;
 
                 // federation_keys ON CONFLICT DO NOTHING.
@@ -2732,10 +2599,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
 
                 tx.commit()?;
                 Ok(Ok(()))
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+            })()
         .map_err(|e| {
             crate::federation::Error::Backend(format!("add_peer_record sqlite: {e}"))
         })?;
@@ -2752,88 +2616,84 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let now_str = now.to_rfc3339();
         let conn = self.conn.clone();
 
-        let outcome = tokio::task::spawn_blocking(
-            move || -> Result<Result<(), crate::federation::Error>, rusqlite::Error> {
-                let mut conn = conn.blocking_lock();
-                let tx = conn.transaction()?;
+        let outcome = (move || -> Result<Result<(), crate::federation::Error>, rusqlite::Error> {
+            let mut conn = conn.lock();
+            let tx = conn.transaction()?;
 
-                // Live-row gate. removed_at TEXT — IS NULL means live.
-                let live: Option<i64> = tx
-                    .query_row(
-                        "SELECT 1 FROM federation_peer_metadata \
+            // Live-row gate. removed_at TEXT — IS NULL means live.
+            let live: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM federation_peer_metadata \
                          WHERE key_id = ?1 AND removed_at IS NULL",
-                        [&key_id_owned],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-                if live.is_none() {
-                    return Ok(Err(crate::federation::Error::PeerNotFound {
-                        key_id: key_id_owned.clone(),
-                    }));
-                }
+                    [&key_id_owned],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if live.is_none() {
+                return Ok(Err(crate::federation::Error::PeerNotFound {
+                    key_id: key_id_owned.clone(),
+                }));
+            }
 
-                if hard {
-                    let count: i64 = tx.query_row(
-                        "SELECT COUNT(*) FROM federation_attestations \
+            if hard {
+                let count: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM federation_attestations \
                          WHERE attesting_key_id = ?1 OR attested_key_id = ?1 OR scrub_key_id = ?1",
-                        [&key_id_owned],
-                        |r| r.get(0),
-                    )?;
-                    if count > 0 {
-                        return Ok(Err(
-                            crate::federation::Error::HardRemoveWithActiveAttestations {
-                                key_id: key_id_owned.clone(),
-                                attestation_count: count as usize,
-                            },
-                        ));
-                    }
-                    // DELETE federation_keys — FK ON DELETE CASCADE on
-                    // federation_peer_metadata cleans up the sibling.
-                    tx.execute(
-                        "DELETE FROM federation_keys WHERE key_id = ?1",
-                        [&key_id_owned],
-                    )?;
-                } else {
-                    // Soft-remove: bump removed_at + updated_at +
-                    // recompute persist_row_hash from the mutated row.
-                    let row = tx.query_row(
-                        "SELECT key_id, alias, trust, notes, policy_blob, \
+                    [&key_id_owned],
+                    |r| r.get(0),
+                )?;
+                if count > 0 {
+                    return Ok(Err(
+                        crate::federation::Error::HardRemoveWithActiveAttestations {
+                            key_id: key_id_owned.clone(),
+                            attestation_count: count as usize,
+                        },
+                    ));
+                }
+                // DELETE federation_keys — FK ON DELETE CASCADE on
+                // federation_peer_metadata cleans up the sibling.
+                tx.execute(
+                    "DELETE FROM federation_keys WHERE key_id = ?1",
+                    [&key_id_owned],
+                )?;
+            } else {
+                // Soft-remove: bump removed_at + updated_at +
+                // recompute persist_row_hash from the mutated row.
+                let row = tx.query_row(
+                    "SELECT key_id, alias, trust, notes, policy_blob, \
                                 transport_identity, inserted_at \
                          FROM federation_peer_metadata WHERE key_id = ?1",
-                        [&key_id_owned],
-                        |r| {
-                            Ok((
-                                r.get::<_, String>(0)?,
-                                r.get::<_, Option<String>>(1)?,
-                                r.get::<_, String>(2)?,
-                                r.get::<_, Option<String>>(3)?,
-                                r.get::<_, Option<String>>(4)?,
-                                r.get::<_, Option<String>>(5)?,
-                                r.get::<_, String>(6)?,
-                            ))
-                        },
-                    )?;
-                    let new_row = sqlite_row_tuple_to_peer_metadata(row, Some(now), now)
-                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-                    let new_hash = crate::federation::types::compute_persist_row_hash(&new_row)
-                        .map_err(|e| {
-                            rusqlite::Error::ToSqlConversionFailure(Box::new(
-                                std::io::Error::other(format!("hash: {e}")),
-                            ))
-                        })?;
-                    tx.execute(
-                        "UPDATE federation_peer_metadata SET \
+                    [&key_id_owned],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, Option<String>>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                            r.get::<_, Option<String>>(4)?,
+                            r.get::<_, Option<String>>(5)?,
+                            r.get::<_, String>(6)?,
+                        ))
+                    },
+                )?;
+                let new_row = sqlite_row_tuple_to_peer_metadata(row, Some(now), now)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                let new_hash = crate::federation::types::compute_persist_row_hash(&new_row)
+                    .map_err(|e| {
+                        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
+                            format!("hash: {e}"),
+                        )))
+                    })?;
+                tx.execute(
+                    "UPDATE federation_peer_metadata SET \
                             removed_at = ?2, updated_at = ?2, persist_row_hash = ?3 \
                          WHERE key_id = ?1",
-                        rusqlite::params![key_id_owned, now_str, new_hash],
-                    )?;
-                }
-                tx.commit()?;
-                Ok(Ok(()))
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+                    rusqlite::params![key_id_owned, now_str, new_hash],
+                )?;
+            }
+            tx.commit()?;
+            Ok(Ok(()))
+        })()
         .map_err(|e| {
             crate::federation::Error::Backend(format!("remove_peer_record sqlite: {e}"))
         })?;
@@ -2880,89 +2740,79 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<Option<crate::federation::PeerMetadataRow>, crate::federation::Error> {
         let conn = self.conn.clone();
         let key_id_owned = key_id.to_owned();
-        tokio::task::spawn_blocking(
-            move || -> Result<Option<crate::federation::PeerMetadataRow>, crate::federation::Error> {
-                let conn = conn.blocking_lock();
-                type Row = (
-                    String,         // key_id
-                    Option<String>, // alias
-                    String,         // trust
-                    Option<String>, // notes
-                    Option<String>, // policy_blob (TEXT-as-JSON)
-                    Option<String>, // transport_identity
-                    Option<String>, // removed_at
-                    String,         // inserted_at
-                    String,         // updated_at
-                    String,         // persist_row_hash
-                );
-                let row_opt: Option<Row> = conn
-                    .query_row(
-                        "SELECT key_id, alias, trust, notes, policy_blob, transport_identity, \
+        (move || -> Result<Option<crate::federation::PeerMetadataRow>, crate::federation::Error> {
+            let conn = conn.lock();
+            type Row = (
+                String,         // key_id
+                Option<String>, // alias
+                String,         // trust
+                Option<String>, // notes
+                Option<String>, // policy_blob (TEXT-as-JSON)
+                Option<String>, // transport_identity
+                Option<String>, // removed_at
+                String,         // inserted_at
+                String,         // updated_at
+                String,         // persist_row_hash
+            );
+            let row_opt: Option<Row> = conn
+                .query_row(
+                    "SELECT key_id, alias, trust, notes, policy_blob, transport_identity, \
                                 removed_at, inserted_at, updated_at, persist_row_hash \
                          FROM federation_peer_metadata WHERE key_id = ?1",
-                        rusqlite::params![key_id_owned],
-                        |row| {
-                            Ok((
-                                row.get(0)?,
-                                row.get(1)?,
-                                row.get(2)?,
-                                row.get(3)?,
-                                row.get(4)?,
-                                row.get(5)?,
-                                row.get(6)?,
-                                row.get(7)?,
-                                row.get(8)?,
-                                row.get(9)?,
-                            ))
-                        },
-                    )
-                    .optional()
-                    .map_err(|e| {
-                        crate::federation::Error::Backend(format!(
-                            "peer_metadata_for query: {e}"
+                    rusqlite::params![key_id_owned],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
+                            row.get(9)?,
                         ))
-                    })?;
-                let Some((
-                    key_id,
-                    alias,
-                    trust_str,
-                    notes,
-                    policy_text,
-                    transport_identity,
-                    removed_at_text,
-                    inserted_at_text,
-                    updated_at_text,
-                    persist_row_hash,
-                )) = row_opt
-                else {
-                    return Ok(None);
-                };
-                if removed_at_text.is_some() {
-                    return Ok(None);
-                }
-                let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_at_text)
-                    .map_err(|e| {
-                        crate::federation::Error::Backend(format!(
-                            "updated_at parse: {e}"
-                        ))
-                    })?
-                    .with_timezone(&chrono::Utc);
-                let tuple: PeerMetadataRowTuple = (
-                    key_id,
-                    alias,
-                    trust_str,
-                    notes,
-                    policy_text,
-                    transport_identity,
-                    inserted_at_text,
-                );
-                let mut meta = sqlite_row_tuple_to_peer_metadata(tuple, None, updated_at)?;
-                meta.persist_row_hash = persist_row_hash;
-                Ok(Some(meta))
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+                    },
+                )
+                .optional()
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!("peer_metadata_for query: {e}"))
+                })?;
+            let Some((
+                key_id,
+                alias,
+                trust_str,
+                notes,
+                policy_text,
+                transport_identity,
+                removed_at_text,
+                inserted_at_text,
+                updated_at_text,
+                persist_row_hash,
+            )) = row_opt
+            else {
+                return Ok(None);
+            };
+            if removed_at_text.is_some() {
+                return Ok(None);
+            }
+            let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_at_text)
+                .map_err(|e| crate::federation::Error::Backend(format!("updated_at parse: {e}")))?
+                .with_timezone(&chrono::Utc);
+            let tuple: PeerMetadataRowTuple = (
+                key_id,
+                alias,
+                trust_str,
+                notes,
+                policy_text,
+                transport_identity,
+                inserted_at_text,
+            );
+            let mut meta = sqlite_row_tuple_to_peer_metadata(tuple, None, updated_at)?;
+            meta.persist_row_hash = persist_row_hash;
+            Ok(Some(meta))
+        })()
     }
 }
 
@@ -3050,124 +2900,120 @@ async fn sqlite_update_peer_field(
     let now = chrono::Utc::now();
     let now_str = now.to_rfc3339();
     let conn = backend.conn.clone();
-    let outcome = tokio::task::spawn_blocking(
-        move || -> Result<Result<(), crate::federation::Error>, rusqlite::Error> {
-            let mut conn = conn.blocking_lock();
-            let tx = conn.transaction()?;
+    let outcome = (move || -> Result<Result<(), crate::federation::Error>, rusqlite::Error> {
+        let mut conn = conn.lock();
+        let tx = conn.transaction()?;
 
-            // Fetch live-row tuple; PeerNotFound on missing or
-            // soft-removed.
-            let row_opt: Option<PeerMetadataRowTupleWithRemoved> = tx
-                .query_row(
-                    "SELECT key_id, alias, trust, notes, policy_blob, \
+        // Fetch live-row tuple; PeerNotFound on missing or
+        // soft-removed.
+        let row_opt: Option<PeerMetadataRowTupleWithRemoved> = tx
+            .query_row(
+                "SELECT key_id, alias, trust, notes, policy_blob, \
                             transport_identity, inserted_at, removed_at \
                      FROM federation_peer_metadata WHERE key_id = ?1",
-                    [&key_id_owned],
-                    |r| {
-                        Ok((
-                            r.get(0)?,
-                            r.get(1)?,
-                            r.get(2)?,
-                            r.get(3)?,
-                            r.get(4)?,
-                            r.get(5)?,
-                            r.get(6)?,
-                            r.get(7)?,
-                        ))
-                    },
-                )
-                .optional()?;
-            let row = match row_opt {
-                None => {
-                    return Ok(Err(crate::federation::Error::PeerNotFound {
-                        key_id: key_id_owned.clone(),
-                    }));
-                }
-                Some(r) => r,
-            };
-            if row.7.is_some() {
+                [&key_id_owned],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let row = match row_opt {
+            None => {
                 return Ok(Err(crate::federation::Error::PeerNotFound {
                     key_id: key_id_owned.clone(),
                 }));
             }
+            Some(r) => r,
+        };
+        if row.7.is_some() {
+            return Ok(Err(crate::federation::Error::PeerNotFound {
+                key_id: key_id_owned.clone(),
+            }));
+        }
 
-            let mut mut_row = match sqlite_row_tuple_to_peer_metadata(
-                (
-                    row.0.clone(),
-                    row.1.clone(),
-                    row.2.clone(),
-                    row.3.clone(),
-                    row.4.clone(),
-                    row.5.clone(),
-                    row.6.clone(),
-                ),
-                None,
-                now,
-            ) {
-                Ok(r) => r,
-                Err(e) => return Ok(Err(e)),
-            };
-            mut_row.updated_at = now;
+        let mut mut_row = match sqlite_row_tuple_to_peer_metadata(
+            (
+                row.0.clone(),
+                row.1.clone(),
+                row.2.clone(),
+                row.3.clone(),
+                row.4.clone(),
+                row.5.clone(),
+                row.6.clone(),
+            ),
+            None,
+            now,
+        ) {
+            Ok(r) => r,
+            Err(e) => return Ok(Err(e)),
+        };
+        mut_row.updated_at = now;
 
-            match &update {
-                SqlitePeerUpdate::Alias(v) => mut_row.alias = v.clone(),
-                SqlitePeerUpdate::Trust(v) => mut_row.trust = *v,
-                SqlitePeerUpdate::Notes(v) => mut_row.notes = v.clone(),
-                SqlitePeerUpdate::Policy(v) => mut_row.policy_blob = Some(v.clone()),
-            }
-            let new_hash = match crate::federation::types::compute_persist_row_hash(&mut_row) {
-                Ok(h) => h,
-                Err(e) => return Ok(Err(e)),
-            };
+        match &update {
+            SqlitePeerUpdate::Alias(v) => mut_row.alias = v.clone(),
+            SqlitePeerUpdate::Trust(v) => mut_row.trust = *v,
+            SqlitePeerUpdate::Notes(v) => mut_row.notes = v.clone(),
+            SqlitePeerUpdate::Policy(v) => mut_row.policy_blob = Some(v.clone()),
+        }
+        let new_hash = match crate::federation::types::compute_persist_row_hash(&mut_row) {
+            Ok(h) => h,
+            Err(e) => return Ok(Err(e)),
+        };
 
-            match update {
-                SqlitePeerUpdate::Alias(_) => {
-                    tx.execute(
-                        "UPDATE federation_peer_metadata SET \
+        match update {
+            SqlitePeerUpdate::Alias(_) => {
+                tx.execute(
+                    "UPDATE federation_peer_metadata SET \
                             alias = ?2, updated_at = ?3, persist_row_hash = ?4 \
                          WHERE key_id = ?1",
-                        rusqlite::params![key_id_owned, mut_row.alias, now_str, new_hash],
-                    )?;
-                }
-                SqlitePeerUpdate::Trust(_) => {
-                    let wire = mut_row.trust.as_wire_str().to_owned();
-                    tx.execute(
-                        "UPDATE federation_peer_metadata SET \
+                    rusqlite::params![key_id_owned, mut_row.alias, now_str, new_hash],
+                )?;
+            }
+            SqlitePeerUpdate::Trust(_) => {
+                let wire = mut_row.trust.as_wire_str().to_owned();
+                tx.execute(
+                    "UPDATE federation_peer_metadata SET \
                             trust = ?2, updated_at = ?3, persist_row_hash = ?4 \
                          WHERE key_id = ?1",
-                        rusqlite::params![key_id_owned, wire, now_str, new_hash],
-                    )?;
-                }
-                SqlitePeerUpdate::Notes(_) => {
-                    tx.execute(
-                        "UPDATE federation_peer_metadata SET \
+                    rusqlite::params![key_id_owned, wire, now_str, new_hash],
+                )?;
+            }
+            SqlitePeerUpdate::Notes(_) => {
+                tx.execute(
+                    "UPDATE federation_peer_metadata SET \
                             notes = ?2, updated_at = ?3, persist_row_hash = ?4 \
                          WHERE key_id = ?1",
-                        rusqlite::params![key_id_owned, mut_row.notes, now_str, new_hash],
-                    )?;
-                }
-                SqlitePeerUpdate::Policy(_) => {
-                    let policy_text: Option<String> =
-                        match &mut_row.policy_blob {
-                            Some(p) => Some(serde_json::to_string(p.as_value()).map_err(|e| {
-                                rusqlite::Error::ToSqlConversionFailure(Box::new(e))
-                            })?),
-                            None => None,
-                        };
-                    tx.execute(
-                        "UPDATE federation_peer_metadata SET \
+                    rusqlite::params![key_id_owned, mut_row.notes, now_str, new_hash],
+                )?;
+            }
+            SqlitePeerUpdate::Policy(_) => {
+                let policy_text: Option<String> = match &mut_row.policy_blob {
+                    Some(p) => Some(
+                        serde_json::to_string(p.as_value())
+                            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                    ),
+                    None => None,
+                };
+                tx.execute(
+                    "UPDATE federation_peer_metadata SET \
                             policy_blob = ?2, updated_at = ?3, persist_row_hash = ?4 \
                          WHERE key_id = ?1",
-                        rusqlite::params![key_id_owned, policy_text, now_str, new_hash],
-                    )?;
-                }
+                    rusqlite::params![key_id_owned, policy_text, now_str, new_hash],
+                )?;
             }
-            tx.commit()?;
-            Ok(Ok(()))
-        },
-    )
-    .await
-    .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        }
+        tx.commit()?;
+        Ok(Ok(()))
+    })()
     .map_err(|e| crate::federation::Error::Backend(format!("update_peer_* sqlite: {e}")))?;
     outcome
 }
@@ -3294,8 +3140,8 @@ impl crate::federation::BlobStorage for SqliteBackend {
         // its first_seen_at instead of the 1970 epoch placeholder.
         let now_iso = chrono::Utc::now().to_rfc3339();
 
-        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
-            let mut conn = conn.blocking_lock();
+        (move || -> Result<(), rusqlite::Error> {
+            let mut conn = conn.lock();
             let tx = conn.transaction()?;
             tx.execute(
                 "INSERT INTO federation_blobs (\
@@ -3340,9 +3186,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
             )?;
             tx.commit()?;
             Ok(())
-        })
-        .await
-        .map_err(|e| crate::federation::BlobError::Backend(format!("spawn_blocking join: {e}")))?
+        })()
         .map_err(|e| {
             let msg = e.to_string();
             if msg.contains("FOREIGN KEY") {
@@ -3400,8 +3244,8 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let now_iso = chrono::Utc::now().to_rfc3339();
         let conn = self.conn.clone();
 
-        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
-            let conn = conn.blocking_lock();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
             conn.execute(
                 "INSERT INTO federation_blobs (\
                     sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
@@ -3419,9 +3263,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 ],
             )?;
             Ok(())
-        })
-        .await
-        .map_err(|e| crate::federation::BlobError::Backend(format!("spawn_blocking join: {e}")))?
+        })()
         .map_err(|e| crate::federation::BlobError::Backend(format!("store_blob_local: {e}")))?;
         Ok(())
     }
@@ -3437,55 +3279,49 @@ impl crate::federation::BlobStorage for SqliteBackend {
         // shape; we do SELECT first, then bump in the same transaction
         // so the counter survives a concurrent get_blob.
         let now_iso = chrono::Utc::now().to_rfc3339();
-        tokio::task::spawn_blocking(
-            move || -> Result<Option<crate::federation::BlobBody>, rusqlite::Error> {
-                let mut conn = conn.blocking_lock();
-                let tx = conn.transaction()?;
-                let row_opt = tx
-                    .query_row(
-                        "SELECT storage_kind, bytes_inline, external_ref, size_bytes, media_type \
+        (move || -> Result<Option<crate::federation::BlobBody>, rusqlite::Error> {
+            let mut conn = conn.lock();
+            let tx = conn.transaction()?;
+            let row_opt = tx
+                .query_row(
+                    "SELECT storage_kind, bytes_inline, external_ref, size_bytes, media_type \
                          FROM federation_blobs WHERE sha256 = ?1",
-                        rusqlite::params![sha_vec],
-                        |row| {
-                            let storage_kind: String = row.get("storage_kind")?;
-                            let bytes_inline: Option<Vec<u8>> = row.get("bytes_inline")?;
-                            let external_ref: Option<String> = row.get("external_ref")?;
-                            let size_bytes: i64 = row.get("size_bytes")?;
-                            let media_type: Option<String> = row.get("media_type")?;
-                            Ok((
-                                storage_kind,
-                                bytes_inline,
-                                external_ref,
-                                size_bytes,
-                                media_type,
-                            ))
-                        },
-                    )
-                    .optional()?;
-                if row_opt.is_some() {
-                    tx.execute(
-                        "UPDATE federation_blobs SET access_count = access_count + 1, \
-                         last_accessed_at = ?2 WHERE sha256 = ?1",
-                        rusqlite::params![sha_vec, now_iso],
-                    )?;
-                }
-                tx.commit()?;
-                Ok(
-                    row_opt.map(|(kind, inline, ext, size, mt)| match kind.as_str() {
-                        "inline" => crate::federation::BlobBody::Inline(inline.unwrap_or_default()),
-                        _ => {
-                            crate::federation::BlobBody::External(crate::federation::ExternalRef {
-                                uri: ext.unwrap_or_default(),
-                                size_bytes: size.max(0) as u64,
-                                media_type: mt,
-                            })
-                        }
-                    }),
+                    rusqlite::params![sha_vec],
+                    |row| {
+                        let storage_kind: String = row.get("storage_kind")?;
+                        let bytes_inline: Option<Vec<u8>> = row.get("bytes_inline")?;
+                        let external_ref: Option<String> = row.get("external_ref")?;
+                        let size_bytes: i64 = row.get("size_bytes")?;
+                        let media_type: Option<String> = row.get("media_type")?;
+                        Ok((
+                            storage_kind,
+                            bytes_inline,
+                            external_ref,
+                            size_bytes,
+                            media_type,
+                        ))
+                    },
                 )
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::BlobError::Backend(format!("spawn_blocking join: {e}")))?
+                .optional()?;
+            if row_opt.is_some() {
+                tx.execute(
+                    "UPDATE federation_blobs SET access_count = access_count + 1, \
+                         last_accessed_at = ?2 WHERE sha256 = ?1",
+                    rusqlite::params![sha_vec, now_iso],
+                )?;
+            }
+            tx.commit()?;
+            Ok(
+                row_opt.map(|(kind, inline, ext, size, mt)| match kind.as_str() {
+                    "inline" => crate::federation::BlobBody::Inline(inline.unwrap_or_default()),
+                    _ => crate::federation::BlobBody::External(crate::federation::ExternalRef {
+                        uri: ext.unwrap_or_default(),
+                        size_bytes: size.max(0) as u64,
+                        media_type: mt,
+                    }),
+                }),
+            )
+        })()
         .map_err(|e| crate::federation::BlobError::Backend(format!("get_blob: {e}")))
     }
 
@@ -3497,8 +3333,8 @@ impl crate::federation::BlobStorage for SqliteBackend {
         // architect's plan §"Per-row access tracking"). Both reads are
         // treated as evidence the blob is still hot.
         let now_iso = chrono::Utc::now().to_rfc3339();
-        tokio::task::spawn_blocking(move || -> Result<bool, rusqlite::Error> {
-            let mut conn = conn.blocking_lock();
+        (move || -> Result<bool, rusqlite::Error> {
+            let mut conn = conn.lock();
             let tx = conn.transaction()?;
             let count: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM federation_blobs WHERE sha256 = ?1",
@@ -3514,9 +3350,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
             }
             tx.commit()?;
             Ok(count > 0)
-        })
-        .await
-        .map_err(|e| crate::federation::BlobError::Backend(format!("spawn_blocking join: {e}")))?
+        })()
         .map_err(|e| crate::federation::BlobError::Backend(format!("has_blob: {e}")))
     }
 
@@ -3551,8 +3385,8 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let ttl = chrono::Duration::from_std(crate::federation::blobs::DEFAULT_HOLDS_BYTES_TTL)
             .expect("DEFAULT_HOLDS_BYTES_TTL fits chrono::Duration");
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<String>, rusqlite::Error> {
-            let conn = conn.blocking_lock();
+        (move || -> Result<Vec<String>, rusqlite::Error> {
+            let conn = conn.lock();
 
             // v3.6.4 local-truth gate.
             let blob_locally_held: bool = conn
@@ -3651,9 +3485,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 }
             }
             Ok(holders)
-        })
-        .await
-        .map_err(|e| crate::federation::BlobError::Backend(format!("spawn_blocking join: {e}")))?
+        })()
         .map_err(|e| crate::federation::BlobError::Backend(format!("list_holders: {e}")))
     }
 
@@ -3669,8 +3501,8 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let full_hex = hex::encode(sha256);
         let sha_vec = sha256.to_vec();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<String>, rusqlite::Error> {
-            let conn = conn.blocking_lock();
+        (move || -> Result<Vec<String>, rusqlite::Error> {
+            let conn = conn.lock();
 
             // Gate: blob must be locally present.
             let blob_present: bool = conn
@@ -3755,9 +3587,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 }
             }
             Ok(holders)
-        })
-        .await
-        .map_err(|e| crate::federation::BlobError::Backend(format!("spawn_blocking join: {e}")))?
+        })()
         .map_err(|e| crate::federation::BlobError::Backend(format!("list_local_holders: {e}")))
     }
 
@@ -3786,8 +3616,8 @@ impl crate::federation::BlobStorage for SqliteBackend {
             .expect("DEFAULT_HOLDS_BYTES_TTL fits chrono::Duration");
         let actor = attesting_key_id.to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<[u8; 32]>, rusqlite::Error> {
-            let conn = conn.blocking_lock();
+        (move || -> Result<Vec<[u8; 32]>, rusqlite::Error> {
+            let conn = conn.lock();
             let like_pattern = format!("{prefix}%");
             let mut stmt = conn.prepare(
                 "SELECT attestation_id, attestation_envelope, asserted_at \
@@ -3867,9 +3697,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 }
             }
             Ok(out)
-        })
-        .await
-        .map_err(|e| crate::federation::BlobError::Backend(format!("spawn_blocking join: {e}")))?
+        })()
         .map_err(|e| crate::federation::BlobError::Backend(format!("list_held_by: {e}")))
     }
 
@@ -3987,49 +3815,45 @@ impl SqliteBackend {
         limit: i64,
     ) -> Result<Vec<crate::federation::EvictionCandidate>, crate::federation::BlobError> {
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(
-            move || -> Result<Vec<crate::federation::EvictionCandidate>, rusqlite::Error> {
-                let conn = conn.blocking_lock();
-                let mut stmt = conn.prepare(
-                    "SELECT sha256, size_bytes, access_count, last_accessed_at \
+        (move || -> Result<Vec<crate::federation::EvictionCandidate>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT sha256, size_bytes, access_count, last_accessed_at \
                      FROM federation_blobs \
                      ORDER BY last_accessed_at ASC, access_count ASC \
                      LIMIT ?1",
-                )?;
-                let rows = stmt.query_map([limit], |r| {
-                    let sha_vec: Vec<u8> = r.get(0)?;
-                    let size_bytes: i64 = r.get(1)?;
-                    let access_count: i64 = r.get(2)?;
-                    let last_str: String = r.get(3)?;
-                    Ok((sha_vec, size_bytes, access_count, last_str))
-                })?;
-                let mut out = Vec::new();
-                for row in rows {
-                    let (sha_vec, size_bytes, access_count, last_str) = row?;
-                    let mut sha = [0u8; 32];
-                    if sha_vec.len() != 32 {
-                        // Defense in depth — schema enforces 32-byte
-                        // sha256 but a corrupt row shouldn't panic
-                        // the sweeper. Skip the row.
-                        continue;
-                    }
-                    sha.copy_from_slice(&sha_vec);
-                    let last_accessed_at: chrono::DateTime<chrono::Utc> =
-                        chrono::DateTime::parse_from_rfc3339(&last_str)
-                            .map(|t| t.with_timezone(&chrono::Utc))
-                            .unwrap_or_else(|_| chrono::Utc::now());
-                    out.push(crate::federation::EvictionCandidate {
-                        sha256: sha,
-                        size_bytes: size_bytes.max(0) as u64,
-                        access_count: access_count.max(0) as u64,
-                        last_accessed_at,
-                    });
+            )?;
+            let rows = stmt.query_map([limit], |r| {
+                let sha_vec: Vec<u8> = r.get(0)?;
+                let size_bytes: i64 = r.get(1)?;
+                let access_count: i64 = r.get(2)?;
+                let last_str: String = r.get(3)?;
+                Ok((sha_vec, size_bytes, access_count, last_str))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (sha_vec, size_bytes, access_count, last_str) = row?;
+                let mut sha = [0u8; 32];
+                if sha_vec.len() != 32 {
+                    // Defense in depth — schema enforces 32-byte
+                    // sha256 but a corrupt row shouldn't panic
+                    // the sweeper. Skip the row.
+                    continue;
                 }
-                Ok(out)
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::BlobError::Backend(format!("spawn_blocking join: {e}")))?
+                sha.copy_from_slice(&sha_vec);
+                let last_accessed_at: chrono::DateTime<chrono::Utc> =
+                    chrono::DateTime::parse_from_rfc3339(&last_str)
+                        .map(|t| t.with_timezone(&chrono::Utc))
+                        .unwrap_or_else(|_| chrono::Utc::now());
+                out.push(crate::federation::EvictionCandidate {
+                    sha256: sha,
+                    size_bytes: size_bytes.max(0) as u64,
+                    access_count: access_count.max(0) as u64,
+                    last_accessed_at,
+                });
+            }
+            Ok(out)
+        })()
         .map_err(|e| crate::federation::BlobError::Backend(format!("sweep_candidates: {e}")))
     }
 
@@ -4043,15 +3867,13 @@ impl SqliteBackend {
     ) -> Result<bool, crate::federation::BlobError> {
         let sha_vec = sha256.to_vec();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<usize, rusqlite::Error> {
-            let conn = conn.blocking_lock();
+        (move || -> Result<usize, rusqlite::Error> {
+            let conn = conn.lock();
             conn.execute(
                 "DELETE FROM federation_blobs WHERE sha256 = ?1",
                 rusqlite::params![sha_vec],
             )
-        })
-        .await
-        .map_err(|e| crate::federation::BlobError::Backend(format!("spawn_blocking join: {e}")))?
+        })()
         .map_err(|e| crate::federation::BlobError::Backend(format!("delete_blob: {e}")))
         .map(|n| n > 0)
     }
@@ -4127,50 +3949,45 @@ impl crate::federation::BlackholeRules for SqliteBackend {
         &self,
     ) -> Result<Vec<crate::federation::BlackholeRecord>, crate::federation::Error> {
         let conn = self.conn.clone();
-        let rows = tokio::task::spawn_blocking(
-            move || -> Result<Vec<crate::federation::BlackholeRecord>, rusqlite::Error> {
-                let conn = conn.blocking_lock();
-                let mut stmt = conn.prepare(
-                    "SELECT identity_hash, until, reason, added_at, hits, persist_row_hash \
+        let rows = (move || -> Result<Vec<crate::federation::BlackholeRecord>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT identity_hash, until, reason, added_at, hits, persist_row_hash \
                      FROM blackhole_rules \
                      ORDER BY added_at ASC",
-                )?;
-                let iter = stmt.query_map([], |row| {
-                    let identity_hash: Vec<u8> = row.get(0)?;
-                    let until_text: Option<String> = row.get(1)?;
-                    let reason: Option<String> = row.get(2)?;
-                    let added_at_text: String = row.get(3)?;
-                    let hits: i64 = row.get(4)?;
-                    let persist_row_hash: String = row.get(5)?;
-                    Ok((
-                        identity_hash,
-                        until_text,
-                        reason,
-                        added_at_text,
-                        hits,
-                        persist_row_hash,
-                    ))
-                })?;
-                let mut out = Vec::new();
-                for r in iter {
-                    let (identity_hash, until_text, reason, added_at_text, hits, persist_row_hash) =
-                        r?;
-                    let added_at = parse_rfc3339(&added_at_text);
-                    let until = until_text.as_deref().map(parse_rfc3339);
-                    out.push(crate::federation::BlackholeRecord {
-                        identity_hash,
-                        until,
-                        reason,
-                        added_at,
-                        hits,
-                        persist_row_hash,
-                    });
-                }
-                Ok(out)
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+            )?;
+            let iter = stmt.query_map([], |row| {
+                let identity_hash: Vec<u8> = row.get(0)?;
+                let until_text: Option<String> = row.get(1)?;
+                let reason: Option<String> = row.get(2)?;
+                let added_at_text: String = row.get(3)?;
+                let hits: i64 = row.get(4)?;
+                let persist_row_hash: String = row.get(5)?;
+                Ok((
+                    identity_hash,
+                    until_text,
+                    reason,
+                    added_at_text,
+                    hits,
+                    persist_row_hash,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for r in iter {
+                let (identity_hash, until_text, reason, added_at_text, hits, persist_row_hash) = r?;
+                let added_at = parse_rfc3339(&added_at_text);
+                let until = until_text.as_deref().map(parse_rfc3339);
+                out.push(crate::federation::BlackholeRecord {
+                    identity_hash,
+                    until,
+                    reason,
+                    added_at,
+                    hits,
+                    persist_row_hash,
+                });
+            }
+            Ok(out)
+        })()
         .map_err(|e| crate::federation::Error::Backend(format!("blackhole_list sqlite: {e}")))?;
         Ok(rows)
     }
@@ -4186,59 +4003,55 @@ impl crate::federation::BlackholeRules for SqliteBackend {
         let identity_owned = identity_hash.to_vec();
         let reason_owned = reason.map(str::to_owned);
         let conn = self.conn.clone();
-        let outcome = tokio::task::spawn_blocking(
-            move || -> Result<Result<(), crate::federation::Error>, rusqlite::Error> {
-                let mut conn = conn.blocking_lock();
-                let tx = conn.transaction()?;
-                let existing_added_at_text: Option<String> = tx
-                    .query_row(
-                        "SELECT added_at FROM blackhole_rules WHERE identity_hash = ?1",
-                        [&identity_owned],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-                let added_at = match &existing_added_at_text {
-                    Some(text) => parse_rfc3339(text),
-                    None => now,
-                };
-                let new_hash = match crate::federation::blackhole::compute_blackhole_row_hash(
-                    &identity_owned,
-                    &until,
-                    &reason_owned,
-                    &added_at,
-                ) {
-                    Ok(h) => h,
-                    Err(e) => return Ok(Err(e)),
-                };
-                let until_text = until.as_ref().map(|t| t.to_rfc3339());
-                if existing_added_at_text.is_some() {
-                    tx.execute(
-                        "UPDATE blackhole_rules SET \
+        let outcome = (move || -> Result<Result<(), crate::federation::Error>, rusqlite::Error> {
+            let mut conn = conn.lock();
+            let tx = conn.transaction()?;
+            let existing_added_at_text: Option<String> = tx
+                .query_row(
+                    "SELECT added_at FROM blackhole_rules WHERE identity_hash = ?1",
+                    [&identity_owned],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let added_at = match &existing_added_at_text {
+                Some(text) => parse_rfc3339(text),
+                None => now,
+            };
+            let new_hash = match crate::federation::blackhole::compute_blackhole_row_hash(
+                &identity_owned,
+                &until,
+                &reason_owned,
+                &added_at,
+            ) {
+                Ok(h) => h,
+                Err(e) => return Ok(Err(e)),
+            };
+            let until_text = until.as_ref().map(|t| t.to_rfc3339());
+            if existing_added_at_text.is_some() {
+                tx.execute(
+                    "UPDATE blackhole_rules SET \
                             until = ?2, reason = ?3, persist_row_hash = ?4 \
                          WHERE identity_hash = ?1",
-                        rusqlite::params![identity_owned, until_text, reason_owned, new_hash],
-                    )?;
-                } else {
-                    let added_at_text = added_at.to_rfc3339();
-                    tx.execute(
-                        "INSERT INTO blackhole_rules \
+                    rusqlite::params![identity_owned, until_text, reason_owned, new_hash],
+                )?;
+            } else {
+                let added_at_text = added_at.to_rfc3339();
+                tx.execute(
+                    "INSERT INTO blackhole_rules \
                             (identity_hash, until, reason, added_at, hits, persist_row_hash) \
                          VALUES (?1, ?2, ?3, ?4, 0, ?5)",
-                        rusqlite::params![
-                            identity_owned,
-                            until_text,
-                            reason_owned,
-                            added_at_text,
-                            new_hash
-                        ],
-                    )?;
-                }
-                tx.commit()?;
-                Ok(Ok(()))
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+                    rusqlite::params![
+                        identity_owned,
+                        until_text,
+                        reason_owned,
+                        added_at_text,
+                        new_hash
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(Ok(()))
+        })()
         .map_err(|e| crate::federation::Error::Backend(format!("blackhole_upsert sqlite: {e}")))?;
         outcome
     }
@@ -4247,16 +4060,14 @@ impl crate::federation::BlackholeRules for SqliteBackend {
         crate::federation::blackhole::validate_identity_hash_len(identity_hash)?;
         let identity_owned = identity_hash.to_vec();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
-            let conn = conn.blocking_lock();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
             conn.execute(
                 "DELETE FROM blackhole_rules WHERE identity_hash = ?1",
                 [&identity_owned],
             )?;
             Ok(())
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
         .map_err(|e| crate::federation::Error::Backend(format!("blackhole_remove sqlite: {e}")))?;
         Ok(())
     }
@@ -4270,16 +4081,14 @@ impl crate::federation::BlackholeRules for SqliteBackend {
         let conn = self.conn.clone();
         // Single-statement UPDATE; race-tolerant — silent no-op when
         // no row matches (rows-affected == 0).
-        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
-            let conn = conn.blocking_lock();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
             conn.execute(
                 "UPDATE blackhole_rules SET hits = hits + 1 WHERE identity_hash = ?1",
                 [&identity_owned],
             )?;
             Ok(())
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
         .map_err(|e| {
             crate::federation::Error::Backend(format!("blackhole_record_hit sqlite: {e}"))
         })?;
@@ -4292,17 +4101,15 @@ impl crate::federation::BlackholeRules for SqliteBackend {
     ) -> Result<u64, crate::federation::Error> {
         let now_str = now.to_rfc3339();
         let conn = self.conn.clone();
-        let n = tokio::task::spawn_blocking(move || -> Result<u64, rusqlite::Error> {
-            let conn = conn.blocking_lock();
+        let n = (move || -> Result<u64, rusqlite::Error> {
+            let conn = conn.lock();
             let affected = conn.execute(
                 "DELETE FROM blackhole_rules \
                  WHERE until IS NOT NULL AND until < ?1",
                 [&now_str],
             )?;
             Ok(affected as u64)
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
         .map_err(|e| {
             crate::federation::Error::Backend(format!("blackhole_prune_expired sqlite: {e}"))
         })?;
@@ -4370,8 +4177,8 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
         let env_bytes = envelope_bytes.to_vec();
         let hash_vec = body_sha256.to_vec();
         let now = chrono::Utc::now();
-        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
-            let conn = conn.blocking_lock();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
             conn.execute(
                 "INSERT INTO edge_outbound_queue (\
                     queue_id, sender_key_id, destination_key_id, message_type, \
@@ -4399,9 +4206,7 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
                 ],
             )?;
             Ok(())
-        })
-        .await
-        .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
+        })()
         .map_err(|e| crate::outbound::Error::Backend(format!("enqueue_outbound: {e}")))?;
         Ok(queue_id)
     }
@@ -4416,49 +4221,45 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
         let now = chrono::Utc::now();
         let claim_until = now + chrono::Duration::seconds(claim_duration_seconds);
         let claimed_by = claimed_by.to_owned();
-        let rows = tokio::task::spawn_blocking(
-            move || -> Result<Vec<crate::outbound::OutboundRow>, rusqlite::Error> {
-                let mut conn = conn.blocking_lock();
-                let tx = conn.transaction()?;
-                let queue_ids: Vec<String> = {
-                    let mut stmt = tx.prepare(
-                        "SELECT queue_id FROM edge_outbound_queue \
+        let rows = (move || -> Result<Vec<crate::outbound::OutboundRow>, rusqlite::Error> {
+            let mut conn = conn.lock();
+            let tx = conn.transaction()?;
+            let queue_ids: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT queue_id FROM edge_outbound_queue \
                      WHERE status = 'pending' AND next_attempt_after <= ?1 \
                      ORDER BY next_attempt_after ASC LIMIT ?2",
-                    )?;
-                    let rows = stmt
-                        .query_map(rusqlite::params![now.to_rfc3339(), batch_size], |r| {
-                            r.get::<_, String>(0)
-                        })?;
-                    rows.collect::<Result<Vec<_>, _>>()?
-                };
-                let now_str = now.to_rfc3339();
-                let claim_until_str = claim_until.to_rfc3339();
-                for qid in &queue_ids {
-                    tx.execute(
-                        "UPDATE edge_outbound_queue \
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![now.to_rfc3339(), batch_size], |r| {
+                        r.get::<_, String>(0)
+                    })?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            let now_str = now.to_rfc3339();
+            let claim_until_str = claim_until.to_rfc3339();
+            for qid in &queue_ids {
+                tx.execute(
+                    "UPDATE edge_outbound_queue \
                      SET status = 'sending', last_attempt_at = ?1, \
                          attempt_count = attempt_count + 1, \
                          claimed_until = ?2, claimed_by = ?3 \
                      WHERE queue_id = ?4",
-                        rusqlite::params![now_str, claim_until_str, claimed_by, qid],
-                    )?;
+                    rusqlite::params![now_str, claim_until_str, claimed_by, qid],
+                )?;
+            }
+            let claimed: Vec<crate::outbound::OutboundRow> = {
+                let mut out = Vec::with_capacity(queue_ids.len());
+                let mut stmt = tx.prepare(SQLITE_OUTBOUND_SELECT_BY_ID)?;
+                for qid in &queue_ids {
+                    let row = stmt.query_row([qid], sqlite_row_to_outbound_row)?;
+                    out.push(row);
                 }
-                let claimed: Vec<crate::outbound::OutboundRow> = {
-                    let mut out = Vec::with_capacity(queue_ids.len());
-                    let mut stmt = tx.prepare(SQLITE_OUTBOUND_SELECT_BY_ID)?;
-                    for qid in &queue_ids {
-                        let row = stmt.query_row([qid], sqlite_row_to_outbound_row)?;
-                        out.push(row);
-                    }
-                    out
-                };
-                tx.commit()?;
-                Ok(claimed)
-            },
-        )
-        .await
-        .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
+                out
+            };
+            tx.commit()?;
+            Ok(claimed)
+        })()
         .map_err(|e| crate::outbound::Error::Backend(format!("claim_pending_outbound: {e}")))?;
         Ok(rows)
     }
@@ -4472,8 +4273,8 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
         let qid = queue_id.clone();
         let transport = transport.to_owned();
         let now_str = chrono::Utc::now().to_rfc3339();
-        let n = tokio::task::spawn_blocking(move || -> rusqlite::Result<usize> {
-            let conn = conn.blocking_lock();
+        let n = (move || -> rusqlite::Result<usize> {
+            let conn = conn.lock();
             // CASE branch on requires_ack: !requires_ack → delivered;
             // requires_ack → awaiting_ack.
             conn.execute(
@@ -4485,9 +4286,7 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
                  WHERE queue_id = ?3 AND status = 'sending'",
                 rusqlite::params![now_str, transport, qid],
             )
-        })
-        .await
-        .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
+        })()
         .map_err(|e| crate::outbound::Error::Backend(format!("mark_transport_delivered: {e}")))?;
         if n == 0 {
             return Err(crate::outbound::Error::InvalidTransition(format!(
@@ -4512,9 +4311,9 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
         let transport = transport.to_owned();
         let now = chrono::Utc::now();
         let next_str = next_attempt_after.to_rfc3339();
-        let outcome = tokio::task::spawn_blocking(
-            move || -> Result<crate::outbound::OutboundFailureOutcome, rusqlite::Error> {
-                let mut conn = conn.blocking_lock();
+        let outcome =
+            (move || -> Result<crate::outbound::OutboundFailureOutcome, rusqlite::Error> {
+                let mut conn = conn.lock();
                 let tx = conn.transaction()?;
                 let (attempt_count, max_attempts, enqueued_at_str, ttl_seconds): (
                     i32,
@@ -4577,16 +4376,13 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
                 };
                 tx.commit()?;
                 Ok(outcome)
-            },
-        )
-        .await
-        .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
-        .map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => crate::outbound::Error::InvalidTransition(
-                format!("queue_id {queue_id} not in 'sending'"),
-            ),
-            other => crate::outbound::Error::Backend(format!("mark_transport_failed: {other}")),
-        })?;
+            })()
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => crate::outbound::Error::InvalidTransition(
+                    format!("queue_id {queue_id} not in 'sending'"),
+                ),
+                other => crate::outbound::Error::Backend(format!("mark_transport_failed: {other}")),
+            })?;
         Ok(outcome)
     }
 
@@ -4597,8 +4393,8 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
         let conn = self.conn.clone();
         let qid = queue_id.clone();
         let now_str = chrono::Utc::now().to_rfc3339();
-        tokio::task::spawn_blocking(move || -> rusqlite::Result<()> {
-            let conn = conn.blocking_lock();
+        (move || -> rusqlite::Result<()> {
+            let conn = conn.lock();
             conn.execute(
                 "UPDATE edge_outbound_queue \
                  SET status = 'delivered', delivered_at = ?1, \
@@ -4607,9 +4403,7 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
                 rusqlite::params![now_str, qid],
             )?;
             Ok(())
-        })
-        .await
-        .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
+        })()
         .map_err(|e| crate::outbound::Error::Backend(format!("mark_replay_resolved: {e}")))?;
         Ok(())
     }
@@ -4620,17 +4414,15 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
     ) -> Result<Option<crate::outbound::OutboundRow>, crate::outbound::Error> {
         let conn = self.conn.clone();
         let hash_vec = in_reply_to_sha256.to_vec();
-        tokio::task::spawn_blocking(move || -> rusqlite::Result<Option<crate::outbound::OutboundRow>> {
-            let conn = conn.blocking_lock();
+        (move || -> rusqlite::Result<Option<crate::outbound::OutboundRow>> {
+            let conn = conn.lock();
             let sql = format!(
                 "{SQLITE_OUTBOUND_SELECT_PREFIX} WHERE body_sha256 = ?1 AND status = 'awaiting_ack' LIMIT 1"
             );
             let mut stmt = conn.prepare(&sql)?;
             stmt.query_row([&hash_vec as &dyn rusqlite::ToSql], sqlite_row_to_outbound_row)
                 .optional()
-        })
-        .await
-        .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
+        })()
         .map_err(|e| crate::outbound::Error::Backend(format!("match_ack_to_outbound: {e}")))
     }
 
@@ -4643,8 +4435,8 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
         let qid = queue_id.clone();
         let ack_bytes = ack_envelope_bytes.to_vec();
         let now_str = chrono::Utc::now().to_rfc3339();
-        let n = tokio::task::spawn_blocking(move || -> rusqlite::Result<usize> {
-            let conn = conn.blocking_lock();
+        let n = (move || -> rusqlite::Result<usize> {
+            let conn = conn.lock();
             conn.execute(
                 "UPDATE edge_outbound_queue \
                  SET status = 'delivered', \
@@ -4652,9 +4444,7 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
                  WHERE queue_id = ?3 AND status = 'awaiting_ack'",
                 rusqlite::params![ack_bytes, now_str, qid],
             )
-        })
-        .await
-        .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
+        })()
         .map_err(|e| crate::outbound::Error::Backend(format!("mark_ack_received: {e}")))?;
         if n == 0 {
             return Err(crate::outbound::Error::InvalidTransition(format!(
@@ -4667,8 +4457,8 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
     async fn sweep_ack_timeouts(&self) -> Result<i64, crate::outbound::Error> {
         let conn = self.conn.clone();
         let now = chrono::Utc::now();
-        tokio::task::spawn_blocking(move || -> rusqlite::Result<i64> {
-            let mut conn = conn.blocking_lock();
+        (move || -> rusqlite::Result<i64> {
+            let mut conn = conn.lock();
             let tx = conn.transaction()?;
             // Walk awaiting_ack rows; per-row TTL/timeout checks in Rust
             // (sqlite has no interval arithmetic).
@@ -4742,17 +4532,15 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
             }
             tx.commit()?;
             Ok(count)
-        })
-        .await
-        .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
+        })()
         .map_err(|e| crate::outbound::Error::Backend(format!("sweep_ack_timeouts: {e}")))
     }
 
     async fn sweep_ttl_expired(&self) -> Result<i64, crate::outbound::Error> {
         let conn = self.conn.clone();
         let now = chrono::Utc::now();
-        tokio::task::spawn_blocking(move || -> rusqlite::Result<i64> {
-            let mut conn = conn.blocking_lock();
+        (move || -> rusqlite::Result<i64> {
+            let mut conn = conn.lock();
             let tx = conn.transaction()?;
             // Pull non-terminal rows; check ttl in Rust.
             let candidates: Vec<(String, String, i64)> = {
@@ -4781,17 +4569,15 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
             }
             tx.commit()?;
             Ok(count)
-        })
-        .await
-        .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
+        })()
         .map_err(|e| crate::outbound::Error::Backend(format!("sweep_ttl_expired: {e}")))
     }
 
     async fn sweep_expired_claims(&self) -> Result<i64, crate::outbound::Error> {
         let conn = self.conn.clone();
         let now_str = chrono::Utc::now().to_rfc3339();
-        tokio::task::spawn_blocking(move || -> rusqlite::Result<i64> {
-            let conn = conn.blocking_lock();
+        (move || -> rusqlite::Result<i64> {
+            let conn = conn.lock();
             let n = conn.execute(
                 "UPDATE edge_outbound_queue \
                  SET status = 'pending', claimed_until = NULL, claimed_by = NULL \
@@ -4799,9 +4585,7 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
                 rusqlite::params![now_str],
             )?;
             Ok(n as i64)
-        })
-        .await
-        .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
+        })()
         .map_err(|e| crate::outbound::Error::Backend(format!("sweep_expired_claims: {e}")))
     }
 
@@ -4811,17 +4595,13 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
     ) -> Result<Option<crate::outbound::OutboundRow>, crate::outbound::Error> {
         let conn = self.conn.clone();
         let qid = queue_id.clone();
-        tokio::task::spawn_blocking(
-            move || -> rusqlite::Result<Option<crate::outbound::OutboundRow>> {
-                let conn = conn.blocking_lock();
-                let sql = format!("{SQLITE_OUTBOUND_SELECT_PREFIX} WHERE queue_id = ?1");
-                let mut stmt = conn.prepare(&sql)?;
-                stmt.query_row([&qid], sqlite_row_to_outbound_row)
-                    .optional()
-            },
-        )
-        .await
-        .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
+        (move || -> rusqlite::Result<Option<crate::outbound::OutboundRow>> {
+            let conn = conn.lock();
+            let sql = format!("{SQLITE_OUTBOUND_SELECT_PREFIX} WHERE queue_id = ?1");
+            let mut stmt = conn.prepare(&sql)?;
+            stmt.query_row([&qid], sqlite_row_to_outbound_row)
+                .optional()
+        })()
         .map_err(|e| crate::outbound::Error::Backend(format!("outbound_status: {e}")))
     }
 
@@ -4862,21 +4642,17 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
             where_clauses.join(" AND "),
             limit_idx,
         );
-        tokio::task::spawn_blocking(
-            move || -> rusqlite::Result<Vec<crate::outbound::OutboundRow>> {
-                let conn = conn.blocking_lock();
-                let mut stmt = conn.prepare(&sql)?;
-                let rows = stmt
-                    .query_map(
-                        rusqlite::params_from_iter(binds.iter()),
-                        sqlite_row_to_outbound_row,
-                    )?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(rows)
-            },
-        )
-        .await
-        .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
+        (move || -> rusqlite::Result<Vec<crate::outbound::OutboundRow>> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map(
+                    rusqlite::params_from_iter(binds.iter()),
+                    sqlite_row_to_outbound_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })()
         .map_err(|e| crate::outbound::Error::Backend(format!("list_outbound: {e}")))
     }
 
@@ -4887,8 +4663,8 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
         let conn = self.conn.clone();
         let qid = queue_id.clone();
         let now_str = chrono::Utc::now().to_rfc3339();
-        tokio::task::spawn_blocking(move || -> rusqlite::Result<()> {
-            let conn = conn.blocking_lock();
+        (move || -> rusqlite::Result<()> {
+            let conn = conn.lock();
             conn.execute(
                 "UPDATE edge_outbound_queue \
                  SET status = 'abandoned', abandoned_at = ?1, \
@@ -4898,9 +4674,7 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
                 rusqlite::params![now_str, qid],
             )?;
             Ok(())
-        })
-        .await
-        .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
+        })()
         .map_err(|e| crate::outbound::Error::Backend(format!("cancel_outbound: {e}")))?;
         Ok(())
     }
@@ -4912,8 +4686,8 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
         let conn = self.conn.clone();
         let qid = queue_id.clone();
         let now_str = chrono::Utc::now().to_rfc3339();
-        let n = tokio::task::spawn_blocking(move || -> rusqlite::Result<usize> {
-            let conn = conn.blocking_lock();
+        let n = (move || -> rusqlite::Result<usize> {
+            let conn = conn.lock();
             conn.execute(
                 "UPDATE edge_outbound_queue \
                  SET status = 'pending', attempt_count = 0, \
@@ -4923,9 +4697,7 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
                  WHERE queue_id = ?2 AND status = 'abandoned'",
                 rusqlite::params![now_str, qid],
             )
-        })
-        .await
-        .map_err(|e| crate::outbound::Error::Backend(format!("spawn_blocking: {e}")))?
+        })()
         .map_err(|e| crate::outbound::Error::Backend(format!("replay_abandoned: {e}")))?;
         if n == 0 {
             return Err(crate::outbound::Error::InvalidTransition(format!(
@@ -5361,8 +5133,8 @@ async fn check_revocation_anti_rollback_sqlite(
 ) -> Result<(), crate::federation::Error> {
     let conn = conn.clone();
     let revoked_key_id_owned = revoked_key_id.to_owned();
-    let latest = tokio::task::spawn_blocking(move || -> Result<Option<String>, rusqlite::Error> {
-        let conn = conn.blocking_lock();
+    let latest = (move || -> Result<Option<String>, rusqlite::Error> {
+        let conn = conn.lock();
         conn.query_row(
             "SELECT scrub_timestamp FROM federation_revocations \
              WHERE revoked_key_id = ?1 ORDER BY scrub_timestamp DESC LIMIT 1",
@@ -5370,9 +5142,7 @@ async fn check_revocation_anti_rollback_sqlite(
             |row| row.get::<_, String>(0),
         )
         .optional()
-    })
-    .await
-    .map_err(|e| crate::federation::Error::Backend(format!("spawn_blocking join: {e}")))?
+    })()
     .map_err(|e| crate::federation::Error::Backend(format!("anti-rollback lookup: {e}")))?;
 
     if let Some(latest_ts_str) = latest {
@@ -5884,24 +5654,20 @@ impl crate::read::ReadEngine for SqliteBackend {
             select = SQLITE_TRACE_SUMMARY_SELECT,
         );
         let conn = self.conn.clone();
-        let items = tokio::task::spawn_blocking(
-            move || -> Result<Vec<crate::read::TraceSummary>, crate::read::Error> {
-                let conn = conn.blocking_lock();
-                let mut stmt = conn
-                    .prepare(&sql)
-                    .map_err(sqlite_read_err("list_trace_summaries prepare"))?;
-                let rows = stmt
-                    .query_map(params_from_iter(binds.iter()), |r| {
-                        sqlite_row_to_trace_summary(r)
-                    })
-                    .map_err(sqlite_read_err("list_trace_summaries query"))?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(sqlite_read_err("list_trace_summaries row"))?;
-                Ok(rows)
-            },
-        )
-        .await
-        .map_err(|e| crate::read::Error::Backend(format!("spawn_blocking join: {e}")))??;
+        let items = (move || -> Result<Vec<crate::read::TraceSummary>, crate::read::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(sqlite_read_err("list_trace_summaries prepare"))?;
+            let rows = stmt
+                .query_map(params_from_iter(binds.iter()), |r| {
+                    sqlite_row_to_trace_summary(r)
+                })
+                .map_err(sqlite_read_err("list_trace_summaries query"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sqlite_read_err("list_trace_summaries row"))?;
+            Ok(rows)
+        })()?;
 
         let next_cursor = if items.len() as i64 == limit {
             items
@@ -5919,24 +5685,20 @@ impl crate::read::ReadEngine for SqliteBackend {
     ) -> Result<Option<crate::read::TraceSummary>, crate::read::Error> {
         let trace_id = trace_id.to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(
-            move || -> Result<Option<crate::read::TraceSummary>, crate::read::Error> {
-                let conn = conn.blocking_lock();
-                let sql = format!(
-                    "SELECT {select} FROM trace_events \
+        (move || -> Result<Option<crate::read::TraceSummary>, crate::read::Error> {
+            let conn = conn.lock();
+            let sql = format!(
+                "SELECT {select} FROM trace_events \
                      WHERE trace_id = ?1 GROUP BY trace_id",
-                    select = SQLITE_TRACE_SUMMARY_SELECT,
-                );
-                let mut stmt = conn
-                    .prepare(&sql)
-                    .map_err(sqlite_read_err("get_trace_summary prepare"))?;
-                stmt.query_row([&trace_id], sqlite_row_to_trace_summary)
-                    .optional()
-                    .map_err(sqlite_read_err("get_trace_summary query"))
-            },
-        )
-        .await
-        .map_err(|e| crate::read::Error::Backend(format!("spawn_blocking join: {e}")))?
+                select = SQLITE_TRACE_SUMMARY_SELECT,
+            );
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(sqlite_read_err("get_trace_summary prepare"))?;
+            stmt.query_row([&trace_id], sqlite_row_to_trace_summary)
+                .optional()
+                .map_err(sqlite_read_err("get_trace_summary query"))
+        })()
     }
 
     async fn get_trace_detail(
@@ -5945,31 +5707,30 @@ impl crate::read::ReadEngine for SqliteBackend {
     ) -> Result<Option<crate::read::TraceDetail>, crate::read::Error> {
         let trace_id = trace_id.to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(
-            move || -> Result<Option<crate::read::TraceDetail>, crate::read::Error> {
-                let conn = conn.blocking_lock();
+        (move || -> Result<Option<crate::read::TraceDetail>, crate::read::Error> {
+            let conn = conn.lock();
 
-                // Summary first — early-out on absent trace.
-                let summary_sql = format!(
-                    "SELECT {select} FROM trace_events \
+            // Summary first — early-out on absent trace.
+            let summary_sql = format!(
+                "SELECT {select} FROM trace_events \
                      WHERE trace_id = ?1 GROUP BY trace_id",
-                    select = SQLITE_TRACE_SUMMARY_SELECT,
-                );
-                let summary = {
-                    let mut stmt = conn
-                        .prepare(&summary_sql)
-                        .map_err(sqlite_read_err("get_trace_detail summary prepare"))?;
-                    stmt.query_row([&trace_id], sqlite_row_to_trace_summary)
-                        .optional()
-                        .map_err(sqlite_read_err("get_trace_detail summary"))?
-                };
-                let summary = match summary {
-                    Some(s) => s,
-                    None => return Ok(None),
-                };
+                select = SQLITE_TRACE_SUMMARY_SELECT,
+            );
+            let summary = {
+                let mut stmt = conn
+                    .prepare(&summary_sql)
+                    .map_err(sqlite_read_err("get_trace_detail summary prepare"))?;
+                stmt.query_row([&trace_id], sqlite_row_to_trace_summary)
+                    .optional()
+                    .map_err(sqlite_read_err("get_trace_detail summary"))?
+            };
+            let summary = match summary {
+                Some(s) => s,
+                None => return Ok(None),
+            };
 
-                // Components — full event-row spread, chronological.
-                let cols = "event_id, trace_id, thought_id, task_id, step_point, \
+            // Components — full event-row spread, chronological.
+            let cols = "event_id, trace_id, thought_id, task_id, step_point, \
                             event_type, attempt_index, ts, agent_name, agent_id_hash, \
                             cognitive_state, trace_level, payload, cost_llm_calls, \
                             cost_tokens, cost_usd, signature, signing_key_id, \
@@ -5979,80 +5740,77 @@ impl crate::read::ReadEngine for SqliteBackend {
                             scrub_timestamp, agent_role, agent_template, \
                             deployment_domain, deployment_type, deployment_region, \
                             deployment_trust_mode, verification_source";
-                let event_rows: Vec<(i64, TraceEventRow)> = {
-                    let sql = format!(
-                        "SELECT {cols} FROM trace_events \
+            let event_rows: Vec<(i64, TraceEventRow)> = {
+                let sql = format!(
+                    "SELECT {cols} FROM trace_events \
                          WHERE trace_id = ?1 ORDER BY ts ASC"
-                    );
-                    let mut stmt = conn
-                        .prepare(&sql)
-                        .map_err(sqlite_read_err("get_trace_detail components prepare"))?;
-                    let collected = stmt
-                        .query_map([&trace_id], sqlite_row_to_event_row)
-                        .map_err(sqlite_read_err("get_trace_detail components query"))?
-                        .collect::<Result<Vec<_>, _>>();
-                    collected.map_err(sqlite_read_err("get_trace_detail components row"))?
-                };
-                if event_rows.is_empty() {
-                    // Concurrent delete between the two reads — caller retries.
-                    return Ok(None);
-                }
+                );
+                let mut stmt = conn
+                    .prepare(&sql)
+                    .map_err(sqlite_read_err("get_trace_detail components prepare"))?;
+                let collected = stmt
+                    .query_map([&trace_id], sqlite_row_to_event_row)
+                    .map_err(sqlite_read_err("get_trace_detail components query"))?
+                    .collect::<Result<Vec<_>, _>>();
+                collected.map_err(sqlite_read_err("get_trace_detail components row"))?
+            };
+            if event_rows.is_empty() {
+                // Concurrent delete between the two reads — caller retries.
+                return Ok(None);
+            }
 
-                // Envelope refs — per-trace constants from the first row.
-                let first = &event_rows[0].1;
-                let envelope = crate::read::TraceEnvelopeRefs {
-                    signature: first.signature.clone(),
-                    signature_key_id: first.signing_key_id.clone(),
-                    original_content_hash: first.original_content_hash.clone(),
-                    scrub_signature: first.scrub_signature.clone(),
-                    scrub_key_id: first.scrub_key_id.clone(),
-                    scrub_timestamp: first.scrub_timestamp,
-                    pii_scrubbed: first.pii_scrubbed,
-                };
-                let components: Vec<crate::read::TraceComponentRow> = event_rows
-                    .into_iter()
-                    .map(|(_id, full)| crate::read::TraceComponentRow {
-                        step_point: full.step_point,
-                        event_type: full.event_type,
-                        attempt_index: full.attempt_index,
-                        ts: full.ts,
-                        payload: full.payload,
-                    })
-                    .collect();
+            // Envelope refs — per-trace constants from the first row.
+            let first = &event_rows[0].1;
+            let envelope = crate::read::TraceEnvelopeRefs {
+                signature: first.signature.clone(),
+                signature_key_id: first.signing_key_id.clone(),
+                original_content_hash: first.original_content_hash.clone(),
+                scrub_signature: first.scrub_signature.clone(),
+                scrub_key_id: first.scrub_key_id.clone(),
+                scrub_timestamp: first.scrub_timestamp,
+                pii_scrubbed: first.pii_scrubbed,
+            };
+            let components: Vec<crate::read::TraceComponentRow> = event_rows
+                .into_iter()
+                .map(|(_id, full)| crate::read::TraceComponentRow {
+                    step_point: full.step_point,
+                    event_type: full.event_type,
+                    attempt_index: full.attempt_index,
+                    ts: full.ts,
+                    payload: full.payload,
+                })
+                .collect();
 
-                // LLM calls — chronological.
-                let llm_cols = "trace_id, thought_id, task_id, parent_event_id, \
+            // LLM calls — chronological.
+            let llm_cols = "trace_id, thought_id, task_id, parent_event_id, \
                                 parent_event_type, parent_attempt_index, attempt_index, \
                                 ts, duration_ms, handler_name, service_name, model, \
                                 base_url, response_model, prompt_tokens, completion_tokens, \
                                 prompt_bytes, completion_bytes, cost_usd, status, \
                                 error_class, attempt_count, retry_count, prompt_hash, \
                                 prompt, response_text";
-                let llm_calls: Vec<TraceLlmCallRow> = {
-                    let sql = format!(
-                        "SELECT {llm_cols} FROM trace_llm_calls \
+            let llm_calls: Vec<TraceLlmCallRow> = {
+                let sql = format!(
+                    "SELECT {llm_cols} FROM trace_llm_calls \
                          WHERE trace_id = ?1 ORDER BY ts ASC"
-                    );
-                    let mut stmt = conn
-                        .prepare(&sql)
-                        .map_err(sqlite_read_err("get_trace_detail llm prepare"))?;
-                    let collected = stmt
-                        .query_map([&trace_id], sqlite_row_to_llm_call_row)
-                        .map_err(sqlite_read_err("get_trace_detail llm query"))?
-                        .collect::<Result<Vec<_>, _>>();
-                    collected.map_err(sqlite_read_err("get_trace_detail llm row"))?
-                };
+                );
+                let mut stmt = conn
+                    .prepare(&sql)
+                    .map_err(sqlite_read_err("get_trace_detail llm prepare"))?;
+                let collected = stmt
+                    .query_map([&trace_id], sqlite_row_to_llm_call_row)
+                    .map_err(sqlite_read_err("get_trace_detail llm query"))?
+                    .collect::<Result<Vec<_>, _>>();
+                collected.map_err(sqlite_read_err("get_trace_detail llm row"))?
+            };
 
-                Ok(Some(crate::read::TraceDetail {
-                    summary,
-                    components,
-                    llm_calls,
-                    envelope,
-                }))
-            },
-        )
-        .await
-        .map_err(|e| crate::read::Error::Backend(format!("spawn_blocking join: {e}")))?
+            Ok(Some(crate::read::TraceDetail {
+                summary,
+                components,
+                llm_calls,
+                envelope,
+            }))
+        })()
     }
 
     async fn list_tasks(
@@ -6123,50 +5881,49 @@ impl crate::read::ReadEngine for SqliteBackend {
         );
         let conn = self.conn.clone();
         let limit_usize = limit as usize;
-        tokio::task::spawn_blocking(
-            move || -> Result<crate::read::TaskListPage, crate::read::Error> {
-                let conn = conn.blocking_lock();
-                struct TaskHeader {
-                    task_id: String,
-                    earliest_at: chrono::DateTime<chrono::Utc>,
-                    latest_at: chrono::DateTime<chrono::Utc>,
-                    initial_observation: Option<String>,
-                }
-                let headers: Vec<TaskHeader> = {
-                    let mut stmt = conn
-                        .prepare(&task_page_sql)
-                        .map_err(sqlite_read_err("list_tasks page prepare"))?;
-                    let collected = stmt
-                        .query_map(params_from_iter(binds.iter()), |r| {
-                            let earliest: String = r.get("earliest_at")?;
-                            let latest: String = r.get("latest_at")?;
-                            Ok(TaskHeader {
-                                task_id: r.get("task_id")?,
-                                earliest_at: parse_rfc3339(&earliest),
-                                latest_at: parse_rfc3339(&latest),
-                                initial_observation: r.get("initial_observation")?,
-                            })
+        (move || -> Result<crate::read::TaskListPage, crate::read::Error> {
+            let conn = conn.lock();
+            struct TaskHeader {
+                task_id: String,
+                earliest_at: chrono::DateTime<chrono::Utc>,
+                latest_at: chrono::DateTime<chrono::Utc>,
+                initial_observation: Option<String>,
+            }
+            let headers: Vec<TaskHeader> = {
+                let mut stmt = conn
+                    .prepare(&task_page_sql)
+                    .map_err(sqlite_read_err("list_tasks page prepare"))?;
+                let collected = stmt
+                    .query_map(params_from_iter(binds.iter()), |r| {
+                        let earliest: String = r.get("earliest_at")?;
+                        let latest: String = r.get("latest_at")?;
+                        Ok(TaskHeader {
+                            task_id: r.get("task_id")?,
+                            earliest_at: parse_rfc3339(&earliest),
+                            latest_at: parse_rfc3339(&latest),
+                            initial_observation: r.get("initial_observation")?,
                         })
-                        .map_err(sqlite_read_err("list_tasks page query"))?
-                        .collect::<Result<Vec<_>, _>>();
-                    collected.map_err(sqlite_read_err("list_tasks page row"))?
-                };
-                if headers.is_empty() {
-                    return Ok(crate::read::TaskListPage {
-                        items: Vec::new(),
-                        next_cursor: None,
-                    });
-                }
+                    })
+                    .map_err(sqlite_read_err("list_tasks page query"))?
+                    .collect::<Result<Vec<_>, _>>();
+                collected.map_err(sqlite_read_err("list_tasks page row"))?
+            };
+            if headers.is_empty() {
+                return Ok(crate::read::TaskListPage {
+                    items: Vec::new(),
+                    next_cursor: None,
+                });
+            }
 
-                // Trace summaries for every task on the page. SQLite has
-                // no array binding — build an IN (?,?,…) list.
-                let task_ids: Vec<String> = headers.iter().map(|h| h.task_id.clone()).collect();
-                let placeholders: String = (1..=task_ids.len())
-                    .map(|i| format!("?{i}"))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let traces_sql = format!(
-                    "SELECT MAX(task_id) AS _tg_task_id, {select}, \
+            // Trace summaries for every task on the page. SQLite has
+            // no array binding — build an IN (?,?,…) list.
+            let task_ids: Vec<String> = headers.iter().map(|h| h.task_id.clone()).collect();
+            let placeholders: String = (1..=task_ids.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let traces_sql = format!(
+                "SELECT MAX(task_id) AS _tg_task_id, {select}, \
                             MAX(CASE WHEN event_type = 'THOUGHT_START' \
                                 THEN json_extract(payload, '$.thought_depth') END) \
                                 AS _tg_depth \
@@ -6174,61 +5931,58 @@ impl crate::read::ReadEngine for SqliteBackend {
                      GROUP BY trace_id \
                      ORDER BY _tg_task_id ASC, \
                               _tg_depth IS NULL, _tg_depth ASC, started_at ASC",
-                    select = SQLITE_TRACE_SUMMARY_SELECT,
-                );
-                let trace_binds: Vec<SqlValue> =
-                    task_ids.iter().map(|t| SqlValue::Text(t.clone())).collect();
-                let mut bucket: std::collections::HashMap<String, Vec<crate::read::TraceSummary>> =
-                    std::collections::HashMap::new();
+                select = SQLITE_TRACE_SUMMARY_SELECT,
+            );
+            let trace_binds: Vec<SqlValue> =
+                task_ids.iter().map(|t| SqlValue::Text(t.clone())).collect();
+            let mut bucket: std::collections::HashMap<String, Vec<crate::read::TraceSummary>> =
+                std::collections::HashMap::new();
+            {
+                let mut stmt = conn
+                    .prepare(&traces_sql)
+                    .map_err(sqlite_read_err("list_tasks traces prepare"))?;
+                let mut rows = stmt
+                    .query(params_from_iter(trace_binds.iter()))
+                    .map_err(sqlite_read_err("list_tasks traces query"))?;
+                while let Some(row) = rows
+                    .next()
+                    .map_err(sqlite_read_err("list_tasks traces row"))?
                 {
-                    let mut stmt = conn
-                        .prepare(&traces_sql)
-                        .map_err(sqlite_read_err("list_tasks traces prepare"))?;
-                    let mut rows = stmt
-                        .query(params_from_iter(trace_binds.iter()))
-                        .map_err(sqlite_read_err("list_tasks traces query"))?;
-                    while let Some(row) = rows
-                        .next()
-                        .map_err(sqlite_read_err("list_tasks traces row"))?
-                    {
-                        let tg_task_id: String = row
-                            .get("_tg_task_id")
-                            .map_err(sqlite_read_err("list_tasks _tg_task_id"))?;
-                        let summary = sqlite_row_to_trace_summary(row)
-                            .map_err(sqlite_read_err("list_tasks trace decode"))?;
-                        bucket.entry(tg_task_id).or_default().push(summary);
-                    }
+                    let tg_task_id: String = row
+                        .get("_tg_task_id")
+                        .map_err(sqlite_read_err("list_tasks _tg_task_id"))?;
+                    let summary = sqlite_row_to_trace_summary(row)
+                        .map_err(sqlite_read_err("list_tasks trace decode"))?;
+                    bucket.entry(tg_task_id).or_default().push(summary);
                 }
+            }
 
-                let items: Vec<crate::read::TaskGroup> = headers
-                    .into_iter()
-                    .map(|h| {
-                        let traces = bucket.remove(&h.task_id).unwrap_or_default();
-                        let task_class = crate::read::TaskClass::from_task_id(&h.task_id);
-                        crate::read::TaskGroup {
-                            task_id: h.task_id,
-                            initial_observation: h.initial_observation,
-                            task_class,
-                            earliest_at: h.earliest_at,
-                            latest_at: h.latest_at,
-                            traces,
-                        }
-                    })
-                    .collect();
-                let next_cursor = if items.len() == limit_usize {
-                    let last = &items[items.len() - 1];
-                    Some(crate::read::TaskCursor::from_trailing(
-                        last.earliest_at,
-                        last.task_id.clone(),
-                    ))
-                } else {
-                    None
-                };
-                Ok(crate::read::TaskListPage { items, next_cursor })
-            },
-        )
-        .await
-        .map_err(|e| crate::read::Error::Backend(format!("spawn_blocking join: {e}")))?
+            let items: Vec<crate::read::TaskGroup> = headers
+                .into_iter()
+                .map(|h| {
+                    let traces = bucket.remove(&h.task_id).unwrap_or_default();
+                    let task_class = crate::read::TaskClass::from_task_id(&h.task_id);
+                    crate::read::TaskGroup {
+                        task_id: h.task_id,
+                        initial_observation: h.initial_observation,
+                        task_class,
+                        earliest_at: h.earliest_at,
+                        latest_at: h.latest_at,
+                        traces,
+                    }
+                })
+                .collect();
+            let next_cursor = if items.len() == limit_usize {
+                let last = &items[items.len() - 1];
+                Some(crate::read::TaskCursor::from_trailing(
+                    last.earliest_at,
+                    last.task_id.clone(),
+                ))
+            } else {
+                None
+            };
+            Ok(crate::read::TaskListPage { items, next_cursor })
+        })()
     }
 
     async fn list_llm_calls(
@@ -6281,32 +6035,28 @@ impl crate::read::ReadEngine for SqliteBackend {
         );
         let conn = self.conn.clone();
         let limit_usize = limit as usize;
-        tokio::task::spawn_blocking(
-            move || -> Result<crate::read::LlmCallListPage, crate::read::Error> {
-                let conn = conn.blocking_lock();
-                let mut stmt = conn
-                    .prepare(&sql)
-                    .map_err(sqlite_read_err("list_llm_calls prepare"))?;
-                let items: Vec<TraceLlmCallRow> = stmt
-                    .query_map(params_from_iter(binds.iter()), sqlite_row_to_llm_call_row)
-                    .map_err(sqlite_read_err("list_llm_calls query"))?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(sqlite_read_err("list_llm_calls row"))?;
-                let next_cursor = if items.len() == limit_usize {
-                    let last = &items[items.len() - 1];
-                    Some(crate::read::LlmCallCursor::from_trailing(
-                        last.ts,
-                        last.trace_id.clone(),
-                        last.attempt_index,
-                    ))
-                } else {
-                    None
-                };
-                Ok(crate::read::LlmCallListPage { items, next_cursor })
-            },
-        )
-        .await
-        .map_err(|e| crate::read::Error::Backend(format!("spawn_blocking join: {e}")))?
+        (move || -> Result<crate::read::LlmCallListPage, crate::read::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(sqlite_read_err("list_llm_calls prepare"))?;
+            let items: Vec<TraceLlmCallRow> = stmt
+                .query_map(params_from_iter(binds.iter()), sqlite_row_to_llm_call_row)
+                .map_err(sqlite_read_err("list_llm_calls query"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sqlite_read_err("list_llm_calls row"))?;
+            let next_cursor = if items.len() == limit_usize {
+                let last = &items[items.len() - 1];
+                Some(crate::read::LlmCallCursor::from_trailing(
+                    last.ts,
+                    last.trace_id.clone(),
+                    last.attempt_index,
+                ))
+            } else {
+                None
+            };
+            Ok(crate::read::LlmCallListPage { items, next_cursor })
+        })()
     }
 
     async fn aggregate_llm_costs(
@@ -6325,179 +6075,174 @@ impl crate::read::ReadEngine for SqliteBackend {
         };
         let time_window = filter.time_window;
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(
-            move || -> Result<crate::read::LlmCostAggregate, crate::read::Error> {
-                let conn = conn.blocking_lock();
+        (move || -> Result<crate::read::LlmCostAggregate, crate::read::Error> {
+            let conn = conn.lock();
 
-                // Per-model rollup.
-                let sql_model = format!(
-                    "SELECT COALESCE(lc.model, '<unknown>') AS k, \
+            // Per-model rollup.
+            let sql_model = format!(
+                "SELECT COALESCE(lc.model, '<unknown>') AS k, \
                             COUNT(*) AS call_count, \
                             COALESCE(SUM(lc.prompt_tokens), 0) AS prompt_tokens, \
                             COALESCE(SUM(lc.completion_tokens), 0) AS completion_tokens, \
                             COALESCE(SUM(lc.cost_usd), 0.0) AS cost_usd, \
                             COUNT(*) FILTER (WHERE lc.status != 'ok') AS error_count \
                      FROM trace_llm_calls lc {join_sql} {where_sql} GROUP BY k"
-                );
-                let mut by_model: std::collections::HashMap<String, crate::read::ModelCostStats> =
-                    std::collections::HashMap::new();
+            );
+            let mut by_model: std::collections::HashMap<String, crate::read::ModelCostStats> =
+                std::collections::HashMap::new();
+            {
+                let mut stmt = conn
+                    .prepare(&sql_model)
+                    .map_err(sqlite_read_err("agg_llm_costs by_model prepare"))?;
+                let mut rows = stmt
+                    .query(params_from_iter(binds.iter()))
+                    .map_err(sqlite_read_err("agg_llm_costs by_model query"))?;
+                while let Some(row) = rows
+                    .next()
+                    .map_err(sqlite_read_err("agg_llm_costs by_model row"))?
                 {
-                    let mut stmt = conn
-                        .prepare(&sql_model)
-                        .map_err(sqlite_read_err("agg_llm_costs by_model prepare"))?;
-                    let mut rows = stmt
-                        .query(params_from_iter(binds.iter()))
-                        .map_err(sqlite_read_err("agg_llm_costs by_model query"))?;
-                    while let Some(row) = rows
-                        .next()
-                        .map_err(sqlite_read_err("agg_llm_costs by_model row"))?
-                    {
-                        let k: String = row.get("k").map_err(sqlite_read_err("by_model k"))?;
-                        by_model.insert(
-                            k.clone(),
-                            crate::read::ModelCostStats {
-                                model: k,
-                                call_count: row
-                                    .get("call_count")
-                                    .map_err(sqlite_read_err("by_model call_count"))?,
-                                prompt_tokens: row
-                                    .get("prompt_tokens")
-                                    .map_err(sqlite_read_err("by_model prompt_tokens"))?,
-                                completion_tokens: row
-                                    .get("completion_tokens")
-                                    .map_err(sqlite_read_err("by_model completion_tokens"))?,
-                                cost_usd: row
-                                    .get("cost_usd")
-                                    .map_err(sqlite_read_err("by_model cost_usd"))?,
-                                error_count: row
-                                    .get("error_count")
-                                    .map_err(sqlite_read_err("by_model error_count"))?,
-                            },
-                        );
-                    }
+                    let k: String = row.get("k").map_err(sqlite_read_err("by_model k"))?;
+                    by_model.insert(
+                        k.clone(),
+                        crate::read::ModelCostStats {
+                            model: k,
+                            call_count: row
+                                .get("call_count")
+                                .map_err(sqlite_read_err("by_model call_count"))?,
+                            prompt_tokens: row
+                                .get("prompt_tokens")
+                                .map_err(sqlite_read_err("by_model prompt_tokens"))?,
+                            completion_tokens: row
+                                .get("completion_tokens")
+                                .map_err(sqlite_read_err("by_model completion_tokens"))?,
+                            cost_usd: row
+                                .get("cost_usd")
+                                .map_err(sqlite_read_err("by_model cost_usd"))?,
+                            error_count: row
+                                .get("error_count")
+                                .map_err(sqlite_read_err("by_model error_count"))?,
+                        },
+                    );
                 }
+            }
 
-                // Per-agent rollup.
-                let sql_agent = format!(
-                    "SELECT e.agent_id_hash AS k, MAX(e.agent_name) AS agent_name, \
+            // Per-agent rollup.
+            let sql_agent = format!(
+                "SELECT e.agent_id_hash AS k, MAX(e.agent_name) AS agent_name, \
                             COUNT(*) AS call_count, \
                             COALESCE(SUM(lc.prompt_tokens), 0) AS prompt_tokens, \
                             COALESCE(SUM(lc.completion_tokens), 0) AS completion_tokens, \
                             COALESCE(SUM(lc.cost_usd), 0.0) AS cost_usd \
                      FROM trace_llm_calls lc {join_for_agg} {where_sql} GROUP BY k"
-                );
-                let mut by_agent: std::collections::HashMap<String, crate::read::AgentCostStats> =
-                    std::collections::HashMap::new();
+            );
+            let mut by_agent: std::collections::HashMap<String, crate::read::AgentCostStats> =
+                std::collections::HashMap::new();
+            {
+                let mut stmt = conn
+                    .prepare(&sql_agent)
+                    .map_err(sqlite_read_err("agg_llm_costs by_agent prepare"))?;
+                let mut rows = stmt
+                    .query(params_from_iter(binds.iter()))
+                    .map_err(sqlite_read_err("agg_llm_costs by_agent query"))?;
+                while let Some(row) = rows
+                    .next()
+                    .map_err(sqlite_read_err("agg_llm_costs by_agent row"))?
                 {
-                    let mut stmt = conn
-                        .prepare(&sql_agent)
-                        .map_err(sqlite_read_err("agg_llm_costs by_agent prepare"))?;
-                    let mut rows = stmt
-                        .query(params_from_iter(binds.iter()))
-                        .map_err(sqlite_read_err("agg_llm_costs by_agent query"))?;
-                    while let Some(row) = rows
-                        .next()
-                        .map_err(sqlite_read_err("agg_llm_costs by_agent row"))?
-                    {
-                        let k: Option<String> =
-                            row.get("k").map_err(sqlite_read_err("by_agent k"))?;
-                        let Some(k) = k else { continue };
-                        by_agent.insert(
-                            k.clone(),
-                            crate::read::AgentCostStats {
-                                agent_id_hash: k,
-                                agent_name: row
-                                    .get("agent_name")
-                                    .map_err(sqlite_read_err("by_agent agent_name"))?,
-                                call_count: row
-                                    .get("call_count")
-                                    .map_err(sqlite_read_err("by_agent call_count"))?,
-                                prompt_tokens: row
-                                    .get("prompt_tokens")
-                                    .map_err(sqlite_read_err("by_agent prompt_tokens"))?,
-                                completion_tokens: row
-                                    .get("completion_tokens")
-                                    .map_err(sqlite_read_err("by_agent completion_tokens"))?,
-                                cost_usd: row
-                                    .get("cost_usd")
-                                    .map_err(sqlite_read_err("by_agent cost_usd"))?,
-                            },
-                        );
-                    }
+                    let k: Option<String> = row.get("k").map_err(sqlite_read_err("by_agent k"))?;
+                    let Some(k) = k else { continue };
+                    by_agent.insert(
+                        k.clone(),
+                        crate::read::AgentCostStats {
+                            agent_id_hash: k,
+                            agent_name: row
+                                .get("agent_name")
+                                .map_err(sqlite_read_err("by_agent agent_name"))?,
+                            call_count: row
+                                .get("call_count")
+                                .map_err(sqlite_read_err("by_agent call_count"))?,
+                            prompt_tokens: row
+                                .get("prompt_tokens")
+                                .map_err(sqlite_read_err("by_agent prompt_tokens"))?,
+                            completion_tokens: row
+                                .get("completion_tokens")
+                                .map_err(sqlite_read_err("by_agent completion_tokens"))?,
+                            cost_usd: row
+                                .get("cost_usd")
+                                .map_err(sqlite_read_err("by_agent cost_usd"))?,
+                        },
+                    );
                 }
+            }
 
-                // Per-domain rollup.
-                let sql_domain = format!(
-                    "SELECT COALESCE(e.deployment_domain, '<unknown>') AS k, \
+            // Per-domain rollup.
+            let sql_domain = format!(
+                "SELECT COALESCE(e.deployment_domain, '<unknown>') AS k, \
                             COUNT(*) AS call_count, \
                             COALESCE(SUM(lc.cost_usd), 0.0) AS cost_usd \
                      FROM trace_llm_calls lc {join_for_agg} {where_sql} GROUP BY k"
-                );
-                let mut by_domain: std::collections::HashMap<String, crate::read::DomainCostStats> =
-                    std::collections::HashMap::new();
+            );
+            let mut by_domain: std::collections::HashMap<String, crate::read::DomainCostStats> =
+                std::collections::HashMap::new();
+            {
+                let mut stmt = conn
+                    .prepare(&sql_domain)
+                    .map_err(sqlite_read_err("agg_llm_costs by_domain prepare"))?;
+                let mut rows = stmt
+                    .query(params_from_iter(binds.iter()))
+                    .map_err(sqlite_read_err("agg_llm_costs by_domain query"))?;
+                while let Some(row) = rows
+                    .next()
+                    .map_err(sqlite_read_err("agg_llm_costs by_domain row"))?
                 {
-                    let mut stmt = conn
-                        .prepare(&sql_domain)
-                        .map_err(sqlite_read_err("agg_llm_costs by_domain prepare"))?;
-                    let mut rows = stmt
-                        .query(params_from_iter(binds.iter()))
-                        .map_err(sqlite_read_err("agg_llm_costs by_domain query"))?;
-                    while let Some(row) = rows
-                        .next()
-                        .map_err(sqlite_read_err("agg_llm_costs by_domain row"))?
-                    {
-                        let k: String = row.get("k").map_err(sqlite_read_err("by_domain k"))?;
-                        by_domain.insert(
-                            k.clone(),
-                            crate::read::DomainCostStats {
-                                deployment_domain: k,
-                                call_count: row
-                                    .get("call_count")
-                                    .map_err(sqlite_read_err("by_domain call_count"))?,
-                                cost_usd: row
-                                    .get("cost_usd")
-                                    .map_err(sqlite_read_err("by_domain cost_usd"))?,
-                            },
-                        );
-                    }
+                    let k: String = row.get("k").map_err(sqlite_read_err("by_domain k"))?;
+                    by_domain.insert(
+                        k.clone(),
+                        crate::read::DomainCostStats {
+                            deployment_domain: k,
+                            call_count: row
+                                .get("call_count")
+                                .map_err(sqlite_read_err("by_domain call_count"))?,
+                            cost_usd: row
+                                .get("cost_usd")
+                                .map_err(sqlite_read_err("by_domain cost_usd"))?,
+                        },
+                    );
                 }
+            }
 
-                // Window totals.
-                let sql_totals = format!(
-                    "SELECT COUNT(*) AS call_count, \
+            // Window totals.
+            let sql_totals = format!(
+                "SELECT COUNT(*) AS call_count, \
                             COALESCE(SUM(lc.prompt_tokens), 0) AS prompt_tokens, \
                             COALESCE(SUM(lc.completion_tokens), 0) AS completion_tokens, \
                             COALESCE(SUM(lc.cost_usd), 0.0) AS cost_usd, \
                             COUNT(*) FILTER (WHERE lc.status != 'ok') AS error_count \
                      FROM trace_llm_calls lc {join_sql} {where_sql}"
-                );
-                let totals = {
-                    let mut stmt = conn
-                        .prepare(&sql_totals)
-                        .map_err(sqlite_read_err("agg_llm_costs totals prepare"))?;
-                    stmt.query_row(params_from_iter(binds.iter()), |row| {
-                        Ok(crate::read::TotalCostStats {
-                            call_count: row.get("call_count")?,
-                            prompt_tokens: row.get("prompt_tokens")?,
-                            completion_tokens: row.get("completion_tokens")?,
-                            cost_usd: row.get("cost_usd")?,
-                            error_count: row.get("error_count")?,
-                        })
+            );
+            let totals = {
+                let mut stmt = conn
+                    .prepare(&sql_totals)
+                    .map_err(sqlite_read_err("agg_llm_costs totals prepare"))?;
+                stmt.query_row(params_from_iter(binds.iter()), |row| {
+                    Ok(crate::read::TotalCostStats {
+                        call_count: row.get("call_count")?,
+                        prompt_tokens: row.get("prompt_tokens")?,
+                        completion_tokens: row.get("completion_tokens")?,
+                        cost_usd: row.get("cost_usd")?,
+                        error_count: row.get("error_count")?,
                     })
-                    .map_err(sqlite_read_err("agg_llm_costs totals"))?
-                };
-
-                Ok(crate::read::LlmCostAggregate {
-                    time_window,
-                    by_model,
-                    by_agent,
-                    by_domain,
-                    totals,
                 })
-            },
-        )
-        .await
-        .map_err(|e| crate::read::Error::Backend(format!("spawn_blocking join: {e}")))?
+                .map_err(sqlite_read_err("agg_llm_costs totals"))?
+            };
+
+            Ok(crate::read::LlmCostAggregate {
+                time_window,
+                by_model,
+                by_agent,
+                by_domain,
+                totals,
+            })
+        })()
     }
 
     async fn corpus_shape(
@@ -6525,13 +6270,12 @@ impl crate::read::ReadEngine for SqliteBackend {
         }
         let where_sql = format!("WHERE {}", parts.join(" AND "));
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(
-            move || -> Result<crate::read::CorpusShape, crate::read::Error> {
-                let conn = conn.blocking_lock();
+        (move || -> Result<crate::read::CorpusShape, crate::read::Error> {
+            let conn = conn.lock();
 
-                // Totals + by_task_class. One distinct row per trace.
-                let sql_totals = format!(
-                    "WITH traces AS ( \
+            // Totals + by_task_class. One distinct row per trace.
+            let sql_totals = format!(
+                "WITH traces AS ( \
                          SELECT trace_id, MAX(task_id) AS task_id \
                          FROM trace_events {where_sql} GROUP BY trace_id \
                      ) \
@@ -6564,77 +6308,77 @@ impl crate::read::ReadEngine for SqliteBackend {
                                   AND task_id NOT LIKE 'real\\_user\\_api\\_%' ESCAPE '\\' \
                                   AND instr(task_id, 'wakeup') = 0) AS c_other \
                      FROM traces"
-                );
-                let (total_traces, by_task_class): (
-                    i64,
-                    std::collections::HashMap<crate::read::TaskClass, i64>,
-                ) = {
-                    let mut stmt = conn
-                        .prepare(&sql_totals)
-                        .map_err(sqlite_read_err("corpus_shape totals prepare"))?;
-                    stmt.query_row(params_from_iter(binds.iter()), |row| {
-                        let total: i64 = row.get("total_traces")?;
-                        let mut map = std::collections::HashMap::new();
-                        for (tc, col) in [
-                            (crate::read::TaskClass::QaEval, "c_qa"),
-                            (crate::read::TaskClass::RealUserDiscord, "c_rud"),
-                            (crate::read::TaskClass::RealUserCli, "c_ruc"),
-                            (crate::read::TaskClass::RealUserApi, "c_rua"),
-                            (crate::read::TaskClass::WakeupRitual, "c_wakeup"),
-                            (crate::read::TaskClass::Discord, "c_discord"),
-                            (crate::read::TaskClass::Other, "c_other"),
-                        ] {
-                            let n: i64 = row.get(col)?;
-                            if n > 0 {
-                                map.insert(tc, n);
-                            }
+            );
+            let (total_traces, by_task_class): (
+                i64,
+                std::collections::HashMap<crate::read::TaskClass, i64>,
+            ) = {
+                let mut stmt = conn
+                    .prepare(&sql_totals)
+                    .map_err(sqlite_read_err("corpus_shape totals prepare"))?;
+                stmt.query_row(params_from_iter(binds.iter()), |row| {
+                    let total: i64 = row.get("total_traces")?;
+                    let mut map = std::collections::HashMap::new();
+                    for (tc, col) in [
+                        (crate::read::TaskClass::QaEval, "c_qa"),
+                        (crate::read::TaskClass::RealUserDiscord, "c_rud"),
+                        (crate::read::TaskClass::RealUserCli, "c_ruc"),
+                        (crate::read::TaskClass::RealUserApi, "c_rua"),
+                        (crate::read::TaskClass::WakeupRitual, "c_wakeup"),
+                        (crate::read::TaskClass::Discord, "c_discord"),
+                        (crate::read::TaskClass::Other, "c_other"),
+                    ] {
+                        let n: i64 = row.get(col)?;
+                        if n > 0 {
+                            map.insert(tc, n);
                         }
-                        Ok((total, map))
-                    })
-                    .map_err(sqlite_read_err("corpus_shape totals"))?
-                };
+                    }
+                    Ok((total, map))
+                })
+                .map_err(sqlite_read_err("corpus_shape totals"))?
+            };
 
-                // QA language + question-num breakdown. SQLite has no
-                // regex-capture; extract in Rust from the task_id.
-                let mut by_qa_language: std::collections::HashMap<String, i64> =
-                    std::collections::HashMap::new();
-                let mut by_qa_question_num: std::collections::HashMap<i32, i64> =
-                    std::collections::HashMap::new();
-                {
-                    let sql_qa = format!(
-                        "WITH traces AS ( \
+            // QA language + question-num breakdown. SQLite has no
+            // regex-capture; extract in Rust from the task_id.
+            let mut by_qa_language: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
+            let mut by_qa_question_num: std::collections::HashMap<i32, i64> =
+                std::collections::HashMap::new();
+            {
+                let sql_qa = format!(
+                    "WITH traces AS ( \
                              SELECT trace_id, MAX(task_id) AS task_id \
                              FROM trace_events {where_sql} GROUP BY trace_id \
                          ) \
                          SELECT task_id FROM traces \
                          WHERE task_id LIKE 'qa\\_%' ESCAPE '\\' \
                             OR task_id LIKE 'qa-eval%'"
-                    );
-                    let mut stmt = conn
-                        .prepare(&sql_qa)
-                        .map_err(sqlite_read_err("corpus_shape qa prepare"))?;
-                    let mut rows = stmt
-                        .query(params_from_iter(binds.iter()))
-                        .map_err(sqlite_read_err("corpus_shape qa query"))?;
-                    while let Some(row) = rows
-                        .next()
-                        .map_err(sqlite_read_err("corpus_shape qa row"))?
-                    {
-                        let task_id: String = row
-                            .get(0)
-                            .map_err(sqlite_read_err("corpus_shape qa task_id"))?;
-                        if let Some((lang, qnum)) = parse_qa_task_id(&task_id) {
-                            *by_qa_language.entry(lang).or_insert(0) += 1;
-                            if let Some(q) = qnum {
-                                *by_qa_question_num.entry(q).or_insert(0) += 1;
-                            }
+                );
+                let mut stmt = conn
+                    .prepare(&sql_qa)
+                    .map_err(sqlite_read_err("corpus_shape qa prepare"))?;
+                let mut rows = stmt
+                    .query(params_from_iter(binds.iter()))
+                    .map_err(sqlite_read_err("corpus_shape qa query"))?;
+                while let Some(row) = rows
+                    .next()
+                    .map_err(sqlite_read_err("corpus_shape qa row"))?
+                {
+                    let task_id: String = row
+                        .get(0)
+                        .map_err(sqlite_read_err("corpus_shape qa task_id"))?;
+                    if let Some((lang, qnum)) = parse_qa_task_id(&task_id) {
+                        *by_qa_language.entry(lang).or_insert(0) += 1;
+                        if let Some(q) = qnum {
+                            *by_qa_question_num.entry(q).or_insert(0) += 1;
                         }
                     }
                 }
+            }
 
-                // by_agent_name + by_agent_version + by_deployment_region.
-                let sql_agent = format!(
-                    "WITH traces AS ( \
+            // by_agent_name + by_agent_version + by_deployment_region.
+            let sql_agent = format!(
+                "WITH traces AS ( \
                          SELECT trace_id, MAX(agent_name) AS agent_name, \
                                 MAX(agent_template) AS agent_template, \
                                 MAX(deployment_region) AS deployment_region \
@@ -6648,46 +6392,46 @@ impl crate::read::ReadEngine for SqliteBackend {
                      UNION ALL \
                      SELECT 'dr', deployment_region, COUNT(*) FROM traces \
                          WHERE deployment_region IS NOT NULL GROUP BY deployment_region"
-                );
-                let mut by_agent_name: std::collections::HashMap<String, i64> =
-                    std::collections::HashMap::new();
-                let mut by_agent_version: std::collections::HashMap<String, i64> =
-                    std::collections::HashMap::new();
-                let mut by_deployment_region: std::collections::HashMap<String, i64> =
-                    std::collections::HashMap::new();
+            );
+            let mut by_agent_name: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
+            let mut by_agent_version: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
+            let mut by_deployment_region: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
+            {
+                let mut stmt = conn
+                    .prepare(&sql_agent)
+                    .map_err(sqlite_read_err("corpus_shape agent prepare"))?;
+                let mut rows = stmt
+                    .query(params_from_iter(binds.iter()))
+                    .map_err(sqlite_read_err("corpus_shape agent query"))?;
+                while let Some(row) = rows
+                    .next()
+                    .map_err(sqlite_read_err("corpus_shape agent row"))?
                 {
-                    let mut stmt = conn
-                        .prepare(&sql_agent)
-                        .map_err(sqlite_read_err("corpus_shape agent prepare"))?;
-                    let mut rows = stmt
-                        .query(params_from_iter(binds.iter()))
-                        .map_err(sqlite_read_err("corpus_shape agent query"))?;
-                    while let Some(row) = rows
-                        .next()
-                        .map_err(sqlite_read_err("corpus_shape agent row"))?
-                    {
-                        let k: String = row.get("k").map_err(sqlite_read_err("corpus_shape k"))?;
-                        let v: String = row.get("v").map_err(sqlite_read_err("corpus_shape v"))?;
-                        let n: i64 = row.get("n").map_err(sqlite_read_err("corpus_shape n"))?;
-                        match k.as_str() {
-                            "an" => {
-                                by_agent_name.insert(v, n);
-                            }
-                            "av" => {
-                                by_agent_version.insert(v, n);
-                            }
-                            "dr" => {
-                                by_deployment_region.insert(v, n);
-                            }
-                            _ => {}
+                    let k: String = row.get("k").map_err(sqlite_read_err("corpus_shape k"))?;
+                    let v: String = row.get("v").map_err(sqlite_read_err("corpus_shape v"))?;
+                    let n: i64 = row.get("n").map_err(sqlite_read_err("corpus_shape n"))?;
+                    match k.as_str() {
+                        "an" => {
+                            by_agent_name.insert(v, n);
                         }
+                        "av" => {
+                            by_agent_version.insert(v, n);
+                        }
+                        "dr" => {
+                            by_deployment_region.insert(v, n);
+                        }
+                        _ => {}
                     }
                 }
+            }
 
-                // by_primary_model: the model with the most LLM calls
-                // per trace, ties broken alphabetically.
-                let sql_model = format!(
-                    "WITH traces AS ( \
+            // by_primary_model: the model with the most LLM calls
+            // per trace, ties broken alphabetically.
+            let sql_model = format!(
+                "WITH traces AS ( \
                          SELECT DISTINCT trace_id FROM trace_events {where_sql} \
                      ), \
                      tm AS ( \
@@ -6706,46 +6450,43 @@ impl crate::read::ReadEngine for SqliteBackend {
                      ) \
                      SELECT model AS k, COUNT(*) AS n FROM ranked \
                      WHERE rn = 1 GROUP BY model"
-                );
-                let mut by_primary_model: std::collections::HashMap<String, i64> =
-                    std::collections::HashMap::new();
+            );
+            let mut by_primary_model: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
+            {
+                let mut stmt = conn
+                    .prepare(&sql_model)
+                    .map_err(sqlite_read_err("corpus_shape model prepare"))?;
+                let mut rows = stmt
+                    .query(params_from_iter(binds.iter()))
+                    .map_err(sqlite_read_err("corpus_shape model query"))?;
+                while let Some(row) = rows
+                    .next()
+                    .map_err(sqlite_read_err("corpus_shape model row"))?
                 {
-                    let mut stmt = conn
-                        .prepare(&sql_model)
-                        .map_err(sqlite_read_err("corpus_shape model prepare"))?;
-                    let mut rows = stmt
-                        .query(params_from_iter(binds.iter()))
-                        .map_err(sqlite_read_err("corpus_shape model query"))?;
-                    while let Some(row) = rows
-                        .next()
-                        .map_err(sqlite_read_err("corpus_shape model row"))?
-                    {
-                        let k: String = row
-                            .get("k")
-                            .map_err(sqlite_read_err("corpus_shape model k"))?;
-                        let n: i64 = row
-                            .get("n")
-                            .map_err(sqlite_read_err("corpus_shape model n"))?;
-                        by_primary_model.insert(k, n);
-                    }
+                    let k: String = row
+                        .get("k")
+                        .map_err(sqlite_read_err("corpus_shape model k"))?;
+                    let n: i64 = row
+                        .get("n")
+                        .map_err(sqlite_read_err("corpus_shape model n"))?;
+                    by_primary_model.insert(k, n);
                 }
+            }
 
-                Ok(crate::read::CorpusShape {
-                    window,
-                    total_traces,
-                    by_task_class,
-                    by_qa_language,
-                    by_qa_question_num,
-                    by_agent_name,
-                    by_agent_version,
-                    by_primary_model,
-                    by_deployment_region,
-                    stationarity_z_score: None,
-                })
-            },
-        )
-        .await
-        .map_err(|e| crate::read::Error::Backend(format!("spawn_blocking join: {e}")))?
+            Ok(crate::read::CorpusShape {
+                window,
+                total_traces,
+                by_task_class,
+                by_qa_language,
+                by_qa_question_num,
+                by_agent_name,
+                by_agent_version,
+                by_primary_model,
+                by_deployment_region,
+                stationarity_z_score: None,
+            })
+        })()
     }
 
     async fn aggregate_scrub_stats(
@@ -6755,12 +6496,11 @@ impl crate::read::ReadEngine for SqliteBackend {
         let since = window.since.to_rfc3339();
         let until = window.until.to_rfc3339();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(
-            move || -> Result<crate::read::ScrubAggregate, crate::read::Error> {
-                let conn = conn.blocking_lock();
-                // Per-trace collapse: MAX(pii_scrubbed) is BOOL_OR;
-                // MAX(trace_level) is the §H reference's MAX().
-                let sql = "WITH traces AS ( \
+        (move || -> Result<crate::read::ScrubAggregate, crate::read::Error> {
+            let conn = conn.lock();
+            // Per-trace collapse: MAX(pii_scrubbed) is BOOL_OR;
+            // MAX(trace_level) is the §H reference's MAX().
+            let sql = "WITH traces AS ( \
                                SELECT trace_id, MAX(pii_scrubbed) AS scrubbed, \
                                       MAX(trace_level) AS trace_level \
                                FROM trace_events WHERE ts >= ?1 AND ts < ?2 \
@@ -6777,39 +6517,36 @@ impl crate::read::ReadEngine for SqliteBackend {
                                       WHERE scrubbed = 1 AND trace_level = 'full_traces') \
                                       AS c_full \
                            FROM traces";
-                let (envelopes_scrubbed, by_trace_level) = {
-                    let mut stmt = conn
-                        .prepare(sql)
-                        .map_err(sqlite_read_err("aggregate_scrub_stats prepare"))?;
-                    stmt.query_row([&since, &until], |row| {
-                        let total: i64 = row.get("total_scrubbed")?;
-                        let mut map = std::collections::HashMap::new();
-                        for (lvl, col) in [
-                            (crate::schema::TraceLevel::Generic, "c_generic"),
-                            (crate::schema::TraceLevel::Detailed, "c_detailed"),
-                            (crate::schema::TraceLevel::FullTraces, "c_full"),
-                        ] {
-                            let n: i64 = row.get(col)?;
-                            if n > 0 {
-                                map.insert(lvl, n);
-                            }
+            let (envelopes_scrubbed, by_trace_level) = {
+                let mut stmt = conn
+                    .prepare(sql)
+                    .map_err(sqlite_read_err("aggregate_scrub_stats prepare"))?;
+                stmt.query_row([&since, &until], |row| {
+                    let total: i64 = row.get("total_scrubbed")?;
+                    let mut map = std::collections::HashMap::new();
+                    for (lvl, col) in [
+                        (crate::schema::TraceLevel::Generic, "c_generic"),
+                        (crate::schema::TraceLevel::Detailed, "c_detailed"),
+                        (crate::schema::TraceLevel::FullTraces, "c_full"),
+                    ] {
+                        let n: i64 = row.get(col)?;
+                        if n > 0 {
+                            map.insert(lvl, n);
                         }
-                        Ok((total, map))
-                    })
-                    .map_err(sqlite_read_err("aggregate_scrub_stats query"))?
-                };
-                Ok(crate::read::ScrubAggregate {
-                    window,
-                    envelopes_scrubbed,
-                    // Same v0.6.0-pipeline gating as the Postgres impl.
-                    fields_scrubbed_total: 0,
-                    by_entity_type: std::collections::HashMap::new(),
-                    by_trace_level,
+                    }
+                    Ok((total, map))
                 })
-            },
-        )
-        .await
-        .map_err(|e| crate::read::Error::Backend(format!("spawn_blocking join: {e}")))?
+                .map_err(sqlite_read_err("aggregate_scrub_stats query"))?
+            };
+            Ok(crate::read::ScrubAggregate {
+                window,
+                envelopes_scrubbed,
+                // Same v0.6.0-pipeline gating as the Postgres impl.
+                fields_scrubbed_total: 0,
+                by_entity_type: std::collections::HashMap::new(),
+                by_trace_level,
+            })
+        })()
     }
 
     async fn list_federation_keys(
@@ -6896,31 +6633,27 @@ impl crate::read::ReadEngine for SqliteBackend {
         );
         let conn = self.conn.clone();
         let limit_usize = limit as usize;
-        tokio::task::spawn_blocking(
-            move || -> Result<crate::read::FederationKeyListPage, crate::read::Error> {
-                let conn = conn.blocking_lock();
-                let mut stmt = conn
-                    .prepare(&sql)
-                    .map_err(sqlite_read_err("list_federation_keys prepare"))?;
-                let items: Vec<crate::federation::KeyRecord> = stmt
-                    .query_map(params_from_iter(binds.iter()), sqlite_row_to_key_record)
-                    .map_err(sqlite_read_err("list_federation_keys query"))?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(sqlite_read_err("list_federation_keys row"))?;
-                let next_cursor = if items.len() == limit_usize {
-                    let last = &items[items.len() - 1];
-                    Some(crate::read::FederationKeyCursor::from_trailing(
-                        last.valid_from,
-                        last.key_id.clone(),
-                    ))
-                } else {
-                    None
-                };
-                Ok(crate::read::FederationKeyListPage { items, next_cursor })
-            },
-        )
-        .await
-        .map_err(|e| crate::read::Error::Backend(format!("spawn_blocking join: {e}")))?
+        (move || -> Result<crate::read::FederationKeyListPage, crate::read::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(sqlite_read_err("list_federation_keys prepare"))?;
+            let items: Vec<crate::federation::KeyRecord> = stmt
+                .query_map(params_from_iter(binds.iter()), sqlite_row_to_key_record)
+                .map_err(sqlite_read_err("list_federation_keys query"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sqlite_read_err("list_federation_keys row"))?;
+            let next_cursor = if items.len() == limit_usize {
+                let last = &items[items.len() - 1];
+                Some(crate::read::FederationKeyCursor::from_trailing(
+                    last.valid_from,
+                    last.key_id.clone(),
+                ))
+            } else {
+                None
+            };
+            Ok(crate::read::FederationKeyListPage { items, next_cursor })
+        })()
     }
 
     async fn list_attestations(
@@ -6988,31 +6721,27 @@ impl crate::read::ReadEngine for SqliteBackend {
         );
         let conn = self.conn.clone();
         let limit_usize = limit as usize;
-        tokio::task::spawn_blocking(
-            move || -> Result<crate::read::AttestationListPage, crate::read::Error> {
-                let conn = conn.blocking_lock();
-                let mut stmt = conn
-                    .prepare(&sql)
-                    .map_err(sqlite_read_err("list_attestations prepare"))?;
-                let items: Vec<crate::federation::Attestation> = stmt
-                    .query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)
-                    .map_err(sqlite_read_err("list_attestations query"))?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(sqlite_read_err("list_attestations row"))?;
-                let next_cursor = if items.len() == limit_usize {
-                    let last = &items[items.len() - 1];
-                    Some(crate::read::AttestationCursor::from_trailing(
-                        last.asserted_at,
-                        last.attestation_id.clone(),
-                    ))
-                } else {
-                    None
-                };
-                Ok(crate::read::AttestationListPage { items, next_cursor })
-            },
-        )
-        .await
-        .map_err(|e| crate::read::Error::Backend(format!("spawn_blocking join: {e}")))?
+        (move || -> Result<crate::read::AttestationListPage, crate::read::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(sqlite_read_err("list_attestations prepare"))?;
+            let items: Vec<crate::federation::Attestation> = stmt
+                .query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)
+                .map_err(sqlite_read_err("list_attestations query"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sqlite_read_err("list_attestations row"))?;
+            let next_cursor = if items.len() == limit_usize {
+                let last = &items[items.len() - 1];
+                Some(crate::read::AttestationCursor::from_trailing(
+                    last.asserted_at,
+                    last.attestation_id.clone(),
+                ))
+            } else {
+                None
+            };
+            Ok(crate::read::AttestationListPage { items, next_cursor })
+        })()
     }
 
     async fn list_revocations(
@@ -7074,31 +6803,27 @@ impl crate::read::ReadEngine for SqliteBackend {
         );
         let conn = self.conn.clone();
         let limit_usize = limit as usize;
-        tokio::task::spawn_blocking(
-            move || -> Result<crate::read::RevocationListPage, crate::read::Error> {
-                let conn = conn.blocking_lock();
-                let mut stmt = conn
-                    .prepare(&sql)
-                    .map_err(sqlite_read_err("list_revocations prepare"))?;
-                let items: Vec<crate::federation::Revocation> = stmt
-                    .query_map(params_from_iter(binds.iter()), sqlite_row_to_revocation)
-                    .map_err(sqlite_read_err("list_revocations query"))?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(sqlite_read_err("list_revocations row"))?;
-                let next_cursor = if items.len() == limit_usize {
-                    let last = &items[items.len() - 1];
-                    Some(crate::read::RevocationCursor::from_trailing(
-                        last.revoked_at,
-                        last.revocation_id.clone(),
-                    ))
-                } else {
-                    None
-                };
-                Ok(crate::read::RevocationListPage { items, next_cursor })
-            },
-        )
-        .await
-        .map_err(|e| crate::read::Error::Backend(format!("spawn_blocking join: {e}")))?
+        (move || -> Result<crate::read::RevocationListPage, crate::read::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(sqlite_read_err("list_revocations prepare"))?;
+            let items: Vec<crate::federation::Revocation> = stmt
+                .query_map(params_from_iter(binds.iter()), sqlite_row_to_revocation)
+                .map_err(sqlite_read_err("list_revocations query"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sqlite_read_err("list_revocations row"))?;
+            let next_cursor = if items.len() == limit_usize {
+                let last = &items[items.len() - 1];
+                Some(crate::read::RevocationCursor::from_trailing(
+                    last.revoked_at,
+                    last.revocation_id.clone(),
+                ))
+            } else {
+                None
+            };
+            Ok(crate::read::RevocationListPage { items, next_cursor })
+        })()
     }
 
     async fn cross_agent_divergence(
@@ -7112,23 +6837,22 @@ impl crate::read::ReadEngine for SqliteBackend {
         let since = window.since.to_rfc3339();
         let until = window.until.to_rfc3339();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(
-            move || -> Result<Vec<crate::read::DivergenceRow>, crate::read::Error> {
-                let conn = conn.blocking_lock();
-                // Per-agent (mean, sample_count) pairs. SQLite has no
-                // STDDEV; the domain mean+stddev of the per-agent means
-                // is computed in Rust.
-                struct PerAgent {
-                    agent_id_hash: String,
-                    agent_name: Option<String>,
-                    mean: f64,
-                    sample_count: i64,
-                }
-                let per_agent: Vec<PerAgent> =
-                    if matches!(metric, DeviationMetric::ConscienceOverrideRate) {
-                        // Per-trace MAX collapses recursive CONSCIENCE_RESULT
-                        // retries; per-agent rate over distinct traces.
-                        let sql = "WITH per_trace AS ( \
+        (move || -> Result<Vec<crate::read::DivergenceRow>, crate::read::Error> {
+            let conn = conn.lock();
+            // Per-agent (mean, sample_count) pairs. SQLite has no
+            // STDDEV; the domain mean+stddev of the per-agent means
+            // is computed in Rust.
+            struct PerAgent {
+                agent_id_hash: String,
+                agent_name: Option<String>,
+                mean: f64,
+                sample_count: i64,
+            }
+            let per_agent: Vec<PerAgent> =
+                if matches!(metric, DeviationMetric::ConscienceOverrideRate) {
+                    // Per-trace MAX collapses recursive CONSCIENCE_RESULT
+                    // retries; per-agent rate over distinct traces.
+                    let sql = "WITH per_trace AS ( \
                                        SELECT agent_id_hash, MIN(agent_name) AS agent_name, \
                                               trace_id, \
                                               MAX(CASE WHEN event_type = 'CONSCIENCE_RESULT' \
@@ -7146,37 +6870,37 @@ impl crate::read::ReadEngine for SqliteBackend {
                                             / COUNT(*) AS mean \
                                    FROM per_trace GROUP BY agent_id_hash \
                                    HAVING COUNT(*) > 0";
-                        let mut stmt = conn
-                            .prepare(sql)
-                            .map_err(sqlite_read_err("cross_agent_divergence override prepare"))?;
-                        let collected = stmt
-                            .query_map([&domain, &since, &until], |row| {
-                                Ok(PerAgent {
-                                    agent_id_hash: row.get("agent_id_hash")?,
-                                    agent_name: row.get("agent_name")?,
-                                    mean: row.get("mean")?,
-                                    sample_count: row.get("sample_count")?,
-                                })
+                    let mut stmt = conn
+                        .prepare(sql)
+                        .map_err(sqlite_read_err("cross_agent_divergence override prepare"))?;
+                    let collected = stmt
+                        .query_map([&domain, &since, &until], |row| {
+                            Ok(PerAgent {
+                                agent_id_hash: row.get("agent_id_hash")?,
+                                agent_name: row.get("agent_name")?,
+                                mean: row.get("mean")?,
+                                sample_count: row.get("sample_count")?,
                             })
-                            .map_err(sqlite_read_err("cross_agent_divergence override query"))?
-                            .collect::<Result<Vec<_>, _>>();
-                        collected.map_err(sqlite_read_err("cross_agent_divergence override row"))?
-                    } else {
-                        let (event_type_filter, field): (&str, &str) = match metric {
-                            DeviationMetric::CsdmaPlausibility => {
-                                ("DMA_RESULTS", "csdma_plausibility_score")
-                            }
-                            DeviationMetric::DsdmaDomainAlignment => {
-                                ("DMA_RESULTS", "dsdma_domain_alignment")
-                            }
-                            DeviationMetric::IdmaKEff => ("IDMA_RESULT", "idma_k_eff"),
-                            DeviationMetric::IdmaCorrelationRisk => {
-                                ("IDMA_RESULT", "idma_correlation_risk")
-                            }
-                            DeviationMetric::ConscienceOverrideRate => unreachable!(),
-                        };
-                        let sql = format!(
-                            "SELECT agent_id_hash, MIN(agent_name) AS agent_name, \
+                        })
+                        .map_err(sqlite_read_err("cross_agent_divergence override query"))?
+                        .collect::<Result<Vec<_>, _>>();
+                    collected.map_err(sqlite_read_err("cross_agent_divergence override row"))?
+                } else {
+                    let (event_type_filter, field): (&str, &str) = match metric {
+                        DeviationMetric::CsdmaPlausibility => {
+                            ("DMA_RESULTS", "csdma_plausibility_score")
+                        }
+                        DeviationMetric::DsdmaDomainAlignment => {
+                            ("DMA_RESULTS", "dsdma_domain_alignment")
+                        }
+                        DeviationMetric::IdmaKEff => ("IDMA_RESULT", "idma_k_eff"),
+                        DeviationMetric::IdmaCorrelationRisk => {
+                            ("IDMA_RESULT", "idma_correlation_risk")
+                        }
+                        DeviationMetric::ConscienceOverrideRate => unreachable!(),
+                    };
+                    let sql = format!(
+                        "SELECT agent_id_hash, MIN(agent_name) AS agent_name, \
                                     AVG(json_extract(payload, '$.{field}')) AS mean, \
                                     COUNT(*) AS sample_count \
                              FROM trace_events \
@@ -7184,67 +6908,63 @@ impl crate::read::ReadEngine for SqliteBackend {
                                    AND event_type = '{event_type_filter}' \
                                    AND json_extract(payload, '$.{field}') IS NOT NULL \
                              GROUP BY agent_id_hash HAVING COUNT(*) > 0"
-                        );
-                        let mut stmt = conn
-                            .prepare(&sql)
-                            .map_err(sqlite_read_err("cross_agent_divergence prepare"))?;
-                        let collected = stmt
-                            .query_map([&domain, &since, &until], |row| {
-                                Ok(PerAgent {
-                                    agent_id_hash: row.get("agent_id_hash")?,
-                                    agent_name: row.get("agent_name")?,
-                                    mean: row.get::<_, Option<f64>>("mean")?.unwrap_or(0.0),
-                                    sample_count: row.get("sample_count")?,
-                                })
+                    );
+                    let mut stmt = conn
+                        .prepare(&sql)
+                        .map_err(sqlite_read_err("cross_agent_divergence prepare"))?;
+                    let collected = stmt
+                        .query_map([&domain, &since, &until], |row| {
+                            Ok(PerAgent {
+                                agent_id_hash: row.get("agent_id_hash")?,
+                                agent_name: row.get("agent_name")?,
+                                mean: row.get::<_, Option<f64>>("mean")?.unwrap_or(0.0),
+                                sample_count: row.get("sample_count")?,
                             })
-                            .map_err(sqlite_read_err("cross_agent_divergence query"))?
-                            .collect::<Result<Vec<_>, _>>();
-                        collected.map_err(sqlite_read_err("cross_agent_divergence row"))?
-                    };
-
-                // Domain mean + sample stddev of the per-agent means.
-                let n = per_agent.len() as f64;
-                let (domain_mean, domain_std) = if per_agent.len() >= 2 {
-                    let m = per_agent.iter().map(|a| a.mean).sum::<f64>() / n;
-                    let var =
-                        per_agent.iter().map(|a| (a.mean - m).powi(2)).sum::<f64>() / (n - 1.0);
-                    (m, var.sqrt())
-                } else if per_agent.len() == 1 {
-                    (per_agent[0].mean, 0.0)
-                } else {
-                    (0.0, 0.0)
+                        })
+                        .map_err(sqlite_read_err("cross_agent_divergence query"))?
+                        .collect::<Result<Vec<_>, _>>();
+                    collected.map_err(sqlite_read_err("cross_agent_divergence row"))?
                 };
 
-                let mut out: Vec<crate::read::DivergenceRow> = per_agent
-                    .into_iter()
-                    .map(|a| {
-                        let z = if domain_std > 0.0 {
-                            (a.mean - domain_mean) / domain_std
-                        } else {
-                            0.0
-                        };
-                        crate::read::DivergenceRow {
-                            agent_id_hash: a.agent_id_hash,
-                            agent_name: a.agent_name,
-                            z_score: z,
-                            deviation_metric: metric,
-                            sample_count: a.sample_count,
-                        }
-                    })
-                    .collect();
-                // Most-divergent first; agent_id_hash ASC tiebreak.
-                out.sort_by(|a, b| {
-                    b.z_score
-                        .abs()
-                        .partial_cmp(&a.z_score.abs())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.agent_id_hash.cmp(&b.agent_id_hash))
-                });
-                Ok(out)
-            },
-        )
-        .await
-        .map_err(|e| crate::read::Error::Backend(format!("spawn_blocking join: {e}")))?
+            // Domain mean + sample stddev of the per-agent means.
+            let n = per_agent.len() as f64;
+            let (domain_mean, domain_std) = if per_agent.len() >= 2 {
+                let m = per_agent.iter().map(|a| a.mean).sum::<f64>() / n;
+                let var = per_agent.iter().map(|a| (a.mean - m).powi(2)).sum::<f64>() / (n - 1.0);
+                (m, var.sqrt())
+            } else if per_agent.len() == 1 {
+                (per_agent[0].mean, 0.0)
+            } else {
+                (0.0, 0.0)
+            };
+
+            let mut out: Vec<crate::read::DivergenceRow> = per_agent
+                .into_iter()
+                .map(|a| {
+                    let z = if domain_std > 0.0 {
+                        (a.mean - domain_mean) / domain_std
+                    } else {
+                        0.0
+                    };
+                    crate::read::DivergenceRow {
+                        agent_id_hash: a.agent_id_hash,
+                        agent_name: a.agent_name,
+                        z_score: z,
+                        deviation_metric: metric,
+                        sample_count: a.sample_count,
+                    }
+                })
+                .collect();
+            // Most-divergent first; agent_id_hash ASC tiebreak.
+            out.sort_by(|a, b| {
+                b.z_score
+                    .abs()
+                    .partial_cmp(&a.z_score.abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.agent_id_hash.cmp(&b.agent_id_hash))
+            });
+            Ok(out)
+        })()
     }
 
     async fn temporal_drift(
@@ -7260,92 +6980,87 @@ impl crate::read::ReadEngine for SqliteBackend {
         let c_since = comparison.since.to_rfc3339();
         let c_until = comparison.until.to_rfc3339();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(
-            move || -> Result<Vec<crate::read::TemporalDriftRow>, crate::read::Error> {
-                let conn = conn.blocking_lock();
-                let metrics = [
-                    (
-                        DeviationMetric::CsdmaPlausibility,
-                        "DMA_RESULTS",
-                        "csdma_plausibility_score",
-                    ),
-                    (
-                        DeviationMetric::DsdmaDomainAlignment,
-                        "DMA_RESULTS",
-                        "dsdma_domain_alignment",
-                    ),
-                    (DeviationMetric::IdmaKEff, "IDMA_RESULT", "idma_k_eff"),
-                    (
-                        DeviationMetric::IdmaCorrelationRisk,
-                        "IDMA_RESULT",
-                        "idma_correlation_risk",
-                    ),
-                ];
-                let mut out = Vec::new();
-                for (metric, et, field) in metrics {
-                    // Pull raw values for each window; compute mean +
-                    // sample variance in Rust (no SQLite VAR_SAMP).
-                    let sql = format!(
-                        "SELECT \
+        (move || -> Result<Vec<crate::read::TemporalDriftRow>, crate::read::Error> {
+            let conn = conn.lock();
+            let metrics = [
+                (
+                    DeviationMetric::CsdmaPlausibility,
+                    "DMA_RESULTS",
+                    "csdma_plausibility_score",
+                ),
+                (
+                    DeviationMetric::DsdmaDomainAlignment,
+                    "DMA_RESULTS",
+                    "dsdma_domain_alignment",
+                ),
+                (DeviationMetric::IdmaKEff, "IDMA_RESULT", "idma_k_eff"),
+                (
+                    DeviationMetric::IdmaCorrelationRisk,
+                    "IDMA_RESULT",
+                    "idma_correlation_risk",
+                ),
+            ];
+            let mut out = Vec::new();
+            for (metric, et, field) in metrics {
+                // Pull raw values for each window; compute mean +
+                // sample variance in Rust (no SQLite VAR_SAMP).
+                let sql = format!(
+                    "SELECT \
                            CASE WHEN ts >= ?2 AND ts < ?3 THEN 0 ELSE 1 END AS win, \
                            json_extract(payload, '$.{field}') AS v \
                          FROM trace_events \
                          WHERE agent_id_hash = ?1 AND event_type = '{et}' \
                                AND json_extract(payload, '$.{field}') IS NOT NULL \
                                AND ((ts >= ?2 AND ts < ?3) OR (ts >= ?4 AND ts < ?5))"
-                    );
-                    let mut base: Vec<f64> = Vec::new();
-                    let mut comp: Vec<f64> = Vec::new();
+                );
+                let mut base: Vec<f64> = Vec::new();
+                let mut comp: Vec<f64> = Vec::new();
+                {
+                    let mut stmt = conn
+                        .prepare(&sql)
+                        .map_err(sqlite_read_err("temporal_drift prepare"))?;
+                    let mut rows = stmt
+                        .query([&agent, &b_since, &b_until, &c_since, &c_until])
+                        .map_err(sqlite_read_err("temporal_drift query"))?;
+                    while let Some(row) =
+                        rows.next().map_err(sqlite_read_err("temporal_drift row"))?
                     {
-                        let mut stmt = conn
-                            .prepare(&sql)
-                            .map_err(sqlite_read_err("temporal_drift prepare"))?;
-                        let mut rows = stmt
-                            .query([&agent, &b_since, &b_until, &c_since, &c_until])
-                            .map_err(sqlite_read_err("temporal_drift query"))?;
-                        while let Some(row) =
-                            rows.next().map_err(sqlite_read_err("temporal_drift row"))?
-                        {
-                            let win: i64 = row
-                                .get("win")
-                                .map_err(sqlite_read_err("temporal_drift win"))?;
-                            let v: f64 =
-                                row.get("v").map_err(sqlite_read_err("temporal_drift v"))?;
-                            if win == 0 {
-                                base.push(v);
-                            } else {
-                                comp.push(v);
-                            }
+                        let win: i64 = row
+                            .get("win")
+                            .map_err(sqlite_read_err("temporal_drift win"))?;
+                        let v: f64 = row.get("v").map_err(sqlite_read_err("temporal_drift v"))?;
+                        if win == 0 {
+                            base.push(v);
+                        } else {
+                            comp.push(v);
                         }
                     }
-                    if base.is_empty() || comp.is_empty() {
-                        continue;
-                    }
-                    let (bm, bv) = mean_and_sample_var(&base);
-                    let (cm, cv) = mean_and_sample_var(&comp);
-                    let pooled_se = ((bv / (base.len() as f64).max(1.0))
-                        + (cv / (comp.len() as f64).max(1.0)))
-                    .sqrt();
-                    let significance = if pooled_se > 0.0 {
-                        (cm - bm) / pooled_se
-                    } else {
-                        0.0
-                    };
-                    let variance_ratio = if bv > 0.0 { cv / bv } else { 0.0 };
-                    out.push(crate::read::TemporalDriftRow {
-                        deviation_metric: metric,
-                        baseline_window: baseline,
-                        comparison_window: comparison,
-                        mean_shift: cm - bm,
-                        variance_ratio,
-                        significance,
-                    });
                 }
-                Ok(out)
-            },
-        )
-        .await
-        .map_err(|e| crate::read::Error::Backend(format!("spawn_blocking join: {e}")))?
+                if base.is_empty() || comp.is_empty() {
+                    continue;
+                }
+                let (bm, bv) = mean_and_sample_var(&base);
+                let (cm, cv) = mean_and_sample_var(&comp);
+                let pooled_se = ((bv / (base.len() as f64).max(1.0))
+                    + (cv / (comp.len() as f64).max(1.0)))
+                .sqrt();
+                let significance = if pooled_se > 0.0 {
+                    (cm - bm) / pooled_se
+                } else {
+                    0.0
+                };
+                let variance_ratio = if bv > 0.0 { cv / bv } else { 0.0 };
+                out.push(crate::read::TemporalDriftRow {
+                    deviation_metric: metric,
+                    baseline_window: baseline,
+                    comparison_window: comparison,
+                    mean_shift: cm - bm,
+                    variance_ratio,
+                    significance,
+                });
+            }
+            Ok(out)
+        })()
     }
 
     async fn hash_chain_gaps(
@@ -7357,12 +7072,11 @@ impl crate::read::ReadEngine for SqliteBackend {
         let since = window.since.to_rfc3339();
         let until = window.until.to_rfc3339();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(
-            move || -> Result<Vec<crate::read::HashChainGap>, crate::read::Error> {
-                let conn = conn.blocking_lock();
-                // LAG window over audit_sequence_number — SQLite
-                // supports window functions since 3.25.
-                let sql = "WITH ordered AS ( \
+        (move || -> Result<Vec<crate::read::HashChainGap>, crate::read::Error> {
+            let conn = conn.lock();
+            // LAG window over audit_sequence_number — SQLite
+            // supports window functions since 3.25.
+            let sql = "WITH ordered AS ( \
                                SELECT audit_sequence_number AS seq, ts, \
                                       LAG(audit_sequence_number) OVER w AS prev_seq, \
                                       LAG(ts) OVER w AS prev_ts \
@@ -7374,30 +7088,27 @@ impl crate::read::ReadEngine for SqliteBackend {
                            SELECT prev_seq, seq, prev_ts, ts FROM ordered \
                            WHERE prev_seq IS NOT NULL AND seq > prev_seq + 1 \
                            ORDER BY seq ASC";
-                let mut stmt = conn
-                    .prepare(sql)
-                    .map_err(sqlite_read_err("hash_chain_gaps prepare"))?;
-                let agent_for_row = agent.clone();
-                let rows = stmt
-                    .query_map([&agent, &since, &until], |row| {
-                        let prev_ts: String = row.get("prev_ts")?;
-                        let ts: String = row.get("ts")?;
-                        Ok(crate::read::HashChainGap {
-                            agent_id_hash: agent_for_row.clone(),
-                            gap_start_seq: row.get("prev_seq")?,
-                            gap_end_seq: row.get("seq")?,
-                            gap_start_ts: parse_rfc3339(&prev_ts),
-                            gap_end_ts: parse_rfc3339(&ts),
-                        })
+            let mut stmt = conn
+                .prepare(sql)
+                .map_err(sqlite_read_err("hash_chain_gaps prepare"))?;
+            let agent_for_row = agent.clone();
+            let rows = stmt
+                .query_map([&agent, &since, &until], |row| {
+                    let prev_ts: String = row.get("prev_ts")?;
+                    let ts: String = row.get("ts")?;
+                    Ok(crate::read::HashChainGap {
+                        agent_id_hash: agent_for_row.clone(),
+                        gap_start_seq: row.get("prev_seq")?,
+                        gap_end_seq: row.get("seq")?,
+                        gap_start_ts: parse_rfc3339(&prev_ts),
+                        gap_end_ts: parse_rfc3339(&ts),
                     })
-                    .map_err(sqlite_read_err("hash_chain_gaps query"))?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(sqlite_read_err("hash_chain_gaps row"))?;
-                Ok(rows)
-            },
-        )
-        .await
-        .map_err(|e| crate::read::Error::Backend(format!("spawn_blocking join: {e}")))?
+                })
+                .map_err(sqlite_read_err("hash_chain_gaps query"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sqlite_read_err("hash_chain_gaps row"))?;
+            Ok(rows)
+        })()
     }
 
     async fn conscience_override_rates(
@@ -7409,12 +7120,11 @@ impl crate::read::ReadEngine for SqliteBackend {
         let since = window.since.to_rfc3339();
         let until = window.until.to_rfc3339();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(
-            move || -> Result<Vec<crate::read::OverrideRateRow>, crate::read::Error> {
-                let conn = conn.blocking_lock();
-                // Per-trace MAX collapse → per-agent counts. Domain
-                // average computed in Rust from the per-agent rows.
-                let sql = "WITH per_trace AS ( \
+        (move || -> Result<Vec<crate::read::OverrideRateRow>, crate::read::Error> {
+            let conn = conn.lock();
+            // Per-trace MAX collapse → per-agent counts. Domain
+            // average computed in Rust from the per-agent rows.
+            let sql = "WITH per_trace AS ( \
                                SELECT agent_id_hash, MIN(agent_name) AS agent_name, \
                                       MIN(deployment_domain) AS deployment_domain, \
                                       trace_id, \
@@ -7431,76 +7141,73 @@ impl crate::read::ReadEngine for SqliteBackend {
                                   SUM(was_overridden) AS override_count, \
                                   COUNT(*) AS trace_count \
                            FROM per_trace GROUP BY agent_id_hash";
-                struct Raw {
-                    agent_id_hash: String,
-                    agent_name: Option<String>,
-                    deployment_domain: Option<String>,
-                    override_count: i64,
-                    trace_count: i64,
-                }
-                let raws: Vec<Raw> = {
-                    let mut stmt = conn
-                        .prepare(sql)
-                        .map_err(sqlite_read_err("conscience_override_rates prepare"))?;
-                    let collected = stmt
-                        .query_map([&domain, &since, &until], |row| {
-                            Ok(Raw {
-                                agent_id_hash: row.get("agent_id_hash")?,
-                                agent_name: row.get("agent_name")?,
-                                deployment_domain: row.get("deployment_domain")?,
-                                override_count: row.get("override_count")?,
-                                trace_count: row.get("trace_count")?,
-                            })
+            struct Raw {
+                agent_id_hash: String,
+                agent_name: Option<String>,
+                deployment_domain: Option<String>,
+                override_count: i64,
+                trace_count: i64,
+            }
+            let raws: Vec<Raw> = {
+                let mut stmt = conn
+                    .prepare(sql)
+                    .map_err(sqlite_read_err("conscience_override_rates prepare"))?;
+                let collected = stmt
+                    .query_map([&domain, &since, &until], |row| {
+                        Ok(Raw {
+                            agent_id_hash: row.get("agent_id_hash")?,
+                            agent_name: row.get("agent_name")?,
+                            deployment_domain: row.get("deployment_domain")?,
+                            override_count: row.get("override_count")?,
+                            trace_count: row.get("trace_count")?,
                         })
-                        .map_err(sqlite_read_err("conscience_override_rates query"))?
-                        .collect::<Result<Vec<_>, _>>();
-                    collected.map_err(sqlite_read_err("conscience_override_rates row"))?
-                };
-                // domain_avg_rate = SUM(overrides) / SUM(traces) — the
-                // call-weighted reference (matches the Postgres CTE).
-                let total_over: i64 = raws.iter().map(|r| r.override_count).sum();
-                let total_trace: i64 = raws.iter().map(|r| r.trace_count).sum();
-                let domain_avg_rate = if total_trace > 0 {
-                    total_over as f64 / total_trace as f64
-                } else {
-                    0.0
-                };
-                let mut out: Vec<crate::read::OverrideRateRow> = raws
-                    .into_iter()
-                    .map(|r| {
-                        let override_rate = if r.trace_count > 0 {
-                            r.override_count as f64 / r.trace_count as f64
-                        } else {
-                            0.0
-                        };
-                        let multiple = if domain_avg_rate > 0.0 {
-                            override_rate / domain_avg_rate
-                        } else {
-                            0.0
-                        };
-                        crate::read::OverrideRateRow {
-                            agent_id_hash: r.agent_id_hash,
-                            agent_name: r.agent_name,
-                            deployment_domain: r.deployment_domain,
-                            override_count: r.override_count,
-                            trace_count: r.trace_count,
-                            override_rate,
-                            domain_avg_rate,
-                            multiple_of_domain_avg: multiple,
-                        }
                     })
-                    .collect();
-                out.sort_by(|a, b| {
-                    b.override_rate
-                        .partial_cmp(&a.override_rate)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.agent_id_hash.cmp(&b.agent_id_hash))
-                });
-                Ok(out)
-            },
-        )
-        .await
-        .map_err(|e| crate::read::Error::Backend(format!("spawn_blocking join: {e}")))?
+                    .map_err(sqlite_read_err("conscience_override_rates query"))?
+                    .collect::<Result<Vec<_>, _>>();
+                collected.map_err(sqlite_read_err("conscience_override_rates row"))?
+            };
+            // domain_avg_rate = SUM(overrides) / SUM(traces) — the
+            // call-weighted reference (matches the Postgres CTE).
+            let total_over: i64 = raws.iter().map(|r| r.override_count).sum();
+            let total_trace: i64 = raws.iter().map(|r| r.trace_count).sum();
+            let domain_avg_rate = if total_trace > 0 {
+                total_over as f64 / total_trace as f64
+            } else {
+                0.0
+            };
+            let mut out: Vec<crate::read::OverrideRateRow> = raws
+                .into_iter()
+                .map(|r| {
+                    let override_rate = if r.trace_count > 0 {
+                        r.override_count as f64 / r.trace_count as f64
+                    } else {
+                        0.0
+                    };
+                    let multiple = if domain_avg_rate > 0.0 {
+                        override_rate / domain_avg_rate
+                    } else {
+                        0.0
+                    };
+                    crate::read::OverrideRateRow {
+                        agent_id_hash: r.agent_id_hash,
+                        agent_name: r.agent_name,
+                        deployment_domain: r.deployment_domain,
+                        override_count: r.override_count,
+                        trace_count: r.trace_count,
+                        override_rate,
+                        domain_avg_rate,
+                        multiple_of_domain_avg: multiple,
+                    }
+                })
+                .collect();
+            out.sort_by(|a, b| {
+                b.override_rate
+                    .partial_cmp(&a.override_rate)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.agent_id_hash.cmp(&b.agent_id_hash))
+            });
+            Ok(out)
+        })()
     }
 
     async fn aggregate_scoring_factors(
@@ -7515,12 +7222,11 @@ impl crate::read::ReadEngine for SqliteBackend {
         let window_secs = (window.until - window.since).num_seconds().max(1);
         let bucket_secs = (window_secs / 24).max(60);
         let conn = self.conn.clone();
-        let agg = tokio::task::spawn_blocking(
-            move || -> Result<crate::read::ScoringFactorAggregate, crate::read::Error> {
-                let conn = conn.blocking_lock();
+        let agg = (move || -> Result<crate::read::ScoringFactorAggregate, crate::read::Error> {
+            let conn = conn.lock();
 
-                // Main per-trace collapse + window-wide counts.
-                let main_sql = "WITH per_trace AS ( \
+            // Main per-trace collapse + window-wide counts.
+            let main_sql = "WITH per_trace AS ( \
                        SELECT trace_id, MIN(agent_name) AS agent_name, \
                               MAX(CASE WHEN event_type = 'CONSCIENCE_RESULT' \
                                   AND json_extract(payload, '$.action_was_overridden') = 1 \
@@ -7548,38 +7254,38 @@ impl crate::read::ReadEngine for SqliteBackend {
                               AND action_succeeded = 1 THEN 1 ELSE 0 END), 0) \
                               AS unsafe_action_count \
                    FROM per_trace";
-                struct Main {
-                    trace_count: i64,
-                    identity_changes: i64,
-                    conscience_overrides: i64,
-                    audit_chain_total: i64,
-                    audit_signed_total: i64,
-                    unsafe_action_count: i64,
-                }
-                let main = {
-                    let mut stmt = conn
-                        .prepare(main_sql)
-                        .map_err(sqlite_read_err("aggregate_scoring_factors main prepare"))?;
-                    stmt.query_row([&agent, &since, &until], |row| {
-                        Ok(Main {
-                            trace_count: row.get("trace_count")?,
-                            identity_changes: row.get("identity_changes")?,
-                            conscience_overrides: row.get("conscience_overrides")?,
-                            audit_chain_total: row.get("audit_chain_total")?,
-                            audit_signed_total: row.get("audit_signed_total")?,
-                            unsafe_action_count: row.get("unsafe_action_count")?,
-                        })
+            struct Main {
+                trace_count: i64,
+                identity_changes: i64,
+                conscience_overrides: i64,
+                audit_chain_total: i64,
+                audit_signed_total: i64,
+                unsafe_action_count: i64,
+            }
+            let main = {
+                let mut stmt = conn
+                    .prepare(main_sql)
+                    .map_err(sqlite_read_err("aggregate_scoring_factors main prepare"))?;
+                stmt.query_row([&agent, &since, &until], |row| {
+                    Ok(Main {
+                        trace_count: row.get("trace_count")?,
+                        identity_changes: row.get("identity_changes")?,
+                        conscience_overrides: row.get("conscience_overrides")?,
+                        audit_chain_total: row.get("audit_chain_total")?,
+                        audit_signed_total: row.get("audit_signed_total")?,
+                        unsafe_action_count: row.get("unsafe_action_count")?,
                     })
-                    .map_err(sqlite_read_err("aggregate_scoring_factors main"))?
-                };
-                let unsafe_action_rate = if main.trace_count > 0 {
-                    main.unsafe_action_count as f64 / main.trace_count as f64
-                } else {
-                    0.0
-                };
+                })
+                .map_err(sqlite_read_err("aggregate_scoring_factors main"))?
+            };
+            let unsafe_action_rate = if main.trace_count > 0 {
+                main.unsafe_action_count as f64 / main.trace_count as f64
+            } else {
+                0.0
+            };
 
-                // Audit-chain gap count via LAG window.
-                let gaps_sql = "WITH ordered AS ( \
+            // Audit-chain gap count via LAG window.
+            let gaps_sql = "WITH ordered AS ( \
                                     SELECT audit_sequence_number AS seq, \
                                            LAG(audit_sequence_number) OVER w AS prev_seq \
                                     FROM trace_events \
@@ -7589,16 +7295,16 @@ impl crate::read::ReadEngine for SqliteBackend {
                                 ) \
                                 SELECT COUNT(*) AS gap_count FROM ordered \
                                 WHERE prev_seq IS NOT NULL AND seq > prev_seq + 1";
-                let audit_chain_gaps: i64 = {
-                    let mut stmt = conn
-                        .prepare(gaps_sql)
-                        .map_err(sqlite_read_err("aggregate_scoring_factors gaps prepare"))?;
-                    stmt.query_row([&agent, &since, &until], |r| r.get("gap_count"))
-                        .map_err(sqlite_read_err("aggregate_scoring_factors gaps"))?
-                };
+            let audit_chain_gaps: i64 = {
+                let mut stmt = conn
+                    .prepare(gaps_sql)
+                    .map_err(sqlite_read_err("aggregate_scoring_factors gaps prepare"))?;
+                stmt.query_row([&agent, &since, &until], |r| r.get("gap_count"))
+                    .map_err(sqlite_read_err("aggregate_scoring_factors gaps"))?
+            };
 
-                // Recovery events: top-50 most recent override→pass pairs.
-                let recovery_sql = "WITH per_trace AS ( \
+            // Recovery events: top-50 most recent override→pass pairs.
+            let recovery_sql = "WITH per_trace AS ( \
                        SELECT trace_id, MIN(ts) AS started_at, MAX(ts) AS completed_at, \
                               MAX(CASE WHEN event_type = 'CONSCIENCE_RESULT' \
                                   AND json_extract(payload, '$.action_was_overridden') = 1 \
@@ -7624,34 +7330,33 @@ impl crate::read::ReadEngine for SqliteBackend {
                    WHERE was_overridden = 1 AND next_trace_id IS NOT NULL \
                          AND next_coherence_passed = 1 \
                    ORDER BY override_at DESC LIMIT 50";
-                let recovery_events: Vec<crate::read::RecoveryEvent> = {
-                    let mut stmt = conn.prepare(recovery_sql).map_err(sqlite_read_err(
-                        "aggregate_scoring_factors recovery prepare",
-                    ))?;
-                    let collected = stmt
-                        .query_map([&agent, &since, &until], |row| {
-                            let override_at: String = row.get("override_at")?;
-                            let recovery_at: String = row.get("recovery_at")?;
-                            let o = parse_rfc3339(&override_at);
-                            let r = parse_rfc3339(&recovery_at);
-                            Ok(crate::read::RecoveryEvent {
-                                override_trace_id: row.get("override_trace_id")?,
-                                override_at: o,
-                                recovery_trace_id: row.get("recovery_trace_id")?,
-                                recovery_at: r,
-                                recovery_latency_seconds: (r - o).num_milliseconds() as f64
-                                    / 1000.0,
-                            })
+            let recovery_events: Vec<crate::read::RecoveryEvent> = {
+                let mut stmt = conn.prepare(recovery_sql).map_err(sqlite_read_err(
+                    "aggregate_scoring_factors recovery prepare",
+                ))?;
+                let collected = stmt
+                    .query_map([&agent, &since, &until], |row| {
+                        let override_at: String = row.get("override_at")?;
+                        let recovery_at: String = row.get("recovery_at")?;
+                        let o = parse_rfc3339(&override_at);
+                        let r = parse_rfc3339(&recovery_at);
+                        Ok(crate::read::RecoveryEvent {
+                            override_trace_id: row.get("override_trace_id")?,
+                            override_at: o,
+                            recovery_trace_id: row.get("recovery_trace_id")?,
+                            recovery_at: r,
+                            recovery_latency_seconds: (r - o).num_milliseconds() as f64 / 1000.0,
                         })
-                        .map_err(sqlite_read_err("aggregate_scoring_factors recovery query"))?
-                        .collect::<Result<Vec<_>, _>>();
-                    collected.map_err(sqlite_read_err("aggregate_scoring_factors recovery row"))?
-                };
+                    })
+                    .map_err(sqlite_read_err("aggregate_scoring_factors recovery query"))?
+                    .collect::<Result<Vec<_>, _>>();
+                collected.map_err(sqlite_read_err("aggregate_scoring_factors recovery row"))?
+            };
 
-                // Coherence decay series — bucketed pass-rate. Bucket on
-                // floor(epoch / bucket_secs) * bucket_secs.
-                let decay_sql = format!(
-                    "WITH per_trace AS ( \
+            // Coherence decay series — bucketed pass-rate. Bucket on
+            // floor(epoch / bucket_secs) * bucket_secs.
+            let decay_sql = format!(
+                "WITH per_trace AS ( \
                          SELECT trace_id, MIN(ts) AS started_at, \
                                 MIN(CASE WHEN event_type = 'CONSCIENCE_RESULT' \
                                     THEN json_extract(payload, '$.coherence_passed') \
@@ -7666,55 +7371,47 @@ impl crate::read::ReadEngine for SqliteBackend {
                             SUM(CASE WHEN coherence_passed = 1 THEN 1 ELSE 0 END) \
                                 AS coherence_passed_count \
                      FROM per_trace GROUP BY bucket_epoch ORDER BY bucket_epoch ASC"
-                );
-                let coherence_decay_series: Vec<crate::read::CoherencePoint> = {
-                    let mut stmt = conn
-                        .prepare(&decay_sql)
-                        .map_err(sqlite_read_err("aggregate_scoring_factors decay prepare"))?;
-                    let collected = stmt
-                        .query_map([&agent, &since, &until], |row| {
-                            let bucket_epoch: i64 = row.get("bucket_epoch")?;
-                            let tc: i64 = row.get("trace_count")?;
-                            let pc: i64 = row.get("coherence_passed_count")?;
-                            let at =
-                                chrono::DateTime::<chrono::Utc>::from_timestamp(bucket_epoch, 0)
-                                    .unwrap_or_else(chrono::Utc::now);
-                            Ok(crate::read::CoherencePoint {
-                                at,
-                                coherence_passed_count: pc,
-                                trace_count: tc,
-                                coherence_pass_rate: if tc > 0 {
-                                    pc as f64 / tc as f64
-                                } else {
-                                    0.0
-                                },
-                            })
+            );
+            let coherence_decay_series: Vec<crate::read::CoherencePoint> = {
+                let mut stmt = conn
+                    .prepare(&decay_sql)
+                    .map_err(sqlite_read_err("aggregate_scoring_factors decay prepare"))?;
+                let collected = stmt
+                    .query_map([&agent, &since, &until], |row| {
+                        let bucket_epoch: i64 = row.get("bucket_epoch")?;
+                        let tc: i64 = row.get("trace_count")?;
+                        let pc: i64 = row.get("coherence_passed_count")?;
+                        let at = chrono::DateTime::<chrono::Utc>::from_timestamp(bucket_epoch, 0)
+                            .unwrap_or_else(chrono::Utc::now);
+                        Ok(crate::read::CoherencePoint {
+                            at,
+                            coherence_passed_count: pc,
+                            trace_count: tc,
+                            coherence_pass_rate: if tc > 0 { pc as f64 / tc as f64 } else { 0.0 },
                         })
-                        .map_err(sqlite_read_err("aggregate_scoring_factors decay query"))?
-                        .collect::<Result<Vec<_>, _>>();
-                    collected.map_err(sqlite_read_err("aggregate_scoring_factors decay row"))?
-                };
+                    })
+                    .map_err(sqlite_read_err("aggregate_scoring_factors decay query"))?
+                    .collect::<Result<Vec<_>, _>>();
+                collected.map_err(sqlite_read_err("aggregate_scoring_factors decay row"))?
+            };
 
-                Ok(crate::read::ScoringFactorAggregate {
-                    agent_id_hash: agent,
-                    window,
-                    trace_count: main.trace_count,
-                    identity_changes: main.identity_changes,
-                    conscience_overrides: main.conscience_overrides,
-                    audit_chain_total: main.audit_chain_total,
-                    audit_chain_gaps,
-                    audit_signed_total: main.audit_signed_total,
-                    recovery_events,
-                    // drift_z_score filled in by the caller below.
-                    drift_z_score: None,
-                    calibration_error: None,
-                    unsafe_action_rate,
-                    coherence_decay_series,
-                })
-            },
-        )
-        .await
-        .map_err(|e| crate::read::Error::Backend(format!("spawn_blocking join: {e}")))??;
+            Ok(crate::read::ScoringFactorAggregate {
+                agent_id_hash: agent,
+                window,
+                trace_count: main.trace_count,
+                identity_changes: main.identity_changes,
+                conscience_overrides: main.conscience_overrides,
+                audit_chain_total: main.audit_chain_total,
+                audit_chain_gaps,
+                audit_signed_total: main.audit_signed_total,
+                recovery_events,
+                // drift_z_score filled in by the caller below.
+                drift_z_score: None,
+                calibration_error: None,
+                unsafe_action_rate,
+                coherence_decay_series,
+            })
+        })()?;
 
         // Drift z-score: when a baseline window is supplied, surface the
         // CSDMA significance from temporal_drift (matches Postgres).
@@ -7755,16 +7452,14 @@ impl crate::read::ReadEngine for SqliteBackend {
         let (where_sql, binds) = sqlite_filter_where(&filter)?;
         let sql = format!("SELECT COUNT(DISTINCT trace_id) AS n FROM trace_events {where_sql}");
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<i64, crate::read::Error> {
-            let conn = conn.blocking_lock();
+        (move || -> Result<i64, crate::read::Error> {
+            let conn = conn.lock();
             let mut stmt = conn
                 .prepare(&sql)
                 .map_err(sqlite_read_err("count_traces prepare"))?;
             stmt.query_row(params_from_iter(binds.iter()), |r| r.get("n"))
                 .map_err(sqlite_read_err("count_traces query"))
-        })
-        .await
-        .map_err(|e| crate::read::Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn count_overrides(
@@ -7781,16 +7476,14 @@ impl crate::read::ReadEngine for SqliteBackend {
              ) sub"
         );
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<i64, crate::read::Error> {
-            let conn = conn.blocking_lock();
+        (move || -> Result<i64, crate::read::Error> {
+            let conn = conn.lock();
             let mut stmt = conn
                 .prepare(&sql)
                 .map_err(sqlite_read_err("count_overrides prepare"))?;
             stmt.query_row(params_from_iter(binds.iter()), |r| r.get("n"))
                 .map_err(sqlite_read_err("count_overrides query"))
-        })
-        .await
-        .map_err(|e| crate::read::Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn count_identity_changes(
@@ -7803,16 +7496,14 @@ impl crate::read::ReadEngine for SqliteBackend {
              FROM trace_events {where_sql}"
         );
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<i64, crate::read::Error> {
-            let conn = conn.blocking_lock();
+        (move || -> Result<i64, crate::read::Error> {
+            let conn = conn.lock();
             let mut stmt = conn
                 .prepare(&sql)
                 .map_err(sqlite_read_err("count_identity_changes prepare"))?;
             stmt.query_row(params_from_iter(binds.iter()), |r| r.get("n"))
                 .map_err(sqlite_read_err("count_identity_changes query"))
-        })
-        .await
-        .map_err(|e| crate::read::Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn aggregate_audit_chain(
@@ -7851,44 +7542,40 @@ impl crate::read::ReadEngine for SqliteBackend {
             None
         };
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(
-            move || -> Result<crate::read::AuditChainAggregate, crate::read::Error> {
-                let conn = conn.blocking_lock();
-                let (audit_total, audit_signed, audit_hashed) = {
-                    let mut stmt = conn
-                        .prepare(&totals_sql)
-                        .map_err(sqlite_read_err("aggregate_audit_chain totals prepare"))?;
-                    stmt.query_row(params_from_iter(binds.iter()), |row| {
-                        Ok((
-                            row.get::<_, i64>("audit_total")?,
-                            row.get::<_, i64>("audit_signed")?,
-                            row.get::<_, i64>("audit_hashed")?,
-                        ))
-                    })
-                    .map_err(sqlite_read_err("aggregate_audit_chain totals"))?
-                };
-                let gap_count = match gaps_sql {
-                    None => 0,
-                    Some(sql) => {
-                        let mut stmt = conn
-                            .prepare(&sql)
-                            .map_err(sqlite_read_err("aggregate_audit_chain gaps prepare"))?;
-                        stmt.query_row(params_from_iter(binds.iter()), |r| {
-                            r.get::<_, i64>("gap_count")
-                        })
-                        .map_err(sqlite_read_err("aggregate_audit_chain gaps"))?
-                    }
-                };
-                Ok(crate::read::AuditChainAggregate {
-                    audit_total,
-                    audit_signed,
-                    audit_hashed,
-                    gap_count,
+        (move || -> Result<crate::read::AuditChainAggregate, crate::read::Error> {
+            let conn = conn.lock();
+            let (audit_total, audit_signed, audit_hashed) = {
+                let mut stmt = conn
+                    .prepare(&totals_sql)
+                    .map_err(sqlite_read_err("aggregate_audit_chain totals prepare"))?;
+                stmt.query_row(params_from_iter(binds.iter()), |row| {
+                    Ok((
+                        row.get::<_, i64>("audit_total")?,
+                        row.get::<_, i64>("audit_signed")?,
+                        row.get::<_, i64>("audit_hashed")?,
+                    ))
                 })
-            },
-        )
-        .await
-        .map_err(|e| crate::read::Error::Backend(format!("spawn_blocking join: {e}")))?
+                .map_err(sqlite_read_err("aggregate_audit_chain totals"))?
+            };
+            let gap_count = match gaps_sql {
+                None => 0,
+                Some(sql) => {
+                    let mut stmt = conn
+                        .prepare(&sql)
+                        .map_err(sqlite_read_err("aggregate_audit_chain gaps prepare"))?;
+                    stmt.query_row(params_from_iter(binds.iter()), |r| {
+                        r.get::<_, i64>("gap_count")
+                    })
+                    .map_err(sqlite_read_err("aggregate_audit_chain gaps"))?
+                }
+            };
+            Ok(crate::read::AuditChainAggregate {
+                audit_total,
+                audit_signed,
+                audit_hashed,
+                gap_count,
+            })
+        })()
     }
 }
 
@@ -8139,8 +7826,8 @@ impl crate::derived::DerivedSchema for SqliteBackend {
             crate::derived::Error::Backend(format!("conformity_payload encode: {e}"))
         })?;
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), crate::derived::Error> {
-            let conn = conn.blocking_lock();
+        (move || -> Result<(), crate::derived::Error> {
+            let conn = conn.lock();
             // Idempotent on detection_id; raise Conflict on collision
             // with different canonical_bytes.
             let changed = conn
@@ -8191,9 +7878,7 @@ impl crate::derived::DerivedSchema for SqliteBackend {
                 }
             }
             Ok(())
-        })
-        .await
-        .map_err(|e| crate::derived::Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn get_detection_events(
@@ -8201,48 +7886,44 @@ impl crate::derived::DerivedSchema for SqliteBackend {
         filter: crate::derived::EventFilter,
     ) -> Result<Vec<crate::derived::DetectionEvent>, crate::derived::Error> {
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(
-            move || -> Result<Vec<crate::derived::DetectionEvent>, crate::derived::Error> {
-                let conn = conn.blocking_lock();
-                // Conditional filters; ts DESC for newest-first triage,
-                // matching the Postgres path (default LIMIT 1000).
-                let mut sql = String::from(
-                    "SELECT detection_id, trace_id, body_sha256, detector, severity, \
+        (move || -> Result<Vec<crate::derived::DetectionEvent>, crate::derived::Error> {
+            let conn = conn.lock();
+            // Conditional filters; ts DESC for newest-first triage,
+            // matching the Postgres path (default LIMIT 1000).
+            let mut sql = String::from(
+                "SELECT detection_id, trace_id, body_sha256, detector, severity, \
                         cohort_cell, conformity_variant, conformity_payload, \
                         lens_core_version, ratchet_calibration_version, \
                         canonical_bytes, ed25519_sig, ml_dsa_65_sig, signing_key_id, ts \
                      FROM cirislens_derived_detection_events WHERE 1 = 1",
-                );
-                let mut binds: Vec<String> = Vec::new();
-                if let Some(t) = filter.trace_id {
-                    binds.push(t);
-                    sql.push_str(&format!(" AND trace_id = ?{}", binds.len()));
-                }
-                if let Some(d) = filter.detector {
-                    binds.push(d);
-                    sql.push_str(&format!(" AND detector = ?{}", binds.len()));
-                }
-                if let Some(s) = filter.since {
-                    binds.push(s.to_rfc3339());
-                    sql.push_str(&format!(" AND ts >= ?{}", binds.len()));
-                }
-                sql.push_str(" ORDER BY ts DESC LIMIT 1000");
+            );
+            let mut binds: Vec<String> = Vec::new();
+            if let Some(t) = filter.trace_id {
+                binds.push(t);
+                sql.push_str(&format!(" AND trace_id = ?{}", binds.len()));
+            }
+            if let Some(d) = filter.detector {
+                binds.push(d);
+                sql.push_str(&format!(" AND detector = ?{}", binds.len()));
+            }
+            if let Some(s) = filter.since {
+                binds.push(s.to_rfc3339());
+                sql.push_str(&format!(" AND ts >= ?{}", binds.len()));
+            }
+            sql.push_str(" ORDER BY ts DESC LIMIT 1000");
 
-                let mut stmt = conn
-                    .prepare(&sql)
-                    .map_err(sqlite_derived_err("get_detection_events prepare"))?;
-                let collected = stmt
-                    .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
-                        sqlite_detection_from_row(row)
-                    })
-                    .map_err(sqlite_derived_err("get_detection_events query"))?
-                    .collect::<Result<Vec<_>, _>>();
-                let raw = collected.map_err(sqlite_derived_err("get_detection_events row"))?;
-                raw.into_iter().map(raw_to_detection_event).collect()
-            },
-        )
-        .await
-        .map_err(|e| crate::derived::Error::Backend(format!("spawn_blocking join: {e}")))?
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(sqlite_derived_err("get_detection_events prepare"))?;
+            let collected = stmt
+                .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
+                    sqlite_detection_from_row(row)
+                })
+                .map_err(sqlite_derived_err("get_detection_events query"))?
+                .collect::<Result<Vec<_>, _>>();
+            let raw = collected.map_err(sqlite_derived_err("get_detection_events row"))?;
+            raw.into_iter().map(raw_to_detection_event).collect()
+        })()
     }
 
     // v3.1.1 (CIRISPersist#118) — admission for
@@ -8256,8 +7937,8 @@ impl crate::derived::DerivedSchema for SqliteBackend {
         event: crate::derived::EdgeDetectionEvent,
     ) -> Result<(), crate::derived::Error> {
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), crate::derived::Error> {
-            let conn = conn.blocking_lock();
+        (move || -> Result<(), crate::derived::Error> {
+            let conn = conn.lock();
             let observed_at_text = event.observed_at.to_rfc3339();
             let evidence_text = serde_json::to_string(&event.evidence)
                 .map_err(|e| crate::derived::Error::Backend(format!("evidence encode: {e}")))?;
@@ -8304,9 +7985,7 @@ impl crate::derived::DerivedSchema for SqliteBackend {
                 }
             }
             Ok(())
-        })
-        .await
-        .map_err(|e| crate::derived::Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     // v2.13.0 (CIRISPersist#113) — read facade over
@@ -8320,119 +7999,113 @@ impl crate::derived::DerivedSchema for SqliteBackend {
         filter: crate::derived::EdgeEventFilter,
     ) -> Result<Vec<crate::derived::EdgeDetectionEvent>, crate::derived::Error> {
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(
-            move || -> Result<Vec<crate::derived::EdgeDetectionEvent>, crate::derived::Error> {
-                let conn = conn.blocking_lock();
-                let mut sql = String::from(
-                    "SELECT detection_id, tenant_id, detector_kind, subject_key_id, \
+        (move || -> Result<Vec<crate::derived::EdgeDetectionEvent>, crate::derived::Error> {
+            let conn = conn.lock();
+            let mut sql = String::from(
+                "SELECT detection_id, tenant_id, detector_kind, subject_key_id, \
                         observed_at, evidence, severity, signature, signing_key_id, \
                         signature_verified, persist_row_hash \
                      FROM edge_detection_events WHERE 1 = 1",
-                );
-                let mut binds: Vec<String> = Vec::new();
-                if let Some(t) = filter.tenant_id {
-                    binds.push(t);
-                    sql.push_str(&format!(" AND tenant_id = ?{}", binds.len()));
-                }
-                if let Some(p) = filter.peer_key_id {
-                    binds.push(p);
-                    sql.push_str(&format!(" AND subject_key_id = ?{}", binds.len()));
-                }
-                if let Some(k) = filter.event_type {
-                    binds.push(k);
-                    sql.push_str(&format!(" AND detector_kind = ?{}", binds.len()));
-                }
-                if let Some(after) = filter.recorded_after {
-                    // Strict `>` for the change-feed polling cursor — a
-                    // re-poll at the same cursor must NOT yield the row
-                    // that advanced the cursor.
-                    binds.push(after.to_rfc3339());
-                    sql.push_str(&format!(" AND observed_at > ?{}", binds.len()));
-                }
-                let limit = filter.limit.unwrap_or(1000);
-                sql.push_str(&format!(
-                    " ORDER BY tenant_id ASC, observed_at ASC, detection_id ASC LIMIT {limit}"
-                ));
+            );
+            let mut binds: Vec<String> = Vec::new();
+            if let Some(t) = filter.tenant_id {
+                binds.push(t);
+                sql.push_str(&format!(" AND tenant_id = ?{}", binds.len()));
+            }
+            if let Some(p) = filter.peer_key_id {
+                binds.push(p);
+                sql.push_str(&format!(" AND subject_key_id = ?{}", binds.len()));
+            }
+            if let Some(k) = filter.event_type {
+                binds.push(k);
+                sql.push_str(&format!(" AND detector_kind = ?{}", binds.len()));
+            }
+            if let Some(after) = filter.recorded_after {
+                // Strict `>` for the change-feed polling cursor — a
+                // re-poll at the same cursor must NOT yield the row
+                // that advanced the cursor.
+                binds.push(after.to_rfc3339());
+                sql.push_str(&format!(" AND observed_at > ?{}", binds.len()));
+            }
+            let limit = filter.limit.unwrap_or(1000);
+            sql.push_str(&format!(
+                " ORDER BY tenant_id ASC, observed_at ASC, detection_id ASC LIMIT {limit}"
+            ));
 
-                let mut stmt = conn
-                    .prepare(&sql)
-                    .map_err(sqlite_derived_err("get_edge_detection_events prepare"))?;
-                let rows = stmt
-                    .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
-                        let detection_id: String = row.get(0)?;
-                        let tenant_id: String = row.get(1)?;
-                        let detector_kind: String = row.get(2)?;
-                        let subject_key_id: String = row.get(3)?;
-                        let observed_at_s: String = row.get(4)?;
-                        let evidence_s: String = row.get(5)?;
-                        let severity: String = row.get(6)?;
-                        let signature: String = row.get(7)?;
-                        let signing_key_id: String = row.get(8)?;
-                        let signature_verified_i: i64 = row.get(9)?;
-                        let persist_row_hash: String = row.get(10)?;
-                        Ok((
-                            detection_id,
-                            tenant_id,
-                            detector_kind,
-                            subject_key_id,
-                            observed_at_s,
-                            evidence_s,
-                            severity,
-                            signature,
-                            signing_key_id,
-                            signature_verified_i,
-                            persist_row_hash,
-                        ))
-                    })
-                    .map_err(sqlite_derived_err("get_edge_detection_events query"))?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(sqlite_derived_err("get_edge_detection_events row"))?;
-
-                let mut out = Vec::with_capacity(rows.len());
-                for (
-                    detection_id,
-                    tenant_id,
-                    detector_kind,
-                    subject_key_id,
-                    observed_at_s,
-                    evidence_s,
-                    severity,
-                    signature,
-                    signing_key_id,
-                    signature_verified_i,
-                    persist_row_hash,
-                ) in rows
-                {
-                    let observed_at = chrono::DateTime::parse_from_rfc3339(&observed_at_s)
-                        .map_err(|e| {
-                            crate::derived::Error::Backend(format!("edge observed_at parse: {e}"))
-                        })?
-                        .with_timezone(&chrono::Utc);
-                    let evidence: serde_json::Value =
-                        serde_json::from_str(&evidence_s).map_err(|e| {
-                            crate::derived::Error::Backend(format!(
-                                "edge evidence JSON decode: {e}"
-                            ))
-                        })?;
-                    out.push(crate::derived::EdgeDetectionEvent {
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(sqlite_derived_err("get_edge_detection_events prepare"))?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
+                    let detection_id: String = row.get(0)?;
+                    let tenant_id: String = row.get(1)?;
+                    let detector_kind: String = row.get(2)?;
+                    let subject_key_id: String = row.get(3)?;
+                    let observed_at_s: String = row.get(4)?;
+                    let evidence_s: String = row.get(5)?;
+                    let severity: String = row.get(6)?;
+                    let signature: String = row.get(7)?;
+                    let signing_key_id: String = row.get(8)?;
+                    let signature_verified_i: i64 = row.get(9)?;
+                    let persist_row_hash: String = row.get(10)?;
+                    Ok((
                         detection_id,
                         tenant_id,
                         detector_kind,
                         subject_key_id,
-                        observed_at,
-                        evidence,
+                        observed_at_s,
+                        evidence_s,
                         severity,
                         signature,
                         signing_key_id,
-                        signature_verified: signature_verified_i != 0,
+                        signature_verified_i,
                         persist_row_hash,
-                    });
-                }
-                Ok(out)
-            },
-        )
-        .await
-        .map_err(|e| crate::derived::Error::Backend(format!("spawn_blocking join: {e}")))?
+                    ))
+                })
+                .map_err(sqlite_derived_err("get_edge_detection_events query"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sqlite_derived_err("get_edge_detection_events row"))?;
+
+            let mut out = Vec::with_capacity(rows.len());
+            for (
+                detection_id,
+                tenant_id,
+                detector_kind,
+                subject_key_id,
+                observed_at_s,
+                evidence_s,
+                severity,
+                signature,
+                signing_key_id,
+                signature_verified_i,
+                persist_row_hash,
+            ) in rows
+            {
+                let observed_at = chrono::DateTime::parse_from_rfc3339(&observed_at_s)
+                    .map_err(|e| {
+                        crate::derived::Error::Backend(format!("edge observed_at parse: {e}"))
+                    })?
+                    .with_timezone(&chrono::Utc);
+                let evidence: serde_json::Value =
+                    serde_json::from_str(&evidence_s).map_err(|e| {
+                        crate::derived::Error::Backend(format!("edge evidence JSON decode: {e}"))
+                    })?;
+                out.push(crate::derived::EdgeDetectionEvent {
+                    detection_id,
+                    tenant_id,
+                    detector_kind,
+                    subject_key_id,
+                    observed_at,
+                    evidence,
+                    severity,
+                    signature,
+                    signing_key_id,
+                    signature_verified: signature_verified_i != 0,
+                    persist_row_hash,
+                });
+            }
+            Ok(out)
+        })()
     }
 
     async fn put_calibration_bundle(
@@ -8459,8 +8132,8 @@ impl crate::derived::DerivedSchema for SqliteBackend {
         let cohort_centroids = serde_json::to_string(&bundle.cohort_centroids)
             .map_err(|e| crate::derived::Error::Backend(format!("cohort_centroids encode: {e}")))?;
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), crate::derived::Error> {
-            let mut conn = conn.blocking_lock();
+        (move || -> Result<(), crate::derived::Error> {
+            let mut conn = conn.lock();
             // Atomic flip: clear the prior is_current row + insert the
             // new row in one transaction. The partial-unique index
             // calibration_bundles_one_current makes "at most one
@@ -8526,31 +8199,25 @@ impl crate::derived::DerivedSchema for SqliteBackend {
             }
             tx.commit().map_err(sqlite_derived_err("commit tx"))?;
             Ok(())
-        })
-        .await
-        .map_err(|e| crate::derived::Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn get_current_calibration_bundle(
         &self,
     ) -> Result<Option<crate::derived::CalibrationBundle>, crate::derived::Error> {
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(
-            move || -> Result<Option<crate::derived::CalibrationBundle>, crate::derived::Error> {
-                let conn = conn.blocking_lock();
-                let raw = conn
-                    .query_row(
-                        &format!("{SQLITE_BUNDLE_SELECT} WHERE is_current = 1"),
-                        [],
-                        sqlite_bundle_from_row,
-                    )
-                    .optional()
-                    .map_err(sqlite_derived_err("get_current_calibration_bundle"))?;
-                raw.map(raw_to_calibration_bundle).transpose()
-            },
-        )
-        .await
-        .map_err(|e| crate::derived::Error::Backend(format!("spawn_blocking join: {e}")))?
+        (move || -> Result<Option<crate::derived::CalibrationBundle>, crate::derived::Error> {
+            let conn = conn.lock();
+            let raw = conn
+                .query_row(
+                    &format!("{SQLITE_BUNDLE_SELECT} WHERE is_current = 1"),
+                    [],
+                    sqlite_bundle_from_row,
+                )
+                .optional()
+                .map_err(sqlite_derived_err("get_current_calibration_bundle"))?;
+            raw.map(raw_to_calibration_bundle).transpose()
+        })()
     }
 
     async fn get_calibration_bundle_by_version(
@@ -8558,22 +8225,18 @@ impl crate::derived::DerivedSchema for SqliteBackend {
         version: i32,
     ) -> Result<Option<crate::derived::CalibrationBundle>, crate::derived::Error> {
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(
-            move || -> Result<Option<crate::derived::CalibrationBundle>, crate::derived::Error> {
-                let conn = conn.blocking_lock();
-                let raw = conn
-                    .query_row(
-                        &format!("{SQLITE_BUNDLE_SELECT} WHERE ratchet_calibration_version = ?1"),
-                        [i64::from(version)],
-                        sqlite_bundle_from_row,
-                    )
-                    .optional()
-                    .map_err(sqlite_derived_err("get_calibration_bundle_by_version"))?;
-                raw.map(raw_to_calibration_bundle).transpose()
-            },
-        )
-        .await
-        .map_err(|e| crate::derived::Error::Backend(format!("spawn_blocking join: {e}")))?
+        (move || -> Result<Option<crate::derived::CalibrationBundle>, crate::derived::Error> {
+            let conn = conn.lock();
+            let raw = conn
+                .query_row(
+                    &format!("{SQLITE_BUNDLE_SELECT} WHERE ratchet_calibration_version = ?1"),
+                    [i64::from(version)],
+                    sqlite_bundle_from_row,
+                )
+                .optional()
+                .map_err(sqlite_derived_err("get_calibration_bundle_by_version"))?;
+            raw.map(raw_to_calibration_bundle).transpose()
+        })()
     }
 }
 
@@ -8748,8 +8411,8 @@ mod tests {
         // directory ingest path is v0.3.0 work).
         {
             let conn = backend.conn.clone();
-            tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
-                let conn = conn.blocking_lock();
+            (move || -> Result<(), rusqlite::Error> {
+                let conn = conn.lock();
                 // v0.4.0 — write directly to federation_keys (the
                 // canonical pubkey directory post-lens#8 ASK 2). The
                 // pre-v0.4.0 dual-read fallback to accord_public_keys
@@ -8766,9 +8429,7 @@ mod tests {
                     rusqlite::params!["key-test", pk_b64, "2026-04-30T00:00:00+00:00"],
                 )?;
                 Ok(())
-            })
-            .await
-            .unwrap()
+            })()
             .unwrap();
         }
 
@@ -8805,8 +8466,8 @@ mod tests {
         {
             let conn = backend.conn.clone();
             let pk_b64 = pk_b64.clone();
-            tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
-                let conn = conn.blocking_lock();
+            (move || -> Result<(), rusqlite::Error> {
+                let conn = conn.lock();
                 conn.execute(
                     "INSERT INTO federation_keys (\
                         key_id, pubkey_ed25519_base64, algorithm, \
@@ -8835,9 +8496,7 @@ mod tests {
                     ],
                 )?;
                 Ok(())
-            })
-            .await
-            .unwrap()
+            })()
             .unwrap();
         }
 
@@ -11639,8 +11298,8 @@ mod tests {
         let conn = backend.conn.clone();
         let detection_id = uuid::Uuid::new_v4().to_string();
         let did = detection_id.clone();
-        tokio::task::spawn_blocking(move || -> rusqlite::Result<()> {
-            let conn = conn.blocking_lock();
+        (move || -> rusqlite::Result<()> {
+            let conn = conn.lock();
             conn.execute(
                 "INSERT INTO edge_detection_events (\
                     detection_id, tenant_id, detector_kind, subject_key_id, \
@@ -11657,24 +11316,20 @@ mod tests {
                 ],
             )?;
             Ok(())
-        })
-        .await
-        .unwrap()
+        })()
         .unwrap();
 
         let conn = backend.conn.clone();
         let did = detection_id.clone();
-        let row_exists = tokio::task::spawn_blocking(move || -> rusqlite::Result<bool> {
-            let conn = conn.blocking_lock();
+        let row_exists = (move || -> rusqlite::Result<bool> {
+            let conn = conn.lock();
             let n: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM edge_detection_events WHERE detection_id = ?1",
                 [&did],
                 |r| r.get(0),
             )?;
             Ok(n == 1)
-        })
-        .await
-        .unwrap()
+        })()
         .unwrap();
         assert!(row_exists);
     }
@@ -11719,8 +11374,8 @@ mod tests {
         let conn = backend.conn.clone();
         let trace_id = trace_id.to_owned();
         let thought_id = thought_id.to_owned();
-        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
-            let conn = conn.blocking_lock();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
             conn.execute(
                 "INSERT INTO trace_events (\
                     trace_id, thought_id, event_type, attempt_index, ts, \
@@ -11732,9 +11387,7 @@ mod tests {
                 rusqlite::params![trace_id, thought_id, "2026-05-16T00:00:00+00:00"],
             )?;
             Ok(())
-        })
-        .await
-        .unwrap()
+        })()
         .unwrap();
     }
 
@@ -13555,8 +13208,8 @@ mod tests {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         let conn = backend.conn_handle();
-        let result = tokio::task::spawn_blocking(move || {
-            let c = conn.blocking_lock();
+        let result = (move || {
+            let c = conn.lock();
             c.execute(
                 "INSERT INTO federation_keys (key_id, pubkey_ed25519_base64, algorithm, \
                     identity_type, identity_ref, valid_from, registration_envelope, \
@@ -13567,9 +13220,7 @@ mod tests {
                     '2026-01-01T00:00:00Z', 'h')",
                 [],
             )
-        })
-        .await
-        .unwrap();
+        })();
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("federation_keys_accord_holder_requires_attestation"),
@@ -14195,8 +13846,8 @@ mod tests {
         // scope_cohort_id must hit the CHECK constraint.
         let conn = backend.conn.clone();
         let bypass_id = uuid::Uuid::new_v4().to_string();
-        let res = tokio::task::spawn_blocking(move || -> Result<usize, rusqlite::Error> {
-            let conn = conn.blocking_lock();
+        let res = (move || -> Result<usize, rusqlite::Error> {
+            let conn = conn.lock();
             conn.execute(
                 "INSERT INTO goals (\
                     goal_id, declared_by_key_id, declared_at, goal_text, \
@@ -14207,9 +13858,7 @@ mod tests {
                           'cohort', NULL, 'plurality', 'r', NULL, NULL, 'h')",
                 [bypass_id],
             )
-        })
-        .await
-        .unwrap();
+        })();
         assert!(
             res.is_err(),
             "schema CHECK must reject scope_kind='cohort' with NULL scope_cohort_id"
@@ -14322,7 +13971,7 @@ mod tests {
         let key_id = key_id.to_owned();
         let conn = backend.conn.clone();
         tokio::task::spawn_blocking(move || -> Option<_> {
-            let conn = conn.blocking_lock();
+            let conn = conn.lock();
             conn.query_row(
                 "SELECT alias, trust, notes, policy_blob, transport_identity, removed_at \
                  FROM federation_peer_metadata WHERE key_id = ?1",
@@ -14351,7 +14000,7 @@ mod tests {
         let key_id = key_id.to_owned();
         let conn = backend.conn.clone();
         tokio::task::spawn_blocking(move || -> bool {
-            let conn = conn.blocking_lock();
+            let conn = conn.lock();
             conn.query_row(
                 "SELECT 1 FROM federation_keys WHERE key_id = ?1",
                 [&key_id],
@@ -14780,15 +14429,13 @@ mod tests {
             .await
             .unwrap();
         let conn = backend.conn.clone();
-        let res = tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
+        let res = (move || {
+            let conn = conn.lock();
             conn.execute(
                 "UPDATE federation_peer_metadata SET trust = 'mystery' WHERE key_id = ?1",
                 ["peer-check"],
             )
-        })
-        .await
-        .unwrap();
+        })();
         assert!(
             res.is_err(),
             "direct-SQL bypass of trust CHECK must fail; got Ok"
@@ -15026,19 +14673,16 @@ mod tests {
         // Row exists; access_count == 0; last_accessed_at populated.
         let conn = backend.conn_handle();
         let sha_vec = sha.to_vec();
-        let (last, count) =
-            tokio::task::spawn_blocking(move || -> Result<(String, i64), rusqlite::Error> {
-                let c = conn.blocking_lock();
-                c.query_row(
-                    "SELECT last_accessed_at, access_count \
+        let (last, count) = (move || -> Result<(String, i64), rusqlite::Error> {
+            let c = conn.lock();
+            c.query_row(
+                "SELECT last_accessed_at, access_count \
                      FROM federation_blobs WHERE sha256 = ?1",
-                    rusqlite::params![sha_vec],
-                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
-                )
-            })
-            .await
-            .unwrap()
-            .unwrap();
+                rusqlite::params![sha_vec],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+        })()
+        .unwrap();
         assert_eq!(count, 0);
         // last_accessed_at must NOT be the V053 sentinel.
         assert_ne!(last, "1970-01-01T00:00:00+00:00");
@@ -15066,16 +14710,14 @@ mod tests {
         assert!(backend.has_blob(&sha).await.unwrap());
         let conn = backend.conn_handle();
         let sha_vec = sha.to_vec();
-        let count: i64 = tokio::task::spawn_blocking(move || -> Result<i64, rusqlite::Error> {
-            let c = conn.blocking_lock();
+        let count: i64 = (move || -> Result<i64, rusqlite::Error> {
+            let c = conn.lock();
             c.query_row(
                 "SELECT access_count FROM federation_blobs WHERE sha256 = ?1",
                 rusqlite::params![sha_vec],
                 |r| r.get(0),
             )
-        })
-        .await
-        .unwrap()
+        })()
         .unwrap();
         // 2 get_blob hits + 1 has_blob = 3.
         assert_eq!(count, 3);

@@ -22,14 +22,21 @@
 //! that does the acquire. This guarantees lock-expiry semantics
 //! match on both backends for any wall-clock moment.
 //!
-//! Threading: `tokio::task::spawn_blocking` + `conn.blocking_lock()`
+//! Threading: `tokio::task::spawn_blocking` + `conn.lock()`
 //! per the existing pattern.
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
 
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
-use tokio::sync::Mutex;
 
 use super::service::MaintenanceLockService;
 use super::types::MaintenanceLock;
@@ -153,8 +160,8 @@ impl MaintenanceLockService for SqliteMaintenanceLockBackend {
         let locked_by = locked_by.to_owned();
         let metadata_str = encode_json_opt(metadata.as_ref())?;
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Option<MaintenanceLock>, Error> {
-            let mut guard = conn.blocking_lock();
+        (move || -> Result<Option<MaintenanceLock>, Error> {
+            let mut guard = conn.lock();
             let tx = guard
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|e| map_sqlite_error(e, "try_acquire_lock begin"))?;
@@ -202,9 +209,7 @@ impl MaintenanceLockService for SqliteMaintenanceLockBackend {
             tx.commit()
                 .map_err(|e| map_sqlite_error(e, "try_acquire_lock commit"))?;
             Ok(Some(row))
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn release_lock(&self, lock_key: &str, locked_by: &str) -> Result<bool, Error> {
@@ -217,8 +222,8 @@ impl MaintenanceLockService for SqliteMaintenanceLockBackend {
         let lock_key = lock_key.to_owned();
         let locked_by = locked_by.to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<bool, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<bool, Error> {
+            let guard = conn.lock();
             let changed = guard
                 .execute(
                     "UPDATE cirislens_maintenance_locks SET \
@@ -229,9 +234,7 @@ impl MaintenanceLockService for SqliteMaintenanceLockBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "release_lock exec"))?;
             Ok(changed > 0)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn get_lock(&self, lock_key: &str) -> Result<Option<MaintenanceLock>, Error> {
@@ -240,8 +243,8 @@ impl MaintenanceLockService for SqliteMaintenanceLockBackend {
         }
         let lock_key = lock_key.to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Option<MaintenanceLock>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Option<MaintenanceLock>, Error> {
+            let guard = conn.lock();
             let row_opt = guard
                 .query_row(
                     "SELECT lock_key, locked_by, locked_at, \
@@ -256,9 +259,7 @@ impl MaintenanceLockService for SqliteMaintenanceLockBackend {
                 None => Ok(None),
                 Some(r) => Ok(Some(r?)),
             }
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 }
 

@@ -18,6 +18,13 @@
 //! Mission constraint (MISSION.md §3 anti-pattern #4): typed errors
 //! cross the FFI boundary as Python exceptions with structured
 //! detail. No silent coercion; no opaque strings.
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
 
 use std::sync::Arc;
 
@@ -2356,8 +2363,8 @@ impl PyEngine {
                     let conn = sq.conn_handle();
                     let expires_text: Option<String> = expires_dt.map(|t| t.to_rfc3339());
                     runtime.block_on(async move {
-                        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
-                            let conn = conn.blocking_lock();
+                        (move || -> Result<(), rusqlite::Error> {
+                            let conn = conn.lock();
                             conn.execute(
                                     "INSERT INTO accord_public_keys \
                                      (key_id, public_key_base64, algorithm, description, \
@@ -2374,11 +2381,7 @@ impl PyEngine {
                                     ],
                                 )?;
                             Ok(())
-                        })
-                        .await
-                        .map_err(|e| {
-                            PyRuntimeError::new_err(format!("register spawn_blocking join: {e}"))
-                        })?
+                        })()
                         .map_err(|e| PyRuntimeError::new_err(format!("register: {e}")))?;
                         Ok::<_, PyErr>(())
                     })
@@ -18171,8 +18174,8 @@ async fn boot_audit_self_verify(backend: &BackendDispatch) -> Result<BootAuditSu
         #[cfg(feature = "sqlite")]
         BackendDispatch::Sqlite(sq) => {
             let conn = sq.conn_handle();
-            tokio::task::spawn_blocking(move || {
-                let guard = conn.blocking_lock();
+            (move || {
+                let guard = conn.lock();
                 let mut stmt = guard
                     .prepare("SELECT DISTINCT tenant_id FROM cirislens_audit_log")
                     .map_err(|e| format!("list tenants: {e}"))?;
@@ -18184,9 +18187,7 @@ async fn boot_audit_self_verify(backend: &BackendDispatch) -> Result<BootAuditSu
                     ids.push(r.map_err(|e| format!("tenant row: {e}"))?);
                 }
                 Ok::<_, String>(ids)
-            })
-            .await
-            .map_err(|e| format!("spawn_blocking: {e}"))??
+            })()?
         }
     };
 
@@ -18296,8 +18297,8 @@ async fn build_audit_chain_proof(
         BackendDispatch::Sqlite(sq) => {
             let conn = sq.conn_handle();
             let trace_id_owned = trace_id.to_owned();
-            tokio::task::spawn_blocking(move || -> Result<Option<(String, i64)>, String> {
-                let guard = conn.blocking_lock();
+            (move || -> Result<Option<(String, i64)>, String> {
+                let guard = conn.lock();
                 let mut stmt = guard
                     .prepare(
                         "SELECT tenant_id, sequence_number \
@@ -18317,9 +18318,7 @@ async fn build_audit_chain_proof(
                         other => Err(format!("locate trace: {other}")),
                     })?;
                 Ok(row)
-            })
-            .await
-            .map_err(|e| format!("spawn_blocking: {e}"))??
+            })()?
         }
     };
 
@@ -18378,8 +18377,8 @@ async fn build_audit_chain_proof(
         BackendDispatch::Sqlite(sq) => {
             let conn = sq.conn_handle();
             let tenant_owned = tenant_id.clone();
-            tokio::task::spawn_blocking(move || -> Result<Vec<AuditChainEntry>, String> {
-                let guard = conn.blocking_lock();
+            (move || -> Result<Vec<AuditChainEntry>, String> {
+                let guard = conn.lock();
                 let mut stmt = guard
                     .prepare(
                         "SELECT sequence_number, tenant_id, action_type, recorded_at, \
@@ -18429,9 +18428,7 @@ async fn build_audit_chain_proof(
                     });
                 }
                 Ok(out)
-            })
-            .await
-            .map_err(|e| format!("spawn_blocking: {e}"))??
+            })()?
         }
     };
 

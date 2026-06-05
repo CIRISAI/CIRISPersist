@@ -8,13 +8,20 @@
 //!   ON CONFLICT (correlation_id) DO NOTHING → identical
 //!   metric_value REAL        → f64 (SQLite REAL is 8-byte IEEE 754)
 //!
-//! Threading: `tokio::task::spawn_blocking` + `conn.blocking_lock()`
+//! Threading: `tokio::task::spawn_blocking` + `conn.lock()`
 //! per the existing pattern.
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
 
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
-use tokio::sync::Mutex;
 
 use super::service::CorrelationService;
 use super::types::{
@@ -215,8 +222,8 @@ impl CorrelationService for SqliteCorrelationBackend {
         let timestamp_str = correlation.timestamp.map(fmt_datetime);
 
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), Error> {
-            let mut guard = conn.blocking_lock();
+        (move || -> Result<(), Error> {
+            let mut guard = conn.lock();
             let tx = guard
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|e| map_sqlite_error(e, "record_correlation begin"))?;
@@ -259,9 +266,7 @@ impl CorrelationService for SqliteCorrelationBackend {
             tx.commit()
                 .map_err(|e| map_sqlite_error(e, "record_correlation commit"))?;
             Ok(())
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn get_correlation(&self, correlation_id: &str) -> Result<Option<Correlation>, Error> {
@@ -270,8 +275,8 @@ impl CorrelationService for SqliteCorrelationBackend {
         }
         let conn = self.conn.clone();
         let correlation_id_owned = correlation_id.to_owned();
-        tokio::task::spawn_blocking(move || -> Result<Option<Correlation>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Option<Correlation>, Error> {
+            let guard = conn.lock();
             let row_opt = guard
                 .query_row(
                     "SELECT correlation_id, service_type, handler_name, action_type, \
@@ -289,9 +294,7 @@ impl CorrelationService for SqliteCorrelationBackend {
                 None => Ok(None),
                 Some(r) => Ok(Some(r?)),
             }
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn update_correlation_status(
@@ -308,8 +311,8 @@ impl CorrelationService for SqliteCorrelationBackend {
         let status_sql = new_status.as_sql_str().to_owned();
         let correlation_id_owned = correlation_id.to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<bool, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<bool, Error> {
+            let guard = conn.lock();
             // COALESCE(?response_data, response_data) — preserve
             // existing value if caller didn't supply one. Caller can
             // pass serde_json::Value::Null via Some(Value::Null) to
@@ -325,9 +328,7 @@ impl CorrelationService for SqliteCorrelationBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "update_correlation_status exec"))?;
             Ok(changed > 0)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn query_correlations(
@@ -416,8 +417,8 @@ impl CorrelationService for SqliteCorrelationBackend {
         );
         let conn = self.conn.clone();
         let limit_usize = limit as usize;
-        tokio::task::spawn_blocking(move || -> Result<CorrelationListPage, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<CorrelationListPage, Error> {
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare(&sql)
                 .map_err(|e| map_sqlite_error(e, "query_correlations prepare"))?;
@@ -438,9 +439,7 @@ impl CorrelationService for SqliteCorrelationBackend {
                 None
             };
             Ok(CorrelationListPage { items, next_cursor })
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 }
 
@@ -864,8 +863,8 @@ mod tests {
         // the migration declares the index supports the walk.
         let conn = b.conn_handle();
         let root_span_owned = root_span.clone();
-        let count = tokio::task::spawn_blocking(move || -> i64 {
-            let guard = conn.blocking_lock();
+        let count = (move || -> i64 {
+            let guard = conn.lock();
             guard
                 .query_row(
                     "SELECT COUNT(*) FROM cirislens_service_correlations \
@@ -874,9 +873,7 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap()
-        })
-        .await
-        .unwrap();
+        })();
         assert_eq!(count, 2);
     }
 
@@ -884,8 +881,8 @@ mod tests {
     async fn status_check_constraint_rejects_unknown_value() {
         let (b, _correlations) = fresh_backend().await;
         let conn = b.conn_handle();
-        let res = tokio::task::spawn_blocking(move || -> rusqlite::Result<usize> {
-            let guard = conn.blocking_lock();
+        let res = (move || -> rusqlite::Result<usize> {
+            let guard = conn.lock();
             guard.execute(
                 "INSERT INTO cirislens_service_correlations (\
                     correlation_id, service_type, handler_name, action_type, status, \
@@ -897,9 +894,7 @@ mod tests {
                            'service_interaction', 'raw', 'occ-1')",
                 params![],
             )
-        })
-        .await
-        .unwrap();
+        })();
         assert!(res.is_err(), "expected CHECK violation on bogus status");
     }
 
@@ -907,8 +902,8 @@ mod tests {
     async fn correlation_type_check_constraint_rejects_unknown_value() {
         let (b, _correlations) = fresh_backend().await;
         let conn = b.conn_handle();
-        let res = tokio::task::spawn_blocking(move || -> rusqlite::Result<usize> {
-            let guard = conn.blocking_lock();
+        let res = (move || -> rusqlite::Result<usize> {
+            let guard = conn.lock();
             guard.execute(
                 "INSERT INTO cirislens_service_correlations (\
                     correlation_id, service_type, handler_name, action_type, status, \
@@ -920,9 +915,7 @@ mod tests {
                            'bogus_type', 'raw', 'occ-1')",
                 params![],
             )
-        })
-        .await
-        .unwrap();
+        })();
         assert!(
             res.is_err(),
             "expected CHECK violation on bogus correlation_type"
@@ -933,8 +926,8 @@ mod tests {
     async fn retention_policy_check_constraint_rejects_unknown_value() {
         let (b, _correlations) = fresh_backend().await;
         let conn = b.conn_handle();
-        let res = tokio::task::spawn_blocking(move || -> rusqlite::Result<usize> {
-            let guard = conn.blocking_lock();
+        let res = (move || -> rusqlite::Result<usize> {
+            let guard = conn.lock();
             guard.execute(
                 "INSERT INTO cirislens_service_correlations (\
                     correlation_id, service_type, handler_name, action_type, status, \
@@ -946,9 +939,7 @@ mod tests {
                            'service_interaction', 'bogus_policy', 'occ-1')",
                 params![],
             )
-        })
-        .await
-        .unwrap();
+        })();
         assert!(
             res.is_err(),
             "expected CHECK violation on bogus retention_policy"

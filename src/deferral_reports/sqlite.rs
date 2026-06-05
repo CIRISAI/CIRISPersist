@@ -11,19 +11,26 @@
 //!                                            without per-tx
 //!                                            `PRAGMA defer_foreign_keys=1`)
 //!
-//! Threading: `tokio::task::spawn_blocking` + `conn.blocking_lock()`
+//! Threading: `tokio::task::spawn_blocking` + `conn.lock()`
 //! per the existing pattern.
 //!
 //! `record_deferral` uses the same ClaimResult shape as the v1.5.9
 //! tasks `try_claim_shared_task` SQLite path: `INSERT OR IGNORE`
 //! followed by an in-transaction `SELECT` so the race-loser reads
 //! back the existing row.
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
 
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use rusqlite::{params, types::Value as SqlValue, Connection, OptionalExtension};
-use tokio::sync::Mutex;
 
 use super::service::DeferralReportService;
 use super::types::{DeferralFilter, DeferralReport};
@@ -155,8 +162,8 @@ impl DeferralReportService for SqliteDeferralReportBackend {
 
         let conn = self.conn.clone();
         let (won, row): (bool, DeferralReport) =
-            tokio::task::spawn_blocking(move || -> Result<(bool, DeferralReport), Error> {
-                let mut guard = conn.blocking_lock();
+            (move || -> Result<(bool, DeferralReport), Error> {
+                let mut guard = conn.lock();
                 let tx = guard
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(|e| map_sqlite_error(e, "record_deferral begin"))?;
@@ -192,9 +199,7 @@ impl DeferralReportService for SqliteDeferralReportBackend {
                 tx.commit()
                     .map_err(|e| map_sqlite_error(e, "record_deferral commit"))?;
                 Ok((won, row))
-            })
-            .await
-            .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))??;
+            })()?;
 
         if won {
             Ok(ClaimResult::Stored(row))
@@ -209,8 +214,8 @@ impl DeferralReportService for SqliteDeferralReportBackend {
         }
         let message_id_owned = message_id.to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Option<DeferralReport>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Option<DeferralReport>, Error> {
+            let guard = conn.lock();
             let row_opt = guard
                 .query_row(
                     "SELECT message_id, task_id, thought_id, package, \
@@ -225,9 +230,7 @@ impl DeferralReportService for SqliteDeferralReportBackend {
                 None => Ok(None),
                 Some(r) => Ok(Some(r?)),
             }
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn list_active_deferrals(
@@ -270,8 +273,8 @@ impl DeferralReportService for SqliteDeferralReportBackend {
              LIMIT ?{p_limit}"
         );
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<DeferralReport>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Vec<DeferralReport>, Error> {
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare(&sql)
                 .map_err(|e| map_sqlite_error(e, "list_active_deferrals prepare"))?;
@@ -285,9 +288,7 @@ impl DeferralReportService for SqliteDeferralReportBackend {
                 items.push(r.map_err(|e| map_sqlite_error(e, "list_active_deferrals row"))??);
             }
             Ok(items)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn resolve_deferral(
@@ -302,8 +303,8 @@ impl DeferralReportService for SqliteDeferralReportBackend {
         let message_id_owned = message_id.to_owned();
         let resolved_at_str = fmt_datetime(resolved_at);
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<bool, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<bool, Error> {
+            let guard = conn.lock();
             let changed = guard
                 .execute(
                     "UPDATE cirislens_deferral_reports SET \
@@ -314,9 +315,7 @@ impl DeferralReportService for SqliteDeferralReportBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "resolve_deferral exec"))?;
             Ok(changed > 0)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 }
 
@@ -408,15 +407,13 @@ mod tests {
     /// it; substrate tests skip the FK rejection check when it's off.
     async fn fk_pragma_on(b: &SqliteBackend) -> bool {
         let conn = b.conn_handle();
-        tokio::task::spawn_blocking(move || -> bool {
-            let guard = conn.blocking_lock();
+        (move || -> bool {
+            let guard = conn.lock();
             guard
                 .query_row("PRAGMA foreign_keys", params![], |row| row.get::<_, i64>(0))
                 .map(|v| v == 1)
                 .unwrap_or(false)
-        })
-        .await
-        .unwrap()
+        })()
     }
 
     #[tokio::test]

@@ -37,12 +37,19 @@
 //! / single-writer). Only [`SqliteNodeCoreBackend::put_promotion_attestation`]
 //! spans multiple statements; the other typed-writes are single
 //! INSERTs that ride SQLite's implicit per-statement transactions.
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
 
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::federation_announcement::{DeliveryAttestation, TransportMedium};
@@ -283,8 +290,8 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         let sig_b64 = env.signature.ed25519.clone();
 
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<(), Error> {
+            let guard = conn.lock();
             guard
                 .execute(
                     "INSERT INTO cirisnode_contributions (\
@@ -317,9 +324,7 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "put_contribution"))?;
             Ok(())
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn cast_vote(&self, env: VoteEnvelope) -> Result<(), Error> {
@@ -342,8 +347,8 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         let sig_b64 = env.signature.ed25519.clone();
 
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<(), Error> {
+            let guard = conn.lock();
             guard
                 .execute(
                     "INSERT INTO cirisnode_votes (\
@@ -366,9 +371,7 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "cast_vote"))?;
             Ok(())
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn update_credits_ledger(&self, update: CreditsUpdate) -> Result<(), Error> {
@@ -381,8 +384,8 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         let now = fmt_datetime(Utc::now());
 
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<(), Error> {
+            let guard = conn.lock();
             // Mirrors the Postgres semantic: SET balance =
             // EXCLUDED.balance (replaces, not accumulates). The
             // ON CONFLICT clause keys on the composite PK.
@@ -408,9 +411,7 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "update_credits_ledger"))?;
             Ok(())
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn update_expertise_ledger(&self, update: ExpertiseUpdate) -> Result<(), Error> {
@@ -429,8 +430,8 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         let now = fmt_datetime(Utc::now());
 
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<(), Error> {
+            let guard = conn.lock();
             guard
                 .execute(
                     "INSERT INTO cirisnode_expertise_ledger (\
@@ -454,9 +455,7 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "update_expertise_ledger"))?;
             Ok(())
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn put_moderation_event(&self, event: ModerationEvent) -> Result<(), Error> {
@@ -469,8 +468,8 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         let sig_b64 = event.signature.ed25519.clone();
 
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<(), Error> {
+            let guard = conn.lock();
             guard
                 .execute(
                     "INSERT INTO cirisnode_moderation_events (\
@@ -490,9 +489,7 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "put_moderation_event"))?;
             Ok(())
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn put_slashing_attestation(&self, att: SlashingAttestation) -> Result<(), Error> {
@@ -505,8 +502,8 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         let sig_b64 = att.signature.ed25519.clone();
 
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<(), Error> {
+            let guard = conn.lock();
             guard
                 .execute(
                     "INSERT INTO cirisnode_slashing_attestations (\
@@ -526,9 +523,7 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "put_slashing_attestation"))?;
             Ok(())
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn put_reconsideration_request(&self, req: ReconsiderationRequest) -> Result<(), Error> {
@@ -541,8 +536,8 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         let sig_b64 = req.signature.ed25519.clone();
 
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<(), Error> {
+            let guard = conn.lock();
             guard
                 .execute(
                     "INSERT INTO cirisnode_reconsideration_requests (\
@@ -562,9 +557,7 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "put_reconsideration_request"))?;
             Ok(())
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn put_reconsideration_attestation(
@@ -580,8 +573,8 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         let sig_b64 = att.signature.ed25519.clone();
 
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<(), Error> {
+            let guard = conn.lock();
             guard
                 .execute(
                     "INSERT INTO cirisnode_reconsideration_attestations (\
@@ -601,9 +594,7 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "put_reconsideration_attestation"))?;
             Ok(())
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn put_promotion_attestation(&self, att: PromotionAttestation) -> Result<(), Error> {
@@ -639,8 +630,8 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         );
 
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), Error> {
-            let mut guard = conn.blocking_lock();
+        (move || -> Result<(), Error> {
+            let mut guard = conn.lock();
             let tx = guard
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|e| map_sqlite_error(e, "put_promotion_attestation begin"))?;
@@ -699,9 +690,7 @@ impl NodeCoreService for SqliteNodeCoreBackend {
             tx.commit()
                 .map_err(|e| Error::Backend(format!("commit: {e}")))?;
             Ok(())
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn routable_contributors(
@@ -712,8 +701,8 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         let domain = domain.to_owned();
         let language = language.to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<RoutableContributor>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Vec<RoutableContributor>, Error> {
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare(
                     "SELECT contributor_id, expertise FROM cirisnode_expertise_ledger \
@@ -732,9 +721,7 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                 .map_err(|e| map_sqlite_error(e, "routable_contributors query"))?;
             let out: Result<Vec<_>, _> = rows.collect();
             out.map_err(|e| map_sqlite_error(e, "routable_contributors collect"))
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn read_vote_weight(
@@ -749,42 +736,39 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         let language_in = language.to_owned();
         let subject_in = subject.to_owned();
         let conn = self.conn.clone();
-        let raw_opt =
-            tokio::task::spawn_blocking(move || -> Result<Option<(f64, f64, bool)>, Error> {
-                let guard = conn.blocking_lock();
-                // SQLite doesn't take to the Postgres `FROM (SELECT 1)
-                // _ LEFT JOIN …` shape cleanly because it lacks the
-                // empty-FROM trick — but we can mirror with two
-                // independent point-lookups + a NULL-tolerant
-                // combiner. Simpler and equivalent semantically.
-                let credits: Option<f64> = guard
-                    .query_row(
-                        "SELECT balance FROM cirisnode_credits_ledger \
+        let raw_opt = (move || -> Result<Option<(f64, f64, bool)>, Error> {
+            let guard = conn.lock();
+            // SQLite doesn't take to the Postgres `FROM (SELECT 1)
+            // _ LEFT JOIN …` shape cleanly because it lacks the
+            // empty-FROM trick — but we can mirror with two
+            // independent point-lookups + a NULL-tolerant
+            // combiner. Simpler and equivalent semantically.
+            let credits: Option<f64> = guard
+                .query_row(
+                    "SELECT balance FROM cirisnode_credits_ledger \
                          WHERE contributor_id = ?1 AND domain = ?2 \
                            AND language = ?3 AND subject = ?4",
-                        params![contributor_id_in, domain_in, language_in, subject_in],
-                        |row| row.get::<_, f64>(0),
-                    )
-                    .optional()
-                    .map_err(|e| map_sqlite_error(e, "read_vote_weight credits"))?;
-                let expertise_row: Option<(f64, bool)> = guard
-                    .query_row(
-                        "SELECT expertise, is_active FROM cirisnode_expertise_ledger \
+                    params![contributor_id_in, domain_in, language_in, subject_in],
+                    |row| row.get::<_, f64>(0),
+                )
+                .optional()
+                .map_err(|e| map_sqlite_error(e, "read_vote_weight credits"))?;
+            let expertise_row: Option<(f64, bool)> = guard
+                .query_row(
+                    "SELECT expertise, is_active FROM cirisnode_expertise_ledger \
                          WHERE contributor_id = ?1 AND domain = ?2 AND language = ?3",
-                        params![contributor_id_in, domain_in, language_in],
-                        |row| Ok((row.get::<_, f64>(0)?, row.get::<_, bool>(1)?)),
-                    )
-                    .optional()
-                    .map_err(|e| map_sqlite_error(e, "read_vote_weight expertise"))?;
-                let credits_v = credits.unwrap_or(0.0);
-                let (expertise_v, is_active_v) = expertise_row.unwrap_or((0.0, false));
-                if credits_v == 0.0 && expertise_v == 0.0 && !is_active_v {
-                    return Ok(None);
-                }
-                Ok(Some((credits_v, expertise_v, is_active_v)))
-            })
-            .await
-            .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))??;
+                    params![contributor_id_in, domain_in, language_in],
+                    |row| Ok((row.get::<_, f64>(0)?, row.get::<_, bool>(1)?)),
+                )
+                .optional()
+                .map_err(|e| map_sqlite_error(e, "read_vote_weight expertise"))?;
+            let credits_v = credits.unwrap_or(0.0);
+            let (expertise_v, is_active_v) = expertise_row.unwrap_or((0.0, false));
+            if credits_v == 0.0 && expertise_v == 0.0 && !is_active_v {
+                return Ok(None);
+            }
+            Ok(Some((credits_v, expertise_v, is_active_v)))
+        })()?;
 
         Ok(raw_opt.map(|(credits, expertise, is_active)| {
             // SCHEMA.md §5.2: expertise_multiplier = 1 + 4*expertise
@@ -924,9 +908,9 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         );
 
         let conn = self.conn.clone();
-        let rows_out = tokio::task::spawn_blocking(
+        let rows_out = (
             move || -> Result<Vec<(String, String, String, String, String, String, String, Option<String>, String, String)>, Error> {
-                let guard = conn.blocking_lock();
+                let guard = conn.lock();
                 let mut stmt = guard
                     .prepare(&sql)
                     .map_err(|e| map_sqlite_error(e, "list_contributions prepare"))?;
@@ -948,10 +932,7 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                     .map_err(|e| map_sqlite_error(e, "list_contributions query"))?;
                 let out: Result<Vec<_>, _> = rows.collect();
                 out.map_err(|e| map_sqlite_error(e, "list_contributions collect"))
-            },
-        )
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))??;
+            })()?;
 
         let mut items: Vec<ContributionEnvelope> = Vec::with_capacity(rows_out.len());
         for (
@@ -1073,9 +1054,9 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         );
 
         let conn = self.conn.clone();
-        let rows_out = tokio::task::spawn_blocking(
+        let rows_out = (
             move || -> Result<Vec<(String, Option<String>, String, String, String, String, String, String)>, Error> {
-                let guard = conn.blocking_lock();
+                let guard = conn.lock();
                 let mut stmt = guard
                     .prepare(&sql)
                     .map_err(|e| map_sqlite_error(e, "list_votes prepare"))?;
@@ -1095,10 +1076,7 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                     .map_err(|e| map_sqlite_error(e, "list_votes query"))?;
                 let out: Result<Vec<_>, _> = rows.collect();
                 out.map_err(|e| map_sqlite_error(e, "list_votes collect"))
-            },
-        )
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))??;
+            })()?;
 
         let mut items: Vec<VoteEnvelope> = Vec::with_capacity(rows_out.len());
         for (
@@ -1163,9 +1141,9 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         let language_in = language.to_owned();
         let subject_in = subject.to_owned();
         let conn = self.conn.clone();
-        let raw_opt = tokio::task::spawn_blocking(
+        let raw_opt = (
             move || -> Result<Option<(String, String, String, String, f64, Option<String>, String, String)>, Error> {
-                let guard = conn.blocking_lock();
+                let guard = conn.lock();
                 guard
                     .query_row(
                         "SELECT contributor_id, domain, language, subject, balance, \
@@ -1189,10 +1167,7 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                     )
                     .optional()
                     .map_err(|e| map_sqlite_error(e, "get_credits_ledger"))
-            },
-        )
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))??;
+            })()?;
 
         match raw_opt {
             None => Ok(None),
@@ -1228,9 +1203,9 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         let domain_in = domain.to_owned();
         let language_in = language.to_owned();
         let conn = self.conn.clone();
-        let raw_opt = tokio::task::spawn_blocking(
+        let raw_opt = (
             move || -> Result<Option<(String, String, String, f64, bool, String, Option<String>, String)>, Error> {
-                let guard = conn.blocking_lock();
+                let guard = conn.lock();
                 guard
                     .query_row(
                         "SELECT contributor_id, domain, language, expertise, is_active, \
@@ -1253,10 +1228,7 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                     )
                     .optional()
                     .map_err(|e| map_sqlite_error(e, "get_expertise_ledger"))
-            },
-        )
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))??;
+            })()?;
 
         match raw_opt {
             None => Ok(None),
@@ -1333,8 +1305,8 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         let transport = attestation.transport_id.as_str().to_owned();
         let conn = self.conn.clone();
 
-        tokio::task::spawn_blocking(move || -> Result<(), Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<(), Error> {
+            let guard = conn.lock();
             // `INSERT OR IGNORE` collapses the (announcement_id,
             // peer_key_id) PK conflict to a no-op — the idempotent
             // replay path per FSD §3.2.1.
@@ -1373,9 +1345,7 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                     Error::Backend(format!("put_delivery_attestation: {e}"))
                 })?;
             Ok(())
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn list_delivery_attestations(
@@ -1386,9 +1356,9 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         let id_str = announcement_uuid.to_string();
         let conn = self.conn.clone();
 
-        let rows = tokio::task::spawn_blocking(
+        let rows = (
             move || -> Result<Vec<(String, Vec<u8>, String, String, String, String, Vec<u8>, Option<Vec<u8>>)>, Error> {
-                let guard = conn.blocking_lock();
+                let guard = conn.lock();
                 let mut stmt = guard
                     .prepare(
                         "SELECT announcement_id, announcement_canonical_hash, peer_key_id, \
@@ -1415,10 +1385,7 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                     .map_err(|e| map_sqlite_error(e, "list_delivery_attestations query"))?;
                 let out: Result<Vec<_>, _> = rows.collect();
                 out.map_err(|e| map_sqlite_error(e, "list_delivery_attestations collect"))
-            },
-        )
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))??;
+            })()?;
 
         let mut out = Vec::with_capacity(rows.len());
         for (
@@ -1460,8 +1427,8 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         let id_str = announcement_uuid.to_string();
         let conn = self.conn.clone();
 
-        tokio::task::spawn_blocking(move || -> Result<u64, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<u64, Error> {
+            let guard = conn.lock();
             let n: i64 = guard
                 .query_row(
                     "SELECT COUNT(*) FROM cirisnode_federation_delivery_attestations \
@@ -1471,9 +1438,7 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "count_delivery_attestations"))?;
             Ok(u64::try_from(n).unwrap_or(0))
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     // ── Media-sharing reads (v3.6.0, CIRISPersist#134) ─────────────
@@ -1484,8 +1449,8 @@ impl NodeCoreService for SqliteNodeCoreBackend {
     ) -> Result<Vec<ContributionEnvelope>, Error> {
         let sha = content_sha256.to_owned();
         let conn = self.conn.clone();
-        let rows = tokio::task::spawn_blocking(move || -> Result<Vec<ContributionRow>, Error> {
-            let guard = conn.blocking_lock();
+        let rows = (move || -> Result<Vec<ContributionRow>, Error> {
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare(
                     "SELECT contribution_id, contribution_type, domain, language, subject_kind, \
@@ -1501,9 +1466,7 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                 .map_err(|e| map_sqlite_error(e, "list_takedowns_for query"))?;
             let out: Result<Vec<_>, _> = rows.collect();
             out.map_err(|e| map_sqlite_error(e, "list_takedowns_for collect"))
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))??;
+        })()?;
         rows.into_iter().map(materialize_contribution).collect()
     }
 
@@ -1513,8 +1476,8 @@ impl NodeCoreService for SqliteNodeCoreBackend {
     ) -> Result<Vec<ContributionEnvelope>, Error> {
         let recipient = recipient_key_id.to_owned();
         let conn = self.conn.clone();
-        let rows = tokio::task::spawn_blocking(move || -> Result<Vec<ContributionRow>, Error> {
-            let guard = conn.blocking_lock();
+        let rows = (move || -> Result<Vec<ContributionRow>, Error> {
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare(
                     "SELECT contribution_id, contribution_type, domain, language, subject_kind, \
@@ -1530,9 +1493,7 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                 .map_err(|e| map_sqlite_error(e, "list_key_grants_for query"))?;
             let out: Result<Vec<_>, _> = rows.collect();
             out.map_err(|e| map_sqlite_error(e, "list_key_grants_for collect"))
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))??;
+        })()?;
         rows.into_iter().map(materialize_contribution).collect()
     }
 
@@ -1544,8 +1505,8 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         let sha = content_sha256.to_owned();
         let recipient = recipient_key_id.to_owned();
         let conn = self.conn.clone();
-        let rows = tokio::task::spawn_blocking(move || -> Result<Vec<ContributionRow>, Error> {
-            let guard = conn.blocking_lock();
+        let rows = (move || -> Result<Vec<ContributionRow>, Error> {
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare(
                     "SELECT contribution_id, contribution_type, domain, language, subject_kind, \
@@ -1562,9 +1523,7 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                 .map_err(|e| map_sqlite_error(e, "list_key_grants_for_content query"))?;
             let out: Result<Vec<_>, _> = rows.collect();
             out.map_err(|e| map_sqlite_error(e, "list_key_grants_for_content collect"))
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))??;
+        })()?;
         rows.into_iter().map(materialize_contribution).collect()
     }
 
@@ -1580,32 +1539,28 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         // is extended by the prior contribution_id.
         let actor = actor_key_id.to_owned();
         let conn = self.conn.clone();
-        let priors = tokio::task::spawn_blocking(
-            move || -> Result<Vec<(String, String, String, String)>, Error> {
-                let guard = conn.blocking_lock();
-                let mut stmt = guard
-                    .prepare(
-                        "SELECT contribution_id, domain, language, payload \
+        let priors = (move || -> Result<Vec<(String, String, String, String)>, Error> {
+            let guard = conn.lock();
+            let mut stmt = guard
+                .prepare(
+                    "SELECT contribution_id, domain, language, payload \
                          FROM cirisnode_contributions \
                          WHERE subject_kind = 'key_grant' AND author_id = ?1",
-                    )
-                    .map_err(|e| map_sqlite_error(e, "retire_key_grants list prepare"))?;
-                let rows = stmt
-                    .query_map([actor], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                        ))
-                    })
-                    .map_err(|e| map_sqlite_error(e, "retire_key_grants list query"))?;
-                let out: Result<Vec<_>, _> = rows.collect();
-                out.map_err(|e| map_sqlite_error(e, "retire_key_grants list collect"))
-            },
-        )
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))??;
+                )
+                .map_err(|e| map_sqlite_error(e, "retire_key_grants list prepare"))?;
+            let rows = stmt
+                .query_map([actor], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(|e| map_sqlite_error(e, "retire_key_grants list query"))?;
+            let out: Result<Vec<_>, _> = rows.collect();
+            out.map_err(|e| map_sqlite_error(e, "retire_key_grants list collect"))
+        })()?;
 
         let mut report = super::RetireKeyGrantsReport {
             grants_seen: priors.len(),
@@ -3143,8 +3098,8 @@ mod tests {
     async fn sqlite_v054_trigger_rejects_mismatched_takedown_columns() {
         let (backend, _cn) = fresh_backend().await;
         let conn = backend.conn_handle();
-        let err = tokio::task::spawn_blocking(move || -> rusqlite::Result<usize> {
-            let guard = conn.blocking_lock();
+        let err = (move || -> rusqlite::Result<usize> {
+            let guard = conn.lock();
             guard.execute(
                 "INSERT INTO cirisnode_contributions (\
                     contribution_id, contribution_type, domain, language, subject_kind, \
@@ -3155,9 +3110,7 @@ mod tests {
                            '2026-01-01T00:00:00Z', 'sig', 'a', 1, 'h', 'dmca_512')",
                 [],
             )
-        })
-        .await
-        .unwrap()
+        })()
         .unwrap_err();
         let detail = err.to_string();
         assert!(
@@ -3172,8 +3125,8 @@ mod tests {
     async fn sqlite_v054_trigger_rejects_mismatched_key_grant_columns() {
         let (backend, _cn) = fresh_backend().await;
         let conn = backend.conn_handle();
-        let err = tokio::task::spawn_blocking(move || -> rusqlite::Result<usize> {
-            let guard = conn.blocking_lock();
+        let err = (move || -> rusqlite::Result<usize> {
+            let guard = conn.lock();
             guard.execute(
                 "INSERT INTO cirisnode_contributions (\
                     contribution_id, contribution_type, domain, language, subject_kind, \
@@ -3184,9 +3137,7 @@ mod tests {
                            '2026-01-01T00:00:00Z', 'sig', 'a', 1, 'h', 'rec-1')",
                 [],
             )
-        })
-        .await
-        .unwrap()
+        })()
         .unwrap_err();
         let detail = err.to_string();
         assert!(

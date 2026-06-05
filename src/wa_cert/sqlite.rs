@@ -11,7 +11,7 @@
 //!                                     immediate-mode FK enforcement
 //!                                     with PRAGMA foreign_keys=ON)
 //!
-//! Threading: `tokio::task::spawn_blocking` + `conn.blocking_lock()`
+//! Threading: `tokio::task::spawn_blocking` + `conn.lock()`
 //! per the existing pattern.
 //!
 //! `upsert_wa_cert` overwrites every column except `wa_id` + `created`
@@ -25,12 +25,19 @@
 //! constraint share the same name with the persist-side rename
 //! convention (`cirislens_` prefix instead of the agent's bare
 //! `wa_cert`).
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
 
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
-use tokio::sync::Mutex;
 
 use super::service::WaCertService;
 use super::types::{TokenType, WaCert, WaRole};
@@ -247,8 +254,8 @@ impl WaCertService for SqliteWaCertBackend {
         let active_int: i64 = if cert.active { 1 } else { 0 };
 
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), Error> {
-            let mut guard = conn.blocking_lock();
+        (move || -> Result<(), Error> {
+            let mut guard = conn.lock();
             let tx = guard
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|e| map_sqlite_error(e, "upsert_wa_cert begin"))?;
@@ -313,9 +320,7 @@ impl WaCertService for SqliteWaCertBackend {
             tx.commit()
                 .map_err(|e| map_sqlite_error(e, "upsert_wa_cert commit"))?;
             Ok(())
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn get_wa_cert(&self, wa_id: &str) -> Result<Option<WaCert>, Error> {
@@ -324,8 +329,8 @@ impl WaCertService for SqliteWaCertBackend {
         }
         let wa_id_owned = wa_id.to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Option<WaCert>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Option<WaCert>, Error> {
+            let guard = conn.lock();
             let row_opt = guard
                 .query_row(
                     &format!("SELECT {SELECT_COLUMNS} FROM cirislens_wa_cert WHERE wa_id = ?1"),
@@ -338,9 +343,7 @@ impl WaCertService for SqliteWaCertBackend {
                 None => Ok(None),
                 Some(r) => Ok(Some(r?)),
             }
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn get_by_kid(&self, jwt_kid: &str) -> Result<Option<WaCert>, Error> {
@@ -349,8 +352,8 @@ impl WaCertService for SqliteWaCertBackend {
         }
         let kid_owned = jwt_kid.to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Option<WaCert>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Option<WaCert>, Error> {
+            let guard = conn.lock();
             let row_opt = guard
                 .query_row(
                     &format!("SELECT {SELECT_COLUMNS} FROM cirislens_wa_cert WHERE jwt_kid = ?1"),
@@ -363,9 +366,7 @@ impl WaCertService for SqliteWaCertBackend {
                 None => Ok(None),
                 Some(r) => Ok(Some(r?)),
             }
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn get_by_oauth(
@@ -382,8 +383,8 @@ impl WaCertService for SqliteWaCertBackend {
         let provider_owned = oauth_provider.to_owned();
         let ext_owned = oauth_external_id.to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Option<WaCert>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Option<WaCert>, Error> {
+            let guard = conn.lock();
             let row_opt = guard
                 .query_row(
                     &format!(
@@ -399,9 +400,7 @@ impl WaCertService for SqliteWaCertBackend {
                 None => Ok(None),
                 Some(r) => Ok(Some(r?)),
             }
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn list_by_role(&self, role: WaRole, limit: i64) -> Result<Vec<WaCert>, Error> {
@@ -412,8 +411,8 @@ impl WaCertService for SqliteWaCertBackend {
         }
         let role_str = role.as_sql_str().to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<WaCert>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Vec<WaCert>, Error> {
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare(&format!(
                     "SELECT {SELECT_COLUMNS} FROM cirislens_wa_cert \
@@ -430,9 +429,7 @@ impl WaCertService for SqliteWaCertBackend {
                 items.push(r.map_err(|e| map_sqlite_error(e, "list_by_role row"))??);
             }
             Ok(items)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn set_active(&self, wa_id: &str, active: bool) -> Result<bool, Error> {
@@ -442,8 +439,8 @@ impl WaCertService for SqliteWaCertBackend {
         let wa_id_owned = wa_id.to_owned();
         let active_int: i64 = if active { 1 } else { 0 };
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<bool, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<bool, Error> {
+            let guard = conn.lock();
             let changed = guard
                 .execute(
                     "UPDATE cirislens_wa_cert SET active = ?1 WHERE wa_id = ?2",
@@ -451,9 +448,7 @@ impl WaCertService for SqliteWaCertBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "set_active"))?;
             Ok(changed > 0)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn update_last_login(
@@ -467,8 +462,8 @@ impl WaCertService for SqliteWaCertBackend {
         let wa_id_owned = wa_id.to_owned();
         let login_str = fmt_datetime(login_time);
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<bool, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<bool, Error> {
+            let guard = conn.lock();
             let changed = guard
                 .execute(
                     "UPDATE cirislens_wa_cert SET last_login = ?1 WHERE wa_id = ?2",
@@ -476,9 +471,7 @@ impl WaCertService for SqliteWaCertBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "update_last_login"))?;
             Ok(changed > 0)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 }
 
@@ -530,15 +523,13 @@ mod tests {
 
     async fn fk_pragma_on(b: &SqliteBackend) -> bool {
         let conn = b.conn_handle();
-        tokio::task::spawn_blocking(move || -> bool {
-            let guard = conn.blocking_lock();
+        (move || -> bool {
+            let guard = conn.lock();
             guard
                 .query_row("PRAGMA foreign_keys", params![], |row| row.get::<_, i64>(0))
                 .map(|v| v == 1)
                 .unwrap_or(false)
-        })
-        .await
-        .unwrap()
+        })()
     }
 
     #[tokio::test]
@@ -795,8 +786,8 @@ mod tests {
     async fn role_check_rejects_unknown_value() {
         let (b, _svc) = fresh_backend().await;
         let conn = b.conn_handle();
-        let res = tokio::task::spawn_blocking(move || -> Result<usize, rusqlite::Error> {
-            let guard = conn.blocking_lock();
+        let res = (move || -> Result<usize, rusqlite::Error> {
+            let guard = conn.lock();
             guard.execute(
                 "INSERT INTO cirislens_wa_cert (\
                     wa_id, name, role, pubkey, jwt_kid, scopes, token_type, \
@@ -805,9 +796,7 @@ mod tests {
                            '2026-01-01T00:00:00Z', 0, 1)",
                 params![],
             )
-        })
-        .await
-        .unwrap();
+        })();
         assert!(res.is_err(), "CHECK should reject 'admin'");
     }
 
@@ -815,8 +804,8 @@ mod tests {
     async fn token_type_check_rejects_unknown_value() {
         let (b, _svc) = fresh_backend().await;
         let conn = b.conn_handle();
-        let res = tokio::task::spawn_blocking(move || -> Result<usize, rusqlite::Error> {
-            let guard = conn.blocking_lock();
+        let res = (move || -> Result<usize, rusqlite::Error> {
+            let guard = conn.lock();
             guard.execute(
                 "INSERT INTO cirislens_wa_cert (\
                     wa_id, name, role, pubkey, jwt_kid, scopes, token_type, \
@@ -825,9 +814,7 @@ mod tests {
                            '2026-01-01T00:00:00Z', 0, 1)",
                 params![],
             )
-        })
-        .await
-        .unwrap();
+        })();
         assert!(res.is_err(), "CHECK should reject 'jwt' token_type");
     }
 

@@ -40,6 +40,13 @@
 //!   — the same surface Phase G's "current_sth" read API will use.
 //!   See the module rustdoc on `crate::audit::service` for the
 //!   atomicity rationale.
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -366,8 +373,8 @@ mod sqlite_tests {
     async fn seed_federation_key(audit: &SqliteAuditBackend, key_id: &str) {
         let conn = audit.conn_handle();
         let key_id = key_id.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
+        (move || {
+            let conn = conn.lock();
             conn.execute(
                 "INSERT OR IGNORE INTO federation_keys (\
                     key_id, pubkey_ed25519_base64, algorithm, \
@@ -381,9 +388,7 @@ mod sqlite_tests {
                 rusqlite::params![key_id],
             )
             .unwrap();
-        })
-        .await
-        .unwrap();
+        })();
     }
 
     /// v1.5.0 Phase E happy path: grant_trust returns a receipt with
@@ -507,34 +512,31 @@ mod sqlite_tests {
 
         let conn = audit.conn_handle();
         let tenant_for_query = tenant.clone();
-        let (leaves, sth_rows, sth_tree_size): (i64, i64, i64) =
-            tokio::task::spawn_blocking(move || {
-                let conn = conn.blocking_lock();
-                let leaves: i64 = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM merkle_leaves WHERE tenant_id = ?1",
-                        rusqlite::params![tenant_for_query],
-                        |row| row.get(0),
-                    )
-                    .unwrap();
-                let sth_rows: i64 = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM merkle_sth_log WHERE tenant_id = ?1",
-                        rusqlite::params![tenant_for_query],
-                        |row| row.get(0),
-                    )
-                    .unwrap();
-                let max_size: i64 = conn
-                    .query_row(
-                        "SELECT MAX(tree_size) FROM merkle_sth_log WHERE tenant_id = ?1",
-                        rusqlite::params![tenant_for_query],
-                        |row| row.get(0),
-                    )
-                    .unwrap();
-                (leaves, sth_rows, max_size)
-            })
-            .await
-            .unwrap();
+        let (leaves, sth_rows, sth_tree_size): (i64, i64, i64) = (move || {
+            let conn = conn.lock();
+            let leaves: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM merkle_leaves WHERE tenant_id = ?1",
+                    rusqlite::params![tenant_for_query],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let sth_rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM merkle_sth_log WHERE tenant_id = ?1",
+                    rusqlite::params![tenant_for_query],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let max_size: i64 = conn
+                .query_row(
+                    "SELECT MAX(tree_size) FROM merkle_sth_log WHERE tenant_id = ?1",
+                    rusqlite::params![tenant_for_query],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (leaves, sth_rows, max_size)
+        })();
         assert_eq!(leaves, 1);
         assert_eq!(sth_rows, 1);
         assert_eq!(
@@ -574,29 +576,26 @@ mod sqlite_tests {
         let conn = audit.conn_handle();
         let grantee_for_query = grantee_b64.clone();
         let granter_for_query = granter_b64.clone();
-        let row: Option<(String, String, String, String, Option<String>)> =
-            tokio::task::spawn_blocking(move || {
-                let conn = conn.blocking_lock();
-                conn.query_row(
-                    "SELECT grantee_key, granter_key, purpose, scope, revoked_at \
+        let row: Option<(String, String, String, String, Option<String>)> = (move || {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT grantee_key, granter_key, purpose, scope, revoked_at \
                      FROM federation_trust_grants \
                      WHERE grantee_key = ?1 AND granter_key = ?2",
-                    rusqlite::params![grantee_for_query, granter_for_query],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                        ))
-                    },
-                )
-                .optional()
-                .unwrap()
-            })
-            .await
-            .unwrap();
+                rusqlite::params![grantee_for_query, granter_for_query],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .unwrap()
+        })();
         let row = row.expect("projection row materialized");
         assert_eq!(row.0, grantee_b64);
         assert_eq!(row.1, granter_b64);
@@ -707,21 +706,18 @@ mod sqlite_tests {
         let conn = audit.conn_handle();
         let grantee_for_query = grantee_b64.clone();
         let granter_for_query = granter_b64.clone();
-        let (revoked_at, revoked_by): (Option<String>, Option<String>) =
-            tokio::task::spawn_blocking(move || {
-                let conn = conn.blocking_lock();
-                conn.query_row(
-                    "SELECT revoked_at, revoked_by \
+        let (revoked_at, revoked_by): (Option<String>, Option<String>) = (move || {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT revoked_at, revoked_by \
                      FROM federation_trust_grants \
                      WHERE grantee_key = ?1 AND granter_key = ?2 \
                        AND purpose = 'deferral' AND scope = 'medical_deferral'",
-                    rusqlite::params![grantee_for_query, granter_for_query],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .unwrap()
-            })
-            .await
-            .unwrap();
+                rusqlite::params![grantee_for_query, granter_for_query],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        })();
         assert!(revoked_at.is_some(), "revoked_at populated");
         assert_eq!(
             revoked_by.as_deref(),

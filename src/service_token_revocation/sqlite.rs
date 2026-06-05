@@ -6,14 +6,21 @@
 //!   TIMESTAMPTZ                  → TEXT (RFC 3339 microseconds, Z)
 //!   ON CONFLICT DO NOTHING       → identical syntax
 //!
-//! Threading: `tokio::task::spawn_blocking` + `conn.blocking_lock()`
+//! Threading: `tokio::task::spawn_blocking` + `conn.lock()`
 //! per the existing pattern.
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
 
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
-use tokio::sync::Mutex;
 
 use super::service::ServiceTokenRevocationService;
 use super::types::RevokedServiceToken;
@@ -105,8 +112,8 @@ impl ServiceTokenRevocationService for SqliteServiceTokenRevocationBackend {
         validate_revocation(&revocation)?;
         let revoked_at_str = fmt_datetime(revocation.revoked_at);
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<(), Error> {
+            let guard = conn.lock();
             guard
                 .execute(
                     "INSERT INTO cirislens_revoked_service_tokens (\
@@ -122,15 +129,13 @@ impl ServiceTokenRevocationService for SqliteServiceTokenRevocationBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "record_revocation"))?;
             Ok(())
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn list_revocations(&self) -> Result<Vec<RevokedServiceToken>, Error> {
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<RevokedServiceToken>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Vec<RevokedServiceToken>, Error> {
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare(
                     "SELECT token_hash, revoked_at, revoked_by, reason \
@@ -145,9 +150,7 @@ impl ServiceTokenRevocationService for SqliteServiceTokenRevocationBackend {
                 out.push(r.map_err(|e| map_sqlite_error(e, "list_revocations row"))??);
             }
             Ok(out)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn check_revocation(
@@ -159,8 +162,8 @@ impl ServiceTokenRevocationService for SqliteServiceTokenRevocationBackend {
         }
         let token_hash = token_hash.to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Option<RevokedServiceToken>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Option<RevokedServiceToken>, Error> {
+            let guard = conn.lock();
             let row_opt = guard
                 .query_row(
                     "SELECT token_hash, revoked_at, revoked_by, reason \
@@ -174,9 +177,7 @@ impl ServiceTokenRevocationService for SqliteServiceTokenRevocationBackend {
                 None => Ok(None),
                 Some(r) => Ok(Some(r?)),
             }
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 }
 

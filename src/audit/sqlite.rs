@@ -15,11 +15,18 @@
 //! `PRAGMA busy_timeout = 30000` set in `SqliteBackend` connection
 //! init, concurrent writers wait up to 30s rather than failing
 //! fast — sufficient for the audit-log write workload.
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
 
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
-use tokio::sync::Mutex;
 
 use super::service::AuditService;
 use super::types::{
@@ -205,8 +212,8 @@ async fn project_trust_grant_sqlite(
     let new_grant_id = Uuid::new_v4().to_string();
 
     let conn = backend.conn_handle();
-    tokio::task::spawn_blocking(move || -> Result<(), Error> {
-        let guard = conn.blocking_lock();
+    (move || -> Result<(), Error> {
+        let guard = conn.lock();
         // Emulate the Postgres revocation rule:
         //   revoked_at = CASE WHEN expires_at <= NOW() THEN NOW()
         //                ELSE NULL END
@@ -264,9 +271,7 @@ async fn project_trust_grant_sqlite(
             )
             .map_err(|e| Error::TrustGrant(format!("UPSERT federation_trust_grants: {e}")))?;
         Ok(())
-    })
-    .await
-    .map_err(|e| Error::TrustGrant(format!("spawn_blocking join: {e}")))??;
+    })()?;
 
     Ok(())
 }
@@ -384,9 +389,9 @@ impl AuditService for SqliteAuditBackend {
         // copy. The clone is cheap (small AuditEntry; payload is
         // JSON Value).
         let entry_for_chain = entry.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), Error> {
+        (move || -> Result<(), Error> {
             let entry = entry_for_chain;
-            let mut guard = conn.blocking_lock();
+            let mut guard = conn.lock();
             // BEGIN IMMEDIATE acquires the database-level RESERVED
             // lock — coarser than Postgres FOR UPDATE but combined
             // with PRAGMA busy_timeout=30000 (v0.8.4) it serializes
@@ -469,9 +474,7 @@ impl AuditService for SqliteAuditBackend {
             tx.commit()
                 .map_err(|e| map_sqlite_error(e, "audit record commit"))?;
             Ok(())
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))??;
+        })()?;
 
         // v1.5.0 Phase C — Merkle transparency hook (SQLite parity).
         // Runs only when a local signer is installed; otherwise this
@@ -564,8 +567,8 @@ impl AuditService for SqliteAuditBackend {
         );
         let conn = self.conn.clone();
         let limit_usize = limit as usize;
-        tokio::task::spawn_blocking(move || -> Result<AuditListPage, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<AuditListPage, Error> {
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare(&sql)
                 .map_err(|e| map_sqlite_error(e, "list_entries prepare"))?;
@@ -586,9 +589,7 @@ impl AuditService for SqliteAuditBackend {
                 None
             };
             Ok(AuditListPage { items, next_cursor })
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn verify_chain(
@@ -605,8 +606,8 @@ impl AuditService for SqliteAuditBackend {
         }
         let conn = self.conn.clone();
         let tenant_id = tenant_id.to_owned();
-        tokio::task::spawn_blocking(move || -> Result<ChainVerification, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<ChainVerification, Error> {
+            let guard = conn.lock();
 
             let to_seq_resolved: i64 = match to_sequence {
                 Some(n) => {
@@ -764,9 +765,7 @@ impl AuditService for SqliteAuditBackend {
                 entries_walked: walked,
                 outcome: ChainVerifyOutcome::Ok,
             })
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn try_claim_event(
@@ -815,9 +814,9 @@ impl AuditService for SqliteAuditBackend {
         // Phase C: clone the entry so the Merkle hook below can use it
         // after the chain-commit closure consumes its copy.
         let entry_for_chain = entry.clone();
-        let result = tokio::task::spawn_blocking(move || -> Result<ClaimResult<AuditEventRef>, Error> {
+        let result = (move || -> Result<ClaimResult<AuditEventRef>, Error> {
             let entry = entry_for_chain;
-            let mut guard = conn.blocking_lock();
+            let mut guard = conn.lock();
             let tx = guard
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|e| map_sqlite_error(e, "try_claim_event begin tx"))?;
@@ -988,9 +987,7 @@ impl AuditService for SqliteAuditBackend {
             tx.commit()
                 .map_err(|e| map_sqlite_error(e, "try_claim_event commit"))?;
             Ok(result)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))??;
+        })()?;
 
         // v1.5.0 Phase C — Merkle hook on the newly-stored path only
         // (same gating rule as the PG impl). On `AlreadyClaimed` the
@@ -1033,8 +1030,8 @@ impl AuditService for SqliteAuditBackend {
         let start = filter.time_window_start.map(fmt_datetime);
         let end = filter.time_window_end.map(fmt_datetime);
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<AuditEntry>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Vec<AuditEntry>, Error> {
+            let guard = conn.lock();
             // json_extract returns NULL when the key is absent and a
             // TEXT value when present (payload is stored as TEXT JSON
             // — see V014 SQLite). The equality compare against a
@@ -1065,9 +1062,7 @@ impl AuditService for SqliteAuditBackend {
                 items.push(r.map_err(|e| map_sqlite_error(e, "query_by_correlation_id row"))??);
             }
             Ok(items)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn next_chain_position(
@@ -1079,8 +1074,8 @@ impl AuditService for SqliteAuditBackend {
         }
         let tenant_owned = tenant_id.to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<super::service::ChainPosition, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<super::service::ChainPosition, Error> {
+            let guard = conn.lock();
             let row_opt: Option<(i64, Vec<u8>)> = guard
                 .query_row(
                     "SELECT sequence_number, entry_hash FROM cirislens_audit_log \
@@ -1108,9 +1103,7 @@ impl AuditService for SqliteAuditBackend {
                     prev_hash: GENESIS_PREV_HASH,
                 })
             }
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn current_sth(
@@ -1153,7 +1146,7 @@ impl AuditService for SqliteAuditBackend {
         let tenant_owned = tenant_id.to_owned();
         let jh: tokio::task::JoinHandle<Result<Option<String>, rusqlite::Error>> =
             tokio::task::spawn_blocking(move || {
-                let guard = conn.blocking_lock();
+                let guard = conn.lock();
                 guard
                     .query_row(
                         "SELECT grant_id FROM federation_trust_grants \
@@ -1190,7 +1183,7 @@ impl AuditService for SqliteAuditBackend {
         let jh: tokio::task::JoinHandle<
             Result<Option<crate::federation::trust_grant::TrustGrantRow>, Error>,
         > = tokio::task::spawn_blocking(move || {
-            let guard = conn.blocking_lock();
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare(
                     "SELECT grant_id, grantee_key, granter_key, purpose, scope, \
@@ -1250,7 +1243,7 @@ impl AuditService for SqliteAuditBackend {
             }
             sql.push_str(" ORDER BY granted_at DESC, grant_id");
 
-            let guard = conn.blocking_lock();
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare(&sql)
                 .map_err(|e| Error::Backend(format!("prepare lookup_trust_grant: {e}")))?;
@@ -1335,7 +1328,7 @@ impl AuditService for SqliteAuditBackend {
             }
             sql.push_str(" ORDER BY granted_at DESC, grant_id");
 
-            let guard = conn.blocking_lock();
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare(&sql)
                 .map_err(|e| Error::Backend(format!("prepare list_trust_grants: {e}")))?;
@@ -1364,7 +1357,7 @@ impl AuditService for SqliteAuditBackend {
         let tenant = tenant_id.to_owned();
         let jh: tokio::task::JoinHandle<Result<Option<Vec<u8>>, rusqlite::Error>> =
             tokio::task::spawn_blocking(move || {
-                let guard = conn.blocking_lock();
+                let guard = conn.lock();
                 guard
                     .query_row(
                         "SELECT canonical_bytes FROM merkle_leaves \
@@ -1397,7 +1390,7 @@ impl AuditService for SqliteAuditBackend {
         let tenant_for_lookup = tenant.clone();
         let leaf_idx_opt: tokio::task::JoinHandle<Result<Option<i64>, rusqlite::Error>> =
             tokio::task::spawn_blocking(move || {
-                let guard = conn.blocking_lock();
+                let guard = conn.lock();
                 guard
                     .query_row(
                         "SELECT leaf_index FROM merkle_leaves \
@@ -1488,7 +1481,7 @@ impl AuditService for SqliteAuditBackend {
         let local_pubkey = local_pubkey.to_owned();
         let jh: tokio::task::JoinHandle<Result<Vec<V020TrustRow>, Error>> =
             tokio::task::spawn_blocking(move || {
-                let guard = conn.blocking_lock();
+                let guard = conn.lock();
                 let mut stmt = guard
                     .prepare(
                         "SELECT key_id, pubkey_ed25519_base64, trust_type, \
@@ -2078,8 +2071,8 @@ mod tests {
     async fn count_merkle_rows(audit: &SqliteAuditBackend, tenant: &str) -> (i64, i64) {
         let conn = audit.conn_handle();
         let tenant = tenant.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
+        (move || {
+            let conn = conn.lock();
             let leaves: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM merkle_leaves WHERE tenant_id = ?1",
@@ -2095,9 +2088,7 @@ mod tests {
                 )
                 .unwrap();
             (leaves, sth)
-        })
-        .await
-        .unwrap()
+        })()
     }
 
     /// v1.5.0 Phase C — when no signer is installed (default),
@@ -2183,8 +2174,8 @@ mod tests {
         // grows by 1 per record_entry call.
         let conn = audit.conn_handle();
         let tenant_owned = tenant.clone();
-        let sizes: Vec<i64> = tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
+        let sizes: Vec<i64> = (move || {
+            let conn = conn.lock();
             let mut stmt = conn
                 .prepare("SELECT tree_size FROM merkle_sth_log WHERE tenant_id = ?1 ORDER BY tree_size ASC")
                 .unwrap();
@@ -2192,9 +2183,7 @@ mod tests {
                 .query_map(rusqlite::params![tenant_owned], |row| row.get::<_, i64>(0))
                 .unwrap();
             rows.map(|r| r.unwrap()).collect()
-        })
-        .await
-        .unwrap();
+        })();
         assert_eq!(sizes, vec![1, 2, 3]);
     }
 
@@ -2347,8 +2336,8 @@ mod tests {
     async fn seed_federation_key(audit: &SqliteAuditBackend, key_id: &str) {
         let conn = audit.conn_handle();
         let key_id = key_id.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
+        (move || {
+            let conn = conn.lock();
             conn.execute(
                 "INSERT OR IGNORE INTO federation_keys (\
                     key_id, pubkey_ed25519_base64, algorithm, \
@@ -2362,9 +2351,7 @@ mod tests {
                 rusqlite::params![key_id],
             )
             .unwrap();
-        })
-        .await
-        .unwrap();
+        })();
     }
 
     /// Build + sign a trust_grant audit entry. Mirrors `build_and_sign`
@@ -2436,8 +2423,8 @@ mod tests {
         let granter = granter.to_owned();
         let purpose = purpose.to_owned();
         let scope = scope.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
+        (move || {
+            let conn = conn.lock();
             conn.query_row(
                 "SELECT grant_id, grantee_key, granter_key, purpose, scope, \
                         granted_at, expires_at, revoked_at, revoked_by, \
@@ -2464,25 +2451,21 @@ mod tests {
             )
             .optional()
             .unwrap()
-        })
-        .await
-        .unwrap()
+        })()
     }
 
     async fn count_grants(audit: &SqliteAuditBackend, tenant: &str) -> i64 {
         let conn = audit.conn_handle();
         let tenant = tenant.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
+        (move || {
+            let conn = conn.lock();
             conn.query_row(
                 "SELECT COUNT(*) FROM federation_trust_grants WHERE tenant_id = ?1",
                 rusqlite::params![tenant],
                 |row| row.get::<_, i64>(0),
             )
             .unwrap()
-        })
-        .await
-        .unwrap()
+        })()
     }
 
     /// v1.5.0 Phase D — Non-trust-grant entries do NOT touch
@@ -2811,15 +2794,13 @@ mod tests {
         // tenants (UNIQUE constraint per FSD §3.6).
         let total: i64 = {
             let conn = audit.conn_handle();
-            tokio::task::spawn_blocking(move || {
-                let conn = conn.blocking_lock();
+            (move || {
+                let conn = conn.lock();
                 conn.query_row("SELECT COUNT(*) FROM federation_trust_grants", [], |r| {
                     r.get::<_, i64>(0)
                 })
                 .unwrap()
-            })
-            .await
-            .unwrap()
+            })()
         };
         assert_eq!(
             total, 1,

@@ -11,14 +11,21 @@
 //! liveness filter is a plain string comparison against
 //! `fmt_datetime(now)`.
 //!
-//! Threading: `tokio::task::spawn_blocking` + `conn.blocking_lock()`
+//! Threading: `tokio::task::spawn_blocking` + `conn.lock()`
 //! per the existing pattern.
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
 
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
+use parking_lot::Mutex;
 use rusqlite::{params, Connection};
-use tokio::sync::Mutex;
 
 use super::service::OccurrenceService;
 use super::types::OccurrenceRecord;
@@ -147,8 +154,8 @@ impl OccurrenceService for SqliteOccurrenceBackend {
         let expires_str = fmt_datetime(now + Duration::seconds(ttl_seconds));
         let metadata_str = encode_optional_json(&metadata)?;
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<(), Error> {
+            let guard = conn.lock();
             // Idempotent upsert: re-registering refreshes every
             // column; the TTL clock restarts from `now`.
             guard
@@ -174,9 +181,7 @@ impl OccurrenceService for SqliteOccurrenceBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "register_occurrence"))?;
             Ok(())
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn heartbeat_occurrence(
@@ -195,8 +200,8 @@ impl OccurrenceService for SqliteOccurrenceBackend {
         let now_str = fmt_datetime(now);
         let expires_str = fmt_datetime(now + Duration::seconds(ttl_seconds));
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<bool, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<bool, Error> {
+            let guard = conn.lock();
             let affected = guard
                 .execute(
                     "UPDATE cirislens_occurrence_registry \
@@ -206,9 +211,7 @@ impl OccurrenceService for SqliteOccurrenceBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "heartbeat_occurrence"))?;
             Ok(affected > 0)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn deregister_occurrence(&self, occurrence_id: &str) -> Result<bool, Error> {
@@ -217,8 +220,8 @@ impl OccurrenceService for SqliteOccurrenceBackend {
         }
         let occurrence_id = occurrence_id.to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<bool, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<bool, Error> {
+            let guard = conn.lock();
             let affected = guard
                 .execute(
                     "DELETE FROM cirislens_occurrence_registry WHERE occurrence_id = ?1",
@@ -226,9 +229,7 @@ impl OccurrenceService for SqliteOccurrenceBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "deregister_occurrence"))?;
             Ok(affected > 0)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn list_live_occurrences(&self, identity: &str) -> Result<Vec<OccurrenceRecord>, Error> {
@@ -238,8 +239,8 @@ impl OccurrenceService for SqliteOccurrenceBackend {
         let identity = identity.to_owned();
         let now_str = fmt_datetime(Utc::now());
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<OccurrenceRecord>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Vec<OccurrenceRecord>, Error> {
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare(
                     "SELECT occurrence_id, identity, registered_at, last_heartbeat, \
@@ -257,9 +258,7 @@ impl OccurrenceService for SqliteOccurrenceBackend {
                 out.push(r.map_err(|e| map_sqlite_error(e, "list_live_occurrences row"))??);
             }
             Ok(out)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 }
 

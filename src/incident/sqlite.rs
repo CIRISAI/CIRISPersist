@@ -3,11 +3,18 @@
 //! Mirrors v0.8.3 Postgres impl. JSONB-array correlation matching
 //! translates to `json_each(...)` joins instead of `?|` / `?&` / `?`
 //! operators. AV-55 state-machine + AV-56 bounds preserved.
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
 
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
-use tokio::sync::Mutex;
 
 use super::service::IncidentService;
 use super::types::{
@@ -222,8 +229,8 @@ impl IncidentService for SqliteIncidentBackend {
         let last_seen_str = fmt_datetime(incident.last_seen_at);
 
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<String, Error> {
-            let mut guard = conn.blocking_lock();
+        (move || -> Result<String, Error> {
+            let mut guard = conn.lock();
             let tx = guard
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|e| map_sqlite_error(e, "record_incident begin"))?;
@@ -314,9 +321,7 @@ impl IncidentService for SqliteIncidentBackend {
             tx.commit()
                 .map_err(|e| map_sqlite_error(e, "record_incident commit"))?;
             Ok(landed_id)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn transition_state(&self, transition: IncidentTransition) -> Result<(), Error> {
@@ -334,8 +339,8 @@ impl IncidentService for SqliteIncidentBackend {
         }
 
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), Error> {
-            let mut guard = conn.blocking_lock();
+        (move || -> Result<(), Error> {
+            let mut guard = conn.lock();
             let tx = guard
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|e| map_sqlite_error(e, "transition_state begin"))?;
@@ -417,9 +422,7 @@ impl IncidentService for SqliteIncidentBackend {
             tx.commit()
                 .map_err(|e| map_sqlite_error(e, "transition commit"))?;
             Ok(())
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn list_incidents(
@@ -502,8 +505,8 @@ impl IncidentService for SqliteIncidentBackend {
         );
         let conn = self.conn.clone();
         let limit_usize = limit as usize;
-        tokio::task::spawn_blocking(move || -> Result<IncidentListPage, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<IncidentListPage, Error> {
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare(&sql)
                 .map_err(|e| map_sqlite_error(e, "list_incidents prepare"))?;
@@ -524,9 +527,7 @@ impl IncidentService for SqliteIncidentBackend {
                 None
             };
             Ok(IncidentListPage { items, next_cursor })
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn correlate(&self, tenant_id: &str, key: &str) -> Result<Vec<IncidentRef>, Error> {
@@ -539,8 +540,8 @@ impl IncidentService for SqliteIncidentBackend {
         let conn = self.conn.clone();
         let tenant_id = tenant_id.to_owned();
         let key = key.to_owned();
-        tokio::task::spawn_blocking(move || -> Result<Vec<IncidentRef>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Vec<IncidentRef>, Error> {
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare(
                     "SELECT incident_id, severity, category, state, last_seen_at \
@@ -577,9 +578,7 @@ impl IncidentService for SqliteIncidentBackend {
                 });
             }
             Ok(out)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 }
 

@@ -6,19 +6,26 @@
 //!   TIMESTAMPTZ                            → TEXT (RFC 3339)
 //!   ON CONFLICT (ceremony_id) DO NOTHING   → INSERT OR IGNORE
 //!
-//! Threading: `tokio::task::spawn_blocking` + `conn.blocking_lock()`
+//! Threading: `tokio::task::spawn_blocking` + `conn.lock()`
 //! per the existing pattern.
 //!
 //! `record_ceremony` uses the same ClaimResult shape as the v1.5.14
 //! deferral_reports SQLite path: `INSERT OR IGNORE` followed by an
 //! in-transaction `SELECT` so the race-loser reads back the existing
 //! row.
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
 
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use rusqlite::{params, types::Value as SqlValue, Connection, OptionalExtension};
-use tokio::sync::Mutex;
 
 use super::service::CreationCeremonyService;
 use super::types::{CeremonyFilter, CeremonyStatus, CreationCeremony};
@@ -180,8 +187,8 @@ impl CreationCeremonyService for SqliteCreationCeremonyBackend {
 
         let conn = self.conn.clone();
         let (won, row): (bool, CreationCeremony) =
-            tokio::task::spawn_blocking(move || -> Result<(bool, CreationCeremony), Error> {
-                let mut guard = conn.blocking_lock();
+            (move || -> Result<(bool, CreationCeremony), Error> {
+                let mut guard = conn.lock();
                 let tx = guard
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(|e| map_sqlite_error(e, "record_ceremony begin"))?;
@@ -225,9 +232,7 @@ impl CreationCeremonyService for SqliteCreationCeremonyBackend {
                 tx.commit()
                     .map_err(|e| map_sqlite_error(e, "record_ceremony commit"))?;
                 Ok((won, row))
-            })
-            .await
-            .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))??;
+            })()?;
 
         if won {
             Ok(ClaimResult::Stored(row))
@@ -242,8 +247,8 @@ impl CreationCeremonyService for SqliteCreationCeremonyBackend {
         }
         let ceremony_id_owned = ceremony_id.to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Option<CreationCeremony>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Option<CreationCeremony>, Error> {
+            let guard = conn.lock();
             let row_opt = guard
                 .query_row(
                     &format!(
@@ -259,9 +264,7 @@ impl CreationCeremonyService for SqliteCreationCeremonyBackend {
                 None => Ok(None),
                 Some(r) => Ok(Some(r?)),
             }
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn list_ceremonies(
@@ -318,8 +321,8 @@ impl CreationCeremonyService for SqliteCreationCeremonyBackend {
              LIMIT ?{p_limit}"
         );
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<CreationCeremony>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Vec<CreationCeremony>, Error> {
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare(&sql)
                 .map_err(|e| map_sqlite_error(e, "list_ceremonies prepare"))?;
@@ -333,9 +336,7 @@ impl CreationCeremonyService for SqliteCreationCeremonyBackend {
                 items.push(r.map_err(|e| map_sqlite_error(e, "list_ceremonies row"))??);
             }
             Ok(items)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn update_ceremony_status(
@@ -349,8 +350,8 @@ impl CreationCeremonyService for SqliteCreationCeremonyBackend {
         let ceremony_id_owned = ceremony_id.to_owned();
         let status_str = new_status.as_sql_str().to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<bool, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<bool, Error> {
+            let guard = conn.lock();
             let changed = guard
                 .execute(
                     "UPDATE cirislens_creation_ceremonies SET \
@@ -360,9 +361,7 @@ impl CreationCeremonyService for SqliteCreationCeremonyBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "update_ceremony_status exec"))?;
             Ok(changed > 0)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 }
 
@@ -544,8 +543,8 @@ mod tests {
         let conn = b.conn_handle();
         let now = fmt_datetime(Utc::now());
         let cid = format!("ceremony-bad-{}", Uuid::new_v4().simple());
-        let res = tokio::task::spawn_blocking(move || {
-            let guard = conn.blocking_lock();
+        let res = (move || {
+            let guard = conn.lock();
             guard.execute(
                 "INSERT INTO cirislens_creation_ceremonies (\
                     ceremony_id, timestamp, creator_agent_id, creator_human_id, \
@@ -555,9 +554,7 @@ mod tests {
                            'just', 'ethics', ?3)",
                 params![cid, now, "WEIRD_STATUS"],
             )
-        })
-        .await
-        .unwrap();
+        })();
         assert!(
             res.is_err(),
             "CHECK on ceremony_status should reject unknown values"

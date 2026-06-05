@@ -66,6 +66,14 @@
 //! `federation_keys`-class row and is **outside** the
 //! recursive-provenance chain. Transport identities are never rooted
 //! here and never walked into the chain.
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
+// each closure's typed return signature load-bearing for error
 
 use std::collections::HashSet;
 
@@ -957,8 +965,8 @@ mod sqlite_conformance {
         // Now repoint scrub_key_id at a non-existent ghost with the
         // FK pragma disabled — representing legacy / FK-off data.
         let conn = backend.conn_handle();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
+        (move || {
+            let conn = conn.lock();
             conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
             conn.execute(
                 "UPDATE federation_keys SET scrub_key_id = 'ghost-parent' \
@@ -967,9 +975,7 @@ mod sqlite_conformance {
             )
             .unwrap();
             conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
-        })
-        .await
-        .unwrap();
+        })();
 
         let verdict = root_binding(&backend, "agent-leaf", &agent_k.pubkey_b64()).await;
         match verdict.rejection() {
@@ -1020,17 +1026,15 @@ mod sqlite_conformance {
         put(&backend, signed_record(&a, &a, primitive())).await;
         put(&backend, signed_record(&b, &a, primitive())).await;
         let conn = backend.conn_handle();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
+        (move || {
+            let conn = conn.lock();
             conn.execute(
                 "UPDATE federation_keys SET scrub_key_id = 'cycle-b' \
                  WHERE key_id = 'cycle-a'",
                 [],
             )
             .unwrap();
-        })
-        .await
-        .unwrap();
+        })();
 
         let verdict = root_binding(&backend, "cycle-a", &a.pubkey_b64()).await;
         assert!(

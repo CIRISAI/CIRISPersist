@@ -12,14 +12,21 @@
 //! shared `Arc<Mutex<Connection>>` serializes across the
 //! occurrences + in-process consumers sharing one Ed25519 identity.
 //!
-//! Threading: `tokio::task::spawn_blocking` + `conn.blocking_lock()`
+//! Threading: `tokio::task::spawn_blocking` + `conn.lock()`
 //! per the existing pattern.
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
 
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
-use tokio::sync::Mutex;
 
 use super::service::SequenceService;
 use super::Error;
@@ -77,8 +84,8 @@ impl SequenceService for SqliteSequenceBackend {
         let stream = stream.to_owned();
         let updated_at = fmt_datetime(Utc::now());
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<u64, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<u64, Error> {
+            let guard = conn.lock();
             // Atomic bump-and-return: a single UPSERT increments the
             // counter and RETURNs the new value. SQLite serializes
             // the write per-connection.
@@ -96,9 +103,7 @@ impl SequenceService for SqliteSequenceBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "next_sequence"))?;
             super::decode_sequence_value(value)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn peek_sequence(&self, identity: &str, stream: &str) -> Result<u64, Error> {
@@ -106,8 +111,8 @@ impl SequenceService for SqliteSequenceBackend {
         let identity = identity.to_owned();
         let stream = stream.to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<u64, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<u64, Error> {
+            let guard = conn.lock();
             let value_opt: Option<i64> = guard
                 .query_row(
                     "SELECT next_value FROM cirislens_identity_sequences \
@@ -118,9 +123,7 @@ impl SequenceService for SqliteSequenceBackend {
                 .optional()
                 .map_err(|e| map_sqlite_error(e, "peek_sequence"))?;
             value_opt.map_or(Ok(0), super::decode_sequence_value)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 }
 

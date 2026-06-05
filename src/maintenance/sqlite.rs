@@ -15,14 +15,22 @@
 //! `tokio::task::spawn_blocking` to keep the runtime responsive
 //! (the rusqlite `Connection` is `!Send` so we can't `.await`
 //! across it without the spawn_blocking).
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
+// each closure's typed return signature load-bearing for error
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use rusqlite::Connection;
-use tokio::sync::Mutex;
 
 use super::service::MaintenanceService;
 use super::types::{ArchiveReport, ArchiveWindow, MaintenanceReport, PruneReport, VacuumReport};
@@ -56,17 +64,15 @@ impl MaintenanceService for SqliteMaintenanceBackend {
     async fn vacuum_substrate(&self) -> Result<VacuumReport, Error> {
         let conn = self.conn.clone();
         let started = Instant::now();
-        tokio::task::spawn_blocking(move || -> Result<(), Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<(), Error> {
+            let guard = conn.lock();
             // VACUUM rebuilds the file; ANALYZE refreshes the stat1
             // tables. Run as a single batch so SQLite sees them
             // back-to-back without dropping the file lock.
             guard
                 .execute_batch("VACUUM; ANALYZE;")
                 .map_err(|e| map_sqlite_error(e, "VACUUM"))
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("vacuum spawn_blocking join: {e}")))??;
+        })()?;
         let elapsed_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
         Ok(VacuumReport {
             dialect: "sqlite".to_owned(),
@@ -87,8 +93,8 @@ impl MaintenanceService for SqliteMaintenanceBackend {
         };
 
         let conn = self.conn.clone();
-        let report = tokio::task::spawn_blocking(move || -> Result<ArchiveReport, Error> {
-            let guard = conn.blocking_lock();
+        let report = (move || -> Result<ArchiveReport, Error> {
+            let guard = conn.lock();
             let mut per_module: HashMap<String, usize> = HashMap::new();
             let mut total: usize = 0;
 
@@ -167,9 +173,7 @@ impl MaintenanceService for SqliteMaintenanceBackend {
                 per_module,
                 total_removed: total,
             })
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("archive spawn_blocking join: {e}")))??;
+        })()?;
         Ok(report)
     }
 
@@ -247,7 +251,7 @@ mod tests {
         let observed = Utc::now() - Duration::hours(2);
         let expires = Utc::now() - Duration::hours(1);
         {
-            let guard = conn.lock().await;
+            let guard = conn.lock();
             guard
                 .execute(
                     "INSERT INTO cirisgraph_telemetry_metrics (\
@@ -274,7 +278,7 @@ mod tests {
         assert_eq!(report.per_module.get("telemetry").copied(), Some(1));
         assert!(report.total_removed >= 1);
 
-        let guard = conn.lock().await;
+        let guard = conn.lock();
         let remaining: i64 = guard
             .query_row(
                 "SELECT COUNT(*) FROM cirisgraph_telemetry_metrics \
@@ -295,7 +299,7 @@ mod tests {
 
         let stale = Utc::now() - Duration::days(60);
         {
-            let guard = conn.lock().await;
+            let guard = conn.lock();
             guard
                 .execute(
                     "INSERT INTO cirislens_secrets_access_log (\
@@ -316,7 +320,7 @@ mod tests {
             Some(1)
         );
 
-        let guard = conn.lock().await;
+        let guard = conn.lock();
         let remaining: i64 = guard
             .query_row(
                 "SELECT COUNT(*) FROM cirislens_secrets_access_log \
@@ -340,7 +344,7 @@ mod tests {
         let stale_secrets = Utc::now() - Duration::days(60);
         let stale_incident = Utc::now() - Duration::days(180);
         {
-            let guard = conn.lock().await;
+            let guard = conn.lock();
             // 1 expired telemetry row.
             guard
                 .execute(

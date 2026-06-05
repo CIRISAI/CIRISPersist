@@ -33,7 +33,13 @@
 //!   already exposes (Phase D-E).
 //! - **No Engine wiring** for per-tenant log management (Phase C).
 //! - **No V021 backfill** (Phase F).
-
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
 #![allow(missing_docs)]
 
 use chrono::{DateTime, Utc};
@@ -491,9 +497,9 @@ mod sqlite_impl {
         AuditLeaf, DateTime, Handle, SignedTreeHead, TransparencyError, TransparencyStore, Utc,
     };
     use ciris_verify_core::transparency::TransparencyLeaf;
+    use parking_lot::Mutex;
     use rusqlite::{params, Connection, OptionalExtension};
     use std::sync::Arc;
-    use tokio::sync::Mutex;
 
     /// SQLite-backed `TransparencyStore<AuditLeaf>`.
     ///
@@ -560,8 +566,8 @@ mod sqlite_impl {
             let conn_arc = self.conn.clone();
 
             self.runtime.block_on(async move {
-                tokio::task::spawn_blocking(move || -> Result<u64, TransparencyError> {
-                    let mut guard = conn_arc.blocking_lock();
+                (move || -> Result<u64, TransparencyError> {
+                    let mut guard = conn_arc.lock();
                     // BEGIN IMMEDIATE serializes writers (RESERVED lock)
                     // — same pattern as `audit::sqlite`'s record_entry.
                     let tx = guard
@@ -592,9 +598,7 @@ mod sqlite_impl {
                     .map_err(|e| sq_storage_err("insert leaf", e))?;
                     tx.commit().map_err(|e| sq_storage_err("commit", e))?;
                     Ok(u64::try_from(leaf_index).unwrap_or(u64::MAX))
-                })
-                .await
-                .map_err(|e| sq_storage_err("spawn_blocking join", e))?
+                })()
             })
         }
 
@@ -604,27 +608,23 @@ mod sqlite_impl {
             let leaf_idx = i64::try_from(index)
                 .map_err(|_| TransparencyError::Storage("index exceeds i64 range".into()))?;
             self.runtime.block_on(async move {
-                tokio::task::spawn_blocking(
-                    move || -> Result<Option<AuditLeaf>, TransparencyError> {
-                        let conn = conn_arc.blocking_lock();
-                        let blob: Option<Vec<u8>> = conn
-                            .query_row(
-                                "SELECT leaf_serialized \
+                (move || -> Result<Option<AuditLeaf>, TransparencyError> {
+                    let conn = conn_arc.lock();
+                    let blob: Option<Vec<u8>> = conn
+                        .query_row(
+                            "SELECT leaf_serialized \
                                  FROM merkle_leaves \
                                  WHERE tenant_id = ?1 AND leaf_index = ?2",
-                                params![tenant, leaf_idx],
-                                |row| row.get(0),
-                            )
-                            .optional()
-                            .map_err(|e| sq_storage_err("select leaf", e))?;
-                        let Some(blob) = blob else { return Ok(None) };
-                        let leaf: AuditLeaf = serde_json::from_slice(&blob)
-                            .map_err(|e| sq_storage_err("deserialize leaf", e))?;
-                        Ok(Some(leaf))
-                    },
-                )
-                .await
-                .map_err(|e| sq_storage_err("spawn_blocking join", e))?
+                            params![tenant, leaf_idx],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(|e| sq_storage_err("select leaf", e))?;
+                    let Some(blob) = blob else { return Ok(None) };
+                    let leaf: AuditLeaf = serde_json::from_slice(&blob)
+                        .map_err(|e| sq_storage_err("deserialize leaf", e))?;
+                    Ok(Some(leaf))
+                })()
             })
         }
 
@@ -634,27 +634,23 @@ mod sqlite_impl {
             let leaf_idx = i64::try_from(index)
                 .map_err(|_| TransparencyError::Storage("index exceeds i64 range".into()))?;
             self.runtime.block_on(async move {
-                tokio::task::spawn_blocking(
-                    move || -> Result<Option<[u8; 32]>, TransparencyError> {
-                        let conn = conn_arc.blocking_lock();
-                        let raw: Option<Vec<u8>> = conn
-                            .query_row(
-                                "SELECT leaf_hash \
+                (move || -> Result<Option<[u8; 32]>, TransparencyError> {
+                    let conn = conn_arc.lock();
+                    let raw: Option<Vec<u8>> = conn
+                        .query_row(
+                            "SELECT leaf_hash \
                                  FROM merkle_leaves \
                                  WHERE tenant_id = ?1 AND leaf_index = ?2",
-                                params![tenant, leaf_idx],
-                                |row| row.get(0),
-                            )
-                            .optional()
-                            .map_err(|e| sq_storage_err("select leaf_hash", e))?;
-                        match raw {
-                            Some(b) => Ok(Some(leaf_hash_from_bytes(&b)?)),
-                            None => Ok(None),
-                        }
-                    },
-                )
-                .await
-                .map_err(|e| sq_storage_err("spawn_blocking join", e))?
+                            params![tenant, leaf_idx],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(|e| sq_storage_err("select leaf_hash", e))?;
+                    match raw {
+                        Some(b) => Ok(Some(leaf_hash_from_bytes(&b)?)),
+                        None => Ok(None),
+                    }
+                })()
             })
         }
 
@@ -662,8 +658,8 @@ mod sqlite_impl {
             let tenant = self.tenant_id.clone();
             let conn_arc = self.conn.clone();
             self.runtime.block_on(async move {
-                tokio::task::spawn_blocking(move || -> Result<u64, TransparencyError> {
-                    let conn = conn_arc.blocking_lock();
+                (move || -> Result<u64, TransparencyError> {
+                    let conn = conn_arc.lock();
                     let n: i64 = conn
                         .query_row(
                             "SELECT COUNT(*) FROM merkle_leaves WHERE tenant_id = ?1",
@@ -672,9 +668,7 @@ mod sqlite_impl {
                         )
                         .map_err(|e| sq_storage_err("tree_size", e))?;
                     Ok(u64::try_from(n).unwrap_or(u64::MAX))
-                })
-                .await
-                .map_err(|e| sq_storage_err("spawn_blocking join", e))?
+                })()
             })
         }
 
@@ -682,50 +676,46 @@ mod sqlite_impl {
             let tenant = self.tenant_id.clone();
             let conn_arc = self.conn.clone();
             self.runtime.block_on(async move {
-                tokio::task::spawn_blocking(
-                    move || -> Result<Option<SignedTreeHead>, TransparencyError> {
-                        let conn = conn_arc.blocking_lock();
-                        let row_opt = conn
-                            .query_row(
-                                "SELECT tree_size, root_hash, signed_at, \
+                (move || -> Result<Option<SignedTreeHead>, TransparencyError> {
+                    let conn = conn_arc.lock();
+                    let row_opt = conn
+                        .query_row(
+                            "SELECT tree_size, root_hash, signed_at, \
                                         signature_blob, witness_signatures \
                                  FROM merkle_sth_log \
                                  WHERE tenant_id = ?1 \
                                  ORDER BY tree_size DESC \
                                  LIMIT 1",
-                                params![tenant],
-                                |row| {
-                                    Ok((
-                                        row.get::<_, i64>(0)?,
-                                        row.get::<_, Vec<u8>>(1)?,
-                                        row.get::<_, String>(2)?,
-                                        row.get::<_, Vec<u8>>(3)?,
-                                        row.get::<_, String>(4)?,
-                                    ))
-                                },
-                            )
-                            .optional()
-                            .map_err(|e| sq_storage_err("latest_sth select", e))?;
-                        let Some((tree_size_i, root_bytes, signed_at_str, sig_blob, witness_str)) =
-                            row_opt
-                        else {
-                            return Ok(None);
-                        };
-                        let timestamp = parse_signed_at(&signed_at_str)?;
-                        let signature = deserialize_signature(&sig_blob)?;
-                        let witness_signatures = deserialize_witness_signatures(&witness_str)?;
-                        Ok(Some(SignedTreeHead {
-                            log_id: log_id_for_tenant(&tenant),
-                            tree_size: u64::try_from(tree_size_i).unwrap_or(u64::MAX),
-                            root_hash: root_hash_from_bytes(&root_bytes)?,
-                            timestamp,
-                            signature,
-                            witness_signatures,
-                        }))
-                    },
-                )
-                .await
-                .map_err(|e| sq_storage_err("spawn_blocking join", e))?
+                            params![tenant],
+                            |row| {
+                                Ok((
+                                    row.get::<_, i64>(0)?,
+                                    row.get::<_, Vec<u8>>(1)?,
+                                    row.get::<_, String>(2)?,
+                                    row.get::<_, Vec<u8>>(3)?,
+                                    row.get::<_, String>(4)?,
+                                ))
+                            },
+                        )
+                        .optional()
+                        .map_err(|e| sq_storage_err("latest_sth select", e))?;
+                    let Some((tree_size_i, root_bytes, signed_at_str, sig_blob, witness_str)) =
+                        row_opt
+                    else {
+                        return Ok(None);
+                    };
+                    let timestamp = parse_signed_at(&signed_at_str)?;
+                    let signature = deserialize_signature(&sig_blob)?;
+                    let witness_signatures = deserialize_witness_signatures(&witness_str)?;
+                    Ok(Some(SignedTreeHead {
+                        log_id: log_id_for_tenant(&tenant),
+                        tree_size: u64::try_from(tree_size_i).unwrap_or(u64::MAX),
+                        root_hash: root_hash_from_bytes(&root_bytes)?,
+                        timestamp,
+                        signature,
+                        witness_signatures,
+                    }))
+                })()
             })
         }
 
@@ -740,8 +730,8 @@ mod sqlite_impl {
             let witnesses_str = serialize_witness_signatures(&sth.witness_signatures)?;
             let signer_key_id = hex::encode(&sth.signature.classical.public_key);
             self.runtime.block_on(async move {
-                tokio::task::spawn_blocking(move || -> Result<(), TransparencyError> {
-                    let conn = conn_arc.blocking_lock();
+                (move || -> Result<(), TransparencyError> {
+                    let conn = conn_arc.lock();
                     conn.execute(
                         "INSERT INTO merkle_sth_log \
                          (tenant_id, tree_size, root_hash, signed_at, \
@@ -760,9 +750,7 @@ mod sqlite_impl {
                     )
                     .map_err(|e| sq_storage_err("insert sth", e))?;
                     Ok(())
-                })
-                .await
-                .map_err(|e| sq_storage_err("spawn_blocking join", e))?
+                })()
             })
         }
 
@@ -770,8 +758,8 @@ mod sqlite_impl {
             let tenant = self.tenant_id.clone();
             let conn_arc = self.conn.clone();
             self.runtime.block_on(async move {
-                tokio::task::spawn_blocking(move || -> Result<Vec<[u8; 32]>, TransparencyError> {
-                    let conn = conn_arc.blocking_lock();
+                (move || -> Result<Vec<[u8; 32]>, TransparencyError> {
+                    let conn = conn_arc.lock();
                     let mut stmt = conn
                         .prepare(
                             "SELECT leaf_hash \
@@ -789,9 +777,7 @@ mod sqlite_impl {
                         out.push(leaf_hash_from_bytes(&raw)?);
                     }
                     Ok(out)
-                })
-                .await
-                .map_err(|e| sq_storage_err("spawn_blocking join", e))?
+                })()
             })
         }
     }
@@ -918,9 +904,7 @@ mod tests {
                 // the SqliteMerkleStore only holds the conn_handle()
                 // Arc clone, not the SqliteBackend itself.
                 let _backend_keepalive = backend;
-                tokio::task::spawn_blocking(move || f(store_arc))
-                    .await
-                    .unwrap()
+                (move || f(store_arc))()
             })
         }
 
@@ -996,7 +980,7 @@ mod tests {
             let a = store_a.clone();
             let b = store_b.clone();
             rt.block_on(async move {
-                tokio::task::spawn_blocking(move || {
+                (move || {
                     a.append(make_test_leaf("a-1", 1, 1)).unwrap();
                     a.append(make_test_leaf("a-2", 2, 2)).unwrap();
                     b.append(make_test_leaf("b-1", 1, 1)).unwrap();
@@ -1004,9 +988,7 @@ mod tests {
                     assert_eq!(b.tree_size().unwrap(), 1);
                     assert_eq!(b.get(0).unwrap().unwrap().entry.entry_id, "b-1");
                     assert!(b.get(1).unwrap().is_none());
-                })
-                .await
-                .unwrap();
+                })();
             });
             drop(backend);
         }
@@ -1188,9 +1170,7 @@ mod tests {
                         PgMerkleStore::new(backend.clone(), handle, tenant_owned.clone()),
                     );
                     let backend_for_f = backend.clone();
-                    let r = tokio::task::spawn_blocking(move || f(store, backend_for_f))
-                        .await
-                        .unwrap();
+                    let r = (move || f(store, backend_for_f))();
                     clean_tenant(&backend, &tenant_owned).await;
                     r
                 });
@@ -1265,16 +1245,14 @@ mod tests {
             let a = store_a.clone();
             let b = store_b.clone();
             rt.block_on(async move {
-                tokio::task::spawn_blocking(move || {
+                (move || {
                     a.append(make_test_leaf("a-1", 1, 1)).unwrap();
                     a.append(make_test_leaf("a-2", 2, 2)).unwrap();
                     b.append(make_test_leaf("b-1", 1, 1)).unwrap();
                     assert_eq!(a.tree_size().unwrap(), 2);
                     assert_eq!(b.tree_size().unwrap(), 1);
                     assert_eq!(b.get(0).unwrap().unwrap().entry.entry_id, "b-1");
-                })
-                .await
-                .unwrap();
+                })();
             });
             rt.block_on(async {
                 clean_tenant(&backend, &tenant_a).await;

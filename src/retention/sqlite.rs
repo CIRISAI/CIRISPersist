@@ -12,14 +12,22 @@
 //!   semantically equivalent.
 //! - Transaction is `BEGIN IMMEDIATE` (matches audit/sqlite.rs
 //!   for write paths).
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
+// each closure's typed return signature load-bearing for error
 
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 #[cfg(feature = "cirisaudit")]
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
 
 #[cfg(feature = "cirisaudit")]
 use super::ArchiveHandle;
@@ -36,15 +44,13 @@ pub async fn storage_summary_sqlite(
     backend: &SqliteBackend,
 ) -> Result<StorageSummary, RetentionError> {
     let conn = backend.conn_handle();
-    tokio::task::spawn_blocking(move || storage_summary_blocking(&conn))
-        .await
-        .map_err(|e| RetentionError::Backend(format!("spawn_blocking join: {e}")))?
+    (move || storage_summary_blocking(&conn))()
 }
 
 fn storage_summary_blocking(
     conn: &Arc<Mutex<Connection>>,
 ) -> Result<StorageSummary, RetentionError> {
-    let guard = conn.blocking_lock();
+    let guard = conn.lock();
 
     // Whole-DB bytes via PRAGMA.
     let page_count: i64 = guard
@@ -165,8 +171,8 @@ pub async fn delete_traces_older_than_sqlite(
     let limit_i64 = i64::try_from(max_rows)
         .map_err(|_| RetentionError::InvalidArgument(format!("max_rows {max_rows} > i64::MAX")))?;
     let conn = backend.conn_handle();
-    let deleted = tokio::task::spawn_blocking(move || -> Result<usize, RetentionError> {
-        let guard = conn.blocking_lock();
+    let deleted = (move || -> Result<usize, RetentionError> {
+        let guard = conn.lock();
         let n = guard
             .execute(
                 "DELETE FROM trace_events \
@@ -180,9 +186,7 @@ pub async fn delete_traces_older_than_sqlite(
             )
             .map_err(|e| RetentionError::Backend(format!("delete_traces_older_than: {e}")))?;
         Ok(n)
-    })
-    .await
-    .map_err(|e| RetentionError::Backend(format!("spawn_blocking join: {e}")))??;
+    })()?;
     Ok(deleted)
 }
 
@@ -209,8 +213,8 @@ pub async fn archive_audit_range_sqlite(
 
     let conn = backend.conn_handle();
 
-    tokio::task::spawn_blocking(move || -> Result<ArchiveHandle, RetentionError> {
-        let mut guard = conn.blocking_lock();
+    (move || -> Result<ArchiveHandle, RetentionError> {
+        let mut guard = conn.lock();
         let tx = guard
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| RetentionError::Backend(format!("begin tx: {e}")))?;
@@ -354,9 +358,7 @@ pub async fn archive_audit_range_sqlite(
             rows_archived,
             chain_anchor,
         })
-    })
-    .await
-    .map_err(|e| RetentionError::Backend(format!("spawn_blocking join: {e}")))?
+    })()
 }
 
 /// v2.7.0 — read an archive blob by `archive_id`. Used by tests +
@@ -369,8 +371,8 @@ pub async fn lookup_audit_archive_sqlite(
 ) -> Result<Option<Vec<u8>>, RetentionError> {
     let conn = backend.conn_handle();
     let id_str = archive_id.to_string();
-    tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>, RetentionError> {
-        let guard = conn.blocking_lock();
+    (move || -> Result<Option<Vec<u8>>, RetentionError> {
+        let guard = conn.lock();
         let bytes: Option<Vec<u8>> = guard
             .query_row(
                 "SELECT archive_bytes FROM cirislens_audit_archives WHERE archive_id = ?1",
@@ -380,7 +382,5 @@ pub async fn lookup_audit_archive_sqlite(
             .optional()
             .map_err(|e| RetentionError::Backend(format!("lookup_audit_archive: {e}")))?;
         Ok(bytes)
-    })
-    .await
-    .map_err(|e| RetentionError::Backend(format!("spawn_blocking join: {e}")))?
+    })()
 }

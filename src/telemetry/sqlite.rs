@@ -5,11 +5,18 @@
 //! the v0.8.4 SQLite cirisgraph impl manages; this module's
 //! consolidator UPSERTs directly via SQL rather than calling
 //! through a `GraphService` to avoid the trait-handle plumbing.
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
 
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
-use tokio::sync::Mutex;
 
 use super::service::TelemetryService;
 use super::types::{
@@ -146,8 +153,8 @@ impl TelemetryService for SqliteTelemetryBackend {
         let expires_at = resolve_expires_at(&obs);
 
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<(), Error> {
+            let guard = conn.lock();
             guard
                 .execute(
                     "INSERT INTO cirisgraph_telemetry_metrics (\
@@ -166,9 +173,7 @@ impl TelemetryService for SqliteTelemetryBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "record_metric"))?;
             Ok(())
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn record_metrics_batch(&self, obs: &[MetricObservation]) -> Result<u64, Error> {
@@ -197,8 +202,8 @@ impl TelemetryService for SqliteTelemetryBackend {
             ));
         }
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<u64, Error> {
-            let mut guard = conn.blocking_lock();
+        (move || -> Result<u64, Error> {
+            let mut guard = conn.lock();
             let tx = guard
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|e| map_sqlite_error(e, "record_metrics_batch begin"))?;
@@ -221,9 +226,7 @@ impl TelemetryService for SqliteTelemetryBackend {
             tx.commit()
                 .map_err(|e| map_sqlite_error(e, "record_metrics_batch commit"))?;
             Ok(inserted)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn list_metrics(
@@ -302,8 +305,8 @@ impl TelemetryService for SqliteTelemetryBackend {
 
         let conn = self.conn.clone();
         let limit_usize = limit as usize;
-        tokio::task::spawn_blocking(move || -> Result<MetricListPage, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<MetricListPage, Error> {
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare(&sql)
                 .map_err(|e| map_sqlite_error(e, "list_metrics prepare"))?;
@@ -326,9 +329,7 @@ impl TelemetryService for SqliteTelemetryBackend {
                 None
             };
             Ok(MetricListPage { items, next_cursor })
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn consolidate_period(
@@ -349,8 +350,8 @@ impl TelemetryService for SqliteTelemetryBackend {
         let period_start_str = fmt_datetime(req.period_start);
         let period_end_str = fmt_datetime(req.period_end);
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<ConsolidationOutcome, Error> {
-            let mut guard = conn.blocking_lock();
+        (move || -> Result<ConsolidationOutcome, Error> {
+            let mut guard = conn.lock();
             // AV-53 lock acquire (INSERT … ON CONFLICT DO NOTHING).
             let inserted = guard
                 .execute(
@@ -431,9 +432,7 @@ impl TelemetryService for SqliteTelemetryBackend {
                 ran: true,
                 broke_stale_lock,
             })
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     // ── v1.6.0 (CIRISPersist#63) TSDB query / prune surface ─────────
@@ -455,8 +454,8 @@ impl TelemetryService for SqliteTelemetryBackend {
         let from_str = fmt_datetime(from);
         let to_str = fmt_datetime(to);
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<MetricSummary>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Vec<MetricSummary>, Error> {
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare(
                     "SELECT attributes FROM cirisgraph_nodes \
@@ -482,9 +481,7 @@ impl TelemetryService for SqliteTelemetryBackend {
                 out.push(summary);
             }
             Ok(out)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn get_summary(
@@ -509,8 +506,8 @@ impl TelemetryService for SqliteTelemetryBackend {
             period_start.to_rfc3339()
         );
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Option<MetricSummary>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Option<MetricSummary>, Error> {
+            let guard = conn.lock();
             let row_opt = guard
                 .query_row(
                     "SELECT attributes FROM cirisgraph_nodes \
@@ -525,9 +522,7 @@ impl TelemetryService for SqliteTelemetryBackend {
             let summary: MetricSummary = serde_json::from_str(&s)
                 .map_err(|e| Error::Backend(format!("MetricSummary decode: {e} (raw={s})")))?;
             Ok(Some(summary))
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn prune_summaries(
@@ -540,8 +535,8 @@ impl TelemetryService for SqliteTelemetryBackend {
         let tenant_owned = tenant_id.to_owned();
         let before_str = fmt_datetime(before);
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<u64, Error> {
-            let mut guard = conn.blocking_lock();
+        (move || -> Result<u64, Error> {
+            let mut guard = conn.lock();
             let tx = guard
                 .transaction()
                 .map_err(|e| map_sqlite_error(e, "prune_summaries begin"))?;
@@ -596,9 +591,7 @@ impl TelemetryService for SqliteTelemetryBackend {
             tx.commit()
                 .map_err(|e| map_sqlite_error(e, "prune_summaries commit"))?;
             Ok(total_deleted)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn count_edges_by_relationship_in_window(
@@ -614,52 +607,45 @@ impl TelemetryService for SqliteTelemetryBackend {
         let from_str = fmt_datetime(from);
         let to_str = fmt_datetime(to);
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(
-            move || -> Result<std::collections::HashMap<String, u64>, Error> {
-                let guard = conn.blocking_lock();
-                // SQLite cirisgraph_edges.created_at uses the
-                // `datetime('now', 'subsec')` default which produces
-                // the space-separated form
-                // `YYYY-MM-DD HH:MM:SS.sss` — not RFC 3339. A raw
-                // lex compare against our RFC-3339-formatted bounds
-                // (`YYYY-MM-DDTHH:MM:SS.sss+00:00`) would miss every
-                // stored row because ' ' (0x20) < 'T' (0x54) at the
-                // T-separator position. Wrap both sides in SQLite's
-                // `datetime()` function which canonicalizes both
-                // formats to UTC `YYYY-MM-DD HH:MM:SS` for the
-                // compare. Defeats index use on `created_at` but the
-                // edge table is small and this is observability-tier.
-                let mut stmt = guard
-                    .prepare(
-                        "SELECT relationship, COUNT(*) FROM cirisgraph_edges \
+        (move || -> Result<std::collections::HashMap<String, u64>, Error> {
+            let guard = conn.lock();
+            // SQLite cirisgraph_edges.created_at uses the
+            // `datetime('now', 'subsec')` default which produces
+            // the space-separated form
+            // `YYYY-MM-DD HH:MM:SS.sss` — not RFC 3339. A raw
+            // lex compare against our RFC-3339-formatted bounds
+            // (`YYYY-MM-DDTHH:MM:SS.sss+00:00`) would miss every
+            // stored row because ' ' (0x20) < 'T' (0x54) at the
+            // T-separator position. Wrap both sides in SQLite's
+            // `datetime()` function which canonicalizes both
+            // formats to UTC `YYYY-MM-DD HH:MM:SS` for the
+            // compare. Defeats index use on `created_at` but the
+            // edge table is small and this is observability-tier.
+            let mut stmt = guard
+                .prepare(
+                    "SELECT relationship, COUNT(*) FROM cirisgraph_edges \
                          WHERE scope = 'ENVIRONMENT' \
                            AND datetime(created_at) >= datetime(?1) \
                            AND datetime(created_at) <  datetime(?2) \
                          GROUP BY relationship",
-                    )
-                    .map_err(|e| {
-                        map_sqlite_error(e, "count_edges_by_relationship_in_window prepare")
-                    })?;
-                let rows = stmt
-                    .query_map(params![from_str, to_str], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                    })
-                    .map_err(|e| {
-                        map_sqlite_error(e, "count_edges_by_relationship_in_window query")
-                    })?;
-                let mut out: std::collections::HashMap<String, u64> =
-                    std::collections::HashMap::new();
-                for r in rows {
-                    let (rel, c) = r.map_err(|e| {
-                        map_sqlite_error(e, "count_edges_by_relationship_in_window row")
-                    })?;
-                    out.insert(rel, c.max(0) as u64);
-                }
-                Ok(out)
-            },
-        )
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+                )
+                .map_err(|e| {
+                    map_sqlite_error(e, "count_edges_by_relationship_in_window prepare")
+                })?;
+            let rows = stmt
+                .query_map(params![from_str, to_str], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(|e| map_sqlite_error(e, "count_edges_by_relationship_in_window query"))?;
+            let mut out: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+            for r in rows {
+                let (rel, c) = r.map_err(|e| {
+                    map_sqlite_error(e, "count_edges_by_relationship_in_window row")
+                })?;
+                out.insert(rel, c.max(0) as u64);
+            }
+            Ok(out)
+        })()
     }
 
     // ── v1.6.2 (CIRISPersist#68) typed-summary consolidate methods ──
@@ -672,8 +658,8 @@ impl TelemetryService for SqliteTelemetryBackend {
         let period_start_str = fmt_datetime(req.period_start);
         let period_end_str = fmt_datetime(req.period_end);
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<TypedConsolidationOutcome, Error> {
-            let mut guard = conn.blocking_lock();
+        (move || -> Result<TypedConsolidationOutcome, Error> {
+            let mut guard = conn.lock();
 
             let mut by_status: std::collections::HashMap<String, i64> =
                 std::collections::HashMap::new();
@@ -739,9 +725,7 @@ impl TelemetryService for SqliteTelemetryBackend {
                 summary_written,
                 source_rows: total_tasks,
             })
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn consolidate_conversations(
@@ -752,8 +736,8 @@ impl TelemetryService for SqliteTelemetryBackend {
         let period_start_str = fmt_datetime(req.period_start);
         let period_end_str = fmt_datetime(req.period_end);
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<TypedConsolidationOutcome, Error> {
-            let mut guard = conn.blocking_lock();
+        (move || -> Result<TypedConsolidationOutcome, Error> {
+            let mut guard = conn.lock();
 
             // SQLite stores request_data as TEXT (raw JSON string).
             // `json_extract(request_data, '$.actor_id')` returns the
@@ -797,9 +781,7 @@ impl TelemetryService for SqliteTelemetryBackend {
                 summary_written,
                 source_rows: total_messages,
             })
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn consolidate_traces(
@@ -810,8 +792,8 @@ impl TelemetryService for SqliteTelemetryBackend {
         let period_start_str = fmt_datetime(req.period_start);
         let period_end_str = fmt_datetime(req.period_end);
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<TypedConsolidationOutcome, Error> {
-            let mut guard = conn.blocking_lock();
+        (move || -> Result<TypedConsolidationOutcome, Error> {
+            let mut guard = conn.lock();
 
             let mut by_action_type: std::collections::HashMap<String, i64> =
                 std::collections::HashMap::new();
@@ -864,9 +846,7 @@ impl TelemetryService for SqliteTelemetryBackend {
                 summary_written,
                 source_rows: total_traces,
             })
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn consolidate_audit(
@@ -877,8 +857,8 @@ impl TelemetryService for SqliteTelemetryBackend {
         let period_start_str = fmt_datetime(req.period_start);
         let period_end_str = fmt_datetime(req.period_end);
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<TypedConsolidationOutcome, Error> {
-            let mut guard = conn.blocking_lock();
+        (move || -> Result<TypedConsolidationOutcome, Error> {
+            let mut guard = conn.lock();
 
             // V014 audit_log: tenant_id column (not occurrence proxy)
             // + recorded_at (not created_at).
@@ -944,9 +924,7 @@ impl TelemetryService for SqliteTelemetryBackend {
                 summary_written,
                 source_rows: total_events,
             })
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn query_summary_nodes(
@@ -975,8 +953,8 @@ impl TelemetryService for SqliteTelemetryBackend {
         let from_str = fmt_datetime(truncate_to_micros(from));
         let to_str = fmt_datetime(truncate_to_micros(to));
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<serde_json::Value>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Vec<serde_json::Value>, Error> {
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare(
                     "SELECT attributes FROM cirisgraph_nodes \
@@ -1002,9 +980,7 @@ impl TelemetryService for SqliteTelemetryBackend {
                 out.push(v);
             }
             Ok(out)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 }
 

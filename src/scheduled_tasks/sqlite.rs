@@ -10,14 +10,21 @@
 //!                                  DEFERRABLE without per-tx
 //!                                  `PRAGMA defer_foreign_keys=1`)
 //!
-//! Threading: `tokio::task::spawn_blocking` + `conn.blocking_lock()`
+//! Threading: `tokio::task::spawn_blocking` + `conn.lock()`
 //! per the existing pattern.
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
 
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use rusqlite::{params, Connection};
-use tokio::sync::Mutex;
 
 use super::service::ScheduledTaskService;
 use super::types::{ScheduledTask, ScheduledTaskStatus};
@@ -194,8 +201,8 @@ impl ScheduledTaskService for SqliteScheduledTaskBackend {
         let deferral_history_str = encode_json_opt(task.deferral_history.as_ref())?;
 
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), Error> {
-            let mut guard = conn.blocking_lock();
+        (move || -> Result<(), Error> {
+            let mut guard = conn.lock();
             let tx = guard
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|e| map_sqlite_error(e, "upsert_scheduled_task begin"))?;
@@ -244,9 +251,7 @@ impl ScheduledTaskService for SqliteScheduledTaskBackend {
             tx.commit()
                 .map_err(|e| map_sqlite_error(e, "upsert_scheduled_task commit"))?;
             Ok(())
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn list_due_scheduled_tasks(
@@ -268,8 +273,8 @@ impl ScheduledTaskService for SqliteScheduledTaskBackend {
         let occ_owned = agent_occurrence_id.to_owned();
         let now_str = fmt_datetime(now);
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<ScheduledTask>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Vec<ScheduledTask>, Error> {
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare(
                     "SELECT id, name, goal_description, status, defer_until, \
@@ -296,9 +301,7 @@ impl ScheduledTaskService for SqliteScheduledTaskBackend {
                 items.push(r.map_err(|e| map_sqlite_error(e, "list_due_scheduled_tasks row"))??);
             }
             Ok(items)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn update_after_trigger(
@@ -326,8 +329,8 @@ impl ScheduledTaskService for SqliteScheduledTaskBackend {
         let task_id_owned = task_id.to_owned();
 
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<bool, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<bool, Error> {
+            let guard = conn.lock();
             // Dynamically build SET clause so callers that don't
             // supply history/status don't overwrite those columns.
             let mut sets: Vec<String> = vec![
@@ -360,9 +363,7 @@ impl ScheduledTaskService for SqliteScheduledTaskBackend {
                 .execute(&sql, rusqlite::params_from_iter(sql_params.iter()))
                 .map_err(|e| map_sqlite_error(e, "update_after_trigger exec"))?;
             Ok(changed > 0)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 }
 
@@ -484,8 +485,8 @@ mod tests {
         // would skip this row due to the far-future next_trigger_at).
         let conn = b.conn_handle();
         let id_owned = id.clone();
-        let got = tokio::task::spawn_blocking(move || -> ScheduledTask {
-            let guard = conn.blocking_lock();
+        let got = (move || -> ScheduledTask {
+            let guard = conn.lock();
             guard
                 .query_row(
                     "SELECT id, name, goal_description, status, defer_until, \
@@ -499,9 +500,7 @@ mod tests {
                 )
                 .unwrap()
                 .unwrap()
-        })
-        .await
-        .unwrap();
+        })();
         assert_eq!(got.id, t.id);
         assert_eq!(got.name, t.name);
         assert_eq!(got.goal_description, t.goal_description);
@@ -536,8 +535,8 @@ mod tests {
 
         let conn = b.conn_handle();
         let id_owned = id.clone();
-        let got = tokio::task::spawn_blocking(move || -> ScheduledTask {
-            let guard = conn.blocking_lock();
+        let got = (move || -> ScheduledTask {
+            let guard = conn.lock();
             guard
                 .query_row(
                     "SELECT id, name, goal_description, status, defer_until, \
@@ -551,9 +550,7 @@ mod tests {
                 )
                 .unwrap()
                 .unwrap()
-        })
-        .await
-        .unwrap();
+        })();
         assert_eq!(got.name, "second-name");
         let drift = (got.created_at - original_created).num_seconds().abs();
         assert!(drift <= 1, "created_at preserved: {drift}s drift");
@@ -564,15 +561,13 @@ mod tests {
         let (b, svc) = fresh_backend().await;
         // PRAGMA foreign_keys is enforced; verify.
         let conn = b.conn_handle();
-        let pragma_on = tokio::task::spawn_blocking(move || -> bool {
-            let guard = conn.blocking_lock();
+        let pragma_on = (move || -> bool {
+            let guard = conn.lock();
             guard
                 .query_row("PRAGMA foreign_keys", params![], |row| row.get::<_, i64>(0))
                 .map(|v| v == 1)
                 .unwrap_or(false)
-        })
-        .await
-        .unwrap();
+        })();
         if !pragma_on {
             eprintln!(
                 "SQLite foreign_keys pragma off — skipping FK rejection check. Migrations \
@@ -713,8 +708,8 @@ mod tests {
         let (b, _svc) = fresh_backend().await;
         // No need to seed thought — CHECK fires before FK.
         let conn = b.conn_handle();
-        let res = tokio::task::spawn_blocking(move || -> rusqlite::Result<usize> {
-            let guard = conn.blocking_lock();
+        let res = (move || -> rusqlite::Result<usize> {
+            let guard = conn.lock();
             guard.execute(
                 "INSERT INTO cirislens_scheduled_tasks (\
                     id, name, goal_description, status, trigger_prompt, \
@@ -723,9 +718,7 @@ mod tests {
                            't', '2026-01-01T00:00:00.000000+00:00', 0, 'occ')",
                 params![],
             )
-        })
-        .await
-        .unwrap();
+        })();
         assert!(
             res.is_err(),
             "expected CHECK violation on lowercase 'pending' (vocabulary is UPPERCASE)"
@@ -737,8 +730,8 @@ mod tests {
         let (b, _svc) = fresh_backend().await;
         // 'completed' (tasks vocab) is NOT in scheduled_tasks's set.
         let conn = b.conn_handle();
-        let res = tokio::task::spawn_blocking(move || -> rusqlite::Result<usize> {
-            let guard = conn.blocking_lock();
+        let res = (move || -> rusqlite::Result<usize> {
+            let guard = conn.lock();
             guard.execute(
                 "INSERT INTO cirislens_scheduled_tasks (\
                     id, name, goal_description, status, trigger_prompt, \
@@ -747,9 +740,7 @@ mod tests {
                            't', '2026-01-01T00:00:00.000000+00:00', 0, 'occ')",
                 params![],
             )
-        })
-        .await
-        .unwrap();
+        })();
         assert!(
             res.is_err(),
             "expected CHECK violation on 'COMPLETED' (set is COMPLETE not COMPLETED)"

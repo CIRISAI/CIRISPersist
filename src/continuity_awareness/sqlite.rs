@@ -13,7 +13,7 @@
 //!                                          immediate FK mode with
 //!                                          PRAGMA foreign_keys=ON)
 //!
-//! Threading: `tokio::task::spawn_blocking` + `conn.blocking_lock()`
+//! Threading: `tokio::task::spawn_blocking` + `conn.lock()`
 //! per the existing pattern.
 //!
 //! `record_shutdown` uses the same ClaimResult shape as v1.5.16
@@ -28,12 +28,19 @@
 //! time. Callers MUST have written the cirisgraph node row first;
 //! a missing parent surfaces as `Error::Conflict` (rusqlite
 //! `ConstraintViolation`).
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
 
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
-use tokio::sync::Mutex;
 
 use super::service::ContinuityAwarenessService;
 use super::types::ContinuityAwareness;
@@ -232,8 +239,8 @@ impl ContinuityAwarenessService for SqliteContinuityAwarenessBackend {
 
         let conn = self.conn.clone();
         let (won, row): (bool, ContinuityAwareness) =
-            tokio::task::spawn_blocking(move || -> Result<(bool, ContinuityAwareness), Error> {
-                let mut guard = conn.blocking_lock();
+            (move || -> Result<(bool, ContinuityAwareness), Error> {
+                let mut guard = conn.lock();
                 let tx = guard
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(|e| map_sqlite_error(e, "record_shutdown begin"))?;
@@ -277,9 +284,7 @@ impl ContinuityAwarenessService for SqliteContinuityAwarenessBackend {
                 tx.commit()
                     .map_err(|e| map_sqlite_error(e, "record_shutdown commit"))?;
                 Ok((won, row))
-            })
-            .await
-            .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))??;
+            })()?;
 
         if won {
             Ok(ClaimResult::Stored(row))
@@ -297,8 +302,8 @@ impl ContinuityAwarenessService for SqliteContinuityAwarenessBackend {
         }
         let agent_id_owned = agent_id.to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Option<ContinuityAwareness>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Option<ContinuityAwareness>, Error> {
+            let guard = conn.lock();
             let row_opt = guard
                 .query_row(
                     &format!(
@@ -316,9 +321,7 @@ impl ContinuityAwarenessService for SqliteContinuityAwarenessBackend {
                 None => Ok(None),
                 Some(r) => Ok(Some(r?)),
             }
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn record_reactivation(&self, agent_id: &str) -> Result<bool, Error> {
@@ -327,8 +330,8 @@ impl ContinuityAwarenessService for SqliteContinuityAwarenessBackend {
         }
         let agent_id_owned = agent_id.to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<bool, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<bool, Error> {
+            let guard = conn.lock();
             let changed = guard
                 .execute(
                     "UPDATE cirislens_continuity_awareness SET \
@@ -343,9 +346,7 @@ impl ContinuityAwarenessService for SqliteContinuityAwarenessBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "record_reactivation exec"))?;
             Ok(changed > 0)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 }
 
@@ -565,8 +566,8 @@ mod tests {
         let conn = b.conn_handle();
         let now = fmt_datetime(Utc::now());
         let cid = format!("shutdown-bad-{}", Uuid::new_v4().simple());
-        let res = tokio::task::spawn_blocking(move || {
-            let guard = conn.blocking_lock();
+        let res = (move || {
+            let guard = conn.lock();
             guard.execute(
                 "INSERT INTO cirislens_continuity_awareness (\
                     id, agent_id, shutdown_timestamp, is_terminal, shutdown_reason, \
@@ -575,9 +576,7 @@ mod tests {
                  ) VALUES (?1, 'a', ?2, 0, 'r', 'i', 'ft', 'p', ?3, 0)",
                 params![cid, now, "WEIRD_SCOPE"],
             )
-        })
-        .await
-        .unwrap();
+        })();
         assert!(
             res.is_err(),
             "CHECK on preservation_scope should reject unknown values"

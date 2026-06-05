@@ -7,13 +7,20 @@
 //!   ON CONFLICT (thought_id) DO UPDATE … → ON CONFLICT (thought_id) DO UPDATE …
 //!   WITH RECURSIVE descendants(...) AS  → identical (SQLite 3.8.3+)
 //!
-//! Threading: `tokio::task::spawn_blocking` + `conn.blocking_lock()`
+//! Threading: `tokio::task::spawn_blocking` + `conn.lock()`
 //! per the existing pattern (mirrors `src/tasks/sqlite.rs`).
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
 
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
-use tokio::sync::Mutex;
 
 use super::service::ThoughtService;
 use super::types::{
@@ -192,8 +199,8 @@ impl ThoughtService for SqliteThoughtBackend {
         let thought_type_str = thought.thought_type.0.clone();
 
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), Error> {
-            let mut guard = conn.blocking_lock();
+        (move || -> Result<(), Error> {
+            let mut guard = conn.lock();
             let tx = guard
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|e| map_sqlite_error(e, "upsert_thought begin"))?;
@@ -247,9 +254,7 @@ impl ThoughtService for SqliteThoughtBackend {
             tx.commit()
                 .map_err(|e| map_sqlite_error(e, "upsert_thought commit"))?;
             Ok(())
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn get_thought(&self, thought_id: &str) -> Result<Option<Thought>, Error> {
@@ -258,8 +263,8 @@ impl ThoughtService for SqliteThoughtBackend {
         }
         let conn = self.conn.clone();
         let thought_id_owned = thought_id.to_owned();
-        tokio::task::spawn_blocking(move || -> Result<Option<Thought>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Option<Thought>, Error> {
+            let guard = conn.lock();
             let row_opt = guard
                 .query_row(
                     "SELECT thought_id, source_task_id, channel_id, thought_type, status, \
@@ -276,9 +281,7 @@ impl ThoughtService for SqliteThoughtBackend {
                 None => Ok(None),
                 Some(r) => Ok(Some(r?)),
             }
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn list_thoughts(
@@ -358,8 +361,8 @@ impl ThoughtService for SqliteThoughtBackend {
         );
         let conn = self.conn.clone();
         let limit_usize = limit as usize;
-        tokio::task::spawn_blocking(move || -> Result<ThoughtListPage, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<ThoughtListPage, Error> {
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare(&sql)
                 .map_err(|e| map_sqlite_error(e, "list_thoughts prepare"))?;
@@ -380,9 +383,7 @@ impl ThoughtService for SqliteThoughtBackend {
                 None
             };
             Ok(ThoughtListPage { items, next_cursor })
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn update_thought_status(
@@ -399,8 +400,8 @@ impl ThoughtService for SqliteThoughtBackend {
         let status_sql = new_status.as_sql_str().to_owned();
         let thought_id_owned = thought_id.to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<bool, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<bool, Error> {
+            let guard = conn.lock();
             // COALESCE($final_action, final_action_json) — preserve
             // existing value if caller didn't supply one. Caller can
             // pass serde_json::Value::Null via Some(Value::Null) to
@@ -416,9 +417,7 @@ impl ThoughtService for SqliteThoughtBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "update_thought_status exec"))?;
             Ok(changed > 0)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn get_descendants(&self, thought_id: &str) -> Result<Vec<Thought>, Error> {
@@ -431,8 +430,8 @@ impl ThoughtService for SqliteThoughtBackend {
         // root. Same shape as the PG impl + cirisgraph's k-hop CTE
         // (`src/graph/sqlite.rs`). Ordering: `thought_depth ASC,
         // thought_id ASC` for deterministic output.
-        tokio::task::spawn_blocking(move || -> Result<Vec<Thought>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Vec<Thought>, Error> {
+            let guard = conn.lock();
             let sql = "WITH RECURSIVE descendants AS ( \
                 SELECT thought_id, source_task_id, channel_id, thought_type, status, \
                        created_at, updated_at, round_number, content, context_json, \
@@ -465,9 +464,7 @@ impl ThoughtService for SqliteThoughtBackend {
                 items.push(r.map_err(|e| map_sqlite_error(e, "get_descendants row"))??);
             }
             Ok(items)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn delete_thought(&self, thought_id: &str) -> Result<bool, Error> {
@@ -476,8 +473,8 @@ impl ThoughtService for SqliteThoughtBackend {
         }
         let thought_id_owned = thought_id.to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<bool, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<bool, Error> {
+            let guard = conn.lock();
             // The store always opens connections with
             // `PRAGMA foreign_keys = ON` so the self-FK on
             // `parent_thought_id` rejects a delete that would orphan
@@ -490,9 +487,7 @@ impl ThoughtService for SqliteThoughtBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "delete_thought exec"))?;
             Ok(changed > 0)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 }
 

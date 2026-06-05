@@ -64,6 +64,14 @@
 //!     }
 //! }
 //! ```
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
+// each closure's typed return signature load-bearing for error
 
 use std::sync::Arc;
 
@@ -792,18 +800,14 @@ impl Engine {
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(b) => {
                 let conn = b.conn_handle();
-                let total = tokio::task::spawn_blocking(move || -> Result<i64, rusqlite::Error> {
-                    let conn = conn.blocking_lock();
+                let total = (move || -> Result<i64, rusqlite::Error> {
+                    let conn = conn.lock();
                     conn.query_row(
                         "SELECT COALESCE(SUM(size_bytes), 0) FROM federation_blobs",
                         [],
                         |r| r.get::<_, i64>(0),
                     )
-                })
-                .await
-                .map_err(|e| {
-                    crate::federation::BlobError::Backend(format!("spawn_blocking join: {e}"))
-                })?
+                })()
                 .map_err(|e| {
                     crate::federation::BlobError::Backend(format!("federation_blob_bytes: {e}"))
                 })?;
@@ -2021,7 +2025,7 @@ mod tests {
         let agent_pk_b64 = B64.encode(agent_sk.verifying_key().to_bytes());
         let key_id_owned = agent_key_id.to_owned();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
+            let conn = conn.lock();
             conn.execute(
                 "INSERT INTO federation_keys (\
                     key_id, pubkey_ed25519_base64, algorithm, \
@@ -2797,8 +2801,8 @@ mod tests {
             ),
         ];
         let rows_clone = rows.clone();
-        tokio::task::spawn_blocking(move || -> rusqlite::Result<()> {
-            let conn = conn.blocking_lock();
+        (move || -> rusqlite::Result<()> {
+            let conn = conn.lock();
             for (did, tenant, kind, observed_at) in rows_clone {
                 conn.execute(
                     "INSERT INTO edge_detection_events (\
@@ -2811,9 +2815,7 @@ mod tests {
                 )?;
             }
             Ok(())
-        })
-        .await
-        .unwrap()
+        })()
         .unwrap();
 
         // Empty filter → 3 rows, stable ASC order on (tenant, ts, id).
@@ -3288,7 +3290,7 @@ mod tests {
         let conn = sq.conn_handle();
         let key_id_owned = key_id.to_owned();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
+            let conn = conn.lock();
             conn.execute(
                 "INSERT INTO federation_keys (\
                     key_id, pubkey_ed25519_base64, algorithm, \
@@ -3376,7 +3378,7 @@ mod tests {
         let attestation_type = holds_bytes_attestation_type(&sha);
         let (stored_hash_hex, stored_scrub_key_id): (String, String) =
             tokio::task::spawn_blocking(move || {
-                let conn = conn.blocking_lock();
+                let conn = conn.lock();
                 conn.query_row(
                     "SELECT lower(hex(original_content_hash)), scrub_key_id \
                      FROM federation_attestations \

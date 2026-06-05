@@ -38,6 +38,13 @@
 //! rows means the backfill is safe to call multiple times — from a
 //! startup hook, an explicit `Engine.backfill_v020_trust_rows()`, and
 //! a CI sweep, in any order.
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
 
 use crate::audit::AuditService;
 use crate::federation::emit::{grant_trust, EmitError};
@@ -298,8 +305,8 @@ mod sqlite_tests {
             expires_at.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Micros, true));
         let trusted_at_str =
             chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
+        (move || {
+            let conn = conn.lock();
             conn.execute(
                 "INSERT OR REPLACE INTO federation_keys (\
                     key_id, pubkey_ed25519_base64, algorithm, \
@@ -324,9 +331,7 @@ mod sqlite_tests {
                 ],
             )
             .unwrap();
-        })
-        .await
-        .unwrap();
+        })();
     }
 
     /// Insert a plain `federation_keys` row without V020 trust columns
@@ -335,8 +340,8 @@ mod sqlite_tests {
     async fn seed_plain_federation_key(audit: &SqliteAuditBackend, pubkey: &str) {
         let conn = audit.conn_handle();
         let pubkey = pubkey.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
+        (move || {
+            let conn = conn.lock();
             conn.execute(
                 "INSERT OR IGNORE INTO federation_keys (\
                     key_id, pubkey_ed25519_base64, algorithm, \
@@ -350,9 +355,7 @@ mod sqlite_tests {
                 rusqlite::params![pubkey],
             )
             .unwrap();
-        })
-        .await
-        .unwrap();
+        })();
     }
 
     fn pubkey_for(seed_byte: u8) -> String {

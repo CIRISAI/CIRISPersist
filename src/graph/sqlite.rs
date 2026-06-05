@@ -18,11 +18,18 @@
 //! - **AV-47** — scope required in every read.
 //! - **AV-48** — optimistic-concurrency `expected_version` gate via
 //!   `UPDATE … WHERE version = ?`.
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
 
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
-use tokio::sync::Mutex;
 
 use super::service::GraphService;
 use super::types::{
@@ -408,8 +415,8 @@ impl GraphService for SqliteGraphBackend {
         let signing_key_id = node.signing_key_id;
         let persist_row_hash = signature.clone();
         let version = node.version;
-        tokio::task::spawn_blocking(move || -> Result<(), Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<(), Error> {
+            let guard = conn.lock();
             let affected = guard
                 .execute(
                     "INSERT INTO cirisgraph_nodes (\
@@ -471,9 +478,7 @@ impl GraphService for SqliteGraphBackend {
             }
             let _ = guard;
             Ok(())
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn upsert_edge(&self, edge: GraphEdge, bulk_import: bool) -> Result<(), Error> {
@@ -488,8 +493,8 @@ impl GraphService for SqliteGraphBackend {
         let target = edge.target_node_id;
         let relationship = edge.relationship;
         let weight = edge.weight;
-        tokio::task::spawn_blocking(move || -> Result<(), Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<(), Error> {
+            let guard = conn.lock();
             guard
                 .execute(
                     "INSERT INTO cirisgraph_edges (\
@@ -510,9 +515,7 @@ impl GraphService for SqliteGraphBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "upsert_edge"))?;
             Ok(())
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn delete_node(
@@ -524,8 +527,8 @@ impl GraphService for SqliteGraphBackend {
         let conn = self.conn.clone();
         let node_id = node_id.to_owned();
         let scope_str = scope.as_sql_str().to_owned();
-        tokio::task::spawn_blocking(move || -> Result<bool, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<bool, Error> {
+            let guard = conn.lock();
             if hard {
                 guard
                     .execute(
@@ -555,17 +558,15 @@ impl GraphService for SqliteGraphBackend {
                     .map_err(|e| map_sqlite_error(e, "soft delete_node"))?;
                 Ok(n > 0)
             }
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn get_node(&self, node_id: &str, scope: GraphScope) -> Result<Option<GraphNode>, Error> {
         let conn = self.conn.clone();
         let node_id = node_id.to_owned();
         let scope_str = scope.as_sql_str().to_owned();
-        tokio::task::spawn_blocking(move || -> Result<Option<GraphNode>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Option<GraphNode>, Error> {
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare(
                     "SELECT node_id, scope, node_type, attributes, version, \
@@ -586,9 +587,7 @@ impl GraphService for SqliteGraphBackend {
                 Some(Ok(node)) => Ok(Some(node)),
                 Some(Err(e)) => Err(e),
             }
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn get_edges_for_node(
@@ -609,8 +608,8 @@ impl GraphService for SqliteGraphBackend {
         let rels: Option<Vec<String>> = relationship_filter
             .filter(|r| !r.is_empty())
             .map(|r| r.to_vec());
-        tokio::task::spawn_blocking(move || -> Result<Vec<GraphEdge>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Vec<GraphEdge>, Error> {
+            let guard = conn.lock();
             let sql_base = format!(
                 "SELECT edge_id, source_node_id, target_node_id, scope, \
                         relationship, weight, attributes, created_at \
@@ -656,9 +655,7 @@ impl GraphService for SqliteGraphBackend {
                 out.push(r.map_err(|e| map_sqlite_error(e, "get_edges_for_node row"))??);
             }
             Ok(out)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn traverse_k_hop(
@@ -751,8 +748,8 @@ impl GraphService for SqliteGraphBackend {
         let conn = self.conn.clone();
         let start_id = start_node_id.to_owned();
         let scope_str = scope.as_sql_str().to_owned();
-        tokio::task::spawn_blocking(move || -> Result<Vec<KhopEntry>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Vec<KhopEntry>, Error> {
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare(&sql)
                 .map_err(|e| map_sqlite_error(e, "traverse_k_hop prepare"))?;
@@ -774,9 +771,7 @@ impl GraphService for SqliteGraphBackend {
                 });
             }
             Ok(out)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn query_nodes(
@@ -869,8 +864,8 @@ impl GraphService for SqliteGraphBackend {
 
         let conn = self.conn.clone();
         let limit_usize = limit as usize;
-        tokio::task::spawn_blocking(move || -> Result<NodeListPage, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<NodeListPage, Error> {
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare(&sql)
                 .map_err(|e| map_sqlite_error(e, "query_nodes prepare"))?;
@@ -891,9 +886,7 @@ impl GraphService for SqliteGraphBackend {
                 None
             };
             Ok(NodeListPage { items, next_cursor })
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn count_nodes(&self, filter: NodeFilter) -> Result<u64, Error> {
@@ -949,22 +942,20 @@ impl GraphService for SqliteGraphBackend {
         let sql = format!("SELECT COUNT(*) FROM cirisgraph_nodes WHERE {where_sql}");
 
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<u64, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<u64, Error> {
+            let guard = conn.lock();
             let count: i64 = guard
                 .query_row(&sql, params_from_iter(params.iter()), |row| row.get(0))
                 .map_err(|e| map_sqlite_error(e, "count_nodes"))?;
             Ok(count.max(0) as u64)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn count_edges(&self, scope: GraphScope) -> Result<u64, Error> {
         let scope_str = scope.as_sql_str().to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<u64, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<u64, Error> {
+            let guard = conn.lock();
             let count: i64 = guard
                 .query_row(
                     "SELECT COUNT(*) FROM cirisgraph_edges WHERE scope = ?1",
@@ -973,9 +964,7 @@ impl GraphService for SqliteGraphBackend {
                 )
                 .map_err(|e| map_sqlite_error(e, "count_edges"))?;
             Ok(count.max(0) as u64)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn count_nodes_by_type(
@@ -984,31 +973,26 @@ impl GraphService for SqliteGraphBackend {
     ) -> Result<std::collections::HashMap<String, u64>, Error> {
         let scope_str = scope.as_sql_str().to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(
-            move || -> Result<std::collections::HashMap<String, u64>, Error> {
-                let guard = conn.blocking_lock();
-                let mut stmt = guard
-                    .prepare(
-                        "SELECT node_type, COUNT(*) FROM cirisgraph_nodes \
+        (move || -> Result<std::collections::HashMap<String, u64>, Error> {
+            let guard = conn.lock();
+            let mut stmt = guard
+                .prepare(
+                    "SELECT node_type, COUNT(*) FROM cirisgraph_nodes \
                          WHERE scope = ?1 GROUP BY node_type",
-                    )
-                    .map_err(|e| map_sqlite_error(e, "count_nodes_by_type prepare"))?;
-                let rows = stmt
-                    .query_map(params![scope_str], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                    })
-                    .map_err(|e| map_sqlite_error(e, "count_nodes_by_type query"))?;
-                let mut out: std::collections::HashMap<String, u64> =
-                    std::collections::HashMap::new();
-                for r in rows {
-                    let (nt, c) = r.map_err(|e| map_sqlite_error(e, "count_nodes_by_type row"))?;
-                    out.insert(nt, c.max(0) as u64);
-                }
-                Ok(out)
-            },
-        )
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+                )
+                .map_err(|e| map_sqlite_error(e, "count_nodes_by_type prepare"))?;
+            let rows = stmt
+                .query_map(params![scope_str], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(|e| map_sqlite_error(e, "count_nodes_by_type query"))?;
+            let mut out: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+            for r in rows {
+                let (nt, c) = r.map_err(|e| map_sqlite_error(e, "count_nodes_by_type row"))?;
+                out.insert(nt, c.max(0) as u64);
+            }
+            Ok(out)
+        })()
     }
 }
 
@@ -1369,8 +1353,8 @@ mod tests {
         // raw SQL. Simulates the kind of corruption the agent observed
         // in CI without us needing to find the upstream root cause.
         let conn = backend.conn_handle();
-        let _ = tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
-            let guard = conn.blocking_lock();
+        let _ = (move || -> Result<(), rusqlite::Error> {
+            let guard = conn.lock();
             // Build a 1 KB attributes string with a planted invalid byte.
             let prefix = "{\"padding\":\"".repeat(60); // ~800 bytes of valid JSON-ish
             let mut bytes: Vec<u8> = prefix.into_bytes();
@@ -1383,9 +1367,7 @@ mod tests {
                 rusqlite::params![bytes],
             )?;
             Ok(())
-        })
-        .await
-        .unwrap();
+        })();
 
         // Now get_node should fail with the diagnostic error.
         let err = graph

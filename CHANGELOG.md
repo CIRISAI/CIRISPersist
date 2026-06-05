@@ -5,6 +5,60 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.14.0] — 2026-06-04
+
+**CIRISPersist 3.14.0 — closes CIRISPersist#158 via inline-sync SQLite rewrite.** No more `tokio::task::spawn_blocking` in the sqlite path; no more `tokio::sync::Mutex<Connection>`.
+
+### Root cause (CIRISPersist#158)
+
+`tokio::task::spawn_blocking` requires a current tokio runtime context (thread-local lookup). Under the executor_capsule cohab path (CIRISPersist#157), edge spawns a future onto persist's tokio runtime via the C-ABI vtable. Polling crosses the cdylib boundary into edge's compiled persist code. By the time persist's `enqueue_outbound` reaches `tokio::task::spawn_blocking`, the thread-local current-runtime read fails — either because edge's static-linked persist copy reads edge.so's tokio's thread-local (unset on persist's worker), or because the polling chain breaks tokio's thread-local invariant in a way that isn't recoverable from inside persist's sqlite path.
+
+Five fix attempts during triage demonstrated the structural class:
+1. **`handle: Handle` field on `SqliteBackend`** — ABI break: edge's compiled view of the struct (smaller, no handle field) reads `self.conn` at the wrong offset → SIGSEGV in `Arc::clone`.
+2. **`OnceLock<Handle>` module static** — per-DSO statics: edge.so's copy is never written, persist.so's set at PyEngine construction; edge's compiled-persist code reads edge.so's empty copy.
+3. **`#[no_mangle] extern "C"` + `dlsym(RTLD_DEFAULT)`** — Python imports with `RTLD_LOCAL`: persist's symbols not globally visible.
+4. **`sys.setdlopenflags(RTLD_GLOBAL)` in `__init__.py`** — `dlsym` resolves to persist.so's accessor, but `tokio::runtime::Handle`'s private `Inner` struct isn't stable across patch versions (1.52.1 vs 1.52.3) — `JoinHandle` awaits hang on cross-DSO waker mismatch.
+5. **Inline-sync rewrite** (this cut) — eliminates the tokio-context dependency entirely; persist's sqlite path stops calling tokio primitives.
+
+Community precedent: `tokio-rusqlite`, `deadpool-sqlite`, and Alice (Tokio maintainer) on `users.rust-lang.org` all converge on the same shape: short rusqlite calls inline in async fn bodies are acceptable for the multi-thread runtime case, no `spawn_blocking` required.
+
+### What changed
+
+**`SqliteBackend.conn` mutex type**:
+- `Arc<tokio::sync::Mutex<Connection>>` → `Arc<parking_lot::Mutex<Connection>>`
+- `parking_lot::Mutex` is a sync mutex (no async context needed). `parking_lot` is already a persist dep (NER cache uses it).
+- Public surface change: `conn_handle()` return type + `from_conn_handle()` param type.
+
+**Inline-sync rewrite (mechanical, 203 sites across 35 files)**:
+- Every `tokio::task::spawn_blocking(closure).await.map_err(JoinError)?` becomes `(closure)()`.
+- Every `conn.blocking_lock()` becomes `conn.lock()` (parking_lot's sync lock).
+- The async fn signatures stay async (for back-compat with existing callers); the bodies have no `.await` points on the sqlite path.
+
+**Why this is safe** (per the tokio-rusqlite community guidance):
+- Persist runs a multi-thread tokio runtime. Blocking one worker on a rusqlite call for microseconds (in-memory) to milliseconds (file-backed) is normal.
+- `parking_lot::Mutex::lock()` is sync and runtime-agnostic. Works on every platform persist targets, including iOS.
+- rusqlite's call shape doesn't change — same dynamically-linked libsqlite3 (CIRISPersist#132's `bundled` drop is preserved).
+- iOS path unchanged: rusqlite → libsqlite3-sys → dlopen'd Apple system libsqlite3.
+
+### What consumers need to do
+
+Any consumer wheel that statically links persist (edge, lens, nodecore) **must rebuild against v3.14.0** to pick up the new mutex type. Edge 1.1.10+ will bump.
+
+Consumers that only call persist via Python (PyEngine API) need no change — they get the v3.14.0 wheel and the cohab race is closed automatically.
+
+### Test results
+
+- **569/569 sqlite lib tests green** (no change in test count; transformation was purely mechanical).
+- **`cargo clippy --features sqlite --lib --tests -- -D warnings`** clean (with `#![allow(clippy::redundant_closure_call)]` at the file level — the `(closure)()` pattern is intentional, see the inline comment for why).
+- **`cargo clippy --features pyo3 --lib -- -D warnings`** clean.
+- **`tools/race_repro.py` against the CIRISEdge 1.1.9 cohab scenario, 100 rounds**: 100/100 fast, 0 hung, 0 panic. Compare to v3.13.0: 20/20 hung. Compare to v3.13.1 (with handle field): 20/20 SIGSEGV.
+
+### What this enables
+
+The `executor_capsule` (#157) keeps its current shape. No v2 ABI is needed for now — persist's sqlite path doesn't need to call back through the capsule for spawn_blocking dispatch. The cross-tokio-aliasing class is closed for sqlite; the postgres path was never affected.
+
+Future tokio primitives in persist's hot paths (e.g., notify-based wakeups, timer-based ack queues) would either need to avoid tokio context dependencies the same way, or could use the executor_capsule's existing function-pointer dispatch (with a v2 capsule adding spawn_blocking).
+
 ## [3.13.0] — 2026-06-04
 
 **CIRISPersist 3.13.0 — ABI-stable `executor_capsule` (CIRISPersist#157 T1+T2, closes the cross-tokio aliasing class behind CIRISEdge#58 / CIRISPersist#156 residual deadlock).**

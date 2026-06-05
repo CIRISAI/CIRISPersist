@@ -49,6 +49,13 @@
 //!   empty); a dedicated read surface lands when the protocol does.
 //! - Cross-tenant correlation — AV-51 forbids it; every read here is
 //!   tenant-scoped via the grant's `tenant_id` column.
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
 
 use ciris_verify_core::transparency::{ConsistencyProof, MerkleProof, SignedTreeHead};
 
@@ -254,8 +261,8 @@ mod sqlite_tests {
     async fn seed_federation_key(audit: &SqliteAuditBackend, key_id: &str) {
         let conn = audit.conn_handle();
         let key_id = key_id.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
+        (move || {
+            let conn = conn.lock();
             conn.execute(
                 "INSERT OR IGNORE INTO federation_keys (\
                     key_id, pubkey_ed25519_base64, algorithm, \
@@ -269,9 +276,7 @@ mod sqlite_tests {
                 rusqlite::params![key_id],
             )
             .unwrap();
-        })
-        .await
-        .unwrap();
+        })();
     }
 
     fn grantee_key(seed_byte: u8) -> String {

@@ -10,7 +10,7 @@
 //!                                          with PRAGMA
 //!                                          foreign_keys=ON)
 //!
-//! Threading: `tokio::task::spawn_blocking` + `conn.blocking_lock()`
+//! Threading: `tokio::task::spawn_blocking` + `conn.lock()`
 //! per the existing pattern.
 //!
 //! `record_feedback` uses the same ClaimResult shape as the v1.5.17
@@ -26,12 +26,19 @@
 //! `cirislens_thoughts(thought_id)` row doesn't exist; that surfaces
 //! as `Error::Conflict` (rusqlite extended code 787,
 //! `SQLITE_CONSTRAINT_FOREIGNKEY`).
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
 
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use rusqlite::{params, types::Value as SqlValue, Connection};
-use tokio::sync::Mutex;
 
 use super::service::FeedbackMappingService;
 use super::types::{FeedbackFilter, FeedbackMapping};
@@ -135,8 +142,8 @@ impl FeedbackMappingService for SqliteFeedbackMappingBackend {
 
         let conn = self.conn.clone();
         let (won, row): (bool, FeedbackMapping) =
-            tokio::task::spawn_blocking(move || -> Result<(bool, FeedbackMapping), Error> {
-                let mut guard = conn.blocking_lock();
+            (move || -> Result<(bool, FeedbackMapping), Error> {
+                let mut guard = conn.lock();
                 let tx = guard
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(|e| map_sqlite_error(e, "record_feedback begin"))?;
@@ -169,9 +176,7 @@ impl FeedbackMappingService for SqliteFeedbackMappingBackend {
                 tx.commit()
                     .map_err(|e| map_sqlite_error(e, "record_feedback commit"))?;
                 Ok((won, row))
-            })
-            .await
-            .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))??;
+            })()?;
 
         if won {
             Ok(ClaimResult::Stored(row))
@@ -195,8 +200,8 @@ impl FeedbackMappingService for SqliteFeedbackMappingBackend {
         }
         let thought_id_owned = thought_id.to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<FeedbackMapping>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Vec<FeedbackMapping>, Error> {
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare(&format!(
                     "SELECT {SELECT_COLUMNS} FROM cirislens_feedback_mappings \
@@ -213,9 +218,7 @@ impl FeedbackMappingService for SqliteFeedbackMappingBackend {
                 items.push(r.map_err(|e| map_sqlite_error(e, "list_feedback_for_thought row"))??);
             }
             Ok(items)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn list_feedback(
@@ -260,8 +263,8 @@ impl FeedbackMappingService for SqliteFeedbackMappingBackend {
              LIMIT ?{p_limit}"
         );
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<FeedbackMapping>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Vec<FeedbackMapping>, Error> {
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare(&sql)
                 .map_err(|e| map_sqlite_error(e, "list_feedback prepare"))?;
@@ -275,9 +278,7 @@ impl FeedbackMappingService for SqliteFeedbackMappingBackend {
                 items.push(r.map_err(|e| map_sqlite_error(e, "list_feedback row"))??);
             }
             Ok(items)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 }
 
@@ -367,15 +368,13 @@ mod tests {
     /// Mirrors the deferral_reports / scheduled_tasks pattern.
     async fn fk_pragma_on(b: &SqliteBackend) -> bool {
         let conn = b.conn_handle();
-        tokio::task::spawn_blocking(move || -> bool {
-            let guard = conn.blocking_lock();
+        (move || -> bool {
+            let guard = conn.lock();
             guard
                 .query_row("PRAGMA foreign_keys", params![], |row| row.get::<_, i64>(0))
                 .map(|v| v == 1)
                 .unwrap_or(false)
-        })
-        .await
-        .unwrap()
+        })()
     }
 
     #[tokio::test]

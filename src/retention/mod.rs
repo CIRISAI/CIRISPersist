@@ -40,6 +40,14 @@
 //!   and continue the walk backwards through the archived rows.
 //!
 //! Either way the chain stays cryptographically intact.
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
+// each closure's typed return signature load-bearing for error
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -389,8 +397,8 @@ mod tests {
         let live_seqs: Vec<i64> = {
             let conn = backend_arc.conn_handle();
             let tenant_q = tenant.clone();
-            tokio::task::spawn_blocking(move || -> Vec<i64> {
-                let guard = conn.blocking_lock();
+            (move || -> Vec<i64> {
+                let guard = conn.lock();
                 let mut stmt = guard
                     .prepare(
                         "SELECT sequence_number FROM cirislens_audit_log \
@@ -401,9 +409,7 @@ mod tests {
                     .query_map(rusqlite::params![tenant_q], |row| row.get::<_, i64>(0))
                     .unwrap();
                 it.map(|r| r.unwrap()).collect()
-            })
-            .await
-            .unwrap()
+            })()
         };
         assert_eq!(live_seqs, vec![1, 2, 7, 8, 9, 10]);
 
@@ -413,8 +419,8 @@ mod tests {
         let seq7_prev: Vec<u8> = {
             let conn = backend_arc.conn_handle();
             let tenant_q = tenant.clone();
-            tokio::task::spawn_blocking(move || -> Vec<u8> {
-                let guard = conn.blocking_lock();
+            (move || -> Vec<u8> {
+                let guard = conn.lock();
                 guard
                     .query_row(
                         "SELECT prev_hash FROM cirislens_audit_log \
@@ -423,9 +429,7 @@ mod tests {
                         |row| row.get::<_, Vec<u8>>(0),
                     )
                     .unwrap()
-            })
-            .await
-            .unwrap()
+            })()
         };
         assert_eq!(
             seq7_prev, entries[5].entry_hash,
@@ -617,8 +621,8 @@ mod tests {
         // trace_id / thought_id / event_type / trace_level / payload
         // / ts as NOT NULL).
         let conn = sq.conn_handle();
-        tokio::task::spawn_blocking(move || {
-            let guard = conn.blocking_lock();
+        (move || {
+            let guard = conn.lock();
             for i in 0..20 {
                 guard
                     .execute(
@@ -634,9 +638,7 @@ mod tests {
                     )
                     .unwrap();
             }
-        })
-        .await
-        .unwrap();
+        })();
 
         // Delete with threshold > newest_ts and max_rows=5 → exactly 5.
         let threshold = chrono::DateTime::parse_from_rfc3339("2026-12-31T00:00:00Z")

@@ -13,18 +13,25 @@
 //! - Attributes arrive as `TEXT`; we parse to `serde_json::Value`
 //!   for the upsert call.
 //!
-//! Threading: `tokio::task::spawn_blocking` + `conn.blocking_lock()`
+//! Threading: `tokio::task::spawn_blocking` + `conn.lock()`
 //! per the existing pattern. The read loop is one blocking task;
 //! each per-row write is its own async call (because
 //! [`crate::graph::sqlite::SqliteGraphBackend::upsert_node`] itself
 //! goes through spawn_blocking).
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use rusqlite::{params, Connection};
-use tokio::sync::Mutex;
 
 use super::service::LegacyMigrationService;
 use super::types::{LegacyMigrationOptions, LegacyMigrationStats};
@@ -108,8 +115,8 @@ fn parse_attrs(text: Option<&str>) -> Result<serde_json::Value, Error> {
 /// task. Returns the parsed Vec or a `Backend` error on read fail.
 async fn read_legacy_nodes(conn: &Arc<Mutex<Connection>>) -> Result<Vec<LegacyNodeRow>, Error> {
     let conn = conn.clone();
-    tokio::task::spawn_blocking(move || -> Result<Vec<LegacyNodeRow>, Error> {
-        let guard = conn.blocking_lock();
+    (move || -> Result<Vec<LegacyNodeRow>, Error> {
+        let guard = conn.lock();
         // 8-column shape per CIRISAgent's pre-v2.9.0 schema. The
         // signature envelope columns are NOT read — they're set to
         // None/false on the write side (cirisgraph.nodes carries
@@ -140,15 +147,13 @@ async fn read_legacy_nodes(conn: &Arc<Mutex<Connection>>) -> Result<Vec<LegacyNo
             out.push(r.map_err(|e| map_sqlite_error(e, "graph_nodes row"))?);
         }
         Ok(out)
-    })
-    .await
-    .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+    })()
 }
 
 async fn read_legacy_edges(conn: &Arc<Mutex<Connection>>) -> Result<Vec<LegacyEdgeRow>, Error> {
     let conn = conn.clone();
-    tokio::task::spawn_blocking(move || -> Result<Vec<LegacyEdgeRow>, Error> {
-        let guard = conn.blocking_lock();
+    (move || -> Result<Vec<LegacyEdgeRow>, Error> {
+        let guard = conn.lock();
         let mut stmt = guard
             .prepare(
                 "SELECT edge_id, source_node_id, target_node_id, scope, \
@@ -175,9 +180,7 @@ async fn read_legacy_edges(conn: &Arc<Mutex<Connection>>) -> Result<Vec<LegacyEd
             out.push(r.map_err(|e| map_sqlite_error(e, "graph_edges row"))?);
         }
         Ok(out)
-    })
-    .await
-    .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+    })()
 }
 
 /// Probe `sqlite_master` for a table by name. Used to detect
@@ -186,8 +189,8 @@ async fn read_legacy_edges(conn: &Arc<Mutex<Connection>>) -> Result<Vec<LegacyEd
 async fn legacy_table_exists(conn: &Arc<Mutex<Connection>>, name: &str) -> Result<bool, Error> {
     let conn = conn.clone();
     let name = name.to_owned();
-    tokio::task::spawn_blocking(move || -> Result<bool, Error> {
-        let guard = conn.blocking_lock();
+    (move || -> Result<bool, Error> {
+        let guard = conn.lock();
         let exists: bool = guard
             .query_row(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?1",
@@ -199,9 +202,7 @@ async fn legacy_table_exists(conn: &Arc<Mutex<Connection>>, name: &str) -> Resul
                 other => Err(map_sqlite_error(other, "probe sqlite_master")),
             })?;
         Ok(exists)
-    })
-    .await
-    .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+    })()
 }
 
 /// Snapshot present (node_id, scope) tuples in `cirisgraph_nodes`
@@ -215,8 +216,8 @@ async fn snapshot_present_nodes(
         return Ok(HashSet::new());
     }
     let conn = conn.clone();
-    tokio::task::spawn_blocking(move || -> Result<HashSet<(String, String)>, Error> {
-        let guard = conn.blocking_lock();
+    (move || -> Result<HashSet<(String, String)>, Error> {
+        let guard = conn.lock();
         let mut stmt = guard
             .prepare("SELECT node_id, scope FROM cirisgraph_nodes")
             .map_err(|e| map_sqlite_error(e, "prepare cirisgraph_nodes"))?;
@@ -233,9 +234,7 @@ async fn snapshot_present_nodes(
             out.insert(r.map_err(|e| map_sqlite_error(e, "cirisgraph_nodes row"))?);
         }
         Ok(out)
-    })
-    .await
-    .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+    })()
 }
 
 async fn snapshot_present_edge_ids(
@@ -245,8 +244,8 @@ async fn snapshot_present_edge_ids(
         return Ok(HashSet::new());
     }
     let conn = conn.clone();
-    tokio::task::spawn_blocking(move || -> Result<HashSet<String>, Error> {
-        let guard = conn.blocking_lock();
+    (move || -> Result<HashSet<String>, Error> {
+        let guard = conn.lock();
         let mut stmt = guard
             .prepare("SELECT edge_id FROM cirisgraph_edges")
             .map_err(|e| map_sqlite_error(e, "prepare cirisgraph_edges"))?;
@@ -258,9 +257,7 @@ async fn snapshot_present_edge_ids(
             out.insert(r.map_err(|e| map_sqlite_error(e, "cirisgraph_edges row"))?);
         }
         Ok(out)
-    })
-    .await
-    .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+    })()
 }
 
 impl LegacyMigrationService for SqliteLegacyMigrationBackend {
@@ -565,8 +562,8 @@ mod tests {
     /// PG and SQLite reads share the same row shape.
     async fn ensure_legacy_tables(backend: &SqliteBackend) {
         let conn = backend.conn_handle();
-        tokio::task::spawn_blocking(move || {
-            let guard = conn.blocking_lock();
+        (move || {
+            let guard = conn.lock();
             guard
                 .execute_batch(
                     // 8-column shape mirrors CIRISAgent's pre-v2.9.0
@@ -595,9 +592,7 @@ mod tests {
                      );",
                 )
                 .unwrap();
-        })
-        .await
-        .unwrap();
+        })();
     }
 
     async fn seed_node(
@@ -609,8 +604,8 @@ mod tests {
         let conn = backend.conn_handle();
         let nid = node_id.to_owned();
         let sc = scope.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let guard = conn.blocking_lock();
+        (move || {
+            let guard = conn.lock();
             guard
                 .execute(
                     "INSERT INTO graph_nodes (node_id, scope, node_type, attributes_json, \
@@ -620,9 +615,7 @@ mod tests {
                     params![nid, sc, attrs.to_string()],
                 )
                 .unwrap();
-        })
-        .await
-        .unwrap();
+        })();
     }
 
     async fn seed_edge(backend: &SqliteBackend, edge_id: &str, src: &str, tgt: &str, scope: &str) {
@@ -631,8 +624,8 @@ mod tests {
         let s = src.to_owned();
         let t = tgt.to_owned();
         let sc = scope.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let guard = conn.blocking_lock();
+        (move || {
+            let guard = conn.lock();
             guard
                 .execute(
                     "INSERT INTO graph_edges (edge_id, source_node_id, target_node_id, \
@@ -642,9 +635,7 @@ mod tests {
                     params![eid, s, t, sc],
                 )
                 .unwrap();
-        })
-        .await
-        .unwrap();
+        })();
     }
 
     #[tokio::test]

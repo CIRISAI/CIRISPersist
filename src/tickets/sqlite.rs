@@ -7,14 +7,21 @@
 //!   BOOLEAN                      → INTEGER (0 / 1)
 //!   ON CONFLICT (ticket_id) DO UPDATE   → identical
 //!
-//! Threading: `tokio::task::spawn_blocking` + `conn.blocking_lock()`
+//! Threading: `tokio::task::spawn_blocking` + `conn.lock()`
 //! per the existing pattern.
+#![allow(clippy::redundant_closure_call)]
+// v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
+// tokio::task::spawn_blocking sites uses (closure)() to invoke
+// the closure inline. Clippy's redundant_closure_call lint flags
+// this; we allow it because the mechanical transformation kept
+// each closure's typed return signature load-bearing for error
+// propagation and any other refactor would be a much larger diff.
 
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
-use tokio::sync::Mutex;
 
 use super::service::TicketService;
 use super::types::{Ticket, TicketCursor, TicketFilter, TicketListPage, TicketStatus};
@@ -191,8 +198,8 @@ impl TicketService for SqliteTicketBackend {
         let created_at_str = fmt_datetime(ticket.created_at);
 
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), Error> {
-            let mut guard = conn.blocking_lock();
+        (move || -> Result<(), Error> {
+            let mut guard = conn.lock();
             let tx = guard
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|e| map_sqlite_error(e, "upsert_ticket begin"))?;
@@ -244,9 +251,7 @@ impl TicketService for SqliteTicketBackend {
             tx.commit()
                 .map_err(|e| map_sqlite_error(e, "upsert_ticket commit"))?;
             Ok(())
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn get_ticket(&self, ticket_id: &str) -> Result<Option<Ticket>, Error> {
@@ -255,8 +260,8 @@ impl TicketService for SqliteTicketBackend {
         }
         let conn = self.conn.clone();
         let ticket_id_owned = ticket_id.to_owned();
-        tokio::task::spawn_blocking(move || -> Result<Option<Ticket>, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<Option<Ticket>, Error> {
+            let guard = conn.lock();
             let row_opt = guard
                 .query_row(
                     "SELECT ticket_id, sop, ticket_type, status, priority, \
@@ -274,9 +279,7 @@ impl TicketService for SqliteTicketBackend {
                 None => Ok(None),
                 Some(r) => Ok(Some(r?)),
             }
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn list_tickets(
@@ -364,8 +367,8 @@ impl TicketService for SqliteTicketBackend {
         );
         let conn = self.conn.clone();
         let limit_usize = limit as usize;
-        tokio::task::spawn_blocking(move || -> Result<TicketListPage, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<TicketListPage, Error> {
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare(&sql)
                 .map_err(|e| map_sqlite_error(e, "list_tickets prepare"))?;
@@ -386,9 +389,7 @@ impl TicketService for SqliteTicketBackend {
                 None
             };
             Ok(TicketListPage { items, next_cursor })
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn assign_ticket(
@@ -411,8 +412,8 @@ impl TicketService for SqliteTicketBackend {
         let ticket_id_owned = ticket_id.to_owned();
         let user_identifier_owned = user_identifier.to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<bool, Error> {
-            let mut guard = conn.blocking_lock();
+        (move || -> Result<bool, Error> {
+            let mut guard = conn.lock();
             let tx = guard
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|e| map_sqlite_error(e, "assign_ticket begin"))?;
@@ -455,9 +456,7 @@ impl TicketService for SqliteTicketBackend {
                     Ok(changed > 0)
                 }
             }
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 
     async fn update_ticket_status(
@@ -475,8 +474,8 @@ impl TicketService for SqliteTicketBackend {
         let completed_at_str = completed_at.map(fmt_datetime);
         let ticket_id_owned = ticket_id.to_owned();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<bool, Error> {
-            let guard = conn.blocking_lock();
+        (move || -> Result<bool, Error> {
+            let guard = conn.lock();
             let mut sets: Vec<String> = vec!["status = ?2".into(), "last_updated = ?3".into()];
             let mut sql_params: Vec<SqlValue> = vec![
                 SqlValue::Text(ticket_id_owned),
@@ -499,9 +498,7 @@ impl TicketService for SqliteTicketBackend {
                 .execute(&sql, params_from_iter(sql_params.iter()))
                 .map_err(|e| map_sqlite_error(e, "update_ticket_status exec"))?;
             Ok(changed > 0)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("spawn_blocking join: {e}")))?
+        })()
     }
 }
 
@@ -614,8 +611,8 @@ mod tests {
     async fn status_check_constraint_rejects_unknown_value() {
         let (b, _svc) = fresh_backend().await;
         let conn = b.conn_handle();
-        let res = tokio::task::spawn_blocking(move || -> rusqlite::Result<usize> {
-            let guard = conn.blocking_lock();
+        let res = (move || -> rusqlite::Result<usize> {
+            let guard = conn.lock();
             guard.execute(
                 "INSERT INTO cirislens_tickets (\
                     ticket_id, sop, ticket_type, status, priority, \
@@ -626,9 +623,7 @@ mod tests {
                            '2026-01-01T00:00:00.000000+00:00')",
                 params![],
             )
-        })
-        .await
-        .unwrap();
+        })();
         assert!(res.is_err(), "expected CHECK violation on bogus status");
     }
 
@@ -655,8 +650,8 @@ mod tests {
         let conn = b.conn_handle();
         for bad in [0i32, 11, -1] {
             let conn = conn.clone();
-            let res = tokio::task::spawn_blocking(move || -> rusqlite::Result<usize> {
-                let guard = conn.blocking_lock();
+            let res = (move || -> rusqlite::Result<usize> {
+                let guard = conn.lock();
                 guard.execute(
                     "INSERT INTO cirislens_tickets (\
                         ticket_id, sop, ticket_type, status, priority, \
@@ -667,9 +662,7 @@ mod tests {
                                '2026-01-01T00:00:00.000000+00:00')",
                     params![format!("id-{bad}"), bad],
                 )
-            })
-            .await
-            .unwrap();
+            })();
             assert!(
                 res.is_err(),
                 "expected CHECK violation on priority {bad} at SQL layer"
