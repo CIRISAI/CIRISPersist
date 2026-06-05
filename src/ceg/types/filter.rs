@@ -1,89 +1,19 @@
-//! Common types shared across `read::` primitives.
+//! [`TraceFilter`] — filter struct for trace queries (sections A / E) —
+//! and [`DeviationMetric`], the Coherence Ratchet divergence
+//! discriminator (section F).
 //!
-//! - [`TimeWindow`] — `(since, until)` pair used by every windowed
-//!   primitive (sections E / F / G / H).
-//! - [`TraceCursor`] — opaque cursor for trace-summary listing
-//!   (section A).
-//! - [`TraceFilter`] — filter struct for trace queries (sections A / E).
-//! - [`DeviationMetric`] — discriminator for Coherence Ratchet
-//!   divergence queries (section F).
+//! Moved from `src/read/types.rs` in v4.0 (FSD §3.3). No behaviour
+//! change; the `Filter` trait + composable filter primitives the FSD
+//! §5 names land in a LATER v4.0 commit — this file holds only the
+//! v3.x filter shapes relocated under the new namespace.
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::window::TimeWindow;
 use crate::schema::TraceLevel;
 
-/// Half-open time window `[since, until)`.
-///
-/// All windowed primitives take a [`TimeWindow`] rather than separate
-/// `since`/`until` parameters to make "filter by time" a single typed
-/// argument. AV-4 caveat: window-filter inputs are caller-provided
-/// wall-clock; the time-bound assertion is best-effort, not
-/// authenticated. Documented on every windowed primitive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TimeWindow {
-    /// Inclusive lower bound.
-    pub since: DateTime<Utc>,
-    /// Exclusive upper bound.
-    pub until: DateTime<Utc>,
-}
-
-impl TimeWindow {
-    /// Construct + validate. Returns
-    /// [`super::Error::InvalidArgument`] if `since >= until`.
-    pub fn new(since: DateTime<Utc>, until: DateTime<Utc>) -> Result<Self, super::Error> {
-        if since >= until {
-            return Err(super::Error::InvalidArgument(format!(
-                "TimeWindow: since ({since}) must be < until ({until})"
-            )));
-        }
-        Ok(TimeWindow { since, until })
-    }
-
-    /// Window duration.
-    pub fn duration(&self) -> chrono::Duration {
-        self.until - self.since
-    }
-}
-
-/// Opaque cursor for [`super::ReadEngine::list_trace_summaries`].
-///
-/// Built around the `(started_at, trace_id)` tuple — paged queries
-/// order by `started_at DESC, trace_id DESC` (newest-first triage),
-/// and the cursor encodes the last item's `(ts, trace_id)` so the
-/// next page picks up at the next-older trace.
-///
-/// Wire-stable: serializes to JSON, the PyO3 boundary treats it as
-/// an opaque string. Internal field shape may evolve in v0.5.x; the
-/// JSON shape is the contract. v0.5.0 carries a `version` tag so
-/// future evolutions can route by it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TraceCursor {
-    /// Cursor format version. v0.5.0 ships `"v1"`. Future cursor
-    /// shape evolutions add a new variant + this field discriminates.
-    pub version: String,
-
-    /// `started_at` of the last item on the previous page.
-    pub last_started_at: DateTime<Utc>,
-
-    /// `trace_id` of the last item — tiebreaker for traces with
-    /// equal `started_at`.
-    pub last_trace_id: String,
-}
-
-impl TraceCursor {
-    /// Construct a v1 cursor from the trailing edge of a result page.
-    pub fn from_trailing(last_started_at: DateTime<Utc>, last_trace_id: String) -> Self {
-        TraceCursor {
-            version: "v1".to_owned(),
-            last_started_at,
-            last_trace_id,
-        }
-    }
-}
-
-/// Filter struct for [`super::ReadEngine::list_trace_summaries`] and
-/// the granular `count_*` primitives.
+/// Filter struct for [`crate::ceg::ReadEngine::list_trace_summaries`]
+/// and the granular `count_*` primitives.
 ///
 /// Every field is optional; an empty filter returns the full table
 /// (subject to the caller's `limit`). Filters compose AND-style — a
@@ -141,7 +71,7 @@ pub struct TraceFilter {
     pub cognitive_state: Option<String>,
 }
 
-/// Discriminator for [`super::ReadEngine::cross_agent_divergence`]
+/// Discriminator for [`crate::ceg::ReadEngine::cross_agent_divergence`]
 /// — which DMA / conscience metric drives the z-score.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

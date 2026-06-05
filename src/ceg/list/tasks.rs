@@ -1,5 +1,7 @@
 //! Section C — Task-grouped listing primitives.
 //!
+//! Moved from `src/read/task.rs` in v4.0 (FSD §3.3).
+//!
 //! A *task* is the unit of work the agent was prompted with; each task
 //! contains 1..N *traces* (one trace per thought). Lens needs to
 //! surface tasks rather than raw traces in the visible-page driver
@@ -13,7 +15,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::{TimeWindow, TraceSummary};
+use crate::ceg::list::traces::TraceSummary;
+use crate::ceg::types::TimeWindow;
 
 /// Task classification — derived from the `task_id` prefix by
 /// [`TaskClass::from_task_id`]. The match table is the canonical
@@ -84,10 +87,10 @@ impl TaskClass {
     }
 }
 
-/// Filter for [`super::ReadEngine::list_tasks`]. Composes AND-style;
-/// every field is optional. Filter semantics match [`super::TraceFilter`]
-/// (filters the underlying trace rows; tasks are then grouped from
-/// the surviving traces).
+/// Filter for [`crate::ceg::ReadEngine::list_tasks`]. Composes
+/// AND-style; every field is optional. Filter semantics match
+/// [`crate::ceg::TraceFilter`] (filters the underlying trace rows;
+/// tasks are then grouped from the surviving traces).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskFilter {
     /// Window on the task's earliest trace `ts`.
@@ -107,7 +110,7 @@ pub struct TaskFilter {
     pub task_class: Option<TaskClass>,
 }
 
-/// Opaque cursor for [`super::ReadEngine::list_tasks`].
+/// Opaque cursor for [`crate::ceg::ReadEngine::list_tasks`].
 ///
 /// Built around the `(earliest_at, task_id)` tuple — pages are ordered
 /// newest-first (`earliest_at DESC, task_id DESC`). The cursor encodes
