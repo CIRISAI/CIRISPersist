@@ -546,6 +546,86 @@ impl DimensionAdmissionPolicy {
         Ok(())
     }
 
+    /// v4.0 (CIRISPersist#160 comment 4, FSD §4.6) — AV-45 closure.
+    /// The write-side cohort_scope admission gate, symmetric to the
+    /// read-gate ([`crate::scope::cohort_scope_sql_predicate`], §4.3).
+    ///
+    /// The read-gate asks "is the *reader* in this row's target cohort?";
+    /// the write-gate asks "is the *writer* in the target cohort they're
+    /// trying to stamp?". Both directions consume the same
+    /// [`CallerAdmission`](crate::scope::CallerAdmission) primitive — one
+    /// builder, no emitter-resolution, pure set-membership.
+    ///
+    /// Called from `put_attestation`, the trace-ingest pipeline
+    /// (`IngestPipeline::receive_and_persist_with`, after the
+    /// verify-before-persist gate, MISSION §4), and every write path that
+    /// stores a row carrying `(cohort_scope, cohort_target_id)`. A
+    /// refusal means the row is NOT persisted (zero writes, mirroring the
+    /// verify-rejection discipline).
+    ///
+    /// `claimed_target_id` is `None` for the broad belonging-tiers and
+    /// for `self` (where the target IS the writer's identity, resolved
+    /// and stamped by the substrate at ingest, not caller-supplied — see
+    /// `IngestPipeline` D2 self-target resolution and FSD §4.4 / §12.0).
+    ///
+    /// # Arms (FSD §4.6)
+    ///
+    /// - `self` — always permitted; the substrate already stamps
+    ///   `cohort_target_id = writer identity` from the verified signer.
+    /// - `family` — `Ok` iff `claimed_target_id ∈
+    ///   writer_admission.family_key_ids`, else
+    ///   [`ScopeRefusalReason::NoFamilyMembership`]. A `None` target
+    ///   (claiming family visibility without naming a family) cannot be
+    ///   membership-validated and is refused.
+    /// - `community` — `Ok` iff `claimed_target_id ∈
+    ///   writer_admission.community_key_ids`, else
+    ///   [`ScopeRefusalReason::NoCommunityMembership`].
+    /// - `affiliations` / `species` / `biosphere` / `federation` —
+    ///   broad belonging-tiers; no per-row target; any authenticated
+    ///   writer may emit. The federation layer counter-signs (hybrid
+    ///   sigs).
+    /// - anything else — [`ScopeRefusalReason::InvalidCohortScope`]
+    ///   carrying the offending label (closed-set fall-through).
+    ///
+    /// Returns `Err(...)` on a downgrade attempt — e.g. stamping
+    /// `cohort_scope: community` for a community the writer is not a
+    /// member of, to broaden visibility.
+    pub fn check_write_cohort_scope(
+        writer_admission: &crate::scope::CallerAdmission,
+        claimed_cohort_scope: &str,
+        claimed_target_id: Option<&str>,
+    ) -> Result<(), crate::scope::ScopeRefusalReason> {
+        use crate::federation::types::cohort_scope as cs;
+        use crate::scope::ScopeRefusalReason;
+
+        match claimed_cohort_scope {
+            // Self — target IS the writer's identity, resolved + stamped
+            // by the substrate from the verified signer (D2 ingest /
+            // FSD §4.4). Any caller-supplied self-target is ignored.
+            // Always permitted for the writer.
+            cs::SELF => Ok(()),
+
+            // Family — the writer must be a member of the claimed family.
+            cs::FAMILY => match claimed_target_id {
+                Some(fid) if writer_admission.family_key_ids.contains(fid) => Ok(()),
+                _ => Err(ScopeRefusalReason::NoFamilyMembership),
+            },
+
+            // Community — the writer must be a member of the claimed
+            // community.
+            cs::COMMUNITY => match claimed_target_id {
+                Some(cid) if writer_admission.community_key_ids.contains(cid) => Ok(()),
+                _ => Err(ScopeRefusalReason::NoCommunityMembership),
+            },
+
+            // Broad belonging-tiers — no per-row target; any
+            // authenticated writer may emit.
+            cs::AFFILIATIONS | cs::SPECIES | cs::BIOSPHERE | cs::FEDERATION => Ok(()),
+
+            other => Err(ScopeRefusalReason::InvalidCohortScope(other.to_string())),
+        }
+    }
+
     /// True iff `dim` is one of the CEG 0.2 §5.2 attestation-ladder
     /// dimensions — either the canonical mechanism form
     /// ([`ATTESTATION_LADDER_MECHANISMS`]) or the deprecated
@@ -1367,5 +1447,140 @@ mod tests {
         // unknown values are not suppressors (they're rejected upstream
         // by is_valid / the admission gate).
         assert!(!cs::suppresses_holds_bytes("global"));
+    }
+
+    // ── AV-45 (FSD §4.6): write-path cohort_scope admission gate ────
+
+    use crate::scope::{CallerAdmission, ScopeRefusalReason};
+
+    /// A writer in family F1 + community C1 (and identity == occurrence).
+    fn writer_in_f1_c1() -> CallerAdmission {
+        CallerAdmission::for_test(
+            "writer-occ",
+            "writer-identity",
+            ["family-key:f1".to_string()],
+            ["community-key:c1".to_string()],
+        )
+    }
+
+    #[test]
+    fn write_self_always_permitted() {
+        // `self` is a no-op pass — the substrate stamps the target from
+        // the verified signer; any caller-supplied target is ignored.
+        let w = writer_in_f1_c1();
+        DimensionAdmissionPolicy::check_write_cohort_scope(&w, "self", None).unwrap();
+        // A bogus self-target is still permitted at the gate (it's
+        // overwritten by D2's self-target resolution, not trusted here).
+        DimensionAdmissionPolicy::check_write_cohort_scope(&w, "self", Some("victim-id")).unwrap();
+    }
+
+    #[test]
+    fn write_family_member_permitted() {
+        let w = writer_in_f1_c1();
+        DimensionAdmissionPolicy::check_write_cohort_scope(&w, "family", Some("family-key:f1"))
+            .unwrap();
+    }
+
+    #[test]
+    fn write_family_non_member_refused() {
+        // Downgrade attempt: claim a family the writer is NOT in.
+        let w = writer_in_f1_c1();
+        let err =
+            DimensionAdmissionPolicy::check_write_cohort_scope(&w, "family", Some("family-key:f9"))
+                .unwrap_err();
+        assert_eq!(err, ScopeRefusalReason::NoFamilyMembership);
+        assert_eq!(err.kind(), "scope_no_family_membership");
+    }
+
+    #[test]
+    fn write_family_missing_target_refused() {
+        // Claiming family visibility without naming a family cannot be
+        // membership-validated — refused.
+        let w = writer_in_f1_c1();
+        let err =
+            DimensionAdmissionPolicy::check_write_cohort_scope(&w, "family", None).unwrap_err();
+        assert_eq!(err, ScopeRefusalReason::NoFamilyMembership);
+    }
+
+    #[test]
+    fn write_community_member_permitted() {
+        let w = writer_in_f1_c1();
+        DimensionAdmissionPolicy::check_write_cohort_scope(
+            &w,
+            "community",
+            Some("community-key:c1"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn write_community_non_member_refused() {
+        // The §4.6 named downgrade-refusal: writer claims community C2
+        // they are NOT a member of → NoCommunityMembership.
+        let w = writer_in_f1_c1();
+        let err = DimensionAdmissionPolicy::check_write_cohort_scope(
+            &w,
+            "community",
+            Some("community-key:c2"),
+        )
+        .unwrap_err();
+        assert_eq!(err, ScopeRefusalReason::NoCommunityMembership);
+        assert_eq!(err.kind(), "scope_no_community_membership");
+    }
+
+    #[test]
+    fn write_community_missing_target_refused() {
+        let w = writer_in_f1_c1();
+        let err =
+            DimensionAdmissionPolicy::check_write_cohort_scope(&w, "community", None).unwrap_err();
+        assert_eq!(err, ScopeRefusalReason::NoCommunityMembership);
+    }
+
+    #[test]
+    fn write_broad_tiers_permitted_for_any_authenticated_writer() {
+        // Broad belonging-tiers carry no per-row target; any
+        // authenticated writer may emit. A writer with empty admission
+        // sets passes all four.
+        let w = CallerAdmission::for_test("sovereign-occ", "sovereign-occ", [], []);
+        for scope in ["affiliations", "species", "biosphere", "federation"] {
+            DimensionAdmissionPolicy::check_write_cohort_scope(&w, scope, None)
+                .unwrap_or_else(|e| panic!("broad tier {scope} must admit, got {e:?}"));
+            // A spurious target on a broad tier is ignored (no target
+            // semantics) — still admitted.
+            DimensionAdmissionPolicy::check_write_cohort_scope(&w, scope, Some("ignored")).unwrap();
+        }
+    }
+
+    #[test]
+    fn write_unknown_cohort_scope_refused_invalid() {
+        let w = writer_in_f1_c1();
+        // `global` is a feed-name, never a wire value; garbage too.
+        for bad in ["global", "", "Self", "partnered"] {
+            let err =
+                DimensionAdmissionPolicy::check_write_cohort_scope(&w, bad, None).unwrap_err();
+            match err {
+                ScopeRefusalReason::InvalidCohortScope(ref label) => {
+                    assert_eq!(label, bad);
+                    assert_eq!(err.kind(), "scope_invalid_cohort_scope");
+                }
+                other => panic!("expected InvalidCohortScope({bad:?}), got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn write_family_target_membership_is_exact_not_substring() {
+        // Set-membership is exact-match, not prefix/substring — a writer
+        // in `family-key:f1` cannot stamp `family-key:f10`.
+        let w = writer_in_f1_c1();
+        assert_eq!(
+            DimensionAdmissionPolicy::check_write_cohort_scope(
+                &w,
+                "family",
+                Some("family-key:f10")
+            )
+            .unwrap_err(),
+            ScopeRefusalReason::NoFamilyMembership
+        );
     }
 }

@@ -271,6 +271,43 @@ pub trait Backend: Send + Sync {
     ) -> impl Future<Output = Result<Option<String>, Error>> + Send {
         async { Ok(None) }
     }
+
+    /// v4.0 (CIRISPersist#160 comment 4, FSD §4.6) — every family
+    /// `family_key_id` the given IDENTITY is a member of. The
+    /// family-half of the writer's [`CallerAdmission`](crate::scope::CallerAdmission)
+    /// for the write-path cohort_scope gate
+    /// ([`DimensionAdmissionPolicy::check_write_cohort_scope`](crate::federation::admission::DimensionAdmissionPolicy::check_write_cohort_scope)).
+    ///
+    /// Mirrors the read-side admission builder
+    /// ([`build_caller_admission`](crate::scope::build_caller_admission))
+    /// step 2 but reachable from the `Backend`-only ingest pipeline,
+    /// which holds no `Engine`. `member_identity_key_id` is the writer's
+    /// identity (resolved via [`Self::resolve_identity_for_occurrence`]).
+    ///
+    /// Default impl returns `Ok(vec![])` — the sovereign/singleton
+    /// posture (no family memberships). The Postgres / SQLite / Memory
+    /// backends override to consult their
+    /// [`crate::federation::FederationDirectory`] impl.
+    fn admission_family_key_ids(
+        &self,
+        _member_identity_key_id: &str,
+    ) -> impl Future<Output = Result<Vec<String>, Error>> + Send {
+        async { Ok(Vec::new()) }
+    }
+
+    /// v4.0 (CIRISPersist#160 comment 4, FSD §4.6) — every community
+    /// `community_key_id` the given IDENTITY is a member of. The
+    /// community-half of the writer's admission for the write-path
+    /// cohort_scope gate. Symmetric to [`Self::admission_family_key_ids`];
+    /// see that method for the full rationale.
+    ///
+    /// Default impl returns `Ok(vec![])` — sovereign/singleton posture.
+    fn admission_community_key_ids(
+        &self,
+        _member_identity_key_id: &str,
+    ) -> impl Future<Output = Result<Vec<String>, Error>> + Send {
+        async { Ok(Vec::new()) }
+    }
 }
 
 /// Report of a batch insert.

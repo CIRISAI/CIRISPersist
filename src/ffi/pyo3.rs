@@ -2511,9 +2511,13 @@ impl PyEngine {
                         // v1.1.0 (CIRISPersist#33 part 3) — PipelineInvariant
                         // is also caller-fault (FSD §4.3 shape violation
                         // signalled by the edge); maps to lens-side HTTP 422.
+                        // v4.0 (FSD §4.6) — AV-45 write-path cohort_scope
+                        // refusal is caller-fault (the writer stamped a
+                        // cohort it isn't a member of); lens-side HTTP 403.
                         IngestError::Schema(_)
                         | IngestError::Verify(_)
                         | IngestError::Scrub(_)
+                        | IngestError::ScopeRefused(_)
                         | IngestError::PipelineInvariant { .. } => Err(match detail {
                             Some(d) => PyValueError::new_err((kind, d)),
                             None => PyValueError::new_err(kind),
@@ -17360,6 +17364,10 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // v3.4.0 (CIRISPersist#123) — trust gate rejection is
         // caller-side authorization failure; ValueError (4xx).
         crate::federation::Error::TrustBelowThreshold { .. } => PyValueError::new_err(kind),
+        // v4.0 (CIRISPersist#160, FSD §4.6) — AV-45 write-path
+        // cohort_scope refusal is caller-side authorization failure (the
+        // writer stamped a cohort it isn't a member of); ValueError (4xx).
+        crate::federation::Error::WriteScopeRefused(_) => PyValueError::new_err(kind),
         // Server-fault → RuntimeError (5xx).
         crate::federation::Error::Backend(_) => PyRuntimeError::new_err(kind),
     }
