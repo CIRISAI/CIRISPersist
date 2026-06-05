@@ -1779,18 +1779,19 @@ mod tests {
         // 10. Tamper: directly UPDATE a payload, verify_chain surfaces
         //     EntryHashMismatch.
         let conn = _b.conn_handle();
-        let guard = conn.lock().await;
-        guard
-            .execute(
-                "UPDATE cirislens_audit_log SET payload = ?1 \
-                 WHERE tenant_id = ?2 AND sequence_number = 2",
-                params![
-                    serde_json::to_string(&serde_json::json!({"TAMPERED": true})).unwrap(),
-                    &tenant,
-                ],
-            )
-            .unwrap();
-        drop(guard);
+        {
+            let guard = conn.lock();
+            guard
+                .execute(
+                    "UPDATE cirislens_audit_log SET payload = ?1 \
+                     WHERE tenant_id = ?2 AND sequence_number = 2",
+                    params![
+                        serde_json::to_string(&serde_json::json!({"TAMPERED": true})).unwrap(),
+                        &tenant,
+                    ],
+                )
+                .unwrap();
+        }
         let tampered = audit.verify_chain(&tenant, 1, None).await.unwrap();
         match tampered.outcome {
             ChainVerifyOutcome::Break {

@@ -2324,6 +2324,7 @@ mod tests {
             .expect("construct engine");
 
         let dispatch = engine.audit_service();
+        #[allow(clippy::infallible_destructuring_match)]
         let backend = match dispatch {
             AuditDispatch::Sqlite(b) => b,
             #[cfg(feature = "postgres")]

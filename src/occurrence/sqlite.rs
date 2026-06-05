@@ -375,7 +375,7 @@ mod tests {
         let past = fmt_datetime(Utc::now() - Duration::hours(1));
         {
             let conn = b.conn_handle();
-            let guard = conn.lock().await;
+            let guard = conn.lock();
             guard
                 .execute(
                     "UPDATE cirislens_occurrence_registry \

@@ -1558,20 +1558,21 @@ mod tests {
 
         // Plant a fresh lock.
         let conn = b.conn_handle();
-        let guard = conn.lock().await;
-        guard
-            .execute(
-                "INSERT INTO cirisgraph_consolidation_locks \
-                 (period_start, period_end, tenant_id, locked_by, locked_at) \
-                 VALUES (?1, ?2, ?3, 'planted-worker', datetime('now', 'subsec'))",
-                params![
-                    fmt_datetime(period_start),
-                    fmt_datetime(period_end),
-                    &tenant
-                ],
-            )
-            .unwrap();
-        drop(guard);
+        {
+            let guard = conn.lock();
+            guard
+                .execute(
+                    "INSERT INTO cirisgraph_consolidation_locks \
+                     (period_start, period_end, tenant_id, locked_by, locked_at) \
+                     VALUES (?1, ?2, ?3, 'planted-worker', datetime('now', 'subsec'))",
+                    params![
+                        fmt_datetime(period_start),
+                        fmt_datetime(period_end),
+                        &tenant
+                    ],
+                )
+                .unwrap();
+        }
 
         let outcome = tlm
             .consolidate_period(ConsolidationRequest {
@@ -1627,7 +1628,7 @@ mod tests {
 
         // Verify the column landed.
         let conn = b.conn_handle();
-        let guard = conn.lock().await;
+        let guard = conn.lock();
         let (lvl, attrs_str): (String, String) = guard
             .query_row(
                 "SELECT consolidation_level, attributes FROM cirisgraph_nodes \
@@ -1704,7 +1705,7 @@ mod tests {
 
         // Verify the daily row.
         let conn = b.conn_handle();
-        let guard = conn.lock().await;
+        let guard = conn.lock();
         let (lvl, attrs_str): (String, String) = guard
             .query_row(
                 "SELECT consolidation_level, attributes FROM cirisgraph_nodes \
@@ -2013,7 +2014,7 @@ mod tests {
 
         {
             let conn = b.conn_handle();
-            let guard = conn.lock().await;
+            let guard = conn.lock();
             seed_task(&guard, "t1", &tenant, "completed", period_start);
             seed_task(
                 &guard,
@@ -2077,7 +2078,7 @@ mod tests {
 
         {
             let conn = b.conn_handle();
-            let guard = conn.lock().await;
+            let guard = conn.lock();
             seed_correlation(
                 &guard,
                 "c1",
@@ -2165,7 +2166,7 @@ mod tests {
 
         {
             let conn = b.conn_handle();
-            let guard = conn.lock().await;
+            let guard = conn.lock();
             seed_correlation(&guard, "tr1", &tenant, "call", "trace", None, period_start);
             seed_correlation(
                 &guard,
@@ -2237,7 +2238,7 @@ mod tests {
 
         {
             let conn = b.conn_handle();
-            let guard = conn.lock().await;
+            let guard = conn.lock();
             seed_audit(
                 &guard,
                 &uuid::Uuid::new_v4().to_string(),

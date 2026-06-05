@@ -476,7 +476,7 @@ impl GraphService for SqliteGraphBackend {
                     )));
                 }
             }
-            let _ = guard;
+            drop(guard);
             Ok(())
         })()
     }

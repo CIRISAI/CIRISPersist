@@ -5,6 +5,16 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.14.1] — 2026-06-05
+
+**Hotfix: CI clippy errors uncovered by v3.14.0's parking_lot::Mutex switch.**
+
+- Stripped residual `.lock().await` patterns (9 sites across `src/occurrence/sqlite.rs`, `src/telemetry/sqlite.rs`, `src/audit/sqlite.rs`) — parking_lot's `lock()` is sync, no `.await` needed
+- `src/graph/sqlite.rs:479` `let _ = guard;` → `drop(guard);` (clippy: non-binding let on sync lock)
+- `src/audit/sqlite.rs` + `src/telemetry/sqlite.rs` test sites: wrapped guard in block scope so it drops before the subsequent `.await` (clippy: MutexGuard held across await — the `drop(guard); ... .await` form satisfied semantics but not clippy's scope-based analysis)
+- `src/engine.rs:2327` test: `#[allow(clippy::infallible_destructuring_match)]` for the postgres-feature-gated match (when postgres is off, the match has a single arm — clippy lints, but the cfg-gate is the right shape)
+- 569/569 sqlite lib tests green. Clippy clean across `sqlite` / `sqlite,telemetry,cirisaudit` / `pyo3` feature axes.
+
 ## [3.14.0] — 2026-06-04
 
 **CIRISPersist 3.14.0 — closes CIRISPersist#158 via inline-sync SQLite rewrite.** No more `tokio::task::spawn_blocking` in the sqlite path; no more `tokio::sync::Mutex<Connection>`.
