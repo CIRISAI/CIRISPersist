@@ -19,6 +19,8 @@ pub mod memory;
 pub mod migration_timing;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod scope_bind;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod types;
