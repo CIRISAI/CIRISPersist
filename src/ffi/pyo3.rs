@@ -3199,43 +3199,14 @@ impl PyEngine {
         })
     }
 
-    /// Federation directory: list attestations targeting `attested_key_id`.
-    fn list_attestations_for(&self, py: Python<'_>, attested_key_id: &str) -> PyResult<String> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let attested_key_id = attested_key_id.to_owned();
-            py.detach(|| match &self.backend {
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        let rows = backend
-                            .list_attestations_for(&attested_key_id)
-                            .await
-                            .map_err(federation_err_to_py)?;
-                        serde_json::to_string(&rows).map_err(|e| {
-                            PyRuntimeError::new_err(format!("Vec<Attestation> JSON encode: {e}"))
-                        })
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend = sq.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        let rows = backend
-                            .list_attestations_for(&attested_key_id)
-                            .await
-                            .map_err(federation_err_to_py)?;
-                        serde_json::to_string(&rows).map_err(|e| {
-                            PyRuntimeError::new_err(format!("Vec<Attestation> JSON encode: {e}"))
-                        })
-                    })
-                }
-            })
-        })
-    }
+    // NB (v4.0 #135) — the legacy `list_attestations_for(attested_key_id)
+    // -> Vec<Attestation>` PyO3 wrapper (uncapped, no scope, no cursor) is
+    // superseded by the scope-gated cursor-paged
+    // `list_attestations_for(target_key_id, cursor, limit,
+    // caller_occurrence_key_id)` below (hard cut, no alias — FSD §0). The
+    // internal `FederationDirectory::list_attestations_for` trait method
+    // stays for grant-chain topology traversal; only the Python surface
+    // moves to the bounded v4.0 contract.
 
     /// Federation directory: list attestations issued by `attesting_key_id`.
     fn list_attestations_by(&self, py: Python<'_>, attesting_key_id: &str) -> PyResult<String> {
@@ -8233,6 +8204,76 @@ impl PyEngine {
                         .await?;
                         let page = backend
                             .list_attestations(filter, cursor, limit, scope)
+                            .await
+                            .map_err(read_err_to_py)?;
+                        serde_json::to_string(&page).map_err(|e| {
+                            PyRuntimeError::new_err(format!("AttestationListPage encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// #135 + part of #150 — list every attestation whose subject is
+    /// `target_key_id` (`attested_key_id = target_key_id`), newest-first,
+    /// cursor-paged. Scope is built from `caller_occurrence_key_id`
+    /// (None → Unauthenticated; the §4.3 gate then admits broad-tier
+    /// attestations only). Returns JSON-encoded `AttestationListPage`.
+    #[pyo3(signature = (target_key_id, cursor_json=None, limit=100, caller_occurrence_key_id=None))]
+    fn list_attestations_for(
+        &self,
+        py: Python<'_>,
+        target_key_id: &str,
+        cursor_json: Option<&str>,
+        limit: i64,
+        caller_occurrence_key_id: Option<String>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let target = target_key_id.to_owned();
+            let cursor: Option<crate::read::AttestationCursor> = match cursor_json {
+                None => None,
+                Some(s) => Some(serde_json::from_str(s).map_err(|e| {
+                    PyValueError::new_err(format!("AttestationCursor JSON decode: {e}"))
+                })?),
+            };
+            let dispatch = self.engine_dispatch();
+            let signer = self.signer.clone();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
+                        let page = backend
+                            .list_attestations_for(&target, cursor, limit, scope)
+                            .await
+                            .map_err(read_err_to_py)?;
+                        serde_json::to_string(&page).map_err(|e| {
+                            PyRuntimeError::new_err(format!("AttestationListPage encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::read::ReadEngine;
+                        let scope = Self::resolve_scope(
+                            dispatch.clone(),
+                            signer.clone(),
+                            caller_occurrence_key_id.clone(),
+                        )
+                        .await?;
+                        let page = backend
+                            .list_attestations_for(&target, cursor, limit, scope)
                             .await
                             .map_err(read_err_to_py)?;
                         serde_json::to_string(&page).map_err(|e| {

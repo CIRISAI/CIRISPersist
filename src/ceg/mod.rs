@@ -337,6 +337,29 @@ pub trait ReadEngine: Send + Sync {
         scope: CallerScope,
     ) -> impl Future<Output = Result<AttestationListPage, Error>> + Send;
 
+    /// List every attestation whose subject is `target` (i.e.
+    /// `attested_key_id = target`), newest-first by
+    /// `(asserted_at, attestation_id)`, cursor-paged. #135 + part of
+    /// #150.
+    ///
+    /// The scope predicate gates on the attestation's OWN
+    /// `cohort_scope` (§4.3), NOT the target's. `federation_attestations`
+    /// carries `cohort_scope` but no per-row cohort *target* column
+    /// (V056 added only `cohort_scope`; the target column an analogue
+    /// of `trace_events.cohort_target_id` would be named
+    /// `cohort_target_id` and is a documented follow-up — see
+    /// `cohort_scope_sql_predicate`'s broad-tier branch). With no
+    /// target column to resolve, the membership-gated tiers
+    /// (self/family/community) cannot resolve a specific cohort target
+    /// and are gated to the broad visibility tiers only.
+    fn list_attestations_for(
+        &self,
+        target: &str,
+        cursor: Option<AttestationCursor>,
+        limit: i64,
+        scope: CallerScope,
+    ) -> impl Future<Output = Result<AttestationListPage, Error>> + Send;
+
     /// Page through `cirislens.federation_revocations`. Newest-first
     /// by `(revoked_at, revocation_id)`. Revocations are federation-tier
     /// transparency events; `scope` no-op in v4.0.
