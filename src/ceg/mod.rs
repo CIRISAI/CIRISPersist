@@ -114,6 +114,11 @@ pub use aggregates::corpus::{CorpusShape, CorpusShapeFilter};
 pub use aggregates::llm::{
     AgentCostStats, DomainCostStats, LlmCostAggregate, ModelCostStats, TotalCostStats,
 };
+pub use aggregates::repository::{
+    ActionAggregates, ConscienceAggregates, ConsciencePerCheck, DomainBreakdown,
+    FragilityAggregates, RepositoryFilter, RepositoryStatistics, ScoreAggregates,
+    ScoreDistribution, Totals, REPOSITORY_STATISTICS_METHOD_ID,
+};
 pub use aggregates::scoring::{
     AuditChainAggregate, CoherencePoint, DivergenceRow, HashChainGap, OverrideRateRow,
     RecoveryEvent, ScoringFactorAggregate, TemporalDriftRow,
@@ -129,7 +134,7 @@ pub use list::tasks::{TaskClass, TaskCursor, TaskFilter, TaskGroup, TaskListPage
 pub use list::traces::{
     TraceComponentRow, TraceDetail, TraceEnvelopeRefs, TraceListPage, TraceSummary,
 };
-pub use types::{DeviationMetric, TimeWindow, TraceCursor, TraceFilter};
+pub use types::{Aggregate, DeviationMetric, Filter, TimeWindow, TraceCursor, TraceFilter};
 
 /// Federation read primitives — typed read surface lens / lens-core /
 /// sovereign agents consume.
@@ -252,6 +257,28 @@ pub trait ReadEngine: Send + Sync {
         filter: LlmCallFilter,
         scope: CallerScope,
     ) -> impl Future<Output = Result<LlmCostAggregate, Error>> + Send;
+
+    // ── Repository statistics (#159, FSD §6.2) ─────────────────────
+
+    /// Corpus-wide repository statistics over a window — the #159
+    /// primitive that drives CIRISLens' `/repository/statistics`.
+    ///
+    /// One round-trip per call (Postgres single CTE §10.1; SQLite
+    /// two-step §10.2) computing the full FSD shape: totals, DMA score
+    /// distributions, conscience pass/override rates, action histogram,
+    /// fragility breakdown, per-domain rollup. Scope-gated (§4.3) on the
+    /// `trace_events.cohort_scope` / `cohort_target_id` columns and
+    /// routed through the §7 substrate cache — the result carries
+    /// `cache_hit` and `evaluated_at_unix_ms` ([`Aggregate`]). Every
+    /// aggregate carries `sample_count` (AV-43; top-vs-nested per §6.3).
+    ///
+    /// Empty window → `sample_count: 0`, never an error (FSD §6.3,
+    /// "zero is honest").
+    fn get_repository_statistics(
+        &self,
+        filter: RepositoryFilter,
+        scope: CallerScope,
+    ) -> impl Future<Output = Result<RepositoryStatistics, Error>> + Send;
 
     // ── Section G — Corpus shape (CIRISPersist#23 §G) ──────────────
 

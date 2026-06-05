@@ -5791,6 +5791,109 @@ fn pg_row_to_trace_summary(
     })
 }
 
+/// Per-trace rollup SELECT for `get_repository_statistics` (#159).
+///
+/// One row per `trace_id`; the score / flag fields are the V042
+/// per-event `payload` extractions (same `FILTER (WHERE event_type =
+/// '...')` shape as [`TRACE_SUMMARY_SELECT`]). Decoded into
+/// [`crate::ceg::aggregates::repository::PerTraceRow`] by
+/// [`pg_row_to_per_trace`]; the Rust-side [`fold_statistics`] aggregates
+/// a second time over these rows.
+///
+/// [`fold_statistics`]: crate::ceg::aggregates::repository::fold_statistics
+const REPO_PER_TRACE_SELECT: &str = "\
+    MAX(deployment_domain) AS deployment_domain, \
+    MAX(agent_id_hash) AS agent_id_hash, \
+    AVG((payload->>'csdma_plausibility_score')::float8) \
+        FILTER (WHERE event_type = 'DMA_RESULTS') AS plausibility, \
+    AVG((payload->>'dsdma_domain_alignment')::float8) \
+        FILTER (WHERE event_type = 'DMA_RESULTS') AS alignment, \
+    BOOL_AND((payload->>'conscience_passed')::bool) \
+        FILTER (WHERE event_type = 'CONSCIENCE_RESULT') AS conscience_passed, \
+    BOOL_OR((payload->>'action_was_overridden')::bool) \
+        FILTER (WHERE event_type = 'CONSCIENCE_RESULT') AS action_was_overridden, \
+    BOOL_AND((payload->>'entropy_passed')::bool) \
+        FILTER (WHERE event_type = 'CONSCIENCE_RESULT') AS entropy_passed, \
+    BOOL_AND((payload->>'coherence_passed')::bool) \
+        FILTER (WHERE event_type = 'CONSCIENCE_RESULT') AS coherence_passed, \
+    BOOL_AND((payload->>'optimization_veto_passed')::bool) \
+        FILTER (WHERE event_type = 'CONSCIENCE_RESULT') AS optimization_veto_passed, \
+    BOOL_AND((payload->>'epistemic_humility_passed')::bool) \
+        FILTER (WHERE event_type = 'CONSCIENCE_RESULT') AS epistemic_humility_passed, \
+    MAX(payload->>'action_executed') \
+        FILTER (WHERE event_type = 'ACTION_RESULT') AS selected_action, \
+    BOOL_AND((payload->>'success')::bool) \
+        FILTER (WHERE event_type = 'ACTION_RESULT') AS action_success, \
+    BOOL_OR((payload->>'idma_fragility_flag')::bool) \
+        FILTER (WHERE event_type = 'IDMA_RESULT') AS fragility_flag, \
+    MAX(payload->>'idma_phase') \
+        FILTER (WHERE event_type = 'IDMA_RESULT') AS fragility_phase";
+
+/// Decode a [`REPO_PER_TRACE_SELECT`] row into a `PerTraceRow`. Every
+/// score / flag field is `Option`-typed so a trace that did not emit the
+/// corresponding event folds in as a NULL the §6.3 `sample_count`
+/// excludes honestly. Reads go through `safe_get` (CIRISPersist#28 — no
+/// bare `Row::get` in the postgres backend; `Option<T>: FromSql` accepts
+/// NULL → None natively).
+fn pg_row_to_per_trace(
+    row: &tokio_postgres::Row,
+) -> Result<crate::ceg::aggregates::repository::PerTraceRow, crate::read::Error> {
+    Ok(crate::ceg::aggregates::repository::PerTraceRow {
+        deployment_domain: row.safe_get("deployment_domain")?,
+        agent_id_hash: row.safe_get("agent_id_hash")?,
+        plausibility: row.safe_get("plausibility")?,
+        alignment: row.safe_get("alignment")?,
+        conscience_passed: row.safe_get("conscience_passed")?,
+        action_was_overridden: row.safe_get("action_was_overridden")?,
+        entropy_passed: row.safe_get("entropy_passed")?,
+        coherence_passed: row.safe_get("coherence_passed")?,
+        optimization_veto_passed: row.safe_get("optimization_veto_passed")?,
+        epistemic_humility_passed: row.safe_get("epistemic_humility_passed")?,
+        selected_action: row.safe_get("selected_action")?,
+        action_success: row.safe_get("action_success")?,
+        fragility_flag: row.safe_get("fragility_flag")?,
+        fragility_phase: row.safe_get("fragility_phase")?,
+    })
+}
+
+/// HAVING fragment restricting the rolled-up per-trace set to the given
+/// task classes (`get_repository_statistics` `task_classes`
+/// discriminator). Mirrors `TaskClass::from_task_id` prefix logic via
+/// `MAX(task_id)` LIKE predicates so the server-side filter matches the
+/// canonical Rust derivation.
+fn pg_task_class_having(classes: &[crate::ceg::TaskClass]) -> String {
+    use crate::ceg::TaskClass;
+    let mut ors: Vec<String> = Vec::new();
+    for c in classes {
+        let pred = match c {
+            TaskClass::QaEval => "MAX(task_id) LIKE 'qa\\_%' OR MAX(task_id) LIKE 'qa-eval%'",
+            TaskClass::RealUserDiscord => "MAX(task_id) LIKE 'real\\_user\\_discord\\_%'",
+            TaskClass::RealUserCli => "MAX(task_id) LIKE 'real\\_user\\_cli\\_%'",
+            TaskClass::RealUserApi => "MAX(task_id) LIKE 'real\\_user\\_api\\_%'",
+            TaskClass::WakeupRitual => {
+                "POSITION('wakeup' IN MAX(task_id)) > 0 \
+                 AND MAX(task_id) NOT LIKE 'real\\_user\\_%'"
+            }
+            TaskClass::Discord => {
+                "MAX(task_id) LIKE 'discord\\_%' \
+                 AND POSITION('wakeup' IN MAX(task_id)) = 0"
+            }
+            TaskClass::Other => {
+                "MAX(task_id) IS NOT NULL \
+                 AND MAX(task_id) NOT LIKE 'qa\\_%' \
+                 AND MAX(task_id) NOT LIKE 'qa-eval%' \
+                 AND MAX(task_id) NOT LIKE 'real\\_user\\_discord\\_%' \
+                 AND MAX(task_id) NOT LIKE 'real\\_user\\_cli\\_%' \
+                 AND MAX(task_id) NOT LIKE 'real\\_user\\_api\\_%' \
+                 AND MAX(task_id) NOT LIKE 'discord\\_%' \
+                 AND POSITION('wakeup' IN MAX(task_id)) = 0"
+            }
+        };
+        ors.push(format!("({pred})"));
+    }
+    format!("({})", ors.join(" OR "))
+}
+
 impl crate::read::ReadEngine for PostgresBackend {
     /// Section A: paged trace summary listing.
     ///
@@ -6633,6 +6736,132 @@ impl crate::read::ReadEngine for PostgresBackend {
             by_domain,
             totals,
         })
+    }
+
+    /// #159: repository statistics (FSD §6.2, §10.1 single CTE).
+    ///
+    /// One round-trip: the `window_traces` CTE rolls every event row up
+    /// to one row per `trace_id` (the V042 per-event `payload` score
+    /// extraction — `csdma_plausibility_score` etc. — same `FILTER`
+    /// shape as `TRACE_SUMMARY_SELECT`), AND-composing the §4.3
+    /// cohort_scope predicate at the event-row level so suppressed rows
+    /// never enter the rollup. The per-trace rows decode into
+    /// [`crate::ceg::aggregates::repository::PerTraceRow`] and the
+    /// backend-agnostic [`fold_statistics`] produces the result —
+    /// byte-identical to the SQLite two-step (§10.4 parity). Routed
+    /// through the §7 substrate cache.
+    ///
+    /// [`fold_statistics`]: crate::ceg::aggregates::repository::fold_statistics
+    async fn get_repository_statistics(
+        &self,
+        filter: crate::ceg::RepositoryFilter,
+        scope: crate::scope::CallerScope,
+    ) -> Result<crate::ceg::RepositoryStatistics, crate::read::Error> {
+        use crate::ceg::aggregates::repository as repo;
+
+        let period = filter.window;
+        let cache = repo::repository_stats_cache();
+        let key = repo::repository_stats_cache_key(&filter, &scope);
+
+        // §7.3 cache-miss path: probe → on hit return cached (cache_hit
+        // already true, original evaluated_at preserved); on miss run the
+        // CTE then store. §7.4 fail-honest: a backend error after a TTL
+        // miss surfaces verbatim — nothing stale served.
+        if let Some(cached) = cache.try_get(&key) {
+            // The stored struct carries `cache_hit: false` (its value at
+            // compute time); flip it on the served clone so the result
+            // reports the served-from-cache fact (FSD §6.1 / §7.4). The
+            // original `evaluated_at_unix_ms` is preserved — the *cached*
+            // evaluation time, not now().
+            let mut hit = (*cached).clone();
+            hit.cache_hit = true;
+            return Ok(hit);
+        }
+
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
+
+        // Build the windowed WHERE (window required) + filter discriminators.
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        let mut where_parts: Vec<String> = Vec::new();
+        params.push(Box::new(period.since));
+        where_parts.push(format!("ts >= ${}", params.len()));
+        params.push(Box::new(period.until));
+        where_parts.push(format!("ts < ${}", params.len()));
+        if !filter.agent_id_hashes.is_empty() {
+            params.push(Box::new(filter.agent_id_hashes.clone()));
+            where_parts.push(format!("agent_id_hash = ANY(${})", params.len()));
+        }
+        if !filter.deployment_domains.is_empty() {
+            params.push(Box::new(filter.deployment_domains.clone()));
+            where_parts.push(format!("deployment_domain = ANY(${})", params.len()));
+        }
+        if !filter.cohort_scope_in.is_empty() {
+            params.push(Box::new(filter.cohort_scope_in.clone()));
+            where_parts.push(format!("cohort_scope = ANY(${})", params.len()));
+        }
+        // §4.3 scope gate at the event-row level.
+        {
+            let (frag, sparams) = crate::store::scope_bind::scope_predicate_pg(
+                &scope,
+                "cohort_scope",
+                "cohort_target_id",
+                params.len(),
+            );
+            where_parts.push(frag);
+            params.extend(sparams);
+        }
+        let where_sql = format!("WHERE {}", where_parts.join(" AND "));
+
+        // task_class + fragility_only discriminators apply on the rolled
+        // up per-trace row (HAVING), since task_id is per-trace and the
+        // fragility flag is a payload rollup.
+        let mut having_parts: Vec<String> = Vec::new();
+        if !filter.task_classes.is_empty() {
+            having_parts.push(pg_task_class_having(&filter.task_classes));
+        }
+        if filter.fragility_only {
+            having_parts.push(
+                "BOOL_OR((payload->>'idma_fragility_flag')::bool) \
+                 FILTER (WHERE event_type = 'IDMA_RESULT') = true"
+                    .to_string(),
+            );
+        }
+        let having_sql = if having_parts.is_empty() {
+            String::new()
+        } else {
+            format!("HAVING {}", having_parts.join(" AND "))
+        };
+
+        let sql = format!(
+            "SELECT {select} \
+             FROM cirislens.trace_events \
+             {where_sql} \
+             GROUP BY trace_id \
+             {having_sql}",
+            select = REPO_PER_TRACE_SELECT,
+        );
+
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let rows = client
+            .query(&sql, &params_ref[..])
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("get_repository_statistics: {e}")))?;
+
+        let per_trace: Vec<repo::PerTraceRow> = rows
+            .iter()
+            .map(pg_row_to_per_trace)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let evaluated_at = chrono::Utc::now().timestamp_millis();
+        let stats = repo::fold_statistics(period, &per_trace, evaluated_at, false);
+        let size = repo::estimate_size(&stats);
+        cache.store(key, stats.clone(), size);
+        Ok(stats)
     }
 
     /// Section G: corpus shape rollup.
@@ -17144,5 +17373,178 @@ mod tests {
                 "every chain entry must be content_rating:* — got {dim:?}"
             );
         }
+    }
+
+    // ── #159 backend parity (FSD §10.4) ─────────────────────────────
+
+    /// Build the scored event rows for one trace (THOUGHT_START +
+    /// DMA_RESULTS + CONSCIENCE_RESULT + ACTION_RESULT + IDMA_RESULT),
+    /// shared by the PG + SQLite halves of the parity test so both
+    /// backends ingest byte-identical input.
+    #[cfg(feature = "sqlite")]
+    fn parity_scored_rows(
+        trace_id: &str,
+        domain: &str,
+        ts: chrono::DateTime<chrono::Utc>,
+        plausibility: f64,
+        alignment: f64,
+        conscience_pass: bool,
+    ) -> Vec<TraceEventRow> {
+        let mk = |event_type: ReasoningEventType,
+                  off: i64,
+                  payload: serde_json::Value|
+         -> TraceEventRow {
+            let payload = match payload {
+                serde_json::Value::Object(m) => m.into_iter().collect(),
+                _ => serde_json::Map::new(),
+            };
+            TraceEventRow {
+                trace_id: trace_id.to_owned(),
+                thought_id: format!("th-{trace_id}"),
+                task_id: Some(format!("task-{trace_id}")),
+                step_point: None,
+                event_type,
+                attempt_index: 0,
+                ts: ts + chrono::Duration::milliseconds(off),
+                agent_name: Some("agent-p".into()),
+                agent_id_hash: "agenthash-p".into(),
+                cognitive_state: Some("work".into()),
+                trace_level: crate::schema::TraceLevel::Generic,
+                payload,
+                cost_llm_calls: None,
+                cost_tokens: None,
+                cost_usd: None,
+                signature: "AAAA".into(),
+                signing_key_id: "test-key".into(),
+                signature_verified: true,
+                verification_source: crate::store::VerificationSource::Persist,
+                schema_version: "2.7.0".into(),
+                pii_scrubbed: false,
+                original_content_hash: None,
+                scrub_signature: None,
+                scrub_key_id: None,
+                scrub_timestamp: None,
+                agent_role: None,
+                agent_template: None,
+                deployment_domain: Some(domain.to_owned()),
+                deployment_type: Some("production".into()),
+                deployment_region: Some("US".into()),
+                deployment_trust_mode: None,
+                cohort_scope: "federation".to_string(),
+                cohort_target_id: None,
+            }
+        };
+        vec![
+            mk(
+                ReasoningEventType::ThoughtStart,
+                0,
+                serde_json::json!({"thought_type": "standard", "thought_depth": 1}),
+            ),
+            mk(
+                ReasoningEventType::DmaResults,
+                10,
+                serde_json::json!({
+                    "csdma_plausibility_score": plausibility,
+                    "dsdma_domain_alignment": alignment,
+                }),
+            ),
+            mk(
+                ReasoningEventType::ConscienceResult,
+                20,
+                serde_json::json!({
+                    "conscience_passed": conscience_pass,
+                    "entropy_passed": true,
+                    "action_was_overridden": !conscience_pass,
+                }),
+            ),
+            mk(
+                ReasoningEventType::ActionResult,
+                30,
+                serde_json::json!({"action_executed": "SPEAK", "success": true}),
+            ),
+            mk(
+                ReasoningEventType::IdmaResult,
+                40,
+                serde_json::json!({"idma_fragility_flag": false, "idma_phase": "flexibility"}),
+            ),
+        ]
+    }
+
+    /// §14 backend parity — the same `(filter, scope)` over identical
+    /// ingested data on Postgres and SQLite returns the identical
+    /// `RepositoryStatistics` struct, modulo `evaluated_at_unix_ms` (and
+    /// `cache_hit`, which both run fresh here). Gated behind the
+    /// `CIRIS_PERSIST_TEST_PG_URL` DSN — skipped when unset.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn parity_get_repository_statistics_pg_vs_sqlite() {
+        use crate::read::ReadEngine;
+
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+
+        let ts = chrono::Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap();
+        let rows1 = parity_scored_rows("p-1", "dom-A", ts, 0.8, 0.5, true);
+        let rows2 = parity_scored_rows("p-2", "dom-A", ts, 0.6, 0.7, false);
+        let rows3 = parity_scored_rows("p-3", "dom-B", ts, 0.9, 0.4, true);
+
+        // Postgres half.
+        let pg = PostgresBackend::connect(&dsn).await.unwrap();
+        pg.run_migrations().await.unwrap();
+        for r in [&rows1, &rows2, &rows3] {
+            pg.insert_trace_events_batch(r).await.unwrap();
+        }
+
+        // SQLite half (fresh :memory:).
+        let sq = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        sq.run_migrations().await.unwrap();
+        for r in [&rows1, &rows2, &rows3] {
+            sq.insert_trace_events_batch(r).await.unwrap();
+        }
+
+        // Distinct window + agent filter so the PG cache key is unique to
+        // this run (the cache is process-global; the SQLite half uses the
+        // same key but a fresh :memory: corpus — equal answer).
+        let filter = crate::ceg::RepositoryFilter {
+            window: crate::ceg::TimeWindow::new(
+                chrono::Utc.with_ymd_and_hms(2026, 4, 20, 0, 0, 0).unwrap(),
+                chrono::Utc.with_ymd_and_hms(2026, 5, 20, 0, 0, 0).unwrap(),
+            )
+            .unwrap(),
+            agent_id_hashes: vec!["agenthash-p".into()],
+            deployment_domains: vec![],
+            cohort_scope_in: vec![],
+            task_classes: vec![],
+            fragility_only: false,
+        };
+
+        let mut pg_stats = pg
+            .get_repository_statistics(filter.clone(), crate::scope::CallerScope::Unauthenticated)
+            .await
+            .unwrap();
+        let mut sq_stats = sq
+            .get_repository_statistics(filter, crate::scope::CallerScope::Unauthenticated)
+            .await
+            .unwrap();
+
+        // Normalize the per-run-variable fields before comparing.
+        pg_stats.evaluated_at_unix_ms = 0;
+        sq_stats.evaluated_at_unix_ms = 0;
+        pg_stats.cache_hit = false;
+        sq_stats.cache_hit = false;
+
+        assert_eq!(
+            pg_stats, sq_stats,
+            "PG and SQLite must produce the identical RepositoryStatistics \
+             modulo evaluated_at_unix_ms"
+        );
+        // Spot-check the shared answer is non-trivial.
+        assert_eq!(pg_stats.sample_count, 3);
+        assert_eq!(pg_stats.by_domain.len(), 2);
     }
 }
