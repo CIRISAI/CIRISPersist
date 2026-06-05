@@ -50,17 +50,53 @@ CREATE TABLE federation_communities (
 -- family read path), so no GIN index here — the postgres @> path is
 -- the optimization, sqlite parses on read.
 
--- ── Part B: DAS covering indexes ───────────────────────────────────
+-- ── Part B(i): trace_events cohort_scope + target ──────────────────
 --
--- sqlite has no INCLUDE — index the columns directly. Reconciled to
--- the real physical schema (see the postgres V060 Part B note):
--- trace_events has no `cohort_scope` column and stores analytics
--- scalars in the `payload` JSON, so the scope-predicate covering index
--- keys on the real `(ts, deployment_domain, scrub_key_id)` columns;
--- federation_attestations exposes its subject as `attested_key_id`.
+-- Postgres parity (postgres/lens/V060 Part B(i)): add TWO columns so
+-- the §4.3 community-lens read-gate can filter at trace-read time.
+-- Default 'federation' + NULL target preserves current behavior for
+-- pre-v4.0 rows. (One ADD COLUMN per statement — SQLite's ALTER TABLE
+-- adds a single column at a time.)
+ALTER TABLE trace_events ADD COLUMN cohort_scope TEXT NOT NULL DEFAULT 'federation';
+ALTER TABLE trace_events ADD COLUMN cohort_target_id TEXT;
+
+-- Closed-set enforcement. SQLite cannot ADD a CHECK via ALTER, so the
+-- closed set is enforced by BEFORE INSERT / BEFORE UPDATE triggers that
+-- RAISE(ABORT, ...) on an out-of-set value — the same trigger
+-- discipline V056 used for its cross-column cohort closed-set
+-- (`contributions_consent_record_insert_check`). One trigger per
+-- mutation verb so both INSERT and UPDATE paths are gated.
+CREATE TRIGGER IF NOT EXISTS trace_events_cohort_scope_insert_check
+BEFORE INSERT ON trace_events
+FOR EACH ROW
+WHEN NEW.cohort_scope NOT IN
+    ('self','family','community','affiliations','species','biosphere','federation')
+BEGIN
+    SELECT RAISE(ABORT,
+        'trace_events.cohort_scope must be one of self/family/community/affiliations/species/biosphere/federation');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trace_events_cohort_scope_update_check
+BEFORE UPDATE ON trace_events
+FOR EACH ROW
+WHEN NEW.cohort_scope NOT IN
+    ('self','family','community','affiliations','species','biosphere','federation')
+BEGIN
+    SELECT RAISE(ABORT,
+        'trace_events.cohort_scope must be one of self/family/community/affiliations/species/biosphere/federation');
+END;
+
+-- ── Part B(ii): DAS covering indexes ───────────────────────────────
+--
+-- sqlite has no INCLUDE — index the columns directly. The §4.3
+-- predicate is now pure set-membership on (cohort_scope,
+-- cohort_target_id), so the covering index LEADS with those two columns
+-- (postgres parity), then ts / deployment_domain / trace_id.
+-- federation_attestations exposes its subject as `attested_key_id`
+-- (V055 reconciliation; see the postgres V060 Part B note).
 
 CREATE INDEX IF NOT EXISTS idx_trace_events_v060_repository_stats
-ON trace_events (ts, deployment_domain, scrub_key_id);
+ON trace_events (cohort_scope, cohort_target_id, ts, deployment_domain, trace_id);
 
 CREATE INDEX IF NOT EXISTS idx_federation_attestations_v060_by_target
 ON federation_attestations (attested_key_id, cohort_scope, asserted_at DESC);

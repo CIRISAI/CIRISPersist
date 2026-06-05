@@ -274,6 +274,21 @@ impl SqliteBackend {
 }
 
 impl Backend for SqliteBackend {
+    /// v4.0 (CIRISPersist#160, FSD §4.4) — delegate to the
+    /// `FederationDirectory` occurrence→identity lookup; `None` means
+    /// the singleton-identity fallback (occurrence == identity).
+    async fn resolve_identity_for_occurrence(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Option<String>, Error> {
+        use crate::federation::FederationDirectory;
+        let io = self
+            .lookup_identity_for_occurrence(occurrence_key_id)
+            .await
+            .map_err(|e| Error::Backend(format!("resolve_identity_for_occurrence: {e}")))?;
+        Ok(io.map(|o| o.identity_key_id))
+    }
+
     async fn insert_trace_events_batch(
         &self,
         rows: &[TraceEventRow],
@@ -306,11 +321,11 @@ impl Backend for SqliteBackend {
                 original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
                 agent_role, agent_template, deployment_domain, \
                 deployment_type, deployment_region, deployment_trust_mode, \
-                verification_source\
+                verification_source, cohort_scope, cohort_target_id\
                 ) VALUES (\
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, \
-                ?28, ?29, ?30, ?31, ?32, ?33, ?34\
+                ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36\
                 ) ON CONFLICT (agent_id_hash, trace_id, thought_id, event_type, \
                 attempt_index, ts) DO NOTHING";
 
@@ -351,7 +366,7 @@ impl Backend for SqliteBackend {
 
                     let attempt_index_i64 = i64::from(row.attempt_index);
 
-                    let params: [SqlValue; 34] = [
+                    let params: [SqlValue; 36] = [
                         SqlValue::Text(row.trace_id.clone()),
                         SqlValue::Text(row.thought_id.clone()),
                         opt_text(row.task_id.as_deref()),
@@ -393,6 +408,12 @@ impl Backend for SqliteBackend {
                         opt_text(row.deployment_trust_mode.as_deref()),
                         // v2.0 verification_source (V044, #91).
                         SqlValue::Text(row.verification_source.as_wire_str().to_owned()),
+                        // v4.0 cohort_scope + target (V060, #160). NOT
+                        // NULL column with DEFAULT 'federation'; we
+                        // always pass the row's value (the ingest
+                        // pipeline resolved the self-target already).
+                        SqlValue::Text(row.cohort_scope.clone()),
+                        opt_text(row.cohort_target_id.as_deref()),
                     ];
 
                     let n = stmt.execute(params_from_iter(params.iter()))?;
@@ -697,7 +718,8 @@ impl Backend for SqliteBackend {
                         audit_signature, original_content_hash, scrub_signature, \
                         scrub_key_id, scrub_timestamp, agent_role, agent_template, \
                         deployment_domain, deployment_type, deployment_region, \
-                        deployment_trust_mode, verification_source";
+                        deployment_trust_mode, verification_source, \
+                        cohort_scope, cohort_target_id";
             let (sql, rows) = match agent {
                 Some(h) => {
                     let sql = format!(
@@ -5025,6 +5047,10 @@ fn sqlite_row_to_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, Tr
             deployment_type: row.get("deployment_type")?,
             deployment_region: row.get("deployment_region")?,
             deployment_trust_mode: row.get("deployment_trust_mode")?,
+            // v4.0 (CIRISPersist#160, V060). Column is NOT NULL DEFAULT
+            // 'federation'; target is nullable. Round-trip both back.
+            cohort_scope: row.get("cohort_scope")?,
+            cohort_target_id: row.get("cohort_target_id")?,
         },
     ))
 }
@@ -5869,7 +5895,8 @@ impl crate::read::ReadEngine for SqliteBackend {
                             original_content_hash, scrub_signature, scrub_key_id, \
                             scrub_timestamp, agent_role, agent_template, \
                             deployment_domain, deployment_type, deployment_region, \
-                            deployment_trust_mode, verification_source";
+                            deployment_trust_mode, verification_source, \
+                        cohort_scope, cohort_target_id";
             let event_rows: Vec<(i64, TraceEventRow)> = {
                 let sql = format!(
                     "SELECT {cols} FROM trace_events \
@@ -8411,6 +8438,8 @@ mod tests {
             deployment_type: None,
             deployment_region: None,
             deployment_trust_mode: None,
+            cohort_scope: "federation".to_string(),
+            cohort_target_id: None,
         }
     }
 
@@ -9359,6 +9388,102 @@ mod tests {
             .await
             .unwrap();
         assert!(none.is_none());
+    }
+
+    /// v4.0 (CIRISPersist#160, V060, FSD §4.3) — cohort_scope +
+    /// cohort_target_id round-trip through the real SQLite trace_events
+    /// store: a community-scoped row with a target inserts and reads
+    /// back with both columns intact (proves the INSERT + SELECT column
+    /// wiring on the SQLite backend).
+    #[tokio::test]
+    async fn trace_events_cohort_scope_round_trips_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let mut row = fixture_event_row("trace-cohort-sqlite", 0);
+        row.cohort_scope = "community".to_owned();
+        row.cohort_target_id = Some("community-key:lens-beta".to_owned());
+        backend
+            .insert_trace_events_batch(std::slice::from_ref(&row))
+            .await
+            .unwrap();
+
+        let page = backend.fetch_trace_events_page(0, 10, None).await.unwrap();
+        assert_eq!(page.len(), 1);
+        let (_id, got) = &page[0];
+        assert_eq!(got.cohort_scope, "community");
+        assert_eq!(
+            got.cohort_target_id.as_deref(),
+            Some("community-key:lens-beta")
+        );
+
+        // A default-federation row reads back as 'federation' / NULL
+        // (backward-compat column DEFAULT honored).
+        let fed = fixture_event_row("trace-cohort-fed", 1);
+        backend
+            .insert_trace_events_batch(std::slice::from_ref(&fed))
+            .await
+            .unwrap();
+        let page2 = backend
+            .fetch_trace_events_page(0, 10, Some("deadbeef"))
+            .await
+            .unwrap();
+        let fed_row = page2
+            .iter()
+            .find(|(_, r)| r.trace_id == "trace-cohort-fed")
+            .map(|(_, r)| r)
+            .unwrap();
+        assert_eq!(fed_row.cohort_scope, "federation");
+        assert_eq!(fed_row.cohort_target_id, None);
+    }
+
+    /// v4.0 (CIRISPersist#160, FSD §4.4) — `resolve_identity_for_occurrence`
+    /// (the Backend self-target resolution hook) returns the bound
+    /// identity for a bound occurrence key, and `None` (singleton
+    /// fallback) for an unbound one.
+    #[tokio::test]
+    async fn resolve_identity_for_occurrence_self_target() {
+        use crate::store::Backend as _;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("alice-root", "alice", "alice-root"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("alice-phone", "alice", "alice-root"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_identity_occurrence(crate::federation::SignedIdentityOccurrence {
+                identity_occurrence: fed_identity_occurrence(
+                    "alice-root",
+                    "alice-phone",
+                    crate::federation::types::device_class::PHONE,
+                ),
+            })
+            .await
+            .unwrap();
+
+        // Bound occurrence → resolves to the identity (this is what a
+        // self-scoped trace signed by alice-phone gets stamped with).
+        let resolved = backend
+            .resolve_identity_for_occurrence("alice-phone")
+            .await
+            .unwrap();
+        assert_eq!(resolved.as_deref(), Some("alice-root"));
+
+        // Unbound occurrence → None → caller applies singleton fallback
+        // (stamps the signer key itself).
+        let unbound = backend
+            .resolve_identity_for_occurrence("fresh-sovereign-key")
+            .await
+            .unwrap();
+        assert_eq!(unbound, None);
     }
 
     /// device_class outside the closed-set is rejected at admission
@@ -11904,6 +12029,8 @@ mod tests {
             deployment_type: Some("production".to_owned()),
             deployment_region: Some("us-east".to_owned()),
             deployment_trust_mode: None,
+            cohort_scope: "federation".to_string(),
+            cohort_target_id: None,
         }
     }
 

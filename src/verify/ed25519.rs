@@ -558,6 +558,8 @@ mod tests {
             trace_schema_version: SchemaVersion::parse("2.7.0").unwrap(),
             components: vec![],
             deployment_profile: None,
+            cohort_scope: "federation".into(),
+            cohort_target_id: None,
             signature: String::new(),
             signature_key_id: key_id.to_owned(),
         };
@@ -641,6 +643,8 @@ mod tests {
             trace_schema_version: SchemaVersion::parse("2.7.0").unwrap(),
             components: vec![],
             deployment_profile: None,
+            cohort_scope: "federation".into(),
+            cohort_target_id: None,
             signature: String::new(),
             signature_key_id: key_id.to_owned(),
         };
@@ -651,6 +655,8 @@ mod tests {
         let sig = sk.sign(&bytes);
         let trace = CompleteTrace {
             // The production-bug shape: URL-safe-no-pad, no `=` padding.
+            cohort_scope: "federation".into(),
+            cohort_target_id: None,
             signature: URL_SAFE_NO_PAD.encode(sig.to_bytes()),
             ..trace_unsigned
         };
@@ -705,6 +711,8 @@ mod tests {
                 agent_id_hash: None,
             }],
             deployment_profile: None,
+            cohort_scope: "federation".into(),
+            cohort_target_id: None,
             signature: String::new(),
             signature_key_id: key_id.to_owned(),
         };
@@ -716,6 +724,8 @@ mod tests {
             .unwrap();
         let sig = sk.sign(&bytes);
         let trace = CompleteTrace {
+            cohort_scope: "federation".into(),
+            cohort_target_id: None,
             signature: BASE64.encode(sig.to_bytes()),
             ..trace_unsigned
         };
@@ -771,6 +781,8 @@ mod tests {
                 agent_id_hash: None,
             }],
             deployment_profile: None,
+            cohort_scope: "federation".into(),
+            cohort_target_id: None,
             signature: String::new(),
             signature_key_id: key_id.to_owned(),
         };
@@ -790,6 +802,8 @@ mod tests {
         // field, and re-deserializing — exercising the serde-default
         // path that production wire deserialization hits.
         let signed = CompleteTrace {
+            cohort_scope: "federation".into(),
+            cohort_target_id: None,
             signature: BASE64.encode(sig.to_bytes()),
             ..trace_for_signing.clone()
         };
@@ -850,6 +864,8 @@ mod tests {
             trace_schema_version: SchemaVersion::parse("2.7.0").unwrap(),
             components: vec![],
             deployment_profile: None,
+            cohort_scope: "federation".into(),
+            cohort_target_id: None,
             signature: String::new(),
             signature_key_id: key_id.to_owned(),
         };
@@ -863,6 +879,8 @@ mod tests {
             .unwrap();
         let sig = sk.sign(&bytes);
         let mut trace = CompleteTrace {
+            cohort_scope: "federation".into(),
+            cohort_target_id: None,
             signature: BASE64.encode(sig.to_bytes()),
             ..trace_unsigned
         };
@@ -907,6 +925,8 @@ mod tests {
                 agent_id_hash: Some("7c3f8e2b1d9a4f60".into()),
             }],
             deployment_profile: None,
+            cohort_scope: "federation".into(),
+            cohort_target_id: None,
             signature: String::new(),
             signature_key_id: key_id.to_owned(),
         };
@@ -917,6 +937,8 @@ mod tests {
             .unwrap();
         let sig = sk.sign(&bytes);
         let trace = CompleteTrace {
+            cohort_scope: "federation".into(),
+            cohort_target_id: None,
             signature: BASE64.encode(sig.to_bytes()),
             ..trace_unsigned
         };
@@ -961,6 +983,8 @@ mod tests {
                     agent_id_hash: per_comp_aih,
                 }],
                 deployment_profile: None,
+                cohort_scope: "federation".into(),
+                cohort_target_id: None,
                 signature: String::new(),
                 signature_key_id: "k".into(),
             }
@@ -1135,6 +1159,8 @@ mod tests {
                 deployment_region: None,
                 deployment_trust_mode: "federated_peer".into(),
             }),
+            cohort_scope: "federation".into(),
+            cohort_target_id: None,
             signature: String::new(),
             signature_key_id: "k".into(),
         };
@@ -1190,6 +1216,8 @@ mod tests {
                     agent_id_hash: None,
                 }],
                 deployment_profile: profile,
+                cohort_scope: "federation".into(),
+                cohort_target_id: None,
                 signature: String::new(),
                 signature_key_id: "k".into(),
             }

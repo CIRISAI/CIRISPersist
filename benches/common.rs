@@ -71,6 +71,8 @@ pub fn build_signed_batch(
         deployment_profile: None,
         signature: String::new(),
         signature_key_id: key_id.into(),
+        cohort_scope: "federation".into(),
+        cohort_target_id: None,
     };
     let payload = canonical_payload_value(&trace);
     let bytes = PythonJsonDumpsCanonicalizer
