@@ -308,18 +308,11 @@ mod tests {
     //! the FSD §4.1 shape: `occurrence_key_id`, `identity_key_id`,
     //! `family_key_ids`, `community_key_ids`.
     use super::*;
-    use std::collections::BTreeSet;
 
     fn admission(occ: &str, identity: &str) -> CallerAdmission {
-        // NOTE: Commit B owns the constructor (crate-private). When this
-        // test compiles against Commit B, swap this for the test-only
-        // builder Commit B exposes. Field shape per FSD §4.1.
-        CallerAdmission {
-            occurrence_key_id: occ.to_string(),
-            identity_key_id: identity.to_string(),
-            family_key_ids: BTreeSet::new(),
-            community_key_ids: BTreeSet::new(),
-        }
+        // Commit B owns the constructor (crate-private, AV-44). Use the
+        // crate-private test builder it exposes. Field shape per FSD §4.1.
+        CallerAdmission::for_test(occ, identity, std::iter::empty(), std::iter::empty())
     }
 
     #[test]
