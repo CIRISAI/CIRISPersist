@@ -1191,7 +1191,18 @@ mod tests {
                         PgMerkleStore::new(backend.clone(), handle, tenant_owned.clone()),
                     );
                     let backend_for_f = backend.clone();
-                    let r = (move || f(store, backend_for_f))();
+                    // v3.14.0 (CIRISPersist#158) — DO NOT inline. `f`
+                    // calls `store.append(...)` which internally
+                    // invokes `self.runtime.block_on(...)`. Calling
+                    // `block_on` from a tokio worker panics with
+                    // "Cannot start a runtime from within a runtime".
+                    // spawn_blocking hops to the blocking pool (no
+                    // current runtime); the inline-sync sweep does
+                    // NOT apply here — same as the sqlite-side
+                    // `run_with_store`.
+                    let r = tokio::task::spawn_blocking(move || f(store, backend_for_f))
+                        .await
+                        .expect("spawn_blocking join");
                     clean_tenant(&backend, &tenant_owned).await;
                     r
                 });
@@ -1265,15 +1276,22 @@ mod tests {
             });
             let a = store_a.clone();
             let b = store_b.clone();
+            // v3.14.0 (CIRISPersist#158) — store.append calls
+            // `self.runtime.block_on(...)`. spawn_blocking hops to
+            // the blocking pool so block_on works; the inline-sync
+            // sweep does NOT apply here. Same mirror of py.detach
+            // as in the sqlite-side `tenants_do_not_cross_contaminate`.
             rt.block_on(async move {
-                (move || {
+                tokio::task::spawn_blocking(move || {
                     a.append(make_test_leaf("a-1", 1, 1)).unwrap();
                     a.append(make_test_leaf("a-2", 2, 2)).unwrap();
                     b.append(make_test_leaf("b-1", 1, 1)).unwrap();
                     assert_eq!(a.tree_size().unwrap(), 2);
                     assert_eq!(b.tree_size().unwrap(), 1);
                     assert_eq!(b.get(0).unwrap().unwrap().entry.entry_id, "b-1");
-                })();
+                })
+                .await
+                .expect("spawn_blocking join");
             });
             rt.block_on(async {
                 clean_tenant(&backend, &tenant_a).await;

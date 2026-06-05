@@ -5,6 +5,18 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.14.3] — 2026-06-05
+
+**Hotfix: postgres-side merkle_store test fixtures (same nested-block_on pattern as v3.14.2).**
+
+v3.14.2 reverted the SQLite-side merkle_store test fixtures back to `spawn_blocking` because `PgMerkleStore`/`SqliteMerkleStore` are sync-API stores that internally `block_on`. The postgres-side equivalents (`run_with_pg_store` helper + `pg_tenants_isolated` direct-fixture test) needed the same revert — caught by the postgres-feature CI matrix running 4 pg tests against the live postgres service.
+
+Two sites reverted:
+- `run_with_pg_store` helper (used by 3 of the 4 failing pg tests: `pg_empty_and_append_and_get`, `pg_leaf_hash_matches_local`, `pg_sth_round_trip_with_transparency_log`)
+- `pg_tenants_isolated` direct-fixture (opens the backend itself for cross-tenant isolation)
+
+Both wrap the closure call in `tokio::task::spawn_blocking(move || ...).await.expect("spawn_blocking join")` so `f → store.append → self.runtime.block_on` runs on the blocking pool (no current runtime → block_on works), not on the rt worker (where block_on would panic with "Cannot start a runtime from within a runtime"). Inline comments at both sites document why this is the one exception to the v3.14.0 inline-sync sweep.
+
 ## [3.14.2] — 2026-06-05
 
 **Hotfix: 2 merkle_store test fixtures that v3.14.0's inline-sync sweep should NOT have touched.**
