@@ -1,7 +1,7 @@
 # FSD: CIRISPersist v4.0 — Data Access Surface
 
-**Status:** Proposed (FSD lockdown — implementation gated on user approval)
-**Author:** Eric Moore (CIRIS Team) with Claude Opus 4.7
+**Status:** Accepted — implemented in the v4.0.0 cut (commits A–I on `v4.0-das`). Pending CIRISConformance adversarial pass before tag. Note: the threat-model entries are **AV-57** (read-side escalation) + **AV-58** (write-side downgrade) — the earlier "AV-44/AV-45" labels collided with existing entries and were renumbered.
+**Author:** Eric Moore (CIRIS Team) with Claude Opus 4.7 / Opus 4.8
 **Created:** 2026-06-05
 **Repo:** `~/CIRISPersist`
 **Risk:** Cut release. Hard break — every consumer (CIRISLens, CIRISLensCore, sovereign-mode agent, CIRISBridge, CIRISNodeCore, sister repos) must update to the v4.0 API. No deprecation window, no aliases. Eric notifies the sisters and federation on cut; downstream PRs land against v4.0.
@@ -73,16 +73,16 @@ Each of these alone is a soft break the team has absorbed in a minor before. **A
 | **`list_attestations_for`** | #135 + part of #150 — `(target_key_id, scope) → page` — substrate-side scope honesty |
 | **PyO3 v2 surface** | `Engine.get_repository_statistics(filter, scope)`, `Engine.list_attestations_for(target, scope)`, `Engine.cache_stats() → CacheStats` |
 | **Migration V060** | (a) `federation_communities` table — the §8.1.13.3 community substrate; (b) scope-aware covering indexes on `trace_events.cohort_scope`, `federation_attestations.cohort_scope` + emitter_key joins to `federation_identity_occurrences` / `federation_families` / `federation_communities` |
-| **THREAT_MODEL.md** | New AV-44 (scope-escalation via caller assertion) — mitigation: admission set built by substrate from `federation_keys`, never caller-asserted |
+| **THREAT_MODEL.md** | New AV-57 (scope-escalation via caller assertion) — mitigation: admission set built by substrate from `federation_keys`, never caller-asserted |
 
 ### 2.2 Out of scope for v4.0 (named, not deferred)
 
 - **No distributed cache** — local-process LRU only. A federation peer wanting cross-node statistics builds it from per-node DAS calls. (Federation is the trust boundary; persist does not aggregate across peers.)
 - **No ad-hoc SQL** — DAS is the *fixed query set* per §1.4 apophatic bound. The substrate refuses to be a columnar engine.
 - **No caller-composed projections** — every primitive returns its named shape; no `SELECT only these fields`. Consumers receive the full named struct and pick the fields they want at their layer.
-- ~~**No write-path scope.**~~ **Reversed (CIRISPersist#160 review, comment 4):** v4.0 now closes the write-side too. The earlier "v4.0 is read-surface only" posture left AV-45 (write-side cohort_scope downgrade) as an open forge surface, which structurally collapses §9's defense-in-depth claim on the write side — edge's Layer 2 can only catch what Layer 1 missed, and with no Layer 1 on writes a downgraded `cohort_scope: federation` row is admissible to every Unauthenticated reader under the §4.3 predicate. Closing AV-44 by construction while leaving AV-45 open is asymmetric in a way the cut posture explicitly rejects.
+- ~~**No write-path scope.**~~ **Reversed (CIRISPersist#160 review, comment 4):** v4.0 now closes the write-side too. The earlier "v4.0 is read-surface only" posture left AV-58 (write-side cohort_scope downgrade) as an open forge surface, which structurally collapses §9's defense-in-depth claim on the write side — edge's Layer 2 can only catch what Layer 1 missed, and with no Layer 1 on writes a downgraded `cohort_scope: federation` row is admissible to every Unauthenticated reader under the §4.3 predicate. Closing AV-57 by construction while leaving AV-58 open is asymmetric in a way the cut posture explicitly rejects.
 
-  The fold is small (reviewer's split (a)): extend `DimensionAdmissionPolicy` (`src/federation/admission.rs`) with one cohort_scope predicate using the same `CallerAdmission` primitive `CallerScope::Authenticated` already carries. See §4.6 for shape. v4.0 lands as: AV-44 closed (read-side, §4.3), **AV-45 closed (write-side, §4.6)**, joint defense-in-depth complete on both sides.
+  The fold is small (reviewer's split (a)): extend `DimensionAdmissionPolicy` (`src/federation/admission.rs`) with one cohort_scope predicate using the same `CallerAdmission` primitive `CallerScope::Authenticated` already carries. See §4.6 for shape. v4.0 lands as: AV-57 closed (read-side, §4.3), **AV-58 closed (write-side, §4.6)**, joint defense-in-depth complete on both sides.
 - **No third CallerScope variant.** `CallerScope` expresses *who is asking* (two variants: Unauthenticated, Authenticated). The CEG cohort vocabulary `{self, family, community, affiliations, species, biosphere, federation}` lives on *rows*, not on callers. A sovereign-mode agent is an `Authenticated` caller whose `CallerAdmission.identity_key_id` is its own identity and whose family/community sets reflect what the federation chain has admitted.
 
 - **No peer-capability table added by v4.0.** Peer capabilities are already first-class as the `service_announcement` Contribution subject_kind (NodeCore SCHEMA §4.23). Capability advertisement is a *routing* primitive (used by NodeCore + CIRISEdge to discover who to send what to); persist's CallerScope is a *visibility* primitive (admission to read what's already stored). The two are deliberately separate — capabilities don't appear in persist's read predicate.
@@ -191,7 +191,7 @@ pub enum CallerScope {
 
     /// Authenticated caller. Admission is *substrate-built* from
     /// the caller's occurrence key — never caller-asserted (§4.2,
-    /// THREAT_MODEL AV-44). Self/family/community are NOT
+    /// THREAT_MODEL AV-57). Self/family/community are NOT
     /// enum variants; they are admission *resolutions* on the
     /// caller's identity.
     Authenticated {
@@ -250,7 +250,7 @@ The substrate's job:
 - **Apply** the resulting predicate to read primitives.
 - **Refuse** caller-asserted admission — `CallerAdmission` has no public constructor; only `build_caller_admission(engine, occurrence_key_id)` produces one. The struct fields are `pub` for read-only access by the SQL helper, but construction is crate-private.
 
-The PyO3 boundary takes the *occurrence key id* (a string) and nothing else admission-related. The substrate resolves identity + families + communities itself. AV-44 in THREAT_MODEL.md: a Python caller cannot forge `Authenticated { admission: { everything } }` by constructing the struct — there is no public constructor.
+The PyO3 boundary takes the *occurrence key id* (a string) and nothing else admission-related. The substrate resolves identity + families + communities itself. AV-57 in THREAT_MODEL.md: a Python caller cannot forge `Authenticated { admission: { everything } }` by constructing the struct — there is no public constructor.
 
 ### 4.3 The SQL predicate — target-membership, not emitter-join
 
@@ -320,7 +320,7 @@ The §4.3 predicate is JOIN-heavy. Two implementation choices:
 
 v4.0 ships Path A. Path B is named-not-deferred per `feedback_no_pg_only_no_deferral` — tracked issue at v4.0 tag.
 
-### 4.6 Write-path admission — AV-45 closure (v4.0)
+### 4.6 Write-path admission — AV-58 closure (v4.0)
 
 The same `CallerAdmission` primitive `CallerScope::Authenticated` carries on the read side admits a one-predicate extension on the write side. At write time, the writer's claimed cohort_scope must be consistent with what their admission permits emitting:
 
@@ -328,7 +328,7 @@ The same `CallerAdmission` primitive `CallerScope::Authenticated` carries on the
 // src/federation/admission.rs — DimensionAdmissionPolicy extension
 
 impl DimensionAdmissionPolicy {
-    /// AV-45 closure — a writer claiming (cohort_scope, target) must be
+    /// AV-58 closure — a writer claiming (cohort_scope, target) must be
     /// a MEMBER of the target it names. Symmetric to the read-gate (§4.3):
     /// the read-gate asks "is the reader in this row's target cohort?";
     /// the write-gate asks "is the writer in the target cohort they're
@@ -394,7 +394,7 @@ impl DimensionAdmissionPolicy {
 - The substrate has the writer identity + admission at write time (the verified signer); no new auth surface.
 - The check is pure set-membership against the same `CallerAdmission` the read-gate uses — one builder, both directions, no emitter-resolution.
 - The cohort_scope vocabulary is closed; the dispatch is a small match.
-- AV-45 closes by the same construction discipline as AV-44 — typed admission, substrate-built, set-membership at the boundary.
+- AV-58 closes by the same construction discipline as AV-57 — typed admission, substrate-built, set-membership at the boundary.
 
 **Defense in depth (§9) on the write side:** Layer 1 is `check_write_cohort_scope` at substrate; Layer 2 is edge's pre-ingest verification that the wire-format envelope's claimed cohort_scope matches the routing the writer used. Joint `cohort_scope_write_double_miss_total` mirrors the read-side alert.
 
@@ -1047,12 +1047,12 @@ Both: the substrate refuses at SQL; the edge refuses at egress. A miss on either
 ### 9.3 The observable joint contract
 
 ```
-# Read-side (AV-44 closure, §4.3)
+# Read-side (AV-57 closure, §4.3)
 persist_refused_scope_total{scope, reason}             # layer 1 refusal
 edge_refused_scope_total{scope, reason}                # layer 2 refusal
 cohort_scope_double_miss_total{scope}                  # alert — both layers passed something they shouldn't have
 
-# Write-side (AV-45 closure, §4.6) — symmetric
+# Write-side (AV-58 closure, §4.6) — symmetric
 persist_refused_write_scope_total{scope, reason}       # layer 1 — substrate refused a downgraded cohort_scope
 edge_refused_write_scope_total{scope, reason}          # layer 2 — edge refused at pre-ingest verification
 cohort_scope_write_double_miss_total{scope}            # alert — both layers passed a downgraded label
@@ -1060,11 +1060,11 @@ cohort_scope_write_double_miss_total{scope}            # alert — both layers p
 
 Layer 2 firing while layer 1 passed is **not** a bug in layer 2 — it's a bug in layer 1, and layer 2 caught it. The two `_double_miss` counters are the only alerts that require immediate response.
 
-### 9.4 Symmetric closure of AV-44 + AV-45
+### 9.4 Symmetric closure of AV-57 + AV-58
 
 The cut now closes both forge surfaces by the same construction discipline:
 
-| Surface | Read side (AV-44) | Write side (AV-45) |
+| Surface | Read side (AV-57) | Write side (AV-58) |
 |---|---|---|
 | What's forged | Admission claim ("I have access to identity X / family F / community C") | cohort_scope label ("this content is federation-visible") |
 | Layer 1 (substrate) | `cohort_scope_sql_predicate` in §4.3 — the WHERE clause refuses to surface suppressed rows to admission the caller doesn't actually hold | `DimensionAdmissionPolicy::check_write_cohort_scope` in §4.6 — refuses writes whose claimed cohort_scope exceeds the writer's admission |
@@ -1152,7 +1152,7 @@ Python passes a *caller occurrence key id* — `None` means `Unauthenticated`, `
 2. Resolves `identity_key_id → family_key_ids` via `list_families_for_member` (V059 §5.6.8.9).
 3. Resolves `identity_key_id → community_key_ids` via `list_communities_for_member` (V060 this cut).
 
-**Python NEVER passes admission fields.** No scope-string parameter; the variant is determined by whether the occurrence key is present. The AV-44 forge surface is closed by construction — there's no admission field a caller can lie about, and no string label to mislabel.
+**Python NEVER passes admission fields.** No scope-string parameter; the variant is determined by whether the occurrence key is present. The AV-57 forge surface is closed by construction — there's no admission field a caller can lie about, and no string label to mislabel.
 
 ### 11.3 Filter and result struct binding
 
@@ -1274,11 +1274,11 @@ Both files land in the same release. The community-membership fan-out is `member
 
 ---
 
-## 13. Threat model — AV-44 (new)
+## 13. Threat model — AV-57 (new)
 
 Added to `docs/THREAT_MODEL.md`:
 
-**AV-44 — scope escalation via caller-asserted admission.**
+**AV-57 — scope escalation via caller-asserted admission.**
 
 *Attack:* A malicious caller constructs a `CallerScope::Authenticated { admission: CallerAdmission { identity_key_id: <victim's identity>, family_key_ids: <every family>, community_key_ids: <every community> } }` and passes it to the substrate, escalating to "see all suppressed content."
 
@@ -1327,10 +1327,10 @@ Per §16.4 the v4.0 cut is **one big break** — there are no separately landing
 3. **Commit C — Cache primitive** (additive): `src/cache/` lands; `CacheConfig::default_for_tier`; admission cache (§7.5); `Engine.cache_stats()` exposed. No aggregates use it yet.
 4. **Commit D — `federation_communities` substrate**: V060 migration Part A; `put_community` / `lookup_community` / `list_communities_for_member` on `FederationDirectory`; both backend implementations; parity tests.
 5. **Commit E — `ReadEngine` v2 trait** (the read-side break): adds `scope` to every read method, drops `Error::NotImplemented`, adds `Error::ScopeRefused(ScopeRefusalReason)`; both backends implement every primitive; PyO3 surface updates.
-6. **Commit F — write-path admission (AV-45 closure)**: extends `DimensionAdmissionPolicy` with `check_write_cohort_scope` (§4.6); wired into `Engine::receive_and_persist`, `put_attestation`, `put_revocation`, `put_takedown_notice`. Tests: write-side forge attempts refused (downgrade attempt → `ScopeRefusalReason`). Closes AV-45 candidate; joint `cohort_scope_write_double_miss_total` observable.
+6. **Commit F — write-path admission (AV-58 closure)**: extends `DimensionAdmissionPolicy` with `check_write_cohort_scope` (§4.6); wired into `Engine::receive_and_persist`, `put_attestation`, `put_revocation`, `put_takedown_notice`. Tests: write-side forge attempts refused (downgrade attempt → `ScopeRefusalReason`). Closes AV-58 candidate; joint `cohort_scope_write_double_miss_total` observable.
 7. **Commit G — `get_repository_statistics`**: the #159 primitive, both backends, scope-gated, cache-aware. V060 migration Part B (DAS covering indexes).
 8. **Commit H — `list_attestations_for`**: #135 + part of #150.
-9. **Commit I — docs**: MISSION.md cross-references, PUBLIC_SCHEMA_CONTRACT.md update, THREAT_MODEL.md AV-44 + AV-45 (both closed in v4.0), this FSD marked Accepted.
+9. **Commit I — docs**: MISSION.md cross-references, PUBLIC_SCHEMA_CONTRACT.md update, THREAT_MODEL.md AV-57 + AV-58 (both closed in v4.0), this FSD marked Accepted.
 
 The whole sequence lands in one PR against `main`, tagged v4.0.0. The commit-axis review is for legibility (reviewer can walk commit-by-commit); the break is at Commit E (read-side trait) + Commit F (write-side admission extension). Eric notifies sisters and federation when the tag publishes.
 
@@ -1362,10 +1362,10 @@ These are the points where I want explicit user confirmation before the v4.0 cut
 3. **CallerScope shape** — two variants, `Unauthenticated` and `Authenticated { admission: CallerAdmission }`. `CallerAdmission` resolves the caller's `occurrence_key_id` through `federation_identity_occurrences` (identity) + `federation_families` (V059) + `federation_communities` (V060 this cut). Self / family / community are admission resolutions, not enum variants. Sovereign-mode is the singleton-identity fallback (§4.4).
 4. **One big cut break** — the v4.0 cut lands as a single PR against `main`; §15 substeps are commits within that PR, ordered for review legibility (Commit A is the module reorg, Commit E is the read-side break, Commit F is the write-side break). No separately-landing PRs.
 5. **Rollout** — tag v4.0.0 → wheel artifacts publish → Eric notifies sisters/federation → consumer PRs land per §15.5. No staging cut.
-6. **No scope-string at PyO3 boundary.** Removed entirely. The PyO3 surface takes `caller_occurrence_key_id: Optional[str]`; `None` → Unauthenticated, `Some(key)` → Authenticated with substrate-resolved admission. No admission fields cross the boundary; no string label a caller can lie about; AV-44 forge surface closed by construction.
+6. **No scope-string at PyO3 boundary.** Removed entirely. The PyO3 surface takes `caller_occurrence_key_id: Optional[str]`; `None` → Unauthenticated, `Some(key)` → Authenticated with substrate-resolved admission. No admission fields cross the boundary; no string label a caller can lie about; AV-57 forge surface closed by construction.
 7. **`federation_communities` ships in v4.0 (Option 1).** V060 migration + symmetric `put_community` / `lookup_community` / `list_communities_for_member` substrate methods. Closes the gap that would otherwise leave the lens-trace community flow theoretical until v4.1.
 8. **Peer capabilities** — NOT added by v4.0. Already first-class as the `service_announcement` Contribution subject_kind (NodeCore SCHEMA §4.23). Capabilities are routing, not scoping; persist doesn't need to model them at the read predicate.
-9. **Write-side scope folds into v4.0 (CIRISPersist#160 comment 4).** AV-44 + AV-45 close together. `DimensionAdmissionPolicy::check_write_cohort_scope` (§4.6) enforced at every write path carrying a cohort_scope label. Symmetric defense in depth (§9.4) on both sides.
+9. **Write-side scope folds into v4.0 (CIRISPersist#160 comment 4).** AV-57 + AV-58 close together. `DimensionAdmissionPolicy::check_write_cohort_scope` (§4.6) enforced at every write path carrying a cohort_scope label. Symmetric defense in depth (§9.4) on both sides.
 10. **Admission cache (CIRISPersist#160 comment 3).** Substrate-side default-on with 5-min TTL + chain-write invalidation; consumers SHOULD also reuse `CallerAdmission` across logical sessions. Belt-and-suspenders bounding of resolution overhead.
 11. **Cache window-overlap correctness (CIRISPersist#160 comment 2).** Cache keys carry the full set of buckets `[window.start, window.end]` overlaps, not just `bucket_of(window.end)`. A write inside any cached entry's window invalidates that entry regardless of which bucket the write timestamp falls in.
 12. **Consumer migration order (CIRISPersist#160 comment 1).** §15.5 names the v4.0 → lens-core v0.5 → edge → lens-core v0.6 → bridge/node-core sequence. `src/derived/` is NOT moved by the reorg; calibration_bundles paths stay at `derived::*`.
@@ -1380,7 +1380,7 @@ Per `feedback_no_pg_only_no_deferral` — anything named here gets a tracked iss
 - **v4.x — Cross-process / cross-node cache coordination.** Out of scope (federation is the trust boundary; persist is local). Issue not opened; documented here as "deliberately not pursued."
 - **v4.x — Ad-hoc query surface.** Refused per §1.4 apophatic bound. Not tracked; this is a "no" with a reason.
 
-(Earlier draft listed "v4.1 sovereign-mode scope semantics" — removed: sovereign-mode is the singleton-identity fallback in §4.4, no enum work needed. Earlier draft also flagged a "capability advertisement primitive" gap — also removed: peer capabilities are first-class as `service_announcement` Contributions per NodeCore SCHEMA §4.23, and they're a routing concern, not a substrate visibility concern. Earlier draft deferred "v4.1 write-path scope (AV-45 candidate)" — also removed per CIRISPersist#160 comment 4: write-side admission folds into v4.0 (Commit F, §4.6), closing AV-44 + AV-45 together as a single cohesive cut.)
+(Earlier draft listed "v4.1 sovereign-mode scope semantics" — removed: sovereign-mode is the singleton-identity fallback in §4.4, no enum work needed. Earlier draft also flagged a "capability advertisement primitive" gap — also removed: peer capabilities are first-class as `service_announcement` Contributions per NodeCore SCHEMA §4.23, and they're a routing concern, not a substrate visibility concern. Earlier draft deferred "v4.1 write-path scope (AV-58 candidate)" — also removed per CIRISPersist#160 comment 4: write-side admission folds into v4.0 (Commit F, §4.6), closing AV-57 + AV-58 together as a single cohesive cut.)
 
 ---
 
@@ -1394,7 +1394,7 @@ Per `feedback_no_pg_only_no_deferral` — anything named here gets a tracked iss
 - **CEG 0.10 §10.1.4** — structural invisibility (load-bearing for §4.3)
 - **CEG 0.10 §8.1.13.3** — community non-suppression (load-bearing for `federation_communities` shipping in v4.0 without suppression bits)
 - **NodeCore SCHEMA §4.23** — `service_announcement` Contribution subject_kind — the routing-side counterpart to persist's visibility-side scoping (validates that capability advertisement is upstream of substrate, not part of v4.0)
-- **`docs/THREAT_MODEL.md`** — AV-43 (k-anonymity), new AV-44 (scope escalation)
+- **`docs/THREAT_MODEL.md`** — AV-43 (k-anonymity), new AV-57 (scope escalation)
 - **`docs/PUBLIC_SCHEMA_CONTRACT.md`** — v4.0 update names the DAS perf table
 - **CIRISPersist#159** — the driving #159 issue; this FSD supersedes its sqlite-NotImplemented proposal
 - **CIRISPersist#135** — `list_attestations_for` ask (closed by Commit G)
