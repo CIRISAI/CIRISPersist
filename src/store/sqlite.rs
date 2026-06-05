@@ -1716,6 +1716,101 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(format!("list_families_for_member: {e}")))
     }
 
+    async fn put_community(
+        &self,
+        community: crate::federation::SignedCommunity,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = community.community;
+        crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let members_json = serde_json::to_string(&row.members)
+            .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
+        let policy_blob_json = match &row.policy_blob {
+            Some(v) => Some(serde_json::to_string(v).map_err(|e| {
+                crate::federation::Error::Backend(format!("policy_blob serialize: {e}"))
+            })?),
+            None => None,
+        };
+        let conn = self.conn.clone();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
+            conn.execute(
+                "INSERT INTO federation_communities (\
+                    community_key_id, community_name, members, founded_at, \
+                    consensus_protocol, policy_blob, persist_row_hash\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    row.community_key_id,
+                    row.community_name,
+                    members_json,
+                    row.founded_at.to_rfc3339(),
+                    row.consensus_protocol,
+                    policy_blob_json,
+                    row.persist_row_hash,
+                ],
+            )?;
+            Ok(())
+        })()
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("FOREIGN KEY") {
+                crate::federation::Error::InvalidArgument(format!(
+                    "FK constraint violated on community insert: {msg}"
+                ))
+            } else {
+                crate::federation::Error::Backend(format!("insert community: {msg}"))
+            }
+        })?;
+        Ok(())
+    }
+
+    async fn lookup_community(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Option<crate::federation::Community>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let key = community_key_id.to_owned();
+        (move || -> Result<Option<crate::federation::Community>, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT community_key_id, community_name, members, founded_at, \
+                        consensus_protocol, policy_blob, persist_row_hash \
+                     FROM federation_communities WHERE community_key_id = ?1",
+                [&key],
+                sqlite_row_to_community,
+            )
+            .optional()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("lookup_community: {e}")))
+    }
+
+    async fn list_communities_for_member(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<crate::federation::Community>, crate::federation::Error> {
+        // sqlite full-scan with members membership check via json_each.
+        // EXISTS subquery against json_each unrolls the array and matches
+        // any entry whose key_id == the target.
+        let conn = self.conn.clone();
+        let key = member_identity_key_id.to_owned();
+        (move || -> Result<Vec<crate::federation::Community>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT community_key_id, community_name, members, founded_at, \
+                        consensus_protocol, policy_blob, persist_row_hash \
+                     FROM federation_communities \
+                     WHERE EXISTS ( \
+                         SELECT 1 FROM json_each(federation_communities.members) \
+                         WHERE json_extract(value, '$.key_id') = ?1 \
+                     ) \
+                     ORDER BY community_key_id ASC",
+            )?;
+            let rows = stmt.query_map([&key], sqlite_row_to_community)?;
+            rows.collect()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("list_communities_for_member: {e}")))
+    }
+
     async fn attach_key_pqc_signature(
         &self,
         key_id: &str,
@@ -5116,6 +5211,41 @@ fn sqlite_row_to_family(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::fede
         founded_at: parse_rfc3339(&founded_at),
         consensus_protocol: row.get("consensus_protocol")?,
         consensus_protocol_entrenched: entrenched != 0,
+        persist_row_hash: row.get("persist_row_hash")?,
+    })
+}
+
+fn sqlite_row_to_community(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::Community> {
+    let members_text: String = row.get("members")?;
+    let members: Vec<crate::federation::CommunityMember> = serde_json::from_str(&members_text)
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            )
+        })?;
+    let policy_blob_text: Option<String> = row.get("policy_blob")?;
+    let policy_blob: Option<serde_json::Value> = match policy_blob_text {
+        Some(t) => Some(serde_json::from_str(&t).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            )
+        })?),
+        None => None,
+    };
+    let founded_at: String = row.get("founded_at")?;
+    Ok(crate::federation::Community {
+        community_key_id: row.get("community_key_id")?,
+        community_name: row.get("community_name")?,
+        members,
+        founded_at: parse_rfc3339(&founded_at),
+        consensus_protocol: row.get("consensus_protocol")?,
+        policy_blob,
         persist_row_hash: row.get("persist_row_hash")?,
     })
 }
@@ -9333,6 +9463,161 @@ mod tests {
             .await
             .unwrap();
         assert!(none.is_empty());
+    }
+
+    fn fed_community(
+        community_key_id: &str,
+        community_name: &str,
+        members: Vec<&str>,
+        consensus_protocol: &str,
+        policy_blob: Option<serde_json::Value>,
+    ) -> crate::federation::Community {
+        crate::federation::Community {
+            community_key_id: community_key_id.into(),
+            community_name: community_name.into(),
+            members: members
+                .into_iter()
+                .map(|k| crate::federation::CommunityMember {
+                    key_id: k.into(),
+                    joined_at: "2026-06-04T00:00:00Z".parse().unwrap(),
+                    role: None,
+                })
+                .collect(),
+            founded_at: "2026-06-04T00:00:00Z".parse().unwrap(),
+            consensus_protocol: consensus_protocol.into(),
+            policy_blob,
+            persist_row_hash: String::new(),
+        }
+    }
+
+    /// Round-trip a community (V060): write → lookup →
+    /// list_communities_for_member. Structural mirror of
+    /// `family_round_trip`; covers the JSON members + nullable
+    /// policy_blob columns + the json_each membership scan. A community
+    /// with N members returns from list_communities_for_member for each
+    /// member identity.
+    #[tokio::test]
+    async fn community_round_trip() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in ["acme-coop", "alice-root", "bob-root", "carol-root"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, "acme", "acme-coop"),
+                })
+                .await
+                .unwrap();
+        }
+        let policy = serde_json::json!({ "cohort_scope": "community", "visibility": "members" });
+        backend
+            .put_community(crate::federation::SignedCommunity {
+                community: fed_community(
+                    "acme-coop",
+                    "Acme Co-op",
+                    vec!["alice-root", "bob-root", "carol-root"],
+                    crate::federation::types::consensus_protocol::MAJORITY,
+                    Some(policy.clone()),
+                ),
+            })
+            .await
+            .unwrap();
+
+        let got = backend
+            .lookup_community("acme-coop")
+            .await
+            .unwrap()
+            .expect("community exists");
+        assert_eq!(got.community_name, "Acme Co-op");
+        assert_eq!(got.members.len(), 3);
+        assert_eq!(got.consensus_protocol, "majority");
+        assert_eq!(got.policy_blob.as_ref(), Some(&policy));
+        assert_eq!(got.persist_row_hash.len(), 64);
+
+        // Membership scan returns the community for every member identity.
+        for member in ["alice-root", "bob-root", "carol-root"] {
+            let communities = backend.list_communities_for_member(member).await.unwrap();
+            assert_eq!(communities.len(), 1, "for member {member}");
+            assert_eq!(communities[0].community_key_id, "acme-coop");
+        }
+
+        // Non-member returns empty.
+        let none = backend
+            .list_communities_for_member("not-a-member")
+            .await
+            .unwrap();
+        assert!(none.is_empty());
+
+        // policy_blob absent round-trips as None.
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("solo-coop", "solo", "solo-coop"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_community(crate::federation::SignedCommunity {
+                community: fed_community(
+                    "solo-coop",
+                    "Solo Co-op",
+                    vec![],
+                    crate::federation::types::consensus_protocol::FOUNDER_ONLY,
+                    None,
+                ),
+            })
+            .await
+            .unwrap();
+        let solo = backend
+            .lookup_community("solo-coop")
+            .await
+            .unwrap()
+            .expect("solo community exists");
+        assert_eq!(solo.policy_blob, None);
+
+        // Absent community returns None.
+        assert!(backend.lookup_community("nope").await.unwrap().is_none());
+    }
+
+    /// consensus_protocol that doesn't parse into a canonical shape is
+    /// rejected at admission for communities (V060) — mirrors the
+    /// family malformed-protocol gate.
+    #[tokio::test]
+    async fn put_community_rejects_malformed_consensus_protocol() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("bad-coop", "bad", "bad-coop"),
+            })
+            .await
+            .unwrap();
+        for cp in ["", "quorum:3/2", "weighted:", "custom:", "raffle"] {
+            let bad = fed_community("bad-coop", "bad", vec![], cp, None);
+            let err = backend
+                .put_community(crate::federation::SignedCommunity { community: bad })
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.kind(),
+                "federation_consensus_protocol_malformed",
+                "expected malformed for {cp:?}, got {err:?}"
+            );
+            assert!(backend
+                .lookup_community("bad-coop")
+                .await
+                .unwrap()
+                .is_none());
+        }
+        // Canonical quorum:m/n admits.
+        let good = fed_community("bad-coop", "now valid", vec![], "quorum:2/3", None);
+        backend
+            .put_community(crate::federation::SignedCommunity { community: good })
+            .await
+            .unwrap();
+        assert!(backend
+            .lookup_community("bad-coop")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     /// consensus_protocol that doesn't parse into a canonical shape is
