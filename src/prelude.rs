@@ -38,6 +38,13 @@
 //! }
 //! ```
 
+// v4.0 (FSD V4.0 §7, Commit C) — the generic substrate cache surface.
+// Consumers observe `cache_stats()` / `admission_cache_stats()`; the
+// aggregate primitives (Commit G) build the cache internally.
+pub use crate::cache::{
+    AdmissionCache, AdmissionStats, Cache, CacheConfig, CacheStats, DeploymentTier,
+};
+
 // Trait surfaces consumers compose against. Federation peers
 // implement against these, not concrete backend types.
 pub use crate::derived::DerivedSchema;
