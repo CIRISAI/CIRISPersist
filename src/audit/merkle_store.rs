@@ -904,7 +904,20 @@ mod tests {
                 // the SqliteMerkleStore only holds the conn_handle()
                 // Arc clone, not the SqliteBackend itself.
                 let _backend_keepalive = backend;
-                (move || f(store_arc))()
+                // v3.14.0 (CIRISPersist#158) — DO NOT inline this
+                // closure. `f` calls `store.append(...)` which
+                // internally invokes `self.runtime.block_on(...)`.
+                // Calling `block_on` from a tokio worker panics with
+                // "Cannot start a runtime from within a runtime".
+                // `spawn_blocking` hops to the blocking-pool thread,
+                // which has no current runtime; `block_on` works
+                // there. This is the test-side mirror of production's
+                // py.detach (PyO3 release-GIL hop). The inline-sync
+                // sweep that closed #158 in the sqlite hot paths
+                // does NOT apply here — `f` MUST run off-worker.
+                tokio::task::spawn_blocking(move || f(store_arc))
+                    .await
+                    .expect("spawn_blocking join")
             })
         }
 
@@ -979,8 +992,14 @@ mod tests {
             ));
             let a = store_a.clone();
             let b = store_b.clone();
+            // v3.14.0 (CIRISPersist#158) — store.append calls
+            // `self.runtime.block_on(...)`, which panics if invoked
+            // from a tokio worker. spawn_blocking hops to the
+            // blocking pool (no runtime context); the inline-sync
+            // sweep does NOT apply here. Same mirroring of py.detach
+            // as in `run_with_store`.
             rt.block_on(async move {
-                (move || {
+                tokio::task::spawn_blocking(move || {
                     a.append(make_test_leaf("a-1", 1, 1)).unwrap();
                     a.append(make_test_leaf("a-2", 2, 2)).unwrap();
                     b.append(make_test_leaf("b-1", 1, 1)).unwrap();
@@ -988,7 +1007,9 @@ mod tests {
                     assert_eq!(b.tree_size().unwrap(), 1);
                     assert_eq!(b.get(0).unwrap().unwrap().entry.entry_id, "b-1");
                     assert!(b.get(1).unwrap().is_none());
-                })();
+                })
+                .await
+                .expect("spawn_blocking join");
             });
             drop(backend);
         }

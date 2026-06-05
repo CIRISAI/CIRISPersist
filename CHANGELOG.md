@@ -5,6 +5,23 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [3.14.2] — 2026-06-05
+
+**Hotfix: 2 merkle_store test fixtures that v3.14.0's inline-sync sweep should NOT have touched.**
+
+`SqliteMerkleStore` is a sync-API store (it implements `TransparencyStore<AuditLeaf>` with sync methods) that internally bridges to async work via `self.runtime.block_on(...)`. Production callers reach this from `py.detach` (PyO3 release-GIL hop) — a thread with NO current tokio runtime, so `block_on` works.
+
+The test fixtures in `src/audit/merkle_store.rs` mirror this by hopping to a blocking-pool thread via `tokio::task::spawn_blocking(move || f(store_arc))`. The v3.14.0 inline-sync sweep mechanically converted that to `(move || f(store_arc))()` — but `f` then runs INSIDE the tokio worker that `rt.block_on(...)` is driving, and `f → store.append → self.runtime.block_on` panics with "Cannot start a runtime from within a runtime."
+
+Two sites reverted to `spawn_blocking`, both with an inline comment explaining why this exception exists.
+
+- `run_with_store` helper (used by 11 of the 12 merkle_store sqlite tests)
+- `tenants_do_not_cross_contaminate` (opens the backend directly because it needs two stores sharing one backend)
+
+The inline-sync sweep applied correctly to the 200+ sites in the SQLite *hot paths* — those don't have the recursive `block_on` pattern. The merkle_store test scaffolding is the one exception.
+
+569/569 sqlite tests + 640/640 sqlite+cirisaudit tests green. Clippy clean across all axes.
+
 ## [3.14.1] — 2026-06-05
 
 **Hotfix: CI clippy errors uncovered by v3.14.0's parking_lot::Mutex switch.**
