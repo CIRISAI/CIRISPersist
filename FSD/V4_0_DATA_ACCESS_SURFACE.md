@@ -252,68 +252,58 @@ The substrate's job:
 
 The PyO3 boundary takes the *occurrence key id* (a string) and nothing else admission-related. The substrate resolves identity + families + communities itself. AV-44 in THREAT_MODEL.md: a Python caller cannot forge `Authenticated { admission: { everything } }` by constructing the struct — there is no public constructor.
 
-### 4.3 The SQL predicate
+### 4.3 The SQL predicate — target-membership, not emitter-join
+
+**The load-bearing model (CIRISPersist#160, the cohort_scope-is-routing correction).** `cohort_scope` is the CEG *visibility/routing* axis — one of three orthogonal envelope concerns (visibility + revocability + delivery, CEG 0.10). Its value is **formed upstream by the producer's trust/distribution policy** (the agent's policy decides "my reasoning traces go to my lens community"); persist **records** that decision and gates reads against it, never deriving or re-arbitrating it (MISSION §1.7).
+
+Critically, `cohort_scope` is **not a bare label** — per CEG §4 the content carries the scope **target** alongside it (`family_id` iff `family`, `community_id` iff `community`). The content names *which specific cohort* its policy routed it to. The read-gate is then **pure set-membership against the reader's resolved admission**: a reader sees the row iff the reader belongs to *the specific target cohort the row was scoped to*.
+
+This is both simpler and correct. The earlier "emitter and reader share a cohort" formulation **leaked**: an agent in communities A+B that routes a trace to B-only would have it visible to an A-only co-member. Target-membership eliminates that — and eliminates the emitter→identity EXISTS-join entirely.
 
 ```rust
 // src/scope/sql.rs
 
 /// Emit the SQL fragment + params enforcing read-side cohort_scope
-/// admission for the given caller scope. The fragment AND-composes
-/// into the caller's WHERE. Returns the fragment + bind params,
-/// matching backend dialect (`->>` for PG / `json_extract` for SQLite).
+/// admission. AND-composes into the caller's WHERE. The row carries
+/// its own cohort_scope + cohort_target_id (the audience its producer
+/// policy named); the predicate compares that target against the
+/// reader's resolved admission sets. No emitter join.
 pub fn cohort_scope_sql_predicate(
     backend: BackendKind,
-    table_alias: &str,
-    emitter_key_col: &str,    // e.g. "scrub_key_id" or "author_key_id"
-    scope_col: &str,          // e.g. "cohort_scope" (TEXT) or a JSON path
+    scope_col: &str,          // the row's cohort_scope column/expr
+    target_col: &str,         // the row's cohort_target_id column/expr
     scope: &CallerScope,
 ) -> (String, Vec<ScopeParam>);
 ```
 
 Conceptual shape, both backends:
 
-**Unauthenticated** — `<scope_col> IN ('community','affiliations','species','biosphere','federation')`
+**Unauthenticated** — `<scope_col> IN ('affiliations','species','biosphere','federation')`.
+(The broad belonging-tiers, which carry no specific small-group target and have no membership substrate to check against. Self/family/community are membership-gated — an unauthenticated reader proves no membership, so sees none of them.)
 
 **Authenticated { admission }** — admits a row when ANY of:
 
 ```sql
--- broadly-visible tiers — any authenticated caller passes
-<scope_col> IN ('community','affiliations','species','biosphere','federation')
+-- broad belonging-tiers — no per-row target; any authenticated reader passes
+<scope_col> IN ('affiliations','species','biosphere','federation')
 
--- self — caller's identity == emitter's identity
-OR (<scope_col> = 'self' AND EXISTS (
-  SELECT 1
-    FROM federation_identity_occurrences io_e
-   WHERE io_e.occurrence_key_id = <emitter_key_col>
-     AND io_e.identity_key_id   = $caller_identity_key_id
-))
+-- self — row scoped to one identity; reader IS that identity
+OR (<scope_col> = 'self'      AND <target_col> = $reader_identity_key_id)
 
--- family — caller's identity ∈ same family as emitter's identity
-OR (<scope_col> = 'family' AND EXISTS (
-  SELECT 1
-    FROM federation_families f
-    JOIN federation_identity_occurrences io_e
-      ON io_e.occurrence_key_id = <emitter_key_col>
-   WHERE f.family_key_id = ANY($caller_family_key_ids)
-     AND f.members @> jsonb_build_array(
-           jsonb_build_object('key_id', io_e.identity_key_id)
-         )                          -- PG; sqlite uses json_each
-))
+-- family — row scoped to one family; reader is a member of THAT family
+OR (<scope_col> = 'family'    AND <target_col> = ANY($reader_family_key_ids))
 
--- community — symmetric to family against federation_communities
-OR (<scope_col> = 'community' AND EXISTS (
-  SELECT 1
-    FROM federation_communities c
-    JOIN federation_identity_occurrences io_e
-      ON io_e.occurrence_key_id = <emitter_key_col>
-   WHERE c.community_key_id = ANY($caller_community_key_ids)
-     AND c.members @> jsonb_build_array(
-           jsonb_build_object('key_id', io_e.identity_key_id)
-         )
-))
+-- community — row scoped to one community; reader is a member of THAT community
+OR (<scope_col> = 'community' AND <target_col> = ANY($reader_community_key_ids))
 ```
 
-The community branch is the lens-trace path: a lens-capable peer's identity sits in the agent's community; lens-cohort rows the agent stored land at the peer when the peer reads — without persist needing to know "lens" as a routing concept. Routing happened upstream (NodeCore `service_announcement` discovery + Edge `ServiceRequest`); persist applies the visibility predicate the cohort label expresses.
+`= ANY($list)` on PG; SQLite expands to `IN (?,?,…)`. No subquery, no join — `$reader_*` come straight from the reader's `CallerAdmission` (§4.1), which already resolved the reader's identity / families / communities once at the boundary.
+
+**The self target.** A `self`-scoped row's `cohort_target_id` is the **owner identity** — resolved from the verified signer (`scrub_key_id` → identity via `federation_identity_occurrences`) **at write time** and stored denormalized (§4.6, §12). So the read-gate is a plain equality; no occurrence resolution on the hot read path.
+
+**The lens-trace path.** An agent routes traces to its lens community by stamping `cohort_scope: community, cohort_target_id: <that community_key_id>` (its distribution policy's expression). A lens-capable peer in that community reads them because `<that community> ∈ reader.community_key_ids`. Persist never needs to know "lens" as a routing concept — routing happened upstream (NodeCore `service_announcement` discovery + Edge `ServiceRequest`); persist records the target the policy named and gates on the reader's membership in it.
+
+**Scope-tier coverage boundary (v4.0).** Precise target-membership gating is implemented for the three cohorts that have a membership substrate: **self** (`federation_identity_occurrences`, V059), **family** (`federation_families`, V059), **community** (`federation_communities`, V060). The broader belonging-scales `affiliations` / `species` / `biosphere` have **no membership substrate table** today, so they cannot be target-gated and are treated as broad-tier (authenticated-visible); `federation` is the genuinely-wide tier (also unauthenticated-visible). Adding target-membership for affiliations/species/biosphere is a noted follow-up gated on those cohorts getting substrate membership tables — named here, not silently dropped.
 
 ### 4.4 The singleton-identity fallback
 
@@ -338,47 +328,49 @@ The same `CallerAdmission` primitive `CallerScope::Authenticated` carries on the
 // src/federation/admission.rs — DimensionAdmissionPolicy extension
 
 impl DimensionAdmissionPolicy {
-    /// AV-45 closure — writer's claimed cohort_scope must be permitted
-    /// by their admission. Called from put_attestation, the trace
-    /// ingest pipeline (verify-before-persist gate, MISSION §4), and
-    /// every other write path that stores rows carrying a cohort_scope.
+    /// AV-45 closure — a writer claiming (cohort_scope, target) must be
+    /// a MEMBER of the target it names. Symmetric to the read-gate (§4.3):
+    /// the read-gate asks "is the reader in this row's target cohort?";
+    /// the write-gate asks "is the writer in the target cohort they're
+    /// trying to stamp?". Same CallerAdmission, both directions.
     ///
-    /// Returns Err(ScopeRefused(...)) when the write attempts to
-    /// downgrade — e.g. claims cohort_scope: federation on content
-    /// the writer's admission can only emit at cohort_scope: self.
+    /// Called from put_attestation, the trace ingest pipeline
+    /// (verify-before-persist gate, MISSION §4), and every write path
+    /// that stores a row carrying (cohort_scope, cohort_target_id).
+    /// `cohort_target_id` is `None` for the broad belonging-tiers and
+    /// for `self` (where the target IS the writer's identity, resolved
+    /// and stamped by the substrate, not caller-supplied).
+    ///
+    /// Returns Err(ScopeRefused(...)) when the write attempts a
+    /// downgrade — e.g. stamps cohort_scope:community on a community
+    /// the writer is not a member of, to broaden visibility.
     pub fn check_write_cohort_scope(
         writer_admission: &CallerAdmission,
-        emitter_key_id: &KeyId,
         claimed_cohort_scope: &str,
+        claimed_target_id: Option<&str>,
     ) -> Result<(), ScopeRefusalReason> {
         match claimed_cohort_scope {
-            // Self — writer's identity must own the emitter occurrence.
-            "self" => {
-                let emitter_identity = lookup_identity_for_occurrence(emitter_key_id)?;
-                if emitter_identity != writer_admission.identity_key_id {
-                    return Err(ScopeRefusalReason::WrongIdentity);
-                }
-                Ok(())
-            }
+            // Self — target IS the writer's identity. The substrate
+            // stamps cohort_target_id = writer_admission.identity_key_id
+            // (resolved from the verified signer); any caller-supplied
+            // target for self is ignored. Always permitted for the writer.
+            "self" => Ok(()),
 
-            // Family — writer's identity must share a family with the emitter's.
-            "family" => {
-                let emitter_identity = lookup_identity_for_occurrence(emitter_key_id)?;
-                let shared = writer_admission.family_key_ids.iter().any(|fid| {
-                    family_contains(fid, &emitter_identity)
-                });
-                if !shared {
-                    return Err(ScopeRefusalReason::NoFamilyMembership);
-                }
-                Ok(())
-            }
+            // Family — writer must be a member of the claimed family.
+            "family" => match claimed_target_id {
+                Some(fid) if writer_admission.family_key_ids.contains(fid) => Ok(()),
+                _ => Err(ScopeRefusalReason::NoFamilyMembership),
+            },
 
-            // Community — symmetric.
-            "community" => { /* identical shape against community_key_ids */ }
+            // Community — writer must be a member of the claimed community.
+            "community" => match claimed_target_id {
+                Some(cid) if writer_admission.community_key_ids.contains(cid) => Ok(()),
+                _ => Err(ScopeRefusalReason::NoCommunityMembership),
+            },
 
-            // Broader tiers — no further check; non-suppressed per §8.1.13.3.
-            // ANY authenticated writer may emit at these tiers; the chain
-            // counter-signs at the federation layer (CIRISVerify hybrid sigs).
+            // Broad belonging-tiers — no per-row target; any authenticated
+            // writer may emit. The chain counter-signs at the federation
+            // layer (CIRISVerify hybrid sigs).
             "affiliations" | "species" | "biosphere" | "federation" => Ok(()),
 
             other => Err(ScopeRefusalReason::InvalidCohortScope(other.to_string())),
@@ -391,18 +383,18 @@ impl DimensionAdmissionPolicy {
 
 | Write path | Gate location |
 |---|---|
-| `Engine::receive_and_persist` (trace ingest) | After verify, before scrub — the writer's admission is built from `scrub_key_id` (the Ed25519-verified signer of the envelope); the trace's emitted `cohort_scope` is checked against the writer's admission |
-| `put_attestation` | Same pattern — `attesting_key_id` is the writer identity |
-| `put_identity_occurrence` / `put_family` / `put_community` | Self-admission writes — writer is the authority for the row's subject; no cohort_scope downgrade concept applies |
-| `put_revocation` / `put_takedown_notice` | Author's admission must permit emission at the revocation's cohort_scope (mirrors the source content's scope) |
-| Internal substrate writes (chain anchors, migrations) | No admission needed — substrate is its own authority for these |
+| `Engine::receive_and_persist` (trace ingest) | After verify, before scrub — writer admission built from `scrub_key_id` (the Ed25519-verified signer); the trace's claimed `(cohort_scope, cohort_target_id)` is checked. For `self`, substrate stamps `cohort_target_id = writer identity`. |
+| `put_attestation` | Same pattern — `attesting_key_id` is the writer identity; checks the attestation's `(cohort_scope, target)`. |
+| `put_identity_occurrence` / `put_family` / `put_community` | Membership-roster writes — admission is the ceremony witness-set (CIRISRegistry#52), not a cohort_scope claim; no downgrade concept. |
+| `put_revocation` / `put_takedown_notice` | Author's admission must permit emission at the revocation's `(cohort_scope, target)` (mirrors the source content's scope). |
+| Internal substrate writes (chain anchors, migrations) | No admission needed — substrate is its own authority. |
 
 **Why the closure is light:**
 
-- The substrate already has the writer identity at write time (the verified envelope signer); no new auth surface.
-- The `CallerAdmission` resolution path is the same as read-side; one builder, used in both directions.
-- The cohort_scope vocabulary is closed; the dispatch is a 7-arm match.
-- AV-45 closes by the same construction discipline as AV-44 — typed admission, substrate-built, predicate at the boundary.
+- The substrate has the writer identity + admission at write time (the verified signer); no new auth surface.
+- The check is pure set-membership against the same `CallerAdmission` the read-gate uses — one builder, both directions, no emitter-resolution.
+- The cohort_scope vocabulary is closed; the dispatch is a small match.
+- AV-45 closes by the same construction discipline as AV-44 — typed admission, substrate-built, set-membership at the boundary.
 
 **Defense in depth (§9) on the write side:** Layer 1 is `check_write_cohort_scope` at substrate; Layer 2 is edge's pre-ingest verification that the wire-format envelope's claimed cohort_scope matches the routing the writer used. Joint `cohort_scope_write_double_miss_total` mirrors the read-side alert.
 
@@ -1170,7 +1162,21 @@ Python passes a *caller occurrence key id* — `None` means `Unauthenticated`, `
 
 ## 12. Migration V060
 
-V057 is already taken (peer_metadata_cohort_scope_index, v3.9.x); V058–V059 are the v3.11/v3.12 cuts. V060 is the next free number and lands as the v4.0 DAS migration. Two concerns in one numbered cut, mirroring the V059 dual-substrate pattern:
+V057 is already taken (peer_metadata_cohort_scope_index, v3.9.x); V058–V059 are the v3.11/v3.12 cuts. V060 is the next free number and lands as the v4.0 DAS migration. **Three** concerns in one numbered cut: (A) `federation_communities` substrate, (B) `trace_events.cohort_scope` column, (C) DAS covering indexes.
+
+### 12.0 Schema-reconciliation notes (Barrier-1 findings, CIRISPersist#160 implementation)
+
+Two facts the FSD's first draft got wrong about the real schema, corrected here:
+
+1. **`trace_events` had no `cohort_scope` column.** The first draft's Part-B trace index referenced a column that didn't exist. Per the #160 trace-scope decision (add cohort_scope to the trace corpus, so the §9 community-lens flow gates at trace-read), Part B(i) below now *creates* **two** columns:
+   - `cohort_scope TEXT NOT NULL DEFAULT 'federation'` + closed-set CHECK, mirroring V056's discipline for `federation_attestations`.
+   - `cohort_target_id TEXT` (nullable) — the §4.3 scope **target**: the `family_id`/`community_id` the producer policy routed the trace to, or (for `self`) the owner identity the substrate resolves from the verified signer at write. NULL for the broad belonging-tiers.
+
+   **Default `'federation'` + NULL target is backward-compat-safe**: existing trace rows predate any scope and are federation-visible today, so the default preserves current behavior. The trace wire format gains **optional** `cohort_scope` + `cohort_target_id` envelope fields (serde default / `skip_serializing_if`) so existing trace canonical bytes / signatures are unchanged (MISSION §3 byte-exactness preserved); producers that omit them ride the default. The substrate **resolves and stamps** the `self` target from the verified `scrub_key_id` (never trusting a caller-supplied self-target), and the write-gate (§4.6) verifies the writer is a member of any family/community target it stamps. **Producer adoption** (CIRISAgent emitting per-trace `cohort_scope` + target) is a tracked cross-repo follow-up; until then all traces are `'federation'`. The columns + predicate + optional fields ship in v4.0 so the substrate is ready the moment producers adopt.
+
+2. **`federation_attestations` real columns differ from the first draft.** It has no `subject_key_id` / `asserter_key_id` / `attestation_kind` columns; the real target column is `attested_key_id` (V055 also added a plural `subject_key_ids` JSONB array), and the emitter column is `scrub_key_id`. The Part-B attestation indexes below use the real columns.
+
+Two concerns mirror the V059 dual-substrate pattern; the trace-column addition is the third:
 
 ```sql
 -- migrations/postgres/lens/V060__v4_0_communities_and_das_indexes.sql
@@ -1198,20 +1204,32 @@ CREATE TABLE cirislens.federation_communities (
 CREATE INDEX idx_federation_communities_members_gin
     ON cirislens.federation_communities USING GIN (members);
 
--- ── Part B: DAS covering indexes ───────────────────────────────────
+-- ── Part B(i): trace_events cohort_scope + target ──────────────────
+ALTER TABLE cirislens.trace_events
+    ADD COLUMN cohort_scope TEXT NOT NULL DEFAULT 'federation';
+ALTER TABLE cirislens.trace_events
+    ADD COLUMN cohort_target_id TEXT;            -- family_id / community_id / owner-identity; NULL for broad tiers
+ALTER TABLE cirislens.trace_events
+    ADD CONSTRAINT trace_events_cohort_scope_closed_set
+    CHECK (cohort_scope IN
+        ('self','family','community','affiliations','species','biosphere','federation'));
+
+-- ── Part B(ii): DAS covering indexes ───────────────────────────────
+-- The §4.3 predicate is now pure set-membership on (cohort_scope,
+-- cohort_target_id) — no emitter join — so the covering index leads
+-- with those two columns to make the scope filter index-only.
 CREATE INDEX IF NOT EXISTS idx_trace_events_v060_repository_stats
-ON cirislens.trace_events (ts, deployment_domain, cohort_scope)
+ON cirislens.trace_events (cohort_scope, cohort_target_id, ts, deployment_domain)
 INCLUDE (trace_id, agent_id_hash, plausibility_score, alignment_score,
-         conscience_passed, action_kind, action_succeeded,
-         fragility_phase, scrub_key_id);
+         conscience_passed, action_kind, action_succeeded, fragility_phase);
 
+-- federation_attestations real columns (V055/V056): attested_key_id is
+-- the target; scrub_key_id the emitter; subject_key_ids is a JSONB array.
 CREATE INDEX IF NOT EXISTS idx_federation_attestations_v060_by_target
-ON cirislens.federation_attestations (subject_key_id, cohort_scope, asserted_at DESC)
-INCLUDE (attestation_id, asserter_key_id, attestation_kind, scrub_key_id);
+ON cirislens.federation_attestations (attested_key_id, cohort_scope, asserted_at DESC);
 
-CREATE INDEX IF NOT EXISTS idx_federation_attestations_v060_emitter_scope
-ON cirislens.federation_attestations (scrub_key_id, cohort_scope);
--- Indexes the inner side of the §4.3 scope-predicate EXISTS join.
+CREATE INDEX IF NOT EXISTS idx_federation_attestations_v060_scope
+ON cirislens.federation_attestations (cohort_scope, asserted_at DESC);
 ```
 
 ```sql
@@ -1234,15 +1252,22 @@ CREATE TABLE federation_communities (
         OR consensus_protocol GLOB 'custom:?*')
 );
 
--- Part B (sqlite: no INCLUDE — index columns directly)
+-- Part B(i): trace_events cohort_scope + target (sqlite ALTER, one col per stmt)
+ALTER TABLE trace_events ADD COLUMN cohort_scope TEXT NOT NULL DEFAULT 'federation';
+ALTER TABLE trace_events ADD COLUMN cohort_target_id TEXT;
+-- SQLite can't ADD a CHECK via ALTER; the closed-set is enforced by a
+-- BEFORE INSERT/UPDATE trigger (V056 discipline) — see the trigger block
+-- the implementation mirrors from V056's cohort_scope trigger.
+
+-- Part B(ii): DAS covering indexes (sqlite: no INCLUDE — columns directly)
 CREATE INDEX IF NOT EXISTS idx_trace_events_v060_repository_stats
-ON trace_events (ts, deployment_domain, cohort_scope, trace_id);
+ON trace_events (cohort_scope, cohort_target_id, ts, deployment_domain, trace_id);
 
 CREATE INDEX IF NOT EXISTS idx_federation_attestations_v060_by_target
-ON federation_attestations (subject_key_id, cohort_scope, asserted_at DESC, attestation_id);
+ON federation_attestations (attested_key_id, cohort_scope, asserted_at DESC, attestation_id);
 
-CREATE INDEX IF NOT EXISTS idx_federation_attestations_v060_emitter_scope
-ON federation_attestations (scrub_key_id, cohort_scope);
+CREATE INDEX IF NOT EXISTS idx_federation_attestations_v060_scope
+ON federation_attestations (cohort_scope, asserted_at DESC);
 ```
 
 Both files land in the same release. The community-membership fan-out is `members @> jsonb_build_array(...)` on PG and `json_each(members)` on sqlite — the substrate hides the dialect difference behind `list_communities_for_member`.

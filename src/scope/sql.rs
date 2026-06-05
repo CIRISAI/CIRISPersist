@@ -1,48 +1,54 @@
 //! [`cohort_scope_sql_predicate`] — the §4.3 read-side admission gate
 //! as a SQL WHERE-fragment + bind params, for both backends.
 //!
-//! The fragment AND-composes into the caller's existing WHERE. It is
-//! always parenthesized so AND-composition is sound regardless of the
-//! caller's surrounding clause. Bind params are returned positionally
-//! in [`ScopeParam`] order; the caller binds them after its own params
-//! (Postgres `$n` placeholders are emitted relative to a caller-supplied
-//! base offset, see [`cohort_scope_sql_predicate`]'s `first_param_index`
-//! — Commit B emits a self-contained fragment starting at `$1`; Commit E
-//! threads the real offset when it composes the fragment into a larger
-//! statement).
+//! # The model (FSD §4.3 — target-membership)
 //!
-//! # Backend dialect (mirrors the existing V059 family reads)
+//! `cohort_scope` is the CEG visibility/routing axis; its value is
+//! **formed upstream** by the producer's trust/distribution policy and
+//! the substrate only **records** it (MISSION §1.7). A scoped row carries
+//! both its `cohort_scope` AND the scope **target** it was routed to
+//! (`family_id` / `community_id`, or — for `self` — the owner identity the
+//! substrate resolved from the verified signer at write). The read-gate is
+//! **pure set-membership**: a reader sees the row iff the reader belongs to
+//! the *specific target cohort the row names*.
 //!
-//! | Construct            | Postgres                              | SQLite                                            |
-//! |----------------------|---------------------------------------|---------------------------------------------------|
-//! | scope label fetch    | `<scope_col>` (TEXT column)           | `<scope_col>` (TEXT column)                        |
-//! | table qualification  | `cirislens.federation_*`              | `federation_*` (unqualified)                      |
-//! | members containment  | `members @> '[{"key_id":..}]'`        | `EXISTS(SELECT 1 FROM json_each(members) WHERE json_extract(value,'$.key_id')=?)` |
-//! | list membership      | `f.family_key_id = ANY($n)`           | `f.family_key_id IN (?,?,…)`                       |
-//! | placeholder          | `$n`                                  | `?`                                               |
+//! This is deliberately NOT "emitter and reader share a cohort" — that
+//! formulation leaks (an agent in communities A+B routing a row to B only
+//! would expose it to an A-only co-member). Target-membership eliminates
+//! the leak and eliminates the emitter→identity join entirely: the
+//! predicate compares the row's `cohort_target_id` against the reader's
+//! already-resolved [`CallerAdmission`](super::admission::CallerAdmission)
+//! sets. No subquery, no join.
 //!
-//! `scope_col` is documented in §4.3 as "`cohort_scope` (TEXT) or a
-//! JSON path". Both backends store `cohort_scope` as a TEXT column on
-//! `trace_events` / `federation_attestations` (V057 indexed it as
-//! such), so this helper treats `scope_col` as a column reference and
-//! does NOT JSON-extract it. A caller passing a JSON-path scope_col is
-//! out of contract for v4.0.
+//! The fragment AND-composes into the caller's existing WHERE and is
+//! always parenthesized. Bind params are returned positionally in
+//! [`ScopeParam`] order; Postgres placeholders are emitted starting at
+//! `$1` (Commit E rebinds them when composing into a larger statement),
+//! SQLite uses `?`.
+//!
+//! # Scope-tier coverage (v4.0)
+//!
+//! Precise target-membership is gated on the cohorts that have a
+//! membership substrate: `self` (identity_occurrences V059), `family`
+//! (federation_families V059), `community` (federation_communities V060).
+//! The broad belonging-tiers `affiliations` / `species` / `biosphere` /
+//! `federation` carry no per-row target and have no membership table, so
+//! they are admitted as broad tiers (any authenticated reader;
+//! `federation` also to the unauthenticated).
 
 use super::caller::CallerScope;
 
 /// Which SQL dialect to emit (FSD §4.3). There is no existing crate-wide
 /// backend-kind enum — the backends are distinguished structurally via
-/// [`crate::engine::BackendDispatch`] match arms — so Commit B defines
-/// this minimal two-variant enum for the predicate emitter. Commit E /
-/// the backend implementations map their `BackendDispatch` arm to a
-/// `BackendKind` when calling this helper.
+/// [`crate::engine::BackendDispatch`] match arms — so this minimal
+/// two-variant enum drives the predicate emitter. The backend
+/// implementations map their `BackendDispatch` arm to a `BackendKind`
+/// when calling this helper.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BackendKind {
-    /// Postgres dialect (`$n` placeholders, `@>`, `= ANY`, schema-qualified
-    /// `cirislens.federation_*` tables).
+    /// Postgres dialect (`$n` placeholders, `= ANY($n)` array membership).
     Postgres,
-    /// SQLite dialect (`?` placeholders, `json_each` / `json_extract`,
-    /// unqualified `federation_*` tables).
+    /// SQLite dialect (`?` placeholders, `IN (?,?,…)` membership).
     Sqlite,
 }
 
@@ -52,38 +58,26 @@ pub enum BackendKind {
 ///
 /// There is no existing crate-wide dynamic-SQL param enum (the backends
 /// bind statically-typed `&[&(dyn ToSql)]` / `params![]` at each call
-/// site), so Commit B defines this minimal carrier. Commit E maps each
-/// variant to the backend's native bind type at the call site.
+/// site), so this minimal carrier bridges. The backend impl maps each
+/// variant to its native bind type at the call site.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScopeParam {
-    /// A single key id — the caller's resolved identity key
-    /// (`$caller_identity_key_id`).
+    /// A single key id (the reader's resolved identity, or one expanded
+    /// family/community key on SQLite).
     Key(String),
-    /// A list of key ids — the caller's family or community admission
-    /// set. Postgres binds this as a single array param (`= ANY($n)`);
-    /// SQLite expands it into one `?` per element (`IN (?,?,…)`), and
-    /// the helper emits exactly `keys.len()` `ScopeParam::Key` entries
-    /// in that case instead of a single `KeyList` (see emitter).
+    /// A list of key ids — the reader's family or community admission
+    /// set. Postgres binds this as one array param (`= ANY($n)`); SQLite
+    /// expands it into one `?` per element (`IN (?,?,…)`) and the emitter
+    /// pushes one [`ScopeParam::Key`] each instead of a `KeyList`.
     KeyList(Vec<String>),
 }
 
-/// The non-suppressed cohort tiers any caller (authenticated or not)
-/// may read, per §8.1.13.3. `self` and `family` are suppressed;
-/// `community` is non-suppressed for the *broad* admit but ALSO has a
-/// membership-gated branch on the authenticated side (a community row
-/// is broadly visible per §8.1.13.3's NO-suppression semantics — the
-/// extra EXISTS branch in §4.3 is the membership *narrowing* path used
-/// when a consumer wants member-only community visibility).
-const BROAD_TIERS: &[&str] = &[
-    "community",
-    "affiliations",
-    "species",
-    "biosphere",
-    "federation",
-];
+/// The broad belonging-tiers, admitted with no per-row target. `self`,
+/// `family`, `community` are membership-gated and NOT in this set.
+const BROAD_TIERS: &[&str] = &["affiliations", "species", "biosphere", "federation"];
 
-/// SQL string literal list of the broad tiers, e.g.
-/// `'community','affiliations','species','biosphere','federation'`.
+/// SQL string-literal list of the broad tiers, e.g.
+/// `'affiliations','species','biosphere','federation'`.
 fn broad_tiers_sql() -> String {
     BROAD_TIERS
         .iter()
@@ -92,96 +86,68 @@ fn broad_tiers_sql() -> String {
         .join(",")
 }
 
-/// Fully-qualified table name for the dialect.
-fn table(backend: BackendKind, name: &str) -> String {
-    match backend {
-        BackendKind::Postgres => format!("cirislens.{name}"),
-        BackendKind::Sqlite => name.to_string(),
-    }
-}
-
 /// Emit the SQL fragment + params enforcing read-side cohort_scope
 /// admission for the given caller scope (FSD §4.3). The fragment
-/// AND-composes into the caller's WHERE. Returns the fragment + bind
-/// params, matching backend dialect.
+/// AND-composes into the caller's WHERE.
 ///
-/// - `table_alias` — alias of the row table in the caller's query
-///   (e.g. `"t"` for `trace_events t`). Used to qualify `emitter_key_col`
-///   / `scope_col`.
-/// - `emitter_key_col` — the column holding the row's emitter occurrence
-///   key (e.g. `"scrub_key_id"` or `"author_key_id"`).
-/// - `scope_col` — the TEXT column holding the row's `cohort_scope`.
+/// - `scope_col` — the row's `cohort_scope` column reference (caller
+///   qualifies, e.g. `"t.cohort_scope"`).
+/// - `target_col` — the row's `cohort_target_id` column reference (the
+///   `family_id`/`community_id`/owner-identity the row was scoped to).
 ///
-/// Postgres placeholders are emitted starting at `$1`; Commit E rebinds
-/// them when composing into a larger statement.
+/// Postgres placeholders start at `$1`; Commit E rebinds them when
+/// composing into a larger statement.
 pub fn cohort_scope_sql_predicate(
     backend: BackendKind,
-    table_alias: &str,
-    emitter_key_col: &str,
     scope_col: &str,
+    target_col: &str,
     scope: &CallerScope,
 ) -> (String, Vec<ScopeParam>) {
-    let scope_ref = format!("{table_alias}.{scope_col}");
-    let emitter_ref = format!("{table_alias}.{emitter_key_col}");
     let broad = broad_tiers_sql();
 
     match scope {
-        // Unauthenticated — only the non-suppressed tiers. No params.
-        CallerScope::Unauthenticated => {
-            let frag = format!("({scope_ref} IN ({broad}))");
-            (frag, Vec::new())
-        }
+        // Unauthenticated — only the broad belonging-tiers. No target,
+        // no membership, no params. Self/family/community are
+        // membership-gated and an unauthenticated reader proves nothing.
+        CallerScope::Unauthenticated => (format!("({scope_col} IN ({broad}))"), Vec::new()),
 
-        // Authenticated — broad tiers OR self/family/community by
-        // admission resolution. Placeholders are assigned left-to-right
-        // in the order the params Vec is built.
+        // Authenticated — broad tiers OR target-membership on
+        // self/family/community. Placeholders assigned left-to-right in
+        // the order params is built.
         CallerScope::Authenticated { admission } => {
             let mut params: Vec<ScopeParam> = Vec::new();
-            // PG placeholder counter; unused for SQLite (always `?`).
             let mut next = 1usize;
 
-            // self — caller's identity == emitter's identity.
-            let identity_ph = placeholder(backend, &mut next);
+            // self — the row's target IS an owner identity; reader sees it
+            // iff that identity is the reader's own.
+            let id_ph = placeholder(backend, &mut next);
             params.push(ScopeParam::Key(admission.identity_key_id.clone()));
-            let io = table(backend, "federation_identity_occurrences");
-            let self_branch = format!(
-                "({scope_ref} = 'self' AND EXISTS (\
-                   SELECT 1 FROM {io} io_e \
-                   WHERE io_e.occurrence_key_id = {emitter_ref} \
-                     AND io_e.identity_key_id = {identity_ph}))"
-            );
+            let self_branch = format!("({scope_col} = 'self' AND {target_col} = {id_ph})");
 
-            // family — caller's identity ∈ same family as emitter's
-            // identity. Membership test against the family roster joins
-            // the emitter occurrence → emitter identity, then checks the
-            // emitter identity is in a family the caller is admitted to.
-            let family_branch = membership_branch(
+            // family — target ∈ the reader's admitted families.
+            let family_branch = target_membership_branch(
                 backend,
-                &scope_ref,
-                &emitter_ref,
+                scope_col,
+                target_col,
                 "family",
-                "federation_families",
-                "family_key_id",
                 &admission.family_key_ids,
                 &mut next,
                 &mut params,
             );
 
-            // community — symmetric against federation_communities.
-            let community_branch = membership_branch(
+            // community — target ∈ the reader's admitted communities.
+            let community_branch = target_membership_branch(
                 backend,
-                &scope_ref,
-                &emitter_ref,
+                scope_col,
+                target_col,
                 "community",
-                "federation_communities",
-                "community_key_id",
                 &admission.community_key_ids,
                 &mut next,
                 &mut params,
             );
 
             let frag = format!(
-                "({scope_ref} IN ({broad}) \
+                "({scope_col} IN ({broad}) \
                  OR {self_branch} \
                  OR {family_branch} \
                  OR {community_branch})"
@@ -204,76 +170,46 @@ fn placeholder(backend: BackendKind, next: &mut usize) -> String {
     }
 }
 
-/// Build a family/community EXISTS membership branch for the §4.3
-/// predicate. The branch admits a `cohort_scope: <label>` row when the
-/// emitter's identity is in the roster of a `<table>` row whose own key
-/// is in the caller's admission set.
+/// Build a `family`/`community` target-membership branch: admit a
+/// `cohort_scope: <label>` row iff its `target_col` is one of the
+/// reader's admitted cohort keys. Pure set-membership — no join.
 ///
-/// When the caller's admission set is empty (no families / no
-/// communities — e.g. the §4.4 singleton fallback), the branch is a
-/// constant-false `(... AND 1=0)`: the caller is in no such cohort, so
-/// no row at that label is admitted. No params are emitted in that case.
-#[allow(clippy::too_many_arguments)]
-fn membership_branch(
+/// Empty admission set (the §4.4 singleton fallback, or a reader in no
+/// families/communities) → constant-false `(scope_col = '<label>' AND
+/// 1=0)`: the reader is in no such cohort, so no row at that label is
+/// admitted. No params in that case.
+fn target_membership_branch(
     backend: BackendKind,
-    scope_ref: &str,
-    emitter_ref: &str,
+    scope_col: &str,
+    target_col: &str,
     label: &str,
-    cohort_table: &str,
-    cohort_key_col: &str,
     admission_keys: &std::collections::BTreeSet<String>,
     next: &mut usize,
     params: &mut Vec<ScopeParam>,
 ) -> String {
     if admission_keys.is_empty() {
-        // Caller is in no cohort of this kind — admit nothing at this
-        // label. Constant-false, no params.
-        return format!("({scope_ref} = '{label}' AND 1=0)");
+        return format!("({scope_col} = '{label}' AND 1=0)");
     }
 
-    let cohort = table(backend, cohort_table);
-    let io = table(backend, "federation_identity_occurrences");
-
-    // Caller-admission membership test: `c.<key_col> IN/ANY (caller set)`.
-    let admit_membership = match backend {
+    let membership = match backend {
         BackendKind::Postgres => {
             let ph = placeholder(backend, next); // single array param
             params.push(ScopeParam::KeyList(
                 admission_keys.iter().cloned().collect(),
             ));
-            format!("c.{cohort_key_col} = ANY({ph})")
+            format!("{target_col} = ANY({ph})")
         }
         BackendKind::Sqlite => {
-            // One `?` per key; emit one ScopeParam::Key each.
             let mut phs = Vec::with_capacity(admission_keys.len());
             for k in admission_keys {
                 phs.push(placeholder(backend, next));
                 params.push(ScopeParam::Key(k.clone()));
             }
-            format!("c.{cohort_key_col} IN ({})", phs.join(","))
+            format!("{target_col} IN ({})", phs.join(","))
         }
     };
 
-    // Roster-containment test: emitter's identity ∈ c.members.
-    let roster_contains = match backend {
-        BackendKind::Postgres => {
-            // members @> jsonb_build_array(jsonb_build_object('key_id', io_e.identity_key_id))
-            "c.members @> jsonb_build_array(\
-               jsonb_build_object('key_id', io_e.identity_key_id))"
-                .to_string()
-        }
-        BackendKind::Sqlite => "EXISTS (SELECT 1 FROM json_each(c.members) \
-               WHERE json_extract(value, '$.key_id') = io_e.identity_key_id)"
-            .to_string(),
-    };
-
-    format!(
-        "({scope_ref} = '{label}' AND EXISTS (\
-           SELECT 1 FROM {cohort} c \
-           JOIN {io} io_e ON io_e.occurrence_key_id = {emitter_ref} \
-           WHERE {admit_membership} \
-             AND {roster_contains}))"
-    )
+    format!("({scope_col} = '{label}' AND {membership})")
 }
 
 #[cfg(test)]
@@ -293,7 +229,8 @@ mod tests {
         }
     }
 
-    /// Authenticated caller in family F1 + F2 and community C1.
+    /// Authenticated caller with identity id-1, in families F1+F2 and
+    /// community C1.
     fn auth_full() -> CallerScope {
         CallerScope::Authenticated {
             admission: CallerAdmission::for_test(
@@ -308,38 +245,44 @@ mod tests {
     #[test]
     fn unauthenticated_admits_only_broad_tiers_both_backends() {
         for backend in [BackendKind::Postgres, BackendKind::Sqlite] {
-            let (frag, params) =
-                cohort_scope_sql_predicate(backend, "t", "scrub_key_id", "cohort_scope", &unauth());
+            let (frag, params) = cohort_scope_sql_predicate(
+                backend,
+                "t.cohort_scope",
+                "t.cohort_target_id",
+                &unauth(),
+            );
             assert_eq!(
                 frag,
-                "(t.cohort_scope IN ('community','affiliations','species','biosphere','federation'))"
+                "(t.cohort_scope IN ('affiliations','species','biosphere','federation'))"
             );
             assert!(params.is_empty(), "unauth emits no params");
-            // never admits self / family
+            // membership-gated cohorts never admitted for the unauthenticated
             assert!(!frag.contains("'self'"));
             assert!(!frag.contains("'family'"));
+            assert!(!frag.contains("'community'"));
         }
     }
 
     #[test]
-    fn authenticated_singleton_postgres_self_only_no_cohorts() {
+    fn authenticated_singleton_postgres_self_target_eq_identity() {
         let (frag, params) = cohort_scope_sql_predicate(
             BackendKind::Postgres,
-            "t",
-            "scrub_key_id",
-            "cohort_scope",
+            "t.cohort_scope",
+            "t.cohort_target_id",
             &auth_singleton(),
         );
-        // broad tiers present
-        assert!(frag.contains(
-            "t.cohort_scope IN ('community','affiliations','species','biosphere','federation')"
-        ));
-        // self branch with $1 = identity, joining identity_occurrences
-        assert!(frag.contains("t.cohort_scope = 'self' AND EXISTS ("));
-        assert!(frag.contains("FROM cirislens.federation_identity_occurrences io_e"));
-        assert!(frag.contains("io_e.occurrence_key_id = t.scrub_key_id"));
-        assert!(frag.contains("io_e.identity_key_id = $1"));
-        // family + community are constant-false (no admission sets)
+        // broad tiers (no community — it's membership-gated now)
+        assert!(
+            frag.contains("t.cohort_scope IN ('affiliations','species','biosphere','federation')")
+        );
+        // self: target == reader identity ($1). No join, no subquery.
+        assert!(frag.contains("(t.cohort_scope = 'self' AND t.cohort_target_id = $1)"));
+        assert!(
+            !frag.contains("EXISTS"),
+            "target-membership uses no subquery"
+        );
+        assert!(!frag.contains("occurrence_key_id"), "no emitter join");
+        // family + community constant-false (no admission sets)
         assert!(frag.contains("(t.cohort_scope = 'family' AND 1=0)"));
         assert!(frag.contains("(t.cohort_scope = 'community' AND 1=0)"));
         // only the identity param
@@ -347,42 +290,36 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_singleton_sqlite_uses_question_placeholders() {
+    fn authenticated_singleton_sqlite_uses_question_placeholder() {
         let (frag, params) = cohort_scope_sql_predicate(
             BackendKind::Sqlite,
-            "t",
-            "scrub_key_id",
-            "cohort_scope",
+            "t.cohort_scope",
+            "t.cohort_target_id",
             &auth_singleton(),
         );
-        assert!(frag.contains("FROM federation_identity_occurrences io_e"));
-        assert!(frag.contains("io_e.identity_key_id = ?"));
+        assert!(frag.contains("(t.cohort_scope = 'self' AND t.cohort_target_id = ?)"));
         assert!(!frag.contains("$1"), "sqlite never emits $n");
         assert!(frag.contains("(t.cohort_scope = 'family' AND 1=0)"));
         assert_eq!(params, vec![ScopeParam::Key("occ-1".to_string())]);
     }
 
     #[test]
-    fn authenticated_full_postgres_family_community_any_arrays() {
+    fn authenticated_full_postgres_target_any_arrays() {
         let (frag, params) = cohort_scope_sql_predicate(
             BackendKind::Postgres,
-            "t",
-            "author_key_id",
-            "cohort_scope",
+            "t.cohort_scope",
+            "t.cohort_target_id",
             &auth_full(),
         );
-        // self branch -> $1
-        assert!(frag.contains("io_e.identity_key_id = $1"));
-        // family branch: ANY($2) against federation_families, roster @>
-        assert!(frag.contains("FROM cirislens.federation_families c"));
-        assert!(frag.contains("c.family_key_id = ANY($2)"));
-        assert!(frag.contains("c.members @> jsonb_build_array("));
-        assert!(frag.contains("io_e.occurrence_key_id = t.author_key_id"));
-        // community branch: ANY($3) against federation_communities
-        assert!(frag.contains("FROM cirislens.federation_communities c"));
-        assert!(frag.contains("c.community_key_id = ANY($3)"));
-        // params, in order: identity, family-set, community-set.
-        // BTreeSet sorts F1<F2.
+        // self: target == $1 (identity)
+        assert!(frag.contains("(t.cohort_scope = 'self' AND t.cohort_target_id = $1)"));
+        // family: target ∈ reader families via ANY($2)
+        assert!(frag.contains("(t.cohort_scope = 'family' AND t.cohort_target_id = ANY($2))"));
+        // community: target ∈ reader communities via ANY($3)
+        assert!(frag.contains("(t.cohort_scope = 'community' AND t.cohort_target_id = ANY($3))"));
+        assert!(!frag.contains("EXISTS"));
+        assert!(!frag.contains("federation_families"), "no roster join");
+        // params: identity, family-set, community-set (BTreeSet sorts F1<F2)
         assert_eq!(
             params,
             vec![
@@ -397,20 +334,13 @@ mod tests {
     fn authenticated_full_sqlite_expands_in_lists() {
         let (frag, params) = cohort_scope_sql_predicate(
             BackendKind::Sqlite,
-            "t",
-            "author_key_id",
-            "cohort_scope",
+            "t.cohort_scope",
+            "t.cohort_target_id",
             &auth_full(),
         );
-        assert!(frag.contains("FROM federation_families c"));
-        // family has 2 keys -> IN (?,?)
-        assert!(frag.contains("c.family_key_id IN (?,?)"));
-        // community has 1 key -> IN (?)
-        assert!(frag.contains("c.community_key_id IN (?)"));
-        assert!(frag.contains(
-            "EXISTS (SELECT 1 FROM json_each(c.members) \
-               WHERE json_extract(value, '$.key_id') = io_e.identity_key_id)"
-        ));
+        // family has 2 keys -> IN (?,?); community 1 -> IN (?)
+        assert!(frag.contains("(t.cohort_scope = 'family' AND t.cohort_target_id IN (?,?))"));
+        assert!(frag.contains("(t.cohort_scope = 'community' AND t.cohort_target_id IN (?))"));
         // params expanded: identity, F1, F2, C1 (BTreeSet-sorted)
         assert_eq!(
             params,
@@ -423,25 +353,41 @@ mod tests {
         );
     }
 
+    /// The leak the target-membership model fixes: a reader sharing
+    /// community C1 with an emitter must NOT see a row the emitter scoped
+    /// to a DIFFERENT community C2. With target-membership the predicate
+    /// only admits `community` rows whose target ∈ {C1}, so a C2-targeted
+    /// row is never matched — structurally, not by emitter comparison.
+    #[test]
+    fn community_row_targeted_elsewhere_is_not_admitted() {
+        let (frag, _) = cohort_scope_sql_predicate(
+            BackendKind::Postgres,
+            "t.cohort_scope",
+            "t.cohort_target_id",
+            &auth_full(), // admitted community = {C1}
+        );
+        // The only community admission is target ∈ ANY($3) where $3 = [C1].
+        // A row with cohort_target_id = 'C2' fails that membership — there
+        // is no emitter-shared-cohort path that could admit it.
+        assert!(frag.contains("(t.cohort_scope = 'community' AND t.cohort_target_id = ANY($3))"));
+        assert!(
+            !frag.contains("members"),
+            "no roster containment path exists"
+        );
+    }
+
     #[test]
     fn fragment_is_parenthesized_for_and_composition() {
         for scope in [unauth(), auth_singleton(), auth_full()] {
             for backend in [BackendKind::Postgres, BackendKind::Sqlite] {
                 let (frag, _) = cohort_scope_sql_predicate(
                     backend,
-                    "t",
-                    "scrub_key_id",
-                    "cohort_scope",
+                    "t.cohort_scope",
+                    "t.cohort_target_id",
                     &scope,
                 );
-                assert!(
-                    frag.starts_with('('),
-                    "fragment must be parenthesized: {frag}"
-                );
-                assert!(
-                    frag.ends_with(')'),
-                    "fragment must be parenthesized: {frag}"
-                );
+                assert!(frag.starts_with('('), "must be parenthesized: {frag}");
+                assert!(frag.ends_with(')'), "must be parenthesized: {frag}");
             }
         }
     }
