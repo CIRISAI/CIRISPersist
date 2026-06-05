@@ -94,6 +94,9 @@ struct State {
     /// v3.12.0 (CIRISPersist#153 Ask 2, CEG 0.7 §5.6.8.9) — family
     /// rows keyed by `family_key_id`. Mirrors V059 PG/SQLite PK.
     federation_families: HashMap<String, crate::federation::Family>,
+    /// v4.0 (CEG 0.8 §8.1.13.3) — community rows keyed by
+    /// `community_key_id`. Mirrors V060 PG/SQLite PK.
+    federation_communities: HashMap<String, crate::federation::Community>,
 }
 
 impl Default for MemoryBackend {
@@ -113,6 +116,7 @@ impl Default for MemoryBackend {
                 federation_peer_metadata: HashMap::new(),
                 federation_identity_occurrences: HashMap::new(),
                 federation_families: HashMap::new(),
+                federation_communities: HashMap::new(),
                 blackhole_rules: HashMap::new(),
             }),
         }
@@ -692,6 +696,51 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by(|a, b| a.family_key_id.cmp(&b.family_key_id));
+        Ok(rows)
+    }
+
+    async fn put_community(
+        &self,
+        community: crate::federation::SignedCommunity,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = community.community;
+        // v4.0 — value-validation admission (consensus_protocol
+        // canonical form). Mirrors put_family.
+        crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
+        let mut state = self.state.lock().expect("memory backend lock");
+        if !state.federation_keys.contains_key(&row.community_key_id) {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "community_key_id {} does not exist in federation_keys",
+                row.community_key_id
+            )));
+        }
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        state
+            .federation_communities
+            .insert(row.community_key_id.clone(), row);
+        Ok(())
+    }
+
+    async fn lookup_community(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Option<crate::federation::Community>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(state.federation_communities.get(community_key_id).cloned())
+    }
+
+    async fn list_communities_for_member(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<crate::federation::Community>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_communities
+            .values()
+            .filter(|c| c.members.iter().any(|m| m.key_id == member_identity_key_id))
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.community_key_id.cmp(&b.community_key_id));
         Ok(rows)
     }
 

@@ -119,10 +119,10 @@ pub use topology::{
     WithdrawalEntry, MAX_DELEGATION_DEPTH,
 };
 pub use types::{
-    Attestation, Family, FamilyMember, HybridPendingRow, IdentityOccurrence, KeyRecord,
-    PeerMetadataRow, PeerPolicyBlob, Revocation, SignedAttestation, SignedFamily,
-    SignedIdentityOccurrence, SignedKeyRecord, SignedRevocation, TrustClass, TrustFilter,
-    TrustGrant, TrustRelationship, TrustRow, TrustType,
+    Attestation, Community, CommunityMember, Family, FamilyMember, HybridPendingRow,
+    IdentityOccurrence, KeyRecord, PeerMetadataRow, PeerPolicyBlob, Revocation, SignedAttestation,
+    SignedCommunity, SignedFamily, SignedIdentityOccurrence, SignedKeyRecord, SignedRevocation,
+    TrustClass, TrustFilter, TrustGrant, TrustRelationship, TrustRow, TrustType,
 };
 
 /// Federation directory trait — the registry/lens/agent's read+write
@@ -375,6 +375,38 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         member_identity_key_id: &str,
     ) -> Result<Vec<Family>, Error>;
+
+    /// v4.0 (CEG 0.8 §8.1.13.3) — admit a `community` row. Structural
+    /// mirror of [`Self::put_family`].
+    ///
+    /// Runs `check_consensus_protocol_form` admission before computing
+    /// `persist_row_hash` and INSERTing. Idempotent on
+    /// `community_key_id` PK collision with matching content; errors on
+    /// collision with differing content.
+    ///
+    /// Unlike `self` / `family`, community content is NOT structurally
+    /// invisible ([`crate::federation::types::cohort_scope::suppresses_holds_bytes`]
+    /// is false for `community`) — read paths federate community
+    /// content normally.
+    async fn put_community(&self, community: SignedCommunity) -> Result<(), Error>;
+
+    /// v4.0 — fetch a single community by `community_key_id`. Returns
+    /// `None` if absent. Structural mirror of [`Self::lookup_family`].
+    async fn lookup_community(&self, community_key_id: &str) -> Result<Option<Community>, Error>;
+
+    /// v4.0 — list every community that `member_identity_key_id`
+    /// belongs to. Structural mirror of
+    /// [`Self::list_families_for_member`]; the §4.3 community-scope
+    /// predicate's fan-out path (`build_caller_admission` resolves
+    /// `identity_key_id → community_key_ids` through this method).
+    ///
+    /// Scans the `members` JSONB / TEXT field; postgres uses the V060
+    /// GIN index for O(log N), sqlite falls back to a full scan via
+    /// `json_each`.
+    async fn list_communities_for_member(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<Community>, Error>;
 
     // ── Cold-path PQC fill-in (writer contract step 4) ─────────────
     //

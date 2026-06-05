@@ -765,6 +765,73 @@ pub struct SignedFamily {
     pub family: Family,
 }
 
+/// One member of a [`Community`] — an IDENTITY key plus when they
+/// joined plus an optional role tag. Structural mirror of
+/// [`FamilyMember`] (V059 §5.6.8.9).
+///
+/// Note: member entries are IDENTITY keys (NOT occurrence keys), per
+/// the §8.1.13.3 worked example — same shape as families.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CommunityMember {
+    /// The member's `federation_keys.key_id` (identity key, not
+    /// occurrence key).
+    pub key_id: String,
+    /// When the member joined (RFC-3339 canonical per §0.5).
+    pub joined_at: DateTime<Utc>,
+    /// `founder` / `member` / operator-defined. Open vocab.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+}
+
+/// `federation_communities` row — the CEG 0.8 §8.1.13.3 wire-format
+/// primitive for `cohort_scope: community` visibility scoping. The
+/// structural mirror of [`Family`] (V059 §5.6.8.9), with one
+/// semantic difference: **community content is NOT structurally
+/// invisible.**
+///
+/// [`cohort_scope::suppresses_holds_bytes`] returns `false` for
+/// `community` (true for `self` / `family`). Community content
+/// federates normally — it emits `holds_bytes:sha256:*` directory
+/// attestations and propagates per status quo (communities can be
+/// large; per-member byte-level invisibility is infeasible — the
+/// community privacy property is cohort-filtered visibility, not
+/// byte-level invisibility). This is the lens-trace path: a
+/// lens-capable peer whose identity sits in the agent's community
+/// receives community-cohort traces the agent stored, via the §4.3
+/// read-side community predicate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Community {
+    /// The community's own `federation_keys.key_id`.
+    pub community_key_id: String,
+    /// Human-readable (e.g. `"Acme Co-op"`); non-unique.
+    pub community_name: String,
+    /// Roster of identity keys + join times + roles. Storage shape
+    /// is `members JSONB` in postgres / `members TEXT (json)` in
+    /// sqlite; consumers normalize via this typed projection.
+    pub members: Vec<CommunityMember>,
+    /// When the community was founded (RFC-3339 canonical per §0.5).
+    pub founded_at: DateTime<Utc>,
+    /// Per [`consensus_protocol::is_canonical_form`]. Open vocab;
+    /// canonical kinds: `founder_only`, `unanimous`, `majority`,
+    /// `quorum:m/n`, `weighted:rubric`, `custom:id`.
+    pub consensus_protocol: String,
+    /// Opaque community policy blob (§8.1.13.3) — carries the
+    /// `cohort_scope` membership label consumed at CIRISEdge#48-A.
+    /// `None` when the community declares no policy. Stored as
+    /// nullable JSONB (postgres) / JSON TEXT (sqlite).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_blob: Option<serde_json::Value>,
+    /// **Server-computed.** See [`KeyRecord::persist_row_hash`].
+    pub persist_row_hash: String,
+}
+
+/// Wraps a [`Community`] payload for write submission.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignedCommunity {
+    /// The community record being submitted.
+    pub community: Community,
+}
+
 /// One hybrid-pending federation row — minimum fields the sweep
 /// needs to recompute the cold-path bound-signature input. Returned
 /// by [`super::FederationDirectory::list_hybrid_pending_keys`] /

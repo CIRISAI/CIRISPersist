@@ -2022,6 +2022,97 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         rows.into_iter().map(pg_row_to_family).collect()
     }
 
+    async fn put_community(
+        &self,
+        community: crate::federation::SignedCommunity,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = community.community;
+        crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let members_value = serde_json::to_value(&row.members)
+            .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
+        let policy_blob_value = row.policy_blob.clone();
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_communities (\
+                    community_key_id, community_name, members, founded_at, \
+                    consensus_protocol, policy_blob, persist_row_hash\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                &[
+                    &row.community_key_id,
+                    &row.community_name,
+                    &members_value,
+                    &row.founded_at,
+                    &row.consensus_protocol,
+                    &policy_blob_value,
+                    &row.persist_row_hash,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("foreign key") {
+                    crate::federation::Error::InvalidArgument(format!(
+                        "FK constraint violated on community insert: {msg}"
+                    ))
+                } else {
+                    crate::federation::Error::Backend(format!("insert community: {msg}"))
+                }
+            })?;
+        Ok(())
+    }
+
+    async fn lookup_community(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Option<crate::federation::Community>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let row_opt = client
+            .query_opt(
+                "SELECT community_key_id, community_name, members, founded_at, \
+                    consensus_protocol, policy_blob, persist_row_hash \
+                 FROM cirislens.federation_communities WHERE community_key_id = $1",
+                &[&community_key_id],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("lookup_community: {e}")))?;
+        row_opt.map(pg_row_to_community).transpose()
+    }
+
+    async fn list_communities_for_member(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<crate::federation::Community>, crate::federation::Error> {
+        // Uses the V060 GIN index — the `@>` containment operator is the
+        // matching shape (members @> [{"key_id": "X"}]).
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let containment = serde_json::json!([{ "key_id": member_identity_key_id }]);
+        let rows = client
+            .query(
+                "SELECT community_key_id, community_name, members, founded_at, \
+                    consensus_protocol, policy_blob, persist_row_hash \
+                 FROM cirislens.federation_communities \
+                 WHERE members @> $1 \
+                 ORDER BY community_key_id ASC",
+                &[&containment],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_communities_for_member: {e}"))
+            })?;
+        rows.into_iter().map(pg_row_to_community).collect()
+    }
+
     async fn attach_key_pqc_signature(
         &self,
         key_id: &str,
@@ -5123,6 +5214,25 @@ fn pg_row_to_family(
         consensus_protocol: row.safe_get_with("consensus_protocol", mk_err)?,
         consensus_protocol_entrenched: row
             .safe_get_with("consensus_protocol_entrenched", mk_err)?,
+        persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
+    })
+}
+
+fn pg_row_to_community(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::Community, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    let members_value: serde_json::Value = row.safe_get_with("members", mk_err)?;
+    let members: Vec<crate::federation::CommunityMember> = serde_json::from_value(members_value)
+        .map_err(|e| crate::federation::Error::Backend(format!("members deserialize: {e}")))?;
+    let policy_blob: Option<serde_json::Value> = row.safe_get_with("policy_blob", mk_err)?;
+    Ok(crate::federation::Community {
+        community_key_id: row.safe_get_with("community_key_id", mk_err)?,
+        community_name: row.safe_get_with("community_name", mk_err)?,
+        members,
+        founded_at: row.safe_get_with("founded_at", mk_err)?,
+        consensus_protocol: row.safe_get_with("consensus_protocol", mk_err)?,
+        policy_blob,
         persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
     })
 }
@@ -10552,6 +10662,83 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence: None,
         }
+    }
+
+    /// V060 community substrate round-trip on Postgres — parity with
+    /// the sqlite `community_round_trip` test. Gated on a live test PG
+    /// (skips when `CIRIS_PERSIST_TEST_PG_URL` is unset), same as every
+    /// other postgres test.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn community_round_trip_pg() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+
+        let now = chrono::Utc::now();
+        let suffix = uuid_like();
+        let coop = format!("acme-coop-{suffix}");
+        let alice = format!("alice-root-{suffix}");
+        let bob = format!("bob-root-{suffix}");
+        let carol = format!("carol-root-{suffix}");
+        for kid in [&coop, &alice, &bob, &carol] {
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord {
+                    record: fix_section_i_key(kid, "acme", now, true),
+                })
+                .await
+                .unwrap();
+        }
+
+        let policy = serde_json::json!({ "cohort_scope": "community" });
+        backend
+            .put_community(crate::federation::SignedCommunity {
+                community: crate::federation::Community {
+                    community_key_id: coop.clone(),
+                    community_name: "Acme Co-op".into(),
+                    members: [&alice, &bob, &carol]
+                        .iter()
+                        .map(|k| crate::federation::CommunityMember {
+                            key_id: (*k).clone(),
+                            joined_at: now,
+                            role: None,
+                        })
+                        .collect(),
+                    founded_at: now,
+                    consensus_protocol: "majority".into(),
+                    policy_blob: Some(policy.clone()),
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .unwrap();
+
+        let got = backend
+            .lookup_community(&coop)
+            .await
+            .unwrap()
+            .expect("community exists");
+        assert_eq!(got.community_name, "Acme Co-op");
+        assert_eq!(got.members.len(), 3);
+        assert_eq!(got.consensus_protocol, "majority");
+        assert_eq!(got.policy_blob.as_ref(), Some(&policy));
+        assert_eq!(got.persist_row_hash.len(), 64);
+
+        // Membership GIN/@> fan-out returns the community for each member.
+        for member in [&alice, &bob, &carol] {
+            let communities = backend.list_communities_for_member(member).await.unwrap();
+            assert_eq!(communities.len(), 1, "for member {member}");
+            assert_eq!(&communities[0].community_key_id, &coop);
+        }
+        let none = backend
+            .list_communities_for_member(&format!("nobody-{suffix}"))
+            .await
+            .unwrap();
+        assert!(none.is_empty());
     }
 
     /// §I list_federation_keys round-trip + cursor pagination.
