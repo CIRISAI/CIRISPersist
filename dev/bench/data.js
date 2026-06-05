@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780628322050,
+  "lastUpdate": 1780629118664,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -12041,6 +12041,264 @@ window.BENCHMARK_DATA = {
             "name": "occurrence_registry/list_live_occurrences/1000",
             "value": 596284,
             "range": "± 2216",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "c24269a29cc43e58fd12fe12eb061af7f5754c1a",
+          "message": "3.14.1 — clippy fixes uncovered by v3.14.0 mutex switch\n\nCI on v3.14.0 surfaced four categories of clippy/build issues that\nthe local `cargo test --features sqlite` didn't trigger because they\nrequire the wider feature set:\n\n - 9 residual `.lock().await` patterns (parking_lot::Mutex::lock is\n   sync; await on a sync MutexGuard is a type error). Spread across\n   src/occurrence/sqlite.rs + src/telemetry/sqlite.rs + src/audit/sqlite.rs.\n\n - src/graph/sqlite.rs:479 `let _ = guard;` → `drop(guard);`\n   (clippy: non-binding let on synchronization lock — `_` doesn't\n   bind, so the lock drops immediately on the bind line).\n\n - Test sites in src/audit/sqlite.rs + src/telemetry/sqlite.rs that\n   had `let guard = conn.lock(); ... drop(guard); ... .await`\n   pattern. The drop() before await is semantically correct but\n   clippy's scope-based MutexGuard-held-across-await analysis still\n   flags it. Wrapped in `{ ... }` block scope so the guard's lexical\n   scope ends before the await.\n\n - src/engine.rs:2327 match on `AuditDispatch` where the postgres arm\n   is cfg-gated. When postgres is off, the match is single-arm and\n   clippy lints \"infallible_destructuring_match\". Added\n   `#[allow(clippy::infallible_destructuring_match)]` to keep the cfg\n   gate readable.\n\nTests: 569/569 sqlite lib green; --features sqlite,telemetry,\ncirisaudit + --features pyo3 both clippy clean.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-06-04T21:53:18-05:00",
+          "tree_id": "62401e7b48db62acb38d31ef9fc183b35311a090",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/c24269a29cc43e58fd12fe12eb061af7f5754c1a"
+        },
+        "date": 1780629116985,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 40466038,
+            "range": "± 33125",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 3002951,
+            "range": "± 204546",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 2523,
+            "range": "± 39",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 5918,
+            "range": "± 29",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 12947,
+            "range": "± 112",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 45774,
+            "range": "± 457",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 35,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 186,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 524,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 599,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 2065,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 9,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 74,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 231,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 1048,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 15,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 54505,
+            "range": "± 2165",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 160129,
+            "range": "± 4587",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 575373,
+            "range": "± 6042",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 8025,
+            "range": "± 830",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 9849,
+            "range": "± 479",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 16157,
+            "range": "± 1283",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 34960,
+            "range": "± 2391",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 1239437,
+            "range": "± 10645",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 4609943,
+            "range": "± 206165",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 358294,
+            "range": "± 153237",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 869424,
+            "range": "± 147380",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 40811930,
+            "range": "± 909412",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 1702429,
+            "range": "± 389133",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 7880263,
+            "range": "± 640601",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 100168939,
+            "range": "± 1613985",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 4088845,
+            "range": "± 320963",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 18643998,
+            "range": "± 229991",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 100120,
+            "range": "± 25778",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 97179,
+            "range": "± 22830",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 7242,
+            "range": "± 45",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 47335,
+            "range": "± 171",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 448645,
+            "range": "± 3319",
             "unit": "ns/iter"
           }
         ]
