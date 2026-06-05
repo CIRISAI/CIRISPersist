@@ -39,6 +39,11 @@
 
 #[cfg(feature = "cirisaudit")]
 pub mod audit;
+// v4.0 (FSD V4.0 §7, Commit C) — generic substrate caching primitive.
+// TTL + LRU bounded, scope-disjoint keys, window-overlap bucket
+// invalidation (CIRISPersist#160 comment 2). Additive; wiring into the
+// aggregate read primitives is Commit G.
+pub mod cache;
 #[cfg(feature = "cirisnode")]
 pub mod cirisnode;
 // v4.0 (FSD §3) — CEG topic-namespace read surface. The v3.x `read`
