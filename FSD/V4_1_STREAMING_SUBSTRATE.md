@@ -130,6 +130,14 @@ Cut A ships against today's `Inline | External` with zero CEG/schema change — 
 - Adds one `storage_kind`/`BlobBody` variant; the chunk relation rides CEG open-vocab `topical_relation:has_chunk` (no grammar change).
 - **Chunk size: 1 MiB** (§8 resolved) — IPFS UnixFS 2025 profile; below fMP4 2–6s segment sizes; 16-byte GCM tag overhead < 0.002%.
 
+#### 4.2.1 V061 migration (correction — Cut B is NOT pure-additive at the CHECK layer)
+
+`federation_blobs.storage_kind` (V047) carries `CHECK (storage_kind IN ('inline','s3','external_url'))` **plus a cross-column CHECK** tying storage_kind → which body column is present (inline→`bytes_inline`, s3/external_url→`external_ref`). Admitting `'chunk_dag'` (manifest stored in `bytes_inline`) requires extending **both** CHECKs on **both** backends:
+- **Postgres** — `DROP CONSTRAINT` + `ADD CONSTRAINT` for the storage_kind enum + the cross-column rule, adding the `(chunk_dag → bytes_inline present)` arm. Bounded.
+- **SQLite** — table-level CHECKs are baked into `CREATE TABLE` and cannot be `ALTER`ed, so this is the **12-step table-rebuild** (create `federation_blobs_new` with the extended CHECKs, copy rows, drop old, rename, recreate indexes/triggers + the holds_bytes linkage). The riskier half; the migration must preserve every column, index, and the access-tracking columns (V123).
+
+This is the same class of "named, not silently additive" finding as the RC1-1c CHECK migration (§4.4) — Cut B's `storage_kind` CHECK extension is its smaller sibling. Migration number: V061 (next free after V060).
+
 ### 4.3 Live append + per-stream log (Cut C)
 
 ```rust
@@ -185,7 +193,7 @@ This is why streaming lands *after* v4.0: it composes on the cohort substrate ra
 | Cut | Deliverable | CEG / gate | Non-additive? |
 |---|---|---|---|
 | **A** | `get_range` over `Inline`+`External` (PyO3) | none | no |
-| **B** | `BlobBody::ChunkDag` + manifest + `put_blob_chunks` + `get_range` over ChunkDag | §10.1.1 | no (one BlobBody variant) |
+| **B** | `BlobBody::ChunkDag` + manifest + `put_blob_chunks` + `get_range` over ChunkDag | §10.1.1 | **yes — V061 storage_kind CHECK migration** (correction, §4.2.1) |
 | **C** | `federation_stream_chunks` + `put_blob_chunk`/`seal_stream` + per-stream STH + STREAM-nonce AEAD + epoch-DEK v2 cascade + `delivery_receipt:{stream_id}` | §10.5.1–.4; gated on CEG 0.10 §10.5 ratified (it is, PWD) + CIRISRegistry#34 for accountable tier | **yes — RC1-1c CHECK migration (§4.4)** |
 
 Cuts A and B are immediately shippable (pure additive, no upstream dependency). Cut C is the CEG-1.0-unblocking cut and carries the one CHECK migration + the epoch cascade; the **accountable** witness-cosign tier additionally waits on CIRISRegistry#34, but the **best-effort** tier (producer-signed STH only) ships with Cut C.
