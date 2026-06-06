@@ -57,7 +57,9 @@ pub use crate::store::Backend;
 // cohort_scope admission primitive: scope variant, substrate-built
 // admission set + its sole builder, the §4.3 SQL predicate emitter, and
 // the structured refusal reason Commit E folds into the read `Error`.
-pub use crate::scope::{build_caller_admission, CallerAdmission, CallerScope, ScopeRefusalReason};
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub use crate::scope::build_caller_admission;
+pub use crate::scope::{CallerAdmission, CallerScope, ScopeRefusalReason};
 
 // Federation read primitive types (v0.5.0, CIRISPersist#23).
 // Sections A/B/F/E ship in v0.5.0 — trace listing, trace detail,

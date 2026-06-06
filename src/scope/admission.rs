@@ -24,6 +24,7 @@
 use std::collections::BTreeSet;
 
 use super::KeyId;
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
 use crate::engine::Engine;
 
 /// Private seal — prevents external struct-literal construction of
@@ -78,6 +79,10 @@ pub struct CallerAdmission {
 /// Resolution backend errors surface here. The §4.4 singleton fallback
 /// is NOT an error — an unbound occurrence key resolves to itself; this
 /// enum fires only when a substrate read genuinely fails.
+///
+/// Backend-gated: admission resolution requires a `FederationDirectory`,
+/// which only exists with a `postgres`/`sqlite` backend.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
 #[derive(Debug, thiserror::Error)]
 pub enum AdmissionError {
     /// A `FederationDirectory` read (identity-occurrence lookup, family
@@ -100,15 +105,11 @@ pub enum AdmissionError {
 ///    [`list_families_for_member`](crate::federation::FederationDirectory::list_families_for_member)
 ///    (V059 §5.6.8.9).
 /// 3. `identity_key_id → community_key_ids` via
-///    `list_communities_for_member` (V060, Commit D).
+///    `list_communities_for_member` (V060).
 ///
-/// # Cross-dependency (Commit B note)
-///
-/// Step 3 calls `list_communities_for_member`, added to
-/// `FederationDirectory` by Commit D (not yet merged into this
-/// worktree). Until Commit D lands, this function will not compile
-/// standalone — that is the single expected residual build error for
-/// Commit B.
+/// Backend-gated: resolution goes through `Engine::federation_directory`,
+/// which only exists when a `postgres`/`sqlite` backend is compiled in.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub async fn build_caller_admission(
     engine: &Engine,
     occurrence_key_id: &KeyId,

@@ -46,7 +46,9 @@ pub mod sql;
 /// fields on [`CallerAdmission`].
 pub type KeyId = String;
 
-pub use admission::{build_caller_admission, AdmissionError, CallerAdmission};
+pub use admission::CallerAdmission;
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub use admission::{build_caller_admission, AdmissionError};
 pub use caller::CallerScope;
 pub use sql::{cohort_scope_sql_predicate, BackendKind, ScopeParam};
 
