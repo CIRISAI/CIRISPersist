@@ -4207,6 +4207,102 @@ impl PyEngine {
         })
     }
 
+    /// v4.1 (CIRISPersist#142, Cut C1a) — live-append one chunk to a
+    /// stream. Inserts the chunk's bytes as a content-addressed
+    /// `federation_blobs` row AND the `federation_stream_chunks` index
+    /// row `(stream_id, seq, chunk_sha, epoch, size_bytes)` in ONE
+    /// transaction. Returns the chunk's SHA-256 as a lowercase hex
+    /// string.
+    ///
+    /// `body_b64` is the chunk's inline bytes, base64-standard. A re-used
+    /// `seq` for the same `stream_id` raises `ValueError`
+    /// (`stream … seq … already exists` — the monotonicity guarantee).
+    /// Cut C1a stores `epoch` but does no crypto (the DEK cascade is Cut
+    /// C3).
+    fn put_blob_chunk(
+        &self,
+        py: Python<'_>,
+        stream_id: &str,
+        seq: u64,
+        body_b64: &str,
+        epoch: u64,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            let bytes = B64.decode(body_b64).map_err(|e| {
+                PyValueError::new_err(format!("put_blob_chunk body base64 decode: {e}"))
+            })?;
+            let body = crate::federation::BlobBody::Inline(bytes);
+            let runtime = self.runtime.clone();
+            let stream_id = stream_id.to_string();
+            let sha = py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .put_blob_chunk(&stream_id, seq, body, epoch)
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .put_blob_chunk(&stream_id, seq, body, epoch)
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+            })?;
+            Ok(hex::encode(sha))
+        })
+    }
+
+    /// v4.1 (CIRISPersist#142, Cut C1a) — seal a live stream into a
+    /// content-addressed chunk DAG. Walks the `federation_stream_chunks`
+    /// index in `seq` order, writes the `chunk_dag` manifest row, and
+    /// returns the manifest's SHA-256 (lowercase hex) — the sealed
+    /// stream's address. `get_blob_json` / `get_blob_range` over that SHA
+    /// then resolve via the Cut B ChunkDag path. An empty stream raises
+    /// `ValueError`.
+    fn seal_stream(&self, py: Python<'_>, stream_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let stream_id = stream_id.to_string();
+            let sha = py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .seal_stream(&stream_id)
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .seal_stream(&stream_id)
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+            })?;
+            Ok(hex::encode(sha))
+        })
+    }
+
     /// v3.11.0 (CIRISPersist#143, CIRISVerify FEDERATION_THREAT_MODEL
     /// §3.3.2) — verify-coord R1+Q1 constants as a JSON dict for
     /// consumer code that needs to pin τ_normal / τ_partial /

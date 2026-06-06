@@ -3523,6 +3523,186 @@ impl crate::federation::BlobStorage for SqliteBackend {
         Ok(())
     }
 
+    async fn put_blob_chunk(
+        &self,
+        stream_id: &str,
+        seq: u64,
+        body: crate::federation::BlobBody,
+        epoch: u64,
+    ) -> Result<[u8; 32], crate::federation::BlobError> {
+        let cap = self.inline_bytes_cap();
+        // Validation + hash-on-write (computes the chunk's content SHA).
+        let row = crate::federation::blobs::prepare_stream_chunk_row(&body, cap)?;
+        // u64 → i64 binds (rusqlite has no native u64 path either; keep
+        // parity with the PG side's typed-overflow errors).
+        let seq_i64 = i64::try_from(seq).map_err(|_| {
+            crate::federation::BlobError::InvalidArgument(
+                "put_blob_chunk: seq exceeds i64 — federation_stream_chunks.seq is INTEGER".into(),
+            )
+        })?;
+        let epoch_i64 = i64::try_from(epoch).map_err(|_| {
+            crate::federation::BlobError::InvalidArgument(
+                "put_blob_chunk: epoch exceeds i64 — federation_stream_chunks.epoch is INTEGER"
+                    .into(),
+            )
+        })?;
+
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        let stream_id_owned = stream_id.to_string();
+        let conn = self.conn.clone();
+        let chunk_sha = row.sha256;
+        // Returns Ok(true) on successful append, Ok(false) on a
+        // (stream_id, seq) PK conflict (monotonicity violation), Err on a
+        // real backend error.
+        let appended = (move || -> Result<bool, rusqlite::Error> {
+            let mut conn = conn.lock();
+            let tx = conn.transaction()?;
+            // 1. The chunk's bytes as a normal federation_blobs row
+            //    (content-addressed + idempotent).
+            let sha_vec = row.sha256.to_vec();
+            tx.execute(
+                "INSERT INTO federation_blobs (\
+                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
+                    last_accessed_at, access_count\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 0) \
+                 ON CONFLICT (sha256) DO NOTHING",
+                rusqlite::params![
+                    sha_vec,
+                    row.storage_kind,
+                    row.bytes_inline,
+                    row.external_ref,
+                    row.size_bytes,
+                    now_iso,
+                ],
+            )?;
+            // 2. The stream-index row. (stream_id, seq) PK = monotonicity.
+            let inserted = tx.execute(
+                "INSERT INTO federation_stream_chunks (\
+                    stream_id, seq, chunk_sha, epoch, size_bytes, created_at\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT (stream_id, seq) DO NOTHING",
+                rusqlite::params![
+                    stream_id_owned,
+                    seq_i64,
+                    sha_vec,
+                    epoch_i64,
+                    row.size_bytes,
+                    now_iso,
+                ],
+            )?;
+            if inserted == 0 {
+                // PK conflict → roll back (drop the tx without commit).
+                return Ok(false);
+            }
+            tx.commit()?;
+            Ok(true)
+        })()
+        .map_err(|e| crate::federation::BlobError::Backend(format!("put_blob_chunk tx: {e}")))?;
+        if !appended {
+            return Err(crate::federation::BlobError::InvalidArgument(format!(
+                "stream {stream_id} seq {seq} already exists"
+            )));
+        }
+        Ok(chunk_sha)
+    }
+
+    async fn seal_stream(&self, stream_id: &str) -> Result<[u8; 32], crate::federation::BlobError> {
+        let cap = self.inline_bytes_cap();
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        let stream_id_owned = stream_id.to_string();
+        let conn = self.conn.clone();
+        // All DB work inside one closure / one txn.
+        let manifest_sha = (move || -> Result<[u8; 32], crate::federation::BlobError> {
+            let mut conn = conn.lock();
+            let tx = conn.transaction().map_err(|e| {
+                crate::federation::BlobError::Backend(format!("seal_stream tx: {e}"))
+            })?;
+
+            // 1. Read the seq-ordered chunk index.
+            let chunk_rows: Vec<([u8; 32], i64)> = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT chunk_sha, size_bytes \
+                           FROM federation_stream_chunks \
+                          WHERE stream_id = ?1 \
+                          ORDER BY seq ASC",
+                    )
+                    .map_err(|e| {
+                        crate::federation::BlobError::Backend(format!("seal_stream prepare: {e}"))
+                    })?;
+                let rows = stmt
+                    .query_map(rusqlite::params![stream_id_owned], |r| {
+                        let sha_vec: Vec<u8> = r.get(0)?;
+                        let size: i64 = r.get(1)?;
+                        Ok((sha_vec, size))
+                    })
+                    .map_err(|e| {
+                        crate::federation::BlobError::Backend(format!("seal_stream query: {e}"))
+                    })?;
+                let mut out = Vec::new();
+                for r in rows {
+                    let (sha_vec, size) = r.map_err(|e| {
+                        crate::federation::BlobError::Backend(format!("seal_stream row: {e}"))
+                    })?;
+                    if sha_vec.len() != 32 {
+                        return Err(crate::federation::BlobError::Backend(format!(
+                            "seal_stream: chunk_sha is {} bytes, expected 32",
+                            sha_vec.len()
+                        )));
+                    }
+                    let mut sha = [0u8; 32];
+                    sha.copy_from_slice(&sha_vec);
+                    out.push((sha, size));
+                }
+                out
+            };
+
+            // 2. Build the sealed manifest + chunk_dag manifest row
+            //    (empty stream → InvalidArgument inside the helper).
+            let (_manifest, manifest_row) = crate::federation::blobs::prepare_sealed_manifest_row(
+                &stream_id_owned,
+                &chunk_rows,
+                cap,
+            )?;
+
+            // 3. Write ONLY the manifest row (chunk rows already exist).
+            let manifest_sha_vec = manifest_row.sha256.to_vec();
+            tx.execute(
+                "INSERT INTO federation_blobs (\
+                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
+                    last_accessed_at, access_count\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 0) \
+                 ON CONFLICT (sha256) DO NOTHING",
+                rusqlite::params![
+                    manifest_sha_vec,
+                    manifest_row.storage_kind,
+                    manifest_row.bytes_inline,
+                    manifest_row.external_ref,
+                    manifest_row.size_bytes,
+                    now_iso,
+                ],
+            )
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("seal_stream manifest insert: {e}"))
+            })?;
+
+            // 4. Stamp sealed_at on the index rows (informational).
+            tx.execute(
+                "UPDATE federation_stream_chunks SET sealed_at = ?2 WHERE stream_id = ?1",
+                rusqlite::params![stream_id_owned, now_iso],
+            )
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("seal_stream sealed_at: {e}"))
+            })?;
+
+            tx.commit().map_err(|e| {
+                crate::federation::BlobError::Backend(format!("seal_stream commit: {e}"))
+            })?;
+            Ok(manifest_row.sha256)
+        })()?;
+        Ok(manifest_sha)
+    }
+
     async fn get_blob(
         &self,
         sha256: &[u8; 32],
@@ -16997,6 +17177,152 @@ mod tests {
             }
             other => panic!("expected RangeSpansExternalChunk, got {other:?}"),
         }
+    }
+
+    // ─── v4.1 (CIRISPersist#142, Cut C1a) — live stream chunks ──────
+
+    /// Append 3 chunks to a stream, seal, and read the assembled bytes
+    /// back via get_blob_range over the sealed manifest sha — end-to-end
+    /// with the Cut B ChunkDag path, including a range that crosses a
+    /// chunk boundary.
+    #[tokio::test]
+    async fn stream_append_seal_and_range_round_trip() {
+        let backend = blob_test_backend().await;
+        let stream = "stream-rt";
+        // 3 chunks: "AAAA"(0..=3) "BBBB"(4..=7) "CC"(8..=9), total 10.
+        let s0 = backend
+            .put_blob_chunk(stream, 0, BlobBody::Inline(b"AAAA".to_vec()), 0)
+            .await
+            .unwrap();
+        let s1 = backend
+            .put_blob_chunk(stream, 1, BlobBody::Inline(b"BBBB".to_vec()), 0)
+            .await
+            .unwrap();
+        let s2 = backend
+            .put_blob_chunk(stream, 2, BlobBody::Inline(b"CC".to_vec()), 0)
+            .await
+            .unwrap();
+        assert_eq!(s0, sha256_of(b"AAAA"));
+        assert_eq!(s1, sha256_of(b"BBBB"));
+        assert_eq!(s2, sha256_of(b"CC"));
+        // Each chunk landed as its own federation_blobs row.
+        assert!(backend.has_blob(&s0).await.unwrap());
+        assert!(backend.has_blob(&s1).await.unwrap());
+        assert!(backend.has_blob(&s2).await.unwrap());
+
+        let manifest_sha = backend.seal_stream(stream).await.unwrap();
+
+        // The sealed sha resolves as a ChunkDag manifest in seq order.
+        match backend.get_blob(&manifest_sha).await.unwrap().unwrap() {
+            BlobBody::ChunkDag(m) => {
+                assert_eq!(m.v, crate::federation::CHUNK_MANIFEST_VERSION);
+                assert_eq!(m.total_size, 10);
+                assert_eq!(m.chunks.len(), 3);
+                assert_eq!(m.chunks[0].sha, s0);
+                assert_eq!(m.chunks[1].sha, s1);
+                assert_eq!(m.chunks[2].sha, s2);
+            }
+            other => panic!("expected ChunkDag, got {other:?}"),
+        }
+
+        // Full range assembles the whole stream.
+        let full = backend
+            .get_blob_range(&manifest_sha, 0, 9)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(full, BlobRange::Inline(b"AAAABBBBCC".to_vec()));
+        // A range across the chunk0/chunk1 boundary: "AABB".
+        let span = backend
+            .get_blob_range(&manifest_sha, 2, 5)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(span, BlobRange::Inline(b"AABB".to_vec()));
+        // A range crossing all three chunks: "ABBBBC".
+        let across = backend
+            .get_blob_range(&manifest_sha, 3, 8)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(across, BlobRange::Inline(b"ABBBBC".to_vec()));
+    }
+
+    /// A re-used (stream_id, seq) is rejected (monotonicity guarantee).
+    #[tokio::test]
+    async fn stream_seq_collision_rejected() {
+        let backend = blob_test_backend().await;
+        let stream = "stream-collide";
+        backend
+            .put_blob_chunk(stream, 0, BlobBody::Inline(b"first".to_vec()), 0)
+            .await
+            .unwrap();
+        // Same seq, different bytes → PK conflict → InvalidArgument.
+        let err = backend
+            .put_blob_chunk(stream, 0, BlobBody::Inline(b"second".to_vec()), 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BlobError::InvalidArgument(_)));
+        // The second chunk's bytes did NOT get indexed: a fresh seq still
+        // works and the stream seals to exactly the first chunk.
+        let manifest_sha = backend.seal_stream(stream).await.unwrap();
+        match backend.get_blob(&manifest_sha).await.unwrap().unwrap() {
+            BlobBody::ChunkDag(m) => {
+                assert_eq!(m.chunks.len(), 1);
+                assert_eq!(m.chunks[0].sha, sha256_of(b"first"));
+            }
+            other => panic!("expected ChunkDag, got {other:?}"),
+        }
+    }
+
+    /// Sealing a stream with no chunks is rejected.
+    #[tokio::test]
+    async fn stream_seal_empty_rejected() {
+        let backend = blob_test_backend().await;
+        let err = backend.seal_stream("nonexistent-stream").await.unwrap_err();
+        assert!(matches!(err, BlobError::InvalidArgument(_)));
+    }
+
+    /// A ChunkDag body to put_blob_chunk is rejected (can't chunk a chunk).
+    #[tokio::test]
+    async fn stream_chunk_dag_body_rejected() {
+        let backend = blob_test_backend().await;
+        let nested = crate::federation::ChunkManifest {
+            v: 1,
+            total_size: 4,
+            chunks: vec![crate::federation::ChunkRef {
+                sha: sha256_of(b"AAAA"),
+                size: 4,
+            }],
+        };
+        let err = backend
+            .put_blob_chunk("s", 0, BlobBody::ChunkDag(nested), 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BlobError::InvalidArgument(_)));
+    }
+
+    /// epoch is stored on the index row (no crypto this cut, but the
+    /// column round-trips).
+    #[tokio::test]
+    async fn stream_epoch_stored_on_index() {
+        let backend = blob_test_backend().await;
+        let stream = "stream-epoch";
+        backend
+            .put_blob_chunk(stream, 0, BlobBody::Inline(b"AAAA".to_vec()), 7)
+            .await
+            .unwrap();
+        let epoch: i64 = {
+            let conn = backend.conn.clone();
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT epoch FROM federation_stream_chunks WHERE stream_id = ?1 AND seq = 0",
+                rusqlite::params![stream],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(epoch, 7);
     }
 
     /// v4.1 (CIRISPersist#142, Cut B) — the V061 SQLite 12-step table
