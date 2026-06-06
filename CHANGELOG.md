@@ -41,7 +41,11 @@ Hard cut, no back-compat, no aliases. Every consumer (CIRISLens, CIRISLensCore, 
 - **AV-57** (read-side cohort_scope escalation) — closed by construction (private `CallerAdmission` constructor + substrate-only builder + target-membership predicate).
 - **AV-58** (write-side cohort_scope downgrade) — closed by verify→gate→persist set-membership.
 
-Handed to CIRISConformance for adversarial ("with fire") testing of the expanded surface before tag.
+### Hardened via CIRISConformance#11 adversarial fire-test (3 rounds, all closed before tag)
+- **No-backend build** — gated `build_caller_admission` + re-exports on `any(postgres, sqlite)` (the `default-features` / `core` CI legs broke; `Engine::federation_directory` is backend-gated).
+- **Cache wide-window OOM** — the reverse index was O(n²) memory (a `CacheKey` carried every overlapped bucket; a 10-year window ≈ 61 GB → SIGKILL). Rewrote to range-based invalidation: `CacheKey` carries `(first_bucket, last_bucket)`; `invalidate_write` scans the bounded LRU. O(1) memory per key, digest unchanged.
+- **Cross-engine cache poison** — the process-global cache had no engine identity in the key (a Postgres engine served a SQLite engine's entry). Scoped to a per-backend-instance `Arc<Cache>`; cohab still shares one cache (one engine), distinct backends / `reset_engine` isolate correctly.
+- Cohabitation runtime green (race-repro 100% fast both backends, no #156/#158 regression); canonical-bytes integrity verified (no input shifts signed bytes); cross-cohort leak closed at the §4.3 predicate + AV-58 admission layer, both backends.
 
 ## [3.14.3] — 2026-06-05
 
