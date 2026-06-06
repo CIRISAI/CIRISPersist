@@ -466,6 +466,77 @@ pub trait BlobStorage: Send + Sync {
         chunks: Vec<([u8; 32], BlobBody)>,
     ) -> impl Future<Output = Result<(), BlobError>> + Send;
 
+    /// v4.1 (CIRISPersist#142, Cut C1a) — **live append** of one chunk
+    /// to a stream (CEG §10.5.1).
+    ///
+    /// Where [`put_blob_chunks`](BlobStorage::put_blob_chunks) seals a
+    /// known-complete blob in one shot, `put_blob_chunk` appends a
+    /// single chunk to a *live* stream at a monotonic `seq`. In ONE
+    /// transaction it:
+    /// - inserts `body` as a normal `federation_blobs` row, keyed on the
+    ///   chunk's SHA-256 (idempotent / first-write-wins on collision —
+    ///   content-addressed bytes, so a re-PUT of identical bytes is
+    ///   fine), and
+    /// - inserts the `federation_stream_chunks` index row
+    ///   `(stream_id, seq, chunk_sha, epoch, size_bytes)`.
+    ///
+    /// Returns the chunk's SHA-256 (its content address).
+    ///
+    /// # Monotonicity (`seq` collision)
+    ///
+    /// The `(stream_id, seq)` pair is the index table's PRIMARY KEY. A
+    /// re-used `seq` for the same stream is a PK conflict and is
+    /// rejected with [`BlobError::InvalidArgument`] — the substrate's
+    /// append-only enforcement. (The blob row itself is content-
+    /// addressed and idempotent; only the stream-index row is unique per
+    /// `(stream, seq)`.)
+    ///
+    /// # `epoch`
+    ///
+    /// The key-rotation epoch (CEG §10.5.3) is stored on the index row.
+    /// Cut C1a does **no** key/crypto work — the epoch-DEK cascade is
+    /// Cut C3; this cut just records the column.
+    ///
+    /// # Validation
+    ///
+    /// - `Inline` body: hashed on write (SHA-256 == the inserted PK);
+    ///   inline-size-capped, exactly like [`put_blob`].
+    /// - `External` body: SHA trusted (persist has no bytes), as in
+    ///   [`put_blob`].
+    /// - A [`BlobBody::ChunkDag`] body is rejected with
+    ///   [`BlobError::InvalidArgument`] — you cannot chunk a chunk.
+    fn put_blob_chunk(
+        &self,
+        stream_id: &str,
+        seq: u64,
+        body: BlobBody,
+        epoch: u64,
+    ) -> impl Future<Output = Result<[u8; 32], BlobError>> + Send;
+
+    /// v4.1 (CIRISPersist#142, Cut C1a) — **seal** a live stream into a
+    /// content-addressed [`BlobBody::ChunkDag`] (CEG §10.5.1).
+    ///
+    /// Walks every [`federation_stream_chunks`](crate) row for
+    /// `stream_id` in `seq ASC` order, builds the Cut-B
+    /// [`ChunkManifest`] (`total_size` = Σ `size_bytes`, `chunks` in seq
+    /// order), and writes **only** the `chunk_dag` manifest row to
+    /// `federation_blobs` (the chunk rows already exist —
+    /// `put_blob_chunk` inserted them; seal does NOT re-insert them).
+    /// `sealed_at` is stamped on the stream's index rows
+    /// (informational).
+    ///
+    /// Returns the manifest's SHA-256 — the sealed stream's content
+    /// address. After seal, [`get_blob`](BlobStorage::get_blob) /
+    /// [`get_blob_range`](BlobStorage::get_blob_range) over that SHA use
+    /// Cut B's ChunkDag path.
+    ///
+    /// An empty stream (no chunks) is rejected with
+    /// [`BlobError::InvalidArgument`].
+    fn seal_stream(
+        &self,
+        stream_id: &str,
+    ) -> impl Future<Output = Result<[u8; 32], BlobError>> + Send;
+
     /// Read a blob by its SHA-256.
     ///
     /// Returns the [`BlobBody`] variant matching the row's stored
@@ -1319,6 +1390,120 @@ pub(crate) struct PreparedBlobRow {
     pub external_ref: Option<String>,
     /// `size_bytes` column value (already range-checked to fit i64).
     pub size_bytes: i64,
+}
+
+/// v4.1 (CIRISPersist#142, Cut C1a) — validate ONE live-append chunk
+/// (`put_blob_chunk`) and produce the prepared `federation_blobs` row +
+/// the chunk's content SHA-256.
+///
+/// Validation mirrors the per-chunk arm of [`prepare_chunk_rows`]:
+/// nested-DAG reject → inline-size cap → hash-on-write (the SHA is
+/// COMPUTED from the bytes for `Inline`, trusted for `External`) → i64
+/// range. There is no manifest here — a live chunk is one
+/// content-addressed blob row; the stream index row is bound by the
+/// backend alongside it in the same txn.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn prepare_stream_chunk_row(
+    body: &BlobBody,
+    inline_bytes_cap: usize,
+) -> Result<PreparedBlobRow, BlobError> {
+    use sha2::{Digest, Sha256};
+
+    let (sha256, storage_kind, bytes_inline, external_ref, size) = match body {
+        BlobBody::Inline(bytes) => {
+            if bytes.len() > inline_bytes_cap {
+                return Err(BlobError::InlineSizeExceeded {
+                    size: bytes.len(),
+                    cap: inline_bytes_cap,
+                });
+            }
+            // Hash-on-write: the chunk's content address is computed from
+            // its bytes (this IS the SHA returned to the caller + the PK).
+            let sha: [u8; 32] = Sha256::digest(bytes).into();
+            (sha, "inline", Some(bytes.clone()), None, bytes.len() as u64)
+        }
+        BlobBody::External(_) => {
+            return Err(BlobError::InvalidArgument(
+                "put_blob_chunk: External chunk body not supported in this cut — \
+                 a live chunk's SHA is computed from its inline bytes (Cut C1a)"
+                    .into(),
+            ));
+        }
+        BlobBody::ChunkDag(_) => {
+            return Err(BlobError::InvalidArgument(
+                "put_blob_chunk: chunk body is itself a ChunkDag — you cannot chunk a chunk".into(),
+            ));
+        }
+    };
+    let size_bytes = i64::try_from(size).map_err(|_| {
+        BlobError::InvalidArgument("put_blob_chunk: chunk size_bytes exceeds i64".into())
+    })?;
+    Ok(PreparedBlobRow {
+        sha256,
+        storage_kind,
+        bytes_inline,
+        external_ref,
+        size_bytes,
+    })
+}
+
+/// v4.1 (CIRISPersist#142, Cut C1a) — from the seq-ordered
+/// `(chunk_sha, size_bytes)` rows read out of `federation_stream_chunks`,
+/// build the sealed [`ChunkManifest`] + the prepared `chunk_dag`
+/// manifest [`PreparedBlobRow`] (its SHA-256 = the sealed stream's
+/// content address). Does NOT touch the chunk rows — they already exist.
+///
+/// Empty input → [`BlobError::InvalidArgument`] (`stream_id` carried by
+/// the caller for the message). `total_size` is Σ `size_bytes`.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn prepare_sealed_manifest_row(
+    stream_id: &str,
+    chunk_rows: &[([u8; 32], i64)],
+    inline_bytes_cap: usize,
+) -> Result<(ChunkManifest, PreparedBlobRow), BlobError> {
+    use sha2::{Digest, Sha256};
+
+    if chunk_rows.is_empty() {
+        return Err(BlobError::InvalidArgument(format!(
+            "stream {stream_id} has no chunks"
+        )));
+    }
+    let mut total_size: u64 = 0;
+    let mut chunks = Vec::with_capacity(chunk_rows.len());
+    for (sha, size_i64) in chunk_rows {
+        let size = u32::try_from(*size_i64).map_err(|_| {
+            BlobError::InvalidArgument(format!(
+                "seal_stream: chunk size {size_i64} does not fit u32 (one-chunk cap)"
+            ))
+        })?;
+        total_size = total_size
+            .checked_add(u64::from(size))
+            .ok_or_else(|| BlobError::InvalidArgument("seal_stream: total_size overflow".into()))?;
+        chunks.push(ChunkRef { sha: *sha, size });
+    }
+    let manifest = ChunkManifest {
+        v: CHUNK_MANIFEST_VERSION,
+        total_size,
+        chunks,
+    };
+    let manifest_bytes = manifest.to_jcs_bytes();
+    if manifest_bytes.len() > inline_bytes_cap {
+        return Err(BlobError::InlineSizeExceeded {
+            size: manifest_bytes.len(),
+            cap: inline_bytes_cap,
+        });
+    }
+    let manifest_sha: [u8; 32] = Sha256::digest(&manifest_bytes).into();
+    let manifest_size = i64::try_from(manifest.total_size)
+        .map_err(|_| BlobError::InvalidArgument("seal_stream: total_size exceeds i64".into()))?;
+    let row = PreparedBlobRow {
+        sha256: manifest_sha,
+        storage_kind: "chunk_dag",
+        bytes_inline: Some(manifest_bytes),
+        external_ref: None,
+        size_bytes: manifest_size,
+    };
+    Ok((manifest, row))
 }
 
 /// v4.1 (CIRISPersist#142, Cut B) — validate a `put_blob_chunks`

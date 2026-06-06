@@ -3793,6 +3793,178 @@ impl crate::federation::BlobStorage for PostgresBackend {
         Ok(())
     }
 
+    async fn put_blob_chunk(
+        &self,
+        stream_id: &str,
+        seq: u64,
+        body: crate::federation::BlobBody,
+        epoch: u64,
+    ) -> Result<[u8; 32], crate::federation::BlobError> {
+        let cap = self.inline_bytes_cap();
+        // Validation + hash-on-write (computes the chunk's content SHA).
+        let row = crate::federation::blobs::prepare_stream_chunk_row(&body, cap)?;
+        // u64 → i64 binds (tokio_postgres has no ToSql for u64).
+        let seq_i64 = i64::try_from(seq).map_err(|_| {
+            crate::federation::BlobError::InvalidArgument(
+                "put_blob_chunk: seq exceeds i64 — federation_stream_chunks.seq is BIGINT".into(),
+            )
+        })?;
+        let epoch_i64 = i64::try_from(epoch).map_err(|_| {
+            crate::federation::BlobError::InvalidArgument(
+                "put_blob_chunk: epoch exceeds i64 — federation_stream_chunks.epoch is BIGINT"
+                    .into(),
+            )
+        })?;
+
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
+
+        // 1. The chunk's bytes land as a normal federation_blobs row.
+        //    Content-addressed + idempotent: a re-PUT of identical bytes
+        //    is a no-op (ON CONFLICT DO NOTHING), exactly like
+        //    store_blob_local / the put_blob_chunks chunk rows.
+        let sha_vec = row.sha256.to_vec();
+        let media_type_null: Option<String> = None;
+        tx.execute(
+            "INSERT INTO cirislens.federation_blobs (\
+                sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type\
+             ) VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (sha256) DO NOTHING",
+            &[
+                &sha_vec,
+                &row.storage_kind,
+                &row.bytes_inline,
+                &row.external_ref,
+                &row.size_bytes,
+                &media_type_null,
+            ],
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("put_blob_chunk blob insert: {e}"))
+        })?;
+
+        // 2. The stream-index row. The (stream_id, seq) PK enforces
+        //    monotonicity — a re-used seq is a PK conflict, mapped to
+        //    InvalidArgument (NOT idempotent: the append-only rule).
+        let inserted = tx
+            .execute(
+                "INSERT INTO cirislens.federation_stream_chunks (\
+                    stream_id, seq, chunk_sha, epoch, size_bytes\
+                 ) VALUES ($1, $2, $3, $4, $5) \
+                 ON CONFLICT (stream_id, seq) DO NOTHING",
+                &[&stream_id, &seq_i64, &sha_vec, &epoch_i64, &row.size_bytes],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("put_blob_chunk index insert: {e}"))
+            })?;
+        if inserted == 0 {
+            // PK conflict on (stream_id, seq) — monotonicity violation.
+            // Roll back the whole txn (the blob row too, if it was new).
+            return Err(crate::federation::BlobError::InvalidArgument(format!(
+                "stream {stream_id} seq {seq} already exists"
+            )));
+        }
+
+        tx.commit().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("put_blob_chunk commit: {e}"))
+        })?;
+        Ok(row.sha256)
+    }
+
+    async fn seal_stream(&self, stream_id: &str) -> Result<[u8; 32], crate::federation::BlobError> {
+        let cap = self.inline_bytes_cap();
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
+
+        // 1. Read the seq-ordered chunk index for the stream.
+        let index_rows = tx
+            .query(
+                "SELECT chunk_sha, size_bytes \
+                   FROM cirislens.federation_stream_chunks \
+                  WHERE stream_id = $1 \
+                  ORDER BY seq ASC",
+                &[&stream_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("seal_stream index read: {e}"))
+            })?;
+        let mut chunk_rows: Vec<([u8; 32], i64)> = Vec::with_capacity(index_rows.len());
+        for r in &index_rows {
+            let sha_vec: Vec<u8> =
+                r.safe_get_with("chunk_sha", crate::federation::BlobError::Backend)?;
+            if sha_vec.len() != 32 {
+                return Err(crate::federation::BlobError::Backend(format!(
+                    "seal_stream: chunk_sha is {} bytes, expected 32",
+                    sha_vec.len()
+                )));
+            }
+            let mut sha = [0u8; 32];
+            sha.copy_from_slice(&sha_vec);
+            let size: i64 = r.safe_get_with("size_bytes", crate::federation::BlobError::Backend)?;
+            chunk_rows.push((sha, size));
+        }
+
+        // 2. Build the sealed manifest + the chunk_dag manifest row.
+        //    (Empty stream → InvalidArgument inside the helper.)
+        let (_manifest, manifest_row) =
+            crate::federation::blobs::prepare_sealed_manifest_row(stream_id, &chunk_rows, cap)?;
+
+        // 3. Write ONLY the manifest row (the chunk rows already exist —
+        //    put_blob_chunk inserted them; seal does not re-insert).
+        let manifest_sha_vec = manifest_row.sha256.to_vec();
+        let media_type_null: Option<String> = None;
+        tx.execute(
+            "INSERT INTO cirislens.federation_blobs (\
+                sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type\
+             ) VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (sha256) DO NOTHING",
+            &[
+                &manifest_sha_vec,
+                &manifest_row.storage_kind,
+                &manifest_row.bytes_inline,
+                &manifest_row.external_ref,
+                &manifest_row.size_bytes,
+                &media_type_null,
+            ],
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("seal_stream manifest insert: {e}"))
+        })?;
+
+        // 4. Stamp sealed_at on the stream's index rows (informational).
+        tx.execute(
+            "UPDATE cirislens.federation_stream_chunks \
+                SET sealed_at = NOW() \
+              WHERE stream_id = $1",
+            &[&stream_id],
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("seal_stream sealed_at: {e}"))
+        })?;
+
+        tx.commit().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("seal_stream commit: {e}"))
+        })?;
+        Ok(manifest_row.sha256)
+    }
+
     async fn get_blob(
         &self,
         sha256: &[u8; 32],
@@ -17352,6 +17524,174 @@ mod tests {
         let _ = backend.delete_blob(&manifest_sha).await;
         let _ = backend.delete_blob(&s0).await;
         let _ = backend.delete_blob(&s_ext).await;
+    }
+
+    // ─── v4.1 (CIRISPersist#142, Cut C1a) — PG live stream chunks ───
+
+    /// Append 3 chunks, seal, and read the assembled bytes back via
+    /// get_blob_range over the sealed manifest sha — end-to-end with the
+    /// Cut B ChunkDag path, including ranges crossing chunk boundaries.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_stream_append_seal_and_range_round_trip() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        use crate::federation::{BlobBody, BlobRange, BlobStorage};
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        // Run-unique chunk bytes (shared test DB → SHAs must not collide).
+        let salt = uuid_like();
+        let c0 = format!("strm-AAAA-{salt}").into_bytes();
+        let c1 = format!("strm-BBBB-{salt}").into_bytes();
+        let c2 = format!("strm-CC-{salt}").into_bytes();
+        let stream = format!("pg-stream-rt-{salt}");
+        let (l0, l1, l2) = (c0.len() as u64, c1.len() as u64, c2.len() as u64);
+        let total = l0 + l1 + l2;
+
+        let s0 = backend
+            .put_blob_chunk(&stream, 0, BlobBody::Inline(c0.clone()), 0)
+            .await
+            .unwrap();
+        let s1 = backend
+            .put_blob_chunk(&stream, 1, BlobBody::Inline(c1.clone()), 0)
+            .await
+            .unwrap();
+        let s2 = backend
+            .put_blob_chunk(&stream, 2, BlobBody::Inline(c2.clone()), 0)
+            .await
+            .unwrap();
+        assert_eq!(s0, pg_sha256_of(&c0));
+        assert_eq!(s1, pg_sha256_of(&c1));
+        assert_eq!(s2, pg_sha256_of(&c2));
+
+        let manifest_sha = backend.seal_stream(&stream).await.unwrap();
+
+        // The sealed sha resolves as a ChunkDag manifest in seq order.
+        match backend.get_blob(&manifest_sha).await.unwrap().unwrap() {
+            BlobBody::ChunkDag(m) => {
+                assert_eq!(m.total_size, total);
+                assert_eq!(m.chunks.len(), 3);
+                assert_eq!(m.chunks[0].sha, s0);
+                assert_eq!(m.chunks[1].sha, s1);
+                assert_eq!(m.chunks[2].sha, s2);
+            }
+            other => panic!("expected ChunkDag, got {other:?}"),
+        }
+
+        // Assemble the full bytes for the range assertions.
+        let mut full = Vec::new();
+        full.extend_from_slice(&c0);
+        full.extend_from_slice(&c1);
+        full.extend_from_slice(&c2);
+
+        // Full range assembles the whole stream.
+        assert_eq!(
+            backend
+                .get_blob_range(&manifest_sha, 0, total - 1)
+                .await
+                .unwrap()
+                .unwrap(),
+            BlobRange::Inline(full.clone())
+        );
+        // A range crossing the chunk0/chunk1 boundary.
+        let span_start = l0 - 2;
+        let span_end = l0 + 1;
+        let expect: Vec<u8> = full[span_start as usize..=span_end as usize].to_vec();
+        assert_eq!(
+            backend
+                .get_blob_range(&manifest_sha, span_start, span_end)
+                .await
+                .unwrap()
+                .unwrap(),
+            BlobRange::Inline(expect)
+        );
+
+        // Cleanup (shared DB).
+        let _ = backend.delete_blob(&manifest_sha).await;
+        let _ = backend.delete_blob(&s0).await;
+        let _ = backend.delete_blob(&s1).await;
+        let _ = backend.delete_blob(&s2).await;
+    }
+
+    /// A re-used (stream_id, seq) is rejected (monotonicity guarantee).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_stream_seq_collision_rejected() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        use crate::federation::{BlobBody, BlobError, BlobStorage};
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let salt = uuid_like();
+        let stream = format!("pg-stream-collide-{salt}");
+        let c0 = format!("first-{salt}").into_bytes();
+        let s0 = backend
+            .put_blob_chunk(&stream, 0, BlobBody::Inline(c0.clone()), 0)
+            .await
+            .unwrap();
+        // Same seq, different bytes → PK conflict → InvalidArgument.
+        let err = backend
+            .put_blob_chunk(
+                &stream,
+                0,
+                BlobBody::Inline(format!("second-{salt}").into_bytes()),
+                0,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BlobError::InvalidArgument(_)));
+        // The stream seals to exactly the first chunk.
+        let manifest_sha = backend.seal_stream(&stream).await.unwrap();
+        match backend.get_blob(&manifest_sha).await.unwrap().unwrap() {
+            BlobBody::ChunkDag(m) => {
+                assert_eq!(m.chunks.len(), 1);
+                assert_eq!(m.chunks[0].sha, s0);
+            }
+            other => panic!("expected ChunkDag, got {other:?}"),
+        }
+        let _ = backend.delete_blob(&manifest_sha).await;
+        let _ = backend.delete_blob(&s0).await;
+    }
+
+    /// Sealing a stream with no chunks is rejected; a ChunkDag body to
+    /// put_blob_chunk is rejected (can't chunk a chunk).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_stream_seal_empty_and_chunk_dag_body_rejected() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        use crate::federation::{BlobBody, BlobError, BlobStorage, ChunkManifest, ChunkRef};
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let salt = uuid_like();
+
+        // Empty stream → InvalidArgument.
+        let err = backend
+            .seal_stream(&format!("pg-empty-{salt}"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BlobError::InvalidArgument(_)));
+
+        // ChunkDag body to put_blob_chunk → InvalidArgument.
+        let nested = ChunkManifest {
+            v: 1,
+            total_size: 4,
+            chunks: vec![ChunkRef {
+                sha: pg_sha256_of(b"AAAA"),
+                size: 4,
+            }],
+        };
+        let err = backend
+            .put_blob_chunk(&format!("pg-nest-{salt}"), 0, BlobBody::ChunkDag(nested), 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BlobError::InvalidArgument(_)));
     }
 
     // ─── v3.4.0 (CIRISPersist#123) — PG sweeper parity ─────────────
