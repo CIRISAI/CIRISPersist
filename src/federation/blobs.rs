@@ -537,6 +537,78 @@ pub trait BlobStorage: Send + Sync {
         stream_id: &str,
     ) -> impl Future<Output = Result<[u8; 32], BlobError>> + Send;
 
+    /// v4.1 (CIRISPersist#142, Cut C1b) — store a **producer-signed**
+    /// Signed Tree Head for a stream's transparency log (CEG §10.5.1).
+    ///
+    /// A stream is its own RFC 6962 log (`log_id = stream:<id>`) whose
+    /// leaves are the chunk hashes in `federation_stream_chunks`. The
+    /// PRODUCER signs the STH; persist's job is integrity-gating, in
+    /// **EXACTLY this order** (the anti-equivocation gate):
+    ///
+    /// 1. Parse `stream_id` from `sth.log_id` (must be `stream:<id>`,
+    ///    else [`BlobError::InvalidArgument`]).
+    /// 2. Load the first `sth.tree_size` chunk hashes for the stream
+    ///    (`seq ASC`). Fewer than `tree_size` exist →
+    ///    [`BlobError::InvalidArgument`] (the STH claims more leaves than
+    ///    persist holds).
+    /// 3. Recompute the Merkle root over those leaves via CIRISVerify's
+    ///    [`InMemoryTransparencyStore`](ciris_verify_core::transparency::InMemoryTransparencyStore)
+    ///    (RFC 6962 — **not** reimplemented here).
+    /// 4. Assert the recomputed root equals `sth.root_hash`; mismatch →
+    ///    [`BlobError::InvalidArgument`]. **Not optional.**
+    /// 5. Verify the producer's hybrid signature over
+    ///    `sth.signing_bytes_of()`, resolving the producer's public key
+    ///    from `federation_keys` via `producer_key_id`. Bad signature →
+    ///    [`BlobError::InvalidArgument`].
+    /// 6. INSERT. A `(stream_id, tree_size)` PK conflict with a DIFFERENT
+    ///    root → [`BlobError::InvalidArgument`] (equivocation attempt);
+    ///    an identical re-PUT is idempotent (`Ok`).
+    ///
+    /// Persist does NOT sign stream STHs (unlike the audit log). Witness
+    /// cosignatures are stored as-provided (default empty); Cut C1b does
+    /// NOT enforce a cosign quorum (best-effort tier — CEG §10.5.1).
+    fn put_stream_sth(
+        &self,
+        sth: ciris_verify_core::transparency::SignedTreeHead,
+        producer_key_id: &str,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
+    /// v4.1 (CIRISPersist#142, Cut C1b) — the most recent STH (highest
+    /// `tree_size`) stored for `stream_id`, or `None` if no STH exists.
+    fn latest_stream_sth(
+        &self,
+        stream_id: &str,
+    ) -> impl Future<
+        Output = Result<Option<ciris_verify_core::transparency::SignedTreeHead>, BlobError>,
+    > + Send;
+
+    /// v4.1 (CIRISPersist#142, Cut C1b) — RFC 6962 inclusion proof for
+    /// the chunk at `leaf_index` against a `tree_size`-leaf tree, built
+    /// from the stream's stored chunk hashes via
+    /// [`InMemoryTransparencyStore`](ciris_verify_core::transparency::InMemoryTransparencyStore).
+    /// `None` if the stream has fewer than `tree_size` chunks or
+    /// `leaf_index >= tree_size`.
+    fn stream_inclusion_proof(
+        &self,
+        stream_id: &str,
+        leaf_index: u64,
+        tree_size: u64,
+    ) -> impl Future<Output = Result<Option<ciris_verify_core::transparency::MerkleProof>, BlobError>>
+           + Send;
+
+    /// v4.1 (CIRISPersist#142, Cut C1b) — RFC 6962 §2.1.2 consistency
+    /// proof between `from_size` and `to_size`, built from the stream's
+    /// stored chunk hashes. `None` if the stream has fewer than
+    /// `to_size` chunks.
+    fn stream_consistency_proof(
+        &self,
+        stream_id: &str,
+        from_size: u64,
+        to_size: u64,
+    ) -> impl Future<
+        Output = Result<Option<ciris_verify_core::transparency::ConsistencyProof>, BlobError>,
+    > + Send;
+
     /// Read a blob by its SHA-256.
     ///
     /// Returns the [`BlobBody`] variant matching the row's stored
@@ -1504,6 +1576,53 @@ pub(crate) fn prepare_sealed_manifest_row(
         size_bytes: manifest_size,
     };
     Ok((manifest, row))
+}
+
+/// v4.1 (CIRISPersist#142, Cut C1b) — **step 5 of the `put_stream_sth`
+/// gate**: verify the producer's hybrid signature over the STH's
+/// canonical signing bytes, resolving the producer's PINNED public key
+/// from `federation_keys` via `producer_key_id`.
+///
+/// The producer's keys come from the directory, **not** from the
+/// pubkeys embedded in the STH's `HybridSignature` — a forged STH
+/// carrying its own keypair cannot self-certify. Uses
+/// [`HybridPolicy::Strict`](crate::verify::HybridPolicy::Strict): a
+/// stream STH must carry both signature components (no hybrid-pending
+/// acceptance for transparency heads). Any verification failure —
+/// unknown key, bad signature, missing PQC — maps to
+/// [`BlobError::InvalidArgument`] so the gate rejects fast.
+///
+/// Mirrors the `verify_hybrid_via_directory` usage at
+/// `src/server/secrets.rs`.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) async fn verify_stream_sth_signature<F>(
+    directory: &F,
+    sth: &ciris_verify_core::transparency::SignedTreeHead,
+    producer_key_id: &str,
+) -> Result<(), BlobError>
+where
+    F: crate::federation::FederationDirectory,
+{
+    let (ed25519_sig_b64, ml_dsa_65_sig_b64) =
+        crate::federation::stream_sth::signature_b64_parts(sth);
+    let signing_bytes = sth.signing_bytes_of();
+    crate::verify::verify_hybrid_via_directory(
+        directory,
+        &signing_bytes,
+        producer_key_id,
+        &ed25519_sig_b64,
+        ml_dsa_65_sig_b64.as_deref(),
+        crate::verify::HybridPolicy::Strict,
+        None,
+    )
+    .await
+    .map(|_outcome| ())
+    .map_err(|e| {
+        BlobError::InvalidArgument(format!(
+            "put_stream_sth: producer signature verification failed for \
+             key_id={producer_key_id}: {e}"
+        ))
+    })
 }
 
 /// v4.1 (CIRISPersist#142, Cut B) — validate a `put_blob_chunks`

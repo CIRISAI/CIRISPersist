@@ -3703,6 +3703,178 @@ impl crate::federation::BlobStorage for SqliteBackend {
         Ok(manifest_sha)
     }
 
+    async fn put_stream_sth(
+        &self,
+        sth: ciris_verify_core::transparency::SignedTreeHead,
+        producer_key_id: &str,
+    ) -> Result<(), crate::federation::BlobError> {
+        use crate::federation::stream_sth;
+        // Step 1: parse stream_id (must be `stream:<id>`).
+        let stream_id = stream_sth::parse_stream_id(&sth.log_id)?.to_string();
+
+        // Step 2: load the seq-ordered chunk hashes for the stream.
+        let chunk_hashes = sqlite_load_stream_chunk_hashes(&self.conn, &stream_id)?;
+
+        // Steps 3–4: recompute the RFC 6962 root from persist's own
+        // chunks + assert equality (anti-equivocation gate; also rejects
+        // an over-claimed tree_size).
+        stream_sth::recompute_and_assert_root(&sth, &chunk_hashes)?;
+
+        // Step 5: verify the producer's hybrid signature (pinned key
+        // resolved from federation_keys via producer_key_id).
+        crate::federation::blobs::verify_stream_sth_signature(self, &sth, producer_key_id).await?;
+
+        // Step 6: INSERT. (stream_id, tree_size) PK conflict with a
+        // DIFFERENT root → equivocation reject; identical → idempotent.
+        let tree_size_i64 = i64::try_from(sth.tree_size).map_err(|_| {
+            crate::federation::BlobError::InvalidArgument(
+                "put_stream_sth: tree_size exceeds i64 — federation_stream_sth.tree_size is INTEGER"
+                    .into(),
+            )
+        })?;
+        let root_vec = sth.root_hash.to_vec();
+        let signed_at_iso = sth.timestamp.to_rfc3339();
+        let signature_blob = stream_sth::serialize_signature(&sth.signature)?;
+        let witness_json = stream_sth::serialize_witness_signatures(&sth.witness_signatures)?;
+        let stream_id_owned = stream_id.clone();
+        let producer_key_id_owned = producer_key_id.to_string();
+        let root_for_closure = root_vec.clone();
+        let conn = self.conn.clone();
+        let tree_size_for_err = sth.tree_size;
+
+        let result = (move || -> Result<(), crate::federation::BlobError> {
+            let mut conn = conn.lock();
+            let tx = conn.transaction().map_err(|e| {
+                crate::federation::BlobError::Backend(format!("put_stream_sth tx: {e}"))
+            })?;
+            let inserted = tx
+                .execute(
+                    "INSERT INTO federation_stream_sth (\
+                        stream_id, tree_size, epoch, root_hash, signed_at, \
+                        producer_key_id, signature_blob, witness_signatures\
+                     ) VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6, ?7) \
+                     ON CONFLICT (stream_id, tree_size) DO NOTHING",
+                    rusqlite::params![
+                        stream_id_owned,
+                        tree_size_i64,
+                        root_for_closure,
+                        signed_at_iso,
+                        producer_key_id_owned,
+                        signature_blob,
+                        witness_json,
+                    ],
+                )
+                .map_err(|e| {
+                    crate::federation::BlobError::Backend(format!("put_stream_sth insert: {e}"))
+                })?;
+            if inserted == 0 {
+                // Row exists at (stream_id, tree_size). Equivocation iff
+                // the stored root differs.
+                let existing_root: Vec<u8> = tx
+                    .query_row(
+                        "SELECT root_hash FROM federation_stream_sth \
+                          WHERE stream_id = ?1 AND tree_size = ?2",
+                        rusqlite::params![stream_id_owned, tree_size_i64],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| {
+                        crate::federation::BlobError::Backend(format!(
+                            "put_stream_sth conflict re-read: {e}"
+                        ))
+                    })?;
+                if existing_root != root_vec {
+                    return Err(crate::federation::BlobError::InvalidArgument(format!(
+                        "put_stream_sth: equivocation — an STH at stream={stream_id_owned} \
+                         tree_size={tree_size_for_err} already exists with a different root"
+                    )));
+                }
+                // Identical re-PUT → idempotent OK; nothing to commit.
+                return Ok(());
+            }
+            tx.commit().map_err(|e| {
+                crate::federation::BlobError::Backend(format!("put_stream_sth commit: {e}"))
+            })?;
+            Ok(())
+        })();
+        result
+    }
+
+    async fn latest_stream_sth(
+        &self,
+        stream_id: &str,
+    ) -> Result<Option<ciris_verify_core::transparency::SignedTreeHead>, crate::federation::BlobError>
+    {
+        let stream_id_owned = stream_id.to_string();
+        let conn = self.conn.clone();
+        type SthRow = (i64, Vec<u8>, String, Vec<u8>, String);
+        let row_opt = (move || -> Result<Option<SthRow>, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT tree_size, root_hash, signed_at, signature_blob, witness_signatures \
+                   FROM federation_stream_sth \
+                  WHERE stream_id = ?1 \
+                  ORDER BY tree_size DESC \
+                  LIMIT 1",
+                rusqlite::params![stream_id_owned],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()
+        })()
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("latest_stream_sth query: {e}"))
+        })?;
+        let Some((tree_size_i64, root_vec, signed_at_iso, signature_blob, witness_json)) = row_opt
+        else {
+            return Ok(None);
+        };
+        let tree_size = u64::try_from(tree_size_i64).map_err(|_| {
+            crate::federation::BlobError::Backend("latest_stream_sth: negative tree_size".into())
+        })?;
+        let root_hash = crate::federation::stream_sth::root_hash_from_bytes(&root_vec)?;
+        let timestamp = chrono::DateTime::parse_from_rfc3339(&signed_at_iso)
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!(
+                    "latest_stream_sth signed_at parse: {e}"
+                ))
+            })?
+            .with_timezone(&chrono::Utc);
+        let signature = crate::federation::stream_sth::deserialize_signature(&signature_blob)?;
+        let witness_signatures =
+            crate::federation::stream_sth::deserialize_witness_signatures(&witness_json)?;
+        Ok(Some(ciris_verify_core::transparency::SignedTreeHead {
+            log_id: crate::federation::stream_sth::log_id_for_stream(stream_id),
+            tree_size,
+            root_hash,
+            timestamp,
+            signature,
+            witness_signatures,
+        }))
+    }
+
+    async fn stream_inclusion_proof(
+        &self,
+        stream_id: &str,
+        leaf_index: u64,
+        tree_size: u64,
+    ) -> Result<Option<ciris_verify_core::transparency::MerkleProof>, crate::federation::BlobError>
+    {
+        let chunk_hashes = sqlite_load_stream_chunk_hashes(&self.conn, stream_id)?;
+        crate::federation::stream_sth::inclusion_proof(&chunk_hashes, leaf_index, tree_size)
+    }
+
+    async fn stream_consistency_proof(
+        &self,
+        stream_id: &str,
+        from_size: u64,
+        to_size: u64,
+    ) -> Result<
+        Option<ciris_verify_core::transparency::ConsistencyProof>,
+        crate::federation::BlobError,
+    > {
+        let chunk_hashes = sqlite_load_stream_chunk_hashes(&self.conn, stream_id)?;
+        crate::federation::stream_sth::consistency_proof(&chunk_hashes, from_size, to_size)
+    }
+
     async fn get_blob(
         &self,
         sha256: &[u8; 32],
@@ -4367,6 +4539,40 @@ impl crate::federation::BlobStorage for SqliteBackend {
         }
         Ok(report)
     }
+}
+
+/// v4.1 (CIRISPersist#142, Cut C1b) — load a stream's chunk hashes in
+/// `seq ASC` order (the leaves of the stream's RFC 6962 log). Shared by
+/// `put_stream_sth` (the anti-equivocation gate) and the proof methods.
+fn sqlite_load_stream_chunk_hashes(
+    conn: &Arc<Mutex<Connection>>,
+    stream_id: &str,
+) -> Result<Vec<[u8; 32]>, crate::federation::BlobError> {
+    let stream_id_owned = stream_id.to_string();
+    let conn = conn.clone();
+    let raw = (move || -> Result<Vec<Vec<u8>>, rusqlite::Error> {
+        let conn = conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT chunk_sha FROM federation_stream_chunks \
+              WHERE stream_id = ?1 ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![stream_id_owned], |r| {
+            r.get::<_, Vec<u8>>(0)
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    })()
+    .map_err(|e| crate::federation::BlobError::Backend(format!("load stream chunk hashes: {e}")))?;
+    let mut out = Vec::with_capacity(raw.len());
+    for sha_vec in &raw {
+        out.push(crate::federation::stream_sth::root_hash_from_bytes(
+            sha_vec,
+        )?);
+    }
+    Ok(out)
 }
 
 // ─── Eviction sweeper helpers (v3.4.0, CIRISPersist#123) ───────────
@@ -17323,6 +17529,273 @@ mod tests {
             .unwrap()
         };
         assert_eq!(epoch, 7);
+    }
+
+    // ─── v4.1 (CIRISPersist#142, Cut C1b) — per-stream transparency
+    //     log: producer-signed STH + RFC 6962 proofs ─────────────────
+
+    /// Build a real hybrid producer signer (Ed25519 + ML-DSA-65 from
+    /// deterministic seeds), register its pubkeys in `federation_keys`
+    /// under `key_id`, and return the signer for producing STHs the
+    /// gate will accept.
+    async fn register_hybrid_producer(
+        backend: &SqliteBackend,
+        key_id: &str,
+    ) -> ciris_crypto::HybridSigner<ciris_crypto::Ed25519Signer, ciris_crypto::MlDsa65Signer> {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        let ed = ciris_crypto::Ed25519Signer::from_seed(&[0x31; 32]).unwrap();
+        let mldsa = ciris_crypto::MlDsa65Signer::from_seed(&[0x32; 32]).unwrap();
+        let ed_pub_b64 = {
+            use ciris_crypto::ClassicalSigner as _;
+            B64.encode(ed.public_key().unwrap())
+        };
+        let mldsa_pub_b64 = {
+            use ciris_crypto::PqcSigner as _;
+            B64.encode(mldsa.public_key().unwrap())
+        };
+        let mut record = fed_key(key_id, key_id, key_id);
+        record.pubkey_ed25519_base64 = ed_pub_b64;
+        record.pubkey_ml_dsa_65_base64 = Some(mldsa_pub_b64);
+        backend
+            .put_public_key(SignedKeyRecord { record })
+            .await
+            .unwrap();
+        ciris_crypto::HybridSigner::new(ed, mldsa).unwrap()
+    }
+
+    /// Produce a producer-signed STH over a stream's recomputed root for
+    /// `tree_size` leaves, signed by `signer`.
+    fn sign_stream_sth(
+        signer: &ciris_crypto::HybridSigner<
+            ciris_crypto::Ed25519Signer,
+            ciris_crypto::MlDsa65Signer,
+        >,
+        stream_id: &str,
+        chunk_hashes: &[[u8; 32]],
+        tree_size: u64,
+    ) -> ciris_verify_core::transparency::SignedTreeHead {
+        use crate::federation::stream_sth::StreamChunkLeaf;
+        use ciris_verify_core::transparency::{InMemoryTransparencyStore, TransparencyStore};
+        let store: InMemoryTransparencyStore<StreamChunkLeaf> =
+            InMemoryTransparencyStore::new(None);
+        for sha in &chunk_hashes[..tree_size as usize] {
+            store.append(StreamChunkLeaf::new(*sha)).unwrap();
+        }
+        let root_hash = store.root().unwrap();
+        let log_id = crate::federation::stream_sth::log_id_for_stream(stream_id);
+        let timestamp = chrono::Utc::now();
+        let signing_bytes = ciris_verify_core::transparency::SignedTreeHead::signing_bytes(
+            &log_id, tree_size, &root_hash, timestamp,
+        );
+        let signature = signer.sign(&signing_bytes).unwrap();
+        ciris_verify_core::transparency::SignedTreeHead {
+            log_id,
+            tree_size,
+            root_hash,
+            timestamp,
+            signature,
+            witness_signatures: Vec::new(),
+        }
+    }
+
+    /// Append chunks, return their seq-ordered hashes.
+    async fn append_chunks(
+        backend: &SqliteBackend,
+        stream: &str,
+        bodies: &[&[u8]],
+    ) -> Vec<[u8; 32]> {
+        let mut out = Vec::new();
+        for (seq, body) in bodies.iter().enumerate() {
+            let sha = backend
+                .put_blob_chunk(stream, seq as u64, BlobBody::Inline(body.to_vec()), 0)
+                .await
+                .unwrap();
+            out.push(sha);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn sth_round_trip_and_proofs_verify() {
+        use ciris_verify_core::transparency::{verify_consistency, verify_inclusion};
+        let backend = blob_test_backend().await;
+        let signer = register_hybrid_producer(&backend, "producer-key").await;
+        let stream = "sth-rt";
+        let hashes = append_chunks(&backend, stream, &[b"AAAA", b"BBBB", b"CC", b"DDDD"]).await;
+
+        // Producer signs an STH over the real root for all 4 chunks.
+        let sth = sign_stream_sth(&signer, stream, &hashes, 4);
+        backend
+            .put_stream_sth(sth.clone(), "producer-key")
+            .await
+            .unwrap();
+
+        // latest_stream_sth round-trips.
+        let stored = backend.latest_stream_sth(stream).await.unwrap().unwrap();
+        assert_eq!(stored.log_id, sth.log_id);
+        assert_eq!(stored.tree_size, 4);
+        assert_eq!(stored.root_hash, sth.root_hash);
+
+        // Inclusion proof for a chunk verifies against the crate verifier.
+        let proof = backend
+            .stream_inclusion_proof(stream, 2, 4)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(verify_inclusion(&proof));
+        assert_eq!(proof.root, sth.root_hash);
+
+        // Consistency proof between two sizes verifies.
+        let sth2 = sign_stream_sth(&signer, stream, &hashes, 2);
+        let cproof = backend
+            .stream_consistency_proof(stream, 2, 4)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(verify_consistency(&sth2.root_hash, 2, &sth.root_hash, 4, &cproof).unwrap());
+    }
+
+    #[tokio::test]
+    async fn sth_idempotent_reput() {
+        let backend = blob_test_backend().await;
+        let signer = register_hybrid_producer(&backend, "producer-key").await;
+        let stream = "sth-idem";
+        let hashes = append_chunks(&backend, stream, &[b"AAAA", b"BBBB"]).await;
+        let sth = sign_stream_sth(&signer, stream, &hashes, 2);
+        backend
+            .put_stream_sth(sth.clone(), "producer-key")
+            .await
+            .unwrap();
+        // Identical re-PUT → idempotent OK.
+        backend.put_stream_sth(sth, "producer-key").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sth_root_mismatch_rejected() {
+        let backend = blob_test_backend().await;
+        let signer = register_hybrid_producer(&backend, "producer-key").await;
+        let stream = "sth-root-mismatch";
+        let hashes = append_chunks(&backend, stream, &[b"AAAA", b"BBBB"]).await;
+        let mut sth = sign_stream_sth(&signer, stream, &hashes, 2);
+        // Tamper the claimed root, re-sign so the SIGNATURE is valid but
+        // the root does NOT match persist's chunks → root-gate rejects
+        // (and would reject before sig anyway).
+        sth.root_hash = [0xAB; 32];
+        let signing_bytes = ciris_verify_core::transparency::SignedTreeHead::signing_bytes(
+            &sth.log_id,
+            sth.tree_size,
+            &sth.root_hash,
+            sth.timestamp,
+        );
+        sth.signature = signer.sign(&signing_bytes).unwrap();
+        let err = backend
+            .put_stream_sth(sth, "producer-key")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BlobError::InvalidArgument(_)), "got {err:?}");
+        assert!(format!("{err}").contains("root mismatch"));
+    }
+
+    #[tokio::test]
+    async fn sth_bad_signature_rejected() {
+        let backend = blob_test_backend().await;
+        let signer = register_hybrid_producer(&backend, "producer-key").await;
+        let stream = "sth-badsig";
+        let hashes = append_chunks(&backend, stream, &[b"AAAA", b"BBBB"]).await;
+        let mut sth = sign_stream_sth(&signer, stream, &hashes, 2);
+        // Forge the signature bytes (root still matches persist's chunks,
+        // so the gate passes the root check then rejects on the sig).
+        for b in &mut sth.signature.classical.signature {
+            *b ^= 0xFF;
+        }
+        let err = backend
+            .put_stream_sth(sth, "producer-key")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BlobError::InvalidArgument(_)), "got {err:?}");
+        assert!(format!("{err}").contains("signature verification failed"));
+    }
+
+    #[tokio::test]
+    async fn sth_over_claimed_tree_size_rejected() {
+        let backend = blob_test_backend().await;
+        let signer = register_hybrid_producer(&backend, "producer-key").await;
+        let stream = "sth-overclaim";
+        // Persist holds only 2 chunks.
+        let hashes = append_chunks(&backend, stream, &[b"AAAA", b"BBBB"]).await;
+        // Build an STH whose root is over 2 chunks but claims tree_size=5.
+        let mut sth = sign_stream_sth(&signer, stream, &hashes, 2);
+        sth.tree_size = 5;
+        let signing_bytes = ciris_verify_core::transparency::SignedTreeHead::signing_bytes(
+            &sth.log_id,
+            5,
+            &sth.root_hash,
+            sth.timestamp,
+        );
+        sth.signature = signer.sign(&signing_bytes).unwrap();
+        let err = backend
+            .put_stream_sth(sth, "producer-key")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BlobError::InvalidArgument(_)), "got {err:?}");
+        assert!(format!("{err}").contains("only 2 chunks"));
+    }
+
+    #[tokio::test]
+    async fn sth_equivocation_same_size_diff_root_rejected() {
+        let backend = blob_test_backend().await;
+        let signer = register_hybrid_producer(&backend, "producer-key").await;
+        let stream = "sth-equiv";
+        let hashes = append_chunks(&backend, stream, &[b"AAAA", b"BBBB"]).await;
+        let sth = sign_stream_sth(&signer, stream, &hashes, 2);
+        backend.put_stream_sth(sth, "producer-key").await.unwrap();
+
+        // A second producer appends a divergent chunk set to a DIFFERENT
+        // stream so we can craft a same-(stream,size) different-root STH.
+        // Simulate equivocation: write a row directly with a different
+        // root at the same (stream, tree_size), then put a new STH whose
+        // root differs but which passes its own gate against the SAME
+        // chunks — we craft this by forcing a different valid root via a
+        // direct row. Simpler: directly assert the DB-level conflict by
+        // attempting to store an STH whose root we tamper to a value that
+        // still matches a different chunk set is not feasible; instead we
+        // insert a conflicting row and re-PUT the original to confirm the
+        // equivocation branch fires.
+        {
+            let conn = backend.conn.clone();
+            let conn = conn.lock();
+            conn.execute(
+                "UPDATE federation_stream_sth SET root_hash = ?1 \
+                   WHERE stream_id = ?2 AND tree_size = 2",
+                rusqlite::params![vec![0xCDu8; 32], stream],
+            )
+            .unwrap();
+        }
+        // Re-PUT the original (correct-root) STH → its root differs from
+        // the now-tampered stored row → equivocation reject.
+        let sth_again = sign_stream_sth(&signer, stream, &hashes, 2);
+        let err = backend
+            .put_stream_sth(sth_again, "producer-key")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BlobError::InvalidArgument(_)), "got {err:?}");
+        assert!(format!("{err}").contains("equivocation"));
+    }
+
+    #[tokio::test]
+    async fn sth_non_stream_log_id_rejected() {
+        let backend = blob_test_backend().await;
+        let signer = register_hybrid_producer(&backend, "producer-key").await;
+        let stream = "sth-logid";
+        let hashes = append_chunks(&backend, stream, &[b"AAAA"]).await;
+        let mut sth = sign_stream_sth(&signer, stream, &hashes, 1);
+        sth.log_id = "tenant:not-a-stream".into();
+        let err = backend
+            .put_stream_sth(sth, "producer-key")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BlobError::InvalidArgument(_)), "got {err:?}");
     }
 
     /// v4.1 (CIRISPersist#142, Cut B) — the V061 SQLite 12-step table

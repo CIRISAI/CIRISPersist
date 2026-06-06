@@ -50,6 +50,7 @@ pub mod rooting;
 pub mod schema_resolver;
 #[cfg(feature = "sqlite")]
 pub mod sqlite_open;
+pub mod stream_sth;
 pub mod topology;
 pub mod trust_grant;
 pub mod types;
@@ -114,6 +115,10 @@ pub use schema_resolver::{
 };
 #[cfg(feature = "sqlite")]
 pub use sqlite_open::FederationDirectorySqlite;
+pub use stream_sth::{
+    log_id_for_stream, parse_stream_id, recompute_and_assert_root, StreamChunkLeaf,
+    STREAM_LOG_ID_PREFIX,
+};
 pub use topology::{
     build_delegation_graph, build_trust_topology, AuditChainEntry, AuditChainProof, DelegationEdge,
     DelegationGraph, EdgeType, FederationDirectoryFilter, TrustEdge, TrustNode, TrustTopology,
