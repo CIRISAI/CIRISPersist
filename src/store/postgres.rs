@@ -3839,18 +3839,22 @@ impl crate::federation::BlobStorage for PostgresBackend {
             "inline" => {
                 // Server-side substring — PG `substring` is 1-indexed, so
                 // FROM = range_start + 1. NEVER loads the whole
-                // bytes_inline column.
-                let from_i64 = i64::try_from(range_start + 1).map_err(|_| {
-                    crate::federation::BlobError::Backend("range_start overflow".into())
+                // bytes_inline column. PG `substring(bytea FROM int FOR
+                // int)` infers the position args as int4, so bind i32 (not
+                // i64 → int8, which fails parameter serialization). Inline
+                // blobs are bounded by MAX_BODY_BYTES (16 MiB), so the
+                // positions always fit i32.
+                let from_i32 = i32::try_from(range_start + 1).map_err(|_| {
+                    crate::federation::BlobError::Backend("range_start exceeds i32".into())
                 })?;
-                let for_i64 = i64::try_from(len).map_err(|_| {
-                    crate::federation::BlobError::Backend("range length overflow".into())
+                let for_i32 = i32::try_from(len).map_err(|_| {
+                    crate::federation::BlobError::Backend("range length exceeds i32".into())
                 })?;
                 let slice_row = client
                     .query_one(
                         "SELECT substring(bytes_inline FROM $2 FOR $3) AS slice \
                              FROM cirislens.federation_blobs WHERE sha256 = $1",
-                        &[&sha_vec, &from_i64, &for_i64],
+                        &[&sha_vec, &from_i32, &for_i32],
                     )
                     .await
                     .map_err(|e| {
