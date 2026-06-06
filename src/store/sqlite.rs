@@ -96,6 +96,13 @@ pub struct SqliteBackend {
     /// v3.6.0 (CIRISPersist#134) — perceptual-hash matcher for the
     /// `put_blob_signing` admission hook. `None` = no hook (default).
     perceptual_hash_matcher: std::sync::RwLock<Option<crate::federation::SharedMatcher>>,
+    /// v4.0 (CIRISConformance#11 round 2) — per-backend-instance
+    /// repository-statistics cache (§7.1). Scoped to *this* backend so a
+    /// SQLite engine never serves an entry a prior Postgres engine wrote
+    /// (cross-backend poisoning) and `reset_engine` drops it with the
+    /// backend. `Arc` so the engine layer / FFI `cache_stats()` can hold
+    /// a handle to the same cache.
+    repo_stats_cache: std::sync::Arc<crate::ceg::aggregates::repository::RepositoryStatsCache>,
 }
 
 impl SqliteBackend {
@@ -127,7 +134,18 @@ impl SqliteBackend {
             )),
             admission_gate: std::sync::RwLock::new(None),
             perceptual_hash_matcher: std::sync::RwLock::new(None),
+            repo_stats_cache: std::sync::Arc::new(crate::cache::Cache::new()),
         }
+    }
+
+    /// v4.0 (CIRISConformance#11 round 2) — this backend's
+    /// repository-statistics cache (§7.1). The engine / FFI
+    /// `cache_stats()` accessor reads from here so observability reports
+    /// *this* backend's cache, not a process global.
+    pub fn repo_stats_cache(
+        &self,
+    ) -> &std::sync::Arc<crate::ceg::aggregates::repository::RepositoryStatsCache> {
+        &self.repo_stats_cache
     }
 
     /// v3.4.0 (CIRISPersist#123) — install the trust-weighted
@@ -269,6 +287,7 @@ impl SqliteBackend {
             )),
             admission_gate: std::sync::RwLock::new(None),
             perceptual_hash_matcher: std::sync::RwLock::new(None),
+            repo_stats_cache: std::sync::Arc::new(crate::cache::Cache::new()),
         })
     }
 }
@@ -6659,8 +6678,9 @@ impl crate::read::ReadEngine for SqliteBackend {
         use crate::ceg::aggregates::repository as repo;
 
         let period = filter.window;
-        let cache = repo::repository_stats_cache();
-        let key = repo::repository_stats_cache_key(&filter, &scope);
+        let cache = &self.repo_stats_cache;
+        let key =
+            repo::repository_stats_cache_key(&filter, &scope, cache.config().invalidation_bucket);
         if let Some(cached) = cache.try_get(&key) {
             // The stored struct carries `cache_hit: false` (its value at
             // compute time); flip it on the served clone so the result
@@ -16644,5 +16664,85 @@ mod tests {
             .await
             .unwrap();
         assert!(chain.is_empty(), "steward isn't a trusted_publisher");
+    }
+
+    /// CIRISConformance#11 round 2, Finding B — the repository-statistics
+    /// cache is per-backend-instance, never a process global.
+    ///
+    /// Two independent backends over the same empty 1-day window: each
+    /// backend's FIRST call is a fresh compute (`cache_hit: false`) and
+    /// its SECOND is a hit (`cache_hit: true`) — symmetrically. Backend
+    /// B's first call must NOT hit backend A's entry (the round-2 report
+    /// saw a fresh engine served a prior engine's cached row). The
+    /// pre-fix process-global cache made B's first call a poisoned hit.
+    #[tokio::test]
+    async fn repo_stats_cache_is_per_backend_not_global() {
+        use crate::ceg::aggregates::repository::RepositoryFilter;
+        use crate::ceg::types::TimeWindow;
+        use crate::scope::CallerScope;
+
+        let window = TimeWindow::new(
+            Utc.timestamp_opt(0, 0).unwrap(),
+            Utc.timestamp_opt(86_400, 0).unwrap(), // 1-day window
+        )
+        .unwrap();
+        let filter = RepositoryFilter {
+            window,
+            agent_id_hashes: vec![],
+            deployment_domains: vec![],
+            cohort_scope_in: vec![],
+            task_classes: vec![],
+            fragility_only: false,
+        };
+
+        let a = SqliteBackend::open_in_memory().await.unwrap();
+        a.run_migrations().await.unwrap();
+        let b = SqliteBackend::open_in_memory().await.unwrap();
+        b.run_migrations().await.unwrap();
+
+        // Backend A: first call is a miss (fresh compute).
+        let a1 = a
+            .get_repository_statistics(filter.clone(), CallerScope::Unauthenticated)
+            .await
+            .unwrap();
+        assert!(!a1.cache_hit, "A first call must be a fresh compute");
+
+        // Backend A: second call is a hit on A's own entry.
+        let a2 = a
+            .get_repository_statistics(filter.clone(), CallerScope::Unauthenticated)
+            .await
+            .unwrap();
+        assert!(a2.cache_hit, "A second call must hit A's cache");
+        assert_eq!(
+            a1.evaluated_at_unix_ms, a2.evaluated_at_unix_ms,
+            "A's hit preserves the cached evaluation time"
+        );
+
+        // Backend B: first call must be a fresh compute, NOT a poisoned
+        // hit on A's entry (the cross-backend leak the global caused).
+        let b1 = b
+            .get_repository_statistics(filter.clone(), CallerScope::Unauthenticated)
+            .await
+            .unwrap();
+        assert!(
+            !b1.cache_hit,
+            "B first call must be a fresh compute, not a hit on A's cache"
+        );
+
+        // Backend B: second call hits B's own entry — symmetric with A.
+        let b2 = b
+            .get_repository_statistics(filter.clone(), CallerScope::Unauthenticated)
+            .await
+            .unwrap();
+        assert!(b2.cache_hit, "B second call must hit B's cache");
+
+        // A's cache stats see exactly one miss + one hit — B's traffic
+        // never touched A's cache.
+        let a_stats = a.repo_stats_cache().stats();
+        assert_eq!(a_stats.misses, 1, "A saw exactly one miss");
+        assert_eq!(a_stats.hits, 1, "A saw exactly one hit");
+        let b_stats = b.repo_stats_cache().stats();
+        assert_eq!(b_stats.misses, 1, "B saw exactly one miss");
+        assert_eq!(b_stats.hits, 1, "B saw exactly one hit");
     }
 }

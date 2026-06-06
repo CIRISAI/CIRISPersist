@@ -89,23 +89,32 @@ pub fn buckets_for_window(start_unix_ms: i64, end_unix_ms: i64, bucket: Duration
 ///
 /// Equality / hashing is over the 32-byte digest of
 /// `(method_id, filter_digest, scope_digest)` — the *content* axis. The
-/// bucket set is carried alongside (the *time* axis) so the cache can
-/// maintain its `bucket → set<CacheKey>` reverse index for §7.3
-/// invalidation, but two entries with the same content digest and the
-/// same window produce equal keys.
+/// window's bucket *range* is carried alongside (the *time* axis) as
+/// `[first_bucket, last_bucket]` so write-invalidation can test
+/// overlap, but two entries with the same content digest and the same
+/// window produce equal keys.
 ///
-/// Note: the window bounds *are* folded into the digest (via the bucket
-/// run), so two queries spanning different buckets get distinct keys
-/// and bucket-scoped write invalidation stays precise (§7.2).
+/// Note: the window bounds *are* folded into the digest (via the
+/// first/last bucket + bucket width), so two queries spanning different
+/// buckets get distinct keys and bucket-scoped write invalidation stays
+/// precise (§7.2).
+///
+/// **O(1) memory (CIRISConformance#11):** the key stores only the two
+/// endpoint buckets — never the materialized run. A 10-year window at
+/// the 1h bucket overlaps ~87,600 buckets; carrying that `Vec` in every
+/// reverse-index clone was O(n²) memory → OOM. The range is sufficient:
+/// a write's bucket invalidates this entry iff it lies in the closed
+/// `[first_bucket, last_bucket]` interval ([`CacheKey::overlaps_bucket`]).
 #[derive(Clone, Debug)]
 pub struct CacheKey {
     /// 32-byte content+time digest used for map identity.
     digest: [u8; 32],
-    /// The buckets this key's window overlaps, sorted ascending.
-    /// Carried so the cache can register/deregister the key in the
-    /// reverse index; not all callers need it, hence read via
-    /// [`CacheKey::buckets`].
-    buckets: Vec<Bucket>,
+    /// First bucket the window overlaps (inclusive). The window is a
+    /// contiguous bucket run, so `[first_bucket, last_bucket]` fully
+    /// describes the overlap set without materializing it.
+    first_bucket: Bucket,
+    /// Last bucket the window overlaps (inclusive).
+    last_bucket: Bucket,
 }
 
 impl CacheKey {
@@ -131,7 +140,18 @@ impl CacheKey {
         window_end_unix_ms: i64,
         bucket: Duration,
     ) -> Self {
-        let buckets = buckets_for_window(window_start_unix_ms, window_end_unix_ms, bucket);
+        // Compute the first/last overlapping buckets directly — DO NOT
+        // materialize the run (a wide window is millions of buckets; the
+        // Vec was the O(n²) reverse-index memory blow-up). Normalize
+        // lo/hi the same way `buckets_for_window` does so a reversed
+        // window keys identically.
+        let (lo, hi) = if window_start_unix_ms <= window_end_unix_ms {
+            (window_start_unix_ms, window_end_unix_ms)
+        } else {
+            (window_end_unix_ms, window_start_unix_ms)
+        };
+        let first = bucket_of(lo, bucket);
+        let last = bucket_of(hi, bucket);
 
         let mut h = Sha256::new();
         h.update(b"CacheKey:v4.0\0");
@@ -142,22 +162,33 @@ impl CacheKey {
         // Fold the bucket run into the digest so distinct windows ->
         // distinct keys. We hash the first/last bucket (the run is
         // contiguous) plus the bucket width so equal windows under
-        // different bucket settings don't collide.
-        let first = buckets.first().copied().unwrap_or(0);
-        let last = buckets.last().copied().unwrap_or(0);
+        // different bucket settings don't collide. These are the SAME
+        // bytes the prior Vec-based impl hashed (its first()/last()),
+        // so the digest — and thus key identity — is unchanged.
         h.update(first.to_le_bytes());
         h.update(last.to_le_bytes());
         h.update((bucket_ms_for_digest(bucket)).to_le_bytes());
 
         let digest: [u8; 32] = h.finalize().into();
-        Self { digest, buckets }
+        Self {
+            digest,
+            first_bucket: first,
+            last_bucket: last,
+        }
     }
 
-    /// The buckets this key's window overlaps (sorted ascending). The
-    /// cache registers the key under each of these in its reverse
-    /// index, so a write in any of them invalidates this entry.
-    pub fn buckets(&self) -> &[Bucket] {
-        &self.buckets
+    /// The closed bucket range `[first, last]` this key's window
+    /// overlaps. A write in any bucket within this inclusive range
+    /// invalidates the entry (§7.3).
+    pub fn bucket_range(&self) -> (Bucket, Bucket) {
+        (self.first_bucket, self.last_bucket)
+    }
+
+    /// True iff bucket `b` falls within this key's window overlap range
+    /// — the §7.3 / #160-comment-2 invalidation test. O(1); no run is
+    /// materialized.
+    pub fn overlaps_bucket(&self, b: Bucket) -> bool {
+        self.first_bucket <= b && b <= self.last_bucket
     }
 
     /// The raw 32-byte digest, exposed for diagnostics / tests.
