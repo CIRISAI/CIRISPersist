@@ -297,7 +297,10 @@ impl<B: BlobStorage + 'static> SchemaResolver for BlobBackedSchemaResolver<B> {
             })?;
             let bytes = match body {
                 Some(BlobBody::Inline(b)) => b,
-                Some(BlobBody::External(_)) | None => {
+                // External + ChunkDag schema bodies aren't directly
+                // available as inline bytes here (persist doesn't
+                // dereference / reassemble for the schema-resolve path).
+                Some(BlobBody::External(_)) | Some(BlobBody::ChunkDag(_)) | None => {
                     return Err(SchemaResolverError::SchemaBlobMissing {
                         axis: axis.to_string(),
                         sha256_hex: hex::encode(sha256),

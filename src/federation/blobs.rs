@@ -139,9 +139,148 @@ pub struct ExternalRef {
     pub media_type: Option<String>,
 }
 
+/// v4.1 (CIRISPersist#142, Cut B) — one chunk's content address + size
+/// in a [`ChunkManifest`]. Serialized inside the manifest as a
+/// JCS-canonical object `{"sha":"<lowercase-hex32>","size":<u32>}`.
+///
+/// The derived serde impl (used only because [`BlobBody`] derives serde)
+/// emits `sha` as a 32-element byte array — that path is NOT the wire
+/// format; the on-the-wire/at-rest manifest is the JCS shape produced by
+/// [`ChunkManifest::to_jcs_bytes`] (sha as lowercase hex).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChunkRef {
+    /// SHA-256 of the chunk's bytes. The chunk is its own
+    /// `federation_blobs` row keyed on this SHA.
+    pub sha: [u8; 32],
+    /// Byte length of the chunk.
+    pub size: u32,
+}
+
+/// v4.1 (CIRISPersist#142, Cut B) — a flat (one-level) content-addressed
+/// chunk DAG manifest. Stored in the manifest row's `bytes_inline` as
+/// **JCS-canonical JSON** (CEG §0.9); the row's `content_sha256` =
+/// SHA-256 over those canonical bytes, and the row's `size_bytes` =
+/// [`total_size`](ChunkManifest::total_size).
+///
+/// Wire shape (JCS — keys lexicographically sorted, no whitespace,
+/// `sha` as lowercase hex):
+///
+/// ```json
+/// {"chunks":[{"sha":"<hex32>","size":<u32>},…],"total_size":<u64>,"v":<u32>}
+/// ```
+///
+/// One-level DAG only (UnixFS flat-leaves; no nested DAGs). Each chunk
+/// is its own `federation_blobs` row (`Inline` or `External`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChunkManifest {
+    /// Manifest schema version (currently `1`).
+    pub v: u32,
+    /// Total byte size of the reassembled blob. MUST equal the sum of
+    /// every [`ChunkRef::size`].
+    pub total_size: u64,
+    /// The ordered chunk list. Concatenating each chunk's bytes in
+    /// order reproduces the original blob.
+    pub chunks: Vec<ChunkRef>,
+}
+
+/// v4.1 (CIRISPersist#142, Cut B) — current `ChunkManifest` schema
+/// version.
+pub const CHUNK_MANIFEST_VERSION: u32 = 1;
+
+impl ChunkManifest {
+    /// Serialize to **JCS-canonical JSON bytes** (CEG §0.9).
+    ///
+    /// The manifest shape is fully ASCII (top-level keys
+    /// `chunks`/`total_size`/`v`, per-chunk keys `sha`/`size`; values are
+    /// hex strings and non-negative integers), so the JCS rules collapse
+    /// to lexicographically-ordered object keys, no insignificant
+    /// whitespace, and plain-decimal integers. This is emitted directly
+    /// from the typed struct (no `serde_json::Value` hot path), so the
+    /// bytes are deterministic and the manifest's `content_sha256` is
+    /// stable.
+    pub fn to_jcs_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // Top-level keys, lexicographically: "chunks" < "total_size" < "v".
+        buf.extend_from_slice(b"{\"chunks\":[");
+        for (i, c) in self.chunks.iter().enumerate() {
+            if i > 0 {
+                buf.push(b',');
+            }
+            // Per-chunk keys, lexicographically: "sha" < "size".
+            buf.extend_from_slice(b"{\"sha\":\"");
+            buf.extend_from_slice(hex::encode(c.sha).as_bytes());
+            buf.extend_from_slice(b"\",\"size\":");
+            buf.extend_from_slice(c.size.to_string().as_bytes());
+            buf.push(b'}');
+        }
+        buf.extend_from_slice(b"],\"total_size\":");
+        buf.extend_from_slice(self.total_size.to_string().as_bytes());
+        buf.extend_from_slice(b",\"v\":");
+        buf.extend_from_slice(self.v.to_string().as_bytes());
+        buf.push(b'}');
+        buf
+    }
+
+    /// Parse a manifest from its JCS-canonical JSON bytes (the inverse
+    /// of [`to_jcs_bytes`](ChunkManifest::to_jcs_bytes)). Tolerant of
+    /// key order on the way in (uses `serde_json` to parse), but the
+    /// round-trip through `to_jcs_bytes` re-canonicalizes on the way
+    /// out. Returns [`BlobError::Backend`] on malformed manifest bytes.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub(crate) fn from_manifest_bytes(bytes: &[u8]) -> Result<Self, BlobError> {
+        #[derive(Deserialize)]
+        struct ChunkRefWire {
+            sha: String,
+            size: u32,
+        }
+        #[derive(Deserialize)]
+        struct ManifestWire {
+            v: u32,
+            total_size: u64,
+            chunks: Vec<ChunkRefWire>,
+        }
+        let wire: ManifestWire = serde_json::from_slice(bytes)
+            .map_err(|e| BlobError::Backend(format!("chunk_dag manifest JSON parse: {e}")))?;
+        let mut chunks = Vec::with_capacity(wire.chunks.len());
+        for c in wire.chunks {
+            let raw = hex::decode(&c.sha).map_err(|e| {
+                BlobError::Backend(format!("chunk_dag manifest chunk sha hex: {e}"))
+            })?;
+            if raw.len() != 32 {
+                return Err(BlobError::Backend(format!(
+                    "chunk_dag manifest chunk sha is {} bytes, expected 32",
+                    raw.len()
+                )));
+            }
+            let mut sha = [0u8; 32];
+            sha.copy_from_slice(&raw);
+            chunks.push(ChunkRef { sha, size: c.size });
+        }
+        Ok(ChunkManifest {
+            v: wire.v,
+            total_size: wire.total_size,
+            chunks,
+        })
+    }
+
+    /// Validate internal consistency: `total_size` MUST equal the sum
+    /// of the chunk sizes (computed in u64 to avoid u32 overflow).
+    /// Returns [`BlobError::InvalidArgument`] on mismatch.
+    pub fn validate_total_size(&self) -> Result<(), BlobError> {
+        let sum: u64 = self.chunks.iter().map(|c| u64::from(c.size)).sum();
+        if sum != self.total_size {
+            return Err(BlobError::InvalidArgument(format!(
+                "chunk_dag manifest total_size {} != sum of chunk sizes {}",
+                self.total_size, sum
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// The body of a [`BlobStorage::put_blob`] / [`BlobStorage::get_blob`]
-/// payload — either the inline bytes themselves, or a pointer to an
-/// external store.
+/// payload — either the inline bytes themselves, a pointer to an
+/// external store, or (Cut B) a content-addressed chunk-DAG manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BlobBody {
@@ -151,6 +290,11 @@ pub enum BlobBody {
     Inline(Vec<u8>),
     /// External reference (S3 URI or arbitrary URL).
     External(ExternalRef),
+    /// v4.1 (CIRISPersist#142, Cut B) — a flat content-addressed chunk
+    /// DAG. The wrapped [`ChunkManifest`] is stored JCS-canonical in the
+    /// manifest row's `bytes_inline`; each chunk is its own
+    /// `federation_blobs` row. `storage_kind` = `"chunk_dag"`.
+    ChunkDag(ChunkManifest),
 }
 
 /// v4.1 (CIRISPersist#142, Cut A) — the result of a
@@ -190,6 +334,9 @@ impl BlobBody {
         match self {
             BlobBody::Inline(b) => b.len() as u64,
             BlobBody::External(e) => e.size_bytes,
+            // v4.1 (Cut B) — the reassembled blob's size is the
+            // manifest's total_size, NOT the manifest-bytes length.
+            BlobBody::ChunkDag(m) => m.total_size,
         }
     }
 
@@ -200,6 +347,7 @@ impl BlobBody {
             BlobBody::Inline(_) => "inline",
             BlobBody::External(e) if e.uri.starts_with("s3://") => "s3",
             BlobBody::External(_) => "external_url",
+            BlobBody::ChunkDag(_) => "chunk_dag",
         }
     }
 }
@@ -285,12 +433,46 @@ pub trait BlobStorage: Send + Sync {
         media_type: Option<&str>,
     ) -> impl Future<Output = Result<(), BlobError>> + Send;
 
+    /// v4.1 (CIRISPersist#142, Cut B) — **atomic** chunked-blob upload.
+    ///
+    /// In ONE transaction, inserts:
+    /// - each chunk as a normal `federation_blobs` row (keyed on the
+    ///   chunk SHA; idempotent / first-write-wins on collision, exactly
+    ///   like [`store_blob_local`](BlobStorage::store_blob_local)); and
+    /// - the **manifest row** (`storage_kind = "chunk_dag"`,
+    ///   `bytes_inline` = the [`ChunkManifest`] JCS bytes,
+    ///   `content_sha256` = SHA-256 over those bytes, `size_bytes` =
+    ///   `manifest.total_size`).
+    ///
+    /// No `holds_bytes` attestation is emitted (this is the local-store
+    /// shape; Cut C / a later surface can wrap a signing variant).
+    ///
+    /// # Validation (all-or-nothing — any failure rolls back the txn)
+    ///
+    /// 1. `manifest.total_size` MUST equal the sum of the chunk sizes,
+    ///    else [`BlobError::InvalidArgument`].
+    /// 2. The `chunks` argument MUST line up 1:1 (by SHA, same order)
+    ///    with `manifest.chunks`, else [`BlobError::InvalidArgument`].
+    /// 3. For each `Inline` chunk: the bytes' SHA-256 MUST match its
+    ///    manifest entry's SHA, else [`BlobError::HashMismatch`]; its
+    ///    length MUST match the manifest entry's `size`, else
+    ///    [`BlobError::InvalidArgument`]. `External` chunks are trusted
+    ///    (persist has no bytes to hash), as in [`put_blob`].
+    /// 4. A nested `ChunkDag` chunk is rejected
+    ///    ([`BlobError::InvalidArgument`]) — one-level DAG only.
+    fn put_blob_chunks(
+        &self,
+        manifest: ChunkManifest,
+        chunks: Vec<([u8; 32], BlobBody)>,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
     /// Read a blob by its SHA-256.
     ///
     /// Returns the [`BlobBody`] variant matching the row's stored
     /// `storage_kind`. Persist never fetches from S3 / external URLs;
     /// the External arm hands back the pointer and the caller streams
-    /// the bytes themselves.
+    /// the bytes themselves. A `chunk_dag` row returns
+    /// [`BlobBody::ChunkDag`] with the parsed manifest.
     fn get_blob(
         &self,
         sha256: &[u8; 32],
@@ -844,6 +1026,23 @@ pub enum BlobError {
         size: u64,
     },
 
+    /// v4.1 (CIRISPersist#142, Cut B) — a
+    /// [`get_blob_range`](BlobStorage::get_blob_range) over a
+    /// [`BlobBody::ChunkDag`] where a chunk covering the requested range
+    /// is stored `External` (S3 / URL). Persist cannot dereference an
+    /// external chunk to slice it, so the range read fails fast with the
+    /// offending chunk's SHA. **v-next enhancement**: a future cut may
+    /// proxy the upstream `Range:` for the covering external chunk; for
+    /// now the caller must fetch the external chunk(s) itself.
+    #[error(
+        "range spans an External chunk (sha256={chunk_sha_hex}); persist cannot \
+         dereference it — fetch the chunk from its external ref directly"
+    )]
+    RangeSpansExternalChunk {
+        /// Hex-encoded SHA-256 of the covering chunk that is External.
+        chunk_sha_hex: String,
+    },
+
     /// Backend-level error (DB connection, serialization, etc.).
     #[error("backend: {0}")]
     Backend(String),
@@ -861,6 +1060,7 @@ impl BlobError {
             BlobError::TrustBelowThreshold { .. } => "blob_trust_below_threshold",
             BlobError::HashMatchedKnownBad { .. } => "blob_hash_matched_known_bad",
             BlobError::RangeNotSatisfiable { .. } => "blob_range_not_satisfiable",
+            BlobError::RangeSpansExternalChunk { .. } => "blob_range_spans_external_chunk",
             BlobError::Backend(_) => "blob_backend",
         }
     }
@@ -1005,6 +1205,234 @@ pub(crate) fn verify_inline_hash(expected: &[u8; 32], bytes: &[u8]) -> Result<()
     }
 }
 
+/// v4.1 (CIRISPersist#142, Cut B) — walk a [`ChunkManifest`] to
+/// assemble the bytes covering the inclusive range `[start, end]`
+/// (already clamped to `[0, total_size - 1]` by the caller).
+///
+/// Prefix-sums the chunk sizes to find the covering chunk(s), fetches
+/// each covering chunk's bytes via [`BlobStorage::get_blob`] (which must
+/// return an `Inline` body — persist cannot dereference an `External`
+/// chunk, so that yields [`BlobError::RangeSpansExternalChunk`]), slices
+/// each at the range boundaries, and concatenates.
+///
+/// Per-chunk SHA is re-verified on read (CEG §10.1.1 — full SHA before
+/// consumption at both the manifest and chunk levels).
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) async fn assemble_chunk_dag_range<S: BlobStorage + ?Sized>(
+    storage: &S,
+    manifest: &ChunkManifest,
+    start: u64,
+    end: u64,
+) -> Result<Vec<u8>, BlobError> {
+    use sha2::{Digest, Sha256};
+
+    debug_assert!(start <= end);
+    let want_len = (end - start + 1) as usize;
+    let mut out: Vec<u8> = Vec::with_capacity(want_len);
+
+    // Running byte offset of the START of the current chunk.
+    let mut chunk_start: u64 = 0;
+    for cref in &manifest.chunks {
+        let chunk_len = u64::from(cref.size);
+        if chunk_len == 0 {
+            continue;
+        }
+        let chunk_end = chunk_start + chunk_len - 1; // inclusive
+                                                     // Does this chunk overlap [start, end]?
+        if chunk_end < start {
+            chunk_start = chunk_end + 1;
+            continue;
+        }
+        if chunk_start > end {
+            break; // past the requested range
+        }
+        // Fetch the covering chunk's bytes. Persist cannot deref an
+        // External chunk → typed error (v-next enhancement).
+        let body = storage.get_blob(&cref.sha).await?;
+        let bytes = match body {
+            Some(BlobBody::Inline(b)) => b,
+            Some(BlobBody::External(_)) => {
+                return Err(BlobError::RangeSpansExternalChunk {
+                    chunk_sha_hex: hex::encode(cref.sha),
+                });
+            }
+            Some(BlobBody::ChunkDag(_)) => {
+                // One-level DAG only; a chunk that is itself a DAG is a
+                // corrupt manifest.
+                return Err(BlobError::Backend(format!(
+                    "chunk_dag covering chunk {} is itself a ChunkDag (nested DAG)",
+                    hex::encode(cref.sha)
+                )));
+            }
+            None => {
+                return Err(BlobError::Backend(format!(
+                    "chunk_dag covering chunk {} is missing from federation_blobs",
+                    hex::encode(cref.sha)
+                )));
+            }
+        };
+        // CEG §10.1.1 — verify the chunk SHA before consumption.
+        let computed = Sha256::digest(&bytes);
+        if computed.as_slice() != cref.sha.as_slice() {
+            return Err(BlobError::HashMismatch {
+                expected_hex: hex::encode(cref.sha),
+                got_hex: hex::encode(computed),
+            });
+        }
+        if bytes.len() as u64 != chunk_len {
+            return Err(BlobError::Backend(format!(
+                "chunk_dag chunk {} is {} bytes but manifest size is {}",
+                hex::encode(cref.sha),
+                bytes.len(),
+                chunk_len
+            )));
+        }
+        // Slice the overlap of [start, end] with this chunk, in
+        // chunk-local coordinates.
+        let local_start = start.saturating_sub(chunk_start);
+        let local_end_inclusive = if end >= chunk_end {
+            chunk_len - 1
+        } else {
+            end - chunk_start
+        };
+        out.extend_from_slice(&bytes[local_start as usize..=local_end_inclusive as usize]);
+
+        chunk_start = chunk_end + 1;
+    }
+
+    Ok(out)
+}
+
+/// v4.1 (CIRISPersist#142, Cut B) — a single row prepared for the
+/// `put_blob_chunks` atomic insert. Backend-agnostic: the backend's
+/// transaction loop binds these directly.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+#[derive(Debug)]
+pub(crate) struct PreparedBlobRow {
+    /// SHA-256 (32 raw bytes) — the `sha256` PK.
+    pub sha256: [u8; 32],
+    /// `storage_kind` column value.
+    pub storage_kind: &'static str,
+    /// `bytes_inline` column value (present for inline / chunk_dag).
+    pub bytes_inline: Option<Vec<u8>>,
+    /// `external_ref` column value (present for s3 / external_url).
+    pub external_ref: Option<String>,
+    /// `size_bytes` column value (already range-checked to fit i64).
+    pub size_bytes: i64,
+}
+
+/// v4.1 (CIRISPersist#142, Cut B) — validate a `put_blob_chunks`
+/// request and produce the ordered list of rows to insert in one txn
+/// (the N chunk rows followed by the manifest row last).
+///
+/// Validation order: nested-DAG reject → total_size → chunk alignment →
+/// per-Inline-chunk SHA + size → i64 range. Returns the prepared rows
+/// (chunks first, manifest last) plus the manifest's `content_sha256`.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn prepare_chunk_rows(
+    manifest: &ChunkManifest,
+    chunks: &[([u8; 32], BlobBody)],
+    inline_bytes_cap: usize,
+) -> Result<Vec<PreparedBlobRow>, BlobError> {
+    use sha2::{Digest, Sha256};
+
+    // 1. total_size == sum(chunk sizes).
+    manifest.validate_total_size()?;
+
+    // 2. The chunks argument lines up 1:1 (by SHA, same order) with the
+    //    manifest's chunk list.
+    if chunks.len() != manifest.chunks.len() {
+        return Err(BlobError::InvalidArgument(format!(
+            "put_blob_chunks: {} chunk bodies supplied but manifest names {} chunks",
+            chunks.len(),
+            manifest.chunks.len()
+        )));
+    }
+
+    let mut rows: Vec<PreparedBlobRow> = Vec::with_capacity(chunks.len() + 1);
+    for (idx, ((chunk_sha, body), mref)) in chunks.iter().zip(manifest.chunks.iter()).enumerate() {
+        if chunk_sha != &mref.sha {
+            return Err(BlobError::InvalidArgument(format!(
+                "put_blob_chunks: chunk[{idx}] sha {} does not match manifest entry {}",
+                hex::encode(chunk_sha),
+                hex::encode(mref.sha)
+            )));
+        }
+        let (storage_kind, bytes_inline, external_ref, size) = match body {
+            BlobBody::Inline(bytes) => {
+                if bytes.len() > inline_bytes_cap {
+                    return Err(BlobError::InlineSizeExceeded {
+                        size: bytes.len(),
+                        cap: inline_bytes_cap,
+                    });
+                }
+                // Verify the chunk bytes hash to the manifest entry SHA.
+                let computed = Sha256::digest(bytes);
+                if computed.as_slice() != mref.sha.as_slice() {
+                    return Err(BlobError::HashMismatch {
+                        expected_hex: hex::encode(mref.sha),
+                        got_hex: hex::encode(computed),
+                    });
+                }
+                // And the chunk length matches the manifest size.
+                if bytes.len() as u64 != u64::from(mref.size) {
+                    return Err(BlobError::InvalidArgument(format!(
+                        "put_blob_chunks: chunk[{idx}] is {} bytes but manifest size is {}",
+                        bytes.len(),
+                        mref.size
+                    )));
+                }
+                ("inline", Some(bytes.clone()), None, u64::from(mref.size))
+            }
+            BlobBody::External(e) => {
+                let kind = body.storage_kind();
+                (kind, None, Some(e.uri.clone()), e.size_bytes)
+            }
+            BlobBody::ChunkDag(_) => {
+                return Err(BlobError::InvalidArgument(format!(
+                    "put_blob_chunks: chunk[{idx}] is itself a ChunkDag — \
+                     one-level DAG only (no nesting)"
+                )));
+            }
+        };
+        let size_bytes = i64::try_from(size).map_err(|_| {
+            BlobError::InvalidArgument("put_blob_chunks: chunk size_bytes exceeds i64".into())
+        })?;
+        rows.push(PreparedBlobRow {
+            sha256: *chunk_sha,
+            storage_kind,
+            bytes_inline,
+            external_ref,
+            size_bytes,
+        });
+    }
+
+    // The manifest row last (so a covering chunk always exists before
+    // the manifest references it within the same txn — not strictly
+    // required for correctness given the single txn, but it keeps the
+    // insert order intuitive).
+    let manifest_bytes = manifest.to_jcs_bytes();
+    if manifest_bytes.len() > inline_bytes_cap {
+        return Err(BlobError::InlineSizeExceeded {
+            size: manifest_bytes.len(),
+            cap: inline_bytes_cap,
+        });
+    }
+    let manifest_sha: [u8; 32] = Sha256::digest(&manifest_bytes).into();
+    let manifest_size = i64::try_from(manifest.total_size).map_err(|_| {
+        BlobError::InvalidArgument("put_blob_chunks: total_size exceeds i64".into())
+    })?;
+    rows.push(PreparedBlobRow {
+        sha256: manifest_sha,
+        storage_kind: "chunk_dag",
+        bytes_inline: Some(manifest_bytes),
+        external_ref: None,
+        size_bytes: manifest_size,
+    });
+
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1030,6 +1458,133 @@ mod tests {
         assert_eq!(refs[0], hex::encode(sha));
     }
 
+    // ── v4.1 (CIRISPersist#142, Cut B) — ChunkManifest JCS ──────────
+
+    fn sha_of(bytes: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(bytes).into()
+    }
+
+    #[test]
+    fn chunk_manifest_jcs_is_canonical() {
+        let c0 = sha_of(b"chunk-zero");
+        let c1 = sha_of(b"chunk-one");
+        let manifest = ChunkManifest {
+            v: 1,
+            total_size: 19,
+            chunks: vec![
+                ChunkRef { sha: c0, size: 10 },
+                ChunkRef { sha: c1, size: 9 },
+            ],
+        };
+        let bytes = manifest.to_jcs_bytes();
+        let s = String::from_utf8(bytes).unwrap();
+        // Keys lexicographically sorted, no whitespace, sha lowercase hex.
+        let expected = format!(
+            "{{\"chunks\":[{{\"sha\":\"{}\",\"size\":10}},{{\"sha\":\"{}\",\"size\":9}}],\"total_size\":19,\"v\":1}}",
+            hex::encode(c0),
+            hex::encode(c1)
+        );
+        assert_eq!(s, expected);
+        // The hex is lowercase.
+        assert!(!s.chars().any(|ch| ch.is_ascii_uppercase()));
+    }
+
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    #[test]
+    fn chunk_manifest_round_trips_through_bytes() {
+        let c0 = sha_of(b"a");
+        let c1 = sha_of(b"bb");
+        let manifest = ChunkManifest {
+            v: 1,
+            total_size: 3,
+            chunks: vec![ChunkRef { sha: c0, size: 1 }, ChunkRef { sha: c1, size: 2 }],
+        };
+        let bytes = manifest.to_jcs_bytes();
+        let parsed = ChunkManifest::from_manifest_bytes(&bytes).unwrap();
+        assert_eq!(parsed, manifest);
+    }
+
+    #[test]
+    fn chunk_manifest_validate_total_size() {
+        let m_ok = ChunkManifest {
+            v: 1,
+            total_size: 5,
+            chunks: vec![
+                ChunkRef {
+                    sha: [0; 32],
+                    size: 2,
+                },
+                ChunkRef {
+                    sha: [1; 32],
+                    size: 3,
+                },
+            ],
+        };
+        m_ok.validate_total_size().unwrap();
+
+        let m_bad = ChunkManifest {
+            total_size: 6,
+            ..m_ok
+        };
+        let err = m_bad.validate_total_size().unwrap_err();
+        assert!(matches!(err, BlobError::InvalidArgument(_)));
+    }
+
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    #[test]
+    fn prepare_chunk_rows_rejects_sha_mismatch() {
+        // Manifest claims a chunk sha that the inline bytes don't hash to.
+        let real = sha_of(b"real");
+        let fake = [0xAB; 32];
+        let manifest = ChunkManifest {
+            v: 1,
+            total_size: 4,
+            chunks: vec![ChunkRef { sha: fake, size: 4 }],
+        };
+        let chunks = vec![(fake, BlobBody::Inline(b"real".to_vec()))];
+        // chunk[0] sha == manifest sha (fake) so alignment passes, but the
+        // bytes hash to `real` != fake → HashMismatch.
+        let _ = real;
+        let err = prepare_chunk_rows(&manifest, &chunks, DEFAULT_INLINE_BYTES_CAP).unwrap_err();
+        assert!(matches!(err, BlobError::HashMismatch { .. }));
+    }
+
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    #[test]
+    fn prepare_chunk_rows_rejects_total_size_mismatch() {
+        let c = sha_of(b"abcd");
+        let manifest = ChunkManifest {
+            v: 1,
+            total_size: 99, // wrong
+            chunks: vec![ChunkRef { sha: c, size: 4 }],
+        };
+        let chunks = vec![(c, BlobBody::Inline(b"abcd".to_vec()))];
+        let err = prepare_chunk_rows(&manifest, &chunks, DEFAULT_INLINE_BYTES_CAP).unwrap_err();
+        assert!(matches!(err, BlobError::InvalidArgument(_)));
+    }
+
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    #[test]
+    fn prepare_chunk_rows_manifest_row_is_last_and_chunk_dag() {
+        let c = sha_of(b"xyz");
+        let manifest = ChunkManifest {
+            v: 1,
+            total_size: 3,
+            chunks: vec![ChunkRef { sha: c, size: 3 }],
+        };
+        let chunks = vec![(c, BlobBody::Inline(b"xyz".to_vec()))];
+        let rows = prepare_chunk_rows(&manifest, &chunks, DEFAULT_INLINE_BYTES_CAP).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].storage_kind, "inline");
+        assert_eq!(rows[0].sha256, c);
+        // Manifest row last: storage_kind chunk_dag, sha = SHA(manifest jcs).
+        assert_eq!(rows[1].storage_kind, "chunk_dag");
+        let expect_manifest_sha = sha_of(&manifest.to_jcs_bytes());
+        assert_eq!(rows[1].sha256, expect_manifest_sha);
+        assert_eq!(rows[1].size_bytes, 3);
+    }
+
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     #[test]
     fn body_storage_kind_strings() {
@@ -1052,6 +1607,19 @@ mod tests {
             .storage_kind(),
             "external_url"
         );
+        // v4.1 (Cut B) — chunk_dag storage_kind + size_bytes = total_size.
+        let manifest = ChunkManifest {
+            v: 1,
+            total_size: 42,
+            chunks: vec![ChunkRef {
+                sha: [0; 32],
+                size: 42,
+            }],
+        };
+        let body = BlobBody::ChunkDag(manifest);
+        assert_eq!(body.storage_kind(), "chunk_dag");
+        assert_eq!(body.size_bytes(), 42);
+        assert!(!body.is_inline());
     }
 
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
