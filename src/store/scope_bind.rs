@@ -143,6 +143,12 @@ fn rebase_sqlite_placeholders(frag: &str, offset: usize) -> String {
 /// AND-compose a scope fragment into an existing `where_sql` that is
 /// either empty or begins with `WHERE `. The fragment is always
 /// parenthesized by the predicate emitter, so a bare `AND` join is safe.
+///
+/// SQLite-only: the Postgres backend composes scope fragments inline at
+/// its call sites, so this helper has no Postgres caller. Gating it on
+/// `sqlite` keeps the `pyo3`-without-sqlite build (the maturin
+/// `test-panic` / abi3 wheel step) free of a dead-code `-D warnings` break.
+#[cfg(feature = "sqlite")]
 pub(crate) fn and_compose(where_sql: &str, scope_frag: &str) -> String {
     if where_sql.is_empty() {
         format!("WHERE {scope_frag}")
