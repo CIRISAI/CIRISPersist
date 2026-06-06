@@ -4166,6 +4166,47 @@ impl PyEngine {
         })
     }
 
+    /// v4.1 (CIRISPersist#142, Cut B) — atomic chunked-blob upload.
+    ///
+    /// Inserts each chunk row + the chunk_dag manifest row in ONE
+    /// transaction. The manifest's `content_sha256` (the SHA over its
+    /// JCS bytes) is the address `get_blob_json` / `get_blob_range`
+    /// resolve. Payload shape:
+    /// `{"manifest": {"v":1,"total_size":N,"chunks":[{"sha":"<hex>",
+    /// "size":M},…]}, "chunks":[{"sha":"<hex>","body":{"inline":"<b64>"}|
+    /// {"external":{…}}},…]}`. Raises `ValueError` on SHA mismatch,
+    /// total_size mismatch, or chunk/manifest misalignment.
+    fn put_blob_chunks_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let (manifest, chunks) = parse_put_blob_chunks_payload(payload_json)?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .put_blob_chunks(manifest, chunks)
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .put_blob_chunks(manifest, chunks)
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
     /// v3.11.0 (CIRISPersist#143, CIRISVerify FEDERATION_THREAT_MODEL
     /// §3.3.2) — verify-coord R1+Q1 constants as a JSON dict for
     /// consumer code that needs to pin τ_normal / τ_partial /
@@ -18006,6 +18047,9 @@ fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
         crate::federation::BlobError::HashMatchedKnownBad { .. } => PyValueError::new_err(kind),
         // v4.1 (CIRISPersist#142, Cut A) — unsatisfiable byte range.
         crate::federation::BlobError::RangeNotSatisfiable { .. } => PyValueError::new_err(kind),
+        // v4.1 (CIRISPersist#142, Cut B) — range over a chunk DAG whose
+        // covering chunk is External (persist can't deref).
+        crate::federation::BlobError::RangeSpansExternalChunk { .. } => PyValueError::new_err(kind),
         crate::federation::BlobError::Backend(_) => PyRuntimeError::new_err(kind),
     }
 }
@@ -18133,6 +18177,79 @@ fn parse_store_blob_local_payload(
     Ok((sha, body, wire.media_type))
 }
 
+/// v4.1 (CIRISPersist#142, Cut B) — wire shape for `put_blob_chunks_json`.
+///
+/// ```json
+/// {
+///   "manifest": {"v":1, "total_size":N, "chunks":[{"sha":"<hex>","size":M}, …]},
+///   "chunks":   [{"sha":"<hex>", "body":{"inline":"<b64>"}|{"external":{…}}}, …]
+/// }
+/// ```
+#[derive(serde::Deserialize)]
+struct ChunkRefWire {
+    sha: String,
+    size: u32,
+}
+
+#[derive(serde::Deserialize)]
+struct ChunkManifestWire {
+    v: u32,
+    total_size: u64,
+    chunks: Vec<ChunkRefWire>,
+}
+
+#[derive(serde::Deserialize)]
+struct ChunkBodyWire {
+    sha: String,
+    body: PutBlobWireBody,
+}
+
+#[derive(serde::Deserialize)]
+struct PutBlobChunksJsonWire {
+    manifest: ChunkManifestWire,
+    chunks: Vec<ChunkBodyWire>,
+}
+
+/// v4.1 (CIRISPersist#142, Cut B) — decode the `put_blob_chunks_json`
+/// payload into the trait-call argument shape.
+#[allow(clippy::type_complexity)]
+fn parse_put_blob_chunks_payload(
+    json: &str,
+) -> PyResult<(
+    crate::federation::ChunkManifest,
+    Vec<([u8; 32], crate::federation::BlobBody)>,
+)> {
+    let wire: PutBlobChunksJsonWire = serde_json::from_str(json)
+        .map_err(|e| PyValueError::new_err(format!("put_blob_chunks_json decode: {e}")))?;
+    let mut mrefs = Vec::with_capacity(wire.manifest.chunks.len());
+    for c in wire.manifest.chunks {
+        let sha = parse_sha256_hex(&c.sha)?;
+        mrefs.push(crate::federation::ChunkRef { sha, size: c.size });
+    }
+    let manifest = crate::federation::ChunkManifest {
+        v: wire.manifest.v,
+        total_size: wire.manifest.total_size,
+        chunks: mrefs,
+    };
+    let mut chunks = Vec::with_capacity(wire.chunks.len());
+    for c in wire.chunks {
+        let sha = parse_sha256_hex(&c.sha)?;
+        let body = match c.body {
+            PutBlobWireBody::Inline(b64) => {
+                use base64::engine::general_purpose::STANDARD as B64;
+                use base64::Engine as _;
+                let bytes = B64.decode(&b64).map_err(|e| {
+                    PyValueError::new_err(format!("put_blob_chunks_json inline base64 decode: {e}"))
+                })?;
+                crate::federation::BlobBody::Inline(bytes)
+            }
+            PutBlobWireBody::External(e) => crate::federation::BlobBody::External(e),
+        };
+        chunks.push((sha, body));
+    }
+    Ok((manifest, chunks))
+}
+
 /// v2.3 (CIRISPersist#103) — parse a 64-char hex string into a
 /// `[u8; 32]` SHA-256.
 fn parse_sha256_hex(hex_str: &str) -> PyResult<[u8; 32]> {
@@ -18162,6 +18279,23 @@ fn encode_blob_body_json(body: &crate::federation::BlobBody) -> PyResult<String>
         crate::federation::BlobBody::External(ext) => serde_json::json!({
             "external": ext,
         }),
+        // v4.1 (CIRISPersist#142, Cut B) — surface the parsed manifest
+        // (`{"chunk_dag": {"v":.., "total_size":.., "chunks":[{"sha":
+        // "<hex>", "size":..}, ..]}}`) so the Python caller can walk it.
+        crate::federation::BlobBody::ChunkDag(manifest) => {
+            let chunks: Vec<serde_json::Value> = manifest
+                .chunks
+                .iter()
+                .map(|c| serde_json::json!({ "sha": hex::encode(c.sha), "size": c.size }))
+                .collect();
+            serde_json::json!({
+                "chunk_dag": {
+                    "v": manifest.v,
+                    "total_size": manifest.total_size,
+                    "chunks": chunks,
+                }
+            })
+        }
     };
     serde_json::to_string(&value)
         .map_err(|e| PyRuntimeError::new_err(format!("BlobBody JSON encode: {e}")))

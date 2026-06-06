@@ -3247,6 +3247,14 @@ impl crate::federation::BlobStorage for SqliteBackend {
         if let Some(gate) = self.admission_gate() {
             gate.check_blob(&attestation.attesting_key_id).await?;
         }
+        // v4.1 (Cut B) — a ChunkDag body is a multi-row manifest; it
+        // only ever goes through put_blob_chunks (which inserts the
+        // chunk rows + the manifest row atomically).
+        if matches!(body, crate::federation::BlobBody::ChunkDag(_)) {
+            return Err(crate::federation::BlobError::InvalidArgument(
+                "put_blob does not accept a ChunkDag body — use put_blob_chunks".into(),
+            ));
+        }
         let cap = self.inline_bytes_cap();
         if let crate::federation::BlobBody::Inline(ref bytes) = body {
             if bytes.len() > cap {
@@ -3274,6 +3282,12 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let (bytes_inline_opt, external_ref_opt) = match &body {
             crate::federation::BlobBody::Inline(b) => (Some(b.clone()), None),
             crate::federation::BlobBody::External(e) => (None, Some(e.uri.clone())),
+            // Rejected above; matched here only for exhaustiveness.
+            crate::federation::BlobBody::ChunkDag(_) => {
+                return Err(crate::federation::BlobError::InvalidArgument(
+                    "put_blob does not accept a ChunkDag body — use put_blob_chunks".into(),
+                ))
+            }
         };
 
         // 2. Compose the holder attestation envelope.
@@ -3413,6 +3427,13 @@ impl crate::federation::BlobStorage for SqliteBackend {
             crate::federation::blobs::verify_inline_hash(sha256, bytes)?;
         }
 
+        // v4.1 (Cut B) — ChunkDag is a multi-row manifest; routed through
+        // put_blob_chunks, never store_blob_local.
+        if matches!(body, crate::federation::BlobBody::ChunkDag(_)) {
+            return Err(crate::federation::BlobError::InvalidArgument(
+                "store_blob_local does not accept a ChunkDag body — use put_blob_chunks".into(),
+            ));
+        }
         let storage_kind = body.storage_kind().to_owned();
         let size_bytes_i64 = i64::try_from(body.size_bytes()).map_err(|_| {
             crate::federation::BlobError::InvalidArgument(
@@ -3422,6 +3443,11 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let (bytes_inline_opt, external_ref_opt) = match &body {
             crate::federation::BlobBody::Inline(b) => (Some(b.clone()), None),
             crate::federation::BlobBody::External(e) => (None, Some(e.uri.clone())),
+            crate::federation::BlobBody::ChunkDag(_) => {
+                return Err(crate::federation::BlobError::InvalidArgument(
+                    "store_blob_local does not accept a ChunkDag body — use put_blob_chunks".into(),
+                ))
+            }
         };
         let sha_vec = sha256.to_vec();
         let media_type_owned = media_type.map(str::to_owned);
@@ -3454,6 +3480,49 @@ impl crate::federation::BlobStorage for SqliteBackend {
         Ok(())
     }
 
+    // v4.1 (CIRISPersist#142, Cut B) — atomic chunked-blob upload.
+    // Validates the manifest + every chunk (per-Inline-chunk SHA + size,
+    // total_size == sum, 1:1 alignment), then inserts the N chunk rows +
+    // the chunk_dag manifest row in ONE transaction (all-or-nothing).
+    async fn put_blob_chunks(
+        &self,
+        manifest: crate::federation::ChunkManifest,
+        chunks: Vec<([u8; 32], crate::federation::BlobBody)>,
+    ) -> Result<(), crate::federation::BlobError> {
+        let cap = self.inline_bytes_cap();
+        // Validation + row preparation (chunks first, manifest last).
+        let rows = crate::federation::blobs::prepare_chunk_rows(&manifest, &chunks, cap)?;
+
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.clone();
+        (move || -> Result<(), rusqlite::Error> {
+            let mut conn = conn.lock();
+            let tx = conn.transaction()?;
+            for row in &rows {
+                let sha_vec = row.sha256.to_vec();
+                tx.execute(
+                    "INSERT INTO federation_blobs (\
+                        sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
+                        last_accessed_at, access_count\
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 0) \
+                     ON CONFLICT (sha256) DO NOTHING",
+                    rusqlite::params![
+                        sha_vec,
+                        row.storage_kind,
+                        row.bytes_inline,
+                        row.external_ref,
+                        row.size_bytes,
+                        now_iso,
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })()
+        .map_err(|e| crate::federation::BlobError::Backend(format!("put_blob_chunks tx: {e}")))?;
+        Ok(())
+    }
+
     async fn get_blob(
         &self,
         sha256: &[u8; 32],
@@ -3465,7 +3534,8 @@ impl crate::federation::BlobStorage for SqliteBackend {
         // shape; we do SELECT first, then bump in the same transaction
         // so the counter survives a concurrent get_blob.
         let now_iso = chrono::Utc::now().to_rfc3339();
-        (move || -> Result<Option<crate::federation::BlobBody>, rusqlite::Error> {
+        type GetBlobRow = (String, Option<Vec<u8>>, Option<String>, i64, Option<String>);
+        let row_opt = (move || -> Result<Option<GetBlobRow>, rusqlite::Error> {
             let mut conn = conn.lock();
             let tx = conn.transaction()?;
             let row_opt = tx
@@ -3497,18 +3567,29 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 )?;
             }
             tx.commit()?;
-            Ok(
-                row_opt.map(|(kind, inline, ext, size, mt)| match kind.as_str() {
-                    "inline" => crate::federation::BlobBody::Inline(inline.unwrap_or_default()),
-                    _ => crate::federation::BlobBody::External(crate::federation::ExternalRef {
-                        uri: ext.unwrap_or_default(),
-                        size_bytes: size.max(0) as u64,
-                        media_type: mt,
-                    }),
-                }),
-            )
+            // chunk_dag is handled outside the closure (manifest parse
+            // returns a typed BlobError, not rusqlite::Error).
+            Ok(row_opt)
         })()
-        .map_err(|e| crate::federation::BlobError::Backend(format!("get_blob: {e}")))
+        .map_err(|e| crate::federation::BlobError::Backend(format!("get_blob: {e}")))?;
+        let Some((kind, inline, ext, size, mt)) = row_opt else {
+            return Ok(None);
+        };
+        Ok(Some(match kind.as_str() {
+            "inline" => crate::federation::BlobBody::Inline(inline.unwrap_or_default()),
+            // v4.1 (Cut B) — parse the JCS manifest stored in bytes_inline.
+            "chunk_dag" => {
+                let manifest = crate::federation::blobs::ChunkManifest::from_manifest_bytes(
+                    &inline.unwrap_or_default(),
+                )?;
+                crate::federation::BlobBody::ChunkDag(manifest)
+            }
+            _ => crate::federation::BlobBody::External(crate::federation::ExternalRef {
+                uri: ext.unwrap_or_default(),
+                size_bytes: size.max(0) as u64,
+                media_type: mt,
+            }),
+        }))
     }
 
     async fn get_blob_range(
@@ -3529,10 +3610,17 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let sha_vec = sha256.to_vec();
         let conn = self.conn.clone();
         let now_iso = chrono::Utc::now().to_rfc3339();
-        // Outcome of the in-transaction work: None (absent),
-        // Err(RangeNotSatisfiable), or Ok(BlobRange).
-        type RangeOutcome = Option<Result<crate::federation::BlobRange, (u64, u64)>>;
-        let outcome: RangeOutcome = (move || -> Result<RangeOutcome, rusqlite::Error> {
+        // Outcome of the in-transaction work. The chunk_dag case can't
+        // be resolved inside the blocking tx (it needs async get_blob on
+        // covering chunks), so it returns the manifest bytes + clamped
+        // [start, end] for the outer async walk.
+        enum RangeDecision {
+            Absent,
+            NotSatisfiable { range_start: u64, size: u64 },
+            Resolved(crate::federation::BlobRange),
+            ChunkDag { manifest_bytes: Vec<u8>, end: u64 },
+        }
+        let outcome = (move || -> Result<RangeDecision, rusqlite::Error> {
             let mut conn = conn.lock();
             let tx = conn.transaction()?;
             // 1. Fetch storage_kind + size (+ external metadata) to do the
@@ -3552,7 +3640,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 )
                 .optional()?;
             let (storage_kind, size_bytes, external_ref, media_type) = match head_opt {
-                None => return Ok(None),
+                None => return Ok(RangeDecision::Absent),
                 Some(h) => h,
             };
             let size: u64 = size_bytes.max(0) as u64;
@@ -3565,7 +3653,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
             // 3. range_start at/past size → RangeNotSatisfiable.
             if range_start >= size {
                 tx.commit()?;
-                return Ok(Some(Err((range_start, size))));
+                return Ok(RangeDecision::NotSatisfiable { range_start, size });
             }
             // 4. Clamp the inclusive end to size-1.
             let end = range_end_inclusive.min(size - 1);
@@ -3581,28 +3669,60 @@ impl crate::federation::BlobStorage for SqliteBackend {
                     |row| row.get(0),
                 )?;
                 tx.commit()?;
-                Ok(Some(Ok(crate::federation::BlobRange::Inline(slice))))
+                Ok(RangeDecision::Resolved(
+                    crate::federation::BlobRange::Inline(slice),
+                ))
+            } else if storage_kind == "chunk_dag" {
+                // v4.1 (Cut B) — pull the manifest bytes; the chunk walk
+                // happens in the async outer scope (needs get_blob).
+                let manifest_bytes: Vec<u8> = tx.query_row(
+                    "SELECT bytes_inline FROM federation_blobs WHERE sha256 = ?1",
+                    rusqlite::params![sha_vec],
+                    |row| row.get(0),
+                )?;
+                tx.commit()?;
+                Ok(RangeDecision::ChunkDag {
+                    manifest_bytes,
+                    end,
+                })
             } else {
                 // External — return the ref + clamped range; do NOT fetch.
                 tx.commit()?;
-                Ok(Some(Ok(crate::federation::BlobRange::External {
-                    external_ref: crate::federation::ExternalRef {
-                        uri: external_ref.unwrap_or_default(),
-                        size_bytes: size,
-                        media_type,
+                Ok(RangeDecision::Resolved(
+                    crate::federation::BlobRange::External {
+                        external_ref: crate::federation::ExternalRef {
+                            uri: external_ref.unwrap_or_default(),
+                            size_bytes: size,
+                            media_type,
+                        },
+                        range_start,
+                        range_end_inclusive: end,
                     },
-                    range_start,
-                    range_end_inclusive: end,
-                })))
+                ))
             }
         })()
         .map_err(|e| crate::federation::BlobError::Backend(format!("get_blob_range: {e}")))?;
         match outcome {
-            None => Ok(None),
-            Some(Err((range_start, size))) => {
+            RangeDecision::Absent => Ok(None),
+            RangeDecision::NotSatisfiable { range_start, size } => {
                 Err(crate::federation::BlobError::RangeNotSatisfiable { range_start, size })
             }
-            Some(Ok(range)) => Ok(Some(range)),
+            RangeDecision::Resolved(range) => Ok(Some(range)),
+            RangeDecision::ChunkDag {
+                manifest_bytes,
+                end,
+            } => {
+                let manifest =
+                    crate::federation::blobs::ChunkManifest::from_manifest_bytes(&manifest_bytes)?;
+                let assembled = crate::federation::blobs::assemble_chunk_dag_range(
+                    self,
+                    &manifest,
+                    range_start,
+                    end,
+                )
+                .await?;
+                Ok(Some(crate::federation::BlobRange::Inline(assembled)))
+            }
         }
     }
 
@@ -16683,6 +16803,312 @@ mod tests {
             }
             other => panic!("expected BlobRange::External, got {other:?}"),
         }
+    }
+
+    // ─── v4.1 (CIRISPersist#142, Cut B) — ChunkDag tests ─────────────
+
+    /// Build a 3-chunk inline manifest from three byte slices.
+    #[allow(clippy::type_complexity)]
+    fn three_chunk_manifest(
+        c0: &[u8],
+        c1: &[u8],
+        c2: &[u8],
+    ) -> (
+        crate::federation::ChunkManifest,
+        Vec<([u8; 32], BlobBody)>,
+        [u8; 32],
+    ) {
+        let s0 = sha256_of(c0);
+        let s1 = sha256_of(c1);
+        let s2 = sha256_of(c2);
+        let total = (c0.len() + c1.len() + c2.len()) as u64;
+        let manifest = crate::federation::ChunkManifest {
+            v: 1,
+            total_size: total,
+            chunks: vec![
+                crate::federation::ChunkRef {
+                    sha: s0,
+                    size: c0.len() as u32,
+                },
+                crate::federation::ChunkRef {
+                    sha: s1,
+                    size: c1.len() as u32,
+                },
+                crate::federation::ChunkRef {
+                    sha: s2,
+                    size: c2.len() as u32,
+                },
+            ],
+        };
+        let manifest_sha = sha256_of(&manifest.to_jcs_bytes());
+        let chunks = vec![
+            (s0, BlobBody::Inline(c0.to_vec())),
+            (s1, BlobBody::Inline(c1.to_vec())),
+            (s2, BlobBody::Inline(c2.to_vec())),
+        ];
+        (manifest, chunks, manifest_sha)
+    }
+
+    #[tokio::test]
+    async fn chunk_dag_put_and_get_manifest_round_trip() {
+        let backend = blob_test_backend().await;
+        let (manifest, chunks, manifest_sha) = three_chunk_manifest(b"AAAA", b"BBBB", b"CC");
+        backend
+            .put_blob_chunks(manifest.clone(), chunks)
+            .await
+            .unwrap();
+        // get_blob on the manifest sha returns the parsed manifest.
+        let got = backend.get_blob(&manifest_sha).await.unwrap().unwrap();
+        match got {
+            BlobBody::ChunkDag(m) => assert_eq!(m, manifest),
+            other => panic!("expected ChunkDag, got {other:?}"),
+        }
+        // The individual chunks landed as their own rows.
+        assert!(backend.has_blob(&sha256_of(b"AAAA")).await.unwrap());
+        assert!(backend.has_blob(&sha256_of(b"CC")).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn chunk_dag_get_range_spans_boundary() {
+        let backend = blob_test_backend().await;
+        // chunks: "AAAA"(0..=3) "BBBB"(4..=7) "CC"(8..=9), total 10.
+        let (manifest, chunks, manifest_sha) = three_chunk_manifest(b"AAAA", b"BBBB", b"CC");
+        backend.put_blob_chunks(manifest, chunks).await.unwrap();
+        // [2..=5] spans the chunk0/chunk1 boundary: "AA" + "BB".
+        let got = backend
+            .get_blob_range(&manifest_sha, 2, 5)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, BlobRange::Inline(b"AABB".to_vec()));
+        // Full range assembles the whole blob.
+        let full = backend
+            .get_blob_range(&manifest_sha, 0, 9)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(full, BlobRange::Inline(b"AAAABBBBCC".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn chunk_dag_get_range_within_single_chunk() {
+        let backend = blob_test_backend().await;
+        let (manifest, chunks, manifest_sha) = three_chunk_manifest(b"AAAA", b"BBBB", b"CC");
+        backend.put_blob_chunks(manifest, chunks).await.unwrap();
+        // [5..=6] is entirely inside chunk1 ("BBBB" at 4..=7) → "BB".
+        let got = backend
+            .get_blob_range(&manifest_sha, 5, 6)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, BlobRange::Inline(b"BB".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn chunk_dag_get_range_end_clamped() {
+        let backend = blob_test_backend().await;
+        let (manifest, chunks, manifest_sha) = three_chunk_manifest(b"AAAA", b"BBBB", b"CC");
+        backend.put_blob_chunks(manifest, chunks).await.unwrap();
+        // [8..=999] clamps to [8..=9] = "CC".
+        let got = backend
+            .get_blob_range(&manifest_sha, 8, 999)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, BlobRange::Inline(b"CC".to_vec()));
+        // start past total_size → RangeNotSatisfiable.
+        let err = backend
+            .get_blob_range(&manifest_sha, 10, 20)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BlobError::RangeNotSatisfiable { size: 10, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn chunk_dag_rejects_sha_mismatch_chunk() {
+        let backend = blob_test_backend().await;
+        let (manifest, mut chunks, _) = three_chunk_manifest(b"AAAA", b"BBBB", b"CC");
+        // Corrupt chunk[0]'s bytes so they don't hash to its manifest sha.
+        chunks[0].1 = BlobBody::Inline(b"XXXX".to_vec());
+        let err = backend.put_blob_chunks(manifest, chunks).await.unwrap_err();
+        assert!(matches!(err, BlobError::HashMismatch { .. }));
+        // Atomicity: nothing landed.
+        assert!(!backend.has_blob(&sha256_of(b"BBBB")).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn chunk_dag_rejects_total_size_mismatch() {
+        let backend = blob_test_backend().await;
+        let (mut manifest, chunks, _) = three_chunk_manifest(b"AAAA", b"BBBB", b"CC");
+        manifest.total_size = 999; // lie
+        let err = backend.put_blob_chunks(manifest, chunks).await.unwrap_err();
+        assert!(matches!(err, BlobError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn chunk_dag_range_spans_external_chunk_typed_error() {
+        let backend = blob_test_backend().await;
+        // chunk1 is External — persist can't deref to slice it.
+        let c0 = b"AAAA";
+        let s0 = sha256_of(c0);
+        let s_ext = [0x9Au8; 32];
+        let manifest = crate::federation::ChunkManifest {
+            v: 1,
+            total_size: 4 + 100,
+            chunks: vec![
+                crate::federation::ChunkRef { sha: s0, size: 4 },
+                crate::federation::ChunkRef {
+                    sha: s_ext,
+                    size: 100,
+                },
+            ],
+        };
+        let manifest_sha = sha256_of(&manifest.to_jcs_bytes());
+        let chunks = vec![
+            (s0, BlobBody::Inline(c0.to_vec())),
+            (
+                s_ext,
+                BlobBody::External(ExternalRef {
+                    uri: "s3://bucket/chunk1".into(),
+                    size_bytes: 100,
+                    media_type: None,
+                }),
+            ),
+        ];
+        backend.put_blob_chunks(manifest, chunks).await.unwrap();
+        // A range entirely inside chunk0 is fine.
+        let ok = backend
+            .get_blob_range(&manifest_sha, 0, 3)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ok, BlobRange::Inline(b"AAAA".to_vec()));
+        // A range reaching into the External chunk → typed error.
+        let err = backend
+            .get_blob_range(&manifest_sha, 2, 50)
+            .await
+            .unwrap_err();
+        match err {
+            BlobError::RangeSpansExternalChunk { chunk_sha_hex } => {
+                assert_eq!(chunk_sha_hex, hex::encode(s_ext));
+            }
+            other => panic!("expected RangeSpansExternalChunk, got {other:?}"),
+        }
+    }
+
+    /// v4.1 (CIRISPersist#142, Cut B) — the V061 SQLite 12-step table
+    /// rebuild MUST preserve existing federation_blobs rows (incl. the
+    /// V053 access-tracking columns), keep every index, and admit
+    /// chunk_dag afterward. Drives the embedded migration chain in two
+    /// passes (target V060, insert a row, then run to HEAD = V061).
+    #[test]
+    fn v061_rebuild_preserves_existing_blob_rows() {
+        // A single in-memory connection held across both runner passes
+        // (the embedded runner's Target lets us stop at V060, insert a
+        // row, then run the rest — V061 — on the same connection).
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+
+        // Pass 1: migrate up to and including V060.
+        embedded::migrations::runner()
+            .set_target(refinery::Target::Version(60))
+            .run(&mut conn)
+            .expect("migrate to V060");
+
+        // Insert an inline blob row directly (pre-V061 schema) with
+        // non-default access-tracking values to prove they survive.
+        {
+            let sha = vec![0x11u8; 32];
+            conn.execute(
+                "INSERT INTO federation_blobs (\
+                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, \
+                    media_type, last_accessed_at, access_count\
+                 ) VALUES (?1, 'inline', ?2, NULL, 5, 'text/plain', \
+                    '2026-01-02T03:04:05+00:00', 7)",
+                rusqlite::params![sha, b"hello".to_vec()],
+            )
+            .unwrap();
+        }
+
+        // Pass 2: run the rest of the chain (V061 rebuild).
+        embedded::migrations::runner()
+            .run(&mut conn)
+            .expect("migrate to HEAD (V061)");
+
+        // Verify the row survived with every column intact.
+        let (kind, inline, size, mt, last_acc, acc_count): (
+            String,
+            Vec<u8>,
+            i64,
+            String,
+            String,
+            i64,
+        ) = conn
+            .query_row(
+                "SELECT storage_kind, bytes_inline, size_bytes, media_type, \
+                    last_accessed_at, access_count FROM federation_blobs \
+                 WHERE sha256 = ?1",
+                rusqlite::params![vec![0x11u8; 32]],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .expect("blob row survives V061 rebuild");
+        assert_eq!(kind, "inline");
+        assert_eq!(inline, b"hello".to_vec());
+        assert_eq!(size, 5);
+        assert_eq!(mt, "text/plain");
+        assert_eq!(last_acc, "2026-01-02T03:04:05+00:00");
+        assert_eq!(acc_count, 7);
+
+        // All three indexes survived the rebuild.
+        let idx_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' \
+                    AND tbl_name='federation_blobs' AND name IN \
+                    ('federation_blobs_size_bytes','federation_blobs_first_seen_at',\
+                     'federation_blobs_eviction_score')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx_count, 3, "all three indexes must survive the rebuild");
+
+        // chunk_dag is now an accepted storage_kind (the CHECK admits it).
+        let dag_sha = vec![0x22u8; 32];
+        conn.execute(
+            "INSERT INTO federation_blobs (\
+                sha256, storage_kind, bytes_inline, external_ref, size_bytes, \
+                media_type, last_accessed_at, access_count\
+             ) VALUES (?1, 'chunk_dag', ?2, NULL, 3, NULL, \
+                '2026-01-01T00:00:00+00:00', 0)",
+            rusqlite::params![dag_sha, b"{}".to_vec()],
+        )
+        .expect("chunk_dag row accepted post-V061");
+
+        // And the cross-column CHECK still rejects a malformed chunk_dag
+        // row (external_ref set when it must be NULL).
+        let bad = conn.execute(
+            "INSERT INTO federation_blobs (\
+                sha256, storage_kind, bytes_inline, external_ref, size_bytes, \
+                media_type, last_accessed_at, access_count\
+             ) VALUES (?1, 'chunk_dag', NULL, 's3://x', 3, NULL, \
+                '2026-01-01T00:00:00+00:00', 0)",
+            rusqlite::params![vec![0x33u8; 32]],
+        );
+        assert!(
+            bad.is_err(),
+            "chunk_dag with external_ref must violate CHECK"
+        );
     }
 
     /// Admission ordering test — trust rejection beats inline-size

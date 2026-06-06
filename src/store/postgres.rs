@@ -3495,6 +3495,13 @@ impl crate::federation::BlobStorage for PostgresBackend {
         if let Some(gate) = self.admission_gate() {
             gate.check_blob(&attestation.attesting_key_id).await?;
         }
+        // v4.1 (Cut B) — a ChunkDag body is a multi-row manifest; it
+        // only ever goes through put_blob_chunks.
+        if matches!(body, crate::federation::BlobBody::ChunkDag(_)) {
+            return Err(crate::federation::BlobError::InvalidArgument(
+                "put_blob does not accept a ChunkDag body — use put_blob_chunks".into(),
+            ));
+        }
         let cap = self.inline_bytes_cap();
         if let crate::federation::BlobBody::Inline(ref bytes) = body {
             if bytes.len() > cap {
@@ -3526,6 +3533,12 @@ impl crate::federation::BlobStorage for PostgresBackend {
         let (bytes_inline_opt, external_ref_opt) = match &body {
             crate::federation::BlobBody::Inline(b) => (Some(b.clone()), None),
             crate::federation::BlobBody::External(e) => (None, Some(e.uri.clone())),
+            // Rejected above; matched here only for exhaustiveness.
+            crate::federation::BlobBody::ChunkDag(_) => {
+                return Err(crate::federation::BlobError::InvalidArgument(
+                    "put_blob does not accept a ChunkDag body — use put_blob_chunks".into(),
+                ))
+            }
         };
 
         // 3. Compose the holder attestation envelope. Attestation type
@@ -3671,6 +3684,13 @@ impl crate::federation::BlobStorage for PostgresBackend {
         body: crate::federation::BlobBody,
         media_type: Option<&str>,
     ) -> Result<(), crate::federation::BlobError> {
+        // v4.1 (Cut B) — ChunkDag is a multi-row manifest; routed through
+        // put_blob_chunks, never store_blob_local.
+        if matches!(body, crate::federation::BlobBody::ChunkDag(_)) {
+            return Err(crate::federation::BlobError::InvalidArgument(
+                "store_blob_local does not accept a ChunkDag body — use put_blob_chunks".into(),
+            ));
+        }
         let cap = self.inline_bytes_cap();
         if let crate::federation::BlobBody::Inline(ref bytes) = body {
             if bytes.len() > cap {
@@ -3690,6 +3710,11 @@ impl crate::federation::BlobStorage for PostgresBackend {
         let (bytes_inline_opt, external_ref_opt) = match &body {
             crate::federation::BlobBody::Inline(b) => (Some(b.clone()), None),
             crate::federation::BlobBody::External(e) => (None, Some(e.uri.clone())),
+            crate::federation::BlobBody::ChunkDag(_) => {
+                return Err(crate::federation::BlobError::InvalidArgument(
+                    "store_blob_local does not accept a ChunkDag body — use put_blob_chunks".into(),
+                ))
+            }
         };
         let client = self
             .get_client()
@@ -3715,6 +3740,56 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .map_err(|e| {
                 crate::federation::BlobError::Backend(format!("store_blob_local insert: {e}"))
             })?;
+        Ok(())
+    }
+
+    // v4.1 (CIRISPersist#142, Cut B) — atomic chunked-blob upload.
+    // Validates the manifest + every chunk (per-Inline-chunk SHA + size,
+    // total_size == sum, 1:1 alignment), then inserts the N chunk rows +
+    // the chunk_dag manifest row in ONE transaction (all-or-nothing).
+    async fn put_blob_chunks(
+        &self,
+        manifest: crate::federation::ChunkManifest,
+        chunks: Vec<([u8; 32], crate::federation::BlobBody)>,
+    ) -> Result<(), crate::federation::BlobError> {
+        let cap = self.inline_bytes_cap();
+        // Validation + row preparation (chunks first, manifest last).
+        let rows = crate::federation::blobs::prepare_chunk_rows(&manifest, &chunks, cap)?;
+
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
+        for row in &rows {
+            let sha_vec = row.sha256.to_vec();
+            // media_type is NULL for chunk rows + the manifest row.
+            let media_type_null: Option<String> = None;
+            tx.execute(
+                "INSERT INTO cirislens.federation_blobs (\
+                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type\
+                 ) VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT (sha256) DO NOTHING",
+                &[
+                    &sha_vec,
+                    &row.storage_kind,
+                    &row.bytes_inline,
+                    &row.external_ref,
+                    &row.size_bytes,
+                    &media_type_null,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("put_blob_chunks insert: {e}"))
+            })?;
+        }
+        tx.commit().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("put_blob_chunks commit: {e}"))
+        })?;
         Ok(())
     }
 
@@ -3753,6 +3828,14 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 let bytes: Vec<u8> =
                     row.safe_get_with("bytes_inline", crate::federation::BlobError::Backend)?;
                 Ok(Some(crate::federation::BlobBody::Inline(bytes)))
+            }
+            // v4.1 (Cut B) — parse the JCS manifest from bytes_inline.
+            "chunk_dag" => {
+                let manifest_bytes: Vec<u8> =
+                    row.safe_get_with("bytes_inline", crate::federation::BlobError::Backend)?;
+                let manifest =
+                    crate::federation::blobs::ChunkManifest::from_manifest_bytes(&manifest_bytes)?;
+                Ok(Some(crate::federation::BlobBody::ChunkDag(manifest)))
             }
             "s3" | "external_url" => {
                 let uri: String =
@@ -3863,6 +3946,33 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 let slice: Vec<u8> =
                     slice_row.safe_get_with("slice", crate::federation::BlobError::Backend)?;
                 Ok(Some(crate::federation::BlobRange::Inline(slice)))
+            }
+            // v4.1 (Cut B) — chunk DAG: pull the manifest, walk the
+            // prefix-sum, fetch + slice the covering chunk(s).
+            "chunk_dag" => {
+                let manifest_row = client
+                    .query_one(
+                        "SELECT bytes_inline FROM cirislens.federation_blobs WHERE sha256 = $1",
+                        &[&sha_vec],
+                    )
+                    .await
+                    .map_err(|e| {
+                        crate::federation::BlobError::Backend(format!(
+                            "get_blob_range chunk_dag manifest fetch: {e}"
+                        ))
+                    })?;
+                let manifest_bytes: Vec<u8> = manifest_row
+                    .safe_get_with("bytes_inline", crate::federation::BlobError::Backend)?;
+                let manifest =
+                    crate::federation::blobs::ChunkManifest::from_manifest_bytes(&manifest_bytes)?;
+                let assembled = crate::federation::blobs::assemble_chunk_dag_range(
+                    self,
+                    &manifest,
+                    range_start,
+                    end,
+                )
+                .await?;
+                Ok(Some(crate::federation::BlobRange::Inline(assembled)))
             }
             "s3" | "external_url" => {
                 let uri: String =
@@ -16996,6 +17106,252 @@ mod tests {
             }
             other => panic!("expected BlobRange::External, got {other:?}"),
         }
+    }
+
+    // ─── v4.1 (CIRISPersist#142, Cut B) — PG ChunkDag parity ────────
+
+    /// Build a 3-chunk inline manifest with run-unique chunk bytes (the
+    /// PG test DB is shared, so the SHAs must not collide across runs).
+    #[allow(clippy::type_complexity)]
+    fn pg_three_chunk_manifest(
+        tag: &str,
+    ) -> (
+        crate::federation::ChunkManifest,
+        Vec<([u8; 32], crate::federation::BlobBody)>,
+        [u8; 32],
+    ) {
+        use crate::federation::{BlobBody, ChunkManifest, ChunkRef};
+        let salt = uuid_like();
+        let c0 = format!("{tag}-AAAA-{salt}").into_bytes();
+        let c1 = format!("{tag}-BBBB-{salt}").into_bytes();
+        let c2 = format!("{tag}-CC-{salt}").into_bytes();
+        let s0 = pg_sha256_of(&c0);
+        let s1 = pg_sha256_of(&c1);
+        let s2 = pg_sha256_of(&c2);
+        let total = (c0.len() + c1.len() + c2.len()) as u64;
+        let manifest = ChunkManifest {
+            v: 1,
+            total_size: total,
+            chunks: vec![
+                ChunkRef {
+                    sha: s0,
+                    size: c0.len() as u32,
+                },
+                ChunkRef {
+                    sha: s1,
+                    size: c1.len() as u32,
+                },
+                ChunkRef {
+                    sha: s2,
+                    size: c2.len() as u32,
+                },
+            ],
+        };
+        let manifest_sha = pg_sha256_of(&manifest.to_jcs_bytes());
+        let chunks = vec![
+            (s0, BlobBody::Inline(c0)),
+            (s1, BlobBody::Inline(c1)),
+            (s2, BlobBody::Inline(c2)),
+        ];
+        (manifest, chunks, manifest_sha)
+    }
+
+    /// put_blob_chunks round-trips a 3-chunk blob; get_blob returns the
+    /// manifest; get_blob_range assembles across + within a chunk.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_chunk_dag_round_trip_and_range() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        use crate::federation::{BlobBody, BlobRange, BlobStorage};
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let (manifest, chunks, manifest_sha) = pg_three_chunk_manifest("dag-rt");
+        // Compute the assembled full bytes for the assertion.
+        let mut full = Vec::new();
+        for (_, b) in &chunks {
+            if let BlobBody::Inline(bytes) = b {
+                full.extend_from_slice(bytes);
+            }
+        }
+        let (c0_len, c1_len) = (
+            manifest.chunks[0].size as u64,
+            manifest.chunks[1].size as u64,
+        );
+        backend
+            .put_blob_chunks(manifest.clone(), chunks)
+            .await
+            .unwrap();
+
+        // get_blob returns the parsed manifest.
+        match backend.get_blob(&manifest_sha).await.unwrap().unwrap() {
+            BlobBody::ChunkDag(m) => assert_eq!(m, manifest),
+            other => panic!("expected ChunkDag, got {other:?}"),
+        }
+
+        // Full range assembles the whole blob.
+        assert_eq!(
+            backend
+                .get_blob_range(&manifest_sha, 0, manifest.total_size - 1)
+                .await
+                .unwrap()
+                .unwrap(),
+            BlobRange::Inline(full.clone())
+        );
+
+        // A range spanning the chunk0/chunk1 boundary: last 2 of chunk0 +
+        // first 2 of chunk1.
+        let span_start = c0_len - 2;
+        let span_end = c0_len + 1; // 2 bytes into chunk1
+        let expect: Vec<u8> = full[span_start as usize..=span_end as usize].to_vec();
+        assert_eq!(
+            backend
+                .get_blob_range(&manifest_sha, span_start, span_end)
+                .await
+                .unwrap()
+                .unwrap(),
+            BlobRange::Inline(expect)
+        );
+
+        // A range entirely within chunk1.
+        let inner_start = c0_len + 1;
+        let inner_end = c0_len + c1_len - 2;
+        let expect_inner: Vec<u8> = full[inner_start as usize..=inner_end as usize].to_vec();
+        assert_eq!(
+            backend
+                .get_blob_range(&manifest_sha, inner_start, inner_end)
+                .await
+                .unwrap()
+                .unwrap(),
+            BlobRange::Inline(expect_inner)
+        );
+
+        // Cleanup (shared DB).
+        let _ = backend.delete_blob(&manifest_sha).await;
+        let _ = backend.delete_blob(&manifest.chunks[0].sha).await;
+        let _ = backend.delete_blob(&manifest.chunks[1].sha).await;
+        let _ = backend.delete_blob(&manifest.chunks[2].sha).await;
+    }
+
+    /// SHA-mismatch chunk rejected; total_size mismatch rejected.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_chunk_dag_rejects_bad_inputs() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        use crate::federation::{BlobBody, BlobError, BlobStorage};
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        // SHA mismatch: corrupt chunk[0]'s bytes.
+        let (manifest, mut chunks, _) = pg_three_chunk_manifest("dag-bad-sha");
+        chunks[0].1 = BlobBody::Inline(b"corrupted-bytes".to_vec());
+        assert!(matches!(
+            backend
+                .put_blob_chunks(manifest.clone(), chunks)
+                .await
+                .unwrap_err(),
+            BlobError::HashMismatch { .. }
+        ));
+        // Atomicity: chunk[1] did not land.
+        assert!(!backend.has_blob(&manifest.chunks[1].sha).await.unwrap());
+
+        // total_size mismatch.
+        let (mut manifest2, chunks2, _) = pg_three_chunk_manifest("dag-bad-size");
+        manifest2.total_size += 1;
+        assert!(matches!(
+            backend
+                .put_blob_chunks(manifest2, chunks2)
+                .await
+                .unwrap_err(),
+            BlobError::InvalidArgument(_)
+        ));
+    }
+
+    /// A range spanning an External chunk → typed RangeSpansExternalChunk.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_chunk_dag_range_spans_external_chunk() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        use crate::federation::{
+            BlobBody, BlobError, BlobRange, BlobStorage, ChunkManifest, ChunkRef, ExternalRef,
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let salt = uuid_like();
+        let c0 = format!("ext-AAAA-{salt}").into_bytes();
+        let s0 = pg_sha256_of(&c0);
+        // A run-unique External chunk SHA.
+        let mut s_ext = [0u8; 32];
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        s_ext[..16].copy_from_slice(&nanos.to_be_bytes());
+        s_ext[16..].copy_from_slice(&nanos.to_be_bytes());
+        let manifest = ChunkManifest {
+            v: 1,
+            total_size: c0.len() as u64 + 100,
+            chunks: vec![
+                ChunkRef {
+                    sha: s0,
+                    size: c0.len() as u32,
+                },
+                ChunkRef {
+                    sha: s_ext,
+                    size: 100,
+                },
+            ],
+        };
+        let manifest_sha = pg_sha256_of(&manifest.to_jcs_bytes());
+        let chunks = vec![
+            (s0, BlobBody::Inline(c0.clone())),
+            (
+                s_ext,
+                BlobBody::External(ExternalRef {
+                    uri: format!("s3://bucket/{}", uuid_like()),
+                    size_bytes: 100,
+                    media_type: None,
+                }),
+            ),
+        ];
+        backend
+            .put_blob_chunks(manifest.clone(), chunks)
+            .await
+            .unwrap();
+
+        // Range inside chunk0 only → fine.
+        assert_eq!(
+            backend
+                .get_blob_range(&manifest_sha, 0, (c0.len() - 1) as u64)
+                .await
+                .unwrap()
+                .unwrap(),
+            BlobRange::Inline(c0.clone())
+        );
+        // Range reaching into the External chunk → typed error.
+        match backend
+            .get_blob_range(&manifest_sha, 0, c0.len() as u64 + 10)
+            .await
+            .unwrap_err()
+        {
+            BlobError::RangeSpansExternalChunk { chunk_sha_hex } => {
+                assert_eq!(chunk_sha_hex, hex::encode(s_ext));
+            }
+            other => panic!("expected RangeSpansExternalChunk, got {other:?}"),
+        }
+
+        // Cleanup.
+        let _ = backend.delete_blob(&manifest_sha).await;
+        let _ = backend.delete_blob(&s0).await;
+        let _ = backend.delete_blob(&s_ext).await;
     }
 
     // ─── v3.4.0 (CIRISPersist#123) — PG sweeper parity ─────────────
