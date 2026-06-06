@@ -39,8 +39,17 @@
 
 #[cfg(feature = "cirisaudit")]
 pub mod audit;
+// v4.0 (FSD V4.0 §7, Commit C) — generic substrate caching primitive.
+// TTL + LRU bounded, scope-disjoint keys, window-overlap bucket
+// invalidation (CIRISPersist#160 comment 2). Additive; wiring into the
+// aggregate read primitives is Commit G.
+pub mod cache;
 #[cfg(feature = "cirisnode")]
 pub mod cirisnode;
+// v4.0 (FSD §3) — CEG topic-namespace read surface. The v3.x `read`
+// modules rehome here; `pub mod read` below stays as a façade shim
+// re-exporting `ceg` until the later v4.0 commit removes it.
+pub mod ceg;
 // v3.12.x (CIRISPersist#156) — diagnostic harness panic hook.
 // Compiled only under `--features debug-tools`; release wheels ship
 // without this module. See src/debug/mod.rs + tools/README.md.
@@ -85,6 +94,7 @@ pub mod retention;
 #[cfg(feature = "cirislens_scheduled_tasks")]
 pub mod scheduled_tasks;
 pub mod schema;
+pub mod scope;
 pub mod scrub;
 #[cfg(feature = "secrets")]
 pub mod secrets;

@@ -38,23 +38,50 @@
 //! }
 //! ```
 
+// v4.0 (FSD V4.0 §7, Commit C) — the generic substrate cache surface.
+// Consumers observe `cache_stats()` / `admission_cache_stats()`; the
+// aggregate primitives (Commit G) build the cache internally.
+pub use crate::cache::{
+    AdmissionCache, AdmissionStats, Cache, CacheConfig, CacheStats, DeploymentTier,
+};
+
 // Trait surfaces consumers compose against. Federation peers
 // implement against these, not concrete backend types.
+pub use crate::ceg::ReadEngine;
 pub use crate::derived::DerivedSchema;
 pub use crate::federation::FederationDirectory;
 pub use crate::outbound::OutboundQueue;
-pub use crate::read::ReadEngine;
 pub use crate::store::Backend;
+
+// v4.0 CallerScope substrate (CIRISPersist#150, FSD §4). The read-side
+// cohort_scope admission primitive: scope variant, substrate-built
+// admission set + its sole builder, the §4.3 SQL predicate emitter, and
+// the structured refusal reason Commit E folds into the read `Error`.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub use crate::scope::build_caller_admission;
+pub use crate::scope::{CallerAdmission, CallerScope, ScopeRefusalReason};
 
 // Federation read primitive types (v0.5.0, CIRISPersist#23).
 // Sections A/B/F/E ship in v0.5.0 — trace listing, trace detail,
 // Coherence Ratchet inputs, scoring factor aggregates. Sections
 // C/D/G/H/I land in v0.5.1 after lens validates the v0.5.0 batch.
-pub use crate::read::{
+//
+// v4.0 (FSD §3): these re-exports follow the read surface to its new
+// `crate::ceg` home; the exported names are unchanged.
+pub use crate::ceg::{
     AuditChainAggregate, CoherencePoint, DeviationMetric, DivergenceRow, HashChainGap,
     OverrideRateRow, RecoveryEvent, ScoringFactorAggregate, TemporalDriftRow, TimeWindow,
     TraceComponentRow, TraceCursor, TraceDetail, TraceEnvelopeRefs, TraceFilter, TraceListPage,
     TraceSummary,
+};
+
+// v4.0 (#159, FSD §5/§6) — the repository-statistics aggregate surface:
+// the `Filter` + `Aggregate` traits, the driving `RepositoryFilter`, and
+// the `RepositoryStatistics` result + its nested shapes.
+pub use crate::ceg::{
+    ActionAggregates, Aggregate, ConscienceAggregates, ConsciencePerCheck, DomainBreakdown, Filter,
+    FragilityAggregates, RepositoryFilter, RepositoryStatistics, ScoreAggregates,
+    ScoreDistribution, Totals,
 };
 
 // Lens-derived schema types (v0.4.3, CIRISPersist#18). Lens-core

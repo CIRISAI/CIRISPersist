@@ -94,6 +94,9 @@ struct State {
     /// v3.12.0 (CIRISPersist#153 Ask 2, CEG 0.7 §5.6.8.9) — family
     /// rows keyed by `family_key_id`. Mirrors V059 PG/SQLite PK.
     federation_families: HashMap<String, crate::federation::Family>,
+    /// v4.0 (CEG 0.8 §8.1.13.3) — community rows keyed by
+    /// `community_key_id`. Mirrors V060 PG/SQLite PK.
+    federation_communities: HashMap<String, crate::federation::Community>,
 }
 
 impl Default for MemoryBackend {
@@ -113,6 +116,7 @@ impl Default for MemoryBackend {
                 federation_peer_metadata: HashMap::new(),
                 federation_identity_occurrences: HashMap::new(),
                 federation_families: HashMap::new(),
+                federation_communities: HashMap::new(),
                 blackhole_rules: HashMap::new(),
             }),
         }
@@ -184,6 +188,41 @@ impl MemoryBackend {
         rec.roles = roles;
     }
 
+    /// v4.0 (CIRISPersist#160, FSD §4.6) — test helper: declare a
+    /// community whose roster contains `member_identity_key_ids`, so the
+    /// write-path cohort_scope gate sees the writer as a member. Inserts
+    /// directly into the in-memory roster (skips the `put_community` FK +
+    /// admission path — pure membership fixture for the AV-45 ingest
+    /// tests). Used by the trace-ingest write-gate tests.
+    pub fn add_community_membership(
+        &self,
+        community_key_id: &str,
+        member_identity_key_ids: &[&str],
+    ) {
+        let now = chrono::Utc::now();
+        let members = member_identity_key_ids
+            .iter()
+            .map(|k| crate::federation::types::CommunityMember {
+                key_id: (*k).to_owned(),
+                joined_at: now,
+                role: None,
+            })
+            .collect();
+        let community = crate::federation::Community {
+            community_key_id: community_key_id.to_owned(),
+            community_name: format!("test-community:{community_key_id}"),
+            members,
+            founded_at: now,
+            consensus_protocol: "founder_only".to_owned(),
+            policy_blob: None,
+            persist_row_hash: String::new(),
+        };
+        let mut state = self.state.lock().expect("memory backend lock");
+        state
+            .federation_communities
+            .insert(community_key_id.to_owned(), community);
+    }
+
     /// Snapshot of inserted event rows. For tests.
     pub fn snapshot_events(&self) -> Vec<TraceEventRow> {
         let state = self.state.lock().expect("memory backend lock");
@@ -200,6 +239,52 @@ impl MemoryBackend {
 }
 
 impl Backend for MemoryBackend {
+    /// v4.0 (CIRISPersist#160, FSD §4.4) — delegate to the
+    /// `FederationDirectory` occurrence→identity lookup; `None` means
+    /// the singleton-identity fallback (occurrence == identity).
+    async fn resolve_identity_for_occurrence(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Option<String>, Error> {
+        use crate::federation::FederationDirectory;
+        let io = self
+            .lookup_identity_for_occurrence(occurrence_key_id)
+            .await
+            .map_err(|e| Error::Backend(format!("resolve_identity_for_occurrence: {e}")))?;
+        Ok(io.map(|o| o.identity_key_id))
+    }
+
+    /// v4.0 (CIRISPersist#160, FSD §4.6) — family-half of the writer
+    /// admission; delegates to the `FederationDirectory` fan-out.
+    async fn admission_family_key_ids(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<String>, Error> {
+        use crate::federation::FederationDirectory;
+        let families = self
+            .list_families_for_member(member_identity_key_id)
+            .await
+            .map_err(|e| Error::Backend(format!("admission_family_key_ids: {e}")))?;
+        Ok(families.into_iter().map(|f| f.family_key_id).collect())
+    }
+
+    /// v4.0 (CIRISPersist#160, FSD §4.6) — community-half of the writer
+    /// admission; delegates to the `FederationDirectory` fan-out.
+    async fn admission_community_key_ids(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<String>, Error> {
+        use crate::federation::FederationDirectory;
+        let communities = self
+            .list_communities_for_member(member_identity_key_id)
+            .await
+            .map_err(|e| Error::Backend(format!("admission_community_key_ids: {e}")))?;
+        Ok(communities
+            .into_iter()
+            .map(|c| c.community_key_id)
+            .collect())
+    }
+
     async fn insert_trace_events_batch(
         &self,
         rows: &[TraceEventRow],
@@ -472,6 +557,25 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         attestation: crate::federation::SignedAttestation,
     ) -> Result<(), crate::federation::Error> {
         let mut row = attestation.attestation;
+
+        // v4.0 (CIRISPersist#160 comment 4, FSD §4.6) — AV-45 write-path
+        // cohort_scope admission gate. Runs BEFORE the state lock is
+        // taken (the resolution fan-out acquires the lock itself; holding
+        // it across the await would not be `Send`). The writer
+        // (`attesting_key_id`) must be a member of the target cohort they
+        // stamp. `self` + broad tiers pass with no read; family/community
+        // (no `cohort_target_id` field on attestations) are refused as a
+        // downgrade with no provable membership. A refusal returns before
+        // any row is pushed (verify-then-gate-then-persist).
+        crate::federation::FederationDirectory::check_write_cohort_scope_for(
+            self,
+            &row.attesting_key_id,
+            "put_attestation",
+            &row.cohort_scope,
+            None,
+        )
+        .await?;
+
         let mut state = self.state.lock().expect("memory backend lock");
         // FK enforcement parity with postgres: both attesting_key_id
         // and attested_key_id must exist in federation_keys.
@@ -692,6 +796,51 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by(|a, b| a.family_key_id.cmp(&b.family_key_id));
+        Ok(rows)
+    }
+
+    async fn put_community(
+        &self,
+        community: crate::federation::SignedCommunity,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = community.community;
+        // v4.0 — value-validation admission (consensus_protocol
+        // canonical form). Mirrors put_family.
+        crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
+        let mut state = self.state.lock().expect("memory backend lock");
+        if !state.federation_keys.contains_key(&row.community_key_id) {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "community_key_id {} does not exist in federation_keys",
+                row.community_key_id
+            )));
+        }
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        state
+            .federation_communities
+            .insert(row.community_key_id.clone(), row);
+        Ok(())
+    }
+
+    async fn lookup_community(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Option<crate::federation::Community>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(state.federation_communities.get(community_key_id).cloned())
+    }
+
+    async fn list_communities_for_member(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<crate::federation::Community>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_communities
+            .values()
+            .filter(|c| c.members.iter().any(|m| m.key_id == member_identity_key_id))
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.community_key_id.cmp(&b.community_key_id));
         Ok(rows)
     }
 
@@ -1938,34 +2087,43 @@ impl IsNoneOrZero for Option<i64> {
 // and Memory backend remains for the lighter Backend trait surfaces
 // (insert / dedup / federation directory).
 
+/// Memory-backend read surface (FSD §8).
+///
+/// The [`MemoryBackend`] is a non-SQL, sovereign-mode Pi-class store; it
+/// holds no `trace_events` / `federation_*` relational tables, so the
+/// SQL-heavy CEG read primitives have nothing to read. v4.0 removed
+/// `Error::NotImplemented`, so these honestly surface
+/// [`Error::Backend`](crate::read::Error::Backend) — "this backend has no
+/// relational read substrate" — rather than the retired escape-hatch
+/// variant. The Postgres + SQLite backends are the two that implement
+/// every primitive for real (MISSION §1.5). Every method accepts the
+/// v4.0 `scope: CallerScope` arg for signature parity; it is unused here
+/// because there is no row substrate to gate.
 impl crate::read::ReadEngine for MemoryBackend {
     async fn list_trace_summaries(
         &self,
         _filter: crate::read::TraceFilter,
         _cursor: Option<crate::read::TraceCursor>,
         _limit: i64,
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::TraceListPage, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "list_trace_summaries (memory backend; use postgres for federation reads)",
-        ))
+        Err(memory_read_unsupported("list_trace_summaries"))
     }
 
     async fn get_trace_summary(
         &self,
         _trace_id: &str,
+        _scope: crate::scope::CallerScope,
     ) -> Result<Option<crate::read::TraceSummary>, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "get_trace_summary (memory backend; use postgres for federation reads)",
-        ))
+        Err(memory_read_unsupported("get_trace_summary"))
     }
 
     async fn get_trace_detail(
         &self,
         _trace_id: &str,
+        _scope: crate::scope::CallerScope,
     ) -> Result<Option<crate::read::TraceDetail>, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "get_trace_detail (memory backend; use postgres for federation reads)",
-        ))
+        Err(memory_read_unsupported("get_trace_detail"))
     }
 
     async fn list_tasks(
@@ -1973,10 +2131,9 @@ impl crate::read::ReadEngine for MemoryBackend {
         _filter: crate::read::TaskFilter,
         _cursor: Option<crate::read::TaskCursor>,
         _limit: i64,
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::TaskListPage, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "list_tasks (memory backend; use postgres for federation reads)",
-        ))
+        Err(memory_read_unsupported("list_tasks"))
     }
 
     async fn list_llm_calls(
@@ -1984,37 +2141,41 @@ impl crate::read::ReadEngine for MemoryBackend {
         _filter: crate::read::LlmCallFilter,
         _cursor: Option<crate::read::LlmCallCursor>,
         _limit: i64,
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::LlmCallListPage, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "list_llm_calls (memory backend; use postgres for federation reads)",
-        ))
+        Err(memory_read_unsupported("list_llm_calls"))
     }
 
     async fn aggregate_llm_costs(
         &self,
         _filter: crate::read::LlmCallFilter,
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::LlmCostAggregate, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "aggregate_llm_costs (memory backend; use postgres for federation reads)",
-        ))
+        Err(memory_read_unsupported("aggregate_llm_costs"))
+    }
+
+    async fn get_repository_statistics(
+        &self,
+        _filter: crate::ceg::RepositoryFilter,
+        _scope: crate::scope::CallerScope,
+    ) -> Result<crate::ceg::RepositoryStatistics, crate::read::Error> {
+        Err(memory_read_unsupported("get_repository_statistics"))
     }
 
     async fn corpus_shape(
         &self,
         _filter: crate::read::CorpusShapeFilter,
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::CorpusShape, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "corpus_shape (memory backend; use postgres for federation reads)",
-        ))
+        Err(memory_read_unsupported("corpus_shape"))
     }
 
     async fn aggregate_scrub_stats(
         &self,
         _window: crate::read::TimeWindow,
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::ScrubAggregate, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "aggregate_scrub_stats (memory backend; use postgres for federation reads)",
-        ))
+        Err(memory_read_unsupported("aggregate_scrub_stats"))
     }
 
     async fn list_federation_keys(
@@ -2022,10 +2183,9 @@ impl crate::read::ReadEngine for MemoryBackend {
         _filter: crate::read::FederationKeyFilter,
         _cursor: Option<crate::read::FederationKeyCursor>,
         _limit: i64,
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::FederationKeyListPage, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "list_federation_keys (memory backend; use postgres for federation reads)",
-        ))
+        Err(memory_read_unsupported("list_federation_keys"))
     }
 
     async fn list_attestations(
@@ -2033,10 +2193,19 @@ impl crate::read::ReadEngine for MemoryBackend {
         _filter: crate::read::AttestationFilter,
         _cursor: Option<crate::read::AttestationCursor>,
         _limit: i64,
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::AttestationListPage, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "list_attestations (memory backend; use postgres for federation reads)",
-        ))
+        Err(memory_read_unsupported("list_attestations"))
+    }
+
+    async fn list_attestations_for(
+        &self,
+        _target: &str,
+        _cursor: Option<crate::read::AttestationCursor>,
+        _limit: i64,
+        _scope: crate::scope::CallerScope,
+    ) -> Result<crate::read::AttestationListPage, crate::read::Error> {
+        Err(memory_read_unsupported("list_attestations_for"))
     }
 
     async fn list_revocations(
@@ -2044,10 +2213,9 @@ impl crate::read::ReadEngine for MemoryBackend {
         _filter: crate::read::RevocationFilter,
         _cursor: Option<crate::read::RevocationCursor>,
         _limit: i64,
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::RevocationListPage, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "list_revocations (memory backend; use postgres for federation reads)",
-        ))
+        Err(memory_read_unsupported("list_revocations"))
     }
 
     async fn cross_agent_divergence(
@@ -2055,10 +2223,9 @@ impl crate::read::ReadEngine for MemoryBackend {
         _deployment_domain: &str,
         _window: crate::read::TimeWindow,
         _metric: crate::read::DeviationMetric,
+        _scope: crate::scope::CallerScope,
     ) -> Result<Vec<crate::read::DivergenceRow>, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "cross_agent_divergence (memory backend)",
-        ))
+        Err(memory_read_unsupported("cross_agent_divergence"))
     }
 
     async fn temporal_drift(
@@ -2066,30 +2233,27 @@ impl crate::read::ReadEngine for MemoryBackend {
         _agent_id_hash: &str,
         _baseline: crate::read::TimeWindow,
         _comparison: crate::read::TimeWindow,
+        _scope: crate::scope::CallerScope,
     ) -> Result<Vec<crate::read::TemporalDriftRow>, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "temporal_drift (memory backend)",
-        ))
+        Err(memory_read_unsupported("temporal_drift"))
     }
 
     async fn hash_chain_gaps(
         &self,
         _agent_id_hash: &str,
         _window: crate::read::TimeWindow,
+        _scope: crate::scope::CallerScope,
     ) -> Result<Vec<crate::read::HashChainGap>, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "hash_chain_gaps (memory backend)",
-        ))
+        Err(memory_read_unsupported("hash_chain_gaps"))
     }
 
     async fn conscience_override_rates(
         &self,
         _deployment_domain: &str,
         _window: crate::read::TimeWindow,
+        _scope: crate::scope::CallerScope,
     ) -> Result<Vec<crate::read::OverrideRateRow>, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "conscience_override_rates (memory backend)",
-        ))
+        Err(memory_read_unsupported("conscience_override_rates"))
     }
 
     async fn aggregate_scoring_factors(
@@ -2097,10 +2261,9 @@ impl crate::read::ReadEngine for MemoryBackend {
         _agent_id_hash: &str,
         _window: crate::read::TimeWindow,
         _baseline: Option<crate::read::TimeWindow>,
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::ScoringFactorAggregate, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "aggregate_scoring_factors (memory backend)",
-        ))
+        Err(memory_read_unsupported("aggregate_scoring_factors"))
     }
 
     async fn aggregate_scoring_factors_batch(
@@ -2108,47 +2271,52 @@ impl crate::read::ReadEngine for MemoryBackend {
         _agent_id_hashes: &[String],
         _window: crate::read::TimeWindow,
         _baseline: Option<crate::read::TimeWindow>,
+        _scope: crate::scope::CallerScope,
     ) -> Result<Vec<crate::read::ScoringFactorAggregate>, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "aggregate_scoring_factors_batch (memory backend)",
-        ))
+        Err(memory_read_unsupported("aggregate_scoring_factors_batch"))
     }
 
     async fn count_traces(
         &self,
         _filter: crate::read::TraceFilter,
+        _scope: crate::scope::CallerScope,
     ) -> Result<i64, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "count_traces (memory backend)",
-        ))
+        Err(memory_read_unsupported("count_traces"))
     }
 
     async fn count_overrides(
         &self,
         _filter: crate::read::TraceFilter,
+        _scope: crate::scope::CallerScope,
     ) -> Result<i64, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "count_overrides (memory backend)",
-        ))
+        Err(memory_read_unsupported("count_overrides"))
     }
 
     async fn count_identity_changes(
         &self,
         _filter: crate::read::TraceFilter,
+        _scope: crate::scope::CallerScope,
     ) -> Result<i64, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "count_identity_changes (memory backend)",
-        ))
+        Err(memory_read_unsupported("count_identity_changes"))
     }
 
     async fn aggregate_audit_chain(
         &self,
         _filter: crate::read::TraceFilter,
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::AuditChainAggregate, crate::read::Error> {
-        Err(crate::read::Error::NotImplemented(
-            "aggregate_audit_chain (memory backend)",
-        ))
+        Err(memory_read_unsupported("aggregate_audit_chain"))
     }
+}
+
+/// The memory backend has no relational read substrate; every CEG read
+/// primitive surfaces this stable [`Error::Backend`](crate::read::Error::Backend)
+/// (v4.0 dropped `NotImplemented`). The `read_backend` kind token crosses
+/// the boundary; the per-method context goes to the message.
+fn memory_read_unsupported(method: &str) -> crate::read::Error {
+    crate::read::Error::Backend(format!(
+        "{method}: memory backend has no relational read substrate; use postgres or sqlite for CEG reads"
+    ))
 }
 
 // ─── DerivedSchema impl (v0.4.3, CIRISPersist#18) ──────────────────
@@ -2265,6 +2433,8 @@ mod tests {
             deployment_type: None,
             deployment_region: None,
             deployment_trust_mode: None,
+            cohort_scope: "federation".to_string(),
+            cohort_target_id: None,
         }
     }
 
@@ -2421,6 +2591,8 @@ mod tests {
                 },
             ],
             deployment_profile: None,
+            cohort_scope: "federation".into(),
+            cohort_target_id: None,
             signature: "AAAA".into(),
             signature_key_id: "ciris-agent-key:dead".into(),
         };
@@ -3128,6 +3300,8 @@ mod tests {
             deployment_type: None,
             deployment_region: None,
             deployment_trust_mode: None,
+            cohort_scope: "federation".to_string(),
+            cohort_target_id: None,
         }
     }
 
@@ -3280,6 +3454,8 @@ mod tests {
                 deployment_type: None,
                 deployment_region: None,
                 deployment_trust_mode: None,
+                cohort_scope: "federation".to_string(),
+                cohort_target_id: None,
             };
             backend.insert_trace_events_batch(&[row]).await.unwrap();
         }

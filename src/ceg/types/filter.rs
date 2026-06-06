@@ -1,89 +1,19 @@
-//! Common types shared across `read::` primitives.
+//! [`TraceFilter`] — filter struct for trace queries (sections A / E) —
+//! and [`DeviationMetric`], the Coherence Ratchet divergence
+//! discriminator (section F).
 //!
-//! - [`TimeWindow`] — `(since, until)` pair used by every windowed
-//!   primitive (sections E / F / G / H).
-//! - [`TraceCursor`] — opaque cursor for trace-summary listing
-//!   (section A).
-//! - [`TraceFilter`] — filter struct for trace queries (sections A / E).
-//! - [`DeviationMetric`] — discriminator for Coherence Ratchet
-//!   divergence queries (section F).
+//! Moved from `src/read/types.rs` in v4.0 (FSD §3.3). No behaviour
+//! change; the `Filter` trait + composable filter primitives the FSD
+//! §5 names land in a LATER v4.0 commit — this file holds only the
+//! v3.x filter shapes relocated under the new namespace.
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::window::TimeWindow;
 use crate::schema::TraceLevel;
 
-/// Half-open time window `[since, until)`.
-///
-/// All windowed primitives take a [`TimeWindow`] rather than separate
-/// `since`/`until` parameters to make "filter by time" a single typed
-/// argument. AV-4 caveat: window-filter inputs are caller-provided
-/// wall-clock; the time-bound assertion is best-effort, not
-/// authenticated. Documented on every windowed primitive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TimeWindow {
-    /// Inclusive lower bound.
-    pub since: DateTime<Utc>,
-    /// Exclusive upper bound.
-    pub until: DateTime<Utc>,
-}
-
-impl TimeWindow {
-    /// Construct + validate. Returns
-    /// [`super::Error::InvalidArgument`] if `since >= until`.
-    pub fn new(since: DateTime<Utc>, until: DateTime<Utc>) -> Result<Self, super::Error> {
-        if since >= until {
-            return Err(super::Error::InvalidArgument(format!(
-                "TimeWindow: since ({since}) must be < until ({until})"
-            )));
-        }
-        Ok(TimeWindow { since, until })
-    }
-
-    /// Window duration.
-    pub fn duration(&self) -> chrono::Duration {
-        self.until - self.since
-    }
-}
-
-/// Opaque cursor for [`super::ReadEngine::list_trace_summaries`].
-///
-/// Built around the `(started_at, trace_id)` tuple — paged queries
-/// order by `started_at DESC, trace_id DESC` (newest-first triage),
-/// and the cursor encodes the last item's `(ts, trace_id)` so the
-/// next page picks up at the next-older trace.
-///
-/// Wire-stable: serializes to JSON, the PyO3 boundary treats it as
-/// an opaque string. Internal field shape may evolve in v0.5.x; the
-/// JSON shape is the contract. v0.5.0 carries a `version` tag so
-/// future evolutions can route by it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TraceCursor {
-    /// Cursor format version. v0.5.0 ships `"v1"`. Future cursor
-    /// shape evolutions add a new variant + this field discriminates.
-    pub version: String,
-
-    /// `started_at` of the last item on the previous page.
-    pub last_started_at: DateTime<Utc>,
-
-    /// `trace_id` of the last item — tiebreaker for traces with
-    /// equal `started_at`.
-    pub last_trace_id: String,
-}
-
-impl TraceCursor {
-    /// Construct a v1 cursor from the trailing edge of a result page.
-    pub fn from_trailing(last_started_at: DateTime<Utc>, last_trace_id: String) -> Self {
-        TraceCursor {
-            version: "v1".to_owned(),
-            last_started_at,
-            last_trace_id,
-        }
-    }
-}
-
-/// Filter struct for [`super::ReadEngine::list_trace_summaries`] and
-/// the granular `count_*` primitives.
+/// Filter struct for [`crate::ceg::ReadEngine::list_trace_summaries`]
+/// and the granular `count_*` primitives.
 ///
 /// Every field is optional; an empty filter returns the full table
 /// (subject to the caller's `limit`). Filters compose AND-style — a
@@ -141,7 +71,7 @@ pub struct TraceFilter {
     pub cognitive_state: Option<String>,
 }
 
-/// Discriminator for [`super::ReadEngine::cross_agent_divergence`]
+/// Discriminator for [`crate::ceg::ReadEngine::cross_agent_divergence`]
 /// — which DMA / conscience metric drives the z-score.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -172,4 +102,67 @@ impl DeviationMetric {
             DeviationMetric::ConscienceOverrideRate => None,
         }
     }
+}
+
+/// Filter primitives — the composable shape substrate read primitives
+/// accept (FSD §5.1).
+///
+/// Each primitive defines its own concrete filter (e.g.
+/// [`crate::ceg::RepositoryFilter`], [`TraceFilter`]); the trait exists
+/// to unify the `time-window + scope + agent-id-hash` shape so the
+/// substrate can write *one* cache helper that works across every
+/// primitive. It does **not** let consumers compose arbitrary filters.
+pub trait Filter {
+    /// The window the filter selects.
+    fn window(&self) -> &TimeWindow;
+    /// `agent_id_hash` discriminators (empty = all agents).
+    fn agent_id_hashes(&self) -> &[String];
+    /// `deployment_domain` discriminators (empty = all domains).
+    fn deployment_domains(&self) -> &[String];
+    /// `cohort_scope` discriminators (empty = scope-default).
+    fn cohort_scope_in(&self) -> &[String];
+
+    /// Cache-key digest — the cache substrate folds this into its
+    /// [`CacheKey`](crate::cache::CacheKey) so two callers with
+    /// identical `(method, filter, scope, bucket)` share an entry.
+    ///
+    /// The default impl hashes `(type_tag, window, agent_id_hashes,
+    /// deployment_domains, cohort_scope_in)`. **It is correct ONLY when
+    /// an implementer's discriminating state is fully captured by those
+    /// fields.** A filter with additional result-changing fields —
+    /// `task_classes`, `fragility_only`, any future discriminator — MUST
+    /// override this method to fold those fields into the hash, or two
+    /// distinct filters collide on one cache entry and the second serves
+    /// the first's answer (FSD §5.1).
+    fn cache_key_digest(&self) -> [u8; 32] {
+        let mut h = <sha2::Sha256 as sha2::Digest>::new();
+        sha2::Digest::update(&mut h, b"Filter:default:v4.0\0");
+        for chunk in canonical_window_bytes(self.window()) {
+            sha2::Digest::update(&mut h, [chunk]);
+        }
+        for a in self.agent_id_hashes() {
+            sha2::Digest::update(&mut h, a.as_bytes());
+            sha2::Digest::update(&mut h, b"\0");
+        }
+        for d in self.deployment_domains() {
+            sha2::Digest::update(&mut h, d.as_bytes());
+            sha2::Digest::update(&mut h, b"\0");
+        }
+        for s in self.cohort_scope_in() {
+            sha2::Digest::update(&mut h, s.as_bytes());
+            sha2::Digest::update(&mut h, b"\0");
+        }
+        sha2::Digest::finalize(h).into()
+    }
+}
+
+/// Canonical byte encoding of a [`TimeWindow`] for cache-key digests —
+/// the two unix-millisecond bounds, little-endian. Shared by the
+/// [`Filter::cache_key_digest`] default impl and every concrete
+/// override so a window hashes identically everywhere.
+pub fn canonical_window_bytes(w: &TimeWindow) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out[..8].copy_from_slice(&w.since.timestamp_millis().to_le_bytes());
+    out[8..].copy_from_slice(&w.until.timestamp_millis().to_le_bytes());
+    out
 }

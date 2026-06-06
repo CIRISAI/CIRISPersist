@@ -96,6 +96,13 @@ pub struct SqliteBackend {
     /// v3.6.0 (CIRISPersist#134) — perceptual-hash matcher for the
     /// `put_blob_signing` admission hook. `None` = no hook (default).
     perceptual_hash_matcher: std::sync::RwLock<Option<crate::federation::SharedMatcher>>,
+    /// v4.0 (CIRISConformance#11 round 2) — per-backend-instance
+    /// repository-statistics cache (§7.1). Scoped to *this* backend so a
+    /// SQLite engine never serves an entry a prior Postgres engine wrote
+    /// (cross-backend poisoning) and `reset_engine` drops it with the
+    /// backend. `Arc` so the engine layer / FFI `cache_stats()` can hold
+    /// a handle to the same cache.
+    repo_stats_cache: std::sync::Arc<crate::ceg::aggregates::repository::RepositoryStatsCache>,
 }
 
 impl SqliteBackend {
@@ -127,7 +134,18 @@ impl SqliteBackend {
             )),
             admission_gate: std::sync::RwLock::new(None),
             perceptual_hash_matcher: std::sync::RwLock::new(None),
+            repo_stats_cache: std::sync::Arc::new(crate::cache::Cache::new()),
         }
+    }
+
+    /// v4.0 (CIRISConformance#11 round 2) — this backend's
+    /// repository-statistics cache (§7.1). The engine / FFI
+    /// `cache_stats()` accessor reads from here so observability reports
+    /// *this* backend's cache, not a process global.
+    pub fn repo_stats_cache(
+        &self,
+    ) -> &std::sync::Arc<crate::ceg::aggregates::repository::RepositoryStatsCache> {
+        &self.repo_stats_cache
     }
 
     /// v3.4.0 (CIRISPersist#123) — install the trust-weighted
@@ -269,11 +287,58 @@ impl SqliteBackend {
             )),
             admission_gate: std::sync::RwLock::new(None),
             perceptual_hash_matcher: std::sync::RwLock::new(None),
+            repo_stats_cache: std::sync::Arc::new(crate::cache::Cache::new()),
         })
     }
 }
 
 impl Backend for SqliteBackend {
+    /// v4.0 (CIRISPersist#160, FSD §4.4) — delegate to the
+    /// `FederationDirectory` occurrence→identity lookup; `None` means
+    /// the singleton-identity fallback (occurrence == identity).
+    async fn resolve_identity_for_occurrence(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Option<String>, Error> {
+        use crate::federation::FederationDirectory;
+        let io = self
+            .lookup_identity_for_occurrence(occurrence_key_id)
+            .await
+            .map_err(|e| Error::Backend(format!("resolve_identity_for_occurrence: {e}")))?;
+        Ok(io.map(|o| o.identity_key_id))
+    }
+
+    /// v4.0 (CIRISPersist#160, FSD §4.6) — family-half of the writer
+    /// admission for the write-path cohort_scope gate.
+    async fn admission_family_key_ids(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<String>, Error> {
+        use crate::federation::FederationDirectory;
+        let families = self
+            .list_families_for_member(member_identity_key_id)
+            .await
+            .map_err(|e| Error::Backend(format!("admission_family_key_ids: {e}")))?;
+        Ok(families.into_iter().map(|f| f.family_key_id).collect())
+    }
+
+    /// v4.0 (CIRISPersist#160, FSD §4.6) — community-half of the writer
+    /// admission for the write-path cohort_scope gate.
+    async fn admission_community_key_ids(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<String>, Error> {
+        use crate::federation::FederationDirectory;
+        let communities = self
+            .list_communities_for_member(member_identity_key_id)
+            .await
+            .map_err(|e| Error::Backend(format!("admission_community_key_ids: {e}")))?;
+        Ok(communities
+            .into_iter()
+            .map(|c| c.community_key_id)
+            .collect())
+    }
+
     async fn insert_trace_events_batch(
         &self,
         rows: &[TraceEventRow],
@@ -306,11 +371,11 @@ impl Backend for SqliteBackend {
                 original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
                 agent_role, agent_template, deployment_domain, \
                 deployment_type, deployment_region, deployment_trust_mode, \
-                verification_source\
+                verification_source, cohort_scope, cohort_target_id\
                 ) VALUES (\
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, \
-                ?28, ?29, ?30, ?31, ?32, ?33, ?34\
+                ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36\
                 ) ON CONFLICT (agent_id_hash, trace_id, thought_id, event_type, \
                 attempt_index, ts) DO NOTHING";
 
@@ -351,7 +416,7 @@ impl Backend for SqliteBackend {
 
                     let attempt_index_i64 = i64::from(row.attempt_index);
 
-                    let params: [SqlValue; 34] = [
+                    let params: [SqlValue; 36] = [
                         SqlValue::Text(row.trace_id.clone()),
                         SqlValue::Text(row.thought_id.clone()),
                         opt_text(row.task_id.as_deref()),
@@ -393,6 +458,12 @@ impl Backend for SqliteBackend {
                         opt_text(row.deployment_trust_mode.as_deref()),
                         // v2.0 verification_source (V044, #91).
                         SqlValue::Text(row.verification_source.as_wire_str().to_owned()),
+                        // v4.0 cohort_scope + target (V060, #160). NOT
+                        // NULL column with DEFAULT 'federation'; we
+                        // always pass the row's value (the ingest
+                        // pipeline resolved the self-target already).
+                        SqlValue::Text(row.cohort_scope.clone()),
+                        opt_text(row.cohort_target_id.as_deref()),
                     ];
 
                     let n = stmt.execute(params_from_iter(params.iter()))?;
@@ -697,7 +768,8 @@ impl Backend for SqliteBackend {
                         audit_signature, original_content_hash, scrub_signature, \
                         scrub_key_id, scrub_timestamp, agent_role, agent_template, \
                         deployment_domain, deployment_type, deployment_region, \
-                        deployment_trust_mode, verification_source";
+                        deployment_trust_mode, verification_source, \
+                        cohort_scope, cohort_target_id";
             let (sql, rows) = match agent {
                 Some(h) => {
                     let sql = format!(
@@ -1239,6 +1311,25 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // backstop for direct-SQL bypass.
         crate::federation::admission::check_cohort_scope(&row.cohort_scope)?;
 
+        // v4.0 (CIRISPersist#160 comment 4, FSD §4.6) — AV-45 write-path
+        // cohort_scope admission gate. The writer (`attesting_key_id`)
+        // must be a MEMBER of the target cohort they stamp. Attestations
+        // carry a `cohort_scope` label but no `cohort_target_id` field,
+        // so `self` + the broad belonging-tiers pass (no target needed)
+        // while `family` / `community` — which require a named target to
+        // membership-validate — are refused (a downgrade with no provable
+        // membership). Runs AFTER value-validation and BEFORE
+        // persist_row_hash + INSERT: a refused row leaves no trace
+        // (verify-then-gate-then-persist, MISSION §1.6).
+        crate::federation::FederationDirectory::check_write_cohort_scope_for(
+            self,
+            &row.attesting_key_id,
+            "put_attestation",
+            &row.cohort_scope,
+            None,
+        )
+        .await?;
+
         // v3.0.0 (CIRISPersist#116, CEG 0.2 §6.1) — structural-composer
         // dedup on `(references_attestation_id, attestation_type,
         // attesting_key_id)`. Look up the candidate row's
@@ -1714,6 +1805,101 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             rows.collect()
         })()
         .map_err(|e| crate::federation::Error::Backend(format!("list_families_for_member: {e}")))
+    }
+
+    async fn put_community(
+        &self,
+        community: crate::federation::SignedCommunity,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = community.community;
+        crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let members_json = serde_json::to_string(&row.members)
+            .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
+        let policy_blob_json = match &row.policy_blob {
+            Some(v) => Some(serde_json::to_string(v).map_err(|e| {
+                crate::federation::Error::Backend(format!("policy_blob serialize: {e}"))
+            })?),
+            None => None,
+        };
+        let conn = self.conn.clone();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
+            conn.execute(
+                "INSERT INTO federation_communities (\
+                    community_key_id, community_name, members, founded_at, \
+                    consensus_protocol, policy_blob, persist_row_hash\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    row.community_key_id,
+                    row.community_name,
+                    members_json,
+                    row.founded_at.to_rfc3339(),
+                    row.consensus_protocol,
+                    policy_blob_json,
+                    row.persist_row_hash,
+                ],
+            )?;
+            Ok(())
+        })()
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("FOREIGN KEY") {
+                crate::federation::Error::InvalidArgument(format!(
+                    "FK constraint violated on community insert: {msg}"
+                ))
+            } else {
+                crate::federation::Error::Backend(format!("insert community: {msg}"))
+            }
+        })?;
+        Ok(())
+    }
+
+    async fn lookup_community(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Option<crate::federation::Community>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let key = community_key_id.to_owned();
+        (move || -> Result<Option<crate::federation::Community>, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT community_key_id, community_name, members, founded_at, \
+                        consensus_protocol, policy_blob, persist_row_hash \
+                     FROM federation_communities WHERE community_key_id = ?1",
+                [&key],
+                sqlite_row_to_community,
+            )
+            .optional()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("lookup_community: {e}")))
+    }
+
+    async fn list_communities_for_member(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<crate::federation::Community>, crate::federation::Error> {
+        // sqlite full-scan with members membership check via json_each.
+        // EXISTS subquery against json_each unrolls the array and matches
+        // any entry whose key_id == the target.
+        let conn = self.conn.clone();
+        let key = member_identity_key_id.to_owned();
+        (move || -> Result<Vec<crate::federation::Community>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT community_key_id, community_name, members, founded_at, \
+                        consensus_protocol, policy_blob, persist_row_hash \
+                     FROM federation_communities \
+                     WHERE EXISTS ( \
+                         SELECT 1 FROM json_each(federation_communities.members) \
+                         WHERE json_extract(value, '$.key_id') = ?1 \
+                     ) \
+                     ORDER BY community_key_id ASC",
+            )?;
+            let rows = stmt.query_map([&key], sqlite_row_to_community)?;
+            rows.collect()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("list_communities_for_member: {e}")))
     }
 
     async fn attach_key_pqc_signature(
@@ -4930,6 +5116,10 @@ fn sqlite_row_to_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, Tr
             deployment_type: row.get("deployment_type")?,
             deployment_region: row.get("deployment_region")?,
             deployment_trust_mode: row.get("deployment_trust_mode")?,
+            // v4.0 (CIRISPersist#160, V060). Column is NOT NULL DEFAULT
+            // 'federation'; target is nullable. Round-trip both back.
+            cohort_scope: row.get("cohort_scope")?,
+            cohort_target_id: row.get("cohort_target_id")?,
         },
     ))
 }
@@ -5116,6 +5306,41 @@ fn sqlite_row_to_family(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::fede
         founded_at: parse_rfc3339(&founded_at),
         consensus_protocol: row.get("consensus_protocol")?,
         consensus_protocol_entrenched: entrenched != 0,
+        persist_row_hash: row.get("persist_row_hash")?,
+    })
+}
+
+fn sqlite_row_to_community(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::Community> {
+    let members_text: String = row.get("members")?;
+    let members: Vec<crate::federation::CommunityMember> = serde_json::from_str(&members_text)
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            )
+        })?;
+    let policy_blob_text: Option<String> = row.get("policy_blob")?;
+    let policy_blob: Option<serde_json::Value> = match policy_blob_text {
+        Some(t) => Some(serde_json::from_str(&t).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            )
+        })?),
+        None => None,
+    };
+    let founded_at: String = row.get("founded_at")?;
+    Ok(crate::federation::Community {
+        community_key_id: row.get("community_key_id")?,
+        community_name: row.get("community_name")?,
+        members,
+        founded_at: parse_rfc3339(&founded_at),
+        consensus_protocol: row.get("consensus_protocol")?,
+        policy_blob,
         persist_row_hash: row.get("persist_row_hash")?,
     })
 }
@@ -5405,6 +5630,114 @@ fn sqlite_row_to_trace_summary(
     })
 }
 
+/// Per-trace rollup SELECT for `get_repository_statistics` (#159).
+///
+/// SQLite mirror of `REPO_PER_TRACE_SELECT`. `BOOL_AND`/`BOOL_OR` →
+/// `MIN`/`MAX` over the 0/1 a `json_extract` on a JSON boolean yields;
+/// decoded by [`sqlite_row_to_per_trace`]. Same `payload`-path
+/// extraction as `SQLITE_TRACE_SUMMARY_SELECT`.
+const SQLITE_REPO_PER_TRACE_SELECT: &str = "\
+    MAX(deployment_domain) AS deployment_domain, \
+    MAX(agent_id_hash) AS agent_id_hash, \
+    AVG(CASE WHEN event_type = 'DMA_RESULTS' \
+        THEN json_extract(payload, '$.csdma_plausibility_score') END) AS plausibility, \
+    AVG(CASE WHEN event_type = 'DMA_RESULTS' \
+        THEN json_extract(payload, '$.dsdma_domain_alignment') END) AS alignment, \
+    MIN(CASE WHEN event_type = 'CONSCIENCE_RESULT' \
+        THEN json_extract(payload, '$.conscience_passed') END) AS conscience_passed, \
+    MAX(CASE WHEN event_type = 'CONSCIENCE_RESULT' \
+        THEN json_extract(payload, '$.action_was_overridden') END) AS action_was_overridden, \
+    MIN(CASE WHEN event_type = 'CONSCIENCE_RESULT' \
+        THEN json_extract(payload, '$.entropy_passed') END) AS entropy_passed, \
+    MIN(CASE WHEN event_type = 'CONSCIENCE_RESULT' \
+        THEN json_extract(payload, '$.coherence_passed') END) AS coherence_passed, \
+    MIN(CASE WHEN event_type = 'CONSCIENCE_RESULT' \
+        THEN json_extract(payload, '$.optimization_veto_passed') END) AS optimization_veto_passed, \
+    MIN(CASE WHEN event_type = 'CONSCIENCE_RESULT' \
+        THEN json_extract(payload, '$.epistemic_humility_passed') END) AS epistemic_humility_passed, \
+    MAX(CASE WHEN event_type = 'ACTION_RESULT' \
+        THEN json_extract(payload, '$.action_executed') END) AS selected_action, \
+    MIN(CASE WHEN event_type = 'ACTION_RESULT' \
+        THEN json_extract(payload, '$.success') END) AS action_success, \
+    MAX(CASE WHEN event_type = 'IDMA_RESULT' \
+        THEN json_extract(payload, '$.idma_fragility_flag') END) AS fragility_flag, \
+    MAX(CASE WHEN event_type = 'IDMA_RESULT' \
+        THEN json_extract(payload, '$.idma_phase') END) AS fragility_phase";
+
+/// Decode a [`SQLITE_REPO_PER_TRACE_SELECT`] row into a `PerTraceRow`.
+/// Infallible — every field is read as a tolerant `Option`; a malformed
+/// score folds in as NULL (excluded from the §6.3 `sample_count`) rather
+/// than failing the whole rollup.
+fn sqlite_row_to_per_trace(
+    row: &rusqlite::Row<'_>,
+) -> crate::ceg::aggregates::repository::PerTraceRow {
+    let optb = |col: &str| {
+        row.get::<_, Option<i64>>(col)
+            .ok()
+            .flatten()
+            .map(|v| v != 0)
+    };
+    let optf = |col: &str| row.get::<_, Option<f64>>(col).ok().flatten();
+    let opts = |col: &str| row.get::<_, Option<String>>(col).ok().flatten();
+    crate::ceg::aggregates::repository::PerTraceRow {
+        deployment_domain: opts("deployment_domain"),
+        agent_id_hash: opts("agent_id_hash"),
+        plausibility: optf("plausibility"),
+        alignment: optf("alignment"),
+        conscience_passed: optb("conscience_passed"),
+        action_was_overridden: optb("action_was_overridden"),
+        entropy_passed: optb("entropy_passed"),
+        coherence_passed: optb("coherence_passed"),
+        optimization_veto_passed: optb("optimization_veto_passed"),
+        epistemic_humility_passed: optb("epistemic_humility_passed"),
+        selected_action: opts("selected_action"),
+        action_success: optb("action_success"),
+        fragility_flag: optb("fragility_flag"),
+        fragility_phase: opts("fragility_phase"),
+    }
+}
+
+/// HAVING fragment restricting the rolled-up per-trace set to the given
+/// task classes (SQLite mirror of `pg_task_class_having`). Uses
+/// `MAX(task_id)` LIKE with `ESCAPE '\\'` to match the canonical
+/// `TaskClass::from_task_id` prefix logic.
+fn sqlite_task_class_having(classes: &[crate::ceg::TaskClass]) -> String {
+    use crate::ceg::TaskClass;
+    let mut ors: Vec<String> = Vec::new();
+    for c in classes {
+        let pred = match c {
+            TaskClass::QaEval => {
+                "MAX(task_id) LIKE 'qa\\_%' ESCAPE '\\' OR MAX(task_id) LIKE 'qa-eval%'"
+            }
+            TaskClass::RealUserDiscord => {
+                "MAX(task_id) LIKE 'real\\_user\\_discord\\_%' ESCAPE '\\'"
+            }
+            TaskClass::RealUserCli => "MAX(task_id) LIKE 'real\\_user\\_cli\\_%' ESCAPE '\\'",
+            TaskClass::RealUserApi => "MAX(task_id) LIKE 'real\\_user\\_api\\_%' ESCAPE '\\'",
+            TaskClass::WakeupRitual => {
+                "instr(MAX(task_id), 'wakeup') > 0 \
+                 AND MAX(task_id) NOT LIKE 'real\\_user\\_%' ESCAPE '\\'"
+            }
+            TaskClass::Discord => {
+                "MAX(task_id) LIKE 'discord\\_%' ESCAPE '\\' \
+                 AND instr(MAX(task_id), 'wakeup') = 0"
+            }
+            TaskClass::Other => {
+                "MAX(task_id) IS NOT NULL \
+                 AND MAX(task_id) NOT LIKE 'qa\\_%' ESCAPE '\\' \
+                 AND MAX(task_id) NOT LIKE 'qa-eval%' \
+                 AND MAX(task_id) NOT LIKE 'real\\_user\\_discord\\_%' ESCAPE '\\' \
+                 AND MAX(task_id) NOT LIKE 'real\\_user\\_cli\\_%' ESCAPE '\\' \
+                 AND MAX(task_id) NOT LIKE 'real\\_user\\_api\\_%' ESCAPE '\\' \
+                 AND MAX(task_id) NOT LIKE 'discord\\_%' ESCAPE '\\' \
+                 AND instr(MAX(task_id), 'wakeup') = 0"
+            }
+        };
+        ors.push(format!("({pred})"));
+    }
+    format!("({})", ors.join(" OR "))
+}
+
 /// Decode a `trace_llm_calls` row into a typed [`TraceLlmCallRow`].
 /// Mirrors `pg_row_to_llm_call_row`; the SELECT must alias every
 /// column read here.
@@ -5519,6 +5852,30 @@ fn sqlite_filter_where(
     Ok((sql, binds))
 }
 
+/// [`sqlite_filter_where`] + the §4.3 cohort_scope gate AND-composed in.
+/// The scope binds follow the filter binds (numbered `?N` continues), so
+/// callers append no further params before these. Used by the
+/// trace-counting / audit-chain primitives whose `where_sql` + `binds`
+/// are reused across sub-queries.
+#[allow(clippy::type_complexity)]
+fn sqlite_scope_filter_where(
+    filter: &crate::read::TraceFilter,
+    scope: &crate::scope::CallerScope,
+) -> Result<(String, Vec<SqlValue>), crate::read::Error> {
+    let (where_sql, mut binds) = sqlite_filter_where(filter)?;
+    let (frag, sbinds) = crate::store::scope_bind::scope_predicate_sqlite(
+        scope,
+        "cohort_scope",
+        "cohort_target_id",
+        binds.len(),
+    );
+    binds.extend(sbinds);
+    Ok((
+        crate::store::scope_bind::and_compose(&where_sql, &frag),
+        binds,
+    ))
+}
+
 /// SQL predicate matching a [`crate::read::TaskClass`] against the
 /// `task_id` column — mirrors `TaskClass::from_task_id`. SQLite
 /// supports `LIKE … ESCAPE` and `instr()` (arg order
@@ -5617,6 +5974,7 @@ impl crate::read::ReadEngine for SqliteBackend {
         filter: crate::read::TraceFilter,
         cursor: Option<crate::read::TraceCursor>,
         limit: i64,
+        scope: crate::scope::CallerScope,
     ) -> Result<crate::read::TraceListPage, crate::read::Error> {
         if !(1..=10_000).contains(&limit) {
             return Err(crate::read::Error::InvalidArgument(format!(
@@ -5631,7 +5989,20 @@ impl crate::read::ReadEngine for SqliteBackend {
                 )));
             }
         }
-        let (where_sql, mut binds) = sqlite_filter_where(&filter)?;
+        let (mut where_sql, mut binds) = sqlite_filter_where(&filter)?;
+        // §4.3 scope gate — AND-composed onto the trace WHERE. Scope binds
+        // come right after the filter binds (numbered ?N continues), before
+        // the cursor/limit params.
+        {
+            let (frag, sbinds) = crate::store::scope_bind::scope_predicate_sqlite(
+                &scope,
+                "cohort_scope",
+                "cohort_target_id",
+                binds.len(),
+            );
+            where_sql = crate::store::scope_bind::and_compose(&where_sql, &frag);
+            binds.extend(sbinds);
+        }
         // HAVING gates the cursor on the GROUPED row's started_at /
         // trace_id (aggregates can't go in WHERE). SQLite supports
         // row-value comparison.
@@ -5682,20 +6053,30 @@ impl crate::read::ReadEngine for SqliteBackend {
     async fn get_trace_summary(
         &self,
         trace_id: &str,
+        scope: crate::scope::CallerScope,
     ) -> Result<Option<crate::read::TraceSummary>, crate::read::Error> {
         let trace_id = trace_id.to_owned();
         let conn = self.conn.clone();
+        // §4.3 scope gate — trace_id is ?1, scope binds start at ?2.
+        let (scope_frag, scope_binds) = crate::store::scope_bind::scope_predicate_sqlite(
+            &scope,
+            "cohort_scope",
+            "cohort_target_id",
+            1,
+        );
         (move || -> Result<Option<crate::read::TraceSummary>, crate::read::Error> {
             let conn = conn.lock();
             let sql = format!(
                 "SELECT {select} FROM trace_events \
-                     WHERE trace_id = ?1 GROUP BY trace_id",
+                     WHERE trace_id = ?1 AND {scope_frag} GROUP BY trace_id",
                 select = SQLITE_TRACE_SUMMARY_SELECT,
             );
             let mut stmt = conn
                 .prepare(&sql)
                 .map_err(sqlite_read_err("get_trace_summary prepare"))?;
-            stmt.query_row([&trace_id], sqlite_row_to_trace_summary)
+            let mut binds: Vec<SqlValue> = vec![SqlValue::Text(trace_id.clone())];
+            binds.extend(scope_binds);
+            stmt.query_row(params_from_iter(binds.iter()), sqlite_row_to_trace_summary)
                 .optional()
                 .map_err(sqlite_read_err("get_trace_summary query"))
         })()
@@ -5704,23 +6085,36 @@ impl crate::read::ReadEngine for SqliteBackend {
     async fn get_trace_detail(
         &self,
         trace_id: &str,
+        scope: crate::scope::CallerScope,
     ) -> Result<Option<crate::read::TraceDetail>, crate::read::Error> {
         let trace_id = trace_id.to_owned();
         let conn = self.conn.clone();
+        // §4.3 scope gate on the summary lookup (trace_id ?1, scope ?2+).
+        // The component/llm sub-reads are keyed by trace_id and only run
+        // once the scope-gated summary admits the trace, so they inherit
+        // the gate without re-applying the predicate.
+        let (scope_frag, scope_binds) = crate::store::scope_bind::scope_predicate_sqlite(
+            &scope,
+            "cohort_scope",
+            "cohort_target_id",
+            1,
+        );
         (move || -> Result<Option<crate::read::TraceDetail>, crate::read::Error> {
             let conn = conn.lock();
 
-            // Summary first — early-out on absent trace.
+            // Summary first — early-out on absent OR scope-invisible trace.
             let summary_sql = format!(
                 "SELECT {select} FROM trace_events \
-                     WHERE trace_id = ?1 GROUP BY trace_id",
+                     WHERE trace_id = ?1 AND {scope_frag} GROUP BY trace_id",
                 select = SQLITE_TRACE_SUMMARY_SELECT,
             );
             let summary = {
                 let mut stmt = conn
                     .prepare(&summary_sql)
                     .map_err(sqlite_read_err("get_trace_detail summary prepare"))?;
-                stmt.query_row([&trace_id], sqlite_row_to_trace_summary)
+                let mut sbinds: Vec<SqlValue> = vec![SqlValue::Text(trace_id.clone())];
+                sbinds.extend(scope_binds.iter().cloned());
+                stmt.query_row(params_from_iter(sbinds.iter()), sqlite_row_to_trace_summary)
                     .optional()
                     .map_err(sqlite_read_err("get_trace_detail summary"))?
             };
@@ -5739,7 +6133,8 @@ impl crate::read::ReadEngine for SqliteBackend {
                             original_content_hash, scrub_signature, scrub_key_id, \
                             scrub_timestamp, agent_role, agent_template, \
                             deployment_domain, deployment_type, deployment_region, \
-                            deployment_trust_mode, verification_source";
+                            deployment_trust_mode, verification_source, \
+                        cohort_scope, cohort_target_id";
             let event_rows: Vec<(i64, TraceEventRow)> = {
                 let sql = format!(
                     "SELECT {cols} FROM trace_events \
@@ -5818,6 +6213,7 @@ impl crate::read::ReadEngine for SqliteBackend {
         filter: crate::read::TaskFilter,
         cursor: Option<crate::read::TaskCursor>,
         limit: i64,
+        scope: crate::scope::CallerScope,
     ) -> Result<crate::read::TaskListPage, crate::read::Error> {
         if !(1..=10_000).contains(&limit) {
             return Err(crate::read::Error::InvalidArgument(format!(
@@ -5856,6 +6252,19 @@ impl crate::read::ReadEngine for SqliteBackend {
         }
         if let Some(tc) = filter.task_class {
             parts.push(sqlite_task_class_predicate(tc).to_owned());
+        }
+        // §4.3 scope gate on the task-page trace rows. The per-task
+        // trace-summary sub-query (below) is keyed by already-admitted
+        // task_ids, so it inherits this gate.
+        {
+            let (frag, sbinds) = crate::store::scope_bind::scope_predicate_sqlite(
+                &scope,
+                "cohort_scope",
+                "cohort_target_id",
+                binds.len(),
+            );
+            parts.push(frag);
+            binds.extend(sbinds);
         }
         let where_sql = format!("WHERE {}", parts.join(" AND "));
         let having_sql = match &cursor {
@@ -5990,6 +6399,10 @@ impl crate::read::ReadEngine for SqliteBackend {
         filter: crate::read::LlmCallFilter,
         cursor: Option<crate::read::LlmCallCursor>,
         limit: i64,
+        // `trace_llm_calls` carries no per-row cohort_scope; visibility is
+        // inherited from the parent trace and gated at the trace layer by
+        // lens-core. `scope` is a documented no-op here (v4.0, FSD §8).
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::LlmCallListPage, crate::read::Error> {
         if !(1..=10_000).contains(&limit) {
             return Err(crate::read::Error::InvalidArgument(format!(
@@ -6062,6 +6475,8 @@ impl crate::read::ReadEngine for SqliteBackend {
     async fn aggregate_llm_costs(
         &self,
         filter: crate::read::LlmCallFilter,
+        // No-op — see [`Self::list_llm_calls`].
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::LlmCostAggregate, crate::read::Error> {
         let (join_sql, where_sql, binds) = sqlite_llm_filter_sql(&filter)?;
         // by_agent / by_domain need the parent join even when the
@@ -6245,9 +6660,135 @@ impl crate::read::ReadEngine for SqliteBackend {
         })()
     }
 
+    /// #159: repository statistics (FSD §6.2, §10.2 two-step).
+    ///
+    /// Step 1: materialize the windowed + scoped per-trace rows (one
+    /// GROUP BY trace_id over the V042 per-event `payload` extractions,
+    /// the §4.3 scope predicate AND-composed at the event-row level).
+    /// Step 2: fold them in Rust via the backend-agnostic
+    /// [`fold_statistics`] — byte-identical to the Postgres single CTE
+    /// (§10.4 parity). Routed through the §7 substrate cache.
+    ///
+    /// [`fold_statistics`]: crate::ceg::aggregates::repository::fold_statistics
+    async fn get_repository_statistics(
+        &self,
+        filter: crate::ceg::RepositoryFilter,
+        scope: crate::scope::CallerScope,
+    ) -> Result<crate::ceg::RepositoryStatistics, crate::read::Error> {
+        use crate::ceg::aggregates::repository as repo;
+
+        let period = filter.window;
+        let cache = &self.repo_stats_cache;
+        let key =
+            repo::repository_stats_cache_key(&filter, &scope, cache.config().invalidation_bucket);
+        if let Some(cached) = cache.try_get(&key) {
+            // The stored struct carries `cache_hit: false` (its value at
+            // compute time); flip it on the served clone so the result
+            // reports the served-from-cache fact (FSD §6.1 / §7.4). The
+            // original `evaluated_at_unix_ms` is preserved — it is the
+            // *cached* evaluation time, not now().
+            let mut hit = (*cached).clone();
+            hit.cache_hit = true;
+            return Ok(hit);
+        }
+
+        // Build the windowed WHERE (window required) + filter discriminators.
+        let mut binds: Vec<SqlValue> = Vec::new();
+        let mut parts: Vec<String> = Vec::new();
+        binds.push(SqlValue::Text(period.since.to_rfc3339()));
+        parts.push(format!("ts >= ?{}", binds.len()));
+        binds.push(SqlValue::Text(period.until.to_rfc3339()));
+        parts.push(format!("ts < ?{}", binds.len()));
+        if !filter.agent_id_hashes.is_empty() {
+            let mut ph = Vec::new();
+            for h in &filter.agent_id_hashes {
+                binds.push(SqlValue::Text(h.clone()));
+                ph.push(format!("?{}", binds.len()));
+            }
+            parts.push(format!("agent_id_hash IN ({})", ph.join(",")));
+        }
+        if !filter.deployment_domains.is_empty() {
+            let mut ph = Vec::new();
+            for d in &filter.deployment_domains {
+                binds.push(SqlValue::Text(d.clone()));
+                ph.push(format!("?{}", binds.len()));
+            }
+            parts.push(format!("deployment_domain IN ({})", ph.join(",")));
+        }
+        if !filter.cohort_scope_in.is_empty() {
+            let mut ph = Vec::new();
+            for s in &filter.cohort_scope_in {
+                binds.push(SqlValue::Text(s.clone()));
+                ph.push(format!("?{}", binds.len()));
+            }
+            parts.push(format!("cohort_scope IN ({})", ph.join(",")));
+        }
+        {
+            let (frag, sbinds) = crate::store::scope_bind::scope_predicate_sqlite(
+                &scope,
+                "cohort_scope",
+                "cohort_target_id",
+                binds.len(),
+            );
+            parts.push(frag);
+            binds.extend(sbinds);
+        }
+        let where_sql = format!("WHERE {}", parts.join(" AND "));
+
+        let mut having_parts: Vec<String> = Vec::new();
+        if !filter.task_classes.is_empty() {
+            having_parts.push(sqlite_task_class_having(&filter.task_classes));
+        }
+        if filter.fragility_only {
+            // MAX over the 0/1 json_extract yields 1 iff any IDMA_RESULT
+            // flagged fragile.
+            having_parts.push(
+                "MAX(CASE WHEN event_type = 'IDMA_RESULT' \
+                 THEN json_extract(payload, '$.idma_fragility_flag') END) = 1"
+                    .to_string(),
+            );
+        }
+        let having_sql = if having_parts.is_empty() {
+            String::new()
+        } else {
+            format!("HAVING {}", having_parts.join(" AND "))
+        };
+
+        let sql = format!(
+            "SELECT {select} FROM trace_events {where_sql} \
+             GROUP BY trace_id {having_sql}",
+            select = SQLITE_REPO_PER_TRACE_SELECT,
+        );
+
+        let conn = self.conn.clone();
+        let per_trace = (move || -> Result<Vec<repo::PerTraceRow>, crate::read::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(sqlite_read_err("get_repository_statistics prepare"))?;
+            let rows = stmt
+                .query_map(params_from_iter(binds.iter()), |row| {
+                    Ok(sqlite_row_to_per_trace(row))
+                })
+                .map_err(sqlite_read_err("get_repository_statistics query"))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(sqlite_read_err("get_repository_statistics row"))?);
+            }
+            Ok(out)
+        })()?;
+
+        let evaluated_at = chrono::Utc::now().timestamp_millis();
+        let stats = repo::fold_statistics(period, &per_trace, evaluated_at, false);
+        let size = repo::estimate_size(&stats);
+        cache.store(key, stats.clone(), size);
+        Ok(stats)
+    }
+
     async fn corpus_shape(
         &self,
         filter: crate::read::CorpusShapeFilter,
+        scope: crate::scope::CallerScope,
     ) -> Result<crate::read::CorpusShape, crate::read::Error> {
         let window = filter.time_window;
         let mut parts: Vec<String> = Vec::new();
@@ -6267,6 +6808,19 @@ impl crate::read::ReadEngine for SqliteBackend {
         if let Some(d) = &filter.deployment_domain {
             binds.push(SqlValue::Text(d.clone()));
             parts.push(format!("deployment_domain = ?{}", binds.len()));
+        }
+        // §4.3 scope gate. `where_sql` + `binds` are reused across every
+        // corpus sub-query (all scan `trace_events`), so composing here
+        // gates the whole rollup uniformly.
+        {
+            let (frag, sbinds) = crate::store::scope_bind::scope_predicate_sqlite(
+                &scope,
+                "cohort_scope",
+                "cohort_target_id",
+                binds.len(),
+            );
+            parts.push(frag);
+            binds.extend(sbinds);
         }
         let where_sql = format!("WHERE {}", parts.join(" AND "));
         let conn = self.conn.clone();
@@ -6492,18 +7046,30 @@ impl crate::read::ReadEngine for SqliteBackend {
     async fn aggregate_scrub_stats(
         &self,
         window: crate::read::TimeWindow,
+        scope: crate::scope::CallerScope,
     ) -> Result<crate::read::ScrubAggregate, crate::read::Error> {
-        let since = window.since.to_rfc3339();
-        let until = window.until.to_rfc3339();
+        let mut binds: Vec<SqlValue> = vec![
+            SqlValue::Text(window.since.to_rfc3339()),
+            SqlValue::Text(window.until.to_rfc3339()),
+        ];
+        // §4.3 scope gate — ts window is ?1/?2, scope binds start at ?3.
+        let (scope_frag, scope_binds) = crate::store::scope_bind::scope_predicate_sqlite(
+            &scope,
+            "cohort_scope",
+            "cohort_target_id",
+            binds.len(),
+        );
+        binds.extend(scope_binds);
         let conn = self.conn.clone();
         (move || -> Result<crate::read::ScrubAggregate, crate::read::Error> {
             let conn = conn.lock();
             // Per-trace collapse: MAX(pii_scrubbed) is BOOL_OR;
             // MAX(trace_level) is the §H reference's MAX().
-            let sql = "WITH traces AS ( \
+            let sql = format!(
+                "WITH traces AS ( \
                                SELECT trace_id, MAX(pii_scrubbed) AS scrubbed, \
                                       MAX(trace_level) AS trace_level \
-                               FROM trace_events WHERE ts >= ?1 AND ts < ?2 \
+                               FROM trace_events WHERE ts >= ?1 AND ts < ?2 AND {scope_frag} \
                                GROUP BY trace_id \
                            ) \
                            SELECT COUNT(*) FILTER (WHERE scrubbed = 1) AS total_scrubbed, \
@@ -6516,12 +7082,13 @@ impl crate::read::ReadEngine for SqliteBackend {
                                   COUNT(*) FILTER ( \
                                       WHERE scrubbed = 1 AND trace_level = 'full_traces') \
                                       AS c_full \
-                           FROM traces";
+                           FROM traces"
+            );
             let (envelopes_scrubbed, by_trace_level) = {
                 let mut stmt = conn
-                    .prepare(sql)
+                    .prepare(&sql)
                     .map_err(sqlite_read_err("aggregate_scrub_stats prepare"))?;
-                stmt.query_row([&since, &until], |row| {
+                stmt.query_row(params_from_iter(binds.iter()), |row| {
                     let total: i64 = row.get("total_scrubbed")?;
                     let mut map = std::collections::HashMap::new();
                     for (lvl, col) in [
@@ -6554,6 +7121,9 @@ impl crate::read::ReadEngine for SqliteBackend {
         filter: crate::read::FederationKeyFilter,
         cursor: Option<crate::read::FederationKeyCursor>,
         limit: i64,
+        // `federation_keys` is the federation-tier directory — no per-row
+        // cohort_scope/target. `scope` no-op in v4.0 (FSD §8).
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::FederationKeyListPage, crate::read::Error> {
         if !(1..=10_000).contains(&limit) {
             return Err(crate::read::Error::InvalidArgument(format!(
@@ -6661,6 +7231,7 @@ impl crate::read::ReadEngine for SqliteBackend {
         filter: crate::read::AttestationFilter,
         cursor: Option<crate::read::AttestationCursor>,
         limit: i64,
+        scope: crate::scope::CallerScope,
     ) -> Result<crate::read::AttestationListPage, crate::read::Error> {
         if !(1..=10_000).contains(&limit) {
             return Err(crate::read::Error::InvalidArgument(format!(
@@ -6687,6 +7258,20 @@ impl crate::read::ReadEngine for SqliteBackend {
             } else {
                 "pqc_completed_at IS NULL".to_owned()
             });
+        }
+        // §4.3 scope gate — federation_attestations carries cohort_scope
+        // (V056) + attested_key_id (the row's target identity, V055). The
+        // gate compares the row's cohort_scope/attested_key_id against the
+        // reader's admission.
+        {
+            let (frag, sbinds) = crate::store::scope_bind::scope_predicate_sqlite(
+                &scope,
+                "cohort_scope",
+                "attested_key_id",
+                binds.len(),
+            );
+            parts.push(frag);
+            binds.extend(sbinds);
         }
         if let Some(c) = &cursor {
             if c.version != "v1" {
@@ -6744,11 +7329,103 @@ impl crate::read::ReadEngine for SqliteBackend {
         })()
     }
 
+    /// #135 + part of #150 — list every attestation whose subject is
+    /// `target` (`attested_key_id = target`), newest-first, cursor-paged.
+    /// Scope-gates (§4.3) on the attestation's own `(cohort_scope,
+    /// attested_key_id)`. `federation_attestations` carries `cohort_scope`
+    /// (V056) but no separate `cohort_target_id`, so the subject doubles
+    /// as the membership target (mirrors `list_attestations`). Uses
+    /// `idx_federation_attestations_v060_by_target
+    /// (attested_key_id, cohort_scope, asserted_at DESC)`.
+    async fn list_attestations_for(
+        &self,
+        target: &str,
+        cursor: Option<crate::read::AttestationCursor>,
+        limit: i64,
+        scope: crate::scope::CallerScope,
+    ) -> Result<crate::read::AttestationListPage, crate::read::Error> {
+        if !(1..=10_000).contains(&limit) {
+            return Err(crate::read::Error::InvalidArgument(format!(
+                "limit must be in [1, 10000], got {limit}"
+            )));
+        }
+        let mut parts: Vec<String> = Vec::new();
+        let mut binds: Vec<SqlValue> = Vec::new();
+        // The by-target predicate — the leading index column.
+        binds.push(SqlValue::Text(target.to_owned()));
+        parts.push(format!("attested_key_id = ?{}", binds.len()));
+        // §4.3 scope gate on the attestation's own cohort_scope /
+        // attested_key_id (subject doubles as membership target).
+        {
+            let (frag, sbinds) = crate::store::scope_bind::scope_predicate_sqlite(
+                &scope,
+                "cohort_scope",
+                "attested_key_id",
+                binds.len(),
+            );
+            parts.push(frag);
+            binds.extend(sbinds);
+        }
+        if let Some(c) = &cursor {
+            if c.version != "v1" {
+                return Err(crate::read::Error::InvalidCursor(format!(
+                    "AttestationCursor version {} unsupported; v1 only",
+                    c.version
+                )));
+            }
+            binds.push(SqlValue::Text(c.last_asserted_at.to_rfc3339()));
+            let p_at = binds.len();
+            binds.push(SqlValue::Text(c.last_attestation_id.clone()));
+            let p_id = binds.len();
+            parts.push(format!(
+                "(asserted_at, attestation_id) < (?{p_at}, ?{p_id})"
+            ));
+        }
+        let where_sql = format!("WHERE {}", parts.join(" AND "));
+        binds.push(SqlValue::Integer(limit));
+        let p_limit = binds.len();
+        let sql = format!(
+            "SELECT attestation_id, attesting_key_id, attested_key_id, \
+                    attestation_type, weight, asserted_at, expires_at, \
+                    attestation_envelope, original_content_hash, \
+                    scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
+                    scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope \
+             FROM federation_attestations {where_sql} \
+             ORDER BY asserted_at DESC, attestation_id DESC LIMIT ?{p_limit}"
+        );
+        let conn = self.conn.clone();
+        let limit_usize = limit as usize;
+        (move || -> Result<crate::read::AttestationListPage, crate::read::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(sqlite_read_err("list_attestations_for prepare"))?;
+            let items: Vec<crate::federation::Attestation> = stmt
+                .query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)
+                .map_err(sqlite_read_err("list_attestations_for query"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sqlite_read_err("list_attestations_for row"))?;
+            let next_cursor = if items.len() == limit_usize {
+                let last = &items[items.len() - 1];
+                Some(crate::read::AttestationCursor::from_trailing(
+                    last.asserted_at,
+                    last.attestation_id.clone(),
+                ))
+            } else {
+                None
+            };
+            Ok(crate::read::AttestationListPage { items, next_cursor })
+        })()
+    }
+
     async fn list_revocations(
         &self,
         filter: crate::read::RevocationFilter,
         cursor: Option<crate::read::RevocationCursor>,
         limit: i64,
+        // Revocations are federation-tier transparency events; `scope`
+        // no-op in v4.0 (FSD §8).
+        _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::RevocationListPage, crate::read::Error> {
         if !(1..=10_000).contains(&limit) {
             return Err(crate::read::Error::InvalidArgument(format!(
@@ -6831,14 +7508,33 @@ impl crate::read::ReadEngine for SqliteBackend {
         deployment_domain: &str,
         window: crate::read::TimeWindow,
         metric: crate::read::DeviationMetric,
+        scope: crate::scope::CallerScope,
     ) -> Result<Vec<crate::read::DivergenceRow>, crate::read::Error> {
         use crate::read::DeviationMetric;
         let domain = deployment_domain.to_owned();
         let since = window.since.to_rfc3339();
         let until = window.until.to_rfc3339();
+        // §4.3 scope gate — domain/since/until are ?1/?2/?3, scope at ?4+.
+        let (scope_frag, scope_binds) = crate::store::scope_bind::scope_predicate_sqlite(
+            &scope,
+            "cohort_scope",
+            "cohort_target_id",
+            3,
+        );
         let conn = self.conn.clone();
         (move || -> Result<Vec<crate::read::DivergenceRow>, crate::read::Error> {
             let conn = conn.lock();
+            // Build the bound param list once: positional [domain, since,
+            // until] then the scope binds. Both metric branches share it.
+            let mk_binds = || {
+                let mut b: Vec<SqlValue> = vec![
+                    SqlValue::Text(domain.clone()),
+                    SqlValue::Text(since.clone()),
+                    SqlValue::Text(until.clone()),
+                ];
+                b.extend(scope_binds.iter().cloned());
+                b
+            };
             // Per-agent (mean, sample_count) pairs. SQLite has no
             // STDDEV; the domain mean+stddev of the per-agent means
             // is computed in Rust.
@@ -6848,11 +7544,14 @@ impl crate::read::ReadEngine for SqliteBackend {
                 mean: f64,
                 sample_count: i64,
             }
-            let per_agent: Vec<PerAgent> =
-                if matches!(metric, DeviationMetric::ConscienceOverrideRate) {
-                    // Per-trace MAX collapses recursive CONSCIENCE_RESULT
-                    // retries; per-agent rate over distinct traces.
-                    let sql = "WITH per_trace AS ( \
+            let per_agent: Vec<PerAgent> = if matches!(
+                metric,
+                DeviationMetric::ConscienceOverrideRate
+            ) {
+                // Per-trace MAX collapses recursive CONSCIENCE_RESULT
+                // retries; per-agent rate over distinct traces.
+                let sql = format!(
+                    "WITH per_trace AS ( \
                                        SELECT agent_id_hash, MIN(agent_name) AS agent_name, \
                                               trace_id, \
                                               MAX(CASE WHEN event_type = 'CONSCIENCE_RESULT' \
@@ -6861,7 +7560,7 @@ impl crate::read::ReadEngine for SqliteBackend {
                                                   THEN 1 ELSE 0 END) AS was_overridden \
                                        FROM trace_events \
                                        WHERE deployment_domain = ?1 \
-                                             AND ts >= ?2 AND ts < ?3 \
+                                             AND ts >= ?2 AND ts < ?3 AND {scope_frag} \
                                        GROUP BY agent_id_hash, trace_id \
                                    ) \
                                    SELECT agent_id_hash, MIN(agent_name) AS agent_name, \
@@ -6869,62 +7568,63 @@ impl crate::read::ReadEngine for SqliteBackend {
                                           CAST(SUM(was_overridden) AS REAL) \
                                             / COUNT(*) AS mean \
                                    FROM per_trace GROUP BY agent_id_hash \
-                                   HAVING COUNT(*) > 0";
-                    let mut stmt = conn
-                        .prepare(sql)
-                        .map_err(sqlite_read_err("cross_agent_divergence override prepare"))?;
-                    let collected = stmt
-                        .query_map([&domain, &since, &until], |row| {
-                            Ok(PerAgent {
-                                agent_id_hash: row.get("agent_id_hash")?,
-                                agent_name: row.get("agent_name")?,
-                                mean: row.get("mean")?,
-                                sample_count: row.get("sample_count")?,
-                            })
+                                   HAVING COUNT(*) > 0"
+                );
+                let mut stmt = conn
+                    .prepare(&sql)
+                    .map_err(sqlite_read_err("cross_agent_divergence override prepare"))?;
+                let collected = stmt
+                    .query_map(params_from_iter(mk_binds().iter()), |row| {
+                        Ok(PerAgent {
+                            agent_id_hash: row.get("agent_id_hash")?,
+                            agent_name: row.get("agent_name")?,
+                            mean: row.get("mean")?,
+                            sample_count: row.get("sample_count")?,
                         })
-                        .map_err(sqlite_read_err("cross_agent_divergence override query"))?
-                        .collect::<Result<Vec<_>, _>>();
-                    collected.map_err(sqlite_read_err("cross_agent_divergence override row"))?
-                } else {
-                    let (event_type_filter, field): (&str, &str) = match metric {
-                        DeviationMetric::CsdmaPlausibility => {
-                            ("DMA_RESULTS", "csdma_plausibility_score")
-                        }
-                        DeviationMetric::DsdmaDomainAlignment => {
-                            ("DMA_RESULTS", "dsdma_domain_alignment")
-                        }
-                        DeviationMetric::IdmaKEff => ("IDMA_RESULT", "idma_k_eff"),
-                        DeviationMetric::IdmaCorrelationRisk => {
-                            ("IDMA_RESULT", "idma_correlation_risk")
-                        }
-                        DeviationMetric::ConscienceOverrideRate => unreachable!(),
-                    };
-                    let sql = format!(
+                    })
+                    .map_err(sqlite_read_err("cross_agent_divergence override query"))?
+                    .collect::<Result<Vec<_>, _>>();
+                collected.map_err(sqlite_read_err("cross_agent_divergence override row"))?
+            } else {
+                let (event_type_filter, field): (&str, &str) = match metric {
+                    DeviationMetric::CsdmaPlausibility => {
+                        ("DMA_RESULTS", "csdma_plausibility_score")
+                    }
+                    DeviationMetric::DsdmaDomainAlignment => {
+                        ("DMA_RESULTS", "dsdma_domain_alignment")
+                    }
+                    DeviationMetric::IdmaKEff => ("IDMA_RESULT", "idma_k_eff"),
+                    DeviationMetric::IdmaCorrelationRisk => {
+                        ("IDMA_RESULT", "idma_correlation_risk")
+                    }
+                    DeviationMetric::ConscienceOverrideRate => unreachable!(),
+                };
+                let sql = format!(
                         "SELECT agent_id_hash, MIN(agent_name) AS agent_name, \
                                     AVG(json_extract(payload, '$.{field}')) AS mean, \
                                     COUNT(*) AS sample_count \
                              FROM trace_events \
-                             WHERE deployment_domain = ?1 AND ts >= ?2 AND ts < ?3 \
+                             WHERE deployment_domain = ?1 AND ts >= ?2 AND ts < ?3 AND {scope_frag} \
                                    AND event_type = '{event_type_filter}' \
                                    AND json_extract(payload, '$.{field}') IS NOT NULL \
                              GROUP BY agent_id_hash HAVING COUNT(*) > 0"
                     );
-                    let mut stmt = conn
-                        .prepare(&sql)
-                        .map_err(sqlite_read_err("cross_agent_divergence prepare"))?;
-                    let collected = stmt
-                        .query_map([&domain, &since, &until], |row| {
-                            Ok(PerAgent {
-                                agent_id_hash: row.get("agent_id_hash")?,
-                                agent_name: row.get("agent_name")?,
-                                mean: row.get::<_, Option<f64>>("mean")?.unwrap_or(0.0),
-                                sample_count: row.get("sample_count")?,
-                            })
+                let mut stmt = conn
+                    .prepare(&sql)
+                    .map_err(sqlite_read_err("cross_agent_divergence prepare"))?;
+                let collected = stmt
+                    .query_map(params_from_iter(mk_binds().iter()), |row| {
+                        Ok(PerAgent {
+                            agent_id_hash: row.get("agent_id_hash")?,
+                            agent_name: row.get("agent_name")?,
+                            mean: row.get::<_, Option<f64>>("mean")?.unwrap_or(0.0),
+                            sample_count: row.get("sample_count")?,
                         })
-                        .map_err(sqlite_read_err("cross_agent_divergence query"))?
-                        .collect::<Result<Vec<_>, _>>();
-                    collected.map_err(sqlite_read_err("cross_agent_divergence row"))?
-                };
+                    })
+                    .map_err(sqlite_read_err("cross_agent_divergence query"))?
+                    .collect::<Result<Vec<_>, _>>();
+                collected.map_err(sqlite_read_err("cross_agent_divergence row"))?
+            };
 
             // Domain mean + sample stddev of the per-agent means.
             let n = per_agent.len() as f64;
@@ -6972,6 +7672,7 @@ impl crate::read::ReadEngine for SqliteBackend {
         agent_id_hash: &str,
         baseline: crate::read::TimeWindow,
         comparison: crate::read::TimeWindow,
+        scope: crate::scope::CallerScope,
     ) -> Result<Vec<crate::read::TemporalDriftRow>, crate::read::Error> {
         use crate::read::DeviationMetric;
         let agent = agent_id_hash.to_owned();
@@ -6979,6 +7680,13 @@ impl crate::read::ReadEngine for SqliteBackend {
         let b_until = baseline.until.to_rfc3339();
         let c_since = comparison.since.to_rfc3339();
         let c_until = comparison.until.to_rfc3339();
+        // §4.3 scope gate — positional params are ?1..?5, scope at ?6+.
+        let (scope_frag, scope_binds) = crate::store::scope_bind::scope_predicate_sqlite(
+            &scope,
+            "cohort_scope",
+            "cohort_target_id",
+            5,
+        );
         let conn = self.conn.clone();
         (move || -> Result<Vec<crate::read::TemporalDriftRow>, crate::read::Error> {
             let conn = conn.lock();
@@ -7009,18 +7717,26 @@ impl crate::read::ReadEngine for SqliteBackend {
                            CASE WHEN ts >= ?2 AND ts < ?3 THEN 0 ELSE 1 END AS win, \
                            json_extract(payload, '$.{field}') AS v \
                          FROM trace_events \
-                         WHERE agent_id_hash = ?1 AND event_type = '{et}' \
+                         WHERE agent_id_hash = ?1 AND event_type = '{et}' AND {scope_frag} \
                                AND json_extract(payload, '$.{field}') IS NOT NULL \
                                AND ((ts >= ?2 AND ts < ?3) OR (ts >= ?4 AND ts < ?5))"
                 );
                 let mut base: Vec<f64> = Vec::new();
                 let mut comp: Vec<f64> = Vec::new();
                 {
+                    let mut binds: Vec<SqlValue> = vec![
+                        SqlValue::Text(agent.clone()),
+                        SqlValue::Text(b_since.clone()),
+                        SqlValue::Text(b_until.clone()),
+                        SqlValue::Text(c_since.clone()),
+                        SqlValue::Text(c_until.clone()),
+                    ];
+                    binds.extend(scope_binds.iter().cloned());
                     let mut stmt = conn
                         .prepare(&sql)
                         .map_err(sqlite_read_err("temporal_drift prepare"))?;
                     let mut rows = stmt
-                        .query([&agent, &b_since, &b_until, &c_since, &c_until])
+                        .query(params_from_iter(binds.iter()))
                         .map_err(sqlite_read_err("temporal_drift query"))?;
                     while let Some(row) =
                         rows.next().map_err(sqlite_read_err("temporal_drift row"))?
@@ -7067,6 +7783,10 @@ impl crate::read::ReadEngine for SqliteBackend {
         &self,
         agent_id_hash: &str,
         window: crate::read::TimeWindow,
+        // Reads the agent's audit-log timeline keyed by `agent_id_hash`
+        // (AV-9 agent-ownership), not cohort-scoped content. `scope`
+        // no-op in v4.0 (FSD §8).
+        _scope: crate::scope::CallerScope,
     ) -> Result<Vec<crate::read::HashChainGap>, crate::read::Error> {
         let agent = agent_id_hash.to_owned();
         let since = window.since.to_rfc3339();
@@ -7115,16 +7835,25 @@ impl crate::read::ReadEngine for SqliteBackend {
         &self,
         deployment_domain: &str,
         window: crate::read::TimeWindow,
+        scope: crate::scope::CallerScope,
     ) -> Result<Vec<crate::read::OverrideRateRow>, crate::read::Error> {
         let domain = deployment_domain.to_owned();
         let since = window.since.to_rfc3339();
         let until = window.until.to_rfc3339();
+        // §4.3 scope gate — domain/since/until are ?1/?2/?3, scope at ?4+.
+        let (scope_frag, scope_binds) = crate::store::scope_bind::scope_predicate_sqlite(
+            &scope,
+            "cohort_scope",
+            "cohort_target_id",
+            3,
+        );
         let conn = self.conn.clone();
         (move || -> Result<Vec<crate::read::OverrideRateRow>, crate::read::Error> {
             let conn = conn.lock();
             // Per-trace MAX collapse → per-agent counts. Domain
             // average computed in Rust from the per-agent rows.
-            let sql = "WITH per_trace AS ( \
+            let sql = format!(
+                "WITH per_trace AS ( \
                                SELECT agent_id_hash, MIN(agent_name) AS agent_name, \
                                       MIN(deployment_domain) AS deployment_domain, \
                                       trace_id, \
@@ -7133,14 +7862,15 @@ impl crate::read::ReadEngine for SqliteBackend {
                                               payload, '$.action_was_overridden') = 1 \
                                           THEN 1 ELSE 0 END) AS was_overridden \
                                FROM trace_events \
-                               WHERE deployment_domain = ?1 AND ts >= ?2 AND ts < ?3 \
+                               WHERE deployment_domain = ?1 AND ts >= ?2 AND ts < ?3 AND {scope_frag} \
                                GROUP BY agent_id_hash, trace_id \
                            ) \
                            SELECT agent_id_hash, MIN(agent_name) AS agent_name, \
                                   MIN(deployment_domain) AS deployment_domain, \
                                   SUM(was_overridden) AS override_count, \
                                   COUNT(*) AS trace_count \
-                           FROM per_trace GROUP BY agent_id_hash";
+                           FROM per_trace GROUP BY agent_id_hash"
+            );
             struct Raw {
                 agent_id_hash: String,
                 agent_name: Option<String>,
@@ -7149,11 +7879,17 @@ impl crate::read::ReadEngine for SqliteBackend {
                 trace_count: i64,
             }
             let raws: Vec<Raw> = {
+                let mut binds: Vec<SqlValue> = vec![
+                    SqlValue::Text(domain.clone()),
+                    SqlValue::Text(since.clone()),
+                    SqlValue::Text(until.clone()),
+                ];
+                binds.extend(scope_binds.iter().cloned());
                 let mut stmt = conn
-                    .prepare(sql)
+                    .prepare(&sql)
                     .map_err(sqlite_read_err("conscience_override_rates prepare"))?;
                 let collected = stmt
-                    .query_map([&domain, &since, &until], |row| {
+                    .query_map(params_from_iter(binds.iter()), |row| {
                         Ok(Raw {
                             agent_id_hash: row.get("agent_id_hash")?,
                             agent_name: row.get("agent_name")?,
@@ -7215,18 +7951,41 @@ impl crate::read::ReadEngine for SqliteBackend {
         agent_id_hash: &str,
         window: crate::read::TimeWindow,
         baseline_window: Option<crate::read::TimeWindow>,
+        scope: crate::scope::CallerScope,
     ) -> Result<crate::read::ScoringFactorAggregate, crate::read::Error> {
         let agent = agent_id_hash.to_owned();
         let since = window.since.to_rfc3339();
         let until = window.until.to_rfc3339();
         let window_secs = (window.until - window.since).num_seconds().max(1);
         let bucket_secs = (window_secs / 24).max(60);
+        // §4.3 scope gate — agent/since/until are ?1/?2/?3 in every
+        // sub-query, scope binds start at ?4. The drift sub-call below
+        // receives the same scope.
+        let (scope_frag, scope_binds) = crate::store::scope_bind::scope_predicate_sqlite(
+            &scope,
+            "cohort_scope",
+            "cohort_target_id",
+            3,
+        );
+        let drift_scope = scope.clone();
         let conn = self.conn.clone();
         let agg = (move || -> Result<crate::read::ScoringFactorAggregate, crate::read::Error> {
             let conn = conn.lock();
+            // [agent, since, until] then scope binds — shared by every
+            // sub-query.
+            let mk_binds = || {
+                let mut b: Vec<SqlValue> = vec![
+                    SqlValue::Text(agent.clone()),
+                    SqlValue::Text(since.clone()),
+                    SqlValue::Text(until.clone()),
+                ];
+                b.extend(scope_binds.iter().cloned());
+                b
+            };
 
             // Main per-trace collapse + window-wide counts.
-            let main_sql = "WITH per_trace AS ( \
+            let main_sql = format!(
+                "WITH per_trace AS ( \
                        SELECT trace_id, MIN(agent_name) AS agent_name, \
                               MAX(CASE WHEN event_type = 'CONSCIENCE_RESULT' \
                                   AND json_extract(payload, '$.action_was_overridden') = 1 \
@@ -7242,7 +8001,7 @@ impl crate::read::ReadEngine for SqliteBackend {
                               MAX(CASE WHEN audit_signature IS NOT NULL \
                                   THEN 1 ELSE 0 END) AS has_audit_sig \
                        FROM trace_events \
-                       WHERE agent_id_hash = ?1 AND ts >= ?2 AND ts < ?3 \
+                       WHERE agent_id_hash = ?1 AND ts >= ?2 AND ts < ?3 AND {scope_frag} \
                        GROUP BY trace_id \
                    ) \
                    SELECT COUNT(*) AS trace_count, \
@@ -7253,7 +8012,8 @@ impl crate::read::ReadEngine for SqliteBackend {
                           COALESCE(SUM(CASE WHEN conscience_failed = 1 \
                               AND action_succeeded = 1 THEN 1 ELSE 0 END), 0) \
                               AS unsafe_action_count \
-                   FROM per_trace";
+                   FROM per_trace"
+            );
             struct Main {
                 trace_count: i64,
                 identity_changes: i64,
@@ -7264,9 +8024,9 @@ impl crate::read::ReadEngine for SqliteBackend {
             }
             let main = {
                 let mut stmt = conn
-                    .prepare(main_sql)
+                    .prepare(&main_sql)
                     .map_err(sqlite_read_err("aggregate_scoring_factors main prepare"))?;
-                stmt.query_row([&agent, &since, &until], |row| {
+                stmt.query_row(params_from_iter(mk_binds().iter()), |row| {
                     Ok(Main {
                         trace_count: row.get("trace_count")?,
                         identity_changes: row.get("identity_changes")?,
@@ -7285,26 +8045,29 @@ impl crate::read::ReadEngine for SqliteBackend {
             };
 
             // Audit-chain gap count via LAG window.
-            let gaps_sql = "WITH ordered AS ( \
+            let gaps_sql = format!(
+                "WITH ordered AS ( \
                                     SELECT audit_sequence_number AS seq, \
                                            LAG(audit_sequence_number) OVER w AS prev_seq \
                                     FROM trace_events \
-                                    WHERE agent_id_hash = ?1 AND ts >= ?2 AND ts < ?3 \
+                                    WHERE agent_id_hash = ?1 AND ts >= ?2 AND ts < ?3 AND {scope_frag} \
                                           AND audit_sequence_number IS NOT NULL \
                                     WINDOW w AS (ORDER BY audit_sequence_number) \
                                 ) \
                                 SELECT COUNT(*) AS gap_count FROM ordered \
-                                WHERE prev_seq IS NOT NULL AND seq > prev_seq + 1";
+                                WHERE prev_seq IS NOT NULL AND seq > prev_seq + 1"
+            );
             let audit_chain_gaps: i64 = {
                 let mut stmt = conn
-                    .prepare(gaps_sql)
+                    .prepare(&gaps_sql)
                     .map_err(sqlite_read_err("aggregate_scoring_factors gaps prepare"))?;
-                stmt.query_row([&agent, &since, &until], |r| r.get("gap_count"))
+                stmt.query_row(params_from_iter(mk_binds().iter()), |r| r.get("gap_count"))
                     .map_err(sqlite_read_err("aggregate_scoring_factors gaps"))?
             };
 
             // Recovery events: top-50 most recent override→pass pairs.
-            let recovery_sql = "WITH per_trace AS ( \
+            let recovery_sql = format!(
+                "WITH per_trace AS ( \
                        SELECT trace_id, MIN(ts) AS started_at, MAX(ts) AS completed_at, \
                               MAX(CASE WHEN event_type = 'CONSCIENCE_RESULT' \
                                   AND json_extract(payload, '$.action_was_overridden') = 1 \
@@ -7313,7 +8076,7 @@ impl crate::read::ReadEngine for SqliteBackend {
                                   THEN json_extract(payload, '$.coherence_passed') \
                                   ELSE 1 END) AS coherence_passed \
                        FROM trace_events \
-                       WHERE agent_id_hash = ?1 AND ts >= ?2 AND ts < ?3 \
+                       WHERE agent_id_hash = ?1 AND ts >= ?2 AND ts < ?3 AND {scope_frag} \
                        GROUP BY trace_id \
                    ), \
                    ordered AS ( \
@@ -7329,13 +8092,14 @@ impl crate::read::ReadEngine for SqliteBackend {
                    FROM ordered \
                    WHERE was_overridden = 1 AND next_trace_id IS NOT NULL \
                          AND next_coherence_passed = 1 \
-                   ORDER BY override_at DESC LIMIT 50";
+                   ORDER BY override_at DESC LIMIT 50"
+            );
             let recovery_events: Vec<crate::read::RecoveryEvent> = {
-                let mut stmt = conn.prepare(recovery_sql).map_err(sqlite_read_err(
+                let mut stmt = conn.prepare(&recovery_sql).map_err(sqlite_read_err(
                     "aggregate_scoring_factors recovery prepare",
                 ))?;
                 let collected = stmt
-                    .query_map([&agent, &since, &until], |row| {
+                    .query_map(params_from_iter(mk_binds().iter()), |row| {
                         let override_at: String = row.get("override_at")?;
                         let recovery_at: String = row.get("recovery_at")?;
                         let o = parse_rfc3339(&override_at);
@@ -7362,7 +8126,7 @@ impl crate::read::ReadEngine for SqliteBackend {
                                     THEN json_extract(payload, '$.coherence_passed') \
                                     ELSE 1 END) AS coherence_passed \
                          FROM trace_events \
-                         WHERE agent_id_hash = ?1 AND ts >= ?2 AND ts < ?3 \
+                         WHERE agent_id_hash = ?1 AND ts >= ?2 AND ts < ?3 AND {scope_frag} \
                          GROUP BY trace_id \
                      ) \
                      SELECT (CAST(strftime('%s', started_at) AS INTEGER) / {bucket_secs}) \
@@ -7377,7 +8141,7 @@ impl crate::read::ReadEngine for SqliteBackend {
                     .prepare(&decay_sql)
                     .map_err(sqlite_read_err("aggregate_scoring_factors decay prepare"))?;
                 let collected = stmt
-                    .query_map([&agent, &since, &until], |row| {
+                    .query_map(params_from_iter(mk_binds().iter()), |row| {
                         let bucket_epoch: i64 = row.get("bucket_epoch")?;
                         let tc: i64 = row.get("trace_count")?;
                         let pc: i64 = row.get("coherence_passed_count")?;
@@ -7417,7 +8181,9 @@ impl crate::read::ReadEngine for SqliteBackend {
         // CSDMA significance from temporal_drift (matches Postgres).
         let mut agg = agg;
         if let Some(base) = baseline_window {
-            let drift_rows = self.temporal_drift(agent_id_hash, base, window).await?;
+            let drift_rows = self
+                .temporal_drift(agent_id_hash, base, window, drift_scope)
+                .await?;
             agg.drift_z_score = drift_rows
                 .iter()
                 .find(|r| r.deviation_metric == crate::read::DeviationMetric::CsdmaPlausibility)
@@ -7431,6 +8197,7 @@ impl crate::read::ReadEngine for SqliteBackend {
         agent_id_hashes: &[String],
         window: crate::read::TimeWindow,
         baseline_window: Option<crate::read::TimeWindow>,
+        scope: crate::scope::CallerScope,
     ) -> Result<Vec<crate::read::ScoringFactorAggregate>, crate::read::Error> {
         if agent_id_hashes.is_empty() {
             return Ok(Vec::new());
@@ -7438,7 +8205,7 @@ impl crate::read::ReadEngine for SqliteBackend {
         let mut out = Vec::with_capacity(agent_id_hashes.len());
         for aid in agent_id_hashes {
             out.push(
-                self.aggregate_scoring_factors(aid, window, baseline_window)
+                self.aggregate_scoring_factors(aid, window, baseline_window, scope.clone())
                     .await?,
             );
         }
@@ -7448,8 +8215,9 @@ impl crate::read::ReadEngine for SqliteBackend {
     async fn count_traces(
         &self,
         filter: crate::read::TraceFilter,
+        scope: crate::scope::CallerScope,
     ) -> Result<i64, crate::read::Error> {
-        let (where_sql, binds) = sqlite_filter_where(&filter)?;
+        let (where_sql, binds) = sqlite_scope_filter_where(&filter, &scope)?;
         let sql = format!("SELECT COUNT(DISTINCT trace_id) AS n FROM trace_events {where_sql}");
         let conn = self.conn.clone();
         (move || -> Result<i64, crate::read::Error> {
@@ -7465,8 +8233,9 @@ impl crate::read::ReadEngine for SqliteBackend {
     async fn count_overrides(
         &self,
         filter: crate::read::TraceFilter,
+        scope: crate::scope::CallerScope,
     ) -> Result<i64, crate::read::Error> {
-        let (where_sql, binds) = sqlite_filter_where(&filter)?;
+        let (where_sql, binds) = sqlite_scope_filter_where(&filter, &scope)?;
         let sql = format!(
             "SELECT COUNT(*) AS n FROM ( \
                 SELECT trace_id FROM trace_events {where_sql} GROUP BY trace_id \
@@ -7489,8 +8258,9 @@ impl crate::read::ReadEngine for SqliteBackend {
     async fn count_identity_changes(
         &self,
         filter: crate::read::TraceFilter,
+        scope: crate::scope::CallerScope,
     ) -> Result<i64, crate::read::Error> {
-        let (where_sql, binds) = sqlite_filter_where(&filter)?;
+        let (where_sql, binds) = sqlite_scope_filter_where(&filter, &scope)?;
         let sql = format!(
             "SELECT MAX(COUNT(DISTINCT agent_name) - 1, 0) AS n \
              FROM trace_events {where_sql}"
@@ -7509,8 +8279,9 @@ impl crate::read::ReadEngine for SqliteBackend {
     async fn aggregate_audit_chain(
         &self,
         filter: crate::read::TraceFilter,
+        scope: crate::scope::CallerScope,
     ) -> Result<crate::read::AuditChainAggregate, crate::read::Error> {
-        let (where_sql, binds) = sqlite_filter_where(&filter)?;
+        let (where_sql, binds) = sqlite_scope_filter_where(&filter, &scope)?;
         let has_agent = filter.agent_id_hash.is_some();
         let totals_sql = format!(
             "SELECT \
@@ -8281,6 +9052,8 @@ mod tests {
             deployment_type: None,
             deployment_region: None,
             deployment_trust_mode: None,
+            cohort_scope: "federation".to_string(),
+            cohort_target_id: None,
         }
     }
 
@@ -8613,8 +9386,7 @@ mod tests {
             .await
             .unwrap();
 
-        let got = backend
-            .list_attestations_for("host-a")
+        let got = crate::federation::FederationDirectory::list_attestations_for(&backend, "host-a")
             .await
             .unwrap()
             .into_iter()
@@ -8852,10 +9624,16 @@ mod tests {
             .expect("row exists");
         assert_eq!(key1.persist_row_hash, key2.persist_row_hash);
 
-        let att1 = backend.list_attestations_for("k-target").await.unwrap();
+        let att1 =
+            crate::federation::FederationDirectory::list_attestations_for(&backend, "k-target")
+                .await
+                .unwrap();
         assert_eq!(att1.len(), 1);
         assert_eq!(att1[0].persist_row_hash.len(), 64);
-        let att2 = backend.list_attestations_for("k-target").await.unwrap();
+        let att2 =
+            crate::federation::FederationDirectory::list_attestations_for(&backend, "k-target")
+                .await
+                .unwrap();
         assert_eq!(att1[0].persist_row_hash, att2[0].persist_row_hash);
 
         let rev1 = backend.revocations_for("k-target").await.unwrap();
@@ -8899,7 +9677,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(by.len(), 1);
-        let for_a = backend.list_attestations_for("k-a").await.unwrap();
+        let for_a = crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+            .await
+            .unwrap();
         assert_eq!(for_a.len(), 1);
         assert_eq!(for_a[0].attestation_id, "att-1");
         assert_eq!(for_a[0].persist_row_hash.len(), 64);
@@ -9231,6 +10011,419 @@ mod tests {
         assert!(none.is_none());
     }
 
+    /// v4.0 (CIRISPersist#160, V060, FSD §4.3) — cohort_scope +
+    /// cohort_target_id round-trip through the real SQLite trace_events
+    /// store: a community-scoped row with a target inserts and reads
+    /// back with both columns intact (proves the INSERT + SELECT column
+    /// wiring on the SQLite backend).
+    #[tokio::test]
+    async fn trace_events_cohort_scope_round_trips_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let mut row = fixture_event_row("trace-cohort-sqlite", 0);
+        row.cohort_scope = "community".to_owned();
+        row.cohort_target_id = Some("community-key:lens-beta".to_owned());
+        backend
+            .insert_trace_events_batch(std::slice::from_ref(&row))
+            .await
+            .unwrap();
+
+        let page = backend.fetch_trace_events_page(0, 10, None).await.unwrap();
+        assert_eq!(page.len(), 1);
+        let (_id, got) = &page[0];
+        assert_eq!(got.cohort_scope, "community");
+        assert_eq!(
+            got.cohort_target_id.as_deref(),
+            Some("community-key:lens-beta")
+        );
+
+        // A default-federation row reads back as 'federation' / NULL
+        // (backward-compat column DEFAULT honored).
+        let fed = fixture_event_row("trace-cohort-fed", 1);
+        backend
+            .insert_trace_events_batch(std::slice::from_ref(&fed))
+            .await
+            .unwrap();
+        let page2 = backend
+            .fetch_trace_events_page(0, 10, Some("deadbeef"))
+            .await
+            .unwrap();
+        let fed_row = page2
+            .iter()
+            .find(|(_, r)| r.trace_id == "trace-cohort-fed")
+            .map(|(_, r)| r)
+            .unwrap();
+        assert_eq!(fed_row.cohort_scope, "federation");
+        assert_eq!(fed_row.cohort_target_id, None);
+    }
+
+    // ── v4.0 Commit E — read-side scope gate (FSD §4.3, §14) ────────
+
+    /// Insert one trace row at a given (cohort_scope, cohort_target_id).
+    async fn insert_scoped_trace(
+        backend: &SqliteBackend,
+        trace_id: &str,
+        scope: &str,
+        target: Option<&str>,
+    ) {
+        let mut row = fixture_event_row(trace_id, 0);
+        row.cohort_scope = scope.to_owned();
+        row.cohort_target_id = target.map(|t| t.to_owned());
+        backend
+            .insert_trace_events_batch(std::slice::from_ref(&row))
+            .await
+            .unwrap();
+    }
+
+    fn auth_in_family(identity: &str, family: &str) -> crate::scope::CallerScope {
+        crate::scope::CallerScope::Authenticated {
+            admission: crate::scope::admission::CallerAdmission::for_test(
+                identity,
+                identity,
+                [family.to_string()],
+                [],
+            ),
+        }
+    }
+
+    /// §14 — an Unauthenticated caller sees zero self/family/community
+    /// rows; only the broad belonging-tier (federation) row survives the
+    /// §4.3 predicate.
+    #[tokio::test]
+    async fn re_scope_unauthenticated_excludes_suppressed_cohorts() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        insert_scoped_trace(&backend, "tr-self", "self", Some("alice-root")).await;
+        insert_scoped_trace(&backend, "tr-family", "family", Some("fam-acme")).await;
+        insert_scoped_trace(&backend, "tr-community", "community", Some("comm-lens")).await;
+        insert_scoped_trace(&backend, "tr-federation", "federation", None).await;
+
+        let page = backend
+            .list_trace_summaries(
+                TraceFilter::default(),
+                None,
+                100,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
+        let ids: std::collections::BTreeSet<&str> =
+            page.items.iter().map(|s| s.trace_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["tr-federation"].into_iter().collect(),
+            "unauthenticated sees only the broad federation tier"
+        );
+    }
+
+    /// §14 — an Authenticated caller in family F sees F-targeted rows and
+    /// NOT G-targeted ones (target-membership, not emitter-shared-cohort).
+    #[tokio::test]
+    async fn re_scope_authenticated_family_target_membership() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        insert_scoped_trace(&backend, "tr-famF", "family", Some("fam-F")).await;
+        insert_scoped_trace(&backend, "tr-famG", "family", Some("fam-G")).await;
+        insert_scoped_trace(&backend, "tr-self-me", "self", Some("reader-id")).await;
+        insert_scoped_trace(&backend, "tr-self-other", "self", Some("someone-else")).await;
+        insert_scoped_trace(&backend, "tr-fed", "federation", None).await;
+
+        let page = backend
+            .list_trace_summaries(
+                TraceFilter::default(),
+                None,
+                100,
+                auth_in_family("reader-id", "fam-F"),
+            )
+            .await
+            .unwrap();
+        let ids: std::collections::BTreeSet<&str> =
+            page.items.iter().map(|s| s.trace_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["tr-famF", "tr-self-me", "tr-fed"].into_iter().collect(),
+            "family-F member sees F-targeted + own-self + federation; \
+             NOT fam-G and NOT another identity's self"
+        );
+    }
+
+    /// §14 — the same gate applies to the granular counters and the
+    /// attestation list path (cohort_scope/attested_key_id columns).
+    #[tokio::test]
+    async fn re_scope_count_traces_honors_gate() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        insert_scoped_trace(&backend, "tr-1", "family", Some("fam-F")).await;
+        insert_scoped_trace(&backend, "tr-2", "family", Some("fam-G")).await;
+        insert_scoped_trace(&backend, "tr-3", "federation", None).await;
+
+        // Unauthenticated: only the federation row counts.
+        let n_unauth = backend
+            .count_traces(
+                TraceFilter::default(),
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
+        assert_eq!(n_unauth, 1);
+
+        // Family-F member: federation + fam-F = 2.
+        let n_auth = backend
+            .count_traces(TraceFilter::default(), auth_in_family("reader-id", "fam-F"))
+            .await
+            .unwrap();
+        assert_eq!(n_auth, 2);
+    }
+
+    // ── #159 get_repository_statistics (FSD §6.2) ───────────────────
+
+    /// Insert a scored trace: a DMA_RESULTS event (plausibility +
+    /// alignment), a CONSCIENCE_RESULT event (pass + entropy), an
+    /// ACTION_RESULT (SPEAK, success), an IDMA_RESULT (phase) — at a
+    /// given cohort_scope/target. Two event rows share `trace_id` so the
+    /// per-trace rollup folds them into one [`PerTraceRow`].
+    async fn insert_scored_trace(
+        backend: &SqliteBackend,
+        trace_id: &str,
+        scope: &str,
+        target: Option<&str>,
+        plausibility: f64,
+        alignment: f64,
+        conscience_pass: bool,
+    ) {
+        let mk = |event: ReasoningEventType,
+                  attempt: u32,
+                  payload: serde_json::Map<String, serde_json::Value>| {
+            let mut r = fixture_event_row(trace_id, attempt);
+            r.event_type = event;
+            r.payload = payload;
+            r.cohort_scope = scope.to_owned();
+            r.cohort_target_id = target.map(|t| t.to_owned());
+            r.deployment_domain = Some("dom-1".to_owned());
+            r
+        };
+        let mut dma = serde_json::Map::new();
+        dma.insert("csdma_plausibility_score".into(), plausibility.into());
+        dma.insert("dsdma_domain_alignment".into(), alignment.into());
+        let mut con = serde_json::Map::new();
+        con.insert("conscience_passed".into(), conscience_pass.into());
+        con.insert("entropy_passed".into(), true.into());
+        con.insert("action_was_overridden".into(), (!conscience_pass).into());
+        let mut act = serde_json::Map::new();
+        act.insert("action_executed".into(), "SPEAK".into());
+        act.insert("success".into(), true.into());
+        let mut idma = serde_json::Map::new();
+        idma.insert("idma_fragility_flag".into(), false.into());
+        idma.insert("idma_phase".into(), "flexibility".into());
+
+        let rows = [
+            mk(ReasoningEventType::DmaResults, 0, dma),
+            mk(ReasoningEventType::ConscienceResult, 1, con),
+            mk(ReasoningEventType::ActionResult, 2, act),
+            mk(ReasoningEventType::IdmaResult, 3, idma),
+        ];
+        backend.insert_trace_events_batch(&rows).await.unwrap();
+    }
+
+    /// Repository filter over a window keyed by `day` — each test passes
+    /// a unique day so its cache key never collides with another test's
+    /// (the repository-statistics cache is a process-global, FSD §7.1, so
+    /// distinct windows keep tests isolated). The window always covers
+    /// the May-1 fixture timestamp.
+    fn repo_filter_day(day: u32) -> crate::ceg::RepositoryFilter {
+        crate::ceg::RepositoryFilter {
+            window: crate::ceg::TimeWindow::new(
+                Utc.with_ymd_and_hms(2026, 4, day, 0, 0, 0).unwrap(),
+                Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap(),
+            )
+            .unwrap(),
+            agent_id_hashes: vec![],
+            deployment_domains: vec![],
+            cohort_scope_in: vec![],
+            task_classes: vec![],
+            fragility_only: false,
+        }
+    }
+
+    /// §14 — empty window → `sample_count: 0`, never an error.
+    #[tokio::test]
+    async fn re_repo_empty_window_is_zero() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let stats = backend
+            .get_repository_statistics(
+                repo_filter_day(1),
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stats.sample_count, 0);
+        assert_eq!(stats.totals.traces, 0);
+        assert_eq!(stats.scores.plausibility.sample_count, 0);
+        assert!(!stats.cache_hit);
+    }
+
+    /// §14 — small-N reported faithfully + nested sample_counts.
+    #[tokio::test]
+    async fn re_repo_small_n_reported() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        insert_scored_trace(&backend, "rt-1", "federation", None, 0.8, 0.5, true).await;
+        insert_scored_trace(&backend, "rt-2", "federation", None, 0.6, 0.7, false).await;
+
+        let stats = backend
+            .get_repository_statistics(
+                repo_filter_day(2),
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stats.sample_count, 2);
+        assert_eq!(stats.totals.traces, 2);
+        assert_eq!(stats.scores.plausibility.sample_count, 2);
+        assert!((stats.scores.plausibility.mean - 0.7).abs() < 1e-9);
+        assert_eq!(stats.conscience.sample_count, 2);
+        assert_eq!(stats.conscience.pass_rate, 0.5);
+        assert_eq!(stats.conscience.override_rate, 0.5);
+        assert_eq!(stats.conscience.by_check["entropy"].sample_count, 2);
+        assert_eq!(stats.actions.sample_count, 2);
+        assert_eq!(stats.actions.distribution["speak"], 1.0);
+        assert_eq!(stats.fragility.sample_count, 2);
+        assert_eq!(stats.fragility.phase_distribution["flexibility"], 1.0);
+        assert_eq!(stats.by_domain.len(), 1);
+        assert_eq!(stats.by_domain[0].domain, "dom-1");
+        assert_eq!(stats.by_domain[0].traces, 2);
+    }
+
+    /// §14 — an Unauthenticated caller's stats exclude self/family/
+    /// community-targeted traces (scope gate at the aggregate).
+    #[tokio::test]
+    async fn re_repo_scope_gated_unauthenticated() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        insert_scored_trace(&backend, "rt-self", "self", Some("alice"), 0.9, 0.9, true).await;
+        insert_scored_trace(&backend, "rt-fam", "family", Some("fam-F"), 0.9, 0.9, true).await;
+        insert_scored_trace(&backend, "rt-fed", "federation", None, 0.2, 0.2, true).await;
+
+        let stats = backend
+            .get_repository_statistics(
+                repo_filter_day(3),
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
+        // Only the federation trace is visible.
+        assert_eq!(stats.sample_count, 1);
+        assert!((stats.scores.plausibility.mean - 0.2).abs() < 1e-9);
+
+        // A family-F member sees the family + federation rows. The self
+        // target is "alice" (not the reader), so the self row stays
+        // suppressed → federation + family-F = 2.
+        let stats_auth = backend
+            .get_repository_statistics(repo_filter_day(3), auth_in_family("reader-id", "fam-F"))
+            .await
+            .unwrap();
+        assert_eq!(stats_auth.sample_count, 2);
+    }
+
+    /// §14 — cache hit reports `cache_hit: true` with the original
+    /// `evaluated_at`; a different scope never shares the entry.
+    #[tokio::test]
+    async fn re_repo_cache_hit_and_scope_disjoint() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        // Distinct window so this test's cache keys don't collide with
+        // other tests sharing the process-global cache.
+        let mut f = repo_filter_day(5);
+        f.window = crate::ceg::TimeWindow::new(
+            Utc.with_ymd_and_hms(2026, 4, 2, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 5, 30, 0, 0, 0).unwrap(),
+        )
+        .unwrap();
+        insert_scored_trace(&backend, "rc-fed", "federation", None, 0.5, 0.5, true).await;
+
+        // First call: fresh DB read.
+        let first = backend
+            .get_repository_statistics(f.clone(), crate::scope::CallerScope::Unauthenticated)
+            .await
+            .unwrap();
+        assert!(!first.cache_hit, "first call is a miss");
+        let eval0 = first.evaluated_at_unix_ms;
+
+        // Second identical call: cache hit, original evaluated_at.
+        let second = backend
+            .get_repository_statistics(f.clone(), crate::scope::CallerScope::Unauthenticated)
+            .await
+            .unwrap();
+        assert!(second.cache_hit, "second identical call is a hit");
+        assert_eq!(
+            second.evaluated_at_unix_ms, eval0,
+            "cache hit preserves the original evaluated_at, not now()"
+        );
+
+        // Different scope: must NOT share the entry — a fresh miss, and
+        // the answer differs (auth sees nothing extra here, but the
+        // cache_hit flag proves disjointness).
+        let auth = backend
+            .get_repository_statistics(f.clone(), auth_in_family("reader-id", "fam-Z"))
+            .await
+            .unwrap();
+        assert!(
+            !auth.cache_hit,
+            "a different scope digest is a separate cache entry (scope-disjoint, §7.3)"
+        );
+    }
+
+    /// v4.0 (CIRISPersist#160, FSD §4.4) — `resolve_identity_for_occurrence`
+    /// (the Backend self-target resolution hook) returns the bound
+    /// identity for a bound occurrence key, and `None` (singleton
+    /// fallback) for an unbound one.
+    #[tokio::test]
+    async fn resolve_identity_for_occurrence_self_target() {
+        use crate::store::Backend as _;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("alice-root", "alice", "alice-root"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("alice-phone", "alice", "alice-root"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_identity_occurrence(crate::federation::SignedIdentityOccurrence {
+                identity_occurrence: fed_identity_occurrence(
+                    "alice-root",
+                    "alice-phone",
+                    crate::federation::types::device_class::PHONE,
+                ),
+            })
+            .await
+            .unwrap();
+
+        // Bound occurrence → resolves to the identity (this is what a
+        // self-scoped trace signed by alice-phone gets stamped with).
+        let resolved = backend
+            .resolve_identity_for_occurrence("alice-phone")
+            .await
+            .unwrap();
+        assert_eq!(resolved.as_deref(), Some("alice-root"));
+
+        // Unbound occurrence → None → caller applies singleton fallback
+        // (stamps the signer key itself).
+        let unbound = backend
+            .resolve_identity_for_occurrence("fresh-sovereign-key")
+            .await
+            .unwrap();
+        assert_eq!(unbound, None);
+    }
+
     /// device_class outside the closed-set is rejected at admission
     /// with the typed `DeviceClassRejected` error + stable kind token;
     /// the row is not stored.
@@ -9333,6 +10526,161 @@ mod tests {
             .await
             .unwrap();
         assert!(none.is_empty());
+    }
+
+    fn fed_community(
+        community_key_id: &str,
+        community_name: &str,
+        members: Vec<&str>,
+        consensus_protocol: &str,
+        policy_blob: Option<serde_json::Value>,
+    ) -> crate::federation::Community {
+        crate::federation::Community {
+            community_key_id: community_key_id.into(),
+            community_name: community_name.into(),
+            members: members
+                .into_iter()
+                .map(|k| crate::federation::CommunityMember {
+                    key_id: k.into(),
+                    joined_at: "2026-06-04T00:00:00Z".parse().unwrap(),
+                    role: None,
+                })
+                .collect(),
+            founded_at: "2026-06-04T00:00:00Z".parse().unwrap(),
+            consensus_protocol: consensus_protocol.into(),
+            policy_blob,
+            persist_row_hash: String::new(),
+        }
+    }
+
+    /// Round-trip a community (V060): write → lookup →
+    /// list_communities_for_member. Structural mirror of
+    /// `family_round_trip`; covers the JSON members + nullable
+    /// policy_blob columns + the json_each membership scan. A community
+    /// with N members returns from list_communities_for_member for each
+    /// member identity.
+    #[tokio::test]
+    async fn community_round_trip() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in ["acme-coop", "alice-root", "bob-root", "carol-root"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, "acme", "acme-coop"),
+                })
+                .await
+                .unwrap();
+        }
+        let policy = serde_json::json!({ "cohort_scope": "community", "visibility": "members" });
+        backend
+            .put_community(crate::federation::SignedCommunity {
+                community: fed_community(
+                    "acme-coop",
+                    "Acme Co-op",
+                    vec!["alice-root", "bob-root", "carol-root"],
+                    crate::federation::types::consensus_protocol::MAJORITY,
+                    Some(policy.clone()),
+                ),
+            })
+            .await
+            .unwrap();
+
+        let got = backend
+            .lookup_community("acme-coop")
+            .await
+            .unwrap()
+            .expect("community exists");
+        assert_eq!(got.community_name, "Acme Co-op");
+        assert_eq!(got.members.len(), 3);
+        assert_eq!(got.consensus_protocol, "majority");
+        assert_eq!(got.policy_blob.as_ref(), Some(&policy));
+        assert_eq!(got.persist_row_hash.len(), 64);
+
+        // Membership scan returns the community for every member identity.
+        for member in ["alice-root", "bob-root", "carol-root"] {
+            let communities = backend.list_communities_for_member(member).await.unwrap();
+            assert_eq!(communities.len(), 1, "for member {member}");
+            assert_eq!(communities[0].community_key_id, "acme-coop");
+        }
+
+        // Non-member returns empty.
+        let none = backend
+            .list_communities_for_member("not-a-member")
+            .await
+            .unwrap();
+        assert!(none.is_empty());
+
+        // policy_blob absent round-trips as None.
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("solo-coop", "solo", "solo-coop"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_community(crate::federation::SignedCommunity {
+                community: fed_community(
+                    "solo-coop",
+                    "Solo Co-op",
+                    vec![],
+                    crate::federation::types::consensus_protocol::FOUNDER_ONLY,
+                    None,
+                ),
+            })
+            .await
+            .unwrap();
+        let solo = backend
+            .lookup_community("solo-coop")
+            .await
+            .unwrap()
+            .expect("solo community exists");
+        assert_eq!(solo.policy_blob, None);
+
+        // Absent community returns None.
+        assert!(backend.lookup_community("nope").await.unwrap().is_none());
+    }
+
+    /// consensus_protocol that doesn't parse into a canonical shape is
+    /// rejected at admission for communities (V060) — mirrors the
+    /// family malformed-protocol gate.
+    #[tokio::test]
+    async fn put_community_rejects_malformed_consensus_protocol() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("bad-coop", "bad", "bad-coop"),
+            })
+            .await
+            .unwrap();
+        for cp in ["", "quorum:3/2", "weighted:", "custom:", "raffle"] {
+            let bad = fed_community("bad-coop", "bad", vec![], cp, None);
+            let err = backend
+                .put_community(crate::federation::SignedCommunity { community: bad })
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.kind(),
+                "federation_consensus_protocol_malformed",
+                "expected malformed for {cp:?}, got {err:?}"
+            );
+            assert!(backend
+                .lookup_community("bad-coop")
+                .await
+                .unwrap()
+                .is_none());
+        }
+        // Canonical quorum:m/n admits.
+        let good = fed_community("bad-coop", "now valid", vec![], "quorum:2/3", None);
+        backend
+            .put_community(crate::federation::SignedCommunity { community: good })
+            .await
+            .unwrap();
+        assert!(backend
+            .lookup_community("bad-coop")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     /// consensus_protocol that doesn't parse into a canonical shape is
@@ -9471,11 +10819,12 @@ mod tests {
             crate::federation::Error::AccordDimensionRequiresAccordHolder { .. }
         ));
         // No row leaked through.
-        assert!(backend
-            .list_attestations_for("k-a")
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -9516,7 +10865,9 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .unwrap();
-        let rows = backend.list_attestations_for("k-a").await.unwrap();
+        let rows = crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
     }
 
@@ -9589,11 +10940,12 @@ mod tests {
             other => panic!("expected CohortScopeRejected, got {other:?}"),
         }
         // Rejected before INSERT — no row leaked through.
-        assert!(backend
-            .list_attestations_for("k-a")
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// v3.9.1 (CIRISPersist#150 Ask 3) — a valid narrow cohort_scope
@@ -9620,7 +10972,9 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .unwrap();
-        let rows = backend.list_attestations_for("k-a").await.unwrap();
+        let rows = crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].cohort_scope, "self");
     }
@@ -9696,7 +11050,9 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .unwrap();
-        let rows = backend.list_attestations_for("k-a").await.unwrap();
+        let rows = crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
     }
 
@@ -9733,7 +11089,9 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .unwrap();
-        let rows = backend.list_attestations_for("k-a").await.unwrap();
+        let rows = crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
     }
 
@@ -9809,10 +11167,12 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: w2 })
             .await
             .unwrap();
-        let rows = backend
-            .list_attestations_for("registry-steward")
-            .await
-            .unwrap();
+        let rows = crate::federation::FederationDirectory::list_attestations_for(
+            &backend,
+            "registry-steward",
+        )
+        .await
+        .unwrap();
         let withdraws_rows: Vec<_> = rows
             .iter()
             .filter(|r| r.attestation_type == crate::federation::types::attestation_type::WITHDRAWS)
@@ -11619,6 +12979,8 @@ mod tests {
             deployment_type: Some("production".to_owned()),
             deployment_region: Some("us-east".to_owned()),
             deployment_trust_mode: None,
+            cohort_scope: "federation".to_string(),
+            cohort_target_id: None,
         }
     }
 
@@ -11725,7 +13087,11 @@ mod tests {
         )
         .await;
 
-        let summary = backend.get_trace_summary("tr-A").await.unwrap().unwrap();
+        let summary = backend
+            .get_trace_summary("tr-A", crate::scope::CallerScope::Unauthenticated)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(summary.trace_id, "tr-A");
         assert_eq!(summary.agent_id_hash, "agent-h");
         assert_eq!(summary.agent_name.as_deref(), Some("Scout"));
@@ -11739,12 +13105,16 @@ mod tests {
 
         // Missing trace → None.
         assert!(backend
-            .get_trace_summary("tr-missing")
+            .get_trace_summary("tr-missing", crate::scope::CallerScope::Unauthenticated)
             .await
             .unwrap()
             .is_none());
 
-        let detail = backend.get_trace_detail("tr-A").await.unwrap().unwrap();
+        let detail = backend
+            .get_trace_detail("tr-A", crate::scope::CallerScope::Unauthenticated)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(detail.components.len(), 4, "4 component rows");
         assert_eq!(detail.summary.trace_id, "tr-A");
         // Components are chronological.
@@ -11753,7 +13123,11 @@ mod tests {
         sorted.sort();
         assert_eq!(ts, sorted);
         assert!(detail.envelope.pii_scrubbed);
-        assert!(backend.get_trace_detail("tr-none").await.unwrap().is_none());
+        assert!(backend
+            .get_trace_detail("tr-none", crate::scope::CallerScope::Unauthenticated)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -11777,7 +13151,12 @@ mod tests {
         }
         // Page 1: limit 2 → newest-first (tr-4, tr-3).
         let page1 = backend
-            .list_trace_summaries(TraceFilter::default(), None, 2)
+            .list_trace_summaries(
+                TraceFilter::default(),
+                None,
+                2,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(page1.items.len(), 2);
@@ -11787,7 +13166,12 @@ mod tests {
 
         // Page 2 via cursor.
         let page2 = backend
-            .list_trace_summaries(TraceFilter::default(), page1.next_cursor, 2)
+            .list_trace_summaries(
+                TraceFilter::default(),
+                page1.next_cursor,
+                2,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(page2.items.len(), 2);
@@ -11796,7 +13180,12 @@ mod tests {
 
         // Page 3: last item, no further cursor.
         let page3 = backend
-            .list_trace_summaries(TraceFilter::default(), page2.next_cursor, 2)
+            .list_trace_summaries(
+                TraceFilter::default(),
+                page2.next_cursor,
+                2,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(page3.items.len(), 1);
@@ -11805,7 +13194,12 @@ mod tests {
 
         // Invalid limit + bad cursor version are typed errors.
         assert!(backend
-            .list_trace_summaries(TraceFilter::default(), None, 0)
+            .list_trace_summaries(
+                TraceFilter::default(),
+                None,
+                0,
+                crate::scope::CallerScope::Unauthenticated
+            )
             .await
             .is_err());
         let bad = crate::read::TraceCursor {
@@ -11814,7 +13208,12 @@ mod tests {
             last_trace_id: "x".to_owned(),
         };
         assert!(backend
-            .list_trace_summaries(TraceFilter::default(), Some(bad), 10)
+            .list_trace_summaries(
+                TraceFilter::default(),
+                Some(bad),
+                10,
+                crate::scope::CallerScope::Unauthenticated
+            )
             .await
             .is_err());
     }
@@ -11845,7 +13244,12 @@ mod tests {
             ..Default::default()
         };
         let page = backend
-            .list_trace_summaries(filter, None, 100)
+            .list_trace_summaries(
+                filter,
+                None,
+                100,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(page.items.len(), 1);
@@ -11897,7 +13301,12 @@ mod tests {
         )
         .await;
         let page = backend
-            .list_tasks(TaskFilter::default(), None, 100)
+            .list_tasks(
+                TaskFilter::default(),
+                None,
+                100,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(page.items.len(), 2, "two distinct tasks");
@@ -11918,6 +13327,7 @@ mod tests {
                 },
                 None,
                 100,
+                crate::scope::CallerScope::Unauthenticated,
             )
             .await
             .unwrap();
@@ -11980,13 +13390,23 @@ mod tests {
 
         // List newest-first; paginate.
         let page1 = backend
-            .list_llm_calls(LlmCallFilter::default(), None, 2)
+            .list_llm_calls(
+                LlmCallFilter::default(),
+                None,
+                2,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(page1.items.len(), 2);
         assert!(page1.next_cursor.is_some());
         let page2 = backend
-            .list_llm_calls(LlmCallFilter::default(), page1.next_cursor, 2)
+            .list_llm_calls(
+                LlmCallFilter::default(),
+                page1.next_cursor,
+                2,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(page2.items.len(), 1);
@@ -12001,6 +13421,7 @@ mod tests {
                 },
                 None,
                 100,
+                crate::scope::CallerScope::Unauthenticated,
             )
             .await
             .unwrap();
@@ -12008,7 +13429,10 @@ mod tests {
 
         // Aggregate.
         let agg = backend
-            .aggregate_llm_costs(LlmCallFilter::default())
+            .aggregate_llm_costs(
+                LlmCallFilter::default(),
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(agg.totals.call_count, 3);
@@ -12072,12 +13496,15 @@ mod tests {
         )
         .unwrap();
         let shape = backend
-            .corpus_shape(CorpusShapeFilter {
-                time_window: window,
-                agent_id_hash: None,
-                agent_name: None,
-                deployment_domain: None,
-            })
+            .corpus_shape(
+                CorpusShapeFilter {
+                    time_window: window,
+                    agent_id_hash: None,
+                    agent_name: None,
+                    deployment_domain: None,
+                },
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(shape.total_traces, 3);
@@ -12117,7 +13544,10 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 5, 2, 0, 0, 0).unwrap(),
         )
         .unwrap();
-        let scrub = backend.aggregate_scrub_stats(window).await.unwrap();
+        let scrub = backend
+            .aggregate_scrub_stats(window, crate::scope::CallerScope::Unauthenticated)
+            .await
+            .unwrap();
         assert_eq!(scrub.envelopes_scrubbed, 1);
         assert_eq!(
             *scrub
@@ -12159,7 +13589,12 @@ mod tests {
             .unwrap();
 
         let keys = backend
-            .list_federation_keys(FederationKeyFilter::default(), None, 100)
+            .list_federation_keys(
+                FederationKeyFilter::default(),
+                None,
+                100,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(keys.items.len(), 2);
@@ -12173,6 +13608,7 @@ mod tests {
                 },
                 None,
                 100,
+                crate::scope::CallerScope::Unauthenticated,
             )
             .await
             .unwrap();
@@ -12180,18 +13616,213 @@ mod tests {
         assert_eq!(revoked.items[0].key_id, "k-b");
 
         let atts = backend
-            .list_attestations(AttestationFilter::default(), None, 100)
+            .list_attestations(
+                AttestationFilter::default(),
+                None,
+                100,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(atts.items.len(), 1);
         assert_eq!(atts.items[0].attestation_id, "att-1");
 
         let revs = backend
-            .list_revocations(RevocationFilter::default(), None, 100)
+            .list_revocations(
+                RevocationFilter::default(),
+                None,
+                100,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(revs.items.len(), 1);
         assert_eq!(revs.items[0].revocation_id, "rev-1");
+    }
+
+    // #135 + part of #150 — list_attestations_for: by-target filtering,
+    // newest-first ordering, cursor paging, and the §4.3 scope gate.
+    #[tokio::test]
+    async fn re_list_attestations_for_by_target_scope_and_cursor() {
+        use crate::read::ReadEngine;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        // Keys: two emitters + two subjects (targets).
+        for (id, scrub) in [
+            ("emit-a", "emit-a"),
+            ("emit-b", "emit-b"),
+            ("tgt-1", "emit-a"),
+            ("tgt-2", "emit-a"),
+        ] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(id, id, scrub),
+                })
+                .await
+                .unwrap();
+        }
+
+        // Helper: a federation-scope (broad-tier) attestation targeting
+        // `attested`, with a distinct asserted_at for stable ordering.
+        let mk = |id: &str, attesting: &str, attested: &str, at: &str, scope: &str| {
+            let mut a = fed_attestation(id, attesting, attested, "emit-a");
+            a.asserted_at = at.parse().unwrap();
+            a.cohort_scope = scope.to_string();
+            SignedAttestation { attestation: a }
+        };
+
+        // tgt-1: three federation-scope rows (newest last by clock).
+        backend
+            .put_attestation(mk(
+                "a1",
+                "emit-a",
+                "tgt-1",
+                "2026-05-01T00:00:00Z",
+                "federation",
+            ))
+            .await
+            .unwrap();
+        backend
+            .put_attestation(mk(
+                "a2",
+                "emit-b",
+                "tgt-1",
+                "2026-05-02T00:00:00Z",
+                "federation",
+            ))
+            .await
+            .unwrap();
+        backend
+            .put_attestation(mk(
+                "a3",
+                "emit-a",
+                "tgt-1",
+                "2026-05-03T00:00:00Z",
+                "federation",
+            ))
+            .await
+            .unwrap();
+        // A `self`-scope row whose subject IS tgt-1 (write-gate allows
+        // self with no membership). Visible only to a caller whose
+        // identity == tgt-1.
+        backend
+            .put_attestation(mk(
+                "a-self",
+                "emit-a",
+                "tgt-1",
+                "2026-05-04T00:00:00Z",
+                "self",
+            ))
+            .await
+            .unwrap();
+        // A different target — must never appear in tgt-1 listings.
+        backend
+            .put_attestation(mk(
+                "b1",
+                "emit-a",
+                "tgt-2",
+                "2026-05-05T00:00:00Z",
+                "federation",
+            ))
+            .await
+            .unwrap();
+
+        // Unauthenticated caller: only broad-tier (federation) rows for
+        // tgt-1, newest-first, no `self` leak, no other target.
+        // UFCS — `list_attestations_for` exists on both ReadEngine (this,
+        // 4-arg) and the legacy FederationDirectory (1-arg) in scope.
+        let page = ReadEngine::list_attestations_for(
+            &backend,
+            "tgt-1",
+            None,
+            100,
+            crate::scope::CallerScope::Unauthenticated,
+        )
+        .await
+        .unwrap();
+        let ids: Vec<&str> = page
+            .items
+            .iter()
+            .map(|a| a.attestation_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["a3", "a2", "a1"], "newest-first, broad-tier only");
+        assert!(page.next_cursor.is_none());
+
+        // Cursor paging: limit=2 then continue.
+        let p1 = ReadEngine::list_attestations_for(
+            &backend,
+            "tgt-1",
+            None,
+            2,
+            crate::scope::CallerScope::Unauthenticated,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            p1.items
+                .iter()
+                .map(|a| a.attestation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a3", "a2"]
+        );
+        assert!(p1.next_cursor.is_some());
+        let p2 = ReadEngine::list_attestations_for(
+            &backend,
+            "tgt-1",
+            p1.next_cursor,
+            2,
+            crate::scope::CallerScope::Unauthenticated,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            p2.items
+                .iter()
+                .map(|a| a.attestation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a1"]
+        );
+        assert!(p2.next_cursor.is_none());
+
+        // Authenticated caller whose identity == tgt-1: the `self` row
+        // now resolves (target-membership = own identity) and sorts
+        // first by clock.
+        let auth_self = crate::scope::CallerScope::Authenticated {
+            admission: crate::scope::admission::CallerAdmission::for_test("tgt-1", "tgt-1", [], []),
+        };
+        let page = ReadEngine::list_attestations_for(&backend, "tgt-1", None, 100, auth_self)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|a| a.attestation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-self", "a3", "a2", "a1"],
+            "self row resolves for its own subject identity"
+        );
+
+        // Authenticated caller with a DIFFERENT identity: the `self` row
+        // does not resolve (target != reader identity) — broad-tier only.
+        let auth_other = crate::scope::CallerScope::Authenticated {
+            admission: crate::scope::admission::CallerAdmission::for_test(
+                "someone-else",
+                "someone-else",
+                [],
+                [],
+            ),
+        };
+        let page = ReadEngine::list_attestations_for(&backend, "tgt-1", None, 100, auth_other)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|a| a.attestation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a3", "a2", "a1"],
+            "self row hidden from a non-owner authenticated reader"
+        );
     }
 
     #[tokio::test]
@@ -12217,7 +13848,12 @@ mod tests {
         )
         .unwrap();
         let rows = backend
-            .cross_agent_divergence("legal", window, DeviationMetric::CsdmaPlausibility)
+            .cross_agent_divergence(
+                "legal",
+                window,
+                DeviationMetric::CsdmaPlausibility,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(rows.len(), 3);
@@ -12257,7 +13893,15 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 5, 1, 15, 0, 0).unwrap(),
         )
         .unwrap();
-        let drift = backend.temporal_drift("agent-h", base, comp).await.unwrap();
+        let drift = backend
+            .temporal_drift(
+                "agent-h",
+                base,
+                comp,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
         let csdma = drift
             .iter()
             .find(|r| r.deviation_metric == DeviationMetric::CsdmaPlausibility)
@@ -12315,7 +13959,14 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 5, 2, 0, 0, 0).unwrap(),
         )
         .unwrap();
-        let gaps = backend.hash_chain_gaps("agent-h", window).await.unwrap();
+        let gaps = backend
+            .hash_chain_gaps(
+                "agent-h",
+                window,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
         assert_eq!(gaps.len(), 1);
         assert_eq!(gaps[0].gap_start_seq, 2);
         assert_eq!(gaps[0].gap_end_seq, 5);
@@ -12344,7 +13995,7 @@ mod tests {
         )
         .unwrap();
         let rates = backend
-            .conscience_override_rates("legal", window)
+            .conscience_override_rates("legal", window, crate::scope::CallerScope::Unauthenticated)
             .await
             .unwrap();
         assert_eq!(rates.len(), 2);
@@ -12407,7 +14058,12 @@ mod tests {
         )
         .unwrap();
         let agg = backend
-            .aggregate_scoring_factors("agent-h", window, None)
+            .aggregate_scoring_factors(
+                "agent-h",
+                window,
+                None,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(agg.trace_count, 3);
@@ -12428,6 +14084,7 @@ mod tests {
                 &["agent-h".to_owned(), "agent-x".to_owned()],
                 window,
                 None,
+                crate::scope::CallerScope::Unauthenticated,
             )
             .await
             .unwrap();
@@ -12437,28 +14094,43 @@ mod tests {
 
         // Granular counts.
         assert_eq!(
-            backend.count_traces(TraceFilter::default()).await.unwrap(),
+            backend
+                .count_traces(
+                    TraceFilter::default(),
+                    crate::scope::CallerScope::Unauthenticated
+                )
+                .await
+                .unwrap(),
             3
         );
         assert_eq!(
             backend
-                .count_overrides(TraceFilter::default())
+                .count_overrides(
+                    TraceFilter::default(),
+                    crate::scope::CallerScope::Unauthenticated
+                )
                 .await
                 .unwrap(),
             1
         );
         let id_changes = backend
-            .count_identity_changes(TraceFilter::default())
+            .count_identity_changes(
+                TraceFilter::default(),
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(id_changes, 0, "single agent_name → 0 changes");
 
         // Audit chain aggregate (agent-pinned → gap detected).
         let chain = backend
-            .aggregate_audit_chain(TraceFilter {
-                agent_id_hash: Some("agent-h".to_owned()),
-                ..Default::default()
-            })
+            .aggregate_audit_chain(
+                TraceFilter {
+                    agent_id_hash: Some("agent-h".to_owned()),
+                    ..Default::default()
+                },
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(chain.audit_total, 3);
@@ -12468,7 +14140,10 @@ mod tests {
 
         // Without agent pin → gap_count documented as 0.
         let chain_unpinned = backend
-            .aggregate_audit_chain(TraceFilter::default())
+            .aggregate_audit_chain(
+                TraceFilter::default(),
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(chain_unpinned.audit_total, 3);
@@ -12506,7 +14181,12 @@ mod tests {
         )
         .unwrap();
         let agg = backend
-            .aggregate_scoring_factors("agent-h", window, Some(baseline))
+            .aggregate_scoring_factors(
+                "agent-h",
+                window,
+                Some(baseline),
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(agg.trace_count, 2);
@@ -14076,14 +15756,24 @@ mod tests {
 
         // Empty match.
         let none = backend
-            .list_federation_keys(mk("no-such-cohort"), None, 100)
+            .list_federation_keys(
+                mk("no-such-cohort"),
+                None,
+                100,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert!(none.items.is_empty(), "unknown cohort → no rows");
 
         // Multi match: exactly the two family-acme peers (not peer-other).
         let fam_all = backend
-            .list_federation_keys(mk("family-acme"), None, 100)
+            .list_federation_keys(
+                mk("family-acme"),
+                None,
+                100,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         let mut ids: Vec<&str> = fam_all.items.iter().map(|k| k.key_id.as_str()).collect();
@@ -14092,13 +15782,23 @@ mod tests {
 
         // Multi-page: limit=1 pages the cohort in O(limit) per call.
         let p1 = backend
-            .list_federation_keys(mk("family-acme"), None, 1)
+            .list_federation_keys(
+                mk("family-acme"),
+                None,
+                1,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(p1.items.len(), 1);
         let cursor = p1.next_cursor.clone().expect("next_cursor on full page");
         let p2 = backend
-            .list_federation_keys(mk("family-acme"), Some(cursor), 1)
+            .list_federation_keys(
+                mk("family-acme"),
+                Some(cursor),
+                1,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(p2.items.len(), 1);
@@ -14110,7 +15810,12 @@ mod tests {
             .await
             .unwrap();
         let fam_live = backend
-            .list_federation_keys(mk("family-acme"), None, 100)
+            .list_federation_keys(
+                mk("family-acme"),
+                None,
+                100,
+                crate::scope::CallerScope::Unauthenticated,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -14959,5 +16664,85 @@ mod tests {
             .await
             .unwrap();
         assert!(chain.is_empty(), "steward isn't a trusted_publisher");
+    }
+
+    /// CIRISConformance#11 round 2, Finding B — the repository-statistics
+    /// cache is per-backend-instance, never a process global.
+    ///
+    /// Two independent backends over the same empty 1-day window: each
+    /// backend's FIRST call is a fresh compute (`cache_hit: false`) and
+    /// its SECOND is a hit (`cache_hit: true`) — symmetrically. Backend
+    /// B's first call must NOT hit backend A's entry (the round-2 report
+    /// saw a fresh engine served a prior engine's cached row). The
+    /// pre-fix process-global cache made B's first call a poisoned hit.
+    #[tokio::test]
+    async fn repo_stats_cache_is_per_backend_not_global() {
+        use crate::ceg::aggregates::repository::RepositoryFilter;
+        use crate::ceg::types::TimeWindow;
+        use crate::scope::CallerScope;
+
+        let window = TimeWindow::new(
+            Utc.timestamp_opt(0, 0).unwrap(),
+            Utc.timestamp_opt(86_400, 0).unwrap(), // 1-day window
+        )
+        .unwrap();
+        let filter = RepositoryFilter {
+            window,
+            agent_id_hashes: vec![],
+            deployment_domains: vec![],
+            cohort_scope_in: vec![],
+            task_classes: vec![],
+            fragility_only: false,
+        };
+
+        let a = SqliteBackend::open_in_memory().await.unwrap();
+        a.run_migrations().await.unwrap();
+        let b = SqliteBackend::open_in_memory().await.unwrap();
+        b.run_migrations().await.unwrap();
+
+        // Backend A: first call is a miss (fresh compute).
+        let a1 = a
+            .get_repository_statistics(filter.clone(), CallerScope::Unauthenticated)
+            .await
+            .unwrap();
+        assert!(!a1.cache_hit, "A first call must be a fresh compute");
+
+        // Backend A: second call is a hit on A's own entry.
+        let a2 = a
+            .get_repository_statistics(filter.clone(), CallerScope::Unauthenticated)
+            .await
+            .unwrap();
+        assert!(a2.cache_hit, "A second call must hit A's cache");
+        assert_eq!(
+            a1.evaluated_at_unix_ms, a2.evaluated_at_unix_ms,
+            "A's hit preserves the cached evaluation time"
+        );
+
+        // Backend B: first call must be a fresh compute, NOT a poisoned
+        // hit on A's entry (the cross-backend leak the global caused).
+        let b1 = b
+            .get_repository_statistics(filter.clone(), CallerScope::Unauthenticated)
+            .await
+            .unwrap();
+        assert!(
+            !b1.cache_hit,
+            "B first call must be a fresh compute, not a hit on A's cache"
+        );
+
+        // Backend B: second call hits B's own entry — symmetric with A.
+        let b2 = b
+            .get_repository_statistics(filter.clone(), CallerScope::Unauthenticated)
+            .await
+            .unwrap();
+        assert!(b2.cache_hit, "B second call must hit B's cache");
+
+        // A's cache stats see exactly one miss + one hit — B's traffic
+        // never touched A's cache.
+        let a_stats = a.repo_stats_cache().stats();
+        assert_eq!(a_stats.misses, 1, "A saw exactly one miss");
+        assert_eq!(a_stats.hits, 1, "A saw exactly one hit");
+        let b_stats = b.repo_stats_cache().stats();
+        assert_eq!(b_stats.misses, 1, "B saw exactly one miss");
+        assert_eq!(b_stats.hits, 1, "B saw exactly one hit");
     }
 }

@@ -306,6 +306,8 @@ mod tests {
             trace_schema_version: SchemaVersion::parse("2.7.0").unwrap(),
             components,
             deployment_profile: None,
+            cohort_scope: "federation".into(),
+            cohort_target_id: None,
             signature: "AAAA".into(),
             signature_key_id: "ciris-agent-key:dead".into(),
         };

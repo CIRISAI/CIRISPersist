@@ -82,6 +82,8 @@ fn build_signed_batch(
         trace_schema_version: SchemaVersion::parse("2.7.0").unwrap(),
         components,
         deployment_profile: None,
+        cohort_scope: "federation".into(),
+        cohort_target_id: None,
         signature: String::new(),
         signature_key_id: key_id.into(),
     };
@@ -478,6 +480,8 @@ async fn av17_attempt_index_out_of_range() {
         trace_schema_version: SchemaVersion::parse("2.7.0").unwrap(),
         components: vec![component],
         deployment_profile: None,
+        cohort_scope: "federation".into(),
+        cohort_target_id: None,
         signature: String::new(),
         signature_key_id: "agent-av17".into(),
     };

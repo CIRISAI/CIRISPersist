@@ -87,6 +87,8 @@ fn bench_event(
         scrub_signature: Some("scrub-sig".to_owned()),
         scrub_key_id: Some("scrub-key".to_owned()),
         scrub_timestamp: None,
+        cohort_scope: "federation".to_string(),
+        cohort_target_id: None,
     }
 }
 
@@ -216,7 +218,12 @@ fn read_engine_analytics(c: &mut Criterion) {
                     |backend| {
                         runtime.block_on(async {
                             let page = backend
-                                .list_trace_summaries(TraceFilter::default(), None, 100)
+                                .list_trace_summaries(
+                                    TraceFilter::default(),
+                                    None,
+                                    100,
+                                    ciris_persist::scope::CallerScope::Unauthenticated,
+                                )
                                 .await
                                 .unwrap();
                             black_box(page);
@@ -237,7 +244,10 @@ fn read_engine_analytics(c: &mut Criterion) {
                     |backend| {
                         runtime.block_on(async {
                             let agg = backend
-                                .aggregate_llm_costs(LlmCallFilter::default())
+                                .aggregate_llm_costs(
+                                    LlmCallFilter::default(),
+                                    ciris_persist::scope::CallerScope::Unauthenticated,
+                                )
                                 .await
                                 .unwrap();
                             black_box(agg);
@@ -262,6 +272,7 @@ fn read_engine_analytics(c: &mut Criterion) {
                                     "research",
                                     window,
                                     DeviationMetric::CsdmaPlausibility,
+                                    ciris_persist::scope::CallerScope::Unauthenticated,
                                 )
                                 .await
                                 .unwrap();

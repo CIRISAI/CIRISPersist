@@ -1,5 +1,7 @@
 //! Section G — Corpus shape primitive.
 //!
+//! Moved from `src/read/corpus.rs` in v4.0 (FSD §3.3).
+//!
 //! Drives `scripts/corpus_shape.py` and federation-side cohort
 //! dashboards. Persist owns the derivation (task_id → task_class,
 //! qa_* → language / question_num, primary model per trace) so every
@@ -8,9 +10,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use super::{TaskClass, TimeWindow};
+use crate::ceg::list::tasks::TaskClass;
+use crate::ceg::types::TimeWindow;
 
-/// Filter for [`super::ReadEngine::corpus_shape`].
+/// Filter for [`crate::ceg::ReadEngine::corpus_shape`].
 ///
 /// `time_window` is required (corpus shape is inherently windowed —
 /// without a window the rollup is unbounded and not comparable to

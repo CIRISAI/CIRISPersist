@@ -209,6 +209,24 @@ pub struct TraceEventRow {
     /// When the scrub+sign happened. Bounds the window between the
     /// trace's `completed_at` and lens handling.
     pub scrub_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+
+    // ─── v4.0 cohort_scope columns (CIRISPersist#160, V060, FSD §4.3
+    // / §12.0 item 1). The CEG visibility/routing axis the producer's
+    // policy formed for the trace; persist RECORDS it (MISSION §1.7)
+    // and the §4.3 read-gate filters on (cohort_scope, cohort_target_id).
+    /// The producer-declared cohort_scope. Closed-set values `self |
+    /// family | community | affiliations | species | biosphere |
+    /// federation`. Defaults to `'federation'` when the producer omits
+    /// it on the wire (today: every producer) — matching the V060
+    /// column DEFAULT and the pre-v4.0 federation-visible behavior.
+    pub cohort_scope: String,
+    /// The scope **target** (FSD §4.3): the `family_id` / `community_id`
+    /// the producer policy routed this trace to, or — for `self` — the
+    /// owner identity the substrate resolved from the verified signer
+    /// at ingest (`scrub_key_id` → identity, FSD §4.4). `None` for the
+    /// broad belonging-tiers (`affiliations` / `species` / `biosphere`
+    /// / `federation`).
+    pub cohort_target_id: Option<String>,
 }
 
 /// A row landing on `cirislens.trace_llm_calls`

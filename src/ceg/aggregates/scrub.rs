@@ -1,5 +1,7 @@
 //! Section H — Privacy / scrub observability primitive.
 //!
+//! Moved from `src/read/scrub.rs` in v4.0 (FSD §3.3).
+//!
 //! Drives privacy dashboards. Two of the four fields require the
 //! post-ingest classification pipeline (CIRISPersist#19 / v0.6.0)
 //! before they have data to populate; the v0.5.5 shape is committed
@@ -10,7 +12,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use super::TimeWindow;
+use crate::ceg::types::TimeWindow;
 use crate::schema::TraceLevel;
 
 /// Scrub-stats aggregate for a window. Counts are distinct-trace

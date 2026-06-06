@@ -119,10 +119,10 @@ pub use topology::{
     WithdrawalEntry, MAX_DELEGATION_DEPTH,
 };
 pub use types::{
-    Attestation, Family, FamilyMember, HybridPendingRow, IdentityOccurrence, KeyRecord,
-    PeerMetadataRow, PeerPolicyBlob, Revocation, SignedAttestation, SignedFamily,
-    SignedIdentityOccurrence, SignedKeyRecord, SignedRevocation, TrustClass, TrustFilter,
-    TrustGrant, TrustRelationship, TrustRow, TrustType,
+    Attestation, Community, CommunityMember, Family, FamilyMember, HybridPendingRow,
+    IdentityOccurrence, KeyRecord, PeerMetadataRow, PeerPolicyBlob, Revocation, SignedAttestation,
+    SignedCommunity, SignedFamily, SignedIdentityOccurrence, SignedKeyRecord, SignedRevocation,
+    TrustClass, TrustFilter, TrustGrant, TrustRelationship, TrustRow, TrustType,
 };
 
 /// Federation directory trait — the registry/lens/agent's read+write
@@ -375,6 +375,128 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         member_identity_key_id: &str,
     ) -> Result<Vec<Family>, Error>;
+
+    /// v4.0 (CEG 0.8 §8.1.13.3) — admit a `community` row. Structural
+    /// mirror of [`Self::put_family`].
+    ///
+    /// Runs `check_consensus_protocol_form` admission before computing
+    /// `persist_row_hash` and INSERTing. Idempotent on
+    /// `community_key_id` PK collision with matching content; errors on
+    /// collision with differing content.
+    ///
+    /// Unlike `self` / `family`, community content is NOT structurally
+    /// invisible ([`crate::federation::types::cohort_scope::suppresses_holds_bytes`]
+    /// is false for `community`) — read paths federate community
+    /// content normally.
+    async fn put_community(&self, community: SignedCommunity) -> Result<(), Error>;
+
+    /// v4.0 — fetch a single community by `community_key_id`. Returns
+    /// `None` if absent. Structural mirror of [`Self::lookup_family`].
+    async fn lookup_community(&self, community_key_id: &str) -> Result<Option<Community>, Error>;
+
+    /// v4.0 — list every community that `member_identity_key_id`
+    /// belongs to. Structural mirror of
+    /// [`Self::list_families_for_member`]; the §4.3 community-scope
+    /// predicate's fan-out path (`build_caller_admission` resolves
+    /// `identity_key_id → community_key_ids` through this method).
+    ///
+    /// Scans the `members` JSONB / TEXT field; postgres uses the V060
+    /// GIN index for O(log N), sqlite falls back to a full scan via
+    /// `json_each`.
+    async fn list_communities_for_member(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<Community>, Error>;
+
+    /// v4.0 (CIRISPersist#160 comment 4, FSD §4.6) — AV-45 write-path
+    /// cohort_scope admission gate, for write paths reachable through
+    /// `FederationDirectory` (`put_attestation`, and any other row
+    /// carrying a `(cohort_scope, target)` claim).
+    ///
+    /// Resolves `writer_occurrence_key_id`'s admission (identity →
+    /// families → communities, identical to
+    /// [`crate::scope::build_caller_admission`] but trait-local so
+    /// per-backend `put_attestation` can call it without an `Engine`)
+    /// and runs [`admission::DimensionAdmissionPolicy::check_write_cohort_scope`]
+    /// against the claimed `(cohort_scope, target)`. Returns
+    /// [`Error::WriteScopeRefused`] on a downgrade attempt; the caller
+    /// runs this BEFORE computing `persist_row_hash` / INSERT so a
+    /// refused row leaves no trace (verify-then-gate-then-persist).
+    ///
+    /// `self` and the broad belonging-tiers are no-op passes that need
+    /// no admission read; only `family` / `community` trigger the
+    /// resolution fan-out. On refusal a §9.3
+    /// `persist_refused_write_scope_total` event is emitted.
+    ///
+    /// Provided method (not per-backend SQL): composes the existing
+    /// resolution methods. Both backends inherit it.
+    async fn check_write_cohort_scope_for(
+        &self,
+        writer_occurrence_key_id: &str,
+        write_path: &'static str,
+        claimed_cohort_scope: &str,
+        claimed_target_id: Option<&str>,
+    ) -> Result<(), Error> {
+        use crate::federation::types::cohort_scope as cs;
+        // Fast path: `self` + the broad belonging-tiers need no
+        // membership resolution. Only family/community do.
+        let needs_admission =
+            claimed_cohort_scope == cs::FAMILY || claimed_cohort_scope == cs::COMMUNITY;
+
+        let admission = if needs_admission {
+            // occurrence → identity (singleton fallback: unbound
+            // occurrence IS its own identity, FSD §4.4).
+            let identity = match self
+                .lookup_identity_for_occurrence(writer_occurrence_key_id)
+                .await?
+            {
+                Some(io) => io.identity_key_id,
+                None => writer_occurrence_key_id.to_owned(),
+            };
+            let family_key_ids = self
+                .list_families_for_member(&identity)
+                .await?
+                .into_iter()
+                .map(|f| f.family_key_id);
+            let community_key_ids = self
+                .list_communities_for_member(&identity)
+                .await?
+                .into_iter()
+                .map(|c| c.community_key_id);
+            crate::scope::CallerAdmission::from_resolved(
+                writer_occurrence_key_id.to_owned(),
+                identity,
+                family_key_ids,
+                community_key_ids,
+            )
+        } else {
+            // No reads needed; an empty admission is sufficient for the
+            // self / broad-tier arms (they ignore the membership sets).
+            crate::scope::CallerAdmission::from_resolved(
+                writer_occurrence_key_id.to_owned(),
+                writer_occurrence_key_id.to_owned(),
+                std::iter::empty::<crate::scope::KeyId>(),
+                std::iter::empty::<crate::scope::KeyId>(),
+            )
+        };
+
+        admission::DimensionAdmissionPolicy::check_write_cohort_scope(
+            &admission,
+            claimed_cohort_scope,
+            claimed_target_id,
+        )
+        .map_err(|reason| {
+            tracing::warn!(
+                metric = "persist_refused_write_scope_total",
+                write_path = %write_path,
+                scope = %claimed_cohort_scope,
+                reason = %reason.kind(),
+                target = ?claimed_target_id,
+                "ciris-persist: write-path cohort_scope refused (AV-45)"
+            );
+            Error::WriteScopeRefused(reason)
+        })
+    }
 
     // ── Cold-path PQC fill-in (writer contract step 4) ─────────────
     //
@@ -1090,6 +1212,24 @@ pub enum Error {
         consensus_protocol: String,
     },
 
+    /// v4.0 (CIRISPersist#160 comment 4, FSD §4.6) — AV-45 write-path
+    /// cohort_scope admission refusal. A writer (`attesting_key_id` for
+    /// an attestation) claimed a `cohort_scope` whose target cohort the
+    /// writer is not a member of — a visibility-downgrade attempt.
+    /// Rejected at admission by
+    /// [`admission::DimensionAdmissionPolicy::check_write_cohort_scope`];
+    /// the row is not stored (mirrors the verify-then-gate-then-persist
+    /// discipline, MISSION §1.6). Distinct from
+    /// [`Error::CohortScopeRejected`] (which is closed-set *value*
+    /// validation): this is *membership* refusal of a well-formed label.
+    ///
+    /// Carries the structured [`ScopeRefusalReason`](crate::scope::ScopeRefusalReason);
+    /// `kind()` returns the stable boundary token
+    /// `federation_write_scope_refused`, and the inner reason's own
+    /// `kind()` distinguishes family vs community membership.
+    #[error("write-path cohort_scope refused: {0}")]
+    WriteScopeRefused(#[from] crate::scope::ScopeRefusalReason),
+
     /// Backend-level error (DB connection, serialization, etc.).
     /// String-typed because each backend has its own error tree.
     #[error("backend: {0}")]
@@ -1130,6 +1270,7 @@ impl Error {
             Error::RevocationRollback { .. } => "federation_revocation_rollback",
             Error::DeviceClassRejected { .. } => "federation_device_class_rejected",
             Error::ConsensusProtocolMalformed { .. } => "federation_consensus_protocol_malformed",
+            Error::WriteScopeRefused(_) => "federation_write_scope_refused",
             Error::Backend(_) => "federation_backend",
         }
     }

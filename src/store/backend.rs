@@ -245,6 +245,69 @@ pub trait Backend: Send + Sync {
     fn add_graph_node(&self, _n: &GraphNode) -> impl Future<Output = Result<(), Error>> + Send {
         async { Err(Error::NotImplemented("add_graph_node (Phase 3)")) }
     }
+
+    /// v4.0 (CIRISPersist#160, FSD §4.4) — resolve the IDENTITY a
+    /// signing/occurrence key speaks for, for the trace-ingest
+    /// `self`-target stamping path (FSD §12.0 item 1).
+    ///
+    /// Returns the `identity_key_id` bound to `occurrence_key_id` via
+    /// `federation_identity_occurrences` (V059), or `None` when the
+    /// key is not (yet) bound as an occurrence of any identity — the
+    /// **singleton-identity fallback** (FSD §4.4): a fresh sovereign
+    /// deployment IS its own identity, so the caller treats `None` as
+    /// "identity == occurrence" and stamps the occurrence key itself.
+    ///
+    /// Default impl returns `Ok(None)` (always singleton) so backends
+    /// without a federation directory degrade to the sovereign posture.
+    /// The Postgres / SQLite / Memory backends override to consult
+    /// their [`crate::federation::FederationDirectory`] impl.
+    ///
+    /// This is a *resolution* method (MISSION §1.7): it reports what
+    /// the federation chain has admitted about the key, never arbitrates
+    /// it.
+    fn resolve_identity_for_occurrence(
+        &self,
+        _occurrence_key_id: &str,
+    ) -> impl Future<Output = Result<Option<String>, Error>> + Send {
+        async { Ok(None) }
+    }
+
+    /// v4.0 (CIRISPersist#160 comment 4, FSD §4.6) — every family
+    /// `family_key_id` the given IDENTITY is a member of. The
+    /// family-half of the writer's [`CallerAdmission`](crate::scope::CallerAdmission)
+    /// for the write-path cohort_scope gate
+    /// ([`DimensionAdmissionPolicy::check_write_cohort_scope`](crate::federation::admission::DimensionAdmissionPolicy::check_write_cohort_scope)).
+    ///
+    /// Mirrors the read-side admission builder
+    /// ([`build_caller_admission`](crate::scope::build_caller_admission))
+    /// step 2 but reachable from the `Backend`-only ingest pipeline,
+    /// which holds no `Engine`. `member_identity_key_id` is the writer's
+    /// identity (resolved via [`Self::resolve_identity_for_occurrence`]).
+    ///
+    /// Default impl returns `Ok(vec![])` — the sovereign/singleton
+    /// posture (no family memberships). The Postgres / SQLite / Memory
+    /// backends override to consult their
+    /// [`crate::federation::FederationDirectory`] impl.
+    fn admission_family_key_ids(
+        &self,
+        _member_identity_key_id: &str,
+    ) -> impl Future<Output = Result<Vec<String>, Error>> + Send {
+        async { Ok(Vec::new()) }
+    }
+
+    /// v4.0 (CIRISPersist#160 comment 4, FSD §4.6) — every community
+    /// `community_key_id` the given IDENTITY is a member of. The
+    /// community-half of the writer's admission for the write-path
+    /// cohort_scope gate. Symmetric to [`Self::admission_family_key_ids`];
+    /// see that method for the full rationale.
+    ///
+    /// Default impl returns `Ok(vec![])` — sovereign/singleton posture.
+    fn admission_community_key_ids(
+        &self,
+        _member_identity_key_id: &str,
+    ) -> impl Future<Output = Result<Vec<String>, Error>> + Send {
+        async { Ok(Vec::new()) }
+    }
 }
 
 /// Report of a batch insert.

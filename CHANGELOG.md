@@ -5,6 +5,48 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [4.0.0] — 2026-06-05
+
+**The Data Access Surface — a generic, scope-aware substrate read/write capability (CIRISPersist#160 / #159 / #135 / partial #150).**
+
+Hard cut, no back-compat, no aliases. Every consumer (CIRISLens, CIRISLensCore, CIRISBridge, CIRISNodeCore, sovereign-mode agents) updates to the v4.0 API — see `FSD/V4_0_DATA_ACCESS_SURFACE.md` §15.5 for the consumer-migration order. FSD reviewed in #160 (external Opus 4.7 review + CIRISLensCore consumer pass).
+
+### The model
+`cohort_scope` is the CEG visibility/routing axis, **formed upstream by the producer's trust/distribution policy**; persist RECORDS it and gates against it, never deriving it (MISSION §1.7). A scoped row carries its `cohort_scope` AND the scope **target** it was routed to (`family_id` / `community_id`, or — for `self` — the owner identity the substrate resolves from the verified signer). The read/write gates are **pure target-membership set checks** against a caller's substrate-resolved admission — no emitter-join, no cross-cohort leak.
+
+### Added — four substrate primitives
+- **`CallerScope`** (`src/scope/`) — `{ Unauthenticated, Authenticated { admission: CallerAdmission } }`. `CallerAdmission` (`occurrence_key_id`, resolved `identity_key_id`, `family_key_ids`, `community_key_ids`) has **no public constructor**; the sole builder is `build_caller_admission(engine, occurrence_key_id)` resolving from `federation_identity_occurrences` / `federation_families` / `federation_communities`. Singleton-identity fallback for unbound occurrence keys.
+- **Filter / Aggregate traits** (`src/ceg/types/`) — `Filter::cache_key_digest` (implementers fold discriminators); `Aggregate` carries `sample_count` (top-level vs nested contract, AV-43 k-anonymity), `evaluated_at_unix_ms`, `cache_hit` on every result.
+- **Generic substrate cache** (`src/cache/`) — bounded LRU + TTL, tier-aware defaults (Mobile 8 MiB / Edge 32 MiB / Server 64 MiB), window-overlap bucket invalidation (a write inside any cached entry's window invalidates it regardless of which bucket the write falls in), fail-honest (TTL expiry + backend down → real error, never stale). Plus an admission cache (5-min TTL, chain-write invalidation).
+- **`cohort_scope_sql_predicate`** (`src/scope/sql.rs`) — target-membership WHERE-fragment + binds, both backends.
+
+### Added — primitives
+- **`get_repository_statistics(filter, scope)`** (#159) — scope-gated, cache-aware `RepositoryStatistics` (totals / scores / conscience / actions / fragility / by_domain) over `trace_events`. Postgres single-CTE, SQLite materialize-then-fold (Rust fold guarantees byte-identical cross-backend output); both real, parity-tested.
+- **`list_attestations_for(target, …, scope)`** (#135, partial #150) — scope-gated attestation listing by subject, cursor-paged.
+
+### Changed — breaking
+- **Module reorg**: `src/read/*` → topic-named `src/ceg/{cohort_scope,identity,family,community,structural_invisibility,streaming,list,aggregates,types}/`. `src/read/mod.rs` removed (façade only landed mid-cut).
+- **`ReadEngine` v2**: every read method gains a trailing `scope: CallerScope`. `Error::NotImplemented` **removed** (both backends implement everything — MISSION §1.5); `Error::ScopeRefused(ScopeRefusalReason)` added.
+- **PyO3**: read methods take `caller_occurrence_key_id: Option<str>` (None → Unauthenticated, Some → substrate-resolved Authenticated). No admission fields cross the boundary. Legacy uncapped `list_attestations_for(target) -> Vec` PyO3 wrapper removed (superseded by the bounded/scoped method).
+
+### Added — write-side admission (AV-58)
+- `DimensionAdmissionPolicy::check_write_cohort_scope` — a writer claiming `(family|community, target)` must be a member of that target, else refused; runs verify→gate→persist (zero writes on refusal). Wired into trace ingest + `put_attestation`. Symmetric to the read gate.
+
+### Added — substrate / migration (V060)
+- `federation_communities` table + `put_community` / `lookup_community` / `list_communities_for_member` (§8.1.13.3 — community is NOT structurally invisible, unlike self/family).
+- `trace_events.cohort_scope` + `cohort_target_id` columns (default `'federation'` / NULL — backward-safe; existing rows stay federation-visible). Optional `cohort_scope`/`cohort_target_id` trace envelope fields are `skip_serializing_if`-defaulted so existing trace canonical bytes / signatures are unchanged (MISSION §3 byte-exactness; proven by the recorded-signature fixture corpus). Producer adoption (CIRISAgent emitting per-trace cohort_scope) is a tracked cross-repo follow-up.
+- DAS covering indexes (lead with `cohort_scope, cohort_target_id`); attestation indexes on the real `attested_key_id` / `cohort_scope` columns.
+
+### Threat model
+- **AV-57** (read-side cohort_scope escalation) — closed by construction (private `CallerAdmission` constructor + substrate-only builder + target-membership predicate).
+- **AV-58** (write-side cohort_scope downgrade) — closed by verify→gate→persist set-membership.
+
+### Hardened via CIRISConformance#11 adversarial fire-test (3 rounds, all closed before tag)
+- **No-backend build** — gated `build_caller_admission` + re-exports on `any(postgres, sqlite)` (the `default-features` / `core` CI legs broke; `Engine::federation_directory` is backend-gated).
+- **Cache wide-window OOM** — the reverse index was O(n²) memory (a `CacheKey` carried every overlapped bucket; a 10-year window ≈ 61 GB → SIGKILL). Rewrote to range-based invalidation: `CacheKey` carries `(first_bucket, last_bucket)`; `invalidate_write` scans the bounded LRU. O(1) memory per key, digest unchanged.
+- **Cross-engine cache poison** — the process-global cache had no engine identity in the key (a Postgres engine served a SQLite engine's entry). Scoped to a per-backend-instance `Arc<Cache>`; cohab still shares one cache (one engine), distinct backends / `reset_engine` isolate correctly.
+- Cohabitation runtime green (race-repro 100% fast both backends, no #156/#158 regression); canonical-bytes integrity verified (no input shifts signed bytes); cross-cohort leak closed at the §4.3 predicate + AV-58 admission layer, both backends.
+
 ## [3.14.3] — 2026-06-05
 
 **Hotfix: postgres-side merkle_store test fixtures (same nested-block_on pattern as v3.14.2).**
