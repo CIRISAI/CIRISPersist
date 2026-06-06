@@ -84,7 +84,7 @@ pub use admission::{
 };
 pub use blackhole::{BlackholeRecord, BlackholeRules, RETICULUM_IDENTITY_HASH_LEN};
 pub use blobs::{
-    holds_bytes_attestation_envelope, holds_bytes_attestation_type, BlobBody, BlobError,
+    holds_bytes_attestation_envelope, holds_bytes_attestation_type, BlobBody, BlobError, BlobRange,
     BlobStorage, EvictActorReport, ExternalRef, PutBlobAttestation, DEFAULT_INLINE_BYTES_CAP,
     HOLDS_BYTES_ATTESTATION_TYPE_PREFIX, HOLDS_BYTES_PREFIX_HEX_LEN,
 };

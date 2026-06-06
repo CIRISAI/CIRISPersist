@@ -153,6 +153,32 @@ pub enum BlobBody {
     External(ExternalRef),
 }
 
+/// v4.1 (CIRISPersist#142, Cut A) — the result of a
+/// [`BlobStorage::get_blob_range`] byte-range read.
+///
+/// For [`BlobBody::Inline`] blobs the requested range is sliced
+/// **server-side** (no full-buffer load) and returned as
+/// [`BlobRange::Inline`]. For [`BlobBody::External`] blobs persist does
+/// **NOT** dereference the URI — it returns [`BlobRange::External`] with
+/// the ref and the (clamped) range so the *caller* fetches
+/// `[range_start, range_end_inclusive]` from the upstream object store
+/// itself, honoring whatever auth its deployment shape requires.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlobRange {
+    /// The requested byte range, sliced from inline storage.
+    Inline(Vec<u8>),
+    /// External blob — persist does NOT dereference; the caller fetches
+    /// [range_start, range_end_inclusive] from the ref's URI itself.
+    External {
+        /// The stored external pointer (URI + size + media type).
+        external_ref: ExternalRef,
+        /// Clamped inclusive range start the caller should fetch.
+        range_start: u64,
+        /// Clamped inclusive range end the caller should fetch.
+        range_end_inclusive: u64,
+    },
+}
+
 impl BlobBody {
     /// True iff this is the [`BlobBody::Inline`] variant.
     pub fn is_inline(&self) -> bool {
@@ -269,6 +295,19 @@ pub trait BlobStorage: Send + Sync {
         &self,
         sha256: &[u8; 32],
     ) -> impl Future<Output = Result<Option<BlobBody>, BlobError>> + Send;
+
+    /// v4.1 (CIRISPersist#142, Cut A) — byte-range read (RFC 9110 §14.4
+    /// semantics). `range_end_inclusive` is clamped to size-1; a
+    /// `range_start` at or past the blob size is `RangeNotSatisfiable`.
+    /// Inline → server-side substring (no full-buffer load). External →
+    /// the ref + clamped range for the caller to fetch (persist never
+    /// dereferences). Returns None if the blob is absent.
+    fn get_blob_range(
+        &self,
+        sha256: &[u8; 32],
+        range_start: u64,
+        range_end_inclusive: u64,
+    ) -> impl Future<Output = Result<Option<BlobRange>, BlobError>> + Send;
 
     /// Existence check. Cheaper than [`get_blob`](BlobStorage::get_blob)
     /// — does not pull the body column.
@@ -794,6 +833,17 @@ pub enum BlobError {
         threshold: f64,
     },
 
+    /// v4.1 (CIRISPersist#142, Cut A) — a
+    /// [`get_blob_range`](BlobStorage::get_blob_range) `range_start` at or
+    /// past the blob's size (RFC 9110 §14.4 "Range Not Satisfiable").
+    #[error("range start {range_start} not satisfiable for blob of size {size}")]
+    RangeNotSatisfiable {
+        /// The requested (unsatisfiable) range start.
+        range_start: u64,
+        /// The blob's actual size in bytes.
+        size: u64,
+    },
+
     /// Backend-level error (DB connection, serialization, etc.).
     #[error("backend: {0}")]
     Backend(String),
@@ -810,6 +860,7 @@ impl BlobError {
             BlobError::AttestationEmissionFailed(_) => "blob_attestation_emission_failed",
             BlobError::TrustBelowThreshold { .. } => "blob_trust_below_threshold",
             BlobError::HashMatchedKnownBad { .. } => "blob_hash_matched_known_bad",
+            BlobError::RangeNotSatisfiable { .. } => "blob_range_not_satisfiable",
             BlobError::Backend(_) => "blob_backend",
         }
     }
