@@ -3965,6 +3965,190 @@ impl crate::federation::BlobStorage for PostgresBackend {
         Ok(manifest_row.sha256)
     }
 
+    async fn put_stream_sth(
+        &self,
+        sth: ciris_verify_core::transparency::SignedTreeHead,
+        producer_key_id: &str,
+    ) -> Result<(), crate::federation::BlobError> {
+        use crate::federation::stream_sth;
+        // Step 1: parse stream_id (must be `stream:<id>`).
+        let stream_id = stream_sth::parse_stream_id(&sth.log_id)?.to_string();
+
+        // Step 2: load the seq-ordered chunk hashes for the stream
+        // (the first `tree_size` are what the gate compares against; we
+        // load all and let recompute_and_assert_root slice + check the
+        // count).
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let chunk_hashes = pg_load_stream_chunk_hashes(&client, &stream_id).await?;
+
+        // Steps 3–4: recompute the RFC 6962 root from persist's own
+        // chunks and assert it equals the STH's claimed root (the
+        // anti-equivocation gate; rejects over-claimed tree_size too).
+        stream_sth::recompute_and_assert_root(&sth, &chunk_hashes)?;
+
+        // Step 5: verify the producer's hybrid signature, resolving the
+        // pinned key from federation_keys via producer_key_id.
+        crate::federation::blobs::verify_stream_sth_signature(self, &sth, producer_key_id).await?;
+
+        // Step 6: INSERT. A (stream_id, tree_size) PK conflict with a
+        // DIFFERENT root is an equivocation attempt → reject; identical
+        // → idempotent. We read any existing row's root first.
+        let tree_size_i64 = i64::try_from(sth.tree_size).map_err(|_| {
+            crate::federation::BlobError::InvalidArgument(
+                "put_stream_sth: tree_size exceeds i64 — federation_stream_sth.tree_size is BIGINT"
+                    .into(),
+            )
+        })?;
+        let epoch_i64 = i64::try_from(0u64).expect("0 fits i64");
+        let root_vec = sth.root_hash.to_vec();
+        let signed_at = sth.timestamp;
+        let signature_blob = stream_sth::serialize_signature(&sth.signature)?;
+        let witness_json = stream_sth::serialize_witness_signatures(&sth.witness_signatures)?;
+        let witness_value: serde_json::Value =
+            serde_json::from_str(&witness_json).map_err(|e| {
+                crate::federation::BlobError::Backend(format!("put_stream_sth witness json: {e}"))
+            })?;
+
+        // Idempotent/equivocation: only insert when absent.
+        let inserted = client
+            .execute(
+                "INSERT INTO cirislens.federation_stream_sth (\
+                    stream_id, tree_size, epoch, root_hash, signed_at, \
+                    producer_key_id, signature_blob, witness_signatures\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                 ON CONFLICT (stream_id, tree_size) DO NOTHING",
+                &[
+                    &stream_id,
+                    &tree_size_i64,
+                    &epoch_i64,
+                    &root_vec,
+                    &signed_at,
+                    &producer_key_id,
+                    &signature_blob,
+                    &witness_value,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("put_stream_sth insert: {e}"))
+            })?;
+
+        if inserted == 0 {
+            // A row already exists at (stream_id, tree_size). Equivocation
+            // iff its stored root differs from the new STH's root.
+            let existing_root: Vec<u8> = client
+                .query_one(
+                    "SELECT root_hash FROM cirislens.federation_stream_sth \
+                      WHERE stream_id = $1 AND tree_size = $2",
+                    &[&stream_id, &tree_size_i64],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::BlobError::Backend(format!(
+                        "put_stream_sth conflict re-read: {e}"
+                    ))
+                })?
+                .get(0);
+            if existing_root != root_vec {
+                return Err(crate::federation::BlobError::InvalidArgument(format!(
+                    "put_stream_sth: equivocation — an STH at stream={stream_id} \
+                     tree_size={} already exists with a different root",
+                    sth.tree_size
+                )));
+            }
+            // Identical re-PUT → idempotent OK.
+        }
+        Ok(())
+    }
+
+    async fn latest_stream_sth(
+        &self,
+        stream_id: &str,
+    ) -> Result<Option<ciris_verify_core::transparency::SignedTreeHead>, crate::federation::BlobError>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let row_opt = client
+            .query_opt(
+                "SELECT tree_size, root_hash, signed_at, signature_blob, witness_signatures \
+                   FROM cirislens.federation_stream_sth \
+                  WHERE stream_id = $1 \
+                  ORDER BY tree_size DESC \
+                  LIMIT 1",
+                &[&stream_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("latest_stream_sth select: {e}"))
+            })?;
+        let Some(row) = row_opt else {
+            return Ok(None);
+        };
+        let tree_size_i64: i64 =
+            row.safe_get_with("tree_size", crate::federation::BlobError::Backend)?;
+        let tree_size = u64::try_from(tree_size_i64).map_err(|_| {
+            crate::federation::BlobError::Backend("latest_stream_sth: negative tree_size".into())
+        })?;
+        let root_vec: Vec<u8> =
+            row.safe_get_with("root_hash", crate::federation::BlobError::Backend)?;
+        let root_hash = crate::federation::stream_sth::root_hash_from_bytes(&root_vec)?;
+        let signed_at: chrono::DateTime<chrono::Utc> =
+            row.safe_get_with("signed_at", crate::federation::BlobError::Backend)?;
+        let signature_blob: Vec<u8> =
+            row.safe_get_with("signature_blob", crate::federation::BlobError::Backend)?;
+        let signature = crate::federation::stream_sth::deserialize_signature(&signature_blob)?;
+        let witness_value: serde_json::Value =
+            row.safe_get_with("witness_signatures", crate::federation::BlobError::Backend)?;
+        let witness_signatures = crate::federation::stream_sth::deserialize_witness_signatures(
+            &witness_value.to_string(),
+        )?;
+        Ok(Some(ciris_verify_core::transparency::SignedTreeHead {
+            log_id: crate::federation::stream_sth::log_id_for_stream(stream_id),
+            tree_size,
+            root_hash,
+            timestamp: signed_at,
+            signature,
+            witness_signatures,
+        }))
+    }
+
+    async fn stream_inclusion_proof(
+        &self,
+        stream_id: &str,
+        leaf_index: u64,
+        tree_size: u64,
+    ) -> Result<Option<ciris_verify_core::transparency::MerkleProof>, crate::federation::BlobError>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let chunk_hashes = pg_load_stream_chunk_hashes(&client, stream_id).await?;
+        crate::federation::stream_sth::inclusion_proof(&chunk_hashes, leaf_index, tree_size)
+    }
+
+    async fn stream_consistency_proof(
+        &self,
+        stream_id: &str,
+        from_size: u64,
+        to_size: u64,
+    ) -> Result<
+        Option<ciris_verify_core::transparency::ConsistencyProof>,
+        crate::federation::BlobError,
+    > {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let chunk_hashes = pg_load_stream_chunk_hashes(&client, stream_id).await?;
+        crate::federation::stream_sth::consistency_proof(&chunk_hashes, from_size, to_size)
+    }
+
     async fn get_blob(
         &self,
         sha256: &[u8; 32],
@@ -4545,6 +4729,34 @@ impl crate::federation::BlobStorage for PostgresBackend {
         }
         Ok(report)
     }
+}
+
+/// v4.1 (CIRISPersist#142, Cut C1b) — load a stream's chunk hashes in
+/// `seq ASC` order (the leaves of the stream's RFC 6962 log). Shared by
+/// `put_stream_sth` (the anti-equivocation gate) and the proof methods.
+async fn pg_load_stream_chunk_hashes(
+    client: &deadpool_postgres::Object,
+    stream_id: &str,
+) -> Result<Vec<[u8; 32]>, crate::federation::BlobError> {
+    let rows = client
+        .query(
+            "SELECT chunk_sha FROM cirislens.federation_stream_chunks \
+              WHERE stream_id = $1 ORDER BY seq ASC",
+            &[&stream_id],
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("load stream chunk hashes: {e}"))
+        })?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let sha_vec: Vec<u8> =
+            r.safe_get_with("chunk_sha", crate::federation::BlobError::Backend)?;
+        out.push(crate::federation::stream_sth::root_hash_from_bytes(
+            &sha_vec,
+        )?);
+    }
+    Ok(out)
 }
 
 // ─── Eviction sweeper helpers (v3.4.0, CIRISPersist#123) ───────────
@@ -17692,6 +17904,290 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, BlobError::InvalidArgument(_)));
+    }
+
+    // ─── v4.1 (CIRISPersist#142, Cut C1b) — PG per-stream transparency
+    //     log: producer-signed STH + RFC 6962 proofs ─────────────────
+
+    /// Register a real hybrid producer key in federation_keys (PG).
+    async fn pg_register_hybrid_producer(
+        backend: &PostgresBackend,
+        key_id: &str,
+    ) -> ciris_crypto::HybridSigner<ciris_crypto::Ed25519Signer, ciris_crypto::MlDsa65Signer> {
+        use crate::federation::FederationDirectory as _;
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        let ed = ciris_crypto::Ed25519Signer::from_seed(&[0x41; 32]).unwrap();
+        let mldsa = ciris_crypto::MlDsa65Signer::from_seed(&[0x42; 32]).unwrap();
+        let ed_pub_b64 = {
+            use ciris_crypto::ClassicalSigner as _;
+            B64.encode(ed.public_key().unwrap())
+        };
+        let mldsa_pub_b64 = {
+            use ciris_crypto::PqcSigner as _;
+            B64.encode(mldsa.public_key().unwrap())
+        };
+        let mut record = fix_section_i_key(key_id, key_id, chrono::Utc::now(), true);
+        record.pubkey_ed25519_base64 = ed_pub_b64;
+        record.pubkey_ml_dsa_65_base64 = Some(mldsa_pub_b64);
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord { record })
+            .await
+            .unwrap();
+        ciris_crypto::HybridSigner::new(ed, mldsa).unwrap()
+    }
+
+    fn pg_sign_stream_sth(
+        signer: &ciris_crypto::HybridSigner<
+            ciris_crypto::Ed25519Signer,
+            ciris_crypto::MlDsa65Signer,
+        >,
+        stream_id: &str,
+        chunk_hashes: &[[u8; 32]],
+        tree_size: u64,
+    ) -> ciris_verify_core::transparency::SignedTreeHead {
+        use crate::federation::stream_sth::StreamChunkLeaf;
+        use ciris_verify_core::transparency::{InMemoryTransparencyStore, TransparencyStore};
+        let store: InMemoryTransparencyStore<StreamChunkLeaf> =
+            InMemoryTransparencyStore::new(None);
+        for sha in &chunk_hashes[..tree_size as usize] {
+            store.append(StreamChunkLeaf::new(*sha)).unwrap();
+        }
+        let root_hash = store.root().unwrap();
+        let log_id = crate::federation::stream_sth::log_id_for_stream(stream_id);
+        let timestamp = chrono::Utc::now();
+        let signing_bytes = ciris_verify_core::transparency::SignedTreeHead::signing_bytes(
+            &log_id, tree_size, &root_hash, timestamp,
+        );
+        let signature = signer.sign(&signing_bytes).unwrap();
+        ciris_verify_core::transparency::SignedTreeHead {
+            log_id,
+            tree_size,
+            root_hash,
+            timestamp,
+            signature,
+            witness_signatures: Vec::new(),
+        }
+    }
+
+    /// Run an async PG-STH test body on a dedicated thread with a large
+    /// stack. The ML-DSA-65 hybrid sign/verify is stack-heavy in debug
+    /// builds; combined with tokio-postgres/deadpool frames it overflows
+    /// the default test-thread stack. A 32 MiB std::thread + a
+    /// current-thread runtime keeps the body self-contained (no
+    /// RUST_MIN_STACK dependency).
+    fn pg_run_big_stack<F, Fut>(f: F)
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()>,
+    {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(f());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial(postgres)]
+    fn pg_sth_round_trip_and_proofs_verify() {
+        pg_run_big_stack(pg_sth_round_trip_and_proofs_verify_inner);
+    }
+
+    async fn pg_sth_round_trip_and_proofs_verify_inner() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        use crate::federation::{BlobBody, BlobStorage};
+        use ciris_verify_core::transparency::{verify_consistency, verify_inclusion};
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let salt = uuid_like();
+        let key_id = format!("pg-producer-{salt}");
+        let signer = pg_register_hybrid_producer(&backend, &key_id).await;
+        let stream = format!("pg-sth-rt-{salt}");
+
+        let mut hashes = Vec::new();
+        let mut shas = Vec::new();
+        for (seq, tag) in ["AAAA", "BBBB", "CC", "DDDD"].iter().enumerate() {
+            let body = format!("sth-{tag}-{salt}").into_bytes();
+            let sha = backend
+                .put_blob_chunk(&stream, seq as u64, BlobBody::Inline(body), 0)
+                .await
+                .unwrap();
+            hashes.push(sha);
+            shas.push(sha);
+        }
+
+        let sth = pg_sign_stream_sth(&signer, &stream, &hashes, 4);
+        backend.put_stream_sth(sth.clone(), &key_id).await.unwrap();
+
+        let stored = backend.latest_stream_sth(&stream).await.unwrap().unwrap();
+        assert_eq!(stored.tree_size, 4);
+        assert_eq!(stored.root_hash, sth.root_hash);
+        assert_eq!(stored.log_id, sth.log_id);
+
+        let proof = backend
+            .stream_inclusion_proof(&stream, 2, 4)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(verify_inclusion(&proof));
+        assert_eq!(proof.root, sth.root_hash);
+
+        let sth2 = pg_sign_stream_sth(&signer, &stream, &hashes, 2);
+        let cproof = backend
+            .stream_consistency_proof(&stream, 2, 4)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(verify_consistency(&sth2.root_hash, 2, &sth.root_hash, 4, &cproof).unwrap());
+
+        // Idempotent re-PUT.
+        backend.put_stream_sth(sth, &key_id).await.unwrap();
+
+        // Cleanup (shared DB).
+        let client = backend.get_client().await.unwrap();
+        let _ = client
+            .execute(
+                "DELETE FROM cirislens.federation_stream_sth WHERE stream_id = $1",
+                &[&stream],
+            )
+            .await;
+        let _ = client
+            .execute(
+                "DELETE FROM cirislens.federation_stream_chunks WHERE stream_id = $1",
+                &[&stream],
+            )
+            .await;
+        for sha in &shas {
+            let _ = backend.delete_blob(sha).await;
+        }
+        let _ = client
+            .execute(
+                "DELETE FROM cirislens.federation_keys WHERE key_id = $1",
+                &[&key_id],
+            )
+            .await;
+    }
+
+    #[test]
+    #[serial_test::serial(postgres)]
+    fn pg_sth_security_gate_negatives() {
+        pg_run_big_stack(pg_sth_security_gate_negatives_inner);
+    }
+
+    async fn pg_sth_security_gate_negatives_inner() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        use crate::federation::{BlobBody, BlobError, BlobStorage};
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let salt = uuid_like();
+        let key_id = format!("pg-producer-neg-{salt}");
+        let signer = pg_register_hybrid_producer(&backend, &key_id).await;
+        let stream = format!("pg-sth-neg-{salt}");
+
+        let mut hashes = Vec::new();
+        let mut shas = Vec::new();
+        for (seq, tag) in ["AAAA", "BBBB"].iter().enumerate() {
+            let body = format!("neg-{tag}-{salt}").into_bytes();
+            let sha = backend
+                .put_blob_chunk(&stream, seq as u64, BlobBody::Inline(body), 0)
+                .await
+                .unwrap();
+            hashes.push(sha);
+            shas.push(sha);
+        }
+
+        // (a) root mismatch (re-signed so the SIG is valid but the root
+        //     does not match persist's chunks).
+        let mut bad_root = pg_sign_stream_sth(&signer, &stream, &hashes, 2);
+        bad_root.root_hash = [0xAB; 32];
+        let sb = ciris_verify_core::transparency::SignedTreeHead::signing_bytes(
+            &bad_root.log_id,
+            2,
+            &bad_root.root_hash,
+            bad_root.timestamp,
+        );
+        bad_root.signature = signer.sign(&sb).unwrap();
+        let err = backend.put_stream_sth(bad_root, &key_id).await.unwrap_err();
+        assert!(matches!(err, BlobError::InvalidArgument(_)));
+        assert!(format!("{err}").contains("root mismatch"));
+
+        // (b) bad/forged producer signature (root matches).
+        let mut bad_sig = pg_sign_stream_sth(&signer, &stream, &hashes, 2);
+        for b in &mut bad_sig.signature.classical.signature {
+            *b ^= 0xFF;
+        }
+        let err = backend.put_stream_sth(bad_sig, &key_id).await.unwrap_err();
+        assert!(matches!(err, BlobError::InvalidArgument(_)));
+        assert!(format!("{err}").contains("signature verification failed"));
+
+        // (c) over-claimed tree_size (> stored chunks).
+        let mut over = pg_sign_stream_sth(&signer, &stream, &hashes, 2);
+        over.tree_size = 5;
+        let sb = ciris_verify_core::transparency::SignedTreeHead::signing_bytes(
+            &over.log_id,
+            5,
+            &over.root_hash,
+            over.timestamp,
+        );
+        over.signature = signer.sign(&sb).unwrap();
+        let err = backend.put_stream_sth(over, &key_id).await.unwrap_err();
+        assert!(matches!(err, BlobError::InvalidArgument(_)));
+        assert!(format!("{err}").contains("only 2 chunks"));
+
+        // (d) equivocation: a valid STH lands, then the stored root is
+        //     tampered and the correct STH is re-PUT → different root at
+        //     the same (stream, tree_size) → reject.
+        let good = pg_sign_stream_sth(&signer, &stream, &hashes, 2);
+        backend.put_stream_sth(good.clone(), &key_id).await.unwrap();
+        let client = backend.get_client().await.unwrap();
+        client
+            .execute(
+                "UPDATE cirislens.federation_stream_sth SET root_hash = $1 \
+                   WHERE stream_id = $2 AND tree_size = 2",
+                &[&vec![0xCDu8; 32], &stream],
+            )
+            .await
+            .unwrap();
+        let err = backend.put_stream_sth(good, &key_id).await.unwrap_err();
+        assert!(matches!(err, BlobError::InvalidArgument(_)));
+        assert!(format!("{err}").contains("equivocation"));
+
+        // Cleanup.
+        let _ = client
+            .execute(
+                "DELETE FROM cirislens.federation_stream_sth WHERE stream_id = $1",
+                &[&stream],
+            )
+            .await;
+        let _ = client
+            .execute(
+                "DELETE FROM cirislens.federation_stream_chunks WHERE stream_id = $1",
+                &[&stream],
+            )
+            .await;
+        for sha in &shas {
+            let _ = backend.delete_blob(sha).await;
+        }
+        let _ = client
+            .execute(
+                "DELETE FROM cirislens.federation_keys WHERE key_id = $1",
+                &[&key_id],
+            )
+            .await;
     }
 
     // ─── v3.4.0 (CIRISPersist#123) — PG sweeper parity ─────────────

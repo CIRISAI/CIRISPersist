@@ -4303,6 +4303,202 @@ impl PyEngine {
         })
     }
 
+    /// v4.1 (CIRISPersist#142, Cut C1b) — store a producer-signed Signed
+    /// Tree Head for a stream's transparency log (CEG §10.5.1).
+    ///
+    /// `sth_json` is a serialized `SignedTreeHead`
+    /// (`{log_id, tree_size, root_hash, timestamp, signature,
+    /// witness_signatures}`). Persist runs the anti-equivocation gate:
+    /// it recomputes the Merkle root from its OWN stored chunks and
+    /// asserts equality with the STH's claimed root, then verifies the
+    /// producer's hybrid signature against the `producer_key_id` row in
+    /// `federation_keys`, then inserts. A root mismatch, a bad
+    /// signature, an over-claimed `tree_size`, or a same-size
+    /// different-root equivocation all raise `ValueError`. An identical
+    /// re-PUT is idempotent.
+    fn put_stream_sth(
+        &self,
+        py: Python<'_>,
+        sth_json: &str,
+        producer_key_id: &str,
+    ) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let sth: ciris_verify_core::transparency::SignedTreeHead =
+                serde_json::from_str(sth_json).map_err(|e| {
+                    PyValueError::new_err(format!("put_stream_sth: sth_json parse: {e}"))
+                })?;
+            let runtime = self.runtime.clone();
+            let producer_key_id = producer_key_id.to_string();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .put_stream_sth(sth, &producer_key_id)
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .put_stream_sth(sth, &producer_key_id)
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
+    /// v4.1 (CIRISPersist#142, Cut C1b) — the latest STH (highest
+    /// `tree_size`) stored for `stream_id`, as a serialized
+    /// `SignedTreeHead` JSON string, or `None` if no STH exists.
+    fn latest_stream_sth(&self, py: Python<'_>, stream_id: &str) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let stream_id = stream_id.to_string();
+            let sth_opt = py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .latest_stream_sth(&stream_id)
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .latest_stream_sth(&stream_id)
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+            })?;
+            match sth_opt {
+                None => Ok(None),
+                Some(sth) => {
+                    let json = serde_json::to_string(&sth).map_err(|e| {
+                        PyValueError::new_err(format!("latest_stream_sth: serialize: {e}"))
+                    })?;
+                    Ok(Some(json))
+                }
+            }
+        })
+    }
+
+    /// v4.1 (CIRISPersist#142, Cut C1b) — RFC 6962 inclusion proof for
+    /// the chunk at `leaf_index` against a `tree_size`-leaf tree, as a
+    /// serialized `MerkleProof` JSON string. `None` if the stream holds
+    /// fewer than `tree_size` chunks or `leaf_index >= tree_size`.
+    fn stream_inclusion_proof(
+        &self,
+        py: Python<'_>,
+        stream_id: &str,
+        leaf_index: u64,
+        tree_size: u64,
+    ) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let stream_id = stream_id.to_string();
+            let proof_opt = py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .stream_inclusion_proof(&stream_id, leaf_index, tree_size)
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .stream_inclusion_proof(&stream_id, leaf_index, tree_size)
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+            })?;
+            match proof_opt {
+                None => Ok(None),
+                Some(proof) => {
+                    let json = serde_json::to_string(&proof).map_err(|e| {
+                        PyValueError::new_err(format!("stream_inclusion_proof: serialize: {e}"))
+                    })?;
+                    Ok(Some(json))
+                }
+            }
+        })
+    }
+
+    /// v4.1 (CIRISPersist#142, Cut C1b) — RFC 6962 §2.1.2 consistency
+    /// proof between `from_size` and `to_size`, as a serialized
+    /// `ConsistencyProof` JSON string. `None` if the stream holds fewer
+    /// than `to_size` chunks.
+    fn stream_consistency_proof(
+        &self,
+        py: Python<'_>,
+        stream_id: &str,
+        from_size: u64,
+        to_size: u64,
+    ) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let stream_id = stream_id.to_string();
+            let proof_opt = py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .stream_consistency_proof(&stream_id, from_size, to_size)
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .stream_consistency_proof(&stream_id, from_size, to_size)
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+            })?;
+            match proof_opt {
+                None => Ok(None),
+                Some(proof) => {
+                    let json = serde_json::to_string(&proof).map_err(|e| {
+                        PyValueError::new_err(format!("stream_consistency_proof: serialize: {e}"))
+                    })?;
+                    Ok(Some(json))
+                }
+            }
+        })
+    }
+
     /// v3.11.0 (CIRISPersist#143, CIRISVerify FEDERATION_THREAT_MODEL
     /// §3.3.2) — verify-coord R1+Q1 constants as a JSON dict for
     /// consumer code that needs to pin τ_normal / τ_partial /
