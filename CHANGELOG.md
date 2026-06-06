@@ -5,6 +5,12 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [4.0.1] — 2026-06-06
+
+**Build fix: `pyo3`-without-a-backend compile (v4.0.0 CI core leg).**
+
+The v4.0.0 tag's CI core leg failed at the maturin `--features test-panic,pyo3 --release` step (pyo3 with no `sqlite`/`postgres` backend): `scope_bind::and_compose` is only called from `sqlite.rs` but carried no `cfg`, so under that combo it was dead code and the build's `-D warnings` failed it (exit 101). Gated it `#[cfg(feature = "sqlite")]` — compiled iff sqlite, used iff sqlite, so it can never be dead again under any feature combo. All 899 core-leg tests already passed on live postgres; this was the only blocker. Verified clean under `-D warnings` across `--no-default-features`, `--features pyo3`, `--features test-panic,pyo3`, `--features sqlite`, and the full CI gated combo. Use **4.0.1** for the federation/lens-core build — it carries working wheels.
+
 ## [4.0.0] — 2026-06-05
 
 **The Data Access Surface — a generic, scope-aware substrate read/write capability (CIRISPersist#160 / #159 / #135 / partial #150).**
