@@ -3780,6 +3780,111 @@ impl crate::federation::BlobStorage for PostgresBackend {
         }
     }
 
+    async fn get_blob_range(
+        &self,
+        sha256: &[u8; 32],
+        range_start: u64,
+        range_end_inclusive: u64,
+    ) -> Result<Option<crate::federation::BlobRange>, crate::federation::BlobError> {
+        // v4.1 (CIRISPersist#142, Cut A) — byte-range read, RFC 9110
+        // §14.4 semantics. Inline → server-side `substring(... FROM ..
+        // FOR ..)` (no full-buffer load). External → the ref + clamped
+        // range; persist NEVER dereferences the URI.
+        if range_start > range_end_inclusive {
+            return Err(crate::federation::BlobError::InvalidArgument(
+                "range_start > range_end".into(),
+            ));
+        }
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let sha_vec = sha256.to_vec();
+        // 1. UPDATE … RETURNING to bump the access tracker AND fetch the
+        //    row head (storage_kind + size + external metadata) in one
+        //    round-trip. NULL row_opt = blob absent.
+        let row_opt = client
+            .query_opt(
+                "UPDATE cirislens.federation_blobs \
+                    SET access_count = access_count + 1, \
+                        last_accessed_at = NOW() \
+                  WHERE sha256 = $1 \
+                  RETURNING storage_kind, size_bytes, external_ref, media_type",
+                &[&sha_vec],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("get_blob_range update+select: {e}"))
+            })?;
+        let Some(row) = row_opt else {
+            return Ok(None);
+        };
+        let storage_kind: String =
+            row.safe_get_with("storage_kind", crate::federation::BlobError::Backend)?;
+        let size_bytes_i64: i64 =
+            row.safe_get_with("size_bytes", crate::federation::BlobError::Backend)?;
+        let size = u64::try_from(size_bytes_i64).map_err(|_| {
+            crate::federation::BlobError::Backend(
+                "size_bytes column went negative — schema CHECK violated".into(),
+            )
+        })?;
+        // 2. range_start at/past size → RangeNotSatisfiable.
+        if range_start >= size {
+            return Err(crate::federation::BlobError::RangeNotSatisfiable { range_start, size });
+        }
+        // 3. Clamp the inclusive end to size-1.
+        let end = range_end_inclusive.min(size - 1);
+        let len = end - range_start + 1; // >= 1
+        match storage_kind.as_str() {
+            "inline" => {
+                // Server-side substring — PG `substring` is 1-indexed, so
+                // FROM = range_start + 1. NEVER loads the whole
+                // bytes_inline column. PG `substring(bytea FROM int FOR
+                // int)` infers the position args as int4, so bind i32 (not
+                // i64 → int8, which fails parameter serialization). Inline
+                // blobs are bounded by MAX_BODY_BYTES (16 MiB), so the
+                // positions always fit i32.
+                let from_i32 = i32::try_from(range_start + 1).map_err(|_| {
+                    crate::federation::BlobError::Backend("range_start exceeds i32".into())
+                })?;
+                let for_i32 = i32::try_from(len).map_err(|_| {
+                    crate::federation::BlobError::Backend("range length exceeds i32".into())
+                })?;
+                let slice_row = client
+                    .query_one(
+                        "SELECT substring(bytes_inline FROM $2 FOR $3) AS slice \
+                             FROM cirislens.federation_blobs WHERE sha256 = $1",
+                        &[&sha_vec, &from_i32, &for_i32],
+                    )
+                    .await
+                    .map_err(|e| {
+                        crate::federation::BlobError::Backend(format!("get_blob_range substr: {e}"))
+                    })?;
+                let slice: Vec<u8> =
+                    slice_row.safe_get_with("slice", crate::federation::BlobError::Backend)?;
+                Ok(Some(crate::federation::BlobRange::Inline(slice)))
+            }
+            "s3" | "external_url" => {
+                let uri: String =
+                    row.safe_get_with("external_ref", crate::federation::BlobError::Backend)?;
+                let media_type: Option<String> =
+                    row.safe_get_with("media_type", crate::federation::BlobError::Backend)?;
+                Ok(Some(crate::federation::BlobRange::External {
+                    external_ref: crate::federation::ExternalRef {
+                        uri,
+                        size_bytes: size,
+                        media_type,
+                    },
+                    range_start,
+                    range_end_inclusive: end,
+                }))
+            }
+            other => Err(crate::federation::BlobError::Backend(format!(
+                "unknown storage_kind: {other}"
+            ))),
+        }
+    }
+
     async fn has_blob(&self, sha256: &[u8; 32]) -> Result<bool, crate::federation::BlobError> {
         let client = self
             .get_client()
@@ -16720,6 +16825,177 @@ mod tests {
             .safe_get_with("access_count", crate::federation::Error::Backend)
             .expect("access_count column present");
         assert_eq!(count, 3);
+    }
+
+    // ─── v4.1 (CIRISPersist#142, Cut A) — PG get_blob_range parity ──
+
+    /// (a)+(b)+(c) mid-range / full / end-clamp over an Inline blob.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_get_blob_range_inline_slices() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        use crate::federation::{BlobBody, BlobRange, BlobStorage};
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let host = format!("range-host-{}", uuid_like());
+        pg_blob_bootstrap_host(&backend, &host).await;
+        // Deterministic 10-byte payload (don't randomize: we assert exact
+        // slice bytes). Unique SHA still derives from these bytes.
+        let bytes = b"abcdefghij".to_vec();
+        let sha = pg_sha256_of(&bytes);
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes.clone()),
+                None,
+                pg_blob_attestation(&host, &host),
+            )
+            .await
+            .unwrap();
+        // (a) mid-range.
+        assert_eq!(
+            backend.get_blob_range(&sha, 2, 5).await.unwrap().unwrap(),
+            BlobRange::Inline(b"cdef".to_vec())
+        );
+        // (b) full range.
+        assert_eq!(
+            backend.get_blob_range(&sha, 0, 9).await.unwrap().unwrap(),
+            BlobRange::Inline(bytes)
+        );
+        // (c) end past size clamps to tail.
+        assert_eq!(
+            backend.get_blob_range(&sha, 7, 99).await.unwrap().unwrap(),
+            BlobRange::Inline(b"hij".to_vec())
+        );
+    }
+
+    /// (d) range_start >= size → RangeNotSatisfiable.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_get_blob_range_start_past_size_not_satisfiable() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        use crate::federation::{BlobBody, BlobError, BlobStorage};
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let host = format!("range-oob-host-{}", uuid_like());
+        pg_blob_bootstrap_host(&backend, &host).await;
+        let bytes = b"abcdefghij".to_vec(); // size 10
+        let sha = pg_sha256_of(&bytes);
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                pg_blob_attestation(&host, &host),
+            )
+            .await
+            .unwrap();
+        match backend.get_blob_range(&sha, 10, 20).await.unwrap_err() {
+            BlobError::RangeNotSatisfiable { range_start, size } => {
+                assert_eq!(range_start, 10);
+                assert_eq!(size, 10);
+            }
+            other => panic!("expected RangeNotSatisfiable, got {other:?}"),
+        }
+    }
+
+    /// (e) range_start > range_end → InvalidArgument; (f) absent → None.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_get_blob_range_invalid_and_absent() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        use crate::federation::{BlobBody, BlobError, BlobStorage};
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let host = format!("range-inv-host-{}", uuid_like());
+        pg_blob_bootstrap_host(&backend, &host).await;
+        let bytes = pg_blob_payload("range-inv");
+        let sha = pg_sha256_of(&bytes);
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                pg_blob_attestation(&host, &host),
+            )
+            .await
+            .unwrap();
+        // (e) start > end → InvalidArgument (caught before DB).
+        assert!(matches!(
+            backend.get_blob_range(&sha, 5, 2).await.unwrap_err(),
+            BlobError::InvalidArgument(_)
+        ));
+        // (f) absent blob → None.
+        let absent = [0xEEu8; 32];
+        assert!(backend
+            .get_blob_range(&absent, 0, 10)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// (g) External blob → BlobRange::External with ref + clamped range;
+    /// persist did NOT dereference the URI.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_get_blob_range_external_returns_ref_without_fetch() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        use crate::federation::{BlobBody, BlobRange, BlobStorage, ExternalRef};
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let host = format!("range-ext-host-{}", uuid_like());
+        pg_blob_bootstrap_host(&backend, &host).await;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut sha = [0u8; 32];
+        sha[..16].copy_from_slice(&nanos.to_be_bytes());
+        sha[16..].copy_from_slice(&nanos.to_be_bytes());
+        let ext = ExternalRef {
+            uri: format!("s3://bucket/{}", uuid_like()),
+            size_bytes: 1000,
+            media_type: Some("video/mp4".into()),
+        };
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::External(ext.clone()),
+                Some("video/mp4"),
+                pg_blob_attestation(&host, &host),
+            )
+            .await
+            .unwrap();
+        // request [100..=99999] — end clamps to size-1 = 999.
+        match backend
+            .get_blob_range(&sha, 100, 99_999)
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            BlobRange::External {
+                external_ref,
+                range_start,
+                range_end_inclusive,
+            } => {
+                assert_eq!(external_ref, ext);
+                assert_eq!(range_start, 100);
+                assert_eq!(range_end_inclusive, 999);
+            }
+            other => panic!("expected BlobRange::External, got {other:?}"),
+        }
     }
 
     // ─── v3.4.0 (CIRISPersist#123) — PG sweeper parity ─────────────

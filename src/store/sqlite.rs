@@ -3511,6 +3511,101 @@ impl crate::federation::BlobStorage for SqliteBackend {
         .map_err(|e| crate::federation::BlobError::Backend(format!("get_blob: {e}")))
     }
 
+    async fn get_blob_range(
+        &self,
+        sha256: &[u8; 32],
+        range_start: u64,
+        range_end_inclusive: u64,
+    ) -> Result<Option<crate::federation::BlobRange>, crate::federation::BlobError> {
+        // v4.1 (CIRISPersist#142, Cut A) — byte-range read, RFC 9110
+        // §14.4 semantics. Inline → server-side `substr` (no full-buffer
+        // load). External → the ref + clamped range; persist NEVER
+        // dereferences the URI.
+        if range_start > range_end_inclusive {
+            return Err(crate::federation::BlobError::InvalidArgument(
+                "range_start > range_end".into(),
+            ));
+        }
+        let sha_vec = sha256.to_vec();
+        let conn = self.conn.clone();
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        // Outcome of the in-transaction work: None (absent),
+        // Err(RangeNotSatisfiable), or Ok(BlobRange).
+        type RangeOutcome = Option<Result<crate::federation::BlobRange, (u64, u64)>>;
+        let outcome: RangeOutcome = (move || -> Result<RangeOutcome, rusqlite::Error> {
+            let mut conn = conn.lock();
+            let tx = conn.transaction()?;
+            // 1. Fetch storage_kind + size (+ external metadata) to do the
+            //    bounds check before pulling any bytes.
+            let head_opt = tx
+                .query_row(
+                    "SELECT storage_kind, size_bytes, external_ref, media_type \
+                         FROM federation_blobs WHERE sha256 = ?1",
+                    rusqlite::params![sha_vec],
+                    |row| {
+                        let storage_kind: String = row.get("storage_kind")?;
+                        let size_bytes: i64 = row.get("size_bytes")?;
+                        let external_ref: Option<String> = row.get("external_ref")?;
+                        let media_type: Option<String> = row.get("media_type")?;
+                        Ok((storage_kind, size_bytes, external_ref, media_type))
+                    },
+                )
+                .optional()?;
+            let (storage_kind, size_bytes, external_ref, media_type) = match head_opt {
+                None => return Ok(None),
+                Some(h) => h,
+            };
+            let size: u64 = size_bytes.max(0) as u64;
+            // 2. Bump access-tracking columns on the hit (mirrors get_blob).
+            tx.execute(
+                "UPDATE federation_blobs SET access_count = access_count + 1, \
+                     last_accessed_at = ?2 WHERE sha256 = ?1",
+                rusqlite::params![sha_vec, now_iso],
+            )?;
+            // 3. range_start at/past size → RangeNotSatisfiable.
+            if range_start >= size {
+                tx.commit()?;
+                return Ok(Some(Err((range_start, size))));
+            }
+            // 4. Clamp the inclusive end to size-1.
+            let end = range_end_inclusive.min(size - 1);
+            let len = end - range_start + 1; // >= 1
+            if storage_kind == "inline" {
+                // Server-side substring — SQLite `substr` is 1-indexed, so
+                // start = range_start + 1. NEVER loads the whole
+                // bytes_inline column.
+                let slice: Vec<u8> = tx.query_row(
+                    "SELECT substr(bytes_inline, ?2, ?3) \
+                         FROM federation_blobs WHERE sha256 = ?1",
+                    rusqlite::params![sha_vec, (range_start + 1) as i64, len as i64],
+                    |row| row.get(0),
+                )?;
+                tx.commit()?;
+                Ok(Some(Ok(crate::federation::BlobRange::Inline(slice))))
+            } else {
+                // External — return the ref + clamped range; do NOT fetch.
+                tx.commit()?;
+                Ok(Some(Ok(crate::federation::BlobRange::External {
+                    external_ref: crate::federation::ExternalRef {
+                        uri: external_ref.unwrap_or_default(),
+                        size_bytes: size,
+                        media_type,
+                    },
+                    range_start,
+                    range_end_inclusive: end,
+                })))
+            }
+        })()
+        .map_err(|e| crate::federation::BlobError::Backend(format!("get_blob_range: {e}")))?;
+        match outcome {
+            None => Ok(None),
+            Some(Err((range_start, size))) => {
+                Err(crate::federation::BlobError::RangeNotSatisfiable { range_start, size })
+            }
+            Some(Ok(range)) => Ok(Some(range)),
+        }
+    }
+
     async fn has_blob(&self, sha256: &[u8; 32]) -> Result<bool, crate::federation::BlobError> {
         let sha_vec = sha256.to_vec();
         let conn = self.conn.clone();
@@ -11454,7 +11549,9 @@ mod tests {
 
     // ─── BlobStorage tests (v2.3, CIRISPersist#103) ────────────────
 
-    use crate::federation::{BlobBody, BlobError, BlobStorage, ExternalRef, PutBlobAttestation};
+    use crate::federation::{
+        BlobBody, BlobError, BlobRange, BlobStorage, ExternalRef, PutBlobAttestation,
+    };
 
     fn blob_attestation(
         attesting_key_id: &str,
@@ -16426,6 +16523,166 @@ mod tests {
         .unwrap();
         // 2 get_blob hits + 1 has_blob = 3.
         assert_eq!(count, 3);
+    }
+
+    // ─── v4.1 (CIRISPersist#142, Cut A) — get_blob_range tests ───
+
+    /// (a) mid-range slice of an Inline blob returns exactly those bytes.
+    #[tokio::test]
+    async fn get_blob_range_inline_mid_range() {
+        let backend = blob_test_backend().await;
+        let bytes = b"abcdefghij".to_vec(); // 10 bytes, indices 0..=9
+        let sha = sha256_of(&bytes);
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                blob_attestation("host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+            )
+            .await
+            .unwrap();
+        let got = backend.get_blob_range(&sha, 2, 5).await.unwrap().unwrap();
+        assert_eq!(got, BlobRange::Inline(b"cdef".to_vec()));
+    }
+
+    /// (b) full range == whole blob.
+    #[tokio::test]
+    async fn get_blob_range_inline_full() {
+        let backend = blob_test_backend().await;
+        let bytes = b"abcdefghij".to_vec();
+        let sha = sha256_of(&bytes);
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes.clone()),
+                None,
+                blob_attestation("host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+            )
+            .await
+            .unwrap();
+        let got = backend.get_blob_range(&sha, 0, 9).await.unwrap().unwrap();
+        assert_eq!(got, BlobRange::Inline(bytes));
+    }
+
+    /// (c) range_end past size clamps to the tail.
+    #[tokio::test]
+    async fn get_blob_range_inline_end_clamped_to_tail() {
+        let backend = blob_test_backend().await;
+        let bytes = b"abcdefghij".to_vec(); // size 10
+        let sha = sha256_of(&bytes);
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                blob_attestation("host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+            )
+            .await
+            .unwrap();
+        // request [7..=99] — clamps to [7..=9] = "hij".
+        let got = backend.get_blob_range(&sha, 7, 99).await.unwrap().unwrap();
+        assert_eq!(got, BlobRange::Inline(b"hij".to_vec()));
+    }
+
+    /// (d) range_start >= size → RangeNotSatisfiable.
+    #[tokio::test]
+    async fn get_blob_range_start_past_size_not_satisfiable() {
+        let backend = blob_test_backend().await;
+        let bytes = b"abcdefghij".to_vec(); // size 10
+        let sha = sha256_of(&bytes);
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                blob_attestation("host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+            )
+            .await
+            .unwrap();
+        let err = backend
+            .get_blob_range(&sha, 10, 20)
+            .await
+            .expect_err("start at size must be RangeNotSatisfiable");
+        match err {
+            BlobError::RangeNotSatisfiable { range_start, size } => {
+                assert_eq!(range_start, 10);
+                assert_eq!(size, 10);
+            }
+            other => panic!("expected RangeNotSatisfiable, got {other:?}"),
+        }
+    }
+
+    /// (e) range_start > range_end → InvalidArgument.
+    #[tokio::test]
+    async fn get_blob_range_start_after_end_invalid() {
+        let backend = blob_test_backend().await;
+        let bytes = b"abcdefghij".to_vec();
+        let sha = sha256_of(&bytes);
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                blob_attestation("host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+            )
+            .await
+            .unwrap();
+        let err = backend
+            .get_blob_range(&sha, 5, 2)
+            .await
+            .expect_err("start > end must be InvalidArgument");
+        assert!(matches!(err, BlobError::InvalidArgument(_)));
+    }
+
+    /// (f) absent blob → None.
+    #[tokio::test]
+    async fn get_blob_range_absent_returns_none() {
+        let backend = blob_test_backend().await;
+        let sha = [0xEEu8; 32];
+        let got = backend.get_blob_range(&sha, 0, 10).await.unwrap();
+        assert!(got.is_none());
+    }
+
+    /// (g) an External blob returns BlobRange::External with the ref +
+    /// clamped range; persist did NOT fetch anything (the URI is a
+    /// non-resolvable placeholder — no network access happens).
+    #[tokio::test]
+    async fn get_blob_range_external_returns_ref_without_fetch() {
+        let backend = blob_test_backend().await;
+        let ext = ExternalRef {
+            uri: "s3://my-bucket/path/to/object".into(),
+            size_bytes: 1000,
+            media_type: Some("video/mp4".into()),
+        };
+        let sha = [0x55u8; 32];
+        backend
+            .put_blob(
+                &sha,
+                BlobBody::External(ext.clone()),
+                Some("video/mp4"),
+                blob_attestation("host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+            )
+            .await
+            .unwrap();
+        // request [100..=99999] — clamps end to size-1 = 999.
+        let got = backend
+            .get_blob_range(&sha, 100, 99_999)
+            .await
+            .unwrap()
+            .unwrap();
+        match got {
+            BlobRange::External {
+                external_ref,
+                range_start,
+                range_end_inclusive,
+            } => {
+                assert_eq!(external_ref, ext);
+                assert_eq!(range_start, 100);
+                assert_eq!(range_end_inclusive, 999);
+            }
+            other => panic!("expected BlobRange::External, got {other:?}"),
+        }
     }
 
     /// Admission ordering test — trust rejection beats inline-size

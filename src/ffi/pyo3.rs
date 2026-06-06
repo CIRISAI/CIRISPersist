@@ -4575,6 +4575,71 @@ impl PyEngine {
         })
     }
 
+    /// v4.1 (CIRISPersist#142, Cut A) — byte-range read over a blob by
+    /// SHA-256 (hex). RFC 9110 §14.4 semantics: `end_inclusive` is
+    /// clamped to size-1; a `start` at/past the blob size raises
+    /// `ValueError` (RangeNotSatisfiable); `start > end_inclusive` raises
+    /// `ValueError` (InvalidArgument); an absent blob returns `None`.
+    ///
+    /// Result shape:
+    /// - Inline blob → the requested bytes as `bytes`.
+    /// - External blob → a dict `{"external_uri": str, "range_start":
+    ///   int, "range_end_inclusive": int}` — persist does NOT
+    ///   dereference; the caller fetches that range from the URI itself.
+    fn get_blob_range(
+        &self,
+        py: Python<'_>,
+        sha256_hex: &str,
+        start: u64,
+        end_inclusive: u64,
+    ) -> PyResult<Option<Py<PyAny>>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let sha = parse_sha256_hex(sha256_hex)?;
+            let range_opt = py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .get_blob_range(&sha, start, end_inclusive)
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .get_blob_range(&sha, start, end_inclusive)
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+            })?;
+            match range_opt {
+                None => Ok(None),
+                Some(crate::federation::BlobRange::Inline(bytes)) => {
+                    Ok(Some(PyBytes::new(py, &bytes).into_any().unbind()))
+                }
+                Some(crate::federation::BlobRange::External {
+                    external_ref,
+                    range_start,
+                    range_end_inclusive,
+                }) => {
+                    let dict = PyDict::new(py);
+                    dict.set_item("external_uri", external_ref.uri)?;
+                    dict.set_item("range_start", range_start)?;
+                    dict.set_item("range_end_inclusive", range_end_inclusive)?;
+                    Ok(Some(dict.into_any().unbind()))
+                }
+            }
+        })
+    }
+
     /// Federation blob storage: existence check by SHA-256 (hex).
     fn has_blob_json(&self, py: Python<'_>, sha256_hex: &str) -> PyResult<bool> {
         self.ensure_usable()?;
@@ -17939,6 +18004,8 @@ fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
         crate::federation::BlobError::TrustBelowThreshold { .. } => PyValueError::new_err(kind),
         // v3.6.0 (CIRISPersist#134) — perceptual-hash matcher hit.
         crate::federation::BlobError::HashMatchedKnownBad { .. } => PyValueError::new_err(kind),
+        // v4.1 (CIRISPersist#142, Cut A) — unsatisfiable byte range.
+        crate::federation::BlobError::RangeNotSatisfiable { .. } => PyValueError::new_err(kind),
         crate::federation::BlobError::Backend(_) => PyRuntimeError::new_err(kind),
     }
 }
