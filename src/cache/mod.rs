@@ -19,7 +19,6 @@ pub mod key;
 pub mod lru;
 pub mod stats;
 
-use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -116,34 +115,18 @@ impl CacheConfig {
     }
 }
 
-/// Locked interior — the LRU plus the §7.3 reverse index. Kept behind a
-/// single `Mutex` so the map + index never diverge.
+/// Locked interior — just the bounded LRU. Behind a single `Mutex`.
+///
+/// There is no longer a `bucket → set<CacheKey>` reverse index:
+/// write-invalidation scans the resident keys and tests each one's
+/// `[first_bucket, last_bucket]` range ([`LruCache::keys_overlapping_bucket`]).
+/// The reverse index cost O(n²) memory because each key carried (and
+/// each per-bucket clone re-carried) the full materialized bucket run
+/// — a wide window OOM'd the process (CIRISConformance#11). The cache
+/// is bounded (`max_entries` ≤ 1024) and writes are off the hot read
+/// path, so the per-write scan is cheap and the per-key memory is O(1).
 struct Inner<T> {
     lru: LruCache<T>,
-    /// `bucket → set<CacheKey>`. A write at timestamp `t` looks up
-    /// `bucket_of(t)` and evicts every key in that bucket's set (§7.3).
-    /// Maintained on every insert/eviction so write-invalidation is
-    /// O(keys-in-bucket).
-    bucket_index: HashMap<Bucket, HashSet<CacheKey>>,
-}
-
-impl<T> Inner<T> {
-    fn register(&mut self, key: &CacheKey) {
-        for b in key.buckets() {
-            self.bucket_index.entry(*b).or_default().insert(key.clone());
-        }
-    }
-
-    fn deregister(&mut self, key: &CacheKey) {
-        for b in key.buckets() {
-            if let Some(set) = self.bucket_index.get_mut(b) {
-                set.remove(key);
-                if set.is_empty() {
-                    self.bucket_index.remove(b);
-                }
-            }
-        }
-    }
 }
 
 /// The generic substrate cache (§7.2).
@@ -172,7 +155,6 @@ impl<T> Cache<T> {
         Self {
             inner: Mutex::new(Inner {
                 lru: LruCache::new(config.max_entries, config.max_bytes),
-                bucket_index: HashMap::new(),
             }),
             config,
             stats: AtomicCacheStats::default(),
@@ -226,7 +208,6 @@ impl<T> Cache<T> {
             let mut inner = self.inner.lock().expect("cache mutex poisoned");
             let got = inner.lru.get(&key, ttl, now);
             if got.evicted_ttl > 0 {
-                inner.deregister(&key);
                 self.stats.record_eviction_ttl(got.evicted_ttl);
                 // The TTL-expired entry was dropped from the LRU; refresh
                 // the residency gauge so a subsequent fail-honest error
@@ -250,9 +231,7 @@ impl<T> Cache<T> {
 
         let mut inner = self.inner.lock().expect("cache mutex poisoned");
         // Another caller may have populated this key while we computed;
-        // last-writer-wins is fine (both computed fresh). Clear any
-        // stale reverse-index entry before re-registering.
-        inner.deregister(&key);
+        // last-writer-wins is fine (both computed fresh).
         let out = inner.lru.insert(
             key.clone(),
             CacheEntry {
@@ -261,17 +240,7 @@ impl<T> Cache<T> {
                 inserted_at: now,
             },
         );
-        // Only register the key in the reverse index if it actually
-        // stayed resident — an entry that alone exceeds a bound is
-        // evicted immediately during insert, so it has no buckets to
-        // invalidate.
-        if inner.lru.contains_resident(&key) {
-            inner.register(&key);
-        }
         if out.evicted_lru > 0 {
-            // Capacity victims left the LRU; sweep any now-dangling
-            // reverse-index entries for keys no longer resident.
-            self.reconcile_index(&mut inner);
             self.stats.record_eviction_lru(out.evicted_lru);
         }
         self.refresh_residency(&inner);
@@ -301,7 +270,6 @@ impl<T> Cache<T> {
         let mut inner = self.inner.lock().expect("cache mutex poisoned");
         let got = inner.lru.get(key, ttl, now);
         if got.evicted_ttl > 0 {
-            inner.deregister(key);
             self.stats.record_eviction_ttl(got.evicted_ttl);
             self.refresh_residency(&inner);
         }
@@ -320,28 +288,23 @@ impl<T> Cache<T> {
 
     /// Store a freshly-computed value after a [`try_get`](Self::try_get)
     /// miss (FSD §7.3). Mirrors the store half of
-    /// [`get_or_compute`](Self::get_or_compute): inserts, maintains the
-    /// §7.3 reverse index, and folds any capacity eviction into stats.
-    /// Returns the shared `Arc<T>` so the caller hands back the same
-    /// instance a concurrent hit would have seen.
+    /// [`get_or_compute`](Self::get_or_compute): inserts and folds any
+    /// capacity eviction into stats. Returns the shared `Arc<T>` so the
+    /// caller hands back the same instance a concurrent hit would have
+    /// seen.
     pub fn store(&self, key: CacheKey, value: T, byte_size: usize) -> Arc<T> {
         let now = Instant::now();
         let value = Arc::new(value);
         let mut inner = self.inner.lock().expect("cache mutex poisoned");
-        inner.deregister(&key);
         let out = inner.lru.insert(
-            key.clone(),
+            key,
             CacheEntry {
                 value: Arc::clone(&value),
                 byte_size,
                 inserted_at: now,
             },
         );
-        if inner.lru.contains_resident(&key) {
-            inner.register(&key);
-        }
         if out.evicted_lru > 0 {
-            self.reconcile_index(&mut inner);
             self.stats.record_eviction_lru(out.evicted_lru);
         }
         self.refresh_residency(&inner);
@@ -350,27 +313,27 @@ impl<T> Cache<T> {
 
     /// Evict every cached aggregate whose window overlaps the bucket the
     /// write landed in (§7.3). `write_unix_ms` is the timestamp of the
-    /// row that changed; the cache looks up `bucket_of(write_unix_ms)`
-    /// and drops every key registered under it. Returns the number of
-    /// entries invalidated.
+    /// row that changed; the cache computes `bucket_of(write_unix_ms)`
+    /// and drops every resident key whose window range contains it.
+    /// Returns the number of entries invalidated.
     ///
     /// This is the no-write-through discipline (§7.3): the cache is a
     /// read-only side effect; writes never update entries in place, they
     /// evict the affected window-keys so the next read recomputes.
     pub fn invalidate_write(&self, write_unix_ms: i64) -> u64 {
-        let bucket = key::bucket_of(write_unix_ms, self.config.invalidation_bucket);
+        let wb = key::bucket_of(write_unix_ms, self.config.invalidation_bucket);
         let mut inner = self.inner.lock().expect("cache mutex poisoned");
 
-        let victims: Vec<CacheKey> = match inner.bucket_index.get(&bucket) {
-            Some(set) => set.iter().cloned().collect(),
-            None => return 0,
-        };
+        // Scan the resident keys for those whose window range
+        // [first_bucket, last_bucket] contains the write bucket (§7.3 /
+        // #160-comment-2). O(resident); the cache is bounded so this is
+        // cheap, and writes are off the hot read path. No reverse index.
+        let victims = inner.lru.keys_overlapping_bucket(wb);
         let mut n = 0u64;
         for k in &victims {
             if inner.lru.remove(k) {
                 n += 1;
             }
-            inner.deregister(k);
         }
         self.stats.record_invalidation_write(n);
         self.refresh_residency(&inner);
@@ -383,28 +346,10 @@ impl<T> Cache<T> {
         let now = Instant::now();
         let mut inner = self.inner.lock().expect("cache mutex poisoned");
         let drained = inner.lru.evict_expired(self.config.ttl, now);
-        for k in &drained {
-            inner.deregister(k);
-        }
         let n = drained.len() as u64;
         self.stats.record_eviction_ttl(n);
         self.refresh_residency(&inner);
         n
-    }
-
-    /// Sweep the reverse index of keys no longer resident in the LRU.
-    /// Called after a capacity eviction, where the LRU dropped a victim
-    /// the cache surface didn't name.
-    fn reconcile_index(&self, inner: &mut Inner<T>) {
-        let stale: Vec<CacheKey> = inner
-            .bucket_index
-            .values()
-            .flat_map(|set| set.iter().cloned())
-            .filter(|k| !inner.lru.contains_resident(k))
-            .collect();
-        for k in stale {
-            inner.deregister(&k);
-        }
     }
 }
 
@@ -571,8 +516,8 @@ mod tests {
             "test precondition: write is in a non-end bucket"
         );
         assert!(
-            key.buckets().contains(&key::bucket_of(write_ms, HOUR)),
-            "test precondition: write bucket is inside the window's overlap set"
+            key.overlaps_bucket(key::bucket_of(write_ms, HOUR)),
+            "test precondition: write bucket is inside the window's overlap range"
         );
 
         let n = cache.invalidate_write(write_ms);
@@ -583,8 +528,63 @@ mod tests {
         assert_eq!(cache.stats().entries_resident, 0);
     }
 
+    /// CIRISConformance#11 round 2, Finding A — a very wide window must
+    /// (a) store + be invalidated by a mid-window write, and (b) NOT OOM.
+    ///
+    /// The old `CacheKey` carried `Vec<Bucket>` = every overlapped bucket
+    /// (a 10-year window at 1h ≈ 87,600 buckets), and the reverse index
+    /// inserted a *clone* of that key under each bucket — O(n²) ≈ 61 GB →
+    /// SIGKILL. The range-based key holds only `[first, last]`, so this
+    /// completes in milliseconds with O(1) per-key memory. We assert the
+    /// key materializes no large run (its range is exactly the endpoint
+    /// buckets, never an 87k-element Vec) and that invalidation is correct.
     #[test]
-    fn lru_eviction_increments_stat_and_reconciles_index() {
+    fn wide_window_stores_invalidates_and_does_not_oom() {
+        let cache: Cache<i64> = Cache::with_config(cfg());
+
+        // 10-year window at the 1h invalidation bucket: ~87,600 buckets.
+        let start_ms: i64 = 0;
+        let end_ms: i64 = 10 * 365 * 24 * HOUR_MS;
+        let key = windowed_key("repo_stats", start_ms, end_ms);
+
+        // (b) The key holds only the two endpoint buckets — no 87k Vec.
+        let (first, last) = key.bucket_range();
+        assert_eq!(first, key::bucket_of(start_ms, HOUR));
+        assert_eq!(last, key::bucket_of(end_ms, HOUR));
+        assert!(
+            last - first >= 87_000,
+            "precondition: window really does span ~87k buckets"
+        );
+
+        // (a) Store completes (no OOM) — this is the SIGKILL path pre-fix.
+        cache
+            .get_or_compute::<(), _>(key.clone(), || Ok((7, 64)))
+            .unwrap();
+        assert_eq!(cache.stats().entries_resident, 1);
+
+        // A write 5 years in (a mid-window, non-end bucket) invalidates it.
+        let mid_write_ms = 5 * 365 * 24 * HOUR_MS + HOUR_MS / 2;
+        let mid_bucket = key::bucket_of(mid_write_ms, HOUR);
+        assert_ne!(
+            mid_bucket, last,
+            "precondition: write is a mid-window, non-end bucket"
+        );
+        assert!(key.overlaps_bucket(mid_bucket));
+        let n = cache.invalidate_write(mid_write_ms);
+        assert_eq!(n, 1, "mid-window write must invalidate the wide entry");
+        assert_eq!(cache.stats().entries_resident, 0);
+
+        // A write outside the window does NOT invalidate.
+        cache
+            .get_or_compute::<(), _>(key.clone(), || Ok((7, 64)))
+            .unwrap();
+        let outside = end_ms + 10 * HOUR_MS;
+        assert_eq!(cache.invalidate_write(outside), 0);
+        assert_eq!(cache.stats().entries_resident, 1);
+    }
+
+    #[test]
+    fn lru_eviction_increments_stat_and_evicted_key_not_invalidated() {
         let mut c = cfg();
         c.max_entries = 2;
         let cache: Cache<i64> = Cache::with_config(c);
@@ -608,8 +608,8 @@ mod tests {
         assert_eq!(cache.stats().evictions_lru, 1);
         assert_eq!(cache.stats().entries_resident, 2);
 
-        // k0's reverse-index entry must be reconciled away: a write in
-        // bucket 0 should now invalidate nothing.
+        // k0 was capacity-evicted, so a write in bucket 0 invalidates
+        // nothing — the scan only sees resident keys.
         assert_eq!(cache.invalidate_write(HOUR_MS / 4), 0);
     }
 
@@ -690,7 +690,7 @@ mod tests {
             .unwrap();
         assert_eq!(*v, 123);
         assert_eq!(cache.stats().entries_resident, 0);
-        // No reverse-index leak from the self-evicted entry.
+        // The self-evicted entry is not resident, so it invalidates nothing.
         assert_eq!(cache.invalidate_write(0), 0);
     }
 }

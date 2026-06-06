@@ -119,6 +119,13 @@ pub struct PostgresBackend {
     /// v3.6.0 (CIRISPersist#134) — perceptual-hash matcher for the
     /// `put_blob_signing` admission hook. `None` = no hook (default).
     perceptual_hash_matcher: std::sync::RwLock<Option<crate::federation::SharedMatcher>>,
+    /// v4.0 (CIRISConformance#11 round 2) — per-backend-instance
+    /// repository-statistics cache (§7.1). Scoped to *this* backend so a
+    /// Postgres engine never serves an entry a prior SQLite engine wrote
+    /// (cross-backend poisoning) and `reset_engine` drops it with the
+    /// backend. `Arc` so the engine layer / FFI `cache_stats()` can hold
+    /// a handle to the same cache.
+    repo_stats_cache: std::sync::Arc<crate::ceg::aggregates::repository::RepositoryStatsCache>,
 }
 
 impl PostgresBackend {
@@ -201,6 +208,7 @@ impl PostgresBackend {
             )),
             admission_gate: std::sync::RwLock::new(None),
             perceptual_hash_matcher: std::sync::RwLock::new(None),
+            repo_stats_cache: std::sync::Arc::new(crate::cache::Cache::new()),
         })
     }
 
@@ -239,7 +247,18 @@ impl PostgresBackend {
             )),
             admission_gate: std::sync::RwLock::new(None),
             perceptual_hash_matcher: std::sync::RwLock::new(None),
+            repo_stats_cache: std::sync::Arc::new(crate::cache::Cache::new()),
         }
+    }
+
+    /// v4.0 (CIRISConformance#11 round 2) — this backend's
+    /// repository-statistics cache (§7.1). The engine / FFI
+    /// `cache_stats()` accessor reads from here so observability reports
+    /// *this* backend's cache, not a process global.
+    pub fn repo_stats_cache(
+        &self,
+    ) -> &std::sync::Arc<crate::ceg::aggregates::repository::RepositoryStatsCache> {
+        &self.repo_stats_cache
     }
 
     /// v3.4.0 (CIRISPersist#123) — install the trust-weighted
@@ -6760,8 +6779,9 @@ impl crate::read::ReadEngine for PostgresBackend {
         use crate::ceg::aggregates::repository as repo;
 
         let period = filter.window;
-        let cache = repo::repository_stats_cache();
-        let key = repo::repository_stats_cache_key(&filter, &scope);
+        let cache = &self.repo_stats_cache;
+        let key =
+            repo::repository_stats_cache_key(&filter, &scope, cache.config().invalidation_bucket);
 
         // §7.3 cache-miss path: probe → on hit return cached (cache_hit
         // already true, original evaluated_at preserved); on miss run the

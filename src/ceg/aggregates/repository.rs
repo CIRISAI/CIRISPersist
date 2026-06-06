@@ -47,33 +47,29 @@ use crate::ceg::types::{Aggregate, Filter, TimeWindow};
 /// Stable cache method-id for `get_repository_statistics` (FSD §7.2).
 pub const REPOSITORY_STATISTICS_METHOD_ID: &str = "get_repository_statistics:v4.0";
 
-/// The process-local substrate cache for repository statistics (FSD
-/// §7.1 — "one cache per cohab process").
+/// A repository-statistics cache, owned per backend instance (FSD §7.1
+/// — "one cache per cohab process").
 ///
-/// A cohabiting peer process running lens + sovereign-agent + bridge
-/// shares this single LRU+TTL cache, one memory budget, one eviction
-/// policy, one `cache_stats()` observability surface. Constructed lazily
-/// with the compile-time deployment-tier defaults
-/// ([`crate::cache::CacheConfig::default`]); the [`crate::cache::Cache`]
-/// is internally `Mutex`-guarded so concurrent reads share it safely.
-static REPOSITORY_STATS_CACHE: std::sync::OnceLock<crate::cache::Cache<RepositoryStatistics>> =
-    std::sync::OnceLock::new();
-
-/// Accessor for the process-local repository-statistics cache (§7.1).
-/// Both backends route their `get_repository_statistics` through this so
-/// the cache key, the scope-disjoint discipline, and the staleness
-/// contract are uniform across Postgres + SQLite.
-pub fn repository_stats_cache() -> &'static crate::cache::Cache<RepositoryStatistics> {
-    REPOSITORY_STATS_CACHE.get_or_init(crate::cache::Cache::new)
-}
+/// In a cohabiting peer process there is one Engine → one backend → one
+/// of these, so lens + sovereign-agent + bridge share a single LRU+TTL
+/// cache, one memory budget, one eviction policy, one `cache_stats()`
+/// surface. Scoping it to the backend instance (rather than a process
+/// global) is the CIRISConformance#11 round-2 fix: a Postgres engine
+/// must never serve an entry a prior SQLite engine wrote, and
+/// `reset_engine` (which drops the backend) must drop its cache.
+pub type RepositoryStatsCache = crate::cache::Cache<RepositoryStatistics>;
 
 /// Build the [`crate::cache::CacheKey`] for a `(filter, scope)` pair
 /// (FSD §7.2 / §7.3). Folds the filter's `cache_key_digest` + the
-/// scope digest + the window-overlap bucket set. Two callers with a
+/// scope digest + the window-overlap bucket range. Two callers with a
 /// different scope digest never share an entry (scope-disjoint, §7.3).
+///
+/// `invalidation_bucket` is the backend cache's bucket width — passed in
+/// rather than read from a global so the cache is per-backend-instance.
 pub fn repository_stats_cache_key(
     filter: &RepositoryFilter,
     scope: &crate::scope::CallerScope,
+    invalidation_bucket: std::time::Duration,
 ) -> crate::cache::CacheKey {
     let scope_digest = scope_digest_for(scope);
     crate::cache::CacheKey::new(
@@ -82,7 +78,7 @@ pub fn repository_stats_cache_key(
         &scope_digest,
         filter.window.since.timestamp_millis(),
         filter.window.until.timestamp_millis(),
-        repository_stats_cache().config().invalidation_bucket,
+        invalidation_bucket,
     )
 }
 

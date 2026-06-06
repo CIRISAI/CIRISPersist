@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::key::CacheKey;
+use super::key::{Bucket, CacheKey};
 
 /// A cached value plus the accounting the LRU + TTL eviction need.
 ///
@@ -225,6 +225,20 @@ impl<T> LruCache<T> {
     /// helper — does not bump recency and does not drop expired entries.
     pub fn contains_resident(&self, key: &CacheKey) -> bool {
         self.map.contains_key(key)
+    }
+
+    /// Every resident key whose window overlaps bucket `b` (§7.3
+    /// write-invalidation). Replaces the old `bucket → set<CacheKey>`
+    /// reverse index: the cache is bounded (`max_entries` ≤ 1024) and
+    /// writes are off the hot read path, so an O(resident) scan per
+    /// write is cheap and carries O(1) memory per key — no reverse index
+    /// to keep coherent (CIRISConformance#11).
+    pub fn keys_overlapping_bucket(&self, b: Bucket) -> Vec<CacheKey> {
+        self.map
+            .keys()
+            .filter(|k| k.overlaps_bucket(b))
+            .cloned()
+            .collect()
     }
 }
 
