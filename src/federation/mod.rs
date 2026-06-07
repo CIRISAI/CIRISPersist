@@ -50,6 +50,11 @@ pub mod rooting;
 pub mod schema_resolver;
 #[cfg(feature = "sqlite")]
 pub mod sqlite_open;
+// v4.1 (CIRISPersist#142 Cut C2) — streaming-chunk AES-256-GCM + STREAM
+// nonce. Gated on `secrets`: routes through that feature's
+// `secrets::crypto` facade (MISSION §1.4 sole symmetric-crypto site).
+#[cfg(feature = "secrets")]
+pub mod stream_seal;
 pub mod stream_sth;
 pub mod topology;
 pub mod trust_grant;

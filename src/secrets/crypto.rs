@@ -158,6 +158,22 @@ pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
     ciris_crypto::hmac::sha256(key, msg)
 }
 
+/// HKDF-SHA-256 expand. Routes to `ciris_crypto::kdf::hkdf_sha256`
+/// (RFC 5869). Empty `salt` → the RFC default (no salt). Added for the
+/// streaming-substrate STREAM-nonce derivation (CEG 0.10 §10.5.2,
+/// CIRISPersist#142 Cut C2); keeping it behind this one facade preserves
+/// the MISSION §1.4 "sole symmetric-crypto routing site" invariant — the
+/// stream seal never imports `ciris_crypto::*` directly.
+pub fn hkdf_sha256(
+    ikm: &[u8],
+    salt: &[u8],
+    info: &[u8],
+    out_len: usize,
+) -> Result<Vec<u8>, SecretsError> {
+    ciris_crypto::kdf::hkdf_sha256(ikm, salt, info, out_len)
+        .map_err(|e| SecretsError::Crypto(format!("hkdf-sha256: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
