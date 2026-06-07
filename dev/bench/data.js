@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780863480425,
+  "lastUpdate": 1780871021532,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -16127,6 +16127,264 @@ window.BENCHMARK_DATA = {
             "name": "occurrence_registry/list_live_occurrences/1000",
             "value": 521153,
             "range": "± 2381",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "7538e42e5c4b463d72b14cde8941376306196d53",
+          "message": "Streaming Cut C4 — signed delivery receipts (#142, CEG 0.15 §10.5.4) (#169)\n\nCloses the streaming delivery loop. A delivery receipt is a subscriber's\nhybrid-signed acknowledgement that they received chunk K under\n(stream_id, epoch). Verification is a JOIN, not just a sig-check:\n\n  1. verify the subscriber's Ed25519+ML-DSA-65 signature over the\n     §10.5.4 canonical bytes against the pinned federation_keys key\n     (necessary, NOT sufficient); then\n  2. the JOIN — chunk_root MUST equal a published\n     federation_stream_sth.root_hash (C1b) at tree_size >= k. A\n     subscriber cannot acknowledge an unpublished root, nor a chunk\n     index beyond the published tree.\n\nProof-of-delivery, not proof-of-consumption. Persist validates (origin +\npublished-root JOIN) but does NOT adjudicate (no \"delivered\" verdict, no\nmembership enforcement — MISSION §1.4 / consumer policy).\n\n- src/federation/stream_receipt.rs — DeliveryReceipt + the sole\n  canonical-bytes fn (domain ciris-delivery-receipt/v1, distinct from\n  the STH domain → no cross-protocol replay) + pinned-key sig verify.\n- put_delivery_receipt / list_delivery_receipts_for on BlobStorage,\n  both backends + PyO3. (stream_id, subscriber_key_id, k) PK =\n  append-only; same-key different-root = subscriber equivocation,\n  rejected; identical re-PUT idempotent.\n- V065 federation_stream_delivery_receipts (both dialects, additive).\n- Real-hybrid-signature e2e tests on live PG + in-memory SQLite:\n  positive/idempotent + four security negatives (phantom root,\n  tree_size<k, wrong-key sig, equivocation) all reject.\n- Fix pre-existing dead-code: engine.rs sha256_of_bytes was gated\n  any(sqlite,postgres) but used only by the sqlite tests → dead under\n  postgres-only -D warnings. Re-gated sqlite-only.\n\n911 lib tests green on live PG (postgres server pyo3 sqlite).\n\nCo-authored-by: Claude Opus 4.8 <noreply@anthropic.com>",
+          "timestamp": "2026-06-07T17:01:30-05:00",
+          "tree_id": "234eb83d10a58c427d675dc48466c70d8591e796",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/7538e42e5c4b463d72b14cde8941376306196d53"
+        },
+        "date": 1780871019894,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 40435511,
+            "range": "± 36018",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 2896760,
+            "range": "± 155710",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 2524,
+            "range": "± 32",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 5961,
+            "range": "± 26",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 13032,
+            "range": "± 107",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 46059,
+            "range": "± 447",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 9,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 35,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 187,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 524,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 599,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 2070,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 9,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 83,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 253,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 1107,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 16,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 56184,
+            "range": "± 2719",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 158451,
+            "range": "± 4751",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 560475,
+            "range": "± 9968",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 8728,
+            "range": "± 768",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 10062,
+            "range": "± 796",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 17108,
+            "range": "± 1180",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 36015,
+            "range": "± 2402",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 1554011,
+            "range": "± 10309",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 4858731,
+            "range": "± 38102",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 257407,
+            "range": "± 14774",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 895191,
+            "range": "± 20359",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 49341832,
+            "range": "± 295871",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 1558072,
+            "range": "± 116636",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 8855826,
+            "range": "± 141783",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 123906202,
+            "range": "± 887462",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 4068037,
+            "range": "± 114589",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 23250934,
+            "range": "± 317498",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 73142,
+            "range": "± 6445",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 71466,
+            "range": "± 5600",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 7512,
+            "range": "± 27",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 48636,
+            "range": "± 940",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 454699,
+            "range": "± 4483",
             "unit": "ns/iter"
           }
         ]
