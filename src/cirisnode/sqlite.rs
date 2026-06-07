@@ -3147,4 +3147,103 @@ mod tests {
             "expected trigger violation; got: {detail}"
         );
     }
+
+    /// V064 (CIRISPersist#142 Cut C3a) — the widened key_grant
+    /// asymmetry triggers admit BOTH addressing modes (content XOR
+    /// stream/epoch) and reject malformed shapes. Direct inserts via
+    /// the shared conn handle exercise the triggers at the DB layer
+    /// (the stream-addressed write path is Cut C3b).
+    #[tokio::test]
+    async fn sqlite_v064_trigger_admits_both_key_grant_addressing_modes() {
+        let (backend, _cn) = fresh_backend().await;
+        let conn = backend.conn_handle();
+
+        // (id, sha, recipient, stream_id, stream_epoch) → Result.
+        let insert = |id: &str,
+                      sha: Option<&str>,
+                      recipient: Option<&str>,
+                      stream: Option<&str>,
+                      epoch: Option<i64>|
+         -> rusqlite::Result<usize> {
+            let guard = conn.lock();
+            guard.execute(
+                "INSERT INTO cirisnode_contributions (\
+                    contribution_id, contribution_type, domain, language, subject_kind, \
+                    author_id, payload, witness_set, submitted_at, \
+                    signature, signing_key_id, signature_verified, persist_row_hash, \
+                    media_content_sha256, key_grant_recipient_key_id, \
+                    key_grant_stream_id, key_grant_stream_epoch\
+                 ) VALUES (?1, 'proposal', 'd', 'en', 'key_grant', 'a', '{}', NULL, \
+                           '2026-01-01T00:00:00Z', 'sig', 'a', 1, 'h', ?2, ?3, ?4, ?5)",
+                rusqlite::params![id, sha, recipient, stream, epoch],
+            )
+        };
+        let sha = "a".repeat(64);
+        let recipient = "rec-1";
+        let stream = "stream-xyz";
+        let epoch: i64 = 7;
+
+        // 1. content-addressed (sha + recipient, stream cols NULL) OK.
+        insert("kg-content", Some(&sha), Some(recipient), None, None)
+            .expect("content-addressed key_grant must still insert post-V064");
+
+        // 2. stream/epoch-addressed (recipient + stream_id + epoch, sha
+        //    NULL) now OK (was rejected pre-V064).
+        insert(
+            "kg-stream",
+            None,
+            Some(recipient),
+            Some(stream),
+            Some(epoch),
+        )
+        .expect("stream/epoch-addressed key_grant must insert post-V064");
+
+        // 3. BOTH modes set → rejected.
+        let err = insert(
+            "kg-both",
+            Some(&sha),
+            Some(recipient),
+            Some(stream),
+            Some(epoch),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("key_grant"),
+            "both-addressing-modes must be rejected; got: {err}"
+        );
+
+        // 4. NEITHER mode (recipient only) → rejected.
+        let err = insert("kg-neither", None, Some(recipient), None, None).unwrap_err();
+        assert!(
+            err.to_string().contains("key_grant"),
+            "neither-addressing-mode must be rejected; got: {err}"
+        );
+
+        // 5. stream_id without epoch → rejected.
+        let err = insert("kg-partial", None, Some(recipient), Some(stream), None).unwrap_err();
+        assert!(
+            err.to_string().contains("key_grant"),
+            "stream_id-without-epoch must be rejected; got: {err}"
+        );
+
+        // 6. non-key_grant row with a stream col set → rejected.
+        let err = (|| -> rusqlite::Result<usize> {
+            let guard = conn.lock();
+            guard.execute(
+                "INSERT INTO cirisnode_contributions (\
+                    contribution_id, contribution_type, domain, language, subject_kind, \
+                    author_id, payload, witness_set, submitted_at, \
+                    signature, signing_key_id, signature_verified, persist_row_hash, \
+                    key_grant_stream_id, key_grant_stream_epoch\
+                 ) VALUES ('kg-nonkg', 'proposal', 'd', 'en', 'arc_question', 'a', '{}', NULL, \
+                           '2026-01-01T00:00:00Z', 'sig', 'a', 1, 'h', ?1, ?2)",
+                rusqlite::params![stream, epoch],
+            )
+        })()
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("key_grant"),
+            "non-key_grant row with stream col set must be rejected; got: {err}"
+        );
+    }
 }

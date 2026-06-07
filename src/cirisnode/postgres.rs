@@ -2890,4 +2890,153 @@ mod tests {
             "expected CHECK violation (SQLSTATE 23514); got: {err:?}"
         );
     }
+
+    /// V064 (CIRISPersist#142 Cut C3a) — the widened key_grant CHECK
+    /// admits BOTH addressing modes (content XOR stream/epoch) and
+    /// rejects malformed shapes. Direct bare-SQL inserts exercise the
+    /// constraint at the DB layer (the stream-addressed write path is
+    /// Cut C3b; C3a only makes the schema admit the shape).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn v064_check_admits_both_key_grant_addressing_modes() {
+        use crate::store::backend::Backend;
+        use tokio_postgres::error::SqlState;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let client = backend.pool().get().await.unwrap();
+
+        // Raw key_grant insert helper. Columns beyond the standard
+        // envelope are passed as $2 (sha), $3 (recipient), $4
+        // (stream_id), $5 (stream_epoch).
+        let sql = "INSERT INTO cirisnode.contributions (\
+                contribution_id, contribution_type, domain, language, subject_kind, \
+                author_id, payload, witness_set, submitted_at, \
+                signature, signing_key_id, signature_verified, persist_row_hash, \
+                media_content_sha256, key_grant_recipient_key_id, \
+                key_grant_stream_id, key_grant_stream_epoch\
+             ) VALUES ($1, 'proposal', 'd', 'en', 'key_grant', 'a', '{}'::jsonb, NULL, NOW(), \
+                       'sig', 'a', TRUE, 'h', $2, $3, $4, $5)";
+        let sha = "a".repeat(64);
+        let recipient = "rec-1".to_string();
+        let stream = "stream-xyz".to_string();
+        let epoch: i64 = 7;
+
+        // 1. Existing content-addressed key_grant (sha + recipient,
+        //    stream cols NULL) STILL inserts OK.
+        client
+            .execute(
+                sql,
+                &[
+                    &Uuid::new_v4(),
+                    &Some(sha.clone()),
+                    &Some(recipient.clone()),
+                    &None::<String>,
+                    &None::<i64>,
+                ],
+            )
+            .await
+            .expect("content-addressed key_grant must still insert post-V064");
+
+        // 2. NEW stream/epoch-addressed key_grant (recipient + stream_id
+        //    + stream_epoch, sha NULL) now inserts OK (was rejected
+        //    pre-V064).
+        client
+            .execute(
+                sql,
+                &[
+                    &Uuid::new_v4(),
+                    &None::<String>,
+                    &Some(recipient.clone()),
+                    &Some(stream.clone()),
+                    &Some(epoch),
+                ],
+            )
+            .await
+            .expect("stream/epoch-addressed key_grant must insert post-V064");
+
+        // 3. BOTH addressing modes set → rejected.
+        let err = client
+            .execute(
+                sql,
+                &[
+                    &Uuid::new_v4(),
+                    &Some(sha.clone()),
+                    &Some(recipient.clone()),
+                    &Some(stream.clone()),
+                    &Some(epoch),
+                ],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.as_db_error().map(|d| d.code().clone()),
+            Some(SqlState::CHECK_VIOLATION),
+            "both-addressing-modes key_grant must be rejected; got: {err:?}"
+        );
+
+        // 4. NEITHER addressing mode set (recipient only) → rejected.
+        let err = client
+            .execute(
+                sql,
+                &[
+                    &Uuid::new_v4(),
+                    &None::<String>,
+                    &Some(recipient.clone()),
+                    &None::<String>,
+                    &None::<i64>,
+                ],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.as_db_error().map(|d| d.code().clone()),
+            Some(SqlState::CHECK_VIOLATION),
+            "neither-addressing-mode key_grant must be rejected; got: {err:?}"
+        );
+
+        // 5. stream_id without stream_epoch → rejected (partial
+        //    stream/epoch mode).
+        let err = client
+            .execute(
+                sql,
+                &[
+                    &Uuid::new_v4(),
+                    &None::<String>,
+                    &Some(recipient.clone()),
+                    &Some(stream.clone()),
+                    &None::<i64>,
+                ],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.as_db_error().map(|d| d.code().clone()),
+            Some(SqlState::CHECK_VIOLATION),
+            "stream_id-without-epoch key_grant must be rejected; got: {err:?}"
+        );
+
+        // 6. non-key_grant row with a stream col set → rejected.
+        let err = client
+            .execute(
+                "INSERT INTO cirisnode.contributions (\
+                    contribution_id, contribution_type, domain, language, subject_kind, \
+                    author_id, payload, witness_set, submitted_at, \
+                    signature, signing_key_id, signature_verified, persist_row_hash, \
+                    key_grant_stream_id, key_grant_stream_epoch\
+                 ) VALUES ($1, 'proposal', 'd', 'en', 'arc_question', 'a', '{}'::jsonb, NULL, NOW(), \
+                           'sig', 'a', TRUE, 'h', $2, $3)",
+                &[&Uuid::new_v4(), &Some(stream.clone()), &Some(epoch)],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.as_db_error().map(|d| d.code().clone()),
+            Some(SqlState::CHECK_VIOLATION),
+            "non-key_grant row with stream col set must be rejected; got: {err:?}"
+        );
+    }
 }
