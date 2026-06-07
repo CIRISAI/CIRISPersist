@@ -3316,7 +3316,10 @@ mod tests {
         .expect("spawn_blocking join");
     }
 
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    // Only the sqlite put_blob_signing tests below use this; the
+    // postgres canonicalizer test computes its hash inline. Gating to
+    // `any(sqlite, postgres)` left it dead under postgres-only builds.
+    #[cfg(feature = "sqlite")]
     fn sha256_of_bytes(bytes: &[u8]) -> [u8; 32] {
         use sha2::{Digest, Sha256};
         let d = Sha256::digest(bytes);

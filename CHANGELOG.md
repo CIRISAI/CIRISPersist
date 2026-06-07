@@ -5,6 +5,27 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [4.2.0] — 2026-06-07
+
+**Streaming substrate Cut C4 — signed delivery receipts (CIRISPersist#142, CEG 0.15 §10.5.4).**
+
+Closes the streaming delivery loop: subscribers return a hybrid-signed acknowledgement that they received chunk `K` under `(stream_id, epoch)`. Additive over 4.1.0; the epoch-DEK cascade (C3b) remains blocked on CIRISVerify#58. 911 lib tests green on live PG.
+
+### The model — verification is a JOIN, not a sig-check
+A receipt is **proof-of-delivery, not proof-of-consumption** (it commits to having received bytes that commit to chunk `K`; it does not prove the subscriber decrypted them). `put_delivery_receipt` gates in order: (1) verify the subscriber's hybrid Ed25519+ML-DSA-65 signature over the §10.5.4 canonical bytes against the **pinned** `federation_keys` key (never keys embedded in the signature); (2) **the JOIN** — `chunk_root` MUST equal a **published** `federation_stream_sth.root_hash` (Cut C1b) for the stream at `tree_size >= k`. The signature is necessary but NOT sufficient: a subscriber cannot acknowledge a root the producer never published, nor a chunk index beyond the published tree. Persist **validates** (authenticates origin + JOINs against the published root) but does **not adjudicate** — no "delivered"/"owes N" verdict, no community-membership enforcement (MISSION §1.4; consumer policy).
+
+### Added
+- **`DeliveryReceipt`** (`src/federation/stream_receipt.rs`) — the canonical signing bytes live in the single `receipt_signing_bytes` function (domain `ciris-delivery-receipt/v1`, `u32` LE length prefixes, LE integers — matching the `SignedTreeHead::signing_bytes` discipline). Its domain tag is distinct from the STH domain, so a receipt signature can never be replayed as a producer STH (cross-protocol safety, tested).
+- **`put_delivery_receipt(receipt)` + `list_delivery_receipts_for(stream_id, limit)`** on `BlobStorage`, both backends + PyO3 (JSON boundary). `(stream_id, subscriber_key_id, k)` PK = append-only; a same-key different-root receipt is a **subscriber equivocation** attempt and is rejected; an identical re-PUT is idempotent.
+- **V065** — `federation_stream_delivery_receipts` (both dialects; pure additive, no CHECK-rebuild). `chunk_root BYTEA/BLOB CHECK len=32`, JOINed against the published STH before insert.
+- **Tests** — real-hybrid-signature end-to-end on both backends (live PG + in-memory SQLite): positive + idempotent, and the four security negatives all reject — phantom root, `tree_size < k`, wrong-key signature, subscriber equivocation.
+
+### Fixed
+- **`engine.rs` dead-code under `postgres`-only test builds** — the `sha256_of_bytes` test helper was gated `any(sqlite, postgres)` but used only by the sqlite `put_blob_signing` tests (the postgres canonicalizer test hashes inline), so it was dead under `--features "postgres server"` with `-D warnings`. Re-gated `#[cfg(feature = "sqlite")]`. Pre-existing; surfaced by the C4 PG test run.
+
+### Semver note
+- `BlobStorage` gained two required methods (no defaults). Persist is the sole implementor; no external impl exists to break. Additive for every consumer that calls the trait.
+
 ## [4.1.0] — 2026-06-06
 
 **Streaming substrate (CIRISPersist#142, Cuts A–C3a) + CIRISVerify 4.8.1 re-pin.**

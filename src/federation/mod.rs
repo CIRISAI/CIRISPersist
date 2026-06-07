@@ -55,6 +55,10 @@ pub mod sqlite_open;
 // `secrets::crypto` facade (MISSION §1.4 sole symmetric-crypto site).
 #[cfg(feature = "secrets")]
 pub mod stream_seal;
+// v4.1 (CIRISPersist#142 Cut C4) — delivery-receipt canonical bytes +
+// subscriber-signature verify. Backend-agnostic; the JOIN-against-STH
+// gate + storage live in the backends.
+pub mod stream_receipt;
 pub mod stream_sth;
 pub mod topology;
 pub mod trust_grant;
