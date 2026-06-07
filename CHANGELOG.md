@@ -7,9 +7,9 @@ threat-model citations because this crate's audit story is the point.
 
 ## [4.1.0] — 2026-06-06
 
-**Streaming substrate (CIRISPersist#142, Cuts A–C2) + CIRISVerify 4.8.1 re-pin.**
+**Streaming substrate (CIRISPersist#142, Cuts A–C3a) + CIRISVerify 4.8.1 re-pin.**
 
-The re-pin is the release CIRISAgent 2.9.5 is holding for. The streaming work is additive substrate toward CEG 0.15 §10.5 (the delivery axis); it is incomplete (the epoch-DEK cascade is C3, in flight) but every surface here is usable and optional.
+The re-pin is the release CIRISAgent 2.9.5 is holding for. The streaming work is additive substrate toward CEG 0.15 §10.5 (the delivery axis); it is incomplete (the epoch-DEK cascade write path is C3b, in flight) but every surface here is usable and optional.
 
 ### Dependency
 - **CIRISVerify `v4.8.0` → `v4.8.1`** across all deps + `[target.*]` tables. Picks up the #56 mobile fix (Android probe / network-race decouple, in `unified.rs`/`mobile_http.rs` — code persist doesn't call); **no change to the crypto/transparency/keyring surface persist uses.** 960+ lib tests green on live PG against 4.8.1.
@@ -20,6 +20,7 @@ The re-pin is the release CIRISAgent 2.9.5 is holding for. The streaming work is
 - **`federation_stream_chunks` + `put_blob_chunk`/`seal_stream`** (Cut C1a, **V062**) — live per-stream chunk append (monotonic `PRIMARY KEY (stream_id, seq)`) + seal into a `ChunkDag`.
 - **Per-stream transparency log** (Cut C1b, **V063**) — `put_stream_sth` stores a **producer-signed** RFC 6962 `SignedTreeHead` only after persist recomputes the root from its own chunks and asserts it matches (anti-equivocation), then verifies the producer's hybrid signature against the pinned `federation_keys` key; `latest_stream_sth` + inclusion/consistency proofs (via the audited `InMemoryTransparencyStore` — no RFC 6962 reimpl).
 - **STREAM-nonce AES-256-GCM chunk sealing** (Cut C2) — `seal_chunk`/`open_chunk` with the CEG 0.15 §10.5.2 nonce `prefix[7] ‖ counter_be[4] ‖ last_flag[1]` (`prefix = HKDF-SHA256(epoch_dek; "ciris-stream-nonce/v1"‖stream_id‖epoch_be8)[0..7]`), routed through the `secrets::crypto` facade (MISSION §1.4). The epoch encoding is normative per CEG 0.15 (ratified, CIRISRegistry#63).
+- **`key_grant` stream/epoch addressing** (Cut C3a, **V064** — the RC1-1c CHECK migration) — extends the `key_grant` cross-column constraint (PG `DROP/ADD CONSTRAINT`; SQLite trigger rewrite, no table rebuild) to admit grants addressed by `(stream_id, epoch)` alongside content-addressed ones. Schema enabler for the C3b epoch-DEK cascade.
 
 ### Changed — semver note
 - **`BlobBody` gained a `ChunkDag` variant.** It is not `#[non_exhaustive]`, so a downstream `match` on `BlobBody` that was exhaustive now needs a `ChunkDag` (or `_`) arm. This is the one source-incompatible change in an otherwise additive release.
