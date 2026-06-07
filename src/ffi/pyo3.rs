@@ -4499,6 +4499,91 @@ impl PyEngine {
         })
     }
 
+    /// v4.1 (CIRISPersist#142, Cut C4, CEG §10.5.4) — store a subscriber
+    /// delivery receipt (`receipt_json` is a serialized `DeliveryReceipt`).
+    /// Runs the JOIN-against-published-STH gate: (1) the subscriber's
+    /// hybrid signature is verified against the pinned `federation_keys`
+    /// key, (2) `chunk_root` MUST match a published
+    /// `federation_stream_sth` root for the stream at `tree_size >= k`
+    /// (a phantom root raises `ValueError`), (3) INSERT. A same-key
+    /// different-root receipt (subscriber equivocation) raises
+    /// `ValueError`; an identical re-PUT is idempotent.
+    fn put_delivery_receipt(&self, py: Python<'_>, receipt_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let receipt: crate::federation::stream_receipt::DeliveryReceipt =
+                serde_json::from_str(receipt_json).map_err(|e| {
+                    PyValueError::new_err(format!("put_delivery_receipt: receipt_json parse: {e}"))
+                })?;
+            let runtime = self.runtime.clone();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .put_delivery_receipt(receipt)
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .put_delivery_receipt(receipt)
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
+    /// v4.1 (CIRISPersist#142, Cut C4) — list stored delivery receipts
+    /// for `stream_id`, ascending `(k, subscriber_key_id)`, bounded by
+    /// `limit`. Returns a JSON array of serialized `DeliveryReceipt`s.
+    fn list_delivery_receipts_for(
+        &self,
+        py: Python<'_>,
+        stream_id: &str,
+        limit: i64,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let stream_id = stream_id.to_string();
+            let receipts = py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .list_delivery_receipts_for(&stream_id, limit)
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .list_delivery_receipts_for(&stream_id, limit)
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+            })?;
+            serde_json::to_string(&receipts).map_err(|e| {
+                PyValueError::new_err(format!("list_delivery_receipts_for: serialize: {e}"))
+            })
+        })
+    }
+
     /// v3.11.0 (CIRISPersist#143, CIRISVerify FEDERATION_THREAT_MODEL
     /// §3.3.2) — verify-coord R1+Q1 constants as a JSON dict for
     /// consumer code that needs to pin τ_normal / τ_partial /

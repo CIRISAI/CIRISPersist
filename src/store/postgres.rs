@@ -4149,6 +4149,182 @@ impl crate::federation::BlobStorage for PostgresBackend {
         crate::federation::stream_sth::consistency_proof(&chunk_hashes, from_size, to_size)
     }
 
+    async fn put_delivery_receipt(
+        &self,
+        receipt: crate::federation::stream_receipt::DeliveryReceipt,
+    ) -> Result<(), crate::federation::BlobError> {
+        use crate::federation::stream_receipt;
+
+        // Step 1: verify the subscriber's hybrid signature (pinned key
+        // resolved from federation_keys via subscriber_key_id). Necessary,
+        // NOT sufficient.
+        stream_receipt::verify_receipt_signature(self, &receipt).await?;
+
+        let k_i64 = i64::try_from(receipt.k).map_err(|_| {
+            crate::federation::BlobError::InvalidArgument(
+                "put_delivery_receipt: k exceeds i64 — \
+                 federation_stream_delivery_receipts.k is BIGINT"
+                    .into(),
+            )
+        })?;
+        let epoch_i64 = i64::try_from(receipt.epoch).map_err(|_| {
+            crate::federation::BlobError::InvalidArgument(
+                "put_delivery_receipt: epoch exceeds i64".into(),
+            )
+        })?;
+        let root_vec = receipt.chunk_root.to_vec();
+        let signature_blob =
+            crate::federation::stream_sth::serialize_signature(&receipt.signature)?;
+        let received_at = chrono::Utc::now();
+
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let tx = client.transaction().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("put_delivery_receipt tx: {e}"))
+        })?;
+
+        // Step 2: the JOIN gate. The acknowledged chunk_root MUST be a root
+        // persist itself published as an STH for this stream
+        // (federation_stream_sth, C1b) at tree_size >= k. A subscriber
+        // cannot acknowledge an unpublished root, nor a chunk index beyond
+        // the published tree. The sig proved WHO; this proves the root is
+        // REAL.
+        let published: i64 = tx
+            .query_one(
+                "SELECT COUNT(*) FROM cirislens.federation_stream_sth \
+                  WHERE stream_id = $1 AND root_hash = $2 AND tree_size >= $3",
+                &[&receipt.stream_id, &root_vec, &k_i64],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("put_delivery_receipt STH JOIN: {e}"))
+            })?
+            .get(0);
+        if published == 0 {
+            return Err(crate::federation::BlobError::InvalidArgument(format!(
+                "put_delivery_receipt: no published STH for stream={} matches the \
+                 acknowledged chunk_root at tree_size >= {} (a subscriber cannot \
+                 acknowledge an unpublished root)",
+                receipt.stream_id, receipt.k
+            )));
+        }
+
+        // Step 3: INSERT. A (stream_id, subscriber_key_id, k) PK conflict
+        // with a DIFFERENT root is a subscriber equivocation attempt →
+        // reject; identical → idempotent.
+        let inserted = tx
+            .execute(
+                "INSERT INTO cirislens.federation_stream_delivery_receipts (\
+                    stream_id, subscriber_key_id, epoch, k, chunk_root, \
+                    signature_blob, received_at\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                 ON CONFLICT (stream_id, subscriber_key_id, k) DO NOTHING",
+                &[
+                    &receipt.stream_id,
+                    &receipt.subscriber_key_id,
+                    &epoch_i64,
+                    &k_i64,
+                    &root_vec,
+                    &signature_blob,
+                    &received_at,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("put_delivery_receipt insert: {e}"))
+            })?;
+
+        if inserted == 0 {
+            let existing_root: Vec<u8> = tx
+                .query_one(
+                    "SELECT chunk_root FROM cirislens.federation_stream_delivery_receipts \
+                      WHERE stream_id = $1 AND subscriber_key_id = $2 AND k = $3",
+                    &[&receipt.stream_id, &receipt.subscriber_key_id, &k_i64],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::BlobError::Backend(format!(
+                        "put_delivery_receipt conflict re-read: {e}"
+                    ))
+                })?
+                .get(0);
+            if existing_root != root_vec {
+                return Err(crate::federation::BlobError::InvalidArgument(format!(
+                    "put_delivery_receipt: subscriber equivocation — a receipt for \
+                     stream={} subscriber={} k={} already exists with a different chunk_root",
+                    receipt.stream_id, receipt.subscriber_key_id, receipt.k
+                )));
+            }
+            // Identical re-PUT → idempotent OK; nothing to commit.
+            return Ok(());
+        }
+        tx.commit().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("put_delivery_receipt commit: {e}"))
+        })?;
+        Ok(())
+    }
+
+    async fn list_delivery_receipts_for(
+        &self,
+        stream_id: &str,
+        limit: i64,
+    ) -> Result<Vec<crate::federation::stream_receipt::DeliveryReceipt>, crate::federation::BlobError>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT subscriber_key_id, epoch, k, chunk_root, signature_blob \
+                   FROM cirislens.federation_stream_delivery_receipts \
+                  WHERE stream_id = $1 \
+                  ORDER BY k ASC, subscriber_key_id ASC \
+                  LIMIT $2",
+                &[&stream_id, &limit],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!(
+                    "list_delivery_receipts_for query: {e}"
+                ))
+            })?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let subscriber_key_id: String =
+                row.safe_get_with("subscriber_key_id", crate::federation::BlobError::Backend)?;
+            let epoch_i64: i64 =
+                row.safe_get_with("epoch", crate::federation::BlobError::Backend)?;
+            let k_i64: i64 = row.safe_get_with("k", crate::federation::BlobError::Backend)?;
+            let root_vec: Vec<u8> =
+                row.safe_get_with("chunk_root", crate::federation::BlobError::Backend)?;
+            let signature_blob: Vec<u8> =
+                row.safe_get_with("signature_blob", crate::federation::BlobError::Backend)?;
+            let chunk_root = crate::federation::stream_sth::root_hash_from_bytes(&root_vec)?;
+            let signature = crate::federation::stream_sth::deserialize_signature(&signature_blob)?;
+            out.push(crate::federation::stream_receipt::DeliveryReceipt {
+                stream_id: stream_id.to_string(),
+                subscriber_key_id,
+                epoch: u64::try_from(epoch_i64).map_err(|_| {
+                    crate::federation::BlobError::Backend(
+                        "list_delivery_receipts_for: negative epoch".into(),
+                    )
+                })?,
+                k: u64::try_from(k_i64).map_err(|_| {
+                    crate::federation::BlobError::Backend(
+                        "list_delivery_receipts_for: negative k".into(),
+                    )
+                })?,
+                chunk_root,
+                signature,
+            });
+        }
+        Ok(out)
+    }
+
     async fn get_blob(
         &self,
         sha256: &[u8; 32],
@@ -19271,5 +19447,196 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page.items.len(), 3, "self row hidden from non-owner reader");
+    }
+
+    // ─── Cut C4 — delivery-receipt JOIN gate on Postgres (CEG §10.5.4) ─
+    //
+    // PG-dialect parity for the SQLite delivery_receipts tests: exercises
+    // V065's DDL, the BYTEA `root_hash` JOIN comparison, the BIGINT
+    // bindings, and the in-transaction gate. Real hybrid signatures.
+
+    /// Build a real hybrid-signed receipt (PQC signs
+    /// `canonical || classical_sig`). Returns the receipt + the
+    /// subscriber's (ed25519, ml_dsa_65) base64 pubkeys.
+    async fn pg_signed_receipt(
+        stream_id: &str,
+        subscriber_key_id: &str,
+        epoch: u64,
+        k: u64,
+        chunk_root: [u8; 32],
+        ed_seed: u8,
+        mldsa_seed: u8,
+    ) -> (
+        crate::federation::stream_receipt::DeliveryReceipt,
+        String,
+        String,
+    ) {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        use ciris_keyring::PqcSigner;
+        use ed25519_dalek::Signer as _;
+
+        let canonical = crate::federation::stream_receipt::receipt_signing_bytes(
+            subscriber_key_id,
+            stream_id,
+            epoch,
+            &chunk_root,
+            k,
+        );
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[ed_seed; 32]);
+        let ed_sig_bytes = sk.sign(&canonical).to_bytes();
+        let ed_pk = sk.verifying_key().to_bytes();
+
+        let mut bound = canonical.clone();
+        bound.extend_from_slice(&ed_sig_bytes);
+        let mldsa =
+            ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(&[mldsa_seed; 32], "c4-pg-test")
+                .expect("ml-dsa seed");
+        let pqc_sig = mldsa.sign(&bound).await.expect("ml-dsa sign");
+        let pqc_pk = mldsa.public_key().await.expect("ml-dsa pk");
+
+        let receipt = crate::federation::stream_receipt::DeliveryReceipt {
+            stream_id: stream_id.to_owned(),
+            subscriber_key_id: subscriber_key_id.to_owned(),
+            epoch,
+            k,
+            chunk_root,
+            signature: ciris_crypto::HybridSignature {
+                crypto_kind: ciris_crypto::CRYPTO_KIND_CIRIS_V1,
+                classical: ciris_crypto::TaggedClassicalSignature {
+                    algorithm: ciris_crypto::ClassicalAlgorithm::Ed25519,
+                    signature: ed_sig_bytes.to_vec(),
+                    public_key: ed_pk.to_vec(),
+                },
+                pqc: ciris_crypto::TaggedPqcSignature {
+                    algorithm: ciris_crypto::PqcAlgorithm::MlDsa65,
+                    signature: pqc_sig,
+                    public_key: pqc_pk.clone(),
+                },
+                mode: ciris_crypto::SignatureMode::HybridRequired,
+            },
+        };
+        (receipt, B64.encode(ed_pk), B64.encode(&pqc_pk))
+    }
+
+    async fn pg_seed_subscriber_key(
+        backend: &PostgresBackend,
+        key_id: &str,
+        ed_b64: &str,
+        mldsa_b64: &str,
+    ) {
+        let client = backend.get_client().await.unwrap();
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_keys (\
+                    key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
+                    identity_type, identity_ref, valid_from, registration_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_key_id, \
+                    scrub_timestamp, persist_row_hash\
+                 ) VALUES ($1, $2, $3, 'hybrid', 'agent', $1, \
+                          '2026-01-01T00:00:00Z', '{}', '\\x00', '', $1, \
+                          '2026-01-01T00:00:00Z', '0') \
+                 ON CONFLICT (key_id) DO NOTHING",
+                &[&key_id, &ed_b64, &mldsa_b64],
+            )
+            .await
+            .expect("seed federation_keys");
+    }
+
+    async fn pg_seed_published_sth(
+        backend: &PostgresBackend,
+        stream_id: &str,
+        tree_size: i64,
+        root_hash: [u8; 32],
+    ) {
+        let client = backend.get_client().await.unwrap();
+        let root_vec = root_hash.to_vec();
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_stream_sth (\
+                    stream_id, tree_size, epoch, root_hash, signed_at, \
+                    producer_key_id, signature_blob, witness_signatures\
+                 ) VALUES ($1, $2, 0, $3, '2026-01-01T00:00:00Z', \
+                          'producer-key', '\\x00', '[]'::jsonb) \
+                 ON CONFLICT (stream_id, tree_size) DO NOTHING",
+                &[&stream_id, &tree_size, &root_vec],
+            )
+            .await
+            .expect("seed federation_stream_sth");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_delivery_receipt_join_gate() {
+        use crate::federation::BlobStorage;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let suffix = uuid_like();
+        let stream_id = format!("stream-c4-pg-{suffix}");
+        let sub = format!("sub-pg-{suffix}");
+        let root = [0x11u8; 32];
+        let phantom = [0x22u8; 32];
+
+        let (receipt, ed_b64, mldsa_b64) =
+            pg_signed_receipt(&stream_id, &sub, 0, 2, root, 0x10, 0x20).await;
+        pg_seed_subscriber_key(&backend, &sub, &ed_b64, &mldsa_b64).await;
+        pg_seed_published_sth(&backend, &stream_id, 3, root).await;
+
+        // Positive: signed receipt against a published root (tree_size >= k).
+        backend
+            .put_delivery_receipt(receipt.clone())
+            .await
+            .expect("receipt against published root accepted");
+        let listed = backend
+            .list_delivery_receipts_for(&stream_id, 10)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].chunk_root, root);
+
+        // Idempotent re-PUT.
+        backend
+            .put_delivery_receipt(receipt)
+            .await
+            .expect("idempotent re-PUT");
+        assert_eq!(
+            backend
+                .list_delivery_receipts_for(&stream_id, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Negative — phantom root (never published) is rejected by the JOIN.
+        let (phantom_receipt, _e, _m) =
+            pg_signed_receipt(&stream_id, &sub, 0, 7, phantom, 0x10, 0x20).await;
+        let err = backend
+            .put_delivery_receipt(phantom_receipt)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::federation::BlobError::InvalidArgument(ref m)
+                if m.contains("unpublished root")),
+            "PG phantom root must be rejected, got: {err:?}"
+        );
+
+        // Negative — subscriber equivocation: a different root at the same
+        // (stream, subscriber, k). Publish root_b too so the JOIN passes
+        // and the equivocation check is what rejects.
+        let root_b = [0x33u8; 32];
+        pg_seed_published_sth(&backend, &stream_id, 4, root_b).await;
+        let (equiv, _e, _m) = pg_signed_receipt(&stream_id, &sub, 0, 2, root_b, 0x10, 0x20).await;
+        let err = backend.put_delivery_receipt(equiv).await.unwrap_err();
+        assert!(
+            matches!(err, crate::federation::BlobError::InvalidArgument(ref m)
+                if m.contains("equivocation")),
+            "PG subscriber equivocation must be rejected, got: {err:?}"
+        );
     }
 }

@@ -609,6 +609,34 @@ pub trait BlobStorage: Send + Sync {
         Output = Result<Option<ciris_verify_core::transparency::ConsistencyProof>, BlobError>,
     > + Send;
 
+    /// v4.1 (CIRISPersist#142, Cut C4, CEG §10.5.4) — store a subscriber
+    /// delivery receipt after the **JOIN-against-published-STH** gate.
+    /// The verify is NOT a sig-check: order is (1) verify the
+    /// subscriber's hybrid signature over the §10.5.4 canonical bytes
+    /// against the pinned `federation_keys` key, (2) **the JOIN** —
+    /// `receipt.chunk_root` MUST equal a `federation_stream_sth.root_hash`
+    /// published for `receipt.stream_id` at `tree_size >= receipt.k`
+    /// (a phantom / self-invented root → [`BlobError::InvalidArgument`]),
+    /// (3) INSERT. A `(stream_id, subscriber_key_id, k)` PK conflict with
+    /// a DIFFERENT `chunk_root` → reject; identical → idempotent. Persist
+    /// validates, never adjudicates — no "delivered" verdict, no
+    /// membership enforcement (§1.4 / consumer policy).
+    fn put_delivery_receipt(
+        &self,
+        receipt: crate::federation::stream_receipt::DeliveryReceipt,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
+    /// v4.1 (CIRISPersist#142, Cut C4) — list stored delivery receipts
+    /// for `stream_id`, ascending `(k, subscriber_key_id)`, bounded by
+    /// `limit`.
+    fn list_delivery_receipts_for(
+        &self,
+        stream_id: &str,
+        limit: i64,
+    ) -> impl Future<
+        Output = Result<Vec<crate::federation::stream_receipt::DeliveryReceipt>, BlobError>,
+    > + Send;
+
     /// Read a blob by its SHA-256.
     ///
     /// Returns the [`BlobBody`] variant matching the row's stored
