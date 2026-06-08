@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780871021532,
+  "lastUpdate": 1780930224273,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -16385,6 +16385,264 @@ window.BENCHMARK_DATA = {
             "name": "occurrence_registry/list_live_occurrences/1000",
             "value": 454699,
             "range": "± 4483",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0e2307febbda30fcd1709767e5ba4e2547fda714",
+          "message": "Streaming Cut C3b — epoch-DEK key_grant cascade + wrap_algorithm v2 (#142, CEG §10.5.3) (#170)\n\nThe streaming epoch-key cascade. A per-(stream_id, epoch) DEK is wrapped\nto each roster recipient as a stream/epoch-addressed key_grant\nContribution. Persist's role is validate / record / list, NOT wrap — the\nproducer wraps + submits; the storage path stores the wrapped DEK\nopaquely (MISSION §1.7). Unblocked by CIRISVerify#58.\n\nDependency: CIRISVerify v4.8.1 → v4.10.0 (6 pins). Picks up\nciris-crypto::key_grant's wrap_algorithm v2 API (KEY_GRANT_ALGORITHM_V2,\nwrap_dek_for_recipient_v2/unwrap_dek_v2/KeyGrantWrapV2; #58) — gated\nml-kem, already pulled via hybrid-kex, so no feature change.\n\nAdded:\n- Stream/epoch-addressed key_grant: KeyGrantPayload gains optional\n  stream_id/stream_epoch (content_sha256 now optional);\n  WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256 (v2);\n  KeyGrantScope::StreamEpoch. Projected onto V064 columns, both backends.\n- list_key_grants_for_stream_epoch(stream_id, epoch) on the service +\n  both backends + PyO3. Persist returns grants; LensCore applies its own\n  P4 catch-up cap (a LensCore knob, NOT a substrate constant — §10.5.3).\n  history_on_join likewise stays a producer/consumer concern.\n- Wheel FFI v2 helpers (wrap_dek_for_recipient_v2_b64 / unwrap_dek_v2_b64)\n  — the only place persist calls the v2 wrap. Real hybrid round-trip.\n- MAX_CHUNKS_PER_EPOCH = 2^24 nonce-safety substrate const; put_blob_chunk\n  refuses an append past it (force epoch roll), both backends.\n\nEnforced at ingest: a streaming epoch grant carrying wrap_algorithm v1 is\nREJECTED at put_contribution (the normative §10.5.3 reject-v1). The\nextractor enforces exactly-one addressing mode (content XOR stream/epoch,\nmirroring the V064 CHECK) + scope=stream_epoch. Content v1 grants\nunaffected (backward-compatible).\n\nPending ratification: the v2 payload wire string\nx25519_mlkem768_aes256_gcm_hkdf_sha256 is proposed pending\nCIRISRegistry#64 (CEG mandates v2 but doesn't yet pin the payload enum\nstring; propose-then-ratify, same as the nonce encoding #63).\n\nTests both backends (live PG + SQLite): stream/epoch round-trip +\n(stream,epoch) filter, ingest reject-v1, addressing-XOR + scope\nvalidators, MAX_CHUNKS_PER_EPOCH boundary, real v2 hybrid wrap/unwrap.\n1028 lib tests green on live PG (postgres server pyo3 sqlite cirisnode).\n\nShips as 4.3.0.\n\nCo-authored-by: Claude Opus 4.8 <noreply@anthropic.com>",
+          "timestamp": "2026-06-08T09:27:15-05:00",
+          "tree_id": "e4a0542fd77cb2b19d5349ac9902dd1683e9fd8c",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/0e2307febbda30fcd1709767e5ba4e2547fda714"
+        },
+        "date": 1780930223078,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 40444377,
+            "range": "± 631385",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 3205938,
+            "range": "± 146445",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 2525,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 5947,
+            "range": "± 174",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 12777,
+            "range": "± 198",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 45820,
+            "range": "± 723",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 36,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 187,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 524,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 599,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 2067,
+            "range": "± 58",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 9,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 81,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 249,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 1106,
+            "range": "± 22",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 15,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 54911,
+            "range": "± 2454",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 158764,
+            "range": "± 4390",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 566738,
+            "range": "± 8185",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 9280,
+            "range": "± 708",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 11712,
+            "range": "± 735",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 18036,
+            "range": "± 1353",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 37129,
+            "range": "± 2336",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 1545615,
+            "range": "± 3978",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 4535374,
+            "range": "± 66106",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 254830,
+            "range": "± 27076",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 880130,
+            "range": "± 20572",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 44490233,
+            "range": "± 262141",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 1387466,
+            "range": "± 30134",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 8049081,
+            "range": "± 161130",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 112149567,
+            "range": "± 1043333",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 3881085,
+            "range": "± 246452",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 20751587,
+            "range": "± 206041",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 74463,
+            "range": "± 4460",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 67723,
+            "range": "± 4199",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 6724,
+            "range": "± 137",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 43726,
+            "range": "± 705",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 408051,
+            "range": "± 2564",
             "unit": "ns/iter"
           }
         ]
