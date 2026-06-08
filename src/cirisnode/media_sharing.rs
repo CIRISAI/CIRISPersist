@@ -465,13 +465,34 @@ pub struct KeyGrantPayload {
     pub recipient_key_id: String,
 
     /// SHA-256 of the content body the granted key encrypts, hex-encoded.
-    pub content_sha256: String,
+    /// Present iff the grant is **content-addressed**; `None` for a
+    /// **stream/epoch-addressed** streaming grant (see [`Self::stream_id`]
+    /// / [`Self::stream_epoch`]). Exactly one addressing mode holds —
+    /// enforced by [`extract_key_grant_payload`] (mirrors the V064
+    /// `cirisnode.contributions` XOR CHECK; CEG 0.15 §10.5.3 RC1-1c).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_sha256: Option<String>,
+
+    /// `federation_streams` stream id the epoch-DEK is scoped to.
+    /// Present iff the grant is **stream/epoch-addressed** (the §10.5.3
+    /// streaming cascade); `None` for a content-addressed grant.
+    /// Projected onto `key_grant_stream_id` (V064) for indexed reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_id: Option<String>,
+
+    /// Key-rotation epoch within [`Self::stream_id`] the wrapped DEK
+    /// covers. Present iff stream/epoch-addressed. Projected onto
+    /// `key_grant_stream_epoch` (V064).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_epoch: Option<u64>,
 
     /// Base64-encoded wrapped DEK. The wrap algorithm is named below.
     pub wrapped_dek_base64: String,
 
-    /// Wrap algorithm identifier. v1 ships with a single variant —
-    /// see [`WrapAlgorithm`].
+    /// Wrap algorithm identifier. Content grants use v1; **stream/epoch
+    /// grants MUST use v2** (PQC hybrid — see [`WrapAlgorithm`] and CEG
+    /// §10.5.3: "a Consumer MUST reject a streaming epoch grant carrying
+    /// `wrap_algorithm: v1`", enforced at ingest).
     pub wrap_algorithm: WrapAlgorithm,
 
     /// Symmetric-ratchet version the key was wrapped under.
@@ -496,28 +517,47 @@ pub struct KeyGrantPayload {
     pub rotation_chain: Vec<String>,
 }
 
-/// Closed-set wrap algorithm vocabulary. v1 ships a single variant;
-/// adding a second is a coordinated registry rev.
+/// Closed-set wrap algorithm vocabulary.
 ///
-/// # CEG 0.3 §5.6.8.4 — HPKE RFC 9180 base mode, KEM X25519, AEAD AES-128-GCM
+/// # v1 — CEG 0.3 §5.6.8.4 — HPKE RFC 9180 base mode, KEM X25519, AEAD AES-128-GCM
 ///
 /// Locked by CEG 0.3 (Registry commit a7d95cd, closes CIRISRegistry#38).
-/// Wire string: `"hpke_rfc9180_base_x25519_aes_gcm"`. Adding a v2
-/// variant (e.g. ML-KEM hybrid) is a coordinated registry rev.
+/// Wire string: `"hpke_rfc9180_base_x25519_aes_gcm"`.
+///
+/// # v2 — CEG 0.15 §10.5.3 — X25519 + ML-KEM-768 hybrid (FIPS 203), PQC at rest
+///
+/// **MANDATORY for streaming epoch-DEK grants** (the §10.5.3 cascade);
+/// a content grant may stay v1, but a stream/epoch grant carrying v1 is
+/// rejected at ingest. Wraps with the `ciris-crypto::key_grant`
+/// `wrap_dek_for_recipient_v2` construction (`KEY_GRANT_ALGORITHM_V2 =
+/// "x25519-mlkem768-aes256-gcm-hkdf-sha256"`, v4.10.0). The payload wire
+/// string `"x25519_mlkem768_aes256_gcm_hkdf_sha256"` names that
+/// construction; **pending CIRISRegistry ratification (CIRISRegistry#64)**
+/// — the CEG mandates `wrap_algorithm: v2` but does not yet pin the
+/// payload enum string (unlike v1's §5.6.8.4-pinned string), so this is
+/// proposed via the same propose-then-ratify path as the STREAM-nonce
+/// epoch encoding (CIRISRegistry#63). If the registry ratifies a
+/// different string, only this serde rename changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WrapAlgorithm {
     /// HPKE RFC 9180 base mode, KEM X25519, AEAD AES-128-GCM. Locked
-    /// by CEG 0.3 §5.6.8.4.
+    /// by CEG 0.3 §5.6.8.4. The content-addressed-grant default.
     #[serde(rename = "hpke_rfc9180_base_x25519_aes_gcm")]
     HpkeRfc9180BaseX25519AesGcm,
+
+    /// X25519 + ML-KEM-768 hybrid DEK wrap (FIPS 203), AES-256-GCM +
+    /// HKDF-SHA-256. CEG 0.15 §10.5.3; mandatory for streaming epoch
+    /// grants. Maps to `ciris-crypto`'s `KEY_GRANT_ALGORITHM_V2`.
+    #[serde(rename = "x25519_mlkem768_aes256_gcm_hkdf_sha256")]
+    X25519MlKem768Aes256GcmHkdfSha256,
 }
 
 impl WrapAlgorithm {
-    /// Wire-shaped string — matches the CEG 0.3 §5.6.8.4 locked
-    /// vocabulary.
+    /// Wire-shaped string — matches the locked vocabulary.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::HpkeRfc9180BaseX25519AesGcm => "hpke_rfc9180_base_x25519_aes_gcm",
+            Self::X25519MlKem768Aes256GcmHkdfSha256 => "x25519_mlkem768_aes256_gcm_hkdf_sha256",
         }
     }
 
@@ -526,8 +566,17 @@ impl WrapAlgorithm {
     pub fn from_wire_str(s: &str) -> Option<Self> {
         match s {
             "hpke_rfc9180_base_x25519_aes_gcm" => Some(Self::HpkeRfc9180BaseX25519AesGcm),
+            "x25519_mlkem768_aes256_gcm_hkdf_sha256" => {
+                Some(Self::X25519MlKem768Aes256GcmHkdfSha256)
+            }
             _ => None,
         }
+    }
+
+    /// Whether this is the PQC-hybrid v2 wrap (the only algorithm a
+    /// streaming epoch-DEK grant may carry; CEG §10.5.3).
+    pub fn is_streaming_pqc_v2(self) -> bool {
+        matches!(self, Self::X25519MlKem768Aes256GcmHkdfSha256)
     }
 }
 
@@ -544,6 +593,10 @@ pub enum KeyGrantScope {
     SingleContent,
     GroupMember,
     SubscriptionTier,
+    /// One grant per `(stream_id, epoch)` — the streaming epoch-DEK
+    /// cascade (CEG 0.15 §10.5.3). `scope_id` is the `stream_id`. The
+    /// only scope a stream/epoch-addressed grant may carry.
+    StreamEpoch,
 }
 
 impl KeyGrantScope {
@@ -553,6 +606,7 @@ impl KeyGrantScope {
             Self::SingleContent => "single_content",
             Self::GroupMember => "group_member",
             Self::SubscriptionTier => "subscription_tier",
+            Self::StreamEpoch => "stream_epoch",
         }
     }
 }
@@ -638,11 +692,21 @@ pub fn extract_takedown_notice_payload(
 /// Decode + validate a `key_grant` payload from the JSONB column.
 /// Returns `Ok(None)` for non-grant rows.
 ///
-/// Validation:
-///   - `content_sha256` is hex-64 lowercase.
+/// Validation (common):
 ///   - `recipient_key_id` / `scope_id` non-empty.
 ///   - `wrapped_dek_base64` is valid base64.
 ///   - `key_validity_window.not_after > not_before`.
+///
+/// Addressing — **exactly one mode** (mirrors the V064
+/// `cirisnode.contributions` XOR CHECK; CEG 0.15 §10.5.3 RC1-1c):
+///   - **content-addressed**: `content_sha256` is `Some` hex-64
+///     lowercase; `stream_id` / `stream_epoch` are `None`.
+///   - **stream/epoch-addressed**: `stream_id` is `Some` non-empty AND
+///     `stream_epoch` is `Some`; `content_sha256` is `None`. The grant
+///     **MUST** carry `wrap_algorithm: v2` (PQC hybrid) — a v1 wrap on a
+///     streaming epoch grant is rejected here (CEG §10.5.3: "a Consumer
+///     MUST reject a streaming epoch grant carrying `wrap_algorithm:
+///     v1`"). `scope` must be [`KeyGrantScope::StreamEpoch`].
 pub fn extract_key_grant_payload(
     subject_kind: &str,
     payload: &serde_json::Value,
@@ -652,7 +716,6 @@ pub fn extract_key_grant_payload(
     }
     let typed: KeyGrantPayload = serde_json::from_value(payload.clone())
         .map_err(|e| Error::InvalidArgument(format!("key_grant payload shape: {e}")))?;
-    validate_hex_64("content_sha256", &typed.content_sha256)?;
     validate_non_empty("recipient_key_id", &typed.recipient_key_id)?;
     validate_non_empty("scope_id", &typed.scope_id)?;
     validate_base64("wrapped_dek_base64", &typed.wrapped_dek_base64)?;
@@ -660,6 +723,57 @@ pub fn extract_key_grant_payload(
         return Err(Error::InvalidArgument(
             "key_grant: key_validity_window.not_after must be after not_before".into(),
         ));
+    }
+
+    // Exactly-one addressing mode (XOR), matching the V064 constraint.
+    let content_addressed = typed.content_sha256.is_some();
+    let stream_addressed = typed.stream_id.is_some() || typed.stream_epoch.is_some();
+    match (content_addressed, stream_addressed) {
+        (true, true) => {
+            return Err(Error::InvalidArgument(
+                "key_grant: content_sha256 and stream_id/stream_epoch are mutually exclusive \
+                 (exactly one addressing mode; CEG §10.5.3 RC1-1c)"
+                    .into(),
+            ));
+        }
+        (false, false) => {
+            return Err(Error::InvalidArgument(
+                "key_grant: must be addressed — set content_sha256 (content) OR \
+                 stream_id + stream_epoch (streaming epoch)"
+                    .into(),
+            ));
+        }
+        (true, false) => {
+            // Content-addressed: hex-64 sha, no stream fields.
+            let sha = typed
+                .content_sha256
+                .as_deref()
+                .expect("content_addressed => Some");
+            validate_hex_64("content_sha256", sha)?;
+        }
+        (false, true) => {
+            // Stream/epoch-addressed: both fields present, v2 wrap required.
+            validate_non_empty("stream_id", typed.stream_id.as_deref().unwrap_or_default())?;
+            if typed.stream_epoch.is_none() {
+                return Err(Error::InvalidArgument(
+                    "key_grant: stream/epoch-addressed grant requires stream_epoch".into(),
+                ));
+            }
+            if !typed.wrap_algorithm.is_streaming_pqc_v2() {
+                return Err(Error::InvalidArgument(format!(
+                    "key_grant: streaming epoch grant MUST use wrap_algorithm v2 \
+                     (x25519_mlkem768_aes256_gcm_hkdf_sha256), got {} — CEG §10.5.3 \
+                     rejects wrap_algorithm: v1 on a streaming epoch grant",
+                    typed.wrap_algorithm.as_str()
+                )));
+            }
+            if typed.scope != KeyGrantScope::StreamEpoch {
+                return Err(Error::InvalidArgument(format!(
+                    "key_grant: stream/epoch-addressed grant requires scope=stream_epoch, got {}",
+                    typed.scope.as_str()
+                )));
+            }
+        }
     }
     Ok(Some(typed))
 }
@@ -696,7 +810,9 @@ mod tests {
     fn fixture_key_grant() -> KeyGrantPayload {
         KeyGrantPayload {
             recipient_key_id: "recipient-1".into(),
-            content_sha256: fixture_sha256(),
+            content_sha256: Some(fixture_sha256()),
+            stream_id: None,
+            stream_epoch: None,
             wrapped_dek_base64: base64::engine::general_purpose::STANDARD.encode([0u8; 48]),
             wrap_algorithm: WrapAlgorithm::HpkeRfc9180BaseX25519AesGcm,
             ratchet_version: 1,
@@ -987,6 +1103,121 @@ mod tests {
         let value = serde_json::to_value(&typed).unwrap();
         let err = extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value).unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    // ── Cut C3b: stream/epoch addressing (CEG §10.5.3) ──────────────
+
+    /// A valid stream/epoch-addressed grant: no content_sha256, stream
+    /// fields set, v2 wrap, StreamEpoch scope.
+    fn fixture_stream_grant() -> KeyGrantPayload {
+        KeyGrantPayload {
+            recipient_key_id: "recipient-1".into(),
+            content_sha256: None,
+            stream_id: Some("stream-abc".into()),
+            stream_epoch: Some(7),
+            wrapped_dek_base64: base64::engine::general_purpose::STANDARD.encode([0u8; 48]),
+            wrap_algorithm: WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256,
+            ratchet_version: 1,
+            key_validity_window: KeyValidityWindow {
+                not_before: DateTime::parse_from_rfc3339("2026-05-29T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                not_after: DateTime::parse_from_rfc3339("2027-05-29T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            },
+            scope: KeyGrantScope::StreamEpoch,
+            scope_id: "stream-abc".into(),
+            rotation_chain: vec![],
+        }
+    }
+
+    #[test]
+    fn extract_stream_epoch_grant_validates() {
+        let typed = fixture_stream_grant();
+        let value = serde_json::to_value(&typed).unwrap();
+        let parsed = extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed, typed);
+        assert!(parsed.wrap_algorithm.is_streaming_pqc_v2());
+    }
+
+    #[test]
+    fn stream_grant_with_v1_wrap_is_rejected() {
+        // The normative §10.5.3 check: a streaming epoch grant carrying
+        // wrap_algorithm v1 MUST be rejected.
+        let mut typed = fixture_stream_grant();
+        typed.wrap_algorithm = WrapAlgorithm::HpkeRfc9180BaseX25519AesGcm;
+        let value = serde_json::to_value(&typed).unwrap();
+        let err = extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value).unwrap_err();
+        match err {
+            Error::InvalidArgument(m) => assert!(
+                m.contains("wrap_algorithm v2") && m.contains("v1"),
+                "expected reject-v1 message, got: {m}"
+            ),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn grant_with_both_addressing_modes_is_rejected() {
+        let mut typed = fixture_stream_grant();
+        typed.content_sha256 = Some("a".repeat(64)); // now BOTH set
+        let value = serde_json::to_value(&typed).unwrap();
+        let err = extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(ref m) if m.contains("mutually exclusive")));
+    }
+
+    #[test]
+    fn grant_with_no_addressing_is_rejected() {
+        let mut typed = fixture_stream_grant();
+        typed.stream_id = None;
+        typed.stream_epoch = None; // neither content nor stream
+        let value = serde_json::to_value(&typed).unwrap();
+        let err = extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(ref m) if m.contains("must be addressed")));
+    }
+
+    #[test]
+    fn stream_grant_requires_stream_epoch_scope() {
+        let mut typed = fixture_stream_grant();
+        typed.scope = KeyGrantScope::GroupMember; // wrong scope
+        let value = serde_json::to_value(&typed).unwrap();
+        let err = extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(ref m) if m.contains("scope=stream_epoch")));
+    }
+
+    #[test]
+    fn content_grant_still_accepts_v1() {
+        // Backward compat: a content-addressed grant with v1 wrap is
+        // unaffected by the streaming reject-v1 rule.
+        let typed = fixture_key_grant();
+        assert_eq!(
+            typed.wrap_algorithm,
+            WrapAlgorithm::HpkeRfc9180BaseX25519AesGcm
+        );
+        let value = serde_json::to_value(&typed).unwrap();
+        assert!(extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn wrap_algorithm_v2_wire_round_trip() {
+        assert_eq!(
+            WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256.as_str(),
+            "x25519_mlkem768_aes256_gcm_hkdf_sha256"
+        );
+        assert_eq!(
+            WrapAlgorithm::from_wire_str("x25519_mlkem768_aes256_gcm_hkdf_sha256"),
+            Some(WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256)
+        );
+        // serde rename matches the wire string.
+        assert_eq!(
+            serde_json::to_string(&WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256).unwrap(),
+            r#""x25519_mlkem768_aes256_gcm_hkdf_sha256""#
+        );
     }
 
     #[test]

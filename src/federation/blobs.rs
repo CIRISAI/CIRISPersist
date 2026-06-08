@@ -187,6 +187,28 @@ pub struct ChunkManifest {
 /// version.
 pub const CHUNK_MANIFEST_VERSION: u32 = 1;
 
+/// v4.x (CIRISPersist#142, Cut C3b) — operational cap on chunks per
+/// `(stream_id, epoch)`: a **nonce-safety substrate constant** (CEG 0.15
+/// §10.5.2 / §10.5.3, FSD §5). The STREAM nonce's `counter_be` is a
+/// 32-bit per-epoch chunk index; the substrate forces an epoch roll well
+/// before `2^32 - 1` so a `(DEK, nonce)` pair is never reused
+/// (GCM-catastrophic). `2^24` (~16.7M chunks/epoch) leaves an 8-bit
+/// safety margin. `put_blob_chunk` rejects an append that would push a
+/// `(stream_id, epoch)` past this count — the producer MUST roll the
+/// epoch. Unlike the P4 catch-up cap (a LensCore policy knob, §10.5.3),
+/// this is genuinely the substrate's to enforce.
+pub const MAX_CHUNKS_PER_EPOCH: u64 = 1 << 24;
+
+/// Whether a `(stream_id, epoch)` that already holds
+/// `existing_chunk_count` chunks has reached [`MAX_CHUNKS_PER_EPOCH`] —
+/// i.e. the next `put_blob_chunk` append must be REFUSED (the producer
+/// rolls the epoch). The single boundary both backends call, so the
+/// nonce-counter-exhaustion rule is defined once and unit-testable
+/// without materializing 2^24 rows.
+pub fn epoch_chunk_cap_reached(existing_chunk_count: u64) -> bool {
+    existing_chunk_count >= MAX_CHUNKS_PER_EPOCH
+}
+
 impl ChunkManifest {
     /// Serialize to **JCS-canonical JSON bytes** (CEG §0.9).
     ///
@@ -1768,6 +1790,18 @@ pub(crate) fn prepare_chunk_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn epoch_chunk_cap_boundary() {
+        // Below the cap → append allowed.
+        assert!(!epoch_chunk_cap_reached(0));
+        assert!(!epoch_chunk_cap_reached(MAX_CHUNKS_PER_EPOCH - 1));
+        // At/over the cap → next append refused (roll the epoch).
+        assert!(epoch_chunk_cap_reached(MAX_CHUNKS_PER_EPOCH));
+        assert!(epoch_chunk_cap_reached(MAX_CHUNKS_PER_EPOCH + 1));
+        // 2^24, the 32-bit-counter safety margin.
+        assert_eq!(MAX_CHUNKS_PER_EPOCH, 16_777_216);
+    }
 
     #[test]
     fn holds_bytes_prefix_shape() {

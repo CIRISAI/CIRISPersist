@@ -267,11 +267,27 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         let media_content_sha256: Option<String> = takedown
             .as_ref()
             .map(|p| p.content_sha256.clone())
-            .or_else(|| key_grant.as_ref().map(|p| p.content_sha256.clone()));
+            .or_else(|| key_grant.as_ref().and_then(|p| p.content_sha256.clone()));
         let takedown_legal_basis: Option<String> =
             takedown.as_ref().map(|p| p.legal_basis.as_str().to_owned());
         let key_grant_recipient_key_id: Option<String> =
             key_grant.as_ref().map(|p| p.recipient_key_id.clone());
+        // v4.x (CIRISPersist#142 Cut C3b) — stream/epoch addressing
+        // projection (V064 columns). Populated iff the grant is
+        // stream/epoch-addressed; the extractor guarantees the XOR with
+        // media_content_sha256.
+        let key_grant_stream_id: Option<String> =
+            key_grant.as_ref().and_then(|p| p.stream_id.clone());
+        let key_grant_stream_epoch: Option<i64> =
+            match key_grant.as_ref().and_then(|p| p.stream_epoch) {
+                None => None,
+                Some(e) => Some(i64::try_from(e).map_err(|_| {
+                    Error::InvalidArgument(
+                        "key_grant: stream_epoch exceeds i64 — key_grant_stream_epoch is INTEGER"
+                            .into(),
+                    )
+                })?),
+            };
 
         let id_str = id.to_string();
         let ct_str = contribution_type_str(env.contribution_type).to_owned();
@@ -299,9 +315,10 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                         author_id, payload, witness_set, submitted_at, \
                         signature, signing_key_id, signature_verified, persist_row_hash, \
                         announcement_priority, announcement_authority_class, \
-                        media_content_sha256, key_grant_recipient_key_id, takedown_legal_basis\
+                        media_content_sha256, key_grant_recipient_key_id, takedown_legal_basis, \
+                        key_grant_stream_id, key_grant_stream_epoch\
                      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?13, ?14, \
-                               ?15, ?16, ?17)",
+                               ?15, ?16, ?17, ?18, ?19)",
                     params![
                         id_str,
                         ct_str,
@@ -320,6 +337,8 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                         media_content_sha256,
                         key_grant_recipient_key_id,
                         takedown_legal_basis,
+                        key_grant_stream_id,
+                        key_grant_stream_epoch,
                     ],
                 )
                 .map_err(|e| map_sqlite_error(e, "put_contribution"))?;
@@ -1527,6 +1546,39 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         rows.into_iter().map(materialize_contribution).collect()
     }
 
+    async fn list_key_grants_for_stream_epoch(
+        &self,
+        stream_id: &str,
+        epoch: u64,
+    ) -> Result<Vec<ContributionEnvelope>, Error> {
+        let stream = stream_id.to_owned();
+        // u64 epoch → bound i64; key_grant_stream_epoch is INTEGER.
+        let epoch_i64 = i64::try_from(epoch).map_err(|_| {
+            Error::InvalidArgument("list_key_grants_for_stream_epoch: epoch exceeds i64".into())
+        })?;
+        let conn = self.conn.clone();
+        let rows = (move || -> Result<Vec<ContributionRow>, Error> {
+            let guard = conn.lock();
+            let mut stmt = guard
+                .prepare(
+                    "SELECT contribution_id, contribution_type, domain, language, subject_kind, \
+                            author_id, payload, witness_set, submitted_at, signature \
+                     FROM cirisnode_contributions \
+                     WHERE subject_kind = 'key_grant' \
+                       AND key_grant_stream_id = ?1 \
+                       AND key_grant_stream_epoch = ?2 \
+                     ORDER BY submitted_at DESC, contribution_id DESC",
+                )
+                .map_err(|e| map_sqlite_error(e, "list_key_grants_for_stream_epoch prepare"))?;
+            let rows = stmt
+                .query_map(params![stream, epoch_i64], read_contribution_row)
+                .map_err(|e| map_sqlite_error(e, "list_key_grants_for_stream_epoch query"))?;
+            let out: Result<Vec<_>, _> = rows.collect();
+            out.map_err(|e| map_sqlite_error(e, "list_key_grants_for_stream_epoch collect"))
+        })()?;
+        rows.into_iter().map(materialize_contribution).collect()
+    }
+
     async fn retire_key_grants(
         &self,
         actor_key_id: &str,
@@ -1709,8 +1761,13 @@ async fn emit_key_grant_supersession_sqlite(
     let supersession_payload = super::media_sharing::KeyGrantPayload {
         recipient_key_id: prior.recipient_key_id.clone(),
         content_sha256: prior.content_sha256.clone(),
+        // Carry the prior grant's addressing + wrap algorithm so a
+        // stream/epoch-grant supersession stays stream-addressed + v2
+        // (the extractor rejects a v1 streaming grant).
+        stream_id: prior.stream_id.clone(),
+        stream_epoch: prior.stream_epoch,
         wrapped_dek_base64: revocation_dek,
-        wrap_algorithm: super::media_sharing::WrapAlgorithm::HpkeRfc9180BaseX25519AesGcm,
+        wrap_algorithm: prior.wrap_algorithm,
         ratchet_version: prior.ratchet_version,
         key_validity_window: super::media_sharing::KeyValidityWindow {
             not_before: now,
@@ -2808,7 +2865,9 @@ mod tests {
         let author = pubkey_b64(author_key);
         let payload = crate::cirisnode::KeyGrantPayload {
             recipient_key_id: recipient_key_id.to_owned(),
-            content_sha256: sha_hex.to_owned(),
+            content_sha256: Some(sha_hex.to_owned()),
+            stream_id: None,
+            stream_epoch: None,
             wrapped_dek_base64: {
                 use base64::Engine as _;
                 base64::engine::general_purpose::STANDARD.encode([0u8; 48])
@@ -2987,6 +3046,132 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    // ── Cut C3b: stream/epoch-addressed grant cascade (CEG §10.5.3) ──
+
+    fn build_stream_key_grant_sqlite(
+        author_key: &ed25519_dalek::SigningKey,
+        stream_id: &str,
+        epoch: u64,
+        recipient_key_id: &str,
+    ) -> ContributionEnvelope {
+        let author = pubkey_b64(author_key);
+        let payload = crate::cirisnode::KeyGrantPayload {
+            recipient_key_id: recipient_key_id.to_owned(),
+            content_sha256: None,
+            stream_id: Some(stream_id.to_owned()),
+            stream_epoch: Some(epoch),
+            wrapped_dek_base64: {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD.encode([0u8; 48])
+            },
+            wrap_algorithm: crate::cirisnode::WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256,
+            ratchet_version: 1,
+            key_validity_window: crate::cirisnode::KeyValidityWindow {
+                not_before: Utc::now(),
+                not_after: Utc::now() + chrono::Duration::days(30),
+            },
+            scope: crate::cirisnode::KeyGrantScope::StreamEpoch,
+            scope_id: stream_id.to_owned(),
+            rotation_chain: vec![],
+        };
+        let mut env = ContributionEnvelope {
+            contribution_id: Uuid::new_v4().to_string(),
+            contribution_type: ContributionType::Proposal,
+            author_id: author,
+            subject: Cell {
+                domain: format!("stream-{}", Uuid::new_v4()),
+                language: "en".into(),
+                subject: Some(crate::cirisnode::KEY_GRANT_SUBJECT_KIND.into()),
+            },
+            payload: serde_json::to_value(&payload).unwrap(),
+            witness_set: None,
+            signature: HybridSignature {
+                ed25519: String::new(),
+                ml_dsa_65: None,
+                signed_at: Utc::now(),
+            },
+            submitted_at: Utc::now(),
+        };
+        env.signature = sign_envelope(&env, author_key);
+        env
+    }
+
+    /// A v2 stream/epoch grant is admitted, projected onto the V064
+    /// columns, and served by list_key_grants_for_stream_epoch filtered
+    /// on (stream_id, epoch) — and only that pair.
+    #[tokio::test]
+    async fn sqlite_stream_epoch_grant_round_trip_and_filter() {
+        let (_b, cn) = fresh_backend().await;
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xC3; 32]);
+        let stream = format!("stream-{}", Uuid::new_v4());
+        let other_stream = format!("stream-{}", Uuid::new_v4());
+        let recip = format!("rec-{}", Uuid::new_v4());
+
+        // Two epochs of the target stream + one of another stream.
+        cn.put_contribution(build_stream_key_grant_sqlite(
+            &author_key,
+            &stream,
+            1,
+            &recip,
+        ))
+        .await
+        .unwrap();
+        cn.put_contribution(build_stream_key_grant_sqlite(
+            &author_key,
+            &stream,
+            2,
+            &recip,
+        ))
+        .await
+        .unwrap();
+        cn.put_contribution(build_stream_key_grant_sqlite(
+            &author_key,
+            &other_stream,
+            1,
+            &recip,
+        ))
+        .await
+        .unwrap();
+
+        // (stream, epoch 1) returns exactly the one grant.
+        let rows = cn
+            .list_key_grants_for_stream_epoch(&stream, 1)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "exactly the (stream, epoch=1) grant");
+        // A different epoch of the same stream is a distinct authorization.
+        let rows2 = cn
+            .list_key_grants_for_stream_epoch(&stream, 2)
+            .await
+            .unwrap();
+        assert_eq!(rows2.len(), 1);
+        // An epoch with no grant is empty (LensCore sees this and pulls).
+        let none = cn
+            .list_key_grants_for_stream_epoch(&stream, 99)
+            .await
+            .unwrap();
+        assert!(none.is_empty());
+    }
+
+    /// A streaming epoch grant carrying wrap_algorithm v1 is rejected at
+    /// ingest (the normative §10.5.3 consumer-MUST-reject-v1, enforced
+    /// substrate-side).
+    #[tokio::test]
+    async fn sqlite_stream_grant_v1_wrap_rejected_at_ingest() {
+        let (_b, cn) = fresh_backend().await;
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xC4; 32]);
+        let mut env = build_stream_key_grant_sqlite(&author_key, "stream-v1-reject", 1, "rec-1");
+        // Downgrade the wrap to v1 and re-sign.
+        let mut payload: crate::cirisnode::KeyGrantPayload =
+            serde_json::from_value(env.payload.clone()).unwrap();
+        payload.wrap_algorithm = crate::cirisnode::WrapAlgorithm::HpkeRfc9180BaseX25519AesGcm;
+        env.payload = serde_json::to_value(&payload).unwrap();
+        env.signature = sign_envelope(&env, &author_key);
+
+        let err = cn.put_contribution(env).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "got: {err:?}");
     }
 
     /// CEG 0.3 §5.6.8.4 — option (b) supersession: retire_key_grants

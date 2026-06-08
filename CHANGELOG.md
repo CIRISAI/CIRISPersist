@@ -5,6 +5,30 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [4.3.0] — 2026-06-07
+
+**Streaming substrate Cut C3b — epoch-DEK `key_grant` cascade + `wrap_algorithm: v2` (PQC) + CIRISVerify 4.10.0 re-pin (CIRISPersist#142, CEG 0.15 §10.5.3).**
+
+The streaming epoch-key cascade. A per-`(stream_id, epoch)` DEK is wrapped to each roster recipient as a stream/epoch-addressed `key_grant` Contribution. **Persist's role is validate / record / list, NOT wrap** (the producer/sender wraps and submits; the storage path stores the wrapped DEK opaquely; MISSION §1.7). Unblocked by CIRISVerify#58 closing.
+
+### Dependency
+- **CIRISVerify `v4.8.1` → `v4.10.0`** across all deps + `[target.*]` tables. Picks up `ciris-crypto::key_grant`'s **`wrap_algorithm: v2`** API (`KEY_GRANT_ALGORITHM_V2`, `wrap_dek_for_recipient_v2`/`unwrap_dek_v2`/`KeyGrantWrapV2`; #58) — gated `ml-kem`, which persist already pulls via `hybrid-kex`, so no feature change. (4.9.0 moved `random` into default features — additive.) 1028 lib tests green on live PG against 4.10.0.
+
+### Added — the cascade
+- **Stream/epoch-addressed `key_grant`** — `KeyGrantPayload` gains optional `stream_id` / `stream_epoch` (and `content_sha256` becomes optional); `WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256` (v2); `KeyGrantScope::StreamEpoch`. Projected onto the V064 (`Cut C3a`) `key_grant_stream_id` / `key_grant_stream_epoch` columns, both backends.
+- **`list_key_grants_for_stream_epoch(stream_id, epoch)`** on the NodeCore service + both backends + PyO3 (`cirisnode_list_key_grants_for_stream_epoch_json`) — the catch-up / delivery read the cascade serves. Persist returns the grants; the consumer (LensCore) applies its own **P4 catch-up depth cap** (a LensCore knob, NOT a substrate constant — CEG §10.5.3). `history_on_join` (a producer envelope field) is likewise not a persist concern.
+- **Wheel FFI v2 helpers** — `wrap_dek_for_recipient_v2_b64` / `unwrap_dek_v2_b64` (the only place persist *calls* the v2 wrap; for Python users of the crate). Real-hybrid round-trip tested.
+- **`MAX_CHUNKS_PER_EPOCH = 2²⁴`** — a nonce-safety **substrate constant** (the STREAM nonce's 32-bit `counter_be` must never wrap). `put_blob_chunk` refuses an append that would push a `(stream_id, epoch)` past it (force epoch roll), both backends.
+
+### Enforced at ingest — the normative reject-v1
+- A **streaming epoch grant carrying `wrap_algorithm: v1` is rejected at `put_contribution`** (CEG §10.5.3: "a Consumer MUST reject a streaming epoch grant carrying `wrap_algorithm: v1`"). The extractor enforces **exactly-one addressing mode** (content XOR stream/epoch, mirroring the V064 CHECK) and `scope=stream_epoch` for streaming grants. Content-addressed v1 grants are unaffected (backward-compatible).
+
+### Pending ratification
+- The **v2 payload wire string** `x25519_mlkem768_aes256_gcm_hkdf_sha256` is **proposed pending CIRISRegistry#64**. CEG §10.5.3 mandates `wrap_algorithm: v2` but does not yet pin the payload enum string (unlike v1's §5.6.8.4-pinned string); shipped via the propose-then-ratify path (same as the STREAM-nonce epoch encoding, #63). Only the serde rename changes if the registry pins a different string.
+
+### Tests
+Both backends (live PG + in-memory SQLite): stream/epoch grant round-trip + `(stream_id, epoch)` filtering, ingest reject-v1, addressing-XOR + scope validators, the `MAX_CHUNKS_PER_EPOCH` boundary, and a real v2 hybrid wrap/unwrap round-trip through the wheel FFI.
+
 ## [4.2.0] — 2026-06-07
 
 **Streaming substrate Cut C4 — signed delivery receipts (CIRISPersist#142, CEG 0.15 §10.5.4).**
