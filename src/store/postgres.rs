@@ -3850,7 +3850,32 @@ impl crate::federation::BlobStorage for PostgresBackend {
             crate::federation::BlobError::Backend(format!("put_blob_chunk blob insert: {e}"))
         })?;
 
-        // 2. The stream-index row. The (stream_id, seq) PK enforces
+        // 2. Nonce-safety cap (CEG §10.5.2/§10.5.3, Cut C3b): the STREAM
+        //    nonce's per-epoch counter_be must never wrap. A given
+        //    (stream_id, epoch) holds at most MAX_CHUNKS_PER_EPOCH chunks;
+        //    past that the producer MUST roll the epoch. Checked in-tx so
+        //    a concurrent append can't slip past the cap.
+        let epoch_chunk_count: i64 = tx
+            .query_one(
+                "SELECT COUNT(*) FROM cirislens.federation_stream_chunks \
+                  WHERE stream_id = $1 AND epoch = $2",
+                &[&stream_id, &epoch_i64],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("put_blob_chunk epoch count: {e}"))
+            })?
+            .get(0);
+        if crate::federation::blobs::epoch_chunk_cap_reached(epoch_chunk_count as u64) {
+            return Err(crate::federation::BlobError::InvalidArgument(format!(
+                "put_blob_chunk: (stream_id={stream_id}, epoch={epoch}) is at \
+                 MAX_CHUNKS_PER_EPOCH ({}) — roll the epoch (STREAM-nonce counter \
+                 exhaustion, CEG §10.5.3)",
+                crate::federation::blobs::MAX_CHUNKS_PER_EPOCH
+            )));
+        }
+
+        // 3. The stream-index row. The (stream_id, seq) PK enforces
         //    monotonicity — a re-used seq is a PK conflict, mapped to
         //    InvalidArgument (NOT idempotent: the append-only rule).
         let inserted = tx

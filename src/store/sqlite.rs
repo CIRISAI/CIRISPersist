@@ -3575,7 +3575,32 @@ impl crate::federation::BlobStorage for SqliteBackend {
                     now_iso,
                 ],
             )?;
-            // 2. The stream-index row. (stream_id, seq) PK = monotonicity.
+            // 2. Nonce-safety cap (CEG §10.5.2/§10.5.3, Cut C3b): the
+            //    STREAM nonce's per-epoch counter_be must never wrap. A
+            //    given (stream_id, epoch) holds at most
+            //    MAX_CHUNKS_PER_EPOCH chunks; past that the producer MUST
+            //    roll the epoch. Checked in-tx (count + insert atomic) so
+            //    a concurrent append can't slip past the cap.
+            let epoch_chunk_count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM federation_stream_chunks \
+                  WHERE stream_id = ?1 AND epoch = ?2",
+                rusqlite::params![stream_id_owned, epoch_i64],
+                |r| r.get(0),
+            )?;
+            if crate::federation::blobs::epoch_chunk_cap_reached(epoch_chunk_count as u64) {
+                // Surface as a rusqlite error so the closure's error arm
+                // maps it; the caller sees InvalidArgument.
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+                    Some(format!(
+                        "put_blob_chunk: (stream_id={stream_id_owned}, epoch={epoch}) \
+                         is at MAX_CHUNKS_PER_EPOCH ({}) — roll the epoch \
+                         (STREAM-nonce counter exhaustion, CEG §10.5.3)",
+                        crate::federation::blobs::MAX_CHUNKS_PER_EPOCH
+                    )),
+                ));
+            }
+            // 3. The stream-index row. (stream_id, seq) PK = monotonicity.
             let inserted = tx.execute(
                 "INSERT INTO federation_stream_chunks (\
                     stream_id, seq, chunk_sha, epoch, size_bytes, created_at\

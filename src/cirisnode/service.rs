@@ -286,6 +286,20 @@ pub trait NodeCoreService: Send + Sync {
         recipient_key_id: &str,
     ) -> impl Future<Output = Result<Vec<ContributionEnvelope>, Error>> + Send;
 
+    /// v4.x (CIRISPersist#142 Cut C3b, CEG §10.5.3) — list every
+    /// **stream/epoch-addressed** `key_grant` Contribution for
+    /// `(stream_id, epoch)`, newest-first. This is the catch-up /
+    /// delivery read the epoch-DEK cascade serves; persist returns the
+    /// grants and the consumer (LensCore) applies its own P4 catch-up
+    /// depth cap (the cap is a LensCore knob, NOT a substrate constant —
+    /// §10.5.3). Indexed via the V064 partial index
+    /// `contributions_key_grant_stream_epoch`.
+    fn list_key_grants_for_stream_epoch(
+        &self,
+        stream_id: &str,
+        epoch: u64,
+    ) -> impl Future<Output = Result<Vec<ContributionEnvelope>, Error>> + Send;
+
     /// v3.6.0 (CIRISPersist#134) — emit a supersession `key_grant`
     /// Contribution against every prior `key_grant` Contribution
     /// issued by `actor_key_id`. Used when an actor's keying material

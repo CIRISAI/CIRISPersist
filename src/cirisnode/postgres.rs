@@ -151,11 +151,27 @@ impl NodeCoreService for PostgresBackend {
         let media_content_sha256: Option<String> = takedown
             .as_ref()
             .map(|p| p.content_sha256.clone())
-            .or_else(|| key_grant.as_ref().map(|p| p.content_sha256.clone()));
+            .or_else(|| key_grant.as_ref().and_then(|p| p.content_sha256.clone()));
         let takedown_legal_basis: Option<&'static str> =
             takedown.as_ref().map(|p| p.legal_basis.as_str());
         let key_grant_recipient_key_id: Option<String> =
             key_grant.as_ref().map(|p| p.recipient_key_id.clone());
+        // v4.x (CIRISPersist#142 Cut C3b) — stream/epoch addressing
+        // projection (V064 columns). XOR with media_content_sha256 is
+        // guaranteed by extract_key_grant_payload. stream_epoch is u64
+        // in Rust → bound i64 (BIGINT); tokio_postgres has no ToSql u64.
+        let key_grant_stream_id: Option<String> =
+            key_grant.as_ref().and_then(|p| p.stream_id.clone());
+        let key_grant_stream_epoch: Option<i64> =
+            match key_grant.as_ref().and_then(|p| p.stream_epoch) {
+                None => None,
+                Some(e) => Some(i64::try_from(e).map_err(|_| {
+                    Error::InvalidArgument(
+                        "key_grant: stream_epoch exceeds i64 — key_grant_stream_epoch is BIGINT"
+                            .into(),
+                    )
+                })?),
+            };
 
         let client = self
             .pool()
@@ -173,9 +189,10 @@ impl NodeCoreService for PostgresBackend {
                     author_id, payload, witness_set, submitted_at, \
                     signature, signing_key_id, signature_verified, persist_row_hash, \
                     announcement_priority, announcement_authority_class, \
-                    media_content_sha256, key_grant_recipient_key_id, takedown_legal_basis\
+                    media_content_sha256, key_grant_recipient_key_id, takedown_legal_basis, \
+                    key_grant_stream_id, key_grant_stream_epoch\
                  ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, TRUE, $12, $13, $14, \
-                           $15, $16, $17)",
+                           $15, $16, $17, $18, $19)",
                 &[
                     &id,
                     &contribution_type_str(env.contribution_type),
@@ -194,6 +211,8 @@ impl NodeCoreService for PostgresBackend {
                     &media_content_sha256,
                     &key_grant_recipient_key_id,
                     &takedown_legal_basis,
+                    &key_grant_stream_id,
+                    &key_grant_stream_epoch,
                 ],
             )
             .await
@@ -1176,6 +1195,36 @@ impl NodeCoreService for PostgresBackend {
         rows.into_iter().map(row_to_contribution).collect()
     }
 
+    async fn list_key_grants_for_stream_epoch(
+        &self,
+        stream_id: &str,
+        epoch: u64,
+    ) -> Result<Vec<ContributionEnvelope>, Error> {
+        // u64 epoch → bound i64 (BIGINT); tokio_postgres has no ToSql u64.
+        let epoch_i64 = i64::try_from(epoch).map_err(|_| {
+            Error::InvalidArgument("list_key_grants_for_stream_epoch: epoch exceeds i64".into())
+        })?;
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let rows = client
+            .query(
+                "SELECT contribution_id::text, contribution_type, domain, language, subject_kind, \
+                        author_id, payload, witness_set, submitted_at, signature \
+                 FROM cirisnode.contributions \
+                 WHERE subject_kind = 'key_grant' \
+                   AND key_grant_stream_id = $1 \
+                   AND key_grant_stream_epoch = $2 \
+                 ORDER BY submitted_at DESC, contribution_id DESC",
+                &[&stream_id, &epoch_i64],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "list_key_grants_for_stream_epoch"))?;
+        rows.into_iter().map(row_to_contribution).collect()
+    }
+
     async fn retire_key_grants(
         &self,
         actor_key_id: &str,
@@ -1317,8 +1366,12 @@ async fn emit_key_grant_supersession(
     let supersession_payload = super::media_sharing::KeyGrantPayload {
         recipient_key_id: prior.recipient_key_id.clone(),
         content_sha256: prior.content_sha256.clone(),
+        // Carry the prior grant's addressing + wrap algorithm so a
+        // stream/epoch-grant supersession stays stream-addressed + v2.
+        stream_id: prior.stream_id.clone(),
+        stream_epoch: prior.stream_epoch,
         wrapped_dek_base64: revocation_dek,
-        wrap_algorithm: super::media_sharing::WrapAlgorithm::HpkeRfc9180BaseX25519AesGcm,
+        wrap_algorithm: prior.wrap_algorithm,
         ratchet_version: prior.ratchet_version,
         key_validity_window: super::media_sharing::KeyValidityWindow {
             // The supersession grant's validity window is bounded by
@@ -2454,7 +2507,9 @@ mod tests {
         let author = pubkey_b64(author_key);
         let payload = crate::cirisnode::KeyGrantPayload {
             recipient_key_id: recipient_key_id.to_owned(),
-            content_sha256: sha_hex.to_owned(),
+            content_sha256: Some(sha_hex.to_owned()),
+            stream_id: None,
+            stream_epoch: None,
             wrapped_dek_base64: {
                 use base64::Engine as _;
                 base64::engine::general_purpose::STANDARD.encode([0u8; 48])
@@ -2489,6 +2544,120 @@ mod tests {
         };
         env.signature = sign_envelope(&env, author_key);
         env
+    }
+
+    // ── Cut C3b: stream/epoch-addressed grant cascade (CEG §10.5.3) ──
+
+    fn build_stream_key_grant(
+        author_key: &ed25519_dalek::SigningKey,
+        stream_id: &str,
+        epoch: u64,
+        recipient_key_id: &str,
+    ) -> ContributionEnvelope {
+        let author = pubkey_b64(author_key);
+        let payload = crate::cirisnode::KeyGrantPayload {
+            recipient_key_id: recipient_key_id.to_owned(),
+            content_sha256: None,
+            stream_id: Some(stream_id.to_owned()),
+            stream_epoch: Some(epoch),
+            wrapped_dek_base64: {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD.encode([0u8; 48])
+            },
+            wrap_algorithm: crate::cirisnode::WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256,
+            ratchet_version: 1,
+            key_validity_window: crate::cirisnode::KeyValidityWindow {
+                not_before: Utc::now(),
+                not_after: Utc::now() + chrono::Duration::days(30),
+            },
+            scope: crate::cirisnode::KeyGrantScope::StreamEpoch,
+            scope_id: stream_id.to_owned(),
+            rotation_chain: vec![],
+        };
+        let mut env = ContributionEnvelope {
+            contribution_id: Uuid::new_v4().to_string(),
+            contribution_type: ContributionType::Proposal,
+            author_id: author,
+            subject: Cell {
+                domain: format!("stream-{}", Uuid::new_v4()),
+                language: "en".into(),
+                subject: Some(crate::cirisnode::KEY_GRANT_SUBJECT_KIND.into()),
+            },
+            payload: serde_json::to_value(&payload).unwrap(),
+            witness_set: None,
+            signature: HybridSignature {
+                ed25519: String::new(),
+                ml_dsa_65: None,
+                signed_at: Utc::now(),
+            },
+            submitted_at: Utc::now(),
+        };
+        env.signature = sign_envelope(&env, author_key);
+        env
+    }
+
+    /// PG parity for the stream/epoch grant cascade: v2 grant admitted,
+    /// projected onto the V064 BIGINT/text columns, served by
+    /// list_key_grants_for_stream_epoch filtered on (stream_id, epoch);
+    /// and a v1-wrapped streaming grant is rejected at ingest.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_stream_epoch_grant_round_trip_and_v1_reject() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xC5; 32]);
+        let stream = format!("stream-{}", Uuid::new_v4());
+        let other_stream = format!("stream-{}", Uuid::new_v4());
+        let recip = format!("rec-{}", Uuid::new_v4());
+
+        backend
+            .put_contribution(build_stream_key_grant(&author_key, &stream, 1, &recip))
+            .await
+            .unwrap();
+        backend
+            .put_contribution(build_stream_key_grant(&author_key, &stream, 2, &recip))
+            .await
+            .unwrap();
+        backend
+            .put_contribution(build_stream_key_grant(
+                &author_key,
+                &other_stream,
+                1,
+                &recip,
+            ))
+            .await
+            .unwrap();
+
+        let rows = backend
+            .list_key_grants_for_stream_epoch(&stream, 1)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "exactly the (stream, epoch=1) grant");
+        let rows2 = backend
+            .list_key_grants_for_stream_epoch(&stream, 2)
+            .await
+            .unwrap();
+        assert_eq!(rows2.len(), 1);
+        let none = backend
+            .list_key_grants_for_stream_epoch(&stream, 99)
+            .await
+            .unwrap();
+        assert!(none.is_empty());
+
+        // v1 wrap on a streaming grant is rejected at ingest.
+        let mut env = build_stream_key_grant(&author_key, &stream, 3, &recip);
+        let mut payload: crate::cirisnode::KeyGrantPayload =
+            serde_json::from_value(env.payload.clone()).unwrap();
+        payload.wrap_algorithm = crate::cirisnode::WrapAlgorithm::HpkeRfc9180BaseX25519AesGcm;
+        env.payload = serde_json::to_value(&payload).unwrap();
+        env.signature = sign_envelope(&env, &author_key);
+        let err = backend.put_contribution(env).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "got: {err:?}");
     }
 
     #[tokio::test]

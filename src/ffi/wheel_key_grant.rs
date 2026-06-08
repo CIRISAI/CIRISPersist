@@ -21,7 +21,10 @@
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
-use ciris_crypto::key_grant::{unwrap_dek, wrap_dek_for_recipient, KeyGrantWrap};
+use ciris_crypto::key_grant::{
+    unwrap_dek, unwrap_dek_v2, wrap_dek_for_recipient, wrap_dek_for_recipient_v2, KeyGrantWrap,
+    KeyGrantWrapV2, KEY_GRANT_ALGORITHM_V2,
+};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
@@ -108,6 +111,123 @@ pub fn unwrap_dek_json(recipient_x25519_priv_b64: &str, wrap_json: &str) -> PyRe
     Ok(B64.encode(dek))
 }
 
+/// v4.x (CIRISPersist#142 Cut C3b, CEG §10.5.3) — wrap a 32-byte DEK for
+/// a recipient under **`wrap_algorithm: v2`** (X25519 + ML-KEM-768 hybrid,
+/// FIPS 203 — the PQC-at-rest wrap mandated for streaming epoch DEKs).
+/// Delegates to `ciris-crypto`'s `wrap_dek_for_recipient_v2` (v4.10.0).
+/// Returns a JSON string:
+///
+/// ```json
+/// {
+///   "algorithm": "x25519-mlkem768-aes256-gcm-hkdf-sha256",
+///   "ephemeral_x25519_public_key_b64": "...",
+///   "ml_kem_ciphertext_b64": "...",
+///   "nonce_b64": "...",
+///   "ciphertext_b64": "..."
+/// }
+/// ```
+///
+/// `recipient_ml_kem_pub_b64` is the recipient's ML-KEM-768 public key
+/// (1184 bytes); a wrong length surfaces as a runtime error from the
+/// crypto layer. Other inputs are base64 (persist's `_b64` idiom).
+pub fn wrap_dek_for_recipient_v2_json(
+    recipient_x25519_pub_b64: &str,
+    recipient_ml_kem_pub_b64: &str,
+    dek_b64: &str,
+) -> PyResult<String> {
+    let recipient_x_pub =
+        decode_fixed_b64::<X25519_KEY_LEN>(recipient_x25519_pub_b64, "recipient_x25519_pub_b64")?;
+    let recipient_ml_kem_pub = B64
+        .decode(recipient_ml_kem_pub_b64)
+        .map_err(|e| PyValueError::new_err(format!("recipient_ml_kem_pub_b64 decode: {e}")))?;
+    let dek = decode_fixed_b64::<DEK_LEN>(dek_b64, "dek_b64")?;
+
+    let wrap = wrap_dek_for_recipient_v2(&recipient_x_pub, &recipient_ml_kem_pub, &dek)
+        .map_err(|e| PyRuntimeError::new_err(format!("key_grant v2 wrap: {e}")))?;
+
+    let envelope = serde_json::json!({
+        "algorithm": KEY_GRANT_ALGORITHM_V2,
+        "ephemeral_x25519_public_key_b64": B64.encode(wrap.ephemeral_x25519_public_key),
+        "ml_kem_ciphertext_b64": B64.encode(&wrap.ml_kem_ciphertext),
+        "nonce_b64": B64.encode(wrap.nonce),
+        "ciphertext_b64": B64.encode(&wrap.ciphertext),
+    });
+    serde_json::to_string(&envelope)
+        .map_err(|e| PyRuntimeError::new_err(format!("key_grant v2 envelope encode: {e}")))
+}
+
+/// v4.x (CIRISPersist#142 Cut C3b) — unwrap a `KeyGrantWrapV2`-shaped
+/// JSON envelope (the shape [`wrap_dek_for_recipient_v2_json`] produces)
+/// using the recipient's X25519 private key + ML-KEM-768 private/public
+/// keys. Returns the 32-byte DEK as base64.
+pub fn unwrap_dek_v2_json(
+    recipient_x25519_priv_b64: &str,
+    recipient_ml_kem_priv_b64: &str,
+    recipient_ml_kem_pub_b64: &str,
+    wrap_json: &str,
+) -> PyResult<String> {
+    let recipient_x_priv =
+        decode_fixed_b64::<X25519_KEY_LEN>(recipient_x25519_priv_b64, "recipient_x25519_priv_b64")?;
+    let recipient_ml_kem_priv = B64
+        .decode(recipient_ml_kem_priv_b64)
+        .map_err(|e| PyValueError::new_err(format!("recipient_ml_kem_priv_b64 decode: {e}")))?;
+    let recipient_ml_kem_pub = B64
+        .decode(recipient_ml_kem_pub_b64)
+        .map_err(|e| PyValueError::new_err(format!("recipient_ml_kem_pub_b64 decode: {e}")))?;
+
+    let envelope: serde_json::Value = serde_json::from_str(wrap_json)
+        .map_err(|e| PyValueError::new_err(format!("wrap_json decode: {e}")))?;
+
+    let ephemeral_b64 = envelope
+        .get("ephemeral_x25519_public_key_b64")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            PyValueError::new_err("wrap_json: missing ephemeral_x25519_public_key_b64")
+        })?;
+    let ml_kem_ct_b64 = envelope
+        .get("ml_kem_ciphertext_b64")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| PyValueError::new_err("wrap_json: missing ml_kem_ciphertext_b64"))?;
+    let nonce_b64 = envelope
+        .get("nonce_b64")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| PyValueError::new_err("wrap_json: missing nonce_b64"))?;
+    let ciphertext_b64 = envelope
+        .get("ciphertext_b64")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| PyValueError::new_err("wrap_json: missing ciphertext_b64"))?;
+
+    let ephemeral_x25519_public_key =
+        decode_fixed_b64::<X25519_KEY_LEN>(ephemeral_b64, "ephemeral_x25519_public_key_b64")?;
+    let ml_kem_ciphertext = B64
+        .decode(ml_kem_ct_b64)
+        .map_err(|e| PyValueError::new_err(format!("ml_kem_ciphertext_b64 decode: {e}")))?;
+    let nonce_vec = B64
+        .decode(nonce_b64)
+        .map_err(|e| PyValueError::new_err(format!("nonce_b64 decode: {e}")))?;
+    let nonce: [u8; 12] = nonce_vec.try_into().map_err(|v: Vec<u8>| {
+        PyValueError::new_err(format!("nonce must be 12 bytes, got {}", v.len()))
+    })?;
+    let ciphertext = B64
+        .decode(ciphertext_b64)
+        .map_err(|e| PyValueError::new_err(format!("ciphertext_b64 decode: {e}")))?;
+
+    let wrap = KeyGrantWrapV2 {
+        ephemeral_x25519_public_key,
+        ml_kem_ciphertext,
+        nonce,
+        ciphertext,
+    };
+    let dek = unwrap_dek_v2(
+        &recipient_x_priv,
+        &recipient_ml_kem_priv,
+        &recipient_ml_kem_pub,
+        &wrap,
+    )
+    .map_err(|e| PyRuntimeError::new_err(format!("key_grant v2 unwrap: {e}")))?;
+    Ok(B64.encode(dek))
+}
+
 fn decode_fixed_b64<const N: usize>(s: &str, label: &'static str) -> PyResult<[u8; N]> {
     let bytes = B64
         .decode(s)
@@ -134,6 +254,64 @@ mod tests {
             unwrap_dek_json(&B64.encode(recipient_priv), &wrap_json).expect("unwrap succeeds");
         let unwrapped = B64.decode(&unwrapped_b64).unwrap();
         assert_eq!(unwrapped, dek, "DEK survives round-trip");
+    }
+
+    #[test]
+    fn wrap_unwrap_v2_round_trip_recovers_dek() {
+        // X25519 half.
+        let recipient_x_priv: [u8; 32] = [0x42; 32];
+        let recipient_x_pub = x25519::public_from_secret(&recipient_x_priv);
+        // ML-KEM-768 half — generate_keypair() returns (private, public).
+        let (ml_kem_priv, ml_kem_pub) =
+            ciris_crypto::ml_kem::generate_keypair().expect("ml-kem keypair");
+        let dek: [u8; 32] = [0xCC; 32];
+
+        let wrap_json = wrap_dek_for_recipient_v2_json(
+            &B64.encode(recipient_x_pub),
+            &B64.encode(&ml_kem_pub),
+            &B64.encode(dek),
+        )
+        .expect("v2 wrap succeeds");
+        // The envelope advertises the v2 algorithm string.
+        assert!(
+            wrap_json.contains("x25519-mlkem768-aes256-gcm-hkdf-sha256"),
+            "v2 envelope names the v2 algorithm: {wrap_json}"
+        );
+
+        let unwrapped_b64 = unwrap_dek_v2_json(
+            &B64.encode(recipient_x_priv),
+            &B64.encode(&ml_kem_priv),
+            &B64.encode(&ml_kem_pub),
+            &wrap_json,
+        )
+        .expect("v2 unwrap succeeds");
+        let unwrapped = B64.decode(&unwrapped_b64).unwrap();
+        assert_eq!(unwrapped, dek, "DEK survives the v2 hybrid round-trip");
+    }
+
+    #[test]
+    fn unwrap_v2_rejects_wrong_x25519_key() {
+        let recipient_x_priv: [u8; 32] = [0x42; 32];
+        let recipient_x_pub = x25519::public_from_secret(&recipient_x_priv);
+        let (ml_kem_priv, ml_kem_pub) =
+            ciris_crypto::ml_kem::generate_keypair().expect("ml-kem keypair");
+        let dek: [u8; 32] = [0xCC; 32];
+        let wrap_json = wrap_dek_for_recipient_v2_json(
+            &B64.encode(recipient_x_pub),
+            &B64.encode(&ml_kem_pub),
+            &B64.encode(dek),
+        )
+        .unwrap();
+        // A different X25519 private key must fail the hybrid unwrap
+        // (AEAD tag mismatch — opaque WrapUnverified).
+        let wrong_x_priv: [u8; 32] = [0x99; 32];
+        let _err = unwrap_dek_v2_json(
+            &B64.encode(wrong_x_priv),
+            &B64.encode(&ml_kem_priv),
+            &B64.encode(&ml_kem_pub),
+            &wrap_json,
+        )
+        .unwrap_err();
     }
 
     #[test]

@@ -11310,6 +11310,53 @@ impl PyEngine {
         })
     }
 
+    /// v4.x (CIRISPersist#142 Cut C3b, CEG §10.5.3) — list every
+    /// stream/epoch-addressed key_grant Contribution for
+    /// `(stream_id, epoch)`, newest-first. JSON array of
+    /// [`ContributionEnvelope`](crate::cirisnode::ContributionEnvelope).
+    /// The consumer (LensCore) applies its own P4 catch-up depth cap.
+    #[cfg(feature = "cirisnode")]
+    fn cirisnode_list_key_grants_for_stream_epoch_json(
+        &self,
+        py: Python<'_>,
+        stream_id: &str,
+        epoch: u64,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let stream = stream_id.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        let rows = backend
+                            .list_key_grants_for_stream_epoch(&stream, epoch)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&rows)
+                            .map_err(|e| PyRuntimeError::new_err(format!("key_grants encode: {e}")))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        let rows = backend
+                            .list_key_grants_for_stream_epoch(&stream, epoch)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&rows)
+                            .map_err(|e| PyRuntimeError::new_err(format!("key_grants encode: {e}")))
+                    })
+                }
+            })
+        })
+    }
+
     /// v3.6.0 (CIRISPersist#134) — install / clear the media-sharing
     /// operator config ([`MultimediaConfig`](crate::cirisnode::MultimediaConfig)).
     /// Wire shape: see [`MultimediaConfigWire`](crate::cirisnode::MultimediaConfigWire).
@@ -17583,6 +17630,42 @@ impl PyEngine {
     /// recipient's X25519 private key. Returns the recovered DEK b64.
     fn unwrap_dek_b64(&self, recipient_x25519_priv_b64: &str, wrap_json: &str) -> PyResult<String> {
         crate::ffi::wheel_key_grant::unwrap_dek_json(recipient_x25519_priv_b64, wrap_json)
+    }
+
+    /// v4.x (CIRISPersist#142 Cut C3b, CEG §10.5.3) — wrap a 32-byte DEK
+    /// under `wrap_algorithm: v2` (X25519 + ML-KEM-768 hybrid PQC), the
+    /// mandatory wrap for streaming epoch-DEK grants. Returns the
+    /// `KeyGrantWrapV2` JSON envelope. `recipient_ml_kem_pub_b64` is the
+    /// recipient's ML-KEM-768 public key (1184 bytes).
+    fn wrap_dek_for_recipient_v2_b64(
+        &self,
+        recipient_x25519_pub_b64: &str,
+        recipient_ml_kem_pub_b64: &str,
+        dek_b64: &str,
+    ) -> PyResult<String> {
+        crate::ffi::wheel_key_grant::wrap_dek_for_recipient_v2_json(
+            recipient_x25519_pub_b64,
+            recipient_ml_kem_pub_b64,
+            dek_b64,
+        )
+    }
+
+    /// v4.x (CIRISPersist#142 Cut C3b) — unwrap a `KeyGrantWrapV2` JSON
+    /// envelope using the recipient's X25519 private key + ML-KEM-768
+    /// private/public keys. Returns the recovered DEK b64.
+    fn unwrap_dek_v2_b64(
+        &self,
+        recipient_x25519_priv_b64: &str,
+        recipient_ml_kem_priv_b64: &str,
+        recipient_ml_kem_pub_b64: &str,
+        wrap_json: &str,
+    ) -> PyResult<String> {
+        crate::ffi::wheel_key_grant::unwrap_dek_v2_json(
+            recipient_x25519_priv_b64,
+            recipient_ml_kem_priv_b64,
+            recipient_ml_kem_pub_b64,
+            wrap_json,
+        )
     }
 
     // ── hybrid_kex (X25519 + ML-KEM-768, CIRISVerify v4.6.0) ──
