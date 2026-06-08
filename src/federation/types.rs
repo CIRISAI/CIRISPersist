@@ -393,6 +393,44 @@ pub struct Attestation {
         skip_serializing_if = "is_default_cohort_scope"
     )]
     pub cohort_scope: String,
+    /// v4.4.0 (CIRISPersist#171, CEG §10.1.3/§10.1.5). Row tier:
+    /// `"local"` (producer-only authority, signature deferred, visible
+    /// ONLY to the producing occurrence) | `"federation"` (hybrid-signed,
+    /// federation-visible). Default `"federation"` (preserves pre-v4.4.0
+    /// rows). **Persist-internal row metadata — NOT part of the
+    /// `attestation_envelope` JCS canonical signing bytes** (CEG
+    /// §10.1.5.3 must #2): the signature covers `attestation_envelope`,
+    /// not this struct, so a promoted row is byte-identical on the wire
+    /// to a natively-federation one. `skip_serializing_if` default keeps
+    /// federation-row JSON output stable across the v4.4 schema bump.
+    #[serde(default = "default_tier", skip_serializing_if = "is_default_tier")]
+    pub tier: String,
+    /// v4.4.0 — wall-clock of the local→federation `attestation_promote`
+    /// transition (the federation-emit moment). `None` for natively-
+    /// federation rows and un-promoted local rows. Persist-internal; not
+    /// in the canonical bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_at: Option<DateTime<Utc>>,
+}
+
+/// v4.4.0 (CIRISPersist#171) — attestation tier wire constants.
+pub mod attestation_tier {
+    /// Producer-only-authority, signature-deferred, self-visible-only.
+    pub const LOCAL: &str = "local";
+    /// Hybrid-signed, federation-visible (status quo + promotion target).
+    pub const FEDERATION: &str = "federation";
+}
+
+/// Default tier for backward compat: pre-v4.4.0 rows are all federation.
+fn default_tier() -> String {
+    attestation_tier::FEDERATION.to_string()
+}
+
+/// True iff the tier equals the default (`federation`) — federation rows
+/// omit the field from JSON so legacy canonical/round-trip output stays
+/// stable across the v4.4 schema bump.
+fn is_default_tier(tier: &str) -> bool {
+    tier == attestation_tier::FEDERATION
 }
 
 /// v3.9.0 (CIRISPersist#150) — default cohort_scope for backward compat.

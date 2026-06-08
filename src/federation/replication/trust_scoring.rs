@@ -148,6 +148,8 @@ mod tests {
             subject_key_ids: Vec::new(),
             withdraws_admission_rule: None,
             cohort_scope: "federation".to_string(),
+            tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
+            promoted_at: None,
         }
     }
 

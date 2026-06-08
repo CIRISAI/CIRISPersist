@@ -1495,7 +1495,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                         weight, asserted_at, expires_at, attestation_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
                      FROM federation_attestations \
                      WHERE attested_key_id = ?1 \
                      ORDER BY asserted_at DESC",
@@ -1519,7 +1519,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                         weight, asserted_at, expires_at, attestation_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
                      FROM federation_attestations \
                      WHERE attesting_key_id = ?1 \
                      ORDER BY asserted_at DESC",
@@ -1968,7 +1968,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                         weight, asserted_at, expires_at, attestation_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
                      FROM federation_attestations WHERE attestation_id = ?1",
                     [&id],
                     sqlite_row_to_attestation,
@@ -3315,6 +3315,8 @@ impl crate::federation::BlobStorage for SqliteBackend {
             subject_key_ids: Vec::new(),
             withdraws_admission_rule: None,
             cohort_scope: "federation".to_string(),
+            tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
+            promoted_at: None,
         };
         let persist_row_hash = crate::federation::types::compute_persist_row_hash(&attestation_row)
             .map_err(|e| crate::federation::BlobError::Backend(format!("persist_row_hash: {e}")))?;
@@ -6027,6 +6029,14 @@ fn sqlite_row_to_attestation(
         subject_key_ids,
         withdraws_admission_rule: withdraws_admission_rule.map(|v| v as u8),
         cohort_scope: row.get("cohort_scope")?,
+        // v4.4.0 (CIRISPersist#171) — tier defaults to 'federation' for
+        // pre-V066 rows (the column DEFAULT); promoted_at NULL for
+        // natively-federation + un-promoted local rows.
+        tier: row.get("tier")?,
+        promoted_at: {
+            let p: Option<String> = row.get("promoted_at")?;
+            p.as_deref().map(parse_rfc3339)
+        },
     })
 }
 
@@ -8101,7 +8111,7 @@ impl crate::read::ReadEngine for SqliteBackend {
                     attestation_type, weight, asserted_at, expires_at, \
                     attestation_envelope, original_content_hash, \
                     scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
-                    scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope \
+                    scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
              FROM federation_attestations {where_sql} \
              ORDER BY asserted_at DESC, attestation_id DESC LIMIT ?{p_limit}"
         );
@@ -8190,7 +8200,7 @@ impl crate::read::ReadEngine for SqliteBackend {
                     attestation_type, weight, asserted_at, expires_at, \
                     attestation_envelope, original_content_hash, \
                     scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
-                    scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope \
+                    scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
              FROM federation_attestations {where_sql} \
              ORDER BY asserted_at DESC, attestation_id DESC LIMIT ?{p_limit}"
         );
@@ -10152,6 +10162,8 @@ mod tests {
             subject_key_ids: Vec::new(),
             withdraws_admission_rule: None,
             cohort_scope: "federation".to_string(),
+            tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
+            promoted_at: None,
         }
     }
 
@@ -11931,6 +11943,8 @@ mod tests {
             subject_key_ids: Vec::new(),
             withdraws_admission_rule: None,
             cohort_scope: "federation".to_string(),
+            tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
+            promoted_at: None,
         }
     }
 
@@ -12872,6 +12886,8 @@ mod tests {
                     subject_key_ids: Vec::new(),
                     withdraws_admission_rule: None,
                     cohort_scope: "federation".to_string(),
+                    tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
+                    promoted_at: None,
                 },
             })
             .await
@@ -15782,6 +15798,8 @@ mod tests {
             subject_key_ids: Vec::new(),
             withdraws_admission_rule: None,
             cohort_scope: "federation".to_string(),
+            tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
+            promoted_at: None,
         }
     }
 
@@ -18219,6 +18237,8 @@ mod tests {
             subject_key_ids: Vec::new(),
             withdraws_admission_rule: None,
             cohort_scope: "federation".to_string(),
+            tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
+            promoted_at: None,
         }
     }
 
