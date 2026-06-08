@@ -8,7 +8,8 @@
 **Risk:** Additive at the grammar layer (CEG 1+4 lockdown holds). The one non-trivial change is a **tier model** on `federation_attestations` (a `local` tier with deferred signature) — additive column + a CHECK, but it relaxes the current "every attestation row is signed at write" invariant, so it is called out explicitly and gated on the threat-model review below.
 **Driving issue:** CIRISPersist#171 (this ask) — gating dependency for **CIRISAgent#840** (CEG-native agent; `graph_nodes` ARE self-level CEG attestations; `CIRISAgent/FSD/CEG_NATIVE_AGENT.md`).
 **Normative anchor:** CEG 0.15 **§10.1.3** (local-tier signature deferral + the consent-revocation non-eligibility rule), §7.0.1 (identity_type emitter gates), §10.1.4 (structural invisibility), §8.1.8.1 (tiered-scope promotion). `CIRISRegistry/FSD/CEG/`.
-**Cross-refs:** CIRISAgent#840 / #866 (2.9.6 umbrella) / #842, CIRISNodeCore (`compose.rs` CEG-projection), CIRISLensCore#857 (CEG-native trace ingest), CIRISRegistry#45, CIRISPersist#161 (removal/revocation substrate — ask #4 is designed *with* it).
+**Cross-refs:** CIRISAgent#840 / #866 (2.9.6 umbrella) / #842, CIRISNodeCore (`compose.rs` CEG-projection), CIRISLensCore#857 (CEG-native trace ingest), CIRISRegistry#45, CIRISPersist#161 (removal/revocation substrate — ask #4 is designed *with* it), **CIRISVerify#59** (JCS RFC 8785 canonicalizer + CEG-Contribution verify — the `attestation_promote` interop deliverable, OQ-4), CIRISConformance#9 (cross-impl JCS vector set).
+**Review state (2026-06-08):** CIRISAgent ✅ nod (conditional, folded in) · CIRISVerify ✅ answered OQ-4 (+ filed #59) · CIRISRegistry 🟡 next (OQ-2) · #161 🟡 (OQ-3) · LensCore + NodeCore ⬜ not yet. See §11/§12.
 **Builds on:** the v4.0 Data Access Surface (`FSD/V4_0_DATA_ACCESS_SURFACE.md`) — `CallerScope`/`CallerAdmission`, the target-membership `cohort_scope_sql_predicate`, the cache + `ReadEngine v2`. This FSD is the **write+promote** half of the same substrate; `attestation_query` is the DAS read shape extended with dimension/valid_at/confidence filters.
 
 ---
@@ -78,8 +79,10 @@ The single load-bearing new concept. Today `federation_attestations` rows are wr
 
 | Tier | `subject_key_ids` | Signature | Federation-visible | Written by |
 |---|---|---|---|---|
-| `local` | empty (producer-only authority) | **deferred** (NULL hybrid sig; `witness_relation: self`) | **No** — visible only to the producing occurrence | `attestation_upsert_local` |
+| `local` | **empty OR non-empty** — any **producer-authority** row (incl. ones that *name* a subject) | **deferred** (NULL hybrid sig; `witness_relation: self`) | **No** — visible only to the producing occurrence | `attestation_upsert_local` / `attestation_insert_local` |
 | `federation` | empty or non-empty | hybrid Ed25519 + ML-DSA-65 present | Yes | `put_attestation` (status quo) OR `attestation_promote` (local→federation) |
+
+> **⚠️ Corrected per CIRISAgent review (was: "local ⟹ empty `subject_key_ids`").** Local-tier eligibility is **producer-only authority**, NOT empty subjects. CEG **§4.2.6** requires any dimension *naming* a subject to carry it in `subject_key_ids`, and large core classes of agent self-attestation are producer-authority **yet name a subject** — `observed:user:{hash}:*`, `consent:partnered:{user}` (CEG §10.1.3 says this MAY ride local-tier verbatim), `epistemic:about:{key}:*`, and the §4.2.3 self-consent `identity:current` with `subject_key_ids=[self]`. Forcing all non-empty-subject rows onto the signed path would defeat the deferral cost model for the majority of agent state and break the hard cut. **The discriminator is "who holds revocation authority," not "is the subject set empty"** — see §5 for the one carve-out (subject-side revocation).
 
 **The invariant (a CHECK on the table):** `tier = 'federation' ⟹ scrub_signature_classical IS NOT NULL` (and PQC per the existing hybrid-pending rules). A `local` row MAY carry a NULL signature. This relaxes — but does not remove — the "signed at federation" guarantee: nothing crosses to federation-visible unsigned.
 
@@ -91,11 +94,17 @@ The single load-bearing new concept. Today `federation_attestations` rows are wr
 
 ## 4. The three primitives
 
-### 4.1 `attestation_upsert_local(envelope)` + `_many(envelopes[])`
+### 4.1 Local write — two classes (`upsert` + `insert`) + `_many`
 
-Write a producer-only-authority self-attestation at `local` tier: `witness_relation: self`, empty `subject_key_ids`, **no hybrid signature** (deferred per §10.1.3). `upsert` semantics keyed on the producer's dimension identity (the #840 `NodeType → dimension` map decides the key; persist treats it as `(occurrence_key_id, attestation_type, scope_id)` unless review pins otherwise — OQ-1). `_many` is one transaction for the boot-time `migrate_graph_nodes_to_attestations()` backlog (identity/config/consent/memory) — bulk insert must be efficient (§9).
+Per CIRISAgent review, the #840 `NodeType → dimension` map splits into two write classes; `upsert` alone is insufficient. **The key is `(occurrence_key_id, dimension)`** — the CEG dimension string IS the identity (it already carries the scoped leaf: `config:filter_config`, `observed:user:{hash}:interaction_count`, `consent:partnered:{user}`). The §3 structural `attestation_type` (scores/supersedes/withdraws/…) is too coarse — keying on it would collapse every distinct dimension in a scope into one row. **OQ-1 resolved: `(occurrence_key_id, dimension)`.**
 
-**Validation:** rejects a non-empty `subject_key_ids` on this path (that is NOT producer-only authority — it must go through the signed `put_attestation`, the §10.1.3 carve-out). Rejects a non-`self` `witness_relation`.
+- **`attestation_upsert_local(envelope)`** — **singleton current-state** (`identity:current`, `config:{key}`, `consent:partnered:{user}`, `observed:user:{hash}:{metric}`): replace-on-`(occurrence_key_id, dimension)`; history via the `supersedes` composer.
+- **`attestation_insert_local(envelope)`** — **multi-valued / event** (`epistemic:memory:topic={topic}` — many memories per topic; per-thought `dma:*`/`conscience:*` verdicts; observation events): **append**, each a distinct row with a server-assigned id, NOT collapsible by dimension. (An upsert keyed on dimension would collapse the agent's entire memory of a topic into one row.) The #840 map tags each dimension's write class.
+- **`attestation_upsert_local_many(envelopes[])` / `attestation_insert_local_many`** — the boot-time `migrate_graph_nodes_to_attestations()` backlog. Must **chunk internally** (CONCEPT/OBSERVATION memory can be thousands of rows on a long-lived agent) — not one statement (§9).
+
+All write at `local` tier (`witness_relation: self`, **no hybrid signature**, deferred per §10.1.3); `subject_key_ids` MAY be non-empty (producer-authority rows that name a subject — §3).
+
+**Validation:** the local path is refused **only** for the §10.1.3 carve-out — a **subject-side revocation** (`attestation_type ∈ {withdraws}` or a `consent:state:revoked` dimension) whose `attesting_key_id` is a member of the *target* row's `subject_key_ids` (the subject exercising its own revocation right). Those MUST go through signed `put_attestation` / promotion (§5). Producer-authority rows are accepted regardless of whether they name a subject. Rejects a non-`self` `witness_relation`.
 
 ### 4.2 `attestation_query(dimensions[], valid_at, confidence_floor, subject_key_id?, scope)`
 
@@ -103,7 +112,13 @@ The uniform read. `dimensions[]` is a closed set of `attestation_type` prefixes 
 
 ### 4.3 `attestation_promote(id) -> SignedAttestation`
 
-The local→federation transition: load the `local` row, compute the hybrid signature over its canonical bytes (`Engine::sign_hybrid` — already available), write the signature + flip `tier = federation` (+ `promoted_at`). Idempotent: promoting an already-`federation` row returns it unchanged. At promotion, tiered-scope promotion semantics (§8.1.8.1) and `holds_bytes` emission (§10.1.2) fire exactly as for any federation write — promotion is the federation-emit moment.
+The local→federation transition: load the `local` row, compute the hybrid signature over its canonical bytes (`Engine::sign_hybrid`), write the signature + flip `tier = federation` (+ `promoted_at`). Idempotent: promoting an already-`federation` row returns it unchanged. At promotion, tiered-scope promotion semantics (§8.1.8.1) and `holds_bytes` emission (§10.1.2) fire exactly as for any federation write — promotion is the federation-emit moment.
+
+**Canonical bytes — `JCS(envelope)`, NOT LP framing (OQ-4, resolved by CIRISVerify review).** A promoted row *is* a CEG Contribution four impls read + verify, so the signature MUST cover `JCS(contribution_envelope)` per CEG **§0.9 / RFC 8785** (`Engine::sign_hybrid(JCS(envelope))`); Verify recomputes the identical JCS bytes to verify. **Do NOT use Verify's internal length-prefixed `signing_bytes` framing** — that is correct only for verify-internal, verify-to-verify primitives (envelope framing, keyset rotation, doc integrity) that never cross the four-impl boundary as JSON; a promoted attestation is the opposite. Registry owns the exact envelope member set; Verify owns the matching recomputation.
+
+**§0.9 omit-vs-materialize is load-bearing here.** Promotion MUST canonicalize the **exact member set the producer committed at local-write time** — a field *omitted* at `upsert_local`/`insert_local` MUST NOT be materialized at promote (and vice-versa), or the bytes diverge from what a peer recomputes and the hybrid sig fails to verify. Persist serializes the stored row → the committed envelope → JCS → sign; it does not re-default.
+
+**Dependency — gates `promote` only.** No Rust impl has a JCS canonicalizer yet; **CIRISVerify#59** (JCS RFC 8785 + CEG-Contribution hybrid-sig verify path) is the deliverable that lets Verify verify the promotion signature as a CEG-Conforming Consumer, composing with CIRISConformance#9's vector set. Persist also needs JCS at promote time (shared impl from Verify, or its own conforming to #59's vectors). **This is why `promote` stages *after* the write+read half** (§2.1 / OQ-5): `upsert_local`/`insert_local`/`query` ship in v4.4.0 with no JCS dependency; `promote` lands once #59 is available.
 
 ---
 
@@ -113,10 +128,12 @@ The one place deferral is unsafe, and the one place the *substrate* (not a consu
 
 **Rule (verbatim from §10.1.3):** a Contribution carrying non-empty `subject_key_ids` whose subject subsequently emits `consent:state:revoked` (or a `withdraws` admitted under §3.2.3 rule 2/3) MUST promote to federation-tier within a bounded window. **Default 24h, operator-tunable.** Past the window without promotion, the substrate MUST emit `hard_case:consent_revocation_promotion_overdue`.
 
+**What "subject-side revocation" means (corrected per Agent review — it is NOT "non-empty subject_key_ids").** The carve-out is a row where a **subject exercises its own revocation right**: `attestation_type ∈ {withdraws}` or a `consent:state:revoked` dimension whose **`attesting_key_id` is a member of the target row's `subject_key_ids`**. That is the §10.1.3 "NOT local-tier-eligible" set. Producer-authority rows that merely *name* a subject (`observed:user:*`, `consent:partnered:*` stance, `epistemic:about:*`, self-consent `identity:current`) are **not** in it — they ride local-tier (§3, §4.1).
+
 **Substrate surface:**
-- `attestations_overdue_for_promotion(now, window) -> Vec<...>` — the scan that finds subject-revoked Contributions still `local`/unpromoted past `now - window`. Indexed (a partial index on `tier = 'local' AND subject_key_ids <> '{}'`).
+- `attestations_overdue_for_promotion(now, window) -> Vec<...>` — the scan that finds subject-side revocations still `local`/unpromoted past `now - window`. Indexed (partial index on `tier = 'local'` + the revocation-dimension/authority predicate).
 - `emit_consent_revocation_overdue(id)` — writes the `hard_case:consent_revocation_promotion_overdue` attestation (the fail-honest signal; LensCore composes `detection:consent:promotion_delay_pattern` on top — not persist's concern).
-- **Enforcement at the upsert gate:** `attestation_upsert_local` *refuses* a subject-side revocation (non-empty `subject_key_ids`) outright — per §10.1.3 these are "NOT local-tier-eligible." So the obligation primarily guards the case where a prior local self-attestation *acquires* a subject revocation against it; the scan catches those.
+- **Enforcement at the write gate:** `attestation_upsert_local` / `attestation_insert_local` *refuse* a subject-side revocation (per the authority test above) outright — these must go through signed `put_attestation` / promotion. The bounded-window obligation then guards the residual case where a prior producer-authority local row *acquires* a subject-side revocation against it; the scan catches those and emits the `hard_case` past the window.
 
 **Designed with CIRISPersist#161** (removal/revocation substrate, Option-A forward secrecy). The window enforcement is the same forward-only-unsubscribe guarantee #161 enforces at the membership-row layer; OQ-3 settles whether the timer lives here or there.
 
@@ -143,7 +160,7 @@ The emitter gate (§7.0.1) is enforced at write per `identity_type` of the `atte
 - `tier TEXT NOT NULL DEFAULT 'federation'` — `CHECK (tier IN ('local','federation'))`. Default `federation` so every existing row keeps its meaning (all current rows are signed/federation).
 - `promoted_at TIMESTAMPTZ NULL` — set by `attestation_promote`.
 - The signature columns (`scrub_signature_classical`) become nullable **only under** `tier = 'local'`, via a replaced CHECK: `tier = 'federation' ⟹ scrub_signature_classical IS NOT NULL`. (Postgres: DROP/ADD CONSTRAINT; SQLite: trigger rewrite per the V054/V056/V064 discipline — this is the one not-pure-additive constraint touch.)
-- Partial index `WHERE tier = 'local' AND subject_key_ids <> '{}'` for the overdue scan (§5).
+- Partial index `WHERE tier = 'local'` (filtered further at query time by the revocation-dimension/authority predicate) for the overdue scan (§5). Note the index is NOT on `subject_key_ids <> '{}'` — producer-authority rows legitimately carry subjects (§3); the scan keys on revocation authority, not subject presence.
 
 No data backfill — the default makes existing rows `federation`. No `graph_nodes` coupling (§9).
 
@@ -163,27 +180,29 @@ Both backends: the tier column + CHECK/trigger, all three primitives, the overdu
 - **AV-60 (unsigned federation leak)** — a `local` row MUST NOT become federation-visible without a hybrid signature. Closed by the CHECK (`tier=federation ⟹ sig present`) + `attestation_promote` being the only transition that flips the tier (and it signs first). Adversary: a direct-SQL `UPDATE tier='federation'` — the CHECK rejects it without a signature.
 - **AV-61 (consent-revocation deferral abuse)** — a subject revokes; the producer leaves it local to keep propagating the subject's data. Closed by §5: the upsert gate refuses subject-revocations at local tier, and the overdue scan + `hard_case` emission make any acquired-revocation delay observable (fail-honest, §1.6).
 
-## 11. Open questions — these gate acceptance
+## 11. Open questions — status after the Agent + Verify review
 
-- **OQ-1 — upsert key.** Is the local-upsert identity `(occurrence_key_id, attestation_type, scope_id)`, or does the #840 `NodeType → dimension` map pin a different key? (Agent owns the answer.)
-- **OQ-2 — query dimension vocabulary.** Is `dimensions[]` a closed enum pinned in CEG, or an open prefix set persist validates structurally? (Registry + the §7 emitter-gate semantics.)
-- **OQ-3 — who runs the 24h clock.** Persist background sweeper vs consumer-driven `attestations_overdue_for_promotion` scan vs edge. Resolve with #161. (Persist ships the query + emission either way; this decides the trigger.)
-- **OQ-4 — promotion canonical bytes.** Exact canonicalization the hybrid signature covers at promote time (must match what federation peers verify). (Registry + Verify.)
-- **OQ-5 — version.** v4.4.0 (additive minor) confirmed, or fold into a larger CEG-RC1 cut?
+- **OQ-1 — local-write key + classes. ✅ RESOLVED (CIRISAgent).** Key on `(occurrence_key_id, dimension)` (the dimension string is the identity; `attestation_type` is too coarse). Two write classes: `attestation_upsert_local` (replace-on-dimension, singleton state) + `attestation_insert_local` (append, server-assigned id, multi-valued/event). The #840 map tags each dimension's class. Also: the local-tier gate keys on **producer authority**, not empty subjects (§3/§4.1/§5). Folded into the design.
+- **OQ-2 — query dimension vocabulary. 🟡 OPEN → CIRISRegistry.** Now *more* load-bearing: since `dimension` IS the upsert key (OQ-1), the dimension grammar is the row identity. Closed enum pinned in CEG vs open prefix persist validates structurally? Registry owns it (+ the §7.0.1 emitter-gate semantics).
+- **OQ-3 — who runs the 24h clock. 🟡 OPEN → resolve with #161.** Persist sweeper vs consumer-driven `attestations_overdue_for_promotion` scan vs edge. Persist ships the query + `hard_case` emission either way; this decides the trigger. Gates only §5's trigger, not the primitives.
+- **OQ-4 — promotion canonical bytes. ✅ RESOLVED on the spec (CIRISVerify); ⛓ new dependency.** `JCS(envelope)` per CEG §0.9 / RFC 8785 — NOT Verify's internal LP framing; canonicalize the exact committed member set (omit-vs-materialize). **New blocking dependency for `promote` only: CIRISVerify#59** (JCS canonicalizer + CEG-Contribution verify path; composes with CIRISConformance#9). Registry still owns the exact envelope member set the JCS runs over.
+- **OQ-5 — version + staging. ✅ RESOLVED (CIRISAgent).** v4.4.0 confirmed. `promote` stages *after* the write+read half — `upsert_local`/`insert_local`/`query` ship first (no JCS dependency); `promote` lands once CIRISVerify#59 is available. (Agent: 2.9.7 can land the transform + CEG-native local operation against the surface before federation promotion exists.)
+
+**Net after review:** the two signature-affecting blockers (OQ-1 + the producer-authority gate) are resolved and folded in. Remaining gates: **OQ-2 (Registry — the dimension grammar, now the upsert key)** and **OQ-3 (#161 — the clock, trigger-only)**. `promote` additionally waits on **CIRISVerify#59**. LensCore + NodeCore have not yet confirmed their views compose (non-blocking for the write+read half).
 
 ## 12. Who needs to nod / shake (the 4-impl RC1 gate)
 
 This surface is a contract *between* implementations, so it can't be accepted on persist's say-so. Required reviewers, each on the hook for specific questions:
 
-| Reviewer | Must nod/shake on | Owns these OQs |
-|---|---|---|
-| **CIRISAgent** (#840, `FSD/CEG_NATIVE_AGENT.md`) | The `attestation_upsert_local` / `attestation_query` shapes match the `NodeType → dimension` map; `_many` bulk-insert + the `graph_nodes` cold-backup coexistence are sufficient for the hard cut; the local-upsert key. **Primary consumer — strongest veto.** | **OQ-1**, OQ-5 |
-| **CIRISRegistry** (CEG authority) | The tier model + §10.1.3 enforcement conform to CEG; the `dimensions[]` vocabulary (closed-enum vs open-prefix); the promotion canonical bytes. **Conformance gate.** | OQ-2, **OQ-4** |
-| **CIRISLensCore** (#857) | The `detection:*` / `capacity:*` write side (federation tier, non-empty `subject_key_ids`) + the anti-Goodhart read flow work through `attestation_query`; LensCore's `detection:consent:promotion_delay_pattern` composes cleanly on the substrate `hard_case` emission. | — |
-| **CIRISNodeCore** | The governance-projection write into `federation_attestations` + reading promoted agent-intent both work through this contract (not a forked path); the `src/cirisnode` typed-table → projection boundary is unchanged. | — |
-| **CIRISVerify** | The promotion-time hybrid signature + canonical bytes interop (what federation peers verify). | OQ-4 (jointly with Registry) |
-| **CIRISPersist#161** (revocation substrate) | OQ-3 — who runs the 24h promotion clock (persist sweeper vs consumer scan vs edge); the window enforcement is the same forward-only-unsubscribe guarantee #161 owns. | **OQ-3** |
+| Reviewer | Status | Must nod/shake on | OQs |
+|---|---|---|---|
+| **CIRISAgent** (#840) | **✅ NOD (conditional, met)** | Conditioned on (1) producer-authority gate not empty-subjects, (2) `(occurrence_key_id, dimension)` key + an append path. Both folded in. v4.4.0 + staging confirmed. | OQ-1 ✅, OQ-5 ✅ |
+| **CIRISVerify** | **✅ ANSWERED** | Promotion bytes = `JCS(envelope)` §0.9, not LP framing; exact committed member set. Filed **CIRISVerify#59** (JCS + Contribution-verify) — the `promote` interop deliverable. | OQ-4 ✅ (spec) |
+| **CIRISRegistry** (CEG authority) | **🟡 PENDING — next** | The `dimensions[]` grammar (now the upsert key — load-bearing); the exact promotion envelope member set the JCS runs over; tier-model + §10.1.3 CEG conformance. **Conformance gate.** | **OQ-2**, OQ-4 member-set |
+| **CIRISPersist#161** | **🟡 PENDING** | OQ-3 — who runs the 24h promotion clock (sweeper vs consumer scan vs edge). Trigger-only; doesn't block the primitives. | **OQ-3** |
+| **CIRISLensCore** (#857) | **⬜ NOT YET** | `detection:*`/`capacity:*` write + anti-Goodhart read flow compose through `attestation_query`; `promotion_delay_pattern` rides the substrate `hard_case`. Non-blocking for write+read. | — |
+| **CIRISNodeCore** | **⬜ NOT YET** | governance-projection write + promoted-agent-intent read both ride this contract, not a forked path. Non-blocking for write+read. | — |
 
-**Minimum to accept:** Agent + Registry nods on OQ-1/OQ-2/OQ-4 and an OQ-3 resolution with #161. LensCore + NodeCore confirm their views compose (no forked read/write path). Eric notifies the sisters + federation per the standing cut convention; downstream PRs land against the accepted surface.
+**Minimum to accept the write+read half (v4.4.0 phase 1):** Agent ✅ + **Registry on OQ-2** (the dimension grammar). LensCore + NodeCore confirm views compose. `promote` (phase 2) additionally needs **CIRISVerify#59** + the OQ-4 member set + OQ-3's clock decision with #161.
 
-**Sequencing:** OQ-1 (upsert key) and OQ-2 (dimension vocab) gate the method signatures, so they block code. OQ-3 (the clock) gates only §5's trigger, not the substrate primitives — persist can ship the scan + emission and wire the trigger once #161 resolves. OQ-4 (canonical bytes) gates `attestation_promote` but not `attestation_upsert_local` / `attestation_query`, so the write+read half can land ahead of promote if review wants to stage it.
+**Sequencing after review:** OQ-1 + the producer-authority gate (signature-affecting) are resolved. **OQ-2 (Registry) is now the sole code-blocker for the write+read half** — it fixes the dimension grammar that is the upsert key. OQ-3 (clock) gates only §5's trigger. OQ-4/CIRISVerify#59 gate only `promote`, which is explicitly staged second.
