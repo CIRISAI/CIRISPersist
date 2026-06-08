@@ -433,6 +433,92 @@ fn is_default_tier(tier: &str) -> bool {
     tier == attestation_tier::FEDERATION
 }
 
+/// v4.4.0 (CIRISPersist#171, CEG §10.1.3) — caller input for a local-tier
+/// attestation write (`attestation_upsert_local` / `_insert_local`). The
+/// producer-only-authority self-attestation envelope: the caller supplies
+/// the semantic fields; persist fills the tier (`local`), the deferred
+/// empty-sentinel scrub envelope, `asserted_at`, and the row id. The
+/// signature is deferred to `attestation_promote` (no hybrid sig here).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalAttestationInput {
+    /// The producing occurrence's `federation_keys.key_id` (the
+    /// `witness_relation: self` producer). Must exist in federation_keys.
+    pub attesting_key_id: String,
+    /// Primary attested key. Defaults to `attesting_key_id` (a
+    /// self-attestation) when omitted. Must exist in federation_keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attested_key_id: Option<String>,
+    /// The §3 structural primitive (`scores` / `supersedes` / …).
+    pub attestation_type: String,
+    /// Optional weight signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<f64>,
+    /// Optional expiry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    /// The CEG attestation envelope. MUST carry a `"dimension"` string
+    /// (the `(occurrence, dimension)` upsert key + the §7.5/§10.1.3
+    /// local-tier gates read it).
+    pub attestation_envelope: serde_json::Value,
+    /// §4.2.6 subjects this attestation names (producer-authority rows
+    /// MAY name subjects; the local-tier gate refuses only a subject-side
+    /// revocation, not subject-naming).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subject_key_ids: Vec<String>,
+    /// Producer-side visibility scope. Defaults `federation`; a local
+    /// self-attestation typically tags `self`.
+    #[serde(
+        default = "default_cohort_scope",
+        skip_serializing_if = "is_default_cohort_scope"
+    )]
+    pub cohort_scope: String,
+}
+
+impl LocalAttestationInput {
+    /// The envelope `dimension` (the local-tier key + gate axis).
+    pub fn dimension(&self) -> Option<&str> {
+        self.attestation_envelope
+            .get("dimension")
+            .and_then(|v| v.as_str())
+    }
+
+    /// Build the `local`-tier [`Attestation`] row: caller fields + the
+    /// deferred empty-sentinel scrub envelope (`scrub_signature_classical
+    /// = ""` — admitted at local tier by the V066 CHECK; `scrub_key_id =
+    /// attesting_key_id` so the FK holds; `original_content_hash = ""`,
+    /// recomputed via JCS at promote). `persist_row_hash` is filled by the
+    /// caller after construction (`compute_persist_row_hash`).
+    pub fn into_local_row(self, attestation_id: String, asserted_at: DateTime<Utc>) -> Attestation {
+        let attested_key_id = self
+            .attested_key_id
+            .unwrap_or_else(|| self.attesting_key_id.clone());
+        Attestation {
+            attestation_id,
+            attesting_key_id: self.attesting_key_id.clone(),
+            attested_key_id,
+            attestation_type: self.attestation_type,
+            weight: self.weight,
+            asserted_at,
+            expires_at: self.expires_at,
+            attestation_envelope: self.attestation_envelope,
+            // Sentinel (empty) — local rows defer the scrub envelope.
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            // FK-valid sentinel: the producer's own key.
+            scrub_key_id: self.attesting_key_id,
+            scrub_timestamp: asserted_at,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: self.subject_key_ids,
+            withdraws_admission_rule: None,
+            cohort_scope: self.cohort_scope,
+            tier: attestation_tier::LOCAL.to_string(),
+            promoted_at: None,
+        }
+    }
+}
+
 /// v3.9.0 (CIRISPersist#150) — default cohort_scope for backward compat.
 /// Pre-v3.9.0 attestations had no cohort_scope; reading them under the
 /// new schema returns the column DEFAULT 'federation', so the Rust

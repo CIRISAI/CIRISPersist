@@ -1763,6 +1763,20 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         Ok(())
     }
 
+    async fn attestation_upsert_local(
+        &self,
+        input: crate::federation::types::LocalAttestationInput,
+    ) -> Result<String, crate::federation::Error> {
+        self.pg_write_local_attestation(input, true).await
+    }
+
+    async fn attestation_insert_local(
+        &self,
+        input: crate::federation::types::LocalAttestationInput,
+    ) -> Result<String, crate::federation::Error> {
+        self.pg_write_local_attestation(input, false).await
+    }
+
     async fn list_attestations_for(
         &self,
         attested_key_id: &str,
@@ -6010,6 +6024,135 @@ fn pg_row_to_key_record(
         roles,
         attestation_evidence,
     })
+}
+
+impl PostgresBackend {
+    /// v4.4.0 (CIRISPersist#171) — shared local-tier write path for
+    /// `attestation_upsert_local` (`replace = true`) /
+    /// `attestation_insert_local` (`replace = false`). Mirrors the SQLite
+    /// path: §4.1 local-tier gate + dimension/cohort_scope admission,
+    /// deferred-signature `local` row, upsert = delete-prior-then-insert.
+    async fn pg_write_local_attestation(
+        &self,
+        input: crate::federation::types::LocalAttestationInput,
+        replace: bool,
+    ) -> Result<String, crate::federation::Error> {
+        use crate::federation::Error;
+
+        let dimension = input.dimension().map(|s| s.to_string()).ok_or_else(|| {
+            Error::InvalidArgument(
+                "local attestation envelope must carry a \"dimension\" string".into(),
+            )
+        })?;
+
+        crate::federation::admission::check_local_tier_eligibility(
+            &input.attestation_type,
+            Some(dimension.as_str()),
+            &input.attesting_key_id,
+            &input.subject_key_ids,
+        )?;
+        crate::federation::admission::check_cohort_scope(&input.cohort_scope)?;
+
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| Error::Backend(e.to_string()))?;
+
+        // FK precondition + §7.0.1 emitter gate (no federation trust gate
+        // for local — producer-only authority).
+        let identity_type: String = client
+            .query_opt(
+                "SELECT identity_type FROM cirislens.federation_keys WHERE key_id = $1",
+                &[&input.attesting_key_id],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("lookup attesting identity_type: {e}")))?
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "attesting_key_id {} does not exist in federation_keys",
+                    input.attesting_key_id
+                ))
+            })?
+            .get(0);
+        let dim = crate::federation::admission::envelope_dimension(&input.attestation_envelope);
+        crate::federation::admission::DimensionAdmissionPolicy::default().check(
+            &input.attestation_type,
+            dim,
+            &identity_type,
+        )?;
+
+        let attestation_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now();
+        let attesting_key_id = input.attesting_key_id.clone();
+        let mut row = input.into_local_row(attestation_id.clone(), now);
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let subject_key_ids_json = serde_json::to_value(&row.subject_key_ids)
+            .map_err(|e| Error::Backend(format!("subject_key_ids serialize: {e}")))?;
+        let original_content_hash: Vec<u8> = Vec::new(); // empty sentinel
+        let attestation_uuid = uuid::Uuid::parse_str(&attestation_id)
+            .map_err(|e| Error::Backend(format!("uuid parse: {e}")))?;
+
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| Error::Backend(format!("begin tx: {e}")))?;
+        if replace {
+            tx.execute(
+                "DELETE FROM cirislens.federation_attestations \
+                  WHERE attesting_key_id = $1 AND tier = 'local' \
+                    AND attestation_envelope->>'dimension' = $2",
+                &[&attesting_key_id, &dimension],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("local upsert delete: {e}")))?;
+        }
+        tx.execute(
+            "INSERT INTO cirislens.federation_attestations (\
+                attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                weight, asserted_at, expires_at, attestation_envelope, \
+                original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at\
+             ) VALUES ($1, $2, $3, $4, $5::float8::numeric, $6, $7, $8, $9, $10, $11, $12, \
+                       $13, $14, $15, $16, $17, $18, 'local', NULL)",
+            &[
+                &attestation_uuid,
+                &row.attesting_key_id,
+                &row.attested_key_id,
+                &row.attestation_type,
+                &row.weight,
+                &row.asserted_at,
+                &row.expires_at,
+                &row.attestation_envelope,
+                &original_content_hash,
+                &row.scrub_signature_classical,
+                &row.scrub_signature_pqc,
+                &row.scrub_key_id,
+                &row.scrub_timestamp,
+                &row.pqc_completed_at,
+                &row.persist_row_hash,
+                &subject_key_ids_json,
+                &None::<i16>,
+                &row.cohort_scope,
+            ],
+        )
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("foreign key") || msg.contains("violates foreign key") {
+                Error::InvalidArgument(format!(
+                    "FK constraint violated on local attestation insert \
+                     (attesting/attested/scrub key must exist in federation_keys): {msg}"
+                ))
+            } else {
+                Error::Backend(format!("insert local attestation: {msg}"))
+            }
+        })?;
+        tx.commit()
+            .await
+            .map_err(|e| Error::Backend(format!("local attestation commit: {e}")))?;
+        Ok(attestation_id)
+    }
 }
 
 fn pg_row_to_attestation(
@@ -19680,6 +19823,116 @@ mod tests {
             matches!(err, crate::federation::BlobError::InvalidArgument(ref m)
                 if m.contains("equivocation")),
             "PG subscriber equivocation must be rejected, got: {err:?}"
+        );
+    }
+
+    // ── Cut #171 phase 1: local-tier write on live Postgres ──
+
+    fn pg_local_input(
+        attesting: &str,
+        attestation_type: &str,
+        dimension: &str,
+        subjects: Vec<String>,
+    ) -> crate::federation::types::LocalAttestationInput {
+        crate::federation::types::LocalAttestationInput {
+            attesting_key_id: attesting.into(),
+            attested_key_id: None,
+            attestation_type: attestation_type.into(),
+            weight: Some(1.0),
+            expires_at: None,
+            attestation_envelope: serde_json::json!({
+                "id": "x", "dimension": dimension, "score": 1.0, "confidence": 0.9,
+            }),
+            subject_key_ids: subjects,
+            cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_local_attestation_upsert_insert_and_gates() {
+        use crate::federation::types::attestation_type::{SCORES, WITHDRAWS};
+        use crate::federation::FederationDirectory;
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let occ = format!("occ-{}", uuid_like());
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &occ,
+                    "registry",
+                    crate::federation::types::identity_type::STEWARD,
+                ),
+            })
+            .await
+            .unwrap();
+
+        // Upsert twice on the same dimension → one local row (replace).
+        backend
+            .attestation_upsert_local(pg_local_input(&occ, SCORES, "identity_binding:v1", vec![]))
+            .await
+            .unwrap();
+        backend
+            .attestation_upsert_local(pg_local_input(&occ, SCORES, "identity_binding:v1", vec![]))
+            .await
+            .unwrap();
+        let rows = crate::federation::FederationDirectory::list_attestations_for(&backend, &occ)
+            .await
+            .unwrap();
+        let local: Vec<_> = rows
+            .iter()
+            .filter(|a| a.tier == crate::federation::types::attestation_tier::LOCAL)
+            .collect();
+        assert_eq!(
+            local.len(),
+            1,
+            "PG upsert replaces on (occurrence, dimension)"
+        );
+        assert!(local[0].scrub_signature_classical.is_empty());
+        assert_eq!(local[0].tier, "local");
+
+        // Insert appends a distinct row.
+        backend
+            .attestation_insert_local(pg_local_input(&occ, SCORES, "identity_binding:v1", vec![]))
+            .await
+            .unwrap();
+        let after = crate::federation::FederationDirectory::list_attestations_for(&backend, &occ)
+            .await
+            .unwrap();
+        let local_n = after
+            .iter()
+            .filter(|a| a.tier == crate::federation::types::attestation_tier::LOCAL)
+            .count();
+        assert_eq!(local_n, 2, "insert appends (1 upsert-survivor + 1 append)");
+
+        // Gate: capacity:* ineligible for local.
+        let err = backend
+            .attestation_upsert_local(pg_local_input(&occ, SCORES, "capacity:core:v1", vec![]))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("capacity")),
+            "got: {err:?}"
+        );
+
+        // Gate: subject-side revocation ineligible for local.
+        let err = backend
+            .attestation_upsert_local(pg_local_input(
+                &occ,
+                WITHDRAWS,
+                "consent:state:revoked:v1",
+                vec![occ.clone()],
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("revocation")),
+            "got: {err:?}"
         );
     }
 }

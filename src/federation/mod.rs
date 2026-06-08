@@ -209,6 +209,58 @@ pub trait FederationDirectory: Send + Sync {
     /// Insert a new attestation row.
     async fn put_attestation(&self, attestation: SignedAttestation) -> Result<(), Error>;
 
+    /// v4.4.0 (CIRISPersist#171, CEG §10.1.3) — **upsert** a local-tier
+    /// self-attestation (singleton current-state): replace any prior
+    /// `local` row for `(attesting_key_id, dimension)`, then insert.
+    /// Signature deferred (no hybrid sig; the row is `tier = local`,
+    /// visible only to the producing occurrence). Runs the §4.1 local-tier
+    /// gate (refuse `capacity:*` and subject-side revocations) plus the
+    /// shared admission gates (trust / dimension / cohort_scope). Returns
+    /// the new row's `attestation_id`.
+    async fn attestation_upsert_local(
+        &self,
+        input: crate::federation::types::LocalAttestationInput,
+    ) -> Result<String, Error>;
+
+    /// v4.4.0 (CIRISPersist#171) — **insert** (append) a local-tier
+    /// attestation for a multi-valued / event dimension (memory, per-
+    /// thought verdicts): a fresh row keyed by a server-assigned id, NOT
+    /// collapsed by dimension. Same gates as
+    /// [`attestation_upsert_local`](Self::attestation_upsert_local).
+    /// Returns the new `attestation_id`.
+    async fn attestation_insert_local(
+        &self,
+        input: crate::federation::types::LocalAttestationInput,
+    ) -> Result<String, Error>;
+
+    /// v4.4.0 (CIRISPersist#171) — batched [`attestation_upsert_local`]
+    /// for the boot-time `graph_nodes → attestations` backlog. Default
+    /// loops; backends MAY override for single-transaction chunking.
+    /// Returns the new ids in input order.
+    async fn attestation_upsert_local_many(
+        &self,
+        inputs: Vec<crate::federation::types::LocalAttestationInput>,
+    ) -> Result<Vec<String>, Error> {
+        let mut ids = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            ids.push(self.attestation_upsert_local(input).await?);
+        }
+        Ok(ids)
+    }
+
+    /// v4.4.0 (CIRISPersist#171) — batched [`attestation_insert_local`].
+    /// Default loops; backends MAY override for chunked single-tx insert.
+    async fn attestation_insert_local_many(
+        &self,
+        inputs: Vec<crate::federation::types::LocalAttestationInput>,
+    ) -> Result<Vec<String>, Error> {
+        let mut ids = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            ids.push(self.attestation_insert_local(input).await?);
+        }
+        Ok(ids)
+    }
+
     /// All attestations targeting `attested_key_id` (consumer asks
     /// "who vouches for K?"). Ordered by `asserted_at` DESC.
     async fn list_attestations_for(&self, attested_key_id: &str)
