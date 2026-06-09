@@ -465,13 +465,19 @@ pub struct LocalAttestationInput {
     /// revocation, not subject-naming).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subject_key_ids: Vec<String>,
-    /// Producer-side visibility scope. Defaults `federation`; a local
-    /// self-attestation typically tags `self`.
-    #[serde(
-        default = "default_cohort_scope",
-        skip_serializing_if = "is_default_cohort_scope"
-    )]
+    /// Producer-side visibility scope. **Local-tier rows MUST be
+    /// `self`** (private to the producing occurrence until promotion;
+    /// the FSD §3 / CEG §10.1.5 tier read-gate is exactly the v4.0
+    /// `self`-cohort gate). Defaults `self`; the write path rejects any
+    /// other value at local tier. Promotion (v4.5) widens the scope.
+    #[serde(default = "default_self_cohort_scope")]
     pub cohort_scope: String,
+}
+
+/// Default cohort_scope for a local-tier write — `self` (private to the
+/// producing occurrence; CEG §10.1.5 tier read-gate).
+fn default_self_cohort_scope() -> String {
+    cohort_scope::SELF.to_string()
 }
 
 impl LocalAttestationInput {

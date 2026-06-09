@@ -787,7 +787,18 @@ pub fn check_local_tier_eligibility(
     dimension: Option<&str>,
     attesting_key_id: &str,
     subject_key_ids: &[String],
+    cohort_scope: &str,
 ) -> Result<(), Error> {
+    // (0) local rows are `self`-scoped (private to the producing
+    // occurrence). The v4.0 `self`-cohort read-gate then IS the tier
+    // read-gate (FSD §3 / CEG §10.1.5, AV-59); promotion widens scope.
+    if cohort_scope != crate::federation::types::cohort_scope::SELF {
+        return Err(Error::InvalidArgument(format!(
+            "local-tier attestations must be cohort_scope='self' (private to the \
+             producing occurrence until promotion; CEG §10.1.5 tier read-gate, AV-59) \
+             — got '{cohort_scope}'"
+        )));
+    }
     // (1) capacity:* — never local (anti-Goodhart §7.5 / AV-62).
     if dimension.is_some_and(|d| d.starts_with("capacity:")) {
         return Err(Error::InvalidArgument(

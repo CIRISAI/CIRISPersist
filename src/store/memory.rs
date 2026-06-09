@@ -147,6 +147,7 @@ impl MemoryBackend {
             Some(dimension.as_str()),
             &input.attesting_key_id,
             &input.subject_key_ids,
+            &input.cohort_scope,
         )?;
         crate::federation::admission::check_cohort_scope(&input.cohort_scope)?;
 
@@ -715,7 +716,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut rows: Vec<_> = state
             .federation_attestations
             .iter()
-            .filter(|a| a.attested_key_id == attested_key_id)
+            .filter(|a| {
+                a.attested_key_id == attested_key_id
+                    && a.tier == crate::federation::types::attestation_tier::FEDERATION
+            })
             .cloned()
             .collect();
         // Match postgres ORDER BY asserted_at DESC.
@@ -731,7 +735,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut rows: Vec<_> = state
             .federation_attestations
             .iter()
-            .filter(|a| a.attesting_key_id == attesting_key_id)
+            .filter(|a| {
+                a.attesting_key_id == attesting_key_id
+                    && a.tier == crate::federation::types::attestation_tier::FEDERATION
+            })
             .cloned()
             .collect();
         rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));

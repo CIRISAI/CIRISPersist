@@ -1511,7 +1511,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                         scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
                      FROM federation_attestations \
-                     WHERE attested_key_id = ?1 \
+                     WHERE attested_key_id = ?1 AND tier = 'federation' \
                      ORDER BY asserted_at DESC",
                 )?;
                 let rows = stmt.query_map([&key], sqlite_row_to_attestation)?;
@@ -1535,7 +1535,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                         scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
                      FROM federation_attestations \
-                     WHERE attesting_key_id = ?1 \
+                     WHERE attesting_key_id = ?1 AND tier = 'federation' \
                      ORDER BY asserted_at DESC",
                 )?;
                 let rows = stmt.query_map([&key], sqlite_row_to_attestation)?;
@@ -6024,6 +6024,7 @@ impl SqliteBackend {
             Some(dimension.as_str()),
             &input.attesting_key_id,
             &input.subject_key_ids,
+            &input.cohort_scope,
         )?;
 
         // cohort_scope value validation (closed set).
@@ -11987,8 +11988,27 @@ mod tests {
         backend
     }
 
-    use crate::federation::types::attestation_tier::LOCAL as TIER_LOCAL;
     use crate::federation::types::attestation_type::{SCORES, WITHDRAWS};
+
+    /// Read local rows directly (the FederationDirectory trust-reads now
+    /// exclude tier='local' — AV-59 — so tests count via the DB).
+    /// Returns (tier, scrub_signature_classical) per local row.
+    fn local_rows(backend: &SqliteBackend, attesting: &str) -> Vec<(String, String)> {
+        let conn = backend.conn_handle();
+        let conn = conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT tier, scrub_signature_classical FROM federation_attestations \
+                 WHERE attesting_key_id = ?1 AND tier = 'local'",
+            )
+            .unwrap();
+        stmt.query_map([attesting], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+    }
 
     #[tokio::test]
     async fn sqlite_local_upsert_replaces_on_dimension() {
@@ -12002,15 +12022,20 @@ mod tests {
             .attestation_upsert_local(local_input("occ", SCORES, "identity_binding:v1", vec![]))
             .await
             .unwrap();
-        let rows = crate::federation::FederationDirectory::list_attestations_for(&backend, "occ")
+        let local = local_rows(&backend, "occ");
+        assert_eq!(local.len(), 1, "upsert replaces on (occurrence, dimension)");
+        assert_eq!(local[0].0, "local");
+        assert!(
+            local[0].1.is_empty(),
+            "local row carries the deferred empty-sentinel signature"
+        );
+        // AV-59: the FederationDirectory trust-read does NOT surface local.
+        let trust = crate::federation::FederationDirectory::list_attestations_for(&backend, "occ")
             .await
             .unwrap();
-        let local: Vec<_> = rows.iter().filter(|a| a.tier == TIER_LOCAL).collect();
-        assert_eq!(local.len(), 1, "upsert replaces on (occurrence, dimension)");
-        assert_eq!(local[0].tier, "local");
         assert!(
-            local[0].scrub_signature_classical.is_empty(),
-            "local row carries the deferred empty-sentinel signature"
+            trust.is_empty(),
+            "local rows must not leak through the federation trust-read (AV-59)"
         );
     }
 
@@ -12026,11 +12051,11 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(id1, id2, "append yields distinct ids");
-        let rows = crate::federation::FederationDirectory::list_attestations_for(&backend, "occ")
-            .await
-            .unwrap();
-        let local = rows.iter().filter(|a| a.tier == TIER_LOCAL).count();
-        assert_eq!(local, 2, "insert appends, never collapses by dimension");
+        assert_eq!(
+            local_rows(&backend, "occ").len(),
+            2,
+            "insert appends, never collapses by dimension"
+        );
     }
 
     #[tokio::test]
@@ -12069,6 +12094,18 @@ mod tests {
         assert!(
             matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("revocation")),
             "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_local_rejects_non_self_cohort_scope() {
+        let backend = fresh_backend_with_occurrence("occ").await;
+        let mut input = local_input("occ", SCORES, "identity_binding:v1", vec![]);
+        input.cohort_scope = crate::federation::types::cohort_scope::FEDERATION.to_string();
+        let err = backend.attestation_upsert_local(input).await.unwrap_err();
+        assert!(
+            matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("self")),
+            "local rows must be cohort_scope='self'; got: {err:?}"
         );
     }
 

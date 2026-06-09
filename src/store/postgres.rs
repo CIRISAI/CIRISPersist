@@ -1797,7 +1797,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
                  FROM cirislens.federation_attestations \
-                 WHERE attested_key_id = $1 \
+                 WHERE attested_key_id = $1 AND tier = 'federation' \
                  ORDER BY asserted_at DESC",
                 &[&attested_key_id],
             )
@@ -1824,7 +1824,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
                  FROM cirislens.federation_attestations \
-                 WHERE attesting_key_id = $1 \
+                 WHERE attesting_key_id = $1 AND tier = 'federation' \
                  ORDER BY asserted_at DESC",
                 &[&attesting_key_id],
             )
@@ -6050,6 +6050,7 @@ impl PostgresBackend {
             Some(dimension.as_str()),
             &input.attesting_key_id,
             &input.subject_key_ids,
+            &input.cohort_scope,
         )?;
         crate::federation::admission::check_cohort_scope(&input.cohort_scope)?;
 
@@ -19881,34 +19882,45 @@ mod tests {
             .attestation_upsert_local(pg_local_input(&occ, SCORES, "identity_binding:v1", vec![]))
             .await
             .unwrap();
-        let rows = crate::federation::FederationDirectory::list_attestations_for(&backend, &occ)
-            .await
-            .unwrap();
-        let local: Vec<_> = rows
-            .iter()
-            .filter(|a| a.tier == crate::federation::types::attestation_tier::LOCAL)
-            .collect();
+        // Read local rows directly — the FederationDirectory trust-read
+        // excludes tier='local' (AV-59).
+        let count_local = |occ: &str| {
+            let occ = occ.to_string();
+            let backend = &backend;
+            async move {
+                let client = backend.get_client().await.unwrap();
+                let row = client
+                    .query_one(
+                        "SELECT COUNT(*)::int8 FROM cirislens.federation_attestations \
+                          WHERE attesting_key_id = $1 AND tier = 'local'",
+                        &[&occ],
+                    )
+                    .await
+                    .unwrap();
+                row.try_get::<_, i64>(0).unwrap()
+            }
+        };
         assert_eq!(
-            local.len(),
+            count_local(&occ).await,
             1,
             "PG upsert replaces on (occurrence, dimension)"
         );
-        assert!(local[0].scrub_signature_classical.is_empty());
-        assert_eq!(local[0].tier, "local");
+        // AV-59: federation trust-read does not surface local rows.
+        let trust = crate::federation::FederationDirectory::list_attestations_for(&backend, &occ)
+            .await
+            .unwrap();
+        assert!(trust.is_empty(), "local rows must not leak (AV-59)");
 
         // Insert appends a distinct row.
         backend
             .attestation_insert_local(pg_local_input(&occ, SCORES, "identity_binding:v1", vec![]))
             .await
             .unwrap();
-        let after = crate::federation::FederationDirectory::list_attestations_for(&backend, &occ)
-            .await
-            .unwrap();
-        let local_n = after
-            .iter()
-            .filter(|a| a.tier == crate::federation::types::attestation_tier::LOCAL)
-            .count();
-        assert_eq!(local_n, 2, "insert appends (1 upsert-survivor + 1 append)");
+        assert_eq!(
+            count_local(&occ).await,
+            2,
+            "insert appends (1 upsert-survivor + 1 append)"
+        );
 
         // Gate: capacity:* ineligible for local.
         let err = backend
