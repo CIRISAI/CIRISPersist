@@ -5,6 +5,28 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [4.7.0] — 2026-06-09
+
+**Typed `register_public_key` — `Registered` / `AlreadyRegistered` / `RotationCollision` (CIRISPersist#177; CEG §0.0; gates CIRISAgent#809).**
+
+`register_public_key` (the agent's sole boot-time key-registration call → `accord_public_keys`) now returns a **typed result dict** instead of `None`. Consumers stop reverse-engineering the insert-vs-match-vs-rotation determination from an exception string (`str(exc).lower()` for `"already"/"exists"/"conflict"`) — per CEG §0.0 the substrate authors the trust-relevant signal; the consumer surfaces it.
+
+**The bug this fixes is sharper than "fragile string-match":** the prior path was `INSERT … ON CONFLICT (key_id) DO NOTHING` with **no collision detection at all**. A same-`key_id`/different-pubkey rotation was **silently swallowed** — invisible, not mis-reported. So the agent's rotation-collision handler (CIRISAgent#809) was **dead code**: the signal it branched on never existed. This release makes a key rotation observable for the first time.
+
+### Added
+- **`store::KeyRegistrationOutcome`** — `Registered` (newly inserted) / `AlreadyRegistered` (idempotent same-pubkey match — the steady-state reboot path) / `RotationCollision { existing_key_fingerprint }` (same `key_id`, **different** pubkey — a rotation / potential-compromise signal). A collision is a **normal return value, not an error** — the idempotent boot path stays non-throwing.
+- **`store::classify_key_registration`** (pure, exhaustively unit-tested incl. the TOCTOU edge — never fabricates a false rotation alarm) + **`store::accord_key_fingerprint`** (SHA-256 hex of the **stored** pubkey).
+- **`PostgresBackend::register_accord_public_key` / `SqliteBackend::register_accord_public_key`** — `INSERT … ON CONFLICT DO NOTHING` → read-after-conflict on the same connection → classify. Collision is **non-destructive** (the stored pubkey is never overwritten).
+
+### Changed — PyO3 surface
+`register_public_key(...)` returns a dict `{ "status", "key_id", ["existing_key_fingerprint"] }` (was `None`). `status` ∈ `"registered" | "already_registered" | "rotation_collision"`; `existing_key_fingerprint` is present only for `rotation_collision`. The agent replaces its `except`-string block with a typed match and surfaces `rotation_collision` on `/v1/system/health` (#809). Source-compatible for callers that ignored the return.
+
+### Scope
+Targets `register_public_key` per the agent's confirmation that it is the agent's *sole* key-registration call (`put_public_key`/`federation_keys` is reached only inside Edge's Rust). Whether the agent's federation signing key should instead live in `federation_keys` (which already has Conflict detection) is a CEG-native key-model question — **CIRISAgent#840, out of scope here**.
+
+### Tests
+Pure classifier (5 cases: insert / idempotent / collision-fingerprint / TOCTOU / status tokens) + **SQLite and live-PG round-trips** (registered → already_registered → rotation_collision, asserting fingerprint-of-stored + non-destructive). **1052 lib green on SQLite, 753 on live PG**; `-D warnings` + clippy clean.
+
 ## [4.6.1] — 2026-06-09
 
 **Re-pin the CIRISVerify stack to v5.0.0 — the CEG 1.0 / Agent 3.0 substrate release.**
