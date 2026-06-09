@@ -2014,11 +2014,10 @@ impl PyEngine {
         catch_panic(|| {
             let value: serde_json::Value = serde_json::from_str(envelope_json)
                 .map_err(|e| PyValueError::new_err(format!("envelope JSON decode: {e}")))?;
-            let bytes = <PythonJsonDumpsCanonicalizer as crate::verify::canonical::Canonicalizer>::canonicalize_value(
-            &PythonJsonDumpsCanonicalizer,
-            &value,
-        )
-        .map_err(|e| PyRuntimeError::new_err(format!("canonicalize: {e}")))?;
+            // v4.6 (#176) — produce-side gate: producers signing over these
+            // bytes emit Python pre-cut, JCS post-cut (one-line flip).
+            let bytes = crate::verify::canonical::ceg_produce_canonicalize(&value)
+                .map_err(|e| PyRuntimeError::new_err(format!("canonicalize: {e}")))?;
             Ok(PyBytes::new(py, &bytes).unbind())
         })
     }

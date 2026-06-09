@@ -5,6 +5,36 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [4.6.0] — 2026-06-09
+
+**JCS (RFC 8785) canonicalization cutover — foundation + signed-epoch version gate + `attestation_promote` (CIRISPersist#171/#176; CEG 1.0 §0.9; FSD `V4_6_JCS_CANONICALIZATION.md`).**
+
+persist becomes §0.9-ready. The blocker this closes: persist signs/verifies with `PythonJsonDumpsCanonicalizer` (`json.dumps(sort_keys=True, ensure_ascii=True)`), which is byte-identical to JCS *only* for pure-ASCII — the agent measured 2/6 real traces byte-identical, breaking on non-English `thought_content`/`rationale` and the `⚠️` disclosure emoji. This cut lands the JCS machinery **flip-ready but inert** (produce stays Python until the one-line cutover at the 2.9.6 substrate triple), plus the mandatory signed-epoch version gate so pre-cut Python rows stay verifiable forever, plus `attestation_promote` (the #171 phase-2 piece JCS unblocks). **persist 4.6 ships FIRST**; the agent validates byte-identity via CIRISConformance#9, then bumps pins (OQ-4).
+
+### Added — JCS foundation (`verify/canonical.rs`)
+- **`JcsCanonicalizer`** — wraps `ciris_verify_core::jcs::canonicalize` (CIRISVerify v4.11.0, the single cross-impl-blessed JCS impl; OQ-1). No second JCS impl to keep in lockstep.
+- **`CanonVersion {V1Python, V2Jcs}`** + **`canonicalizer_for(version) -> &'static dyn Canonicalizer`** (static dispatch over `PYTHON_CANON`/`JCS_CANON`).
+- **`produce_canon_version() -> CanonVersion`** — `const`, returns `V1Python` until the 2.9.6 cutover (a one-line flip to `V2Jcs`). **`ceg_produce_canonicalize(value)`** is the single produce-side entry point; behavior-preserving today.
+
+### Added — signed-epoch version gate (the mandatory OQ-5 piece)
+The canonicalizer is selected by each row's **signed, attacker-uncontrollable** discriminator, NOT a caller flag:
+- **Traces** (`verify/ed25519.rs::canon_version_for_trace_schema`): `trace_schema_version` major ≥ 3 → JCS, else Python. Wired into production trace verify (`server/pipeline.rs`, `ingest.rs`). Inert until 3.x enters `SUPPORTED_VERSIONS`.
+- **`persist_row_hash` stays Python (OQ-2)** — internal-only, never crosses the federation boundary; flipping it would break existing rows' integrity recompute. The ingest component scrub-diff likewise stays Python (not a boundary signing surface; FSD §scope).
+
+### Added — `Engine::attestation_promote(attestation_id) -> Result<bool>` (#171 phase 2)
+Promotes a **local**-tier self-attestation to **federation** tier: canonicalize the envelope via the produce gate → `sha256` → `Engine::sign_hybrid` (Ed25519 + ML-DSA-65) → write the scrub envelope + flip `tier=federation` + stamp `promoted_at`. The signing bytes are the §0.9-canonical envelope, so a promoted row is byte-identical on the wire to a natively-federation attestation (Registry must #1 holds once JCS is live). Idempotent: re-promoting a `federation` row returns `Ok(false)`. New `FederationDirectory::{get_attestation, promote_attestation}` on all three backends (Postgres / SQLite / memory). PyO3 binding deferred pending the agent-facing shape decision (synchronous-hybrid vs. classical-write-then-PQC-sweep) — Engine + storage surface is complete and tested.
+
+### Fixed — latent Postgres UUID-serialization bug on the deferred-PQC completion path
+`attach_attestation_pqc_signature` / `attach_revocation_pqc_signature` bound a `&str` against a `$N::uuid` param — which panics with `error serializing parameter 0` on real Postgres. These run in production via `Engine.run_pqc_sweep` (PyO3), but were covered **only** on the in-memory backend (string-keyed map, never exercised the driver), so the bug was invisible. Both now parse to `uuid::Uuid` before binding (the proven `put_revocation` pattern). **CI gap closed** with a live-PG attach round-trip test for both paths.
+
+### Tests
+- `attestation_promote` round-trip on **both** backends (SQLite + live PG): `local → promote → tier=federation` + hybrid scrub envelope populated + 64-hex `original_content_hash` + `promoted_at` stamped + envelope untouched + idempotent re-promote; missing-row → `InvalidArgument`.
+- JCS foundation: production-JCS-matches-RFC8785-reference, version-gate routing, the agent-measured divergence corpus, trace-schema major-version gate.
+- **1045 lib tests green on SQLite, 747 on live PG**; `-D warnings` clean across no-default / `test-panic,pyo3` / full `--tests`; clippy clean.
+
+### Migration / lockstep
+Behavior is **unchanged** this release — produce stays Python, verify already gates per-row. The cutover is a separate, coordinated event: at the **2.9.6 substrate triple** (agent 3.0 JCS + persist 4.6 + ciris-verify 4.11.0 + edge + lens), flip `produce_canon_version()` to `V2Jcs`. **Upstream ask (OQ-1):** CIRISVerify must expose `jcs::canonicalize` as a Python binding so the agent producer canonicalizes byte-identically.
+
 ## [4.5.0] — 2026-06-09
 
 **Shared CEG attestation surface — `attestation_query` filters (CIRISPersist#171; CEG 0.15 §10.1.5.4).**

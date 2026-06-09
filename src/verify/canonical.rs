@@ -78,12 +78,26 @@ pub trait Canonicalizer: Send + Sync {
 }
 
 /// Phase 1 canonicalizer — byte-exact match with the agent's
-/// `json.dumps(canonical, sort_keys=True, separators=(",", ":"),
-/// ensure_ascii=True)` output.
+/// `json.dumps(canonical, sort_keys=True, separators=(",", ":"))` output.
 ///
-/// `ensure_ascii=True` is Python's default; the agent code in
-/// `accord_metrics/services.py:208-368` does not pass
-/// `ensure_ascii=False`, so the wire is ASCII-only.
+/// The agent's signing sites
+/// (`ciris_adapters/ciris_accord_metrics/services.py:450`,
+/// `authentication/service.py`, `dsar/signature_service.py`) pass **no**
+/// `ensure_ascii` argument, so Python applies its default
+/// **`ensure_ascii=True`**: every non-ASCII codepoint is `\uXXXX`-escaped
+/// (BMP) or surrogate-pair-escaped (non-BMP). This canonicalizer escapes
+/// identically (see [`write_string`]), so the produced bytes are
+/// pure-ASCII and byte-match the agent in **every** language.
+///
+/// **Contrast with JCS (the v4.6 flip target):** RFC 8785 §3.2.2.2 emits
+/// **raw UTF-8** for non-ASCII (escaping only `"`, `\`, C0 controls). So
+/// Python-compat and JCS agree on pure-ASCII payloads but **diverge on
+/// every non-ASCII character** — not merely the non-BMP tail. Per the
+/// CIRISAgent #174 measurement, that breaking set is the majority of the
+/// multilingual corpus (any `thought_content`/`rationale` in a non-Latin
+/// locale, plus the `⚠️` attestation-disclosure emoji on English traces).
+/// This is why the v4.6 flip needs a signed-epoch version gate, not a
+/// naked swap.
 pub struct PythonJsonDumpsCanonicalizer;
 
 impl Canonicalizer for PythonJsonDumpsCanonicalizer {
@@ -113,6 +127,86 @@ impl Canonicalizer for Rfc8785Canonicalizer {
             .map(|s| s.into_bytes())
             .map_err(|e| Error::Canonicalization(e.to_string()))
     }
+}
+
+/// v4.6 (CIRISPersist#171 / CEG §0.9) — the **JCS (RFC 8785)**
+/// canonicalizer: the CEG-1.0 signing canonicalization. Production impl,
+/// delegating to the single blessed cross-impl implementation
+/// [`ciris_verify_core::jcs::canonicalize`] (OQ-1) so persist's bytes are
+/// byte-identical to what CIRISVerify and the agent (3.0) recompute — no
+/// second JCS impl to keep in lockstep. Selected for post-flip rows by
+/// the signed-epoch version gate ([`canonicalizer_for`]).
+///
+/// Unlike [`PythonJsonDumpsCanonicalizer`] this emits **raw UTF-8** for
+/// non-ASCII (RFC 8785 §3.2.2.2), so the two agree on pure-ASCII payloads
+/// and diverge on every non-ASCII character — the migration's whole
+/// reason for the version gate.
+pub struct JcsCanonicalizer;
+
+impl Canonicalizer for JcsCanonicalizer {
+    fn canonicalize_value(&self, v: &serde_json::Value) -> Result<Vec<u8>, Error> {
+        ciris_verify_core::jcs::canonicalize(v)
+            .map_err(|e| Error::Canonicalization(format!("jcs (rfc 8785): {e}")))
+    }
+}
+
+/// v4.6 (CIRISPersist#171 / CEG §0.9 / CIRISAgent#840) — the CEG
+/// canonicalization version: the signed-epoch discriminator for the JCS
+/// migration. `V1Python` is the pre-flip Python-compat rule; `V2Jcs` is
+/// the 2.9.6 RFC 8785 flip. A row's version is read from a
+/// **signed-bytes-bound** field (`crypto_kind` for federation signatures
+/// / the producer's schema epoch for traces) so an attacker flipping the
+/// discriminator only ever causes a canonicalization *mismatch →
+/// rejection*, never a check bypass (§6 downgrade guard). The exact
+/// per-surface field + boundary value is pinned with the agent during
+/// the CIRISConformance#9 byte-identity validation before the 2.9.6
+/// pin-bump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonVersion {
+    /// Pre-flip: Python `json.dumps(sort_keys=True, ensure_ascii=True)`.
+    V1Python,
+    /// 2.9.6 flip: RFC 8785 JCS.
+    V2Jcs,
+}
+
+static PYTHON_CANON: PythonJsonDumpsCanonicalizer = PythonJsonDumpsCanonicalizer;
+static JCS_CANON: JcsCanonicalizer = JcsCanonicalizer;
+
+/// v4.6 — the version gate: select the canonicalizer for a row's signed
+/// [`CanonVersion`]. The single point the JCS migration routes through;
+/// verify reads the version per-row (so persist verifies both pre-cut
+/// Python and post-cut JCS), and the produce side stamps the current
+/// epoch's version.
+pub fn canonicalizer_for(version: CanonVersion) -> &'static dyn Canonicalizer {
+    match version {
+        CanonVersion::V1Python => &PYTHON_CANON,
+        CanonVersion::V2Jcs => &JCS_CANON,
+    }
+}
+
+/// v4.6 (CIRISPersist#171 / #176) — the canonicalization version persist
+/// **produces** at today. Until the coordinated **2.9.6 cutover**, persist
+/// emits `V1Python` so the still-Python chain (agent ≤ 2.9.5, lens, edge)
+/// can verify persist-produced federation rows; the cutover flips this to
+/// `V2Jcs` in lockstep. It is a `const fn`, not a runtime toggle — the
+/// flip is a release event coordinated chain-wide (the activation is a
+/// one-line change here, re-released as the 2.9.6 triple lands). The
+/// **verify** side gates per-row regardless ([`canonicalizer_for`] keyed
+/// on the row's signed epoch), so persist verifies both V1 and V2 rows no
+/// matter what it produces.
+pub const fn produce_canon_version() -> CanonVersion {
+    // 2.9.6 cutover flips this to CanonVersion::V2Jcs (lockstep).
+    CanonVersion::V1Python
+}
+
+/// v4.6 — canonicalize a payload persist is about to **sign/emit**, via
+/// the [`produce_canon_version`] gate. The single produce-side
+/// canonicalization entry point: routing every persist-produced signing
+/// payload through here makes the 2.9.6 flip a one-line change and keeps
+/// the produce epoch consistent across all surfaces (withdraws /
+/// holds_bytes / attestation_promote / key registration / FFI).
+pub fn ceg_produce_canonicalize(value: &serde_json::Value) -> Result<Vec<u8>, Error> {
+    canonicalizer_for(produce_canon_version()).canonicalize_value(value)
 }
 
 // ─── Python-compat writer ──────────────────────────────────────────
@@ -441,6 +535,80 @@ mod tests {
         // Python form has the escape literal; JCS has UTF-8 bytes.
         assert!(py.contains("\\u00e9"), "python emits backslash-u-escape");
         assert!(j.contains("\u{00e9}"), "jcs emits raw UTF-8");
+    }
+
+    // ─── v4.6 JCS flip: production JcsCanonicalizer + version gate ───
+
+    fn jcs_prod(v: serde_json::Value) -> String {
+        String::from_utf8(JcsCanonicalizer.canonicalize_value(&v).unwrap()).unwrap()
+    }
+
+    /// OQ-1: the production `JcsCanonicalizer` (delegating to
+    /// `ciris_verify_core::jcs`) is byte-identical to the in-tree
+    /// `serde_json_canonicalizer` reference across ASCII + non-ASCII +
+    /// nested — i.e. the blessed impl IS RFC 8785. If this ever drifts,
+    /// persist and Verify would disagree on the wire.
+    #[test]
+    fn production_jcs_matches_rfc8785_reference() {
+        for v in [
+            json!({"k": "hello", "n": 42, "list": [1, 2, 3]}),
+            json!({"dimension": "config:filter:v1", "score": 1, "z": true, "a": null}),
+            json!({"msg": "用户 ⚠️ héllo", "nested": {"ar": "مرحبا", "am": "ሰላም"}}),
+        ] {
+            assert_eq!(
+                jcs_prod(v.clone()),
+                jcs(v.clone()),
+                "ciris_verify_core::jcs must equal the RFC 8785 reference for {v}"
+            );
+        }
+    }
+
+    /// The version gate routes V1→Python-compat, V2→JCS.
+    #[test]
+    fn version_gate_routes() {
+        let v = json!({"k": "héllo"});
+        let via_v1 = String::from_utf8(
+            canonicalizer_for(CanonVersion::V1Python)
+                .canonicalize_value(&v)
+                .unwrap(),
+        )
+        .unwrap();
+        let via_v2 = String::from_utf8(
+            canonicalizer_for(CanonVersion::V2Jcs)
+                .canonicalize_value(&v)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(via_v1, pyc(v.clone()), "V1 = Python-compat");
+        assert_eq!(via_v2, jcs_prod(v), "V2 = JCS");
+        assert_ne!(
+            via_v1, via_v2,
+            "the two epochs produce different bytes on non-ASCII"
+        );
+    }
+
+    /// Encodes the CIRISAgent #174 measurement: ASCII identical, but the
+    /// real breaking corpus (non-Latin reasoning text + the ⚠️
+    /// attestation-disclosure emoji on English GENERIC traces) diverges —
+    /// NOT just a non-BMP tail. This is why the version gate is mandatory.
+    #[test]
+    fn agent_measured_divergence_corpus() {
+        // ✅ pure-ASCII trace shape — identical (no gate needed).
+        let ascii_trace =
+            json!({"dimension":"identity_binding:v1","score":1,"thought_content":"ok"});
+        assert_eq!(pyc(ascii_trace.clone()), jcs_prod(ascii_trace));
+        // ❌ the ⚠️ disclosure emoji on an otherwise-English trace.
+        let warn = json!({"context":"⚠️ WARNING: attestation"});
+        assert_ne!(pyc(warn.clone()), jcs_prod(warn));
+        // ❌ non-Latin reasoning narrative (am / zh / ar).
+        for text in ["የተደረገ", "用户推理", "سبب"] {
+            let v = json!({"rationale": text});
+            assert_ne!(
+                pyc(v.clone()),
+                jcs_prod(v),
+                "non-Latin rationale must diverge (pre-cut rows need the legacy gate): {text}"
+            );
+        }
     }
 
     #[test]

@@ -754,7 +754,6 @@ pub trait BlobStorage: Send + Sync {
         Self: Sync,
     {
         async move {
-            use crate::verify::canonical::{Canonicalizer, PythonJsonDumpsCanonicalizer};
             use base64::engine::general_purpose::STANDARD as B64;
             use base64::Engine as _;
             use sha2::{Digest, Sha256};
@@ -823,8 +822,8 @@ pub trait BlobStorage: Send + Sync {
             }
 
             let envelope = holds_bytes_attestation_envelope(sha256);
-            let canonical_bytes = PythonJsonDumpsCanonicalizer
-                .canonicalize_value(&envelope)
+            // v4.6 (#176) — produce-side gate (Python pre-cut, JCS post-cut).
+            let canonical_bytes = crate::verify::canonical::ceg_produce_canonicalize(&envelope)
                 .map_err(|e| {
                     BlobError::InvalidArgument(format!("canonicalize holds_bytes envelope: {e}"))
                 })?;

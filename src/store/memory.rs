@@ -987,6 +987,56 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(())
     }
 
+    async fn get_attestation(
+        &self,
+        attestation_id: &str,
+    ) -> Result<Option<crate::federation::Attestation>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(state
+            .federation_attestations
+            .iter()
+            .find(|a| a.attestation_id == attestation_id)
+            .cloned())
+    }
+
+    async fn promote_attestation(
+        &self,
+        attestation_id: &str,
+        scrub_signature_classical: &str,
+        scrub_signature_pqc: Option<&str>,
+        original_content_hash_hex: &str,
+        scrub_key_id: &str,
+        scrub_timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, crate::federation::Error> {
+        use crate::federation::types::attestation_tier;
+        let mut state = self.state.lock().expect("memory backend lock");
+        let row = state
+            .federation_attestations
+            .iter_mut()
+            .find(|a| a.attestation_id == attestation_id)
+            .ok_or_else(|| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "federation_attestations row {attestation_id} does not exist"
+                ))
+            })?;
+        if row.tier == attestation_tier::FEDERATION {
+            return Ok(false);
+        }
+        let now = scrub_timestamp;
+        row.original_content_hash = original_content_hash_hex.to_owned();
+        row.scrub_signature_classical = scrub_signature_classical.to_owned();
+        row.scrub_signature_pqc = scrub_signature_pqc.map(|s| s.to_owned());
+        row.scrub_key_id = scrub_key_id.to_owned();
+        row.scrub_timestamp = now;
+        row.pqc_completed_at = scrub_signature_pqc.map(|_| now);
+        row.tier = attestation_tier::FEDERATION.to_string();
+        row.promoted_at = Some(now);
+        let mut for_hash = row.clone();
+        for_hash.persist_row_hash = String::new();
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+        Ok(true)
+    }
+
     async fn attach_revocation_pqc_signature(
         &self,
         revocation_id: &str,
