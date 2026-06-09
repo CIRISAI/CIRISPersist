@@ -129,6 +129,61 @@ impl Canonicalizer for Rfc8785Canonicalizer {
     }
 }
 
+/// v4.6 (CIRISPersist#171 / CEG §0.9) — the **JCS (RFC 8785)**
+/// canonicalizer: the CEG-1.0 signing canonicalization. Production impl,
+/// delegating to the single blessed cross-impl implementation
+/// [`ciris_verify_core::jcs::canonicalize`] (OQ-1) so persist's bytes are
+/// byte-identical to what CIRISVerify and the agent (3.0) recompute — no
+/// second JCS impl to keep in lockstep. Selected for post-flip rows by
+/// the signed-epoch version gate ([`canonicalizer_for`]).
+///
+/// Unlike [`PythonJsonDumpsCanonicalizer`] this emits **raw UTF-8** for
+/// non-ASCII (RFC 8785 §3.2.2.2), so the two agree on pure-ASCII payloads
+/// and diverge on every non-ASCII character — the migration's whole
+/// reason for the version gate.
+pub struct JcsCanonicalizer;
+
+impl Canonicalizer for JcsCanonicalizer {
+    fn canonicalize_value(&self, v: &serde_json::Value) -> Result<Vec<u8>, Error> {
+        ciris_verify_core::jcs::canonicalize(v)
+            .map_err(|e| Error::Canonicalization(format!("jcs (rfc 8785): {e}")))
+    }
+}
+
+/// v4.6 (CIRISPersist#171 / CEG §0.9 / CIRISAgent#840) — the CEG
+/// canonicalization version: the signed-epoch discriminator for the JCS
+/// migration. `V1Python` is the pre-flip Python-compat rule; `V2Jcs` is
+/// the 2.9.6 RFC 8785 flip. A row's version is read from a
+/// **signed-bytes-bound** field (`crypto_kind` for federation signatures
+/// / the producer's schema epoch for traces) so an attacker flipping the
+/// discriminator only ever causes a canonicalization *mismatch →
+/// rejection*, never a check bypass (§6 downgrade guard). The exact
+/// per-surface field + boundary value is pinned with the agent during
+/// the CIRISConformance#9 byte-identity validation before the 2.9.6
+/// pin-bump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonVersion {
+    /// Pre-flip: Python `json.dumps(sort_keys=True, ensure_ascii=True)`.
+    V1Python,
+    /// 2.9.6 flip: RFC 8785 JCS.
+    V2Jcs,
+}
+
+static PYTHON_CANON: PythonJsonDumpsCanonicalizer = PythonJsonDumpsCanonicalizer;
+static JCS_CANON: JcsCanonicalizer = JcsCanonicalizer;
+
+/// v4.6 — the version gate: select the canonicalizer for a row's signed
+/// [`CanonVersion`]. The single point the JCS migration routes through;
+/// verify reads the version per-row (so persist verifies both pre-cut
+/// Python and post-cut JCS), and the produce side stamps the current
+/// epoch's version.
+pub fn canonicalizer_for(version: CanonVersion) -> &'static dyn Canonicalizer {
+    match version {
+        CanonVersion::V1Python => &PYTHON_CANON,
+        CanonVersion::V2Jcs => &JCS_CANON,
+    }
+}
+
 // ─── Python-compat writer ──────────────────────────────────────────
 
 fn write_value(buf: &mut Vec<u8>, v: &serde_json::Value) {
@@ -455,6 +510,80 @@ mod tests {
         // Python form has the escape literal; JCS has UTF-8 bytes.
         assert!(py.contains("\\u00e9"), "python emits backslash-u-escape");
         assert!(j.contains("\u{00e9}"), "jcs emits raw UTF-8");
+    }
+
+    // ─── v4.6 JCS flip: production JcsCanonicalizer + version gate ───
+
+    fn jcs_prod(v: serde_json::Value) -> String {
+        String::from_utf8(JcsCanonicalizer.canonicalize_value(&v).unwrap()).unwrap()
+    }
+
+    /// OQ-1: the production `JcsCanonicalizer` (delegating to
+    /// `ciris_verify_core::jcs`) is byte-identical to the in-tree
+    /// `serde_json_canonicalizer` reference across ASCII + non-ASCII +
+    /// nested — i.e. the blessed impl IS RFC 8785. If this ever drifts,
+    /// persist and Verify would disagree on the wire.
+    #[test]
+    fn production_jcs_matches_rfc8785_reference() {
+        for v in [
+            json!({"k": "hello", "n": 42, "list": [1, 2, 3]}),
+            json!({"dimension": "config:filter:v1", "score": 1, "z": true, "a": null}),
+            json!({"msg": "用户 ⚠️ héllo", "nested": {"ar": "مرحبا", "am": "ሰላም"}}),
+        ] {
+            assert_eq!(
+                jcs_prod(v.clone()),
+                jcs(v.clone()),
+                "ciris_verify_core::jcs must equal the RFC 8785 reference for {v}"
+            );
+        }
+    }
+
+    /// The version gate routes V1→Python-compat, V2→JCS.
+    #[test]
+    fn version_gate_routes() {
+        let v = json!({"k": "héllo"});
+        let via_v1 = String::from_utf8(
+            canonicalizer_for(CanonVersion::V1Python)
+                .canonicalize_value(&v)
+                .unwrap(),
+        )
+        .unwrap();
+        let via_v2 = String::from_utf8(
+            canonicalizer_for(CanonVersion::V2Jcs)
+                .canonicalize_value(&v)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(via_v1, pyc(v.clone()), "V1 = Python-compat");
+        assert_eq!(via_v2, jcs_prod(v), "V2 = JCS");
+        assert_ne!(
+            via_v1, via_v2,
+            "the two epochs produce different bytes on non-ASCII"
+        );
+    }
+
+    /// Encodes the CIRISAgent #174 measurement: ASCII identical, but the
+    /// real breaking corpus (non-Latin reasoning text + the ⚠️
+    /// attestation-disclosure emoji on English GENERIC traces) diverges —
+    /// NOT just a non-BMP tail. This is why the version gate is mandatory.
+    #[test]
+    fn agent_measured_divergence_corpus() {
+        // ✅ pure-ASCII trace shape — identical (no gate needed).
+        let ascii_trace =
+            json!({"dimension":"identity_binding:v1","score":1,"thought_content":"ok"});
+        assert_eq!(pyc(ascii_trace.clone()), jcs_prod(ascii_trace));
+        // ❌ the ⚠️ disclosure emoji on an otherwise-English trace.
+        let warn = json!({"context":"⚠️ WARNING: attestation"});
+        assert_ne!(pyc(warn.clone()), jcs_prod(warn));
+        // ❌ non-Latin reasoning narrative (am / zh / ar).
+        for text in ["የተደረገ", "用户推理", "سبب"] {
+            let v = json!({"rationale": text});
+            assert_ne!(
+                pyc(v.clone()),
+                jcs_prod(v),
+                "non-Latin rationale must diverge (pre-cut rows need the legacy gate): {text}"
+            );
+        }
     }
 
     #[test]
