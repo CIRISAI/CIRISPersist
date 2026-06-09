@@ -5,6 +5,16 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [4.6.1] — 2026-06-09
+
+**Re-pin the CIRISVerify stack to v5.0.0 — the CEG 1.0 / Agent 3.0 substrate release.**
+
+`ciris-verify-core` / `ciris-keyring` / `ciris-crypto` move `v4.11.0 → v5.0.0` (tag + `version = "5"`, all six platform pins). The major bump is a **substrate-coherence milestone** (CEG 1.0 / Agent 3.0), not a breaking Rust API change for persist:
+- **CIRISVerify#61 (our OQ-1 ask) shipped** — `from ciris_verify import jcs_canonicalize` is now a Python binding over the same `ciris_verify_core::jcs::canonicalize` persist already consumes (Rust side). This unblocks the **agent producer** side of the 2.9.6 JCS cutover; persist's consumption is unchanged.
+- **CIRISVerify#60** adds `KeyAttestationResult.boundary_degraded: bool` (hardware-absent vs. hardware-present-but-compromised). persist reads platform-attestation types but does **not** construct `KeyAttestationResult`, so this is additive here.
+
+No persist code change — purely the dependency pin. **1045 lib green on SQLite, 747 on live PG** against v5.0.0; `-D warnings` + clippy clean. Keeps the substrate workspace-coherent at the v5/CEG-1.0 line ahead of the 2.9.6 triple.
+
 ## [4.6.0] — 2026-06-09
 
 **JCS (RFC 8785) canonicalization cutover — foundation + signed-epoch version gate + `attestation_promote` (CIRISPersist#171/#176; CEG 1.0 §0.9; FSD `V4_6_JCS_CANONICALIZATION.md`).**
