@@ -911,6 +911,16 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // v4.0 — value-validation admission (consensus_protocol
         // canonical form). Mirrors put_family.
         crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
+        // v4.11.0 (#154 Ask 4) — geographic cohort_subkind admission. Runs
+        // BEFORE the state lock below: it reads via list_location_proofs_for
+        // (which locks state itself), so calling it under the lock would
+        // deadlock. No-op for non-geographic communities.
+        crate::federation::location::check_geographic_community_admission(
+            self,
+            &row,
+            chrono::Utc::now(),
+        )
+        .await?;
         let mut state = self.state.lock().expect("memory backend lock");
         if !state.federation_keys.contains_key(&row.community_key_id) {
             return Err(crate::federation::Error::InvalidArgument(format!(
@@ -1101,6 +1111,26 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by_key(|p| p.asserted_at);
+        Ok(rows)
+    }
+
+    async fn communities_containing(
+        &self,
+        cell_id: &str,
+    ) -> Result<Vec<crate::federation::Community>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_communities
+            .values()
+            .filter(|c| {
+                crate::federation::location::geographic_constraint_cell(c.policy_blob.as_ref())
+                    .is_some_and(|constraint| {
+                        crate::federation::location::h3_cell_contained(cell_id, &constraint)
+                    })
+            })
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.community_key_id.cmp(&b.community_key_id));
         Ok(rows)
     }
 

@@ -101,6 +101,77 @@ pub fn h3_cell_contained(contained_cell_id: &str, container_cell_id: &str) -> bo
     contained.parent(container.resolution()) == Some(container)
 }
 
+/// v4.11.0 (CIRISPersist#154 Ask 4) — read a geographic community's
+/// containment cell from its `policy_blob`. Returns `Some(cell_id)` iff
+/// `policy_blob.cohort_subkind == "geographic"` and a
+/// `geographic_constraint.cell_id` string is present. `None` for any
+/// non-geographic (or absent) policy — those admit on consensus_protocol
+/// alone (the §8.1.13.2 dispatcher's default arm).
+///
+/// Shape: `{"cohort_subkind": "geographic",
+///          "geographic_constraint": {"cell_id": "<h3>", "cell_resolution": N}}`.
+pub fn geographic_constraint_cell(policy_blob: Option<&serde_json::Value>) -> Option<String> {
+    let blob = policy_blob?;
+    if blob.get("cohort_subkind").and_then(|v| v.as_str()) != Some("geographic") {
+        return None;
+    }
+    blob.get("geographic_constraint")?
+        .get("cell_id")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// v4.11.0 (CIRISPersist#154 Ask 4 / §8.1.13.2 geographic predicate) —
+/// is `member_proofs` sufficient to admit a member into a geographic
+/// community bounded by `constraint_cell`? True iff the member has at
+/// least one **in-force** (`withdrawn_at` unset), **unexpired**
+/// (`valid_until` unset or `> now`) `location_proof` whose cell is
+/// [`h3_cell_contained`] within `constraint_cell`. No valid contained
+/// proof → not admissible (the §8.1.13.2 `return Ok(false)` path).
+pub fn member_in_geographic_constraint(
+    constraint_cell: &str,
+    member_proofs: &[crate::federation::LocationProof],
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    member_proofs.iter().any(|p| {
+        p.withdrawn_at.is_none()
+            && p.valid_until.map_or(true, |vu| vu > now)
+            && h3_cell_contained(&p.cell_id, constraint_cell)
+    })
+}
+
+/// v4.11.0 (CIRISPersist#154 Ask 4, CEG 0.8 §8.1.13.2) — the geographic
+/// `cohort_subkind` admission predicate, run on `put_community`. For a
+/// geographic community (per [`geographic_constraint_cell`]), **every**
+/// member of the submitted roster MUST hold an in-force, contained
+/// `location_proof` ([`member_in_geographic_constraint`]) — else the
+/// community is refused. Non-geographic communities pass through (admit
+/// on `consensus_protocol` alone). Reads each member's proofs through the
+/// directory, so it runs before the write on every backend.
+pub async fn check_geographic_community_admission<D>(
+    dir: &D,
+    community: &crate::federation::Community,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Error>
+where
+    D: crate::federation::FederationDirectory + ?Sized,
+{
+    let Some(constraint_cell) = geographic_constraint_cell(community.policy_blob.as_ref()) else {
+        return Ok(());
+    };
+    for m in &community.members {
+        let proofs = dir.list_location_proofs_for(&m.key_id).await?;
+        if !member_in_geographic_constraint(&constraint_cell, &proofs, now) {
+            return Err(Error::InvalidArgument(format!(
+                "geographic community member {} has no in-force location_proof contained in the \
+                 constraint cell {constraint_cell} (CEG §8.1.13.2)",
+                m.key_id
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,6 +253,72 @@ mod tests {
             .to_cell(h3o::Resolution::Three)
             .to_string();
         assert!(!h3_cell_contained(&a, &b));
+    }
+
+    #[test]
+    fn geographic_constraint_cell_reads_geographic_policy() {
+        let geo = serde_json::json!({
+            "cohort_subkind": "geographic",
+            "geographic_constraint": {"cell_id": "abc", "cell_resolution": 3}
+        });
+        assert_eq!(
+            geographic_constraint_cell(Some(&geo)),
+            Some("abc".to_string())
+        );
+        // Non-geographic / absent → None (admit on consensus alone).
+        let other = serde_json::json!({"cohort_subkind": "operator_defined"});
+        assert_eq!(geographic_constraint_cell(Some(&other)), None);
+        assert_eq!(geographic_constraint_cell(None), None);
+    }
+
+    #[test]
+    fn member_admission_requires_in_force_contained_unexpired_proof() {
+        use crate::federation::LocationProof;
+        let ll = h3o::LatLng::new(37.0, -122.0).unwrap();
+        let constraint = ll.to_cell(h3o::Resolution::Three).to_string();
+        let inside7 = ll.to_cell(h3o::Resolution::Seven).to_string();
+        let now: chrono::DateTime<chrono::Utc> = "2026-06-09T00:00:00Z".parse().unwrap();
+        let proof =
+            |cell: &str, withdrawn: Option<&str>, valid_until: Option<&str>| LocationProof {
+                subject_key_id: "m".into(),
+                cell_id: cell.into(),
+                cell_resolution: 7,
+                asserted_at: "2026-06-01T00:00:00Z".parse().unwrap(),
+                valid_until: valid_until.map(|s| s.parse().unwrap()),
+                attestation_evidence: None,
+                withdrawn_at: withdrawn.map(|s| s.parse().unwrap()),
+                persist_row_hash: String::new(),
+            };
+        // in-force, contained, unexpired → admit.
+        assert!(member_in_geographic_constraint(
+            &constraint,
+            &[proof(&inside7, None, None)],
+            now
+        ));
+        // withdrawn → not.
+        assert!(!member_in_geographic_constraint(
+            &constraint,
+            &[proof(&inside7, Some("2026-06-05T00:00:00Z"), None)],
+            now
+        ));
+        // expired → not.
+        assert!(!member_in_geographic_constraint(
+            &constraint,
+            &[proof(&inside7, None, Some("2026-06-05T00:00:00Z"))],
+            now
+        ));
+        // outside the constraint (Sydney res-7) → not.
+        let outside = h3o::LatLng::new(-33.8, 151.2)
+            .unwrap()
+            .to_cell(h3o::Resolution::Seven)
+            .to_string();
+        assert!(!member_in_geographic_constraint(
+            &constraint,
+            &[proof(&outside, None, None)],
+            now
+        ));
+        // no proofs → not.
+        assert!(!member_in_geographic_constraint(&constraint, &[], now));
     }
 
     #[test]
