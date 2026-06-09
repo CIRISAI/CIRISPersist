@@ -1885,6 +1885,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<(), crate::federation::Error> {
         let mut row = community.community;
         crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
+        // v4.11.0 (#154 Ask 4) — geographic cohort_subkind admission: every
+        // member must hold an in-force contained location_proof. Reads run
+        // before the write lock below. No-op for non-geographic communities.
+        crate::federation::location::check_geographic_community_admission(
+            self,
+            &row,
+            chrono::Utc::now(),
+        )
+        .await?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let members_json = serde_json::to_string(&row.members)
             .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
@@ -2198,6 +2207,40 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             rows.collect()
         })()
         .map_err(|e| crate::federation::Error::Backend(format!("list_location_proofs_for: {e}")))
+    }
+
+    async fn communities_containing(
+        &self,
+        cell_id: &str,
+    ) -> Result<Vec<crate::federation::Community>, crate::federation::Error> {
+        // Prefilter to geographic communities in SQL, then h3-filter in
+        // Rust (community cardinality is small; no spatial index).
+        let conn = self.conn.clone();
+        let all: Vec<crate::federation::Community> =
+            (move || -> Result<Vec<_>, rusqlite::Error> {
+                let conn = conn.lock();
+                let mut stmt = conn.prepare(
+                    "SELECT community_key_id, community_name, members, founded_at, \
+                        consensus_protocol, policy_blob, persist_row_hash \
+                     FROM federation_communities \
+                     WHERE json_extract(policy_blob, '$.cohort_subkind') = 'geographic' \
+                     ORDER BY community_key_id ASC",
+                )?;
+                let rows = stmt.query_map([], sqlite_row_to_community)?;
+                rows.collect()
+            })()
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("communities_containing: {e}"))
+            })?;
+        Ok(all
+            .into_iter()
+            .filter(|c| {
+                crate::federation::location::geographic_constraint_cell(c.policy_blob.as_ref())
+                    .is_some_and(|constraint| {
+                        crate::federation::location::h3_cell_contained(cell_id, &constraint)
+                    })
+            })
+            .collect())
     }
 
     async fn attach_key_pqc_signature(
@@ -11494,6 +11537,99 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// v4.11.0 (#154 Ask 4/5) — geographic community admission gates each
+    /// member on an in-force contained location_proof; `communities_
+    /// containing` finds the community for a cell inside its constraint.
+    #[tokio::test]
+    async fn geographic_community_admission_and_containing() {
+        use crate::federation::{
+            Community, CommunityMember, LocationProof, SignedCommunity, SignedLocationProof,
+        };
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in ["geo-comm", "alice", "bob"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, k, k),
+                })
+                .await
+                .unwrap();
+        }
+        let ll = h3o::LatLng::new(37.0, -122.0).unwrap();
+        let constraint = ll.to_cell(h3o::Resolution::Three).to_string();
+        let inside = ll.to_cell(h3o::Resolution::Seven).to_string();
+
+        // alice has an in-force contained proof; bob has none.
+        backend
+            .put_location_proof(SignedLocationProof {
+                location_proof: LocationProof {
+                    subject_key_id: "alice".into(),
+                    cell_id: inside.clone(),
+                    cell_resolution: 7,
+                    asserted_at: "2026-06-01T00:00:00Z".parse().unwrap(),
+                    valid_until: None,
+                    attestation_evidence: None,
+                    withdrawn_at: None,
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .unwrap();
+
+        let geo_policy = serde_json::json!({
+            "cohort_subkind": "geographic",
+            "geographic_constraint": {"cell_id": constraint, "cell_resolution": 3}
+        });
+        let community = |members: Vec<&str>| SignedCommunity {
+            community: Community {
+                community_key_id: "geo-comm".into(),
+                community_name: "Geo".into(),
+                members: members
+                    .into_iter()
+                    .map(|k| CommunityMember {
+                        key_id: k.into(),
+                        joined_at: "2026-06-01T00:00:00Z".parse().unwrap(),
+                        role: None,
+                    })
+                    .collect(),
+                founded_at: "2026-06-01T00:00:00Z".parse().unwrap(),
+                consensus_protocol: "unanimous".into(),
+                policy_blob: Some(geo_policy.clone()),
+                persist_row_hash: String::new(),
+            },
+        };
+
+        // bob (no contained proof) → refused.
+        let err = backend
+            .put_community(community(vec!["alice", "bob"]))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("location_proof")),
+            "got: {err:?}"
+        );
+        // alice-only → admits.
+        backend
+            .put_community(community(vec!["alice"]))
+            .await
+            .unwrap();
+
+        // communities_containing: a cell inside the constraint finds it.
+        let hit = backend.communities_containing(&inside).await.unwrap();
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].community_key_id, "geo-comm");
+        // A far-away cell does not.
+        let far = h3o::LatLng::new(-33.8, 151.2)
+            .unwrap()
+            .to_cell(h3o::Resolution::Seven)
+            .to_string();
+        assert!(backend
+            .communities_containing(&far)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     // ─── v4.8.0 (CIRISPersist#161, CEG §11.7.1) — revocation tests ─────

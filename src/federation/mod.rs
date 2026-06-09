@@ -553,6 +553,15 @@ pub trait FederationDirectory: Send + Sync {
         subject_key_id: &str,
     ) -> Result<Vec<LocationProof>, Error>;
 
+    /// v4.11.0 (CIRISPersist#154 Ask 5, CEG 0.8 §0.8.2) — geographic
+    /// communities whose constraint cell **contains** `cell_id` (the
+    /// emergency-broadcast cascade read: "which geo-communities does this
+    /// location fall within?"). Scans communities with
+    /// `policy_blob.cohort_subkind == "geographic"` and returns those where
+    /// [`location::h3_cell_contained`](crate::federation::location::h3_cell_contained)`(cell_id, constraint_cell)`.
+    /// Non-geographic communities are never returned.
+    async fn communities_containing(&self, cell_id: &str) -> Result<Vec<Community>, Error>;
+
     /// v4.8.0 (#161 Ask 2) — occurrences of `identity_key_id` that are
     /// **currently active**: admitted AND with no revocation whose
     /// `effective_at <= now`. This is the honest view

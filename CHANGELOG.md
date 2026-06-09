@@ -5,6 +5,25 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [4.11.0] — 2026-06-09
+
+**Geographic `cohort_subkind` community admission + `communities_containing` — closes CIRISPersist#154 (CEG 0.8 §8.1.13.2 / §0.8.2).**
+
+Completes #154's residual (Asks 4–5), consuming the `location_proof` + H3 primitives from v4.10.0. The community substrate (V060) and the location_proof primitive (V068) were already in; this wires the geographic-subkind admission predicate and the containment read.
+
+### Added
+- **Geographic community admission** — `put_community` now runs the §8.1.13.2 geographic predicate: when a community's `policy_blob` is `{"cohort_subkind": "geographic", "geographic_constraint": {"cell_id": …}}`, **every** member of the submitted roster MUST hold an in-force, unexpired `location_proof` whose cell is H3-contained within the constraint cell — else the community is refused (`InvalidArgument`). Non-geographic communities pass through (admit on `consensus_protocol` alone — the dispatcher's default arm). Enforced on all three backends; the location-proof reads run before the write (lock-safe).
+- **`FederationDirectory::communities_containing(cell_id)`** (Ask 5, §0.8.2) — the emergency-broadcast cascade read: geographic communities whose constraint cell **contains** `cell_id`. PG/SQLite prefilter to `cohort_subkind = 'geographic'` (JSONB `->>'` / `json_extract`), then H3-filter in Rust.
+- **`federation::location`** helpers: `geographic_constraint_cell` (read the constraint from `policy_blob`), `member_in_geographic_constraint` (in-force + unexpired + contained), `check_geographic_community_admission` (the shared admission step).
+
+### Deferred (noted)
+The full §8.1.13.2 dispatcher also composes `consensus_protocol` *signature-counting* (Step 1) — that membership-ceremony consensus enforcement is the separate #153 lifecycle-track piece (CIRISRegistry#52), not yet built; this cut lands the subkind predicate (Step 2). Operator-defined non-geographic subkinds admit on consensus alone for now.
+
+### Tests
+`location` unit tests (constraint-cell parse, member admission: in-force/withdrawn/expired/outside/no-proof) + SQLite and live-PG integration (geographic community refuses a member without a contained proof, admits with one; `communities_containing` finds the community for an inside cell, not a far one). **1071 lib green on SQLite, 766 on live PG**; `-D warnings` + clippy + cargo-deny clean.
+
+**#154 is now fully closed** (community substrate v4.0.1 + location_proof/H3 v4.10.0 + this).
+
 ## [4.10.0] — 2026-06-09
 
 **`location_proof` substrate + H3 rough-only enforcement — the CEG 0.8 §0.8.1 normative privacy primitive (CIRISPersist#154).**

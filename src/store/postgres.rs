@@ -2188,6 +2188,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     ) -> Result<(), crate::federation::Error> {
         let mut row = community.community;
         crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
+        // v4.11.0 (#154 Ask 4) — geographic cohort_subkind admission.
+        crate::federation::location::check_geographic_community_admission(
+            self,
+            &row,
+            chrono::Utc::now(),
+        )
+        .await?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let members_value = serde_json::to_value(&row.members)
             .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
@@ -2511,6 +2518,43 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 crate::federation::Error::Backend(format!("list_location_proofs_for: {e}"))
             })?;
         rows.into_iter().map(pg_row_to_location_proof).collect()
+    }
+
+    async fn communities_containing(
+        &self,
+        cell_id: &str,
+    ) -> Result<Vec<crate::federation::Community>, crate::federation::Error> {
+        // Prefilter to geographic communities (JSONB), h3-filter in Rust.
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT community_key_id, community_name, members, founded_at, \
+                    consensus_protocol, policy_blob, persist_row_hash \
+                 FROM cirislens.federation_communities \
+                 WHERE policy_blob->>'cohort_subkind' = 'geographic' \
+                 ORDER BY community_key_id ASC",
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("communities_containing: {e}"))
+            })?;
+        let all: Vec<crate::federation::Community> = rows
+            .into_iter()
+            .map(pg_row_to_community)
+            .collect::<Result<_, _>>()?;
+        Ok(all
+            .into_iter()
+            .filter(|c| {
+                crate::federation::location::geographic_constraint_cell(c.policy_blob.as_ref())
+                    .is_some_and(|constraint| {
+                        crate::federation::location::h3_cell_contained(cell_id, &constraint)
+                    })
+            })
+            .collect())
     }
 
     async fn attach_key_pqc_signature(
@@ -20965,5 +21009,92 @@ mod tests {
             matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("rough-only")),
             "got: {err:?}"
         );
+    }
+
+    /// v4.11.0 (#154 Ask 4/5) — live-PG geographic community admission +
+    /// `communities_containing` (exercises the JSONB
+    /// `policy_blob->>'cohort_subkind'` query). Unique keys per run.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_geographic_community_admission_and_containing() {
+        use crate::federation::{
+            Community, CommunityMember, FederationDirectory, LocationProof, SignedCommunity,
+            SignedLocationProof,
+        };
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let comm = format!("geo-{}", uuid_like());
+        let alice = format!("alice-{}", uuid_like());
+        let bob = format!("bob-{}", uuid_like());
+        for k in [&comm, &alice, &bob] {
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord {
+                    record: pg_admission_key(
+                        k,
+                        k,
+                        crate::federation::types::identity_type::PRIMITIVE,
+                    ),
+                })
+                .await
+                .unwrap();
+        }
+        let ll = h3o::LatLng::new(37.0, -122.0).unwrap();
+        let constraint = ll.to_cell(h3o::Resolution::Three).to_string();
+        let inside = ll.to_cell(h3o::Resolution::Seven).to_string();
+        backend
+            .put_location_proof(SignedLocationProof {
+                location_proof: LocationProof {
+                    subject_key_id: alice.clone(),
+                    cell_id: inside.clone(),
+                    cell_resolution: 7,
+                    asserted_at: "2026-06-01T00:00:00Z".parse().unwrap(),
+                    valid_until: None,
+                    attestation_evidence: None,
+                    withdrawn_at: None,
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .unwrap();
+        let geo_policy = serde_json::json!({
+            "cohort_subkind": "geographic",
+            "geographic_constraint": {"cell_id": constraint, "cell_resolution": 3}
+        });
+        let mk = |members: Vec<&str>| SignedCommunity {
+            community: Community {
+                community_key_id: comm.clone(),
+                community_name: "Geo".into(),
+                members: members
+                    .into_iter()
+                    .map(|k| CommunityMember {
+                        key_id: k.to_string(),
+                        joined_at: "2026-06-01T00:00:00Z".parse().unwrap(),
+                        role: None,
+                    })
+                    .collect(),
+                founded_at: "2026-06-01T00:00:00Z".parse().unwrap(),
+                consensus_protocol: "unanimous".into(),
+                policy_blob: Some(geo_policy.clone()),
+                persist_row_hash: String::new(),
+            },
+        };
+        // bob lacks a contained proof → refused.
+        let err = backend
+            .put_community(mk(vec![&alice, &bob]))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("location_proof")),
+            "got: {err:?}"
+        );
+        // alice-only admits.
+        backend.put_community(mk(vec![&alice])).await.unwrap();
+        // containing finds it via the JSONB prefilter + h3 containment.
+        let hit = backend.communities_containing(&inside).await.unwrap();
+        assert!(hit.iter().any(|c| c.community_key_id == comm));
     }
 }
