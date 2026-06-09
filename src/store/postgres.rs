@@ -382,6 +382,63 @@ impl PostgresBackend {
             .map_err(|e| Error::Backend(format!("pool get: {e}")))
     }
 
+    /// v4.7.0 (CIRISPersist#177) — register an `accord_public_keys`
+    /// pubkey and return a typed [`KeyRegistrationOutcome`] instead of a
+    /// bare `Ok(())` that hid insert-vs-match-vs-rotation. Inserts
+    /// `ON CONFLICT (key_id) DO NOTHING`; on a no-op (conflict) it reads
+    /// the stored pubkey on the same client and classifies via the
+    /// shared [`crate::store::classify_key_registration`]. The idempotent
+    /// boot path stays non-throwing — a `RotationCollision` is a normal
+    /// return value (the trust signal CIRISAgent#809 surfaces), not an
+    /// error.
+    pub async fn register_accord_public_key(
+        &self,
+        key_id: &str,
+        public_key_base64: &str,
+        algorithm: &str,
+        description: Option<&str>,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+        added_by: Option<&str>,
+    ) -> Result<crate::store::KeyRegistrationOutcome, Error> {
+        let client = self.get_client().await?;
+        let inserted = client
+            .execute(
+                "INSERT INTO cirislens.accord_public_keys \
+                    (key_id, public_key_base64, algorithm, description, expires_at, added_by) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT (key_id) DO NOTHING",
+                &[
+                    &key_id,
+                    &public_key_base64,
+                    &algorithm,
+                    &description,
+                    &expires_at,
+                    &added_by,
+                ],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("register insert: {e}")))?;
+        if inserted == 1 {
+            return Ok(crate::store::KeyRegistrationOutcome::Registered);
+        }
+        // Conflict — read the stored pubkey on the same client to classify.
+        let existing: Option<String> = client
+            .query_opt(
+                "SELECT public_key_base64 FROM cirislens.accord_public_keys WHERE key_id = $1",
+                &[&key_id],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("register read: {e}")))?
+            .map(|r| r.try_get::<_, String>(0))
+            .transpose()
+            .map_err(|e| Error::Backend(format!("register read col: {e}")))?;
+        Ok(crate::store::classify_key_registration(
+            false,
+            existing.as_deref(),
+            public_key_base64,
+        ))
+    }
+
     /// Open a one-shot non-pooled connection. Used by
     /// [`Backend::run_migrations`] to hold the session-scoped
     /// advisory lock. When the returned client drops, the
@@ -20335,5 +20392,59 @@ mod tests {
             .await,
             want_valid
         );
+    }
+
+    /// v4.7.0 (CIRISPersist#177) — live-PG round-trip for the typed
+    /// key-registration outcome. Mirrors the SQLite twin: new key →
+    /// `Registered`; same key+pubkey → `AlreadyRegistered`; same key,
+    /// different pubkey → `RotationCollision` (fingerprint of the stored
+    /// key) and the stored row is left intact. Unique `key_id` per run
+    /// for the shared DB.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_register_accord_public_key_classifies_outcomes() {
+        use crate::store::{accord_key_fingerprint, KeyRegistrationOutcome};
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let key_id = format!("agent-k-{}", uuid_like());
+
+        let reg = backend
+            .register_accord_public_key(&key_id, "pubA", "Ed25519", None, None, Some("boot"))
+            .await
+            .unwrap();
+        assert_eq!(reg, KeyRegistrationOutcome::Registered);
+
+        let again = backend
+            .register_accord_public_key(&key_id, "pubA", "Ed25519", None, None, Some("boot"))
+            .await
+            .unwrap();
+        assert_eq!(again, KeyRegistrationOutcome::AlreadyRegistered);
+
+        let collision = backend
+            .register_accord_public_key(&key_id, "pubB", "Ed25519", None, None, Some("boot"))
+            .await
+            .unwrap();
+        match collision {
+            KeyRegistrationOutcome::RotationCollision {
+                existing_key_fingerprint,
+            } => assert_eq!(existing_key_fingerprint, accord_key_fingerprint("pubA")),
+            other => panic!("expected RotationCollision, got {other:?}"),
+        }
+        // Non-destructive: the stored pubkey is unchanged.
+        let client = backend.get_client().await.unwrap();
+        let stored: String = client
+            .query_one(
+                "SELECT public_key_base64 FROM cirislens.accord_public_keys WHERE key_id = $1",
+                &[&key_id],
+            )
+            .await
+            .unwrap()
+            .try_get::<_, String>(0)
+            .unwrap();
+        assert_eq!(stored, "pubA", "rotation collision must not overwrite");
     }
 }
