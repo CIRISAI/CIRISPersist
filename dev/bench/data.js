@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780930224273,
+  "lastUpdate": 1780970116639,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -16643,6 +16643,264 @@ window.BENCHMARK_DATA = {
             "name": "occurrence_registry/list_live_occurrences/1000",
             "value": 408051,
             "range": "± 2564",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "41a304a04eed1a89579ae710fe8d8280163cbc19",
+          "message": "FSD review — Shared CEG Attestation Surface (local-tier write+query+promote, #171) (#172)\n\n* FSD draft: Shared CEG Attestation Surface (local-tier write+query+promote, #171)\n\nDraft for the 4-impl RC1 review (Agent/NodeCore/LensCore/Registry). The\ngating dependency for CIRISAgent#840's hard cut-over. Adds the missing\nwrite+promote half of the federation_attestations substrate (v4.0 gave\nit the scope-aware read):\n\n- A tier model (local | federation) — local = producer-only authority,\n  signature deferred per CEG §10.1.3; CHECK enforces federation ⟹ signed;\n  read gate hides local rows from non-self callers (AV-59/60/61).\n- attestation_upsert_local(+_many) / attestation_query / promote.\n- The consent-revocation promotion obligation (§10.1.3, 24h → hard_case),\n  designed with #161.\n- One contract, four role-scoped views. No wire-format change, no\n  dual-write, both backends.\n\nStatus: Draft — NOT accepted. §11 open questions + §12 reviewer matrix\ngate acceptance.\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>\n\n* FSD update: fold in CIRISAgent + CIRISVerify review (#171/#172)\n\nCIRISAgent (✅ conditional nod) + CIRISVerify (✅ OQ-4):\n\n- §3 tier model corrected: local-tier eligibility = producer-only\n  AUTHORITY, not empty subject_key_ids. Producer-authority rows that\n  name a subject (observed:user, consent:partnered stance, epistemic:\n  about, self-consent identity:current) ride local-tier. The\n  discriminator is revocation authority (§4.2.6 / §10.1.3).\n- §4.1 split into upsert (replace-on-dimension, singleton state) +\n  insert (append, server-assigned id, multi-valued/event); key on\n  (occurrence_key_id, dimension), not attestation_type. _many chunks\n  internally. OQ-1 resolved.\n- §4.3 promote canonical bytes = JCS(envelope) per CEG §0.9/RFC 8785,\n  exact committed member set (omit-vs-materialize), NOT Verify's LP\n  framing. New dependency CIRISVerify#59 (JCS + Contribution verify);\n  gates promote only → staged after write+read. OQ-4 resolved (spec).\n- §5 carve-out redefined: subject-side revocation = withdraws /\n  consent:state:revoked where attesting_key_id ∈ target subject_key_ids,\n  NOT non-empty subjects.\n- §11/§12: OQ-1/4/5 resolved; OQ-2 (Registry, dimension grammar = the\n  upsert key) is now the sole code-blocker for the write+read half;\n  OQ-3 (#161 clock) trigger-only; promote waits on #59. Review-state\n  matrix updated.\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>\n\n* FSD finalized — phase 1 ACCEPTED (4-impl nod): fold in Registry/LensCore/NodeCore\n\nAll four CEG-RC1 impls nod. Folded in:\n- OQ-2 RESOLVED (Registry, CEG §10.1.5.4): dimensions[] = OPEN prefix,\n  hierarchical-prefix-matched; closed enum non-conformant. Apophatic\n  bound is on the operator set (5 predicates), not the vocabulary —\n  \"open data, closed operators\" (§1.4/§4.2). Satisfies NodeCore's\n  governance slice by construction.\n- OQ-4 RESOLVED (Registry 3 musts, §10.1.5.3): byte-identical wire (no\n  was-promoted marker); substrate cols (tier/promoted_at) NOT\n  canonicalized; §0.9 omit-vs-materialize. JCS(envelope), not LP framing.\n- LensCore condition (load-bearing): capacity:* ineligible for local\n  tier + substrate attesting≠attested (§7.5 anti-Goodhart) → §4.1/§4.2,\n  new AV-62. detection:* closed by §7.0.1 emitter gate.\n- NodeCore: two read surfaces (attestations via query; feeds stay on\n  cirisnode.contributions); write claim forward-looking (\"reads, and MAY\n  project via put_attestation\"); no forked path, no new write primitive.\n- Tier model pinned in CEG §10.1.5 (v-ceg-0.15); Registry fixed CEG\n  §10.1.3's over-narrow \"empty subject_key_ids\" → \"producer holds sole\n  revocation authority\" (matched our correction).\n- Load model §10.1.5.5 + 3 measurable signals.\n\nPhase 1 (write+read) accepted, zero blockers — ready to build. Phase 2\n(promote) stages behind CIRISVerify#59 (JCS) + OQ-4 member set; §5 clock\ntrigger behind OQ-3/#161.\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>\n\n* FSD: phase 2 unblocked — CIRISVerify#59 closed, v4.11.0 ships JCS\n\nCIRISVerify 4.11.0 ships ciris_verify_core::jcs::{canonicalize,\nverify_jcs_hybrid_signature} (RFC 8785 + CEG-Contribution hybrid-sig\nverify) — the OQ-4 deliverable. promote() no longer blocked: persist\nre-pins 4.10.0→4.11.0 and canonicalizes via jcs::canonicalize, routed\nthrough the verify/secrets facade (MISSION §1.4). May build with phase 1\nor stage second. §5 clock trigger still OQ-3/#161.\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Opus 4.8 <noreply@anthropic.com>",
+          "timestamp": "2026-06-08T20:34:30-05:00",
+          "tree_id": "496dc1ab68cca11a99a38f037a1b7f4500961496",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/41a304a04eed1a89579ae710fe8d8280163cbc19"
+        },
+        "date": 1780970115653,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 45664452,
+            "range": "± 395298",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 4212637,
+            "range": "± 215815",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 2388,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 5698,
+            "range": "± 22",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 12161,
+            "range": "± 110",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 43554,
+            "range": "± 174",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 7,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 145,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 506,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 577,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 1993,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 69,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 229,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 1007,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 13,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 47741,
+            "range": "± 2882",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 145005,
+            "range": "± 6887",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 531631,
+            "range": "± 40230",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 8172,
+            "range": "± 534",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 9815,
+            "range": "± 1401",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 14257,
+            "range": "± 5778",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 25150,
+            "range": "± 1568",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 1330947,
+            "range": "± 5122",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 3378487,
+            "range": "± 42383",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 211256,
+            "range": "± 33062",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 628064,
+            "range": "± 14862",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 33737005,
+            "range": "± 448717",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 1234013,
+            "range": "± 25947",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 6132285,
+            "range": "± 141286",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 84394438,
+            "range": "± 450512",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 3411641,
+            "range": "± 179515",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 16140711,
+            "range": "± 290374",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 60858,
+            "range": "± 4367",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 55432,
+            "range": "± 2638",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 4881,
+            "range": "± 45",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 32365,
+            "range": "± 146",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 301666,
+            "range": "± 1041",
             "unit": "ns/iter"
           }
         ]
