@@ -2285,6 +2285,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // Parse to uuid::Uuid before binding — the driver refuses a &str
+        // against a `uuid`-typed param (see the 1693 / put_revocation note).
+        let att_uuid = uuid::Uuid::parse_str(attestation_id).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!("attestation_id uuid: {e}"))
+        })?;
         // Read existing row to recompute the hash with new fields.
         let row_opt = client
             .query_opt(
@@ -2293,8 +2298,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
-                 FROM cirislens.federation_attestations WHERE attestation_id = $1::uuid",
-                &[&attestation_id],
+                 FROM cirislens.federation_attestations WHERE attestation_id = $1",
+                &[&att_uuid],
             )
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("attach lookup: {e}")))?;
@@ -2321,8 +2326,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .execute(
                 "UPDATE cirislens.federation_attestations \
                  SET scrub_signature_pqc = $1, pqc_completed_at = $2, persist_row_hash = $3 \
-                 WHERE attestation_id = $4::uuid AND pqc_completed_at IS NULL",
-                &[&scrub_signature_pqc, &now, &new_hash, &attestation_id],
+                 WHERE attestation_id = $4 AND pqc_completed_at IS NULL",
+                &[&scrub_signature_pqc, &now, &new_hash, &att_uuid],
             )
             .await
             .map_err(|e| {
@@ -2336,6 +2341,107 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         Ok(())
     }
 
+    async fn get_attestation(
+        &self,
+        attestation_id: &str,
+    ) -> Result<Option<crate::federation::Attestation>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // Parse attestation_id to uuid::Uuid before binding — the driver
+        // refuses to serialize a &str against a `uuid`-typed param (see
+        // put_revocation / the 1693 comment). Invalid → no such row.
+        let Ok(att_uuid) = uuid::Uuid::parse_str(attestation_id) else {
+            return Ok(None);
+        };
+        let row_opt = client
+            .query_opt(
+                "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
+                    weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
+                 FROM cirislens.federation_attestations WHERE attestation_id = $1",
+                &[&att_uuid],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("get_attestation: {e}")))?;
+        row_opt.map(pg_row_to_attestation).transpose()
+    }
+
+    async fn promote_attestation(
+        &self,
+        attestation_id: &str,
+        scrub_signature_classical: &str,
+        scrub_signature_pqc: Option<&str>,
+        original_content_hash_hex: &str,
+        scrub_key_id: &str,
+        scrub_timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, crate::federation::Error> {
+        use crate::federation::types::attestation_tier;
+        let mut row = self.get_attestation(attestation_id).await?.ok_or_else(|| {
+            crate::federation::Error::InvalidArgument(format!(
+                "federation_attestations row {attestation_id} does not exist"
+            ))
+        })?;
+        if row.tier == attestation_tier::FEDERATION {
+            return Ok(false); // idempotent
+        }
+        let och: Vec<u8> = hex::decode(original_content_hash_hex).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
+        })?;
+        let now = scrub_timestamp;
+        let pqc_owned = scrub_signature_pqc.map(|s| s.to_owned());
+        row.original_content_hash = original_content_hash_hex.to_owned();
+        row.scrub_signature_classical = scrub_signature_classical.to_owned();
+        row.scrub_signature_pqc = pqc_owned.clone();
+        row.scrub_key_id = scrub_key_id.to_owned();
+        row.scrub_timestamp = now;
+        row.pqc_completed_at = pqc_owned.as_ref().map(|_| now);
+        row.tier = attestation_tier::FEDERATION.to_string();
+        row.promoted_at = Some(now);
+        let mut for_hash = row.clone();
+        for_hash.persist_row_hash = String::new();
+        let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+        let pqc_completed = row.pqc_completed_at;
+        // get_attestation already succeeded above → attestation_id parses.
+        let att_uuid = uuid::Uuid::parse_str(attestation_id).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!("attestation_id uuid: {e}"))
+        })?;
+
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let n = client
+            .execute(
+                "UPDATE cirislens.federation_attestations \
+                 SET original_content_hash = $1, scrub_signature_classical = $2, \
+                     scrub_signature_pqc = $3, scrub_key_id = $4, scrub_timestamp = $5, \
+                     pqc_completed_at = $6, persist_row_hash = $7, tier = 'federation', \
+                     promoted_at = $5 \
+                 WHERE attestation_id = $8 AND tier = 'local'",
+                &[
+                    &och,
+                    &scrub_signature_classical,
+                    &pqc_owned,
+                    &scrub_key_id,
+                    &now,
+                    &pqc_completed,
+                    &new_hash,
+                    &att_uuid,
+                ],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("promote_attestation: {e}")))?;
+        if n == 0 {
+            return Err(crate::federation::Error::Conflict(format!(
+                "federation_attestations row {attestation_id} was concurrently promoted"
+            )));
+        }
+        Ok(true)
+    }
+
     async fn attach_revocation_pqc_signature(
         &self,
         revocation_id: &str,
@@ -2345,14 +2451,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // Parse to uuid::Uuid before binding — see the 1693 note.
+        let rev_uuid = uuid::Uuid::parse_str(revocation_id).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!("revocation_id uuid: {e}"))
+        })?;
         let row_opt = client
             .query_opt(
                 "SELECT revocation_id::text, revoked_key_id, revoking_key_id, reason, \
                     revoked_at, effective_at, revocation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, persist_row_hash \
-                 FROM cirislens.federation_revocations WHERE revocation_id = $1::uuid",
-                &[&revocation_id],
+                 FROM cirislens.federation_revocations WHERE revocation_id = $1",
+                &[&rev_uuid],
             )
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("attach lookup: {e}")))?;
@@ -2379,8 +2489,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .execute(
                 "UPDATE cirislens.federation_revocations \
                  SET scrub_signature_pqc = $1, pqc_completed_at = $2, persist_row_hash = $3 \
-                 WHERE revocation_id = $4::uuid AND pqc_completed_at IS NULL",
-                &[&scrub_signature_pqc, &now, &new_hash, &revocation_id],
+                 WHERE revocation_id = $4 AND pqc_completed_at IS NULL",
+                &[&scrub_signature_pqc, &now, &new_hash, &rev_uuid],
             )
             .await
             .map_err(|e| {
@@ -14643,6 +14753,107 @@ mod tests {
             err,
             crate::federation::Error::AccordDimensionRequiresAccordHolder { .. }
         ));
+    }
+
+    /// v4.6.0 (CIRISPersist#171/#176) — live-PG coverage for the
+    /// deferred-PQC completion path (`attach_attestation_pqc_signature` /
+    /// `attach_revocation_pqc_signature`), the sweep `Engine.run_pqc_sweep`
+    /// drives via PyO3. Previously tested ONLY on the in-memory backend,
+    /// whose string-keyed map never exercised the `attestation_id`/`uuid`
+    /// driver serialization — so a `&str`-bound `$N::uuid` param (which
+    /// panics with "error serializing parameter 0" on real Postgres) went
+    /// undetected. This test closes that gap for both attach paths.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_attach_pqc_for_attestation_and_revocation() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+
+        let steward = format!("pg-attach-steward-{}", uuid_like());
+        let target = format!("pg-attach-target-{}", uuid_like());
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &steward,
+                    "registry",
+                    crate::federation::types::identity_type::STEWARD,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &target,
+                    "primitive-a",
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await
+            .unwrap();
+
+        // Federation-tier, PQC-pending attestation (real UUID id).
+        let att = pg_scores_attestation(&steward, &target, &steward, "identity_binding:v1");
+        let att_id = att.attestation_id.clone();
+        backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+        backend
+            .attach_attestation_pqc_signature(&att_id, "att-pqc-sig")
+            .await
+            .expect("attach attestation PQC sig must serialize the uuid param");
+        let after = backend
+            .get_attestation(&att_id)
+            .await
+            .unwrap()
+            .expect("row");
+        assert!(
+            after.is_pqc_complete(),
+            "attestation PQC-complete after attach"
+        );
+
+        // Same for a federation revocation (real UUID id; valid 64-hex
+        // original_content_hash — the revocation path hex-decodes it).
+        let now = chrono::Utc::now();
+        let rev_id = uuid::Uuid::new_v4().to_string();
+        let rev = crate::federation::Revocation {
+            revocation_id: rev_id.clone(),
+            revoked_key_id: target.clone(),
+            revoking_key_id: steward.clone(),
+            reason: Some("test".into()),
+            revoked_at: now,
+            effective_at: now,
+            revocation_envelope: serde_json::json!({ "id": rev_id }),
+            original_content_hash:
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: steward.clone(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            observed_region: crate::federation::verify_coord::region::US.into(),
+            persist_row_hash: String::new(),
+        };
+        backend
+            .put_revocation(crate::federation::SignedRevocation { revocation: rev })
+            .await
+            .unwrap();
+        backend
+            .attach_revocation_pqc_signature(&rev_id, "rev-pqc-sig")
+            .await
+            .expect("attach revocation PQC sig must serialize the uuid param");
+        let revs = backend.revocations_for(&target).await.unwrap();
+        assert!(
+            revs.iter()
+                .any(|r| r.revocation_id == rev_id && r.is_pqc_complete()),
+            "revocation PQC-complete after attach"
+        );
     }
 
     #[tokio::test]

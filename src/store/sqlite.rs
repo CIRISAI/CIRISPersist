@@ -2031,6 +2031,102 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         Ok(())
     }
 
+    async fn get_attestation(
+        &self,
+        attestation_id: &str,
+    ) -> Result<Option<crate::federation::Attestation>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let id = attestation_id.to_owned();
+        (move || -> Result<Option<crate::federation::Attestation>, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                    weight, asserted_at, expires_at, attestation_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                    subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
+                 FROM federation_attestations WHERE attestation_id = ?1",
+                [&id],
+                sqlite_row_to_attestation,
+            )
+            .optional()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("get_attestation: {e}")))
+    }
+
+    async fn promote_attestation(
+        &self,
+        attestation_id: &str,
+        scrub_signature_classical: &str,
+        scrub_signature_pqc: Option<&str>,
+        original_content_hash_hex: &str,
+        scrub_key_id: &str,
+        scrub_timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, crate::federation::Error> {
+        use crate::federation::types::attestation_tier;
+        // Load + tier-check + stamp the row's promoted shape so we can
+        // recompute persist_row_hash over the post-promotion fields.
+        let mut row = self.get_attestation(attestation_id).await?.ok_or_else(|| {
+            crate::federation::Error::InvalidArgument(format!(
+                "federation_attestations row {attestation_id} does not exist"
+            ))
+        })?;
+        if row.tier == attestation_tier::FEDERATION {
+            return Ok(false); // idempotent: already promoted / native-federation
+        }
+        let och = hex::decode(original_content_hash_hex).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
+        })?;
+        let now = scrub_timestamp;
+        row.original_content_hash = original_content_hash_hex.to_owned();
+        row.scrub_signature_classical = scrub_signature_classical.to_owned();
+        row.scrub_signature_pqc = scrub_signature_pqc.map(|s| s.to_owned());
+        row.scrub_key_id = scrub_key_id.to_owned();
+        row.scrub_timestamp = now;
+        row.pqc_completed_at = scrub_signature_pqc.map(|_| now);
+        row.tier = attestation_tier::FEDERATION.to_string();
+        row.promoted_at = Some(now);
+        let mut for_hash = row.clone();
+        for_hash.persist_row_hash = String::new();
+        let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+
+        let conn = self.conn.clone();
+        let id = attestation_id.to_owned();
+        let classical = scrub_signature_classical.to_owned();
+        let pqc = scrub_signature_pqc.map(|s| s.to_owned());
+        let scrub_key = scrub_key_id.to_owned();
+        let ts = now.to_rfc3339();
+        let pqc_completed = row.pqc_completed_at.map(|t| t.to_rfc3339());
+        let n = (move || -> Result<usize, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.execute(
+                "UPDATE federation_attestations \
+                 SET original_content_hash = ?1, scrub_signature_classical = ?2, \
+                     scrub_signature_pqc = ?3, scrub_key_id = ?4, scrub_timestamp = ?5, \
+                     pqc_completed_at = ?6, persist_row_hash = ?7, tier = 'federation', \
+                     promoted_at = ?5 \
+                 WHERE attestation_id = ?8 AND tier = 'local'",
+                rusqlite::params![
+                    och,
+                    classical,
+                    pqc,
+                    scrub_key,
+                    ts,
+                    pqc_completed,
+                    new_hash,
+                    id
+                ],
+            )
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("promote_attestation: {e}")))?;
+        if n == 0 {
+            return Err(crate::federation::Error::Conflict(format!(
+                "federation_attestations row {attestation_id} was concurrently promoted"
+            )));
+        }
+        Ok(true)
+    }
+
     async fn attach_revocation_pqc_signature(
         &self,
         revocation_id: &str,

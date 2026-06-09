@@ -856,6 +856,90 @@ impl Engine {
         Ok(sig)
     }
 
+    /// v4.6 (CIRISPersist#171 phase 2, CEG §10.1.3/§10.1.5) — promote a
+    /// **local**-tier self-attestation to **federation**: canonicalize the
+    /// row's envelope through the produce-side gate (JCS post-cut, §0.9),
+    /// hybrid-sign the canonical bytes (Ed25519 + ML-DSA-65), and write
+    /// back the scrub envelope + flip `tier` to `federation`. The signing
+    /// bytes are the §0.9-canonical envelope, so the promoted row is
+    /// byte-identical on the wire to a natively-federation attestation
+    /// (Registry must #1). Returns `Ok(true)` on promotion, `Ok(false)` if
+    /// the row is already `federation` (idempotent). Requires a
+    /// PQC-configured `LocalSigner`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn attestation_promote(
+        &self,
+        attestation_id: &str,
+    ) -> Result<bool, crate::federation::Error> {
+        use crate::federation::FederationDirectory;
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        use sha2::{Digest, Sha256};
+
+        // 1. Load the row (any tier).
+        let row = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.get_attestation(attestation_id).await?,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.get_attestation(attestation_id).await?,
+        }
+        .ok_or_else(|| {
+            crate::federation::Error::InvalidArgument(format!(
+                "attestation_promote: row {attestation_id} does not exist"
+            ))
+        })?;
+        if row.tier == crate::federation::types::attestation_tier::FEDERATION {
+            return Ok(false); // idempotent
+        }
+
+        // 2. Canonicalize the envelope (produce gate → JCS post-cut) + hash.
+        let canonical = crate::verify::canonical::ceg_produce_canonicalize(
+            &row.attestation_envelope,
+        )
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("attestation_promote canonicalize: {e}"))
+        })?;
+        let original_content_hash_hex = hex::encode(Sha256::digest(&canonical));
+
+        // 3. Hybrid-sign the canonical bytes (matches the native produce
+        // path: signer.sign(canonical_bytes)).
+        let sig = self.sign_hybrid(&canonical).await.map_err(|e| {
+            crate::federation::Error::Backend(format!("attestation_promote sign_hybrid: {e}"))
+        })?;
+        let classical_b64 = B64.encode(&sig.classical.signature);
+        let pqc_b64 = B64.encode(&sig.pqc.signature);
+        let scrub_key_id = self.signer.current_alias().to_owned();
+        let now = chrono::Utc::now();
+
+        // 4. Write back the scrub envelope + flip tier (signed-epoch gate
+        // on the verify side will read these post-cut as JCS).
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => {
+                b.promote_attestation(
+                    attestation_id,
+                    &classical_b64,
+                    Some(&pqc_b64),
+                    &original_content_hash_hex,
+                    &scrub_key_id,
+                    now,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => {
+                b.promote_attestation(
+                    attestation_id,
+                    &classical_b64,
+                    Some(&pqc_b64),
+                    &original_content_hash_hex,
+                    &scrub_key_id,
+                    now,
+                )
+                .await
+            }
+        }
+    }
+
     /// Borrow the SQLite backend Arc, if this Engine was constructed
     /// with a `sqlite://` DSN. Returns `None` for Postgres-backed
     /// Engines (or when the `sqlite` feature is off).
@@ -3966,5 +4050,261 @@ mod tests {
             empty_holder_count as u64 >= report.rows_evicted,
             "evicted blobs must have list_holders return empty after withdraws"
         );
+    }
+
+    // ── v4.6.0 (CIRISPersist#171, CEG §10.1.5) — attestation_promote:
+    //    local-tier self-attestation → federation-tier hybrid-signed row.
+
+    /// PQC-configured signer whose classical alias is `occ`, so the
+    /// producing occurrence (`attesting_key_id`) and the promotion
+    /// signer (`scrub_key_id = current_alias()`) are the same
+    /// federation key — one seeded `federation_keys` row satisfies both
+    /// FKs. `attestation_promote` calls `sign_hybrid`, so PQC is required.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    fn pqc_signer(alias: &str) -> Arc<LocalSigner> {
+        use ciris_keyring::MlDsa65SoftwareSigner;
+        let signing_key = SigningKey::from_bytes(&[0x5Au8; 32]);
+        let pqc = MlDsa65SoftwareSigner::from_seed_bytes(&[0x5Au8 ^ 0x55; 32], "promote-test-pqc")
+            .expect("pqc seed");
+        let pqc_arc: Arc<dyn ciris_keyring::PqcSigner> = Arc::new(pqc);
+        Arc::new(LocalSigner::from_parts(
+            signing_key,
+            alias.to_owned(),
+            Some(pqc_arc),
+            Some("promote-test-pqc".to_owned()),
+        ))
+    }
+
+    /// Seed a `federation_keys` row for `key_id` so the local-tier write
+    /// gate's `attesting_key_id` FK and the promote path's `scrub_key_id`
+    /// FK both hold.
+    #[cfg(feature = "sqlite")]
+    async fn seed_promote_key(sq: &Arc<SqliteBackend>, key_id: &str) {
+        use crate::federation::{FederationDirectory, KeyRecord, SignedKeyRecord};
+        let record = KeyRecord {
+            key_id: key_id.into(),
+            pubkey_ed25519_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: crate::federation::types::algorithm::HYBRID.into(),
+            identity_type: crate::federation::types::identity_type::STEWARD.into(),
+            identity_ref: key_id.into(),
+            valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
+            valid_until: None,
+            registration_envelope: serde_json::json!({ "id": key_id }),
+            original_content_hash: "deadbeef".into(),
+            scrub_signature_classical: "c2lnbmF0dXJl".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: key_id.into(),
+            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+        };
+        sq.put_public_key(SignedKeyRecord { record }).await.unwrap();
+    }
+
+    /// Round-trip: write a `local` self-attestation, promote it, confirm
+    /// the row flips to `federation` with a populated hybrid scrub
+    /// envelope, a recomputed `original_content_hash`, and the producing
+    /// occurrence as `scrub_key_id`. A second promote is idempotent
+    /// (`Ok(false)`, no further mutation).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn attestation_promote_flips_local_to_federation_signed() {
+        use crate::federation::types::attestation_type::SCORES;
+        use crate::federation::FederationDirectory;
+
+        let engine = Engine::with_signer(pqc_signer("occ"), "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        let sq = engine.sqlite_backend().expect("sqlite present").clone();
+        seed_promote_key(&sq, "occ").await;
+
+        // Write a local-tier self-attestation (signature deferred).
+        let input = crate::federation::types::LocalAttestationInput {
+            attesting_key_id: "occ".into(),
+            attested_key_id: None,
+            attestation_type: SCORES.into(),
+            weight: Some(1.0),
+            expires_at: None,
+            attestation_envelope: serde_json::json!({
+                "id": "att-1", "dimension": "identity_binding:v1",
+                "score": 1.0, "confidence": 0.9,
+            }),
+            subject_key_ids: vec![],
+            cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
+        };
+        let att_id = sq.attestation_upsert_local(input).await.unwrap();
+
+        // Pre-promote: the row is local with an empty-sentinel scrub.
+        let before = sq.get_attestation(&att_id).await.unwrap().expect("row");
+        assert_eq!(
+            before.tier,
+            crate::federation::types::attestation_tier::LOCAL
+        );
+        assert!(before.scrub_signature_classical.is_empty());
+        assert!(before.original_content_hash.is_empty());
+        assert!(before.promoted_at.is_none());
+
+        // Promote.
+        let promoted = engine.attestation_promote(&att_id).await.unwrap();
+        assert!(promoted, "first promote flips the tier");
+
+        let after = sq.get_attestation(&att_id).await.unwrap().expect("row");
+        assert_eq!(
+            after.tier,
+            crate::federation::types::attestation_tier::FEDERATION,
+            "tier flips to federation"
+        );
+        assert!(
+            !after.scrub_signature_classical.is_empty(),
+            "Ed25519 scrub signature populated"
+        );
+        assert!(
+            after
+                .scrub_signature_pqc
+                .as_deref()
+                .is_some_and(|s| !s.is_empty()),
+            "ML-DSA-65 scrub signature populated"
+        );
+        assert_eq!(
+            after.original_content_hash.len(),
+            64,
+            "original_content_hash is the hex SHA-256 of the canonical envelope"
+        );
+        assert_eq!(
+            after.scrub_key_id, "occ",
+            "promoter is the producing occurrence"
+        );
+        assert!(after.promoted_at.is_some(), "promoted_at stamped");
+        // Envelope is untouched by promotion (signing reads it, never edits).
+        assert_eq!(after.attestation_envelope, before.attestation_envelope);
+
+        // Idempotent: re-promoting a federation row is a no-op.
+        let again = engine.attestation_promote(&att_id).await.unwrap();
+        assert!(!again, "re-promote of a federation row returns Ok(false)");
+        let after2 = sq.get_attestation(&att_id).await.unwrap().expect("row");
+        assert_eq!(
+            after2.scrub_signature_classical, after.scrub_signature_classical,
+            "idempotent re-promote does not re-sign"
+        );
+        assert_eq!(after2.promoted_at, after.promoted_at);
+    }
+
+    /// Promoting a non-existent row is an `InvalidArgument`, not a panic
+    /// or a silent success.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn attestation_promote_missing_row_is_invalid_argument() {
+        let engine = Engine::with_signer(pqc_signer("occ"), "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        let err = engine
+            .attestation_promote("00000000-0000-0000-0000-000000000000")
+            .await
+            .expect_err("missing row");
+        assert!(
+            matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("does not exist")),
+            "got: {err:?}"
+        );
+    }
+
+    /// Live-PG twin of `attestation_promote_flips_local_to_federation_signed`.
+    /// Exercises the Postgres `get_attestation` + `promote_attestation`
+    /// backend impls end-to-end through the Engine orchestrator. Skips
+    /// when `CIRIS_PERSIST_TEST_PG_URL` is unset.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn attestation_promote_flips_local_to_federation_signed_postgres() {
+        use crate::federation::types::attestation_type::SCORES;
+        use crate::federation::{FederationDirectory, KeyRecord, SignedKeyRecord};
+
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        // Unique occurrence key so concurrent/shared-DB runs don't collide.
+        let occ = format!("occ-promote-{}", uuid::Uuid::new_v4().simple());
+
+        let engine = Engine::with_signer(pqc_signer(&occ), &dsn)
+            .await
+            .expect("construct PG engine");
+        let pg = engine.postgres_backend().expect("pg backend");
+
+        // Seed the federation_keys row for both attesting + scrub FKs.
+        let record = KeyRecord {
+            key_id: occ.clone(),
+            pubkey_ed25519_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: crate::federation::types::algorithm::HYBRID.into(),
+            identity_type: crate::federation::types::identity_type::STEWARD.into(),
+            identity_ref: occ.clone(),
+            valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
+            valid_until: None,
+            registration_envelope: serde_json::json!({ "id": occ.clone() }),
+            original_content_hash: "deadbeef".into(),
+            scrub_signature_classical: "c2lnbmF0dXJl".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: occ.clone(),
+            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+        };
+        pg.put_public_key(SignedKeyRecord { record }).await.unwrap();
+
+        let input = crate::federation::types::LocalAttestationInput {
+            attesting_key_id: occ.clone(),
+            attested_key_id: None,
+            attestation_type: SCORES.into(),
+            weight: Some(1.0),
+            expires_at: None,
+            attestation_envelope: serde_json::json!({
+                "id": "att-pg-1", "dimension": "identity_binding:v1",
+                "score": 1.0, "confidence": 0.9,
+            }),
+            subject_key_ids: vec![],
+            cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
+        };
+        let att_id = pg.attestation_upsert_local(input).await.unwrap();
+
+        let before = pg.get_attestation(&att_id).await.unwrap().expect("row");
+        assert_eq!(
+            before.tier,
+            crate::federation::types::attestation_tier::LOCAL
+        );
+        assert!(before.scrub_signature_classical.is_empty());
+        assert!(before.original_content_hash.is_empty());
+
+        let promoted = engine.attestation_promote(&att_id).await.unwrap();
+        assert!(promoted, "first promote flips the tier");
+
+        let after = pg.get_attestation(&att_id).await.unwrap().expect("row");
+        assert_eq!(
+            after.tier,
+            crate::federation::types::attestation_tier::FEDERATION
+        );
+        assert!(!after.scrub_signature_classical.is_empty());
+        assert!(after
+            .scrub_signature_pqc
+            .as_deref()
+            .is_some_and(|s| !s.is_empty()));
+        assert_eq!(after.original_content_hash.len(), 64);
+        assert_eq!(after.scrub_key_id, occ);
+        assert!(after.promoted_at.is_some());
+        assert_eq!(after.attestation_envelope, before.attestation_envelope);
+
+        // Idempotent re-promote.
+        let again = engine.attestation_promote(&att_id).await.unwrap();
+        assert!(!again, "re-promote of a federation row returns Ok(false)");
+        let after2 = pg.get_attestation(&att_id).await.unwrap().expect("row");
+        assert_eq!(
+            after2.scrub_signature_classical,
+            after.scrub_signature_classical
+        );
+        assert_eq!(after2.promoted_at, after.promoted_at);
     }
 }

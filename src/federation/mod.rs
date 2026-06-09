@@ -613,6 +613,31 @@ pub trait FederationDirectory: Send + Sync {
         scrub_signature_pqc: &str,
     ) -> Result<(), Error>;
 
+    /// v4.6 (CIRISPersist#171 phase 2) — fetch a single attestation row
+    /// by id (any tier). `None` if absent. Used by `Engine::attestation_
+    /// promote` to load the `local` row's envelope before signing.
+    async fn get_attestation(&self, attestation_id: &str) -> Result<Option<Attestation>, Error>;
+
+    /// v4.6 (CIRISPersist#171 phase 2, CEG §10.1.3/§10.1.5) — the
+    /// local→federation **promotion** write-back: stamp the hybrid scrub
+    /// envelope computed by [`crate::Engine::attestation_promote`] and
+    /// flip `tier` to `federation` (+ `promoted_at`), iff the row is
+    /// currently `local`. Returns `Ok(true)` on promotion, `Ok(false)` if
+    /// the row is already `federation` (idempotent), `Err` if absent. The
+    /// signing bytes are the §0.9-canonical envelope (gated produce
+    /// canonicalizer), so a promoted row is byte-identical on the wire to
+    /// a natively-federation one (Registry must #1).
+    #[allow(clippy::too_many_arguments)]
+    async fn promote_attestation(
+        &self,
+        attestation_id: &str,
+        scrub_signature_classical: &str,
+        scrub_signature_pqc: Option<&str>,
+        original_content_hash_hex: &str,
+        scrub_key_id: &str,
+        scrub_timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, Error>;
+
     // ── Hybrid-pending sweep (CIRISPersist#11, v0.3.2) ─────────────
     //
     // Per V004's schema header §"Phase transitions":
