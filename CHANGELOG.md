@@ -5,6 +5,32 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [4.8.0] — 2026-06-09
+
+**Option-A forward-secrecy removal/revocation substrate primitives (CIRISPersist#161 Phases 1–3; CEG §11.7.1).**
+
+V059 (identity_occurrence + family) and V060 (community) landed the **admission** side append-only, with no way to express "this binding/membership is currently revoked." So a removed member's read access persisted silently — `build_caller_admission` resolved every roster row regardless of revocation state. This cut closes that forge surface: the substrate can now express revocation, and the honest "currently-bound" view is what admission resolves through.
+
+### Added — V067 migration (PG + SQLite)
+Three append-only revocation tables, symmetric to the V059/V060 admission tables: `federation_identity_occurrence_revocations`, `federation_family_membership_revocations`, `federation_community_membership_revocations`. Each: subject + removed id, `revoked_at`/`removed_at`, `effective_at`, `reason`, `witness_set` (JSONB / JSON-TEXT array of vouching key_ids — single-vouch for self per §11.7.4, multi-vouch per the family/community `consensus_protocol`), `persist_row_hash`; composite PK + `effective_at` + by-removed indexes. **Supersedes V059's "an occurrence withdraws rides `federation_revocations`" note** — that table revokes a *key* globally and carries no `witness_set`, so it can't express a *binding* or *membership* removal.
+
+### Added — types + write/read surface (Asks 1–2)
+- `IdentityOccurrenceRevocation` / `FamilyMembershipRevocation` / `CommunityMembershipRevocation` + `Signed*` wrappers.
+- `FederationDirectory::put_{identity_occurrence,family_membership,community_membership}_revocation` + `list_*_revocations_for` — implemented on all three backends (Postgres / SQLite / memory). `persist_row_hash` server-computed; a revocation is **append-only** and **non-destructive** (the admission row/roster is left intact). FK-violation (subject/removed key absent) → `InvalidArgument`.
+- `list_identity_occurrences_active` / `list_families_for_member_active` / `list_communities_for_member_active` — the honest "currently-bound" view (admitted AND no revocation with `effective_at <= now`), as **default trait methods** composing the admission read with the revocation read. The existing `list_*_for` / `list_*_for_member` remain the **full-history** accessors.
+
+### Changed — honest CallerAdmission (Ask 6, the forge-surface closure)
+`build_caller_admission` now honors revocation: a **revoked occurrence falls through to the §4.4 singleton fallback** (it speaks only for itself, inheriting no identity/family/community admission), and `family_key_ids` / `community_key_ids` resolve through the `_active` reads (removed memberships excluded). Without this, a removed member's read access persisted silently.
+
+### Design note — additive, not a breaking rename
+#161 Ask 2 suggested renaming `list_*` → `list_*_active` (active-by-default). We chose **additive `_active` methods + wiring the one security-critical caller** (`build_caller_admission`) instead — the existing accessors are widely used and reading "all rows" is the documented full-history contract. No current caller is left unsafe (the DEK cascade caller is Ask 4, deferred). Net: same security property, no gratuitous breakage.
+
+### Deferred — Ask 4 (producer-side forward-secrecy gate)
+The "stop wrapping new `key_grant`s to a removed party" enforcement at `put_blob_signing` gates on the at-rest **ADD** key_grant cascade (#152), which is not in persist yet — there is no ADD cascade to make symmetric. Lands when #152 does. Ask 5 (reserved-prefix `*_membership_change` emission on removal) rides the same future cut.
+
+### Tests
+SQLite + live-PG round-trips (put → list → active-state filtering, incl. future-dated revocation does-not-take-effect, JSONB `witness_set` order-preserving round-trip, FK→`InvalidArgument`) + the two Ask-6 `build_caller_admission` honesty tests (revoked occurrence → singleton; removed family member → dropped). **1056 lib green on SQLite, 754 on live PG**; `-D warnings` clean across no-default / `test-panic,pyo3` / full `--tests`; clippy clean.
+
 ## [4.7.0] — 2026-06-09
 
 **Typed `register_public_key` — `Registered` / `AlreadyRegistered` / `RotationCollision` (CIRISPersist#177; CEG §0.0; gates CIRISAgent#809).**

@@ -962,6 +962,109 @@ pub struct SignedCommunity {
     pub community: Community,
 }
 
+// ─── v4.8.0 (CIRISPersist#161, CEG §11.7.1) — Option-A forward-secrecy
+//     removal/revocation primitives. Append-only rows that SUPERSEDE a
+//     V059/V060 admission binding: effective membership =
+//     (admitted AND NOT revoked-with-effective_at<=now). The substrate's
+//     "this binding/membership is currently revoked" expression that the
+//     stop-wrapping rule (§11.7.1) and honest CallerAdmission depend on.
+
+/// Revokes a single V059 `(identity_key_id, occurrence_key_id)` binding
+/// (an occurrence leaving a self-collective). The admission row in
+/// `federation_identity_occurrences` is left intact; the active-state
+/// read excludes pairs with a matching revocation whose `effective_at`
+/// has passed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityOccurrenceRevocation {
+    /// The root identity's `federation_keys.key_id`.
+    pub identity_key_id: String,
+    /// The occurrence being revoked — a `federation_keys.key_id`.
+    pub occurrence_key_id: String,
+    /// When the revocation ceremony issued it (RFC-3339 per §0.5).
+    pub revoked_at: DateTime<Utc>,
+    /// When the revocation takes effect (may be future-dated). The
+    /// active-state filter is `effective_at <= now()`.
+    pub effective_at: DateTime<Utc>,
+    /// Optional operator/ceremony annotation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Vouch set (`federation_keys.key_id`s). Single-vouch for self per
+    /// §11.7.4 — the revoking occurrence OR the `identity_key_id`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub witness_set: Vec<String>,
+    /// **Server-computed.** See [`KeyRecord::persist_row_hash`].
+    pub persist_row_hash: String,
+}
+
+/// Wraps an [`IdentityOccurrenceRevocation`] for write submission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedIdentityOccurrenceRevocation {
+    /// The revocation being submitted.
+    pub identity_occurrence_revocation: IdentityOccurrenceRevocation,
+}
+
+/// Removes one identity from a V059 family roster. The family's
+/// `members` roster is left intact; the active-membership read filters
+/// against this table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FamilyMembershipRevocation {
+    /// The family's `federation_keys.key_id`.
+    pub family_key_id: String,
+    /// The removed member's identity `federation_keys.key_id`.
+    pub removed_identity_key_id: String,
+    /// When the removal ceremony issued it (RFC-3339 per §0.5).
+    pub removed_at: DateTime<Utc>,
+    /// When the removal takes effect. Active-state filter:
+    /// `effective_at <= now()`.
+    pub effective_at: DateTime<Utc>,
+    /// Optional operator/ceremony annotation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Vouch set — multi-vouch per the family's `consensus_protocol`
+    /// (Registry-validated, CIRISRegistry#52 Ask 2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub witness_set: Vec<String>,
+    /// **Server-computed.** See [`KeyRecord::persist_row_hash`].
+    pub persist_row_hash: String,
+}
+
+/// Wraps a [`FamilyMembershipRevocation`] for write submission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedFamilyMembershipRevocation {
+    /// The revocation being submitted.
+    pub family_membership_revocation: FamilyMembershipRevocation,
+}
+
+/// Removes one identity from a V060 community roster. Structural mirror
+/// of [`FamilyMembershipRevocation`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommunityMembershipRevocation {
+    /// The community's `federation_keys.key_id`.
+    pub community_key_id: String,
+    /// The removed member's identity `federation_keys.key_id`.
+    pub removed_identity_key_id: String,
+    /// When the removal ceremony issued it (RFC-3339 per §0.5).
+    pub removed_at: DateTime<Utc>,
+    /// When the removal takes effect. Active-state filter:
+    /// `effective_at <= now()`.
+    pub effective_at: DateTime<Utc>,
+    /// Optional operator/ceremony annotation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Vouch set — multi-vouch per the community's `consensus_protocol`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub witness_set: Vec<String>,
+    /// **Server-computed.** See [`KeyRecord::persist_row_hash`].
+    pub persist_row_hash: String,
+}
+
+/// Wraps a [`CommunityMembershipRevocation`] for write submission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedCommunityMembershipRevocation {
+    /// The revocation being submitted.
+    pub community_membership_revocation: CommunityMembershipRevocation,
+}
+
 /// One hybrid-pending federation row — minimum fields the sweep
 /// needs to recompute the cold-path bound-signature input. Returned
 /// by [`super::FederationDirectory::list_hybrid_pending_keys`] /

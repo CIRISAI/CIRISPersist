@@ -99,13 +99,22 @@ pub enum AdmissionError {
 ///
 /// 1. `occurrence_key_id → identity_key_id` via
 ///    [`lookup_identity_for_occurrence`](crate::federation::FederationDirectory::lookup_identity_for_occurrence)
-///    (V059 §5.6.8.8). On no binding, the §4.4 singleton fallback
-///    applies: `identity == occurrence`, empty family/community sets.
+///    (V059 §5.6.8.8). On no binding — OR an **active revocation** of the
+///    binding (v4.8.0, CIRISPersist#161 Ask 6, CEG §11.7.1) — the §4.4
+///    singleton fallback applies: `identity == occurrence`, empty
+///    family/community sets. A revoked occurrence speaks only for itself,
+///    never for the identity it was removed from.
 /// 2. `identity_key_id → family_key_ids` via
-///    [`list_families_for_member`](crate::federation::FederationDirectory::list_families_for_member)
-///    (V059 §5.6.8.9).
+///    [`list_families_for_member_active`](crate::federation::FederationDirectory::list_families_for_member_active)
+///    (V059 §5.6.8.9) — **active** membership only: families this identity
+///    has an effective revocation from are excluded.
 /// 3. `identity_key_id → community_key_ids` via
-///    `list_communities_for_member` (V060).
+///    `list_communities_for_member_active` (V060) — same revocation
+///    honesty.
+///
+/// Honoring revocation here is the substrate-side closure of the
+/// symmetric forge surface: without it, a removed member's read access
+/// would persist silently.
 ///
 /// Backend-gated: resolution goes through `Engine::federation_directory`,
 /// which only exists when a `postgres`/`sqlite` backend is compiled in.
@@ -115,32 +124,44 @@ pub async fn build_caller_admission(
     occurrence_key_id: &KeyId,
 ) -> Result<CallerAdmission, AdmissionError> {
     let directory = engine.federation_directory();
+    let now = chrono::Utc::now();
 
     // Step 1 — occurrence → identity. §4.4 singleton fallback when the
-    // occurrence key is not bound as an occurrence of any identity:
-    // the caller IS its own identity.
+    // occurrence key is not bound as an occurrence of any identity, OR
+    // (Ask 6) when the binding has an effective revocation: the caller
+    // IS its own identity, with no inherited family/community admission.
     let identity_key_id = match directory
         .lookup_identity_for_occurrence(occurrence_key_id)
         .await?
     {
-        Some(occurrence) => occurrence.identity_key_id,
+        Some(occurrence) => {
+            let revoked = directory
+                .list_identity_occurrence_revocations_for(&occurrence.identity_key_id)
+                .await?
+                .into_iter()
+                .any(|r| r.occurrence_key_id == *occurrence_key_id && r.effective_at <= now);
+            if revoked {
+                occurrence_key_id.clone()
+            } else {
+                occurrence.identity_key_id
+            }
+        }
         None => occurrence_key_id.clone(),
     };
 
-    // Step 2 — identity → families. Members are identity keys; the
-    // family's own key_id is the admission token.
+    // Step 2 — identity → ACTIVE families. Members are identity keys; the
+    // family's own key_id is the admission token. Revoked memberships
+    // are filtered (Ask 2 / Ask 6).
     let family_key_ids: BTreeSet<KeyId> = directory
-        .list_families_for_member(&identity_key_id)
+        .list_families_for_member_active(&identity_key_id)
         .await?
         .into_iter()
         .map(|family| family.family_key_id)
         .collect();
 
-    // Step 3 — identity → communities. Provided by Commit D; symmetric
-    // to families. Each community's `community_key_id` is the admission
-    // token.
+    // Step 3 — identity → ACTIVE communities. Symmetric to families.
     let community_key_ids: BTreeSet<KeyId> = directory
-        .list_communities_for_member(&identity_key_id)
+        .list_communities_for_member_active(&identity_key_id)
         .await?
         .into_iter()
         .map(|community| community.community_key_id)
@@ -204,5 +225,187 @@ impl CallerAdmission {
             community_key_ids: community_key_ids.into_iter().collect(),
             _seal: AdmissionSeal,
         }
+    }
+}
+
+/// v4.8.0 (CIRISPersist#161 Ask 6) — `build_caller_admission` honors
+/// revocation: a revoked occurrence falls through to the singleton
+/// fallback and a removed family member drops out of `family_key_ids`.
+#[cfg(all(test, feature = "sqlite"))]
+mod revocation_honesty_tests {
+    use crate::federation::{
+        FamilyMembershipRevocation, FederationDirectory, IdentityOccurrence,
+        IdentityOccurrenceRevocation, KeyRecord, SignedFamily, SignedFamilyMembershipRevocation,
+        SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation, SignedKeyRecord,
+    };
+    use crate::signing::LocalSigner;
+    use crate::Engine;
+    use ed25519_dalek::SigningKey;
+    use std::sync::Arc;
+
+    fn signer() -> Arc<LocalSigner> {
+        Arc::new(LocalSigner::from_parts(
+            SigningKey::from_bytes(&[0x11u8; 32]),
+            "admission-test".into(),
+            None,
+            None,
+        ))
+    }
+
+    fn key(k: &str) -> SignedKeyRecord {
+        SignedKeyRecord {
+            record: KeyRecord {
+                key_id: k.into(),
+                pubkey_ed25519_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+                pubkey_ml_dsa_65_base64: None,
+                algorithm: crate::federation::types::algorithm::HYBRID.into(),
+                identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
+                identity_ref: k.into(),
+                valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
+                valid_until: None,
+                registration_envelope: serde_json::json!({ "id": k }),
+                original_content_hash: "deadbeef".into(),
+                scrub_signature_classical: "c2ln".into(),
+                scrub_signature_pqc: None,
+                scrub_key_id: k.into(),
+                scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                roles: Vec::new(),
+                attestation_evidence: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn revoked_occurrence_falls_through_to_singleton() {
+        let engine = Engine::with_signer(signer(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        for k in ["alice-root", "alice-phone", "fam-1"] {
+            sq.put_public_key(key(k)).await.unwrap();
+        }
+        sq.put_identity_occurrence(SignedIdentityOccurrence {
+            identity_occurrence: IdentityOccurrence {
+                identity_key_id: "alice-root".into(),
+                occurrence_key_id: "alice-phone".into(),
+                device_class: crate::federation::types::device_class::PHONE.into(),
+                hardware_attestation: None,
+                asserted_at: "2026-06-01T00:00:00Z".parse().unwrap(),
+                valid_until: None,
+                persist_row_hash: String::new(),
+            },
+        })
+        .await
+        .unwrap();
+        sq.put_family(SignedFamily {
+            family: crate::federation::Family {
+                family_key_id: "fam-1".into(),
+                family_name: "Fam".into(),
+                members: vec![crate::federation::FamilyMember {
+                    key_id: "alice-root".into(),
+                    joined_at: "2026-06-01T00:00:00Z".parse().unwrap(),
+                    role: None,
+                }],
+                founded_at: "2026-06-01T00:00:00Z".parse().unwrap(),
+                consensus_protocol: "unanimous".into(),
+                consensus_protocol_entrenched: false,
+                persist_row_hash: String::new(),
+            },
+        })
+        .await
+        .unwrap();
+
+        // Pre-revocation: alice-phone resolves to alice-root + fam-1.
+        let adm = super::build_caller_admission(&engine, &"alice-phone".to_string())
+            .await
+            .unwrap();
+        assert_eq!(adm.identity_key_id, "alice-root");
+        assert!(adm.family_key_ids.contains("fam-1"));
+
+        // Revoke the occurrence binding (effective in the past).
+        sq.put_identity_occurrence_revocation(SignedIdentityOccurrenceRevocation {
+            identity_occurrence_revocation: IdentityOccurrenceRevocation {
+                identity_key_id: "alice-root".into(),
+                occurrence_key_id: "alice-phone".into(),
+                revoked_at: "2026-06-02T00:00:00Z".parse().unwrap(),
+                effective_at: "2026-06-02T00:00:00Z".parse().unwrap(),
+                reason: None,
+                witness_set: vec!["alice-root".into()],
+                persist_row_hash: String::new(),
+            },
+        })
+        .await
+        .unwrap();
+
+        // Post-revocation: alice-phone speaks only for itself — singleton
+        // fallback, no inherited family admission.
+        let adm = super::build_caller_admission(&engine, &"alice-phone".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            adm.identity_key_id, "alice-phone",
+            "revoked occurrence falls through to singleton identity"
+        );
+        assert!(
+            adm.family_key_ids.is_empty(),
+            "revoked occurrence inherits no family admission"
+        );
+    }
+
+    #[tokio::test]
+    async fn removed_family_member_drops_from_admission() {
+        let engine = Engine::with_signer(signer(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        for k in ["bob-root", "fam-1"] {
+            sq.put_public_key(key(k)).await.unwrap();
+        }
+        sq.put_family(SignedFamily {
+            family: crate::federation::Family {
+                family_key_id: "fam-1".into(),
+                family_name: "Fam".into(),
+                members: vec![crate::federation::FamilyMember {
+                    key_id: "bob-root".into(),
+                    joined_at: "2026-06-01T00:00:00Z".parse().unwrap(),
+                    role: None,
+                }],
+                founded_at: "2026-06-01T00:00:00Z".parse().unwrap(),
+                consensus_protocol: "unanimous".into(),
+                consensus_protocol_entrenched: false,
+                persist_row_hash: String::new(),
+            },
+        })
+        .await
+        .unwrap();
+        // bob-root is a singleton identity (no occurrence binding) in fam-1.
+        let adm = super::build_caller_admission(&engine, &"bob-root".to_string())
+            .await
+            .unwrap();
+        assert!(adm.family_key_ids.contains("fam-1"));
+
+        sq.put_family_membership_revocation(SignedFamilyMembershipRevocation {
+            family_membership_revocation: FamilyMembershipRevocation {
+                family_key_id: "fam-1".into(),
+                removed_identity_key_id: "bob-root".into(),
+                removed_at: "2026-06-02T00:00:00Z".parse().unwrap(),
+                effective_at: "2026-06-02T00:00:00Z".parse().unwrap(),
+                reason: None,
+                witness_set: vec![],
+                persist_row_hash: String::new(),
+            },
+        })
+        .await
+        .unwrap();
+
+        let adm = super::build_caller_admission(&engine, &"bob-root".to_string())
+            .await
+            .unwrap();
+        assert!(
+            adm.family_key_ids.is_empty(),
+            "removed member loses family admission (forge surface closed)"
+        );
     }
 }

@@ -97,6 +97,14 @@ struct State {
     /// v4.0 (CEG 0.8 §8.1.13.3) — community rows keyed by
     /// `community_key_id`. Mirrors V060 PG/SQLite PK.
     federation_communities: HashMap<String, crate::federation::Community>,
+    /// v4.8.0 (CIRISPersist#161, CEG §11.7.1) — Option-A forward-secrecy
+    /// removal/revocation rows. Keyed by the V067 composite PKs.
+    federation_identity_occurrence_revocations:
+        HashMap<(String, String), crate::federation::IdentityOccurrenceRevocation>,
+    federation_family_membership_revocations:
+        HashMap<(String, String), crate::federation::FamilyMembershipRevocation>,
+    federation_community_membership_revocations:
+        HashMap<(String, String), crate::federation::CommunityMembershipRevocation>,
 }
 
 impl Default for MemoryBackend {
@@ -117,6 +125,9 @@ impl Default for MemoryBackend {
                 federation_identity_occurrences: HashMap::new(),
                 federation_families: HashMap::new(),
                 federation_communities: HashMap::new(),
+                federation_identity_occurrence_revocations: HashMap::new(),
+                federation_family_membership_revocations: HashMap::new(),
+                federation_community_membership_revocations: HashMap::new(),
                 blackhole_rules: HashMap::new(),
             }),
         }
@@ -929,6 +940,124 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by(|a, b| a.community_key_id.cmp(&b.community_key_id));
+        Ok(rows)
+    }
+
+    // ─── v4.8.0 (CIRISPersist#161, CEG §11.7.1) — membership revocations.
+
+    async fn put_identity_occurrence_revocation(
+        &self,
+        revocation: crate::federation::SignedIdentityOccurrenceRevocation,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = revocation.identity_occurrence_revocation;
+        let mut state = self.state.lock().expect("memory backend lock");
+        for k in [&row.identity_key_id, &row.occurrence_key_id] {
+            if !state.federation_keys.contains_key(k) {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "{k} does not exist in federation_keys"
+                )));
+            }
+        }
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        state.federation_identity_occurrence_revocations.insert(
+            (row.identity_key_id.clone(), row.occurrence_key_id.clone()),
+            row,
+        );
+        Ok(())
+    }
+
+    async fn put_family_membership_revocation(
+        &self,
+        revocation: crate::federation::SignedFamilyMembershipRevocation,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = revocation.family_membership_revocation;
+        let mut state = self.state.lock().expect("memory backend lock");
+        for k in [&row.family_key_id, &row.removed_identity_key_id] {
+            if !state.federation_keys.contains_key(k) {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "{k} does not exist in federation_keys"
+                )));
+            }
+        }
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        state.federation_family_membership_revocations.insert(
+            (
+                row.family_key_id.clone(),
+                row.removed_identity_key_id.clone(),
+            ),
+            row,
+        );
+        Ok(())
+    }
+
+    async fn put_community_membership_revocation(
+        &self,
+        revocation: crate::federation::SignedCommunityMembershipRevocation,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = revocation.community_membership_revocation;
+        let mut state = self.state.lock().expect("memory backend lock");
+        for k in [&row.community_key_id, &row.removed_identity_key_id] {
+            if !state.federation_keys.contains_key(k) {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "{k} does not exist in federation_keys"
+                )));
+            }
+        }
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        state.federation_community_membership_revocations.insert(
+            (
+                row.community_key_id.clone(),
+                row.removed_identity_key_id.clone(),
+            ),
+            row,
+        );
+        Ok(())
+    }
+
+    async fn list_identity_occurrence_revocations_for(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<crate::federation::IdentityOccurrenceRevocation>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_identity_occurrence_revocations
+            .values()
+            .filter(|r| r.identity_key_id == identity_key_id)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.occurrence_key_id.cmp(&b.occurrence_key_id));
+        Ok(rows)
+    }
+
+    async fn list_family_membership_revocations_for(
+        &self,
+        family_key_id: &str,
+    ) -> Result<Vec<crate::federation::FamilyMembershipRevocation>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_family_membership_revocations
+            .values()
+            .filter(|r| r.family_key_id == family_key_id)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.removed_identity_key_id.cmp(&b.removed_identity_key_id));
+        Ok(rows)
+    }
+
+    async fn list_community_membership_revocations_for(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Vec<crate::federation::CommunityMembershipRevocation>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_community_membership_revocations
+            .values()
+            .filter(|r| r.community_key_id == community_key_id)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.removed_identity_key_id.cmp(&b.removed_identity_key_id));
         Ok(rows)
     }
 
