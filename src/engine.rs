@@ -711,7 +711,6 @@ impl Engine {
         target_holds_bytes_type: &str,
         signer_key_id: &str,
     ) -> Result<(), crate::federation::BlobError> {
-        use crate::verify::canonical::{Canonicalizer, PythonJsonDumpsCanonicalizer};
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine as _;
         use sha2::{Digest, Sha256};
@@ -720,8 +719,10 @@ impl Engine {
             target_attestation_id,
             target_holds_bytes_type,
         );
-        let canonical_bytes = PythonJsonDumpsCanonicalizer
-            .canonicalize_value(&envelope)
+        // v4.6 (#176) — produce-side gate: emit Python pre-cut, JCS post-
+        // cut (one-line flip in produce_canon_version). Keeps persist's
+        // produced withdraws attestation verifiable by the chain.
+        let canonical_bytes = crate::verify::canonical::ceg_produce_canonicalize(&envelope)
             .map_err(|e| {
                 crate::federation::BlobError::Backend(format!("withdraws canonicalize: {e}"))
             })?;

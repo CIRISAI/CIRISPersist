@@ -184,6 +184,31 @@ pub fn canonicalizer_for(version: CanonVersion) -> &'static dyn Canonicalizer {
     }
 }
 
+/// v4.6 (CIRISPersist#171 / #176) — the canonicalization version persist
+/// **produces** at today. Until the coordinated **2.9.6 cutover**, persist
+/// emits `V1Python` so the still-Python chain (agent ≤ 2.9.5, lens, edge)
+/// can verify persist-produced federation rows; the cutover flips this to
+/// `V2Jcs` in lockstep. It is a `const fn`, not a runtime toggle — the
+/// flip is a release event coordinated chain-wide (the activation is a
+/// one-line change here, re-released as the 2.9.6 triple lands). The
+/// **verify** side gates per-row regardless ([`canonicalizer_for`] keyed
+/// on the row's signed epoch), so persist verifies both V1 and V2 rows no
+/// matter what it produces.
+pub const fn produce_canon_version() -> CanonVersion {
+    // 2.9.6 cutover flips this to CanonVersion::V2Jcs (lockstep).
+    CanonVersion::V1Python
+}
+
+/// v4.6 — canonicalize a payload persist is about to **sign/emit**, via
+/// the [`produce_canon_version`] gate. The single produce-side
+/// canonicalization entry point: routing every persist-produced signing
+/// payload through here makes the 2.9.6 flip a one-line change and keeps
+/// the produce epoch consistent across all surfaces (withdraws /
+/// holds_bytes / attestation_promote / key registration / FFI).
+pub fn ceg_produce_canonicalize(value: &serde_json::Value) -> Result<Vec<u8>, Error> {
+    canonicalizer_for(produce_canon_version()).canonicalize_value(value)
+}
+
 // ─── Python-compat writer ──────────────────────────────────────────
 
 fn write_value(buf: &mut Vec<u8>, v: &serde_json::Value) {
