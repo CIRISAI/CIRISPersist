@@ -8321,6 +8321,45 @@ impl crate::read::ReadEngine for PostgresBackend {
                 "pqc_completed_at IS NULL".to_owned()
             });
         }
+        // v4.5 (CEG §10.1.5.4) — open-vocab dimension-prefix filter
+        // (OR-combined LIKE on the JSONB envelope dimension).
+        if !filter.dimension_prefixes.is_empty() {
+            let mut ors: Vec<String> = Vec::new();
+            for p in &filter.dimension_prefixes {
+                let esc = p
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_");
+                params.push(Box::new(format!("{esc}%")));
+                ors.push(format!(
+                    "attestation_envelope->>'dimension' LIKE ${}",
+                    params.len()
+                ));
+            }
+            where_parts.push(format!("({})", ors.join(" OR ")));
+        }
+        // v4.5 — point-in-time validity.
+        if let Some(va) = filter.valid_at {
+            params.push(Box::new(va));
+            let p = params.len();
+            where_parts.push(format!(
+                "(asserted_at <= ${p} AND (expires_at IS NULL OR expires_at > ${p}))"
+            ));
+        }
+        // v4.5 — confidence floor (NUMERIC weight compared via float8;
+        // NULL weight excluded when a floor is set).
+        if let Some(floor) = filter.confidence_floor {
+            params.push(Box::new(floor));
+            where_parts.push(format!(
+                "(weight IS NOT NULL AND weight::float8 >= ${})",
+                params.len()
+            ));
+        }
+        // v4.5 — subject membership (subject_key_ids JSONB array ? element).
+        if let Some(subj) = &filter.subject_key_id {
+            params.push(Box::new(subj.clone()));
+            where_parts.push(format!("(subject_key_ids ? ${})", params.len()));
+        }
         // §4.3 scope gate — federation_attestations carries cohort_scope
         // (V056) + attested_key_id (target identity, V055).
         {
@@ -19945,6 +19984,145 @@ mod tests {
         assert!(
             matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("revocation")),
             "got: {err:?}"
+        );
+    }
+
+    /// v4.5 attestation_query filters on live PG — exercises the
+    /// PG-specific SQL: `->>'dimension' LIKE`, `weight::float8 >=`, and
+    /// the `subject_key_ids ? $n` JSONB-array-membership operator.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_attestation_query_filters() {
+        use crate::ceg::ReadEngine;
+        use crate::federation::FederationDirectory;
+        use crate::read::AttestationFilter;
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let occ = format!("occ-{}", uuid_like());
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &occ,
+                    "registry",
+                    crate::federation::types::identity_type::STEWARD,
+                ),
+            })
+            .await
+            .unwrap();
+
+        let seed = |id: uuid::Uuid,
+                    dim: &'static str,
+                    weight: f64,
+                    subjects: serde_json::Value,
+                    expires: Option<chrono::DateTime<chrono::Utc>>| {
+            let occ = occ.clone();
+            let backend = &backend;
+            async move {
+                let client = backend.get_client().await.unwrap();
+                let env = serde_json::json!({"id": id.to_string(), "dimension": dim, "score": 1.0});
+                let empty: Vec<u8> = Vec::new();
+                let asserted = "2026-05-01T00:00:00Z"
+                    .parse::<chrono::DateTime<chrono::Utc>>()
+                    .unwrap();
+                client.execute(
+                    "INSERT INTO cirislens.federation_attestations (\
+                        attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                        weight, asserted_at, expires_at, attestation_envelope, original_content_hash, \
+                        scrub_signature_classical, scrub_signature_pqc, scrub_key_id, scrub_timestamp, \
+                        pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, \
+                        cohort_scope, tier, promoted_at\
+                     ) VALUES ($1, $2, $2, 'scores', $3::float8::numeric, $4, $5, $6, $7, \
+                              'sig', NULL, $2, $4, NULL, '0', $8, NULL, 'federation', 'federation', NULL)",
+                    &[&id, &occ, &weight, &asserted, &expires, &env, &empty, &subjects],
+                ).await.unwrap();
+            }
+        };
+        let (a, b, c, d) = (
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        );
+        seed(a, "config:filter:v1", 0.9, serde_json::json!([]), None).await;
+        seed(b, "config:other:v1", 0.4, serde_json::json!([]), None).await;
+        seed(
+            c,
+            "goal:x:v1",
+            0.95,
+            serde_json::json!(["subj-1"]),
+            "2030-01-01T00:00:00Z".parse().ok(),
+        )
+        .await;
+        seed(
+            d,
+            "goal:y:v1",
+            0.7,
+            serde_json::json!([]),
+            "2026-05-02T00:00:00Z".parse().ok(),
+        )
+        .await;
+
+        let q = |mut f: AttestationFilter| {
+            let backend = &backend;
+            let occ = occ.clone();
+            async move {
+                // Scope to THIS run's rows (shared PG DB holds other tests').
+                f.attesting_key_id = Some(occ);
+                let mut ids: Vec<String> = backend
+                    .list_attestations(f, None, 100, crate::scope::CallerScope::Unauthenticated)
+                    .await
+                    .unwrap()
+                    .items
+                    .into_iter()
+                    .map(|a| a.attestation_id)
+                    .collect();
+                ids.sort();
+                ids
+            }
+        };
+        let mut want_config = vec![a.to_string(), b.to_string()];
+        want_config.sort();
+        assert_eq!(
+            q(AttestationFilter {
+                dimension_prefixes: vec!["config:".into()],
+                ..Default::default()
+            })
+            .await,
+            want_config
+        );
+        let mut want_floor = vec![a.to_string(), c.to_string()];
+        want_floor.sort();
+        assert_eq!(
+            q(AttestationFilter {
+                confidence_floor: Some(0.8),
+                ..Default::default()
+            })
+            .await,
+            want_floor
+        );
+        assert_eq!(
+            q(AttestationFilter {
+                subject_key_id: Some("subj-1".into()),
+                ..Default::default()
+            })
+            .await,
+            vec![c.to_string()]
+        );
+        let at = "2026-05-03T00:00:00Z".parse().unwrap();
+        let mut want_valid = vec![a.to_string(), b.to_string(), c.to_string()]; // d expired
+        want_valid.sort();
+        assert_eq!(
+            q(AttestationFilter {
+                valid_at: Some(at),
+                ..Default::default()
+            })
+            .await,
+            want_valid
         );
     }
 }

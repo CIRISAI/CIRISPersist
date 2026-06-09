@@ -5,6 +5,26 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [4.5.0] — 2026-06-09
+
+**Shared CEG attestation surface — `attestation_query` filters (CIRISPersist#171; CEG 0.15 §10.1.5.4).**
+
+The uniform read the agent's memory/config/consent/audit services wrap over — and the same read NodeCore/LensCore/Registry use. Built as additive fields on `AttestationFilter` (riding the existing scope-gated, cursor-paged `ReadEngine::list_attestations` + its PyO3 JSON wrapper — no new method, no new result type), so it composes with the v4.0 DAS scope machinery + cache. No signing involved → independent of the v4.5 JCS flip (FSD review #174).
+
+### Added — `AttestationFilter` query fields
+- **`dimension_prefixes: Vec<String>`** — **open-vocabulary**, hierarchical-prefix-matched on the envelope `dimension` (`attestation_envelope->>'dimension' LIKE 'prefix%'`, OR-combined; `%`/`_`/`\` escaped). Validated structurally, NOT against a closed enum (the OQ-2 resolution: open data, closed operators). New CEG dimension families work with no redeploy.
+- **`valid_at: Option<DateTime>`** — point-in-time validity (`asserted_at <= valid_at < COALESCE(expires_at, +inf)`).
+- **`confidence_floor: Option<f64>`** — `weight >= floor` (NULL weight excluded when a floor is set; PG compares via `weight::float8`).
+- **`subject_key_id: Option<String>`** — attestations naming a subject (PG `subject_key_ids ? $n` JSONB-array membership; SQLite `json_each`).
+
+All four AND-compose with the existing `attesting`/`attested`/`type`/`pqc` filters + the §4.3 cohort scope gate + the v4.4 tier gate. The agent reads its own local (`self`-cohort) + federation rows by dimension through this one call. PyO3: automatic — the existing `list_attestations(filter_json, …)` wrapper deserializes the richer filter.
+
+### Tests
+Both backends (live PG + SQLite): dimension-prefix (single + OR), confidence-floor (NULL-excluded), subject membership, point-in-time validity. **1037 lib tests green on live PG**; `-D warnings` clean across no-backend / `test-panic,pyo3` / full; clippy clean over `--tests`.
+
+### Note
+- `AttestationFilter` dropped its `Eq` derive (`confidence_floor: Option<f64>` is not `Eq`); it keeps `PartialEq`. Source-incompatible only for code that relied on `AttestationFilter: Eq`.
+
 ## [4.4.0] — 2026-06-08
 
 **Shared CEG attestation surface — phase 1: local-tier write + read-gate (CIRISPersist#171; CEG 0.15 §10.1.3 / §10.1.5; FSD `V4_4_SHARED_ATTESTATION_SURFACE.md`).**
