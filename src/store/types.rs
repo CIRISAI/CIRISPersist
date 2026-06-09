@@ -454,3 +454,143 @@ pub struct ClaimParams<'a> {
     /// Wall-clock at the moment of claim.
     pub now: DateTime<Utc>,
 }
+
+/// v4.7.0 (CIRISPersist#177) — typed outcome of registering an
+/// `accord_public_keys` pubkey (the agent's boot-time signing-key
+/// registration). Replaces the string-matchable exception consumers
+/// reverse-engineered (`str(exc).lower()` for "already"/"exists"/
+/// "conflict"). A rotation collision is a **normal return value, not an
+/// error**, so the idempotent boot path stays non-throwing; per CEG §0.0
+/// the substrate authors the trust-relevant signal and the consumer
+/// surfaces it without parsing exception strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyRegistrationOutcome {
+    /// Newly inserted — no prior row for this `key_id`.
+    Registered,
+    /// Idempotent match — the `key_id` already maps to the **same**
+    /// pubkey. The expected steady-state on every reboot.
+    AlreadyRegistered,
+    /// The `key_id` already maps to a **different** pubkey — a key
+    /// rotation / potential-compromise signal the consumer MUST surface
+    /// (CIRISAgent#809). Carries a stable fingerprint of the *existing*
+    /// (stored) key so the consumer can log/compare without handling raw
+    /// key material.
+    RotationCollision {
+        /// SHA-256 (hex) of the stored `public_key_base64`.
+        existing_key_fingerprint: String,
+    },
+}
+
+impl KeyRegistrationOutcome {
+    /// Stable discriminator token for the PyO3 dict / logs / metrics.
+    pub fn status(&self) -> &'static str {
+        match self {
+            Self::Registered => "registered",
+            Self::AlreadyRegistered => "already_registered",
+            Self::RotationCollision { .. } => "rotation_collision",
+        }
+    }
+}
+
+/// SHA-256 (hex) of a stored pubkey base64 — the stable fingerprint
+/// carried on [`KeyRegistrationOutcome::RotationCollision`].
+pub fn accord_key_fingerprint(public_key_base64: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(public_key_base64.as_bytes()))
+}
+
+/// Classify a registration attempt from the `INSERT … ON CONFLICT DO
+/// NOTHING` result plus any pre-existing row, read back on the same
+/// connection. Pure (no IO) so backends share one definition and it is
+/// exhaustively unit-testable.
+///
+/// - `inserted` — the insert affected a row (no prior `key_id`).
+/// - `existing_public_key_base64` — the stored pubkey when the insert
+///   was a no-op (conflict), else `None`.
+///
+/// The `inserted == false && existing == None` case is a benign TOCTOU
+/// (the conflicting row was deleted between insert and read on an
+/// otherwise append-only table); we report [`AlreadyRegistered`] rather
+/// than fabricate a [`RotationCollision`] — never raise a false rotation
+/// alarm.
+///
+/// [`AlreadyRegistered`]: KeyRegistrationOutcome::AlreadyRegistered
+/// [`RotationCollision`]: KeyRegistrationOutcome::RotationCollision
+pub fn classify_key_registration(
+    inserted: bool,
+    existing_public_key_base64: Option<&str>,
+    new_public_key_base64: &str,
+) -> KeyRegistrationOutcome {
+    if inserted {
+        return KeyRegistrationOutcome::Registered;
+    }
+    match existing_public_key_base64 {
+        Some(existing) if existing == new_public_key_base64 => {
+            KeyRegistrationOutcome::AlreadyRegistered
+        }
+        Some(existing) => KeyRegistrationOutcome::RotationCollision {
+            existing_key_fingerprint: accord_key_fingerprint(existing),
+        },
+        None => KeyRegistrationOutcome::AlreadyRegistered,
+    }
+}
+
+#[cfg(test)]
+mod keyreg_tests {
+    use super::*;
+
+    #[test]
+    fn classify_new_insert_is_registered() {
+        assert_eq!(
+            classify_key_registration(true, None, "pubA"),
+            KeyRegistrationOutcome::Registered
+        );
+    }
+
+    #[test]
+    fn classify_conflict_same_pubkey_is_already_registered() {
+        assert_eq!(
+            classify_key_registration(false, Some("pubA"), "pubA"),
+            KeyRegistrationOutcome::AlreadyRegistered
+        );
+    }
+
+    #[test]
+    fn classify_conflict_different_pubkey_is_rotation_collision() {
+        let out = classify_key_registration(false, Some("pubOLD"), "pubNEW");
+        match out {
+            KeyRegistrationOutcome::RotationCollision {
+                existing_key_fingerprint,
+            } => {
+                assert_eq!(existing_key_fingerprint, accord_key_fingerprint("pubOLD"));
+                assert_eq!(existing_key_fingerprint.len(), 64, "sha256 hex");
+            }
+            other => panic!("expected RotationCollision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_conflict_vanished_row_is_benign_not_false_collision() {
+        // TOCTOU: never fabricate a rotation alarm.
+        assert_eq!(
+            classify_key_registration(false, None, "pubA"),
+            KeyRegistrationOutcome::AlreadyRegistered
+        );
+    }
+
+    #[test]
+    fn status_tokens_are_stable() {
+        assert_eq!(KeyRegistrationOutcome::Registered.status(), "registered");
+        assert_eq!(
+            KeyRegistrationOutcome::AlreadyRegistered.status(),
+            "already_registered"
+        );
+        assert_eq!(
+            KeyRegistrationOutcome::RotationCollision {
+                existing_key_fingerprint: "x".into()
+            }
+            .status(),
+            "rotation_collision"
+        );
+    }
+}

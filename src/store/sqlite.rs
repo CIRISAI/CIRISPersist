@@ -113,6 +113,64 @@ impl SqliteBackend {
         self.conn.clone()
     }
 
+    /// v4.7.0 (CIRISPersist#177) — SQLite twin of
+    /// [`PostgresBackend::register_accord_public_key`]. Inserts
+    /// `ON CONFLICT (key_id) DO NOTHING`; on a no-op reads the stored
+    /// pubkey on the same locked connection and classifies via the
+    /// shared [`crate::store::classify_key_registration`]. Returns a
+    /// typed [`KeyRegistrationOutcome`](crate::store::KeyRegistrationOutcome);
+    /// a rotation collision is a normal return, not an error.
+    pub async fn register_accord_public_key(
+        &self,
+        key_id: &str,
+        public_key_base64: &str,
+        algorithm: &str,
+        description: Option<&str>,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+        added_by: Option<&str>,
+    ) -> Result<crate::store::KeyRegistrationOutcome, Error> {
+        let conn = self.conn.clone();
+        let key_id = key_id.to_owned();
+        let pubkey = public_key_base64.to_owned();
+        let algorithm = algorithm.to_owned();
+        let description = description.map(str::to_owned);
+        let expires_text: Option<String> = expires_at.map(|t| t.to_rfc3339());
+        let added_by = added_by.map(str::to_owned);
+        (move || -> Result<crate::store::KeyRegistrationOutcome, rusqlite::Error> {
+            let conn = conn.lock();
+            let inserted = conn.execute(
+                "INSERT INTO accord_public_keys \
+                    (key_id, public_key_base64, algorithm, description, expires_at, added_by) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT (key_id) DO NOTHING",
+                rusqlite::params![
+                    key_id,
+                    pubkey,
+                    algorithm,
+                    description,
+                    expires_text,
+                    added_by
+                ],
+            )?;
+            if inserted == 1 {
+                return Ok(crate::store::KeyRegistrationOutcome::Registered);
+            }
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT public_key_base64 FROM accord_public_keys WHERE key_id = ?1",
+                    [&key_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(crate::store::classify_key_registration(
+                false,
+                existing.as_deref(),
+                &pubkey,
+            ))
+        })()
+        .map_err(|e| Error::Backend(format!("register_accord_public_key: {e}")))
+    }
+
     /// v2.1 (CIRISPersist#101) — construct a `SqliteBackend` from an
     /// existing connection handle (e.g. one shared with the cirisnode
     /// substrate). Used internally by `cirisnode::sqlite` to compose
@@ -12833,6 +12891,62 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .unwrap();
+    }
+
+    // ─── v4.7.0 (CIRISPersist#177) — typed register_accord_public_key ──
+
+    /// SQLite round-trip for the typed key-registration outcome: a new
+    /// key → `Registered`; the same key+pubkey → `AlreadyRegistered`; the
+    /// same key with a *different* pubkey → `RotationCollision` carrying
+    /// the SHA-256 fingerprint of the **stored** (original) pubkey.
+    #[tokio::test]
+    async fn sqlite_register_accord_public_key_classifies_outcomes() {
+        use crate::store::{accord_key_fingerprint, KeyRegistrationOutcome};
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let reg = backend
+            .register_accord_public_key("agent-k", "pubA", "Ed25519", None, None, Some("boot"))
+            .await
+            .unwrap();
+        assert_eq!(reg, KeyRegistrationOutcome::Registered);
+
+        let again = backend
+            .register_accord_public_key("agent-k", "pubA", "Ed25519", None, None, Some("boot"))
+            .await
+            .unwrap();
+        assert_eq!(
+            again,
+            KeyRegistrationOutcome::AlreadyRegistered,
+            "same key+pubkey is the idempotent reboot path"
+        );
+
+        let collision = backend
+            .register_accord_public_key("agent-k", "pubB", "Ed25519", None, None, Some("boot"))
+            .await
+            .unwrap();
+        match collision {
+            KeyRegistrationOutcome::RotationCollision {
+                existing_key_fingerprint,
+            } => assert_eq!(
+                existing_key_fingerprint,
+                accord_key_fingerprint("pubA"),
+                "fingerprint is of the STORED key, not the incoming one"
+            ),
+            other => panic!("expected RotationCollision, got {other:?}"),
+        }
+        // The collision is non-destructive: the stored pubkey is unchanged.
+        let stored: String = {
+            let conn = backend.conn_handle();
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT public_key_base64 FROM accord_public_keys WHERE key_id = 'agent-k'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(stored, "pubA", "rotation collision must not overwrite");
     }
 
     // ─── BlobStorage tests (v2.3, CIRISPersist#103) ────────────────

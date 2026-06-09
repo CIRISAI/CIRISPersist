@@ -2377,27 +2377,42 @@ impl PyEngine {
     ///   `accord_public_keys.expires_at`.
     /// - `added_by` — operator / process annotation for audit.
     ///
-    /// Idempotent: re-registering the same `signature_key_id`
-    /// is a no-op (ON CONFLICT DO NOTHING). For genuine key
-    /// rotation, use the lens's revocation surface (set
-    /// `revoked_at` on the old row, register a new row with a
-    /// different `signature_key_id`). Mission constraint
-    /// (MISSION.md §3 anti-pattern #3): no automated key rotation
-    /// under attacker control.
+    /// Idempotent: re-registering the same `signature_key_id` with the
+    /// **same** pubkey is a no-op. For genuine key rotation, use the
+    /// lens's revocation surface (set `revoked_at` on the old row,
+    /// register a new row with a different `signature_key_id`). Mission
+    /// constraint (MISSION.md §3 anti-pattern #3): no automated key
+    /// rotation under attacker control.
+    ///
+    /// v4.7.0 (CIRISPersist#177) — **returns a typed result dict**
+    /// instead of `None`, so consumers no longer reverse-engineer the
+    /// insert-vs-match-vs-rotation determination from an exception
+    /// string (per CEG §0.0 the substrate authors trust signals; the
+    /// consumer surfaces them). The dict carries:
+    /// - `status` — `"registered"` (newly inserted) /
+    ///   `"already_registered"` (idempotent same-pubkey match) /
+    ///   `"rotation_collision"` (same `key_id`, **different** pubkey — a
+    ///   rotation / potential-compromise signal; CIRISAgent#809).
+    /// - `key_id` — echoed for the caller's convenience.
+    /// - `existing_key_fingerprint` — present **only** for
+    ///   `rotation_collision`: SHA-256 hex of the stored pubkey.
+    ///
+    /// A rotation collision is a normal return, **not** an exception —
+    /// the idempotent boot path stays non-throwing.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (signature_key_id, public_key_b64,
                         algorithm = None, description = None,
                         expires_at = None, added_by = None))]
-    fn register_public_key(
+    fn register_public_key<'py>(
         &self,
-        py: Python<'_>,
+        py: Python<'py>,
         signature_key_id: &str,
         public_key_b64: &str,
         algorithm: Option<&str>,
         description: Option<&str>,
         expires_at: Option<&str>,
         added_by: Option<&str>,
-    ) -> PyResult<()> {
+    ) -> PyResult<Bound<'py, PyDict>> {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
@@ -2417,65 +2432,53 @@ impl PyEngine {
                 })?),
             };
 
-            py.detach(move || match &self.backend {
+            let key_id_for_dict = key_id.clone();
+            let outcome = py.detach(move || match &self.backend {
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
-                        let client = backend
-                            .pool()
-                            .get()
-                            .await
-                            .map_err(|e| PyRuntimeError::new_err(format!("pool: {e}")))?;
-                        client
-                            .execute(
-                                "INSERT INTO cirislens.accord_public_keys \
-                             (key_id, public_key_base64, algorithm, description, \
-                              expires_at, added_by) \
-                             VALUES ($1, $2, $3, $4, $5, $6) \
-                             ON CONFLICT (key_id) DO NOTHING",
-                                &[&key_id, &pub_b64, &algo, &desc, &expires_dt, &added],
+                        backend
+                            .register_accord_public_key(
+                                &key_id,
+                                &pub_b64,
+                                &algo,
+                                desc.as_deref(),
+                                expires_dt,
+                                added.as_deref(),
                             )
                             .await
-                            .map_err(|e| PyRuntimeError::new_err(format!("register: {e}")))?;
-                        Ok::<_, PyErr>(())
+                            .map_err(|e| PyRuntimeError::new_err(format!("register: {e}")))
                     })
                 }
                 #[cfg(feature = "sqlite")]
                 BackendDispatch::Sqlite(sq) => {
-                    // SQLite shape (migrations/sqlite/lens/V001
-                    // accord_public_keys): unqualified table name (no
-                    // `cirislens.` schema prefix), `?N` placeholders,
-                    // TEXT-encoded ISO-8601 for `expires_at` matching
-                    // the rest of the SQLite TEXT-as-TIMESTAMPTZ
-                    // convention. Idempotent on `key_id` PRIMARY KEY
-                    // via `ON CONFLICT DO NOTHING` (same shape as PG).
-                    let conn = sq.conn_handle();
-                    let expires_text: Option<String> = expires_dt.map(|t| t.to_rfc3339());
+                    let backend = sq.clone();
                     runtime.block_on(async move {
-                        (move || -> Result<(), rusqlite::Error> {
-                            let conn = conn.lock();
-                            conn.execute(
-                                    "INSERT INTO accord_public_keys \
-                                     (key_id, public_key_base64, algorithm, description, \
-                                      expires_at, added_by) \
-                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-                                     ON CONFLICT (key_id) DO NOTHING",
-                                    rusqlite::params![
-                                        key_id,
-                                        pub_b64,
-                                        algo,
-                                        desc,
-                                        expires_text,
-                                        added,
-                                    ],
-                                )?;
-                            Ok(())
-                        })()
-                        .map_err(|e| PyRuntimeError::new_err(format!("register: {e}")))?;
-                        Ok::<_, PyErr>(())
+                        backend
+                            .register_accord_public_key(
+                                &key_id,
+                                &pub_b64,
+                                &algo,
+                                desc.as_deref(),
+                                expires_dt,
+                                added.as_deref(),
+                            )
+                            .await
+                            .map_err(|e| PyRuntimeError::new_err(format!("register: {e}")))
                     })
                 }
-            })
+            })?;
+
+            let dict = PyDict::new(py);
+            dict.set_item("status", outcome.status())?;
+            dict.set_item("key_id", key_id_for_dict)?;
+            if let crate::store::KeyRegistrationOutcome::RotationCollision {
+                existing_key_fingerprint,
+            } = &outcome
+            {
+                dict.set_item("existing_key_fingerprint", existing_key_fingerprint)?;
+            }
+            Ok(dict)
         })
     }
 
