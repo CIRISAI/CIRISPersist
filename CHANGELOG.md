@@ -23,6 +23,9 @@ The `cohort_subkind: geographic` community-admission dispatch (gate new members 
 ### Tests
 `federation::location` unit tests (valid res-7 admit, resolution-redundancy mismatch, over-precise refused, uppercase/garbage refused, containment parent/child + disjoint + invalid-input) + SQLite and live-PG round-trips (valid admit, BYTEA `attestation_evidence` round-trip, rough-only rejection, rejections don't write, FK holds). **1067 lib green on SQLite, 763 on live PG**; `-D warnings` clean across no-default / `test-panic,pyo3` / full; clippy + cargo-deny clean (h3o + transitives).
 
+### Fixed — `pyproject.toml` `ciris-verify` pin blocked the conformance matrix
+The Python wheel's `Requires-Dist` stayed at `ciris-verify>=4.4.2,<5` after the v4.6.1 Rust pin moved to verify v5.0.0 — the same Requires-Dist drift the v2.0.1 hotfix fixed once before. The effect: `pip install ciris-persist` refused `ciris-verify==5.0.0`, so **CIRISConformance could not put verify 5.0 (the `jcs_canonicalize` binding, CIRISVerify#61) into its matrix alongside persist.** Bumped to `>=5.0.0,<6`, coherent with the Rust crates' v5.0.0 pin.
+
 ## [4.9.0] — 2026-06-09
 
 **PyO3 `attestation_promote` binding — the local→federation transition for the agent's 2.9.6 community-server opt-in (CIRISPersist#171 phase 2, CEG §10.1.5).**
