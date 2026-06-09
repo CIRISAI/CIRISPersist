@@ -5,6 +5,20 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [4.9.0] — 2026-06-09
+
+**PyO3 `attestation_promote` binding — the local→federation transition for the agent's 2.9.6 community-server opt-in (CIRISPersist#171 phase 2, CEG §10.1.5).**
+
+The agent confirmed the shape on #171: their 2.9.6 community-server opt-in writes a `witness_relation: self` local-tier row via `attestation_upsert_local` (already exposed, v4.4), then **promotes it to federation tier at federation-emit time** (PROXY/SERVER mode) — computing the hybrid Ed25519 + ML-DSA-65 signature **synchronously** and marking it federation-visible. That's exactly `Engine::attestation_promote` (shipped v4.6.0); this release exposes it through PyO3.
+
+### Added — `PyEngine.attestation_promote(attestation_id) -> bool`
+Reconstructs a hybrid-capable Engine over the shared backend + signer (the cohabitation `from_shared_with_local` path, same as the eviction sweeper) so `sign_hybrid` can reach the PQC-configured `LocalSigner`, then runs the §0.9 produce-gate canonicalize → SHA-256 → hybrid sign → write scrub envelope → flip `tier=federation`. The signing bytes are the §0.9 canonical envelope, so a promoted row is byte-identical on the wire to a natively-federation attestation (Registry must #1). Returns `True` on promotion, `False` if the row is already `federation` (idempotent — re-emitting an already-announced opt-in is a no-op, not an error). Requires the Engine to carry a PQC local signer (PROXY/SERVER mode); raises otherwise.
+
+`attestation_upsert_local` / `attestation_insert_local` (v4.4) and the `attestation_query` read (v4.5, via the `list_attestations` JSON wrapper) were already exposed — this completes the agent-facing `upsert_local` + `promote` (+ `query`) slice #171 scopes for 2.9.6. The bulk/migrate trio (`attestation_upsert_local_many` / `migrate_graph_nodes_to_attestations` / consent-revocation auto-promote) stays **#840-scoped (agent 3.0)** — the 2.9.6 opt-in object is single-party self (`subject_key_ids` empty), so it exercises none of them.
+
+### Tests
+A Rust test exercises the binding's substantive path end-to-end: a PQC local signer reconstructed via `from_shared_with_local` (exactly what the binding does) → seed a local self-attestation → `attestation_promote` flips it to federation with a populated **hybrid** scrub envelope + 64-hex content hash, and re-promote is idempotent. Per the module's PyO3-wrapper convention (the `py`-taking method body is thin glue; `cargo test --lib` has no interpreter to drive the dispatch boundary), the wrapper itself is trusted boilerplate over the already-tested `Engine::attestation_promote`. **1057 lib green on SQLite, 754 on live PG**; `-D warnings` + clippy clean.
+
 ## [4.8.0] — 2026-06-09
 
 **Option-A forward-secrecy removal/revocation substrate primitives (CIRISPersist#161 Phases 1–3; CEG §11.7.1).**

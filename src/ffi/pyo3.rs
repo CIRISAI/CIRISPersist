@@ -3264,6 +3264,54 @@ impl PyEngine {
         self.local_attestation_write(py, input_json, false)
     }
 
+    /// v4.9.0 (CIRISPersist#171 phase 2, CEG §10.1.5) — promote a
+    /// **local**-tier self-attestation to **federation** tier: the
+    /// local→public transition the agent's community-server opt-in
+    /// performs at federation-emit time. Canonicalizes the row's envelope
+    /// (§0.9 produce gate), hybrid-signs the canonical bytes
+    /// (Ed25519 + ML-DSA-65) **synchronously**, writes the scrub envelope,
+    /// and flips `tier=federation`. The signing bytes are the §0.9
+    /// canonical envelope, so a promoted row is byte-identical on the wire
+    /// to a natively-federation attestation (Registry must #1).
+    ///
+    /// Returns `True` on promotion, `False` if the row is already
+    /// `federation` (idempotent — re-emitting an already-announced opt-in
+    /// is a no-op, not an error).
+    ///
+    /// Requires the Engine to carry a PQC-configured local signer
+    /// (constructed with `local_pqc_key_id` + `local_pqc_key_path`) — the
+    /// agent runs this in PROXY/SERVER mode where that signer is present.
+    /// Raises if PQC is not configured (the synchronous hybrid sign can't
+    /// complete).
+    fn attestation_promote(&self, py: Python<'_>, attestation_id: &str) -> PyResult<bool> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            // Convert the PyO3 dispatch to the crate-level engine dispatch
+            // (same shape `federation_directory()` produces).
+            let backend = match &self.backend {
+                BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+            };
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            let id = attestation_id.to_owned();
+            py.detach(move || {
+                // Reconstruct a hybrid-capable Engine over the shared
+                // backend + signer (the cohabitation path, same as the
+                // sweeper) so `sign_hybrid` can reach the LocalSigner.
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(async move {
+                    engine
+                        .attestation_promote(&id)
+                        .await
+                        .map_err(federation_err_to_py)
+                })
+            })
+        })
+    }
+
     // NB (v4.0 #135) — the legacy `list_attestations_for(attested_key_id)
     // -> Vec<Attestation>` PyO3 wrapper (uncapped, no scope, no cursor) is
     // superseded by the scope-gated cursor-paged
@@ -20226,6 +20274,115 @@ mod tests {
             multimedia_config: Arc::new(std::sync::RwLock::new(None)),
         });
         (cell, sq)
+    }
+
+    /// v4.9.0 (CIRISPersist#171 phase 2) — the substantive path the PyO3
+    /// `attestation_promote` binding delegates to: a backend + a
+    /// **PQC-configured** local signer, reconstructed into an Engine via
+    /// `from_shared_with_local` (exactly what the binding does), then
+    /// `attestation_promote` runs the synchronous hybrid sign. Exercised
+    /// at the Engine surface per the module's PyO3-wrapper test convention
+    /// (the `py`-taking method body is thin glue; `cargo test --lib` has
+    /// no interpreter to drive the dispatch boundary).
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn attestation_promote_via_cohab_reconstruction_hybrid_signs() {
+        use crate::federation::{FederationDirectory, KeyRecord, SignedKeyRecord};
+        use ciris_keyring::MlDsa65SoftwareSigner;
+        let runtime = Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let sq = {
+                use crate::store::Backend;
+                let sq = SqliteBackend::open_in_memory().await.unwrap();
+                sq.run_migrations().await.unwrap();
+                Arc::new(sq)
+            };
+            // PQC-configured local signer (alias == the producing occurrence
+            // so attesting_key_id and scrub_key_id share one seeded key).
+            let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+            let pqc = MlDsa65SoftwareSigner::from_seed_bytes(&[0x42 ^ 0x55; 32], "promote-pqc")
+                .expect("pqc seed");
+            let local = Arc::new(crate::signing::LocalSigner::from_parts(
+                signing_key,
+                "occ".to_string(),
+                Some(Arc::new(pqc)),
+                Some("promote-pqc".to_string()),
+            ));
+            let signer: Arc<dyn HardwareSigner> = Arc::new(
+                crate::signing::LocalSignerHardwareAdapter::new(local.clone()),
+            );
+
+            // Seed the federation key + a local-tier self-attestation.
+            sq.put_public_key(SignedKeyRecord {
+                record: KeyRecord {
+                    key_id: "occ".into(),
+                    pubkey_ed25519_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+                    pubkey_ml_dsa_65_base64: None,
+                    algorithm: crate::federation::types::algorithm::HYBRID.into(),
+                    identity_type: crate::federation::types::identity_type::STEWARD.into(),
+                    identity_ref: "occ".into(),
+                    valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
+                    valid_until: None,
+                    registration_envelope: serde_json::json!({ "id": "occ" }),
+                    original_content_hash: "deadbeef".into(),
+                    scrub_signature_classical: "c2ln".into(),
+                    scrub_signature_pqc: None,
+                    scrub_key_id: "occ".into(),
+                    scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+                    pqc_completed_at: None,
+                    persist_row_hash: String::new(),
+                    roles: Vec::new(),
+                    attestation_evidence: None,
+                },
+            })
+            .await
+            .unwrap();
+            let att_id = sq
+                .attestation_upsert_local(crate::federation::types::LocalAttestationInput {
+                    attesting_key_id: "occ".into(),
+                    attested_key_id: None,
+                    attestation_type: crate::federation::types::attestation_type::SCORES.into(),
+                    weight: Some(1.0),
+                    expires_at: None,
+                    attestation_envelope: serde_json::json!({
+                        "id": "att-1", "dimension": "identity_binding:v1",
+                        "score": 1.0, "confidence": 0.9,
+                    }),
+                    subject_key_ids: vec![],
+                    cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
+                })
+                .await
+                .unwrap();
+
+            // Reconstruct the Engine exactly as the PyO3 binding does.
+            let engine = crate::Engine::from_shared_with_local(
+                crate::engine::BackendDispatch::Sqlite(sq.clone()),
+                signer,
+                Some(local),
+            );
+            assert!(
+                engine.attestation_promote(&att_id).await.unwrap(),
+                "first promote flips local→federation"
+            );
+            assert!(
+                !engine.attestation_promote(&att_id).await.unwrap(),
+                "re-promote is idempotent (already federation)"
+            );
+
+            let row = sq.get_attestation(&att_id).await.unwrap().expect("row");
+            assert_eq!(
+                row.tier,
+                crate::federation::types::attestation_tier::FEDERATION
+            );
+            assert!(!row.scrub_signature_classical.is_empty(), "Ed25519 signed");
+            assert!(
+                row.scrub_signature_pqc
+                    .as_deref()
+                    .is_some_and(|s| !s.is_empty()),
+                "ML-DSA-65 signed (synchronous hybrid)"
+            );
+            assert_eq!(row.original_content_hash.len(), 64);
+        });
     }
 
     /// #95 — `federation_directory()` yields the singleton's backend
