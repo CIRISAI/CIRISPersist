@@ -2146,6 +2146,60 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         })
     }
 
+    // ─── v4.10.0 (CIRISPersist#154, CEG 0.8 §0.8.1) — location proofs.
+
+    async fn put_location_proof(
+        &self,
+        proof: crate::federation::SignedLocationProof,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = proof.location_proof;
+        crate::federation::location::validate_location_cell(&row.cell_id, row.cell_resolution)?;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let conn = self.conn.clone();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
+            conn.execute(
+                "INSERT INTO federation_location_proofs (\
+                    subject_key_id, cell_id, cell_resolution, asserted_at, valid_until, \
+                    attestation_evidence, withdrawn_at, persist_row_hash\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    row.subject_key_id,
+                    row.cell_id,
+                    row.cell_resolution as i64,
+                    row.asserted_at.to_rfc3339(),
+                    row.valid_until.map(|t| t.to_rfc3339()),
+                    row.attestation_evidence,
+                    row.withdrawn_at.map(|t| t.to_rfc3339()),
+                    row.persist_row_hash,
+                ],
+            )?;
+            Ok(())
+        })()
+        .map_err(map_revocation_sqlite_err("location_proof"))?;
+        Ok(())
+    }
+
+    async fn list_location_proofs_for(
+        &self,
+        subject_key_id: &str,
+    ) -> Result<Vec<crate::federation::LocationProof>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let key = subject_key_id.to_owned();
+        (move || -> Result<Vec<_>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT subject_key_id, cell_id, cell_resolution, asserted_at, valid_until, \
+                        attestation_evidence, withdrawn_at, persist_row_hash \
+                     FROM federation_location_proofs \
+                     WHERE subject_key_id = ?1 ORDER BY asserted_at ASC",
+            )?;
+            let rows = stmt.query_map([&key], sqlite_row_to_location_proof)?;
+            rows.collect()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("list_location_proofs_for: {e}")))
+    }
+
     async fn attach_key_pqc_signature(
         &self,
         key_id: &str,
@@ -6718,6 +6772,25 @@ fn sqlite_row_to_community_membership_revocation(
         effective_at: parse_rfc3339(&effective_at),
         reason: row.get("reason")?,
         witness_set: decode_witness_set(&witness_text, 5)?,
+        persist_row_hash: row.get("persist_row_hash")?,
+    })
+}
+
+fn sqlite_row_to_location_proof(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::LocationProof> {
+    let asserted_at: String = row.get("asserted_at")?;
+    let valid_until: Option<String> = row.get("valid_until")?;
+    let withdrawn_at: Option<String> = row.get("withdrawn_at")?;
+    let cell_resolution: i64 = row.get("cell_resolution")?;
+    Ok(crate::federation::LocationProof {
+        subject_key_id: row.get("subject_key_id")?,
+        cell_id: row.get("cell_id")?,
+        cell_resolution: cell_resolution as u8,
+        asserted_at: parse_rfc3339(&asserted_at),
+        valid_until: valid_until.as_deref().map(parse_rfc3339),
+        attestation_evidence: row.get("attestation_evidence")?,
+        withdrawn_at: withdrawn_at.as_deref().map(parse_rfc3339),
         persist_row_hash: row.get("persist_row_hash")?,
     })
 }
@@ -11356,6 +11429,71 @@ mod tests {
             consensus_protocol_entrenched: false,
             persist_row_hash: String::new(),
         }
+    }
+
+    // ─── v4.10.0 (CIRISPersist#154, CEG 0.8 §0.8.1) — location proof ───
+
+    /// A valid res-7 cell admits + round-trips; an over-precise (res-9)
+    /// proof is refused at admission (§0.8.1 rough-only); a malformed cell
+    /// is refused; the FK to federation_keys holds.
+    #[tokio::test]
+    async fn location_proof_round_trip_and_rough_only_gate() {
+        use crate::federation::{LocationProof, SignedLocationProof};
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("subj", "subj", "subj"),
+            })
+            .await
+            .unwrap();
+
+        let ll = h3o::LatLng::new(37.0, -122.0).unwrap();
+        let cell7 = ll.to_cell(h3o::Resolution::Seven).to_string();
+        let proof = |cell: &str, res: u8| SignedLocationProof {
+            location_proof: LocationProof {
+                subject_key_id: "subj".into(),
+                cell_id: cell.into(),
+                cell_resolution: res,
+                asserted_at: "2026-06-09T00:00:00Z".parse().unwrap(),
+                valid_until: None,
+                attestation_evidence: None,
+                withdrawn_at: None,
+                persist_row_hash: String::new(),
+            },
+        };
+
+        // Valid res-7 admits + round-trips.
+        backend.put_location_proof(proof(&cell7, 7)).await.unwrap();
+        let rows = backend.list_location_proofs_for("subj").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cell_id, cell7);
+        assert_eq!(rows[0].cell_resolution, 7);
+        assert!(!rows[0].persist_row_hash.is_empty(), "hash computed");
+
+        // Over-precise res-9 → refused (§0.8.1 rough-only).
+        let cell9 = ll.to_cell(h3o::Resolution::Nine).to_string();
+        let mut input = proof(&cell9, 9);
+        input.location_proof.asserted_at = "2026-06-09T01:00:00Z".parse().unwrap();
+        let err = backend.put_location_proof(input).await.unwrap_err();
+        assert!(
+            matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("rough-only")),
+            "got: {err:?}"
+        );
+        // Malformed cell → refused.
+        let mut bad = proof("not-a-cell", 7);
+        bad.location_proof.asserted_at = "2026-06-09T02:00:00Z".parse().unwrap();
+        assert!(backend.put_location_proof(bad).await.is_err());
+
+        // Still exactly one stored row (rejections didn't write).
+        assert_eq!(
+            backend
+                .list_location_proofs_for("subj")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     // ─── v4.8.0 (CIRISPersist#161, CEG §11.7.1) — revocation tests ─────

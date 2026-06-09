@@ -2454,6 +2454,65 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .collect()
     }
 
+    // ─── v4.10.0 (CIRISPersist#154, CEG 0.8 §0.8.1) — location proofs.
+
+    async fn put_location_proof(
+        &self,
+        proof: crate::federation::SignedLocationProof,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = proof.location_proof;
+        crate::federation::location::validate_location_cell(&row.cell_id, row.cell_resolution)?;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let resolution = i16::from(row.cell_resolution);
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_location_proofs (\
+                    subject_key_id, cell_id, cell_resolution, asserted_at, valid_until, \
+                    attestation_evidence, withdrawn_at, persist_row_hash\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                &[
+                    &row.subject_key_id,
+                    &row.cell_id,
+                    &resolution,
+                    &row.asserted_at,
+                    &row.valid_until,
+                    &row.attestation_evidence,
+                    &row.withdrawn_at,
+                    &row.persist_row_hash,
+                ],
+            )
+            .await
+            .map_err(map_revocation_pg_err("location_proof"))?;
+        Ok(())
+    }
+
+    async fn list_location_proofs_for(
+        &self,
+        subject_key_id: &str,
+    ) -> Result<Vec<crate::federation::LocationProof>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT subject_key_id, cell_id, cell_resolution, asserted_at, valid_until, \
+                    attestation_evidence, withdrawn_at, persist_row_hash \
+                 FROM cirislens.federation_location_proofs \
+                 WHERE subject_key_id = $1 ORDER BY asserted_at ASC",
+                &[&subject_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_location_proofs_for: {e}"))
+            })?;
+        rows.into_iter().map(pg_row_to_location_proof).collect()
+    }
+
     async fn attach_key_pqc_signature(
         &self,
         key_id: &str,
@@ -6706,6 +6765,23 @@ fn pg_row_to_community_membership_revocation(
         effective_at: row.safe_get_with("effective_at", mk_err)?,
         reason: row.safe_get_with("reason", mk_err)?,
         witness_set,
+        persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
+    })
+}
+
+fn pg_row_to_location_proof(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::LocationProof, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    let resolution: i16 = row.safe_get_with("cell_resolution", mk_err)?;
+    Ok(crate::federation::LocationProof {
+        subject_key_id: row.safe_get_with("subject_key_id", mk_err)?,
+        cell_id: row.safe_get_with("cell_id", mk_err)?,
+        cell_resolution: resolution as u8,
+        asserted_at: row.safe_get_with("asserted_at", mk_err)?,
+        valid_until: row.safe_get_with("valid_until", mk_err)?,
+        attestation_evidence: row.safe_get_with("attestation_evidence", mk_err)?,
+        withdrawn_at: row.safe_get_with("withdrawn_at", mk_err)?,
         persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
     })
 }
@@ -20814,6 +20890,79 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("FK")),
+            "got: {err:?}"
+        );
+    }
+
+    /// v4.10.0 (CIRISPersist#154) — live-PG location_proof round-trip:
+    /// SMALLINT `cell_resolution` + BYTEA `attestation_evidence` binding,
+    /// valid res-7 admits, over-precise res-9 refused (§0.8.1).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_location_proof_round_trip_and_rough_only_gate() {
+        use crate::federation::{FederationDirectory, LocationProof, SignedLocationProof};
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let subj = format!("subj-{}", uuid_like());
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &subj,
+                    &subj,
+                    crate::federation::types::identity_type::PRIMITIVE,
+                ),
+            })
+            .await
+            .unwrap();
+
+        let ll = h3o::LatLng::new(37.0, -122.0).unwrap();
+        let cell7 = ll.to_cell(h3o::Resolution::Seven).to_string();
+        backend
+            .put_location_proof(SignedLocationProof {
+                location_proof: LocationProof {
+                    subject_key_id: subj.clone(),
+                    cell_id: cell7.clone(),
+                    cell_resolution: 7,
+                    asserted_at: "2026-06-09T00:00:00Z".parse().unwrap(),
+                    valid_until: None,
+                    attestation_evidence: Some(vec![0xDEu8, 0xAD, 0xBE, 0xEF]),
+                    withdrawn_at: None,
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .unwrap();
+        let rows = backend.list_location_proofs_for(&subj).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cell_id, cell7);
+        assert_eq!(rows[0].cell_resolution, 7);
+        assert_eq!(
+            rows[0].attestation_evidence.as_deref(),
+            Some(&[0xDEu8, 0xAD, 0xBE, 0xEF][..])
+        );
+
+        let cell9 = ll.to_cell(h3o::Resolution::Nine).to_string();
+        let err = backend
+            .put_location_proof(SignedLocationProof {
+                location_proof: LocationProof {
+                    subject_key_id: subj.clone(),
+                    cell_id: cell9,
+                    cell_resolution: 9,
+                    asserted_at: "2026-06-09T01:00:00Z".parse().unwrap(),
+                    valid_until: None,
+                    attestation_evidence: None,
+                    withdrawn_at: None,
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("rough-only")),
             "got: {err:?}"
         );
     }

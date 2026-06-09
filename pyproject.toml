@@ -39,8 +39,18 @@ classifiers = [
 # fixes that metadata. The Python `ciris-verify` package on PATH
 # is now the v3.x major (build-sign / build-verify CLIs); pin to
 # `<4` to follow semver-major.
+#
+# v4.10.0 (CIRISPersist#154 cut) — bumped floor to v5.0.0 (`<6`). The
+# Rust-side Cargo.toml moved to ciris-verify-core/keyring/crypto v5.0.0
+# in the v4.6.1 cut, but THIS Python wheel Requires-Dist stayed at `<5`
+# — the same drift the v2.0.1 hotfix above describes. The mismatch
+# meant `pip install ciris-persist` refused `ciris-verify==5.0.0`, so
+# CIRISConformance could not put verify 5.0 (the `jcs_canonicalize`
+# Python binding, CIRISVerify#61) into its matrix alongside persist.
+# Floor is v5.0.0 to require the JCS-cutover line, coherent with the
+# Rust pin.
 dependencies = [
-    "ciris-verify>=4.4.2,<5",
+    "ciris-verify>=5.0.0,<6",
 ]
 dynamic = ["version"]
 

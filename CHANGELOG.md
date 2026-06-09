@@ -5,6 +5,27 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [4.10.0] — 2026-06-09
+
+**`location_proof` substrate + H3 rough-only enforcement — the CEG 0.8 §0.8.1 normative privacy primitive (CIRISPersist#154).**
+
+CEG 0.8's load-bearing wire-format rule: a subject's geographic claim is bounded to **H3 resolution ≤ 7** ("rough-only"), enforced at the substrate so a producer cannot over-share precise location even if client UI gating fails — the substrate is the second line of defense. This lands that primitive; the community substrate half of #154 shipped in v4.0.1 (V060).
+
+### Added
+- **V068 migration** (PG + SQLite) — `federation_location_proofs`: `subject_key_id` (FK → `federation_keys`), `cell_id` (H3 lowercase hex), `cell_resolution`, `asserted_at`, `valid_until`, `attestation_evidence` (BYTEA/BLOB, optional hardware blob), `withdrawn_at` (append-only; null = in force), `persist_row_hash`; PK `(subject_key_id, asserted_at)` + by-subject-live + by-cell indexes. Standalone (no `source_attestation_id` FK — the proof row *is* the record).
+- **`LocationProof` / `SignedLocationProof`** types.
+- **`FederationDirectory::put_location_proof` / `list_location_proofs_for`** on all three backends. `put_location_proof` runs the §0.8 + §0.8.1 admission gate before write.
+- **`federation::location`** module (pure-Rust [`h3o`], not a crypto dep — MISSION §1.4 unaffected): `validate_location_cell` (§0.8 canonical-form: lowercase hex + valid H3 cell + resolution-redundancy; §0.8.1 rough-only ≤ 7) and `h3_cell_contained` (§0.8.2 parent/child containment). An over-precise or malformed cell is **refused** (`InvalidArgument`) — the refusal *is* the privacy enforcement.
+
+### Deferred — #154 residual (Ask 4)
+The `cohort_subkind: geographic` community-admission dispatch (gate new members on a valid containing `location_proof`) is left open on #154 — it couples to the `put_community` write path + needs the geographic constraint pinned in the community `policy_blob`. The `h3_cell_contained` helper it will use is shipped here. Everything else in #154 is now landed (community substrate v4.0.1 + this).
+
+### Tests
+`federation::location` unit tests (valid res-7 admit, resolution-redundancy mismatch, over-precise refused, uppercase/garbage refused, containment parent/child + disjoint + invalid-input) + SQLite and live-PG round-trips (valid admit, BYTEA `attestation_evidence` round-trip, rough-only rejection, rejections don't write, FK holds). **1067 lib green on SQLite, 763 on live PG**; `-D warnings` clean across no-default / `test-panic,pyo3` / full; clippy + cargo-deny clean (h3o + transitives).
+
+### Fixed — `pyproject.toml` `ciris-verify` pin blocked the conformance matrix
+The Python wheel's `Requires-Dist` stayed at `ciris-verify>=4.4.2,<5` after the v4.6.1 Rust pin moved to verify v5.0.0 — the same Requires-Dist drift the v2.0.1 hotfix fixed once before. The effect: `pip install ciris-persist` refused `ciris-verify==5.0.0`, so **CIRISConformance could not put verify 5.0 (the `jcs_canonicalize` binding, CIRISVerify#61) into its matrix alongside persist.** Bumped to `>=5.0.0,<6`, coherent with the Rust crates' v5.0.0 pin.
+
 ## [4.9.0] — 2026-06-09
 
 **PyO3 `attestation_promote` binding — the local→federation transition for the agent's 2.9.6 community-server opt-in (CIRISPersist#171 phase 2, CEG §10.1.5).**

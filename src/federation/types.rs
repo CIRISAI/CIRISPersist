@@ -1065,6 +1065,44 @@ pub struct SignedCommunityMembershipRevocation {
     pub community_membership_revocation: CommunityMembershipRevocation,
 }
 
+/// v4.10.0 (CIRISPersist#154, CEG 0.8 §5.6.8.11 / §0.8.1) — a subject's
+/// coarse geographic claim. The §0.8.1-normative privacy primitive:
+/// `cell_resolution` is bounded to **≤ 7** ("rough-only") at admission
+/// (see [`crate::federation::location::validate_location_cell`]) so the
+/// substrate refuses an over-precise claim even if client UI gating
+/// fails. Append-only; `withdrawn_at` marks a proof no longer in force.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocationProof {
+    /// The subject's `federation_keys.key_id`.
+    pub subject_key_id: String,
+    /// H3 cell index, lowercase hex (§0.8). Canonical form + validity +
+    /// resolution-redundancy are admission-gate enforced.
+    pub cell_id: String,
+    /// H3 resolution (0-15). The §0.8.1 gate rejects `> 7` at admission.
+    pub cell_resolution: u8,
+    /// When the proof was asserted (RFC-3339 per §0.5).
+    pub asserted_at: DateTime<Utc>,
+    /// When the proof expires. `None` = indefinite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<DateTime<Utc>>,
+    /// Optional hardware attestation blob (TPM / Secure Enclave /
+    /// StrongBox) backing the claim. `None` for software-only proofs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation_evidence: Option<Vec<u8>>,
+    /// `None` = currently in force; set = withdrawn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withdrawn_at: Option<DateTime<Utc>>,
+    /// **Server-computed.** See [`KeyRecord::persist_row_hash`].
+    pub persist_row_hash: String,
+}
+
+/// Wraps a [`LocationProof`] for write submission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedLocationProof {
+    /// The location proof being submitted.
+    pub location_proof: LocationProof,
+}
+
 /// One hybrid-pending federation row — minimum fields the sweep
 /// needs to recompute the cold-path bound-signature input. Returned
 /// by [`super::FederationDirectory::list_hybrid_pending_keys`] /

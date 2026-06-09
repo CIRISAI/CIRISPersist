@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "4.9.0"
+version = "4.10.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -528,6 +528,13 @@ thiserror     = "2"
 tracing       = "0.1"
 base64        = "0.22"
 hex           = "0.4"
+# v4.10.0 (CIRISPersist#154, CEG 0.8 §0.8) — pure-Rust H3 geospatial
+# index for location_proof cell canonicalization + containment. h3o is
+# pure Rust (no libh3 C bindings), so it cross-compiles to the iOS /
+# Android / wasm wheel targets the same as the rest of the tree. NOT a
+# crypto dep — the §1.4 "never rolls its own crypto" invariant is
+# unaffected (H3 is geospatial indexing, not key material).
+h3o           = "0.7"
 # v0.4.3 (CIRISPersist#18) — UUID type for cirislens_derived
 # .detection_events.detection_id. v4 generation lives at the
 # caller (lens-core); persist just stores. tokio-postgres's

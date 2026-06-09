@@ -105,6 +105,10 @@ struct State {
         HashMap<(String, String), crate::federation::FamilyMembershipRevocation>,
     federation_community_membership_revocations:
         HashMap<(String, String), crate::federation::CommunityMembershipRevocation>,
+    /// v4.10.0 (CIRISPersist#154) — location_proofs keyed by the V068
+    /// `(subject_key_id, asserted_at)` PK.
+    federation_location_proofs:
+        HashMap<(String, chrono::DateTime<chrono::Utc>), crate::federation::LocationProof>,
 }
 
 impl Default for MemoryBackend {
@@ -128,6 +132,7 @@ impl Default for MemoryBackend {
                 federation_identity_occurrence_revocations: HashMap::new(),
                 federation_family_membership_revocations: HashMap::new(),
                 federation_community_membership_revocations: HashMap::new(),
+                federation_location_proofs: HashMap::new(),
                 blackhole_rules: HashMap::new(),
             }),
         }
@@ -1058,6 +1063,44 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by(|a, b| a.removed_identity_key_id.cmp(&b.removed_identity_key_id));
+        Ok(rows)
+    }
+
+    // ─── v4.10.0 (CIRISPersist#154, CEG 0.8 §0.8.1) — location proofs.
+
+    async fn put_location_proof(
+        &self,
+        proof: crate::federation::SignedLocationProof,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = proof.location_proof;
+        // §0.8 canonicalization + §0.8.1 rough-only gate before write.
+        crate::federation::location::validate_location_cell(&row.cell_id, row.cell_resolution)?;
+        let mut state = self.state.lock().expect("memory backend lock");
+        if !state.federation_keys.contains_key(&row.subject_key_id) {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "subject_key_id {} does not exist in federation_keys",
+                row.subject_key_id
+            )));
+        }
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        state
+            .federation_location_proofs
+            .insert((row.subject_key_id.clone(), row.asserted_at), row);
+        Ok(())
+    }
+
+    async fn list_location_proofs_for(
+        &self,
+        subject_key_id: &str,
+    ) -> Result<Vec<crate::federation::LocationProof>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_location_proofs
+            .values()
+            .filter(|p| p.subject_key_id == subject_key_id)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|p| p.asserted_at);
         Ok(rows)
     }
 
