@@ -2273,6 +2273,187 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         rows.into_iter().map(pg_row_to_community).collect()
     }
 
+    // ─── v4.8.0 (CIRISPersist#161, CEG §11.7.1) — membership revocations.
+
+    async fn put_identity_occurrence_revocation(
+        &self,
+        revocation: crate::federation::SignedIdentityOccurrenceRevocation,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = revocation.identity_occurrence_revocation;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let witness = serde_json::json!(row.witness_set);
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_identity_occurrence_revocations (\
+                    identity_key_id, occurrence_key_id, revoked_at, effective_at, \
+                    reason, witness_set, persist_row_hash\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                &[
+                    &row.identity_key_id,
+                    &row.occurrence_key_id,
+                    &row.revoked_at,
+                    &row.effective_at,
+                    &row.reason,
+                    &witness,
+                    &row.persist_row_hash,
+                ],
+            )
+            .await
+            .map_err(map_revocation_pg_err("identity_occurrence_revocation"))?;
+        Ok(())
+    }
+
+    async fn put_family_membership_revocation(
+        &self,
+        revocation: crate::federation::SignedFamilyMembershipRevocation,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = revocation.family_membership_revocation;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let witness = serde_json::json!(row.witness_set);
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_family_membership_revocations (\
+                    family_key_id, removed_identity_key_id, removed_at, effective_at, \
+                    reason, witness_set, persist_row_hash\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                &[
+                    &row.family_key_id,
+                    &row.removed_identity_key_id,
+                    &row.removed_at,
+                    &row.effective_at,
+                    &row.reason,
+                    &witness,
+                    &row.persist_row_hash,
+                ],
+            )
+            .await
+            .map_err(map_revocation_pg_err("family_membership_revocation"))?;
+        Ok(())
+    }
+
+    async fn put_community_membership_revocation(
+        &self,
+        revocation: crate::federation::SignedCommunityMembershipRevocation,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = revocation.community_membership_revocation;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let witness = serde_json::json!(row.witness_set);
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_community_membership_revocations (\
+                    community_key_id, removed_identity_key_id, removed_at, effective_at, \
+                    reason, witness_set, persist_row_hash\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                &[
+                    &row.community_key_id,
+                    &row.removed_identity_key_id,
+                    &row.removed_at,
+                    &row.effective_at,
+                    &row.reason,
+                    &witness,
+                    &row.persist_row_hash,
+                ],
+            )
+            .await
+            .map_err(map_revocation_pg_err("community_membership_revocation"))?;
+        Ok(())
+    }
+
+    async fn list_identity_occurrence_revocations_for(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<crate::federation::IdentityOccurrenceRevocation>, crate::federation::Error>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT identity_key_id, occurrence_key_id, revoked_at, effective_at, \
+                    reason, witness_set, persist_row_hash \
+                 FROM cirislens.federation_identity_occurrence_revocations \
+                 WHERE identity_key_id = $1 ORDER BY occurrence_key_id ASC",
+                &[&identity_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "list_identity_occurrence_revocations_for: {e}"
+                ))
+            })?;
+        rows.into_iter()
+            .map(pg_row_to_identity_occurrence_revocation)
+            .collect()
+    }
+
+    async fn list_family_membership_revocations_for(
+        &self,
+        family_key_id: &str,
+    ) -> Result<Vec<crate::federation::FamilyMembershipRevocation>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT family_key_id, removed_identity_key_id, removed_at, effective_at, \
+                    reason, witness_set, persist_row_hash \
+                 FROM cirislens.federation_family_membership_revocations \
+                 WHERE family_key_id = $1 ORDER BY removed_identity_key_id ASC",
+                &[&family_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "list_family_membership_revocations_for: {e}"
+                ))
+            })?;
+        rows.into_iter()
+            .map(pg_row_to_family_membership_revocation)
+            .collect()
+    }
+
+    async fn list_community_membership_revocations_for(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Vec<crate::federation::CommunityMembershipRevocation>, crate::federation::Error>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT community_key_id, removed_identity_key_id, removed_at, effective_at, \
+                    reason, witness_set, persist_row_hash \
+                 FROM cirislens.federation_community_membership_revocations \
+                 WHERE community_key_id = $1 ORDER BY removed_identity_key_id ASC",
+                &[&community_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "list_community_membership_revocations_for: {e}"
+                ))
+            })?;
+        rows.into_iter()
+            .map(pg_row_to_community_membership_revocation)
+            .collect()
+    }
+
     async fn attach_key_pqc_signature(
         &self,
         key_id: &str,
@@ -6439,6 +6620,92 @@ fn pg_row_to_community(
         founded_at: row.safe_get_with("founded_at", mk_err)?,
         consensus_protocol: row.safe_get_with("consensus_protocol", mk_err)?,
         policy_blob,
+        persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
+    })
+}
+
+// ─── v4.8.0 (CIRISPersist#161) — membership-revocation row decoders +
+//     a shared FK-aware error mapper for the three revocation inserts.
+
+/// Map a Postgres revocation-insert error: a FK violation (subject/
+/// removed key absent from federation_keys) → `InvalidArgument`, else
+/// `Backend`.
+fn map_revocation_pg_err(
+    op: &'static str,
+) -> impl FnOnce(tokio_postgres::Error) -> crate::federation::Error {
+    move |e| {
+        // tokio_postgres's Display is the terse "db error"; the FK signal
+        // lives in the structured DbError SQLSTATE (23503), not the string.
+        let is_fk = e
+            .as_db_error()
+            .map(|db| *db.code() == tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION)
+            .unwrap_or(false);
+        let detail = e
+            .as_db_error()
+            .map(|db| db.message().to_owned())
+            .unwrap_or_else(|| e.to_string());
+        if is_fk {
+            crate::federation::Error::InvalidArgument(format!(
+                "FK constraint violated on {op} insert: {detail}"
+            ))
+        } else {
+            crate::federation::Error::Backend(format!("insert {op}: {detail}"))
+        }
+    }
+}
+
+/// Decode a JSONB `witness_set` array column → `Vec<String>`.
+fn pg_witness_set(row: &tokio_postgres::Row) -> Result<Vec<String>, crate::federation::Error> {
+    let v: serde_json::Value =
+        row.safe_get_with("witness_set", crate::federation::Error::Backend)?;
+    serde_json::from_value(v)
+        .map_err(|e| crate::federation::Error::Backend(format!("witness_set deserialize: {e}")))
+}
+
+fn pg_row_to_identity_occurrence_revocation(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::IdentityOccurrenceRevocation, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    let witness_set = pg_witness_set(&row)?;
+    Ok(crate::federation::IdentityOccurrenceRevocation {
+        identity_key_id: row.safe_get_with("identity_key_id", mk_err)?,
+        occurrence_key_id: row.safe_get_with("occurrence_key_id", mk_err)?,
+        revoked_at: row.safe_get_with("revoked_at", mk_err)?,
+        effective_at: row.safe_get_with("effective_at", mk_err)?,
+        reason: row.safe_get_with("reason", mk_err)?,
+        witness_set,
+        persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
+    })
+}
+
+fn pg_row_to_family_membership_revocation(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::FamilyMembershipRevocation, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    let witness_set = pg_witness_set(&row)?;
+    Ok(crate::federation::FamilyMembershipRevocation {
+        family_key_id: row.safe_get_with("family_key_id", mk_err)?,
+        removed_identity_key_id: row.safe_get_with("removed_identity_key_id", mk_err)?,
+        removed_at: row.safe_get_with("removed_at", mk_err)?,
+        effective_at: row.safe_get_with("effective_at", mk_err)?,
+        reason: row.safe_get_with("reason", mk_err)?,
+        witness_set,
+        persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
+    })
+}
+
+fn pg_row_to_community_membership_revocation(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::CommunityMembershipRevocation, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    let witness_set = pg_witness_set(&row)?;
+    Ok(crate::federation::CommunityMembershipRevocation {
+        community_key_id: row.safe_get_with("community_key_id", mk_err)?,
+        removed_identity_key_id: row.safe_get_with("removed_identity_key_id", mk_err)?,
+        removed_at: row.safe_get_with("removed_at", mk_err)?,
+        effective_at: row.safe_get_with("effective_at", mk_err)?,
+        reason: row.safe_get_with("reason", mk_err)?,
+        witness_set,
         persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
     })
 }
@@ -20446,5 +20713,108 @@ mod tests {
             .try_get::<_, String>(0)
             .unwrap();
         assert_eq!(stored, "pubA", "rotation collision must not overwrite");
+    }
+
+    /// v4.8.0 (CIRISPersist#161) — live-PG round-trip for the membership
+    /// revocation tables: put → list_*_revocations_for (exercises the
+    /// JSONB `witness_set` encode/decode) → active-state filtering with a
+    /// past- vs future-effective revocation. Unique key_ids per run.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_membership_revocation_round_trip_and_active_filtering() {
+        use crate::federation::{
+            FederationDirectory, IdentityOccurrence, IdentityOccurrenceRevocation,
+            SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation,
+        };
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let root = format!("root-{}", uuid_like());
+        let phone = format!("phone-{}", uuid_like());
+        let laptop = format!("laptop-{}", uuid_like());
+        for (k, t) in [
+            (&root, crate::federation::types::identity_type::STEWARD),
+            (&phone, crate::federation::types::identity_type::PRIMITIVE),
+            (&laptop, crate::federation::types::identity_type::PRIMITIVE),
+        ] {
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord {
+                    record: pg_admission_key(k, k, t),
+                })
+                .await
+                .unwrap();
+        }
+        let occ = |o: &str| SignedIdentityOccurrence {
+            identity_occurrence: IdentityOccurrence {
+                identity_key_id: root.clone(),
+                occurrence_key_id: o.to_string(),
+                device_class: crate::federation::types::device_class::PHONE.into(),
+                hardware_attestation: None,
+                asserted_at: "2026-06-01T00:00:00Z".parse().unwrap(),
+                valid_until: None,
+                persist_row_hash: String::new(),
+            },
+        };
+        backend.put_identity_occurrence(occ(&phone)).await.unwrap();
+        backend.put_identity_occurrence(occ(&laptop)).await.unwrap();
+
+        // Past-effective revocation of phone.
+        backend
+            .put_identity_occurrence_revocation(SignedIdentityOccurrenceRevocation {
+                identity_occurrence_revocation: IdentityOccurrenceRevocation {
+                    identity_key_id: root.clone(),
+                    occurrence_key_id: phone.clone(),
+                    revoked_at: "2026-06-05T00:00:00Z".parse().unwrap(),
+                    effective_at: "2026-06-05T00:00:00Z".parse().unwrap(),
+                    reason: Some("lost".into()),
+                    witness_set: vec![root.clone(), laptop.clone()],
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .unwrap();
+
+        let revs = backend
+            .list_identity_occurrence_revocations_for(&root)
+            .await
+            .unwrap();
+        assert_eq!(revs.len(), 1);
+        assert_eq!(revs[0].occurrence_key_id, phone);
+        assert_eq!(
+            revs[0].witness_set,
+            vec![root.clone(), laptop.clone()],
+            "JSONB witness_set round-trips in order"
+        );
+        assert!(!revs[0].persist_row_hash.is_empty());
+
+        let active = backend
+            .list_identity_occurrences_active(&root)
+            .await
+            .unwrap();
+        let ids: Vec<_> = active.iter().map(|o| o.occurrence_key_id.clone()).collect();
+        assert_eq!(ids, vec![laptop.clone()], "revoked phone excluded on PG");
+
+        // FK violation surfaces as InvalidArgument.
+        let err = backend
+            .put_identity_occurrence_revocation(SignedIdentityOccurrenceRevocation {
+                identity_occurrence_revocation: IdentityOccurrenceRevocation {
+                    identity_key_id: root.clone(),
+                    occurrence_key_id: format!("ghost-{}", uuid_like()),
+                    revoked_at: "2026-06-05T00:00:00Z".parse().unwrap(),
+                    effective_at: "2026-06-05T00:00:00Z".parse().unwrap(),
+                    reason: None,
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("FK")),
+            "got: {err:?}"
+        );
     }
 }

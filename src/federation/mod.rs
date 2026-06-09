@@ -134,10 +134,12 @@ pub use topology::{
     WithdrawalEntry, MAX_DELEGATION_DEPTH,
 };
 pub use types::{
-    Attestation, Community, CommunityMember, Family, FamilyMember, HybridPendingRow,
-    IdentityOccurrence, KeyRecord, PeerMetadataRow, PeerPolicyBlob, Revocation, SignedAttestation,
-    SignedCommunity, SignedFamily, SignedIdentityOccurrence, SignedKeyRecord, SignedRevocation,
-    TrustClass, TrustFilter, TrustGrant, TrustRelationship, TrustRow, TrustType,
+    Attestation, Community, CommunityMember, CommunityMembershipRevocation, Family, FamilyMember,
+    FamilyMembershipRevocation, HybridPendingRow, IdentityOccurrence, IdentityOccurrenceRevocation,
+    KeyRecord, PeerMetadataRow, PeerPolicyBlob, Revocation, SignedAttestation, SignedCommunity,
+    SignedCommunityMembershipRevocation, SignedFamily, SignedFamilyMembershipRevocation,
+    SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation, SignedKeyRecord,
+    SignedRevocation, TrustClass, TrustFilter, TrustGrant, TrustRelationship, TrustRow, TrustType,
 };
 
 /// Federation directory trait — the registry/lens/agent's read+write
@@ -474,6 +476,147 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         member_identity_key_id: &str,
     ) -> Result<Vec<Community>, Error>;
+
+    // ─── v4.8.0 (CIRISPersist#161, CEG §11.7.1) — Option-A forward-
+    //     secrecy removal/revocation primitives. The `list_*_for` /
+    //     `list_*_for_member` methods above are the **full-history**
+    //     accessors (admit rows, no revocation filter). The
+    //     `list_*_active` default methods below compose them with the
+    //     revocation tables for the honest "currently-bound" view that
+    //     `build_caller_admission` (Ask 6) and the deferred forward-
+    //     secrecy key_grant gate (Ask 4) depend on.
+
+    /// v4.8.0 — record an identity-occurrence revocation (an occurrence
+    /// leaving a self-collective). Append-only; idempotent on the
+    /// `(identity_key_id, occurrence_key_id)` PK. Computes
+    /// `persist_row_hash` server-side. The V059 admission row is left
+    /// intact — effective state is the composition (see
+    /// [`Self::list_identity_occurrences_active`]).
+    async fn put_identity_occurrence_revocation(
+        &self,
+        revocation: SignedIdentityOccurrenceRevocation,
+    ) -> Result<(), Error>;
+
+    /// v4.8.0 — record a family-membership removal. Append-only;
+    /// idempotent on the `(family_key_id, removed_identity_key_id)` PK.
+    async fn put_family_membership_revocation(
+        &self,
+        revocation: SignedFamilyMembershipRevocation,
+    ) -> Result<(), Error>;
+
+    /// v4.8.0 — record a community-membership removal. Structural mirror
+    /// of [`Self::put_family_membership_revocation`].
+    async fn put_community_membership_revocation(
+        &self,
+        revocation: SignedCommunityMembershipRevocation,
+    ) -> Result<(), Error>;
+
+    /// v4.8.0 — all identity-occurrence revocations for `identity_key_id`
+    /// (no `effective_at` filter — full history). Keyed by the table's
+    /// leading PK column.
+    async fn list_identity_occurrence_revocations_for(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<IdentityOccurrenceRevocation>, Error>;
+
+    /// v4.8.0 — all family-membership revocations for `family_key_id`.
+    async fn list_family_membership_revocations_for(
+        &self,
+        family_key_id: &str,
+    ) -> Result<Vec<FamilyMembershipRevocation>, Error>;
+
+    /// v4.8.0 — all community-membership revocations for
+    /// `community_key_id`.
+    async fn list_community_membership_revocations_for(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Vec<CommunityMembershipRevocation>, Error>;
+
+    /// v4.8.0 (#161 Ask 2) — occurrences of `identity_key_id` that are
+    /// **currently active**: admitted AND with no revocation whose
+    /// `effective_at <= now`. This is the honest view
+    /// [`build_caller_admission`](crate::scope::build_caller_admission)
+    /// resolves identity membership through; the deferred forward-
+    /// secrecy DEK cascade (#161 Ask 4) will fan out over it.
+    ///
+    /// Default impl composes [`Self::list_identity_occurrences_for`]
+    /// with [`Self::list_identity_occurrence_revocations_for`]; backends
+    /// need not override.
+    async fn list_identity_occurrences_active(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<IdentityOccurrence>, Error> {
+        let revs = self
+            .list_identity_occurrence_revocations_for(identity_key_id)
+            .await?;
+        let now = chrono::Utc::now();
+        let revoked: std::collections::HashSet<&str> = revs
+            .iter()
+            .filter(|r| r.effective_at <= now)
+            .map(|r| r.occurrence_key_id.as_str())
+            .collect();
+        Ok(self
+            .list_identity_occurrences_for(identity_key_id)
+            .await?
+            .into_iter()
+            .filter(|o| !revoked.contains(o.occurrence_key_id.as_str()))
+            .collect())
+    }
+
+    /// v4.8.0 (#161 Ask 2) — families `member_identity_key_id` is
+    /// **currently** an active member of: a member of the roster AND not
+    /// removed by a revocation whose `effective_at <= now`. Default impl
+    /// composes [`Self::list_families_for_member`] with a per-family
+    /// [`Self::list_family_membership_revocations_for`] (family-count
+    /// cardinality is small — tens, not thousands).
+    async fn list_families_for_member_active(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<Family>, Error> {
+        let now = chrono::Utc::now();
+        let families = self
+            .list_families_for_member(member_identity_key_id)
+            .await?;
+        let mut active = Vec::with_capacity(families.len());
+        for f in families {
+            let revs = self
+                .list_family_membership_revocations_for(&f.family_key_id)
+                .await?;
+            let removed = revs.iter().any(|r| {
+                r.removed_identity_key_id == member_identity_key_id && r.effective_at <= now
+            });
+            if !removed {
+                active.push(f);
+            }
+        }
+        Ok(active)
+    }
+
+    /// v4.8.0 (#161 Ask 2) — communities `member_identity_key_id` is
+    /// **currently** an active member of. Structural mirror of
+    /// [`Self::list_families_for_member_active`].
+    async fn list_communities_for_member_active(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<Community>, Error> {
+        let now = chrono::Utc::now();
+        let communities = self
+            .list_communities_for_member(member_identity_key_id)
+            .await?;
+        let mut active = Vec::with_capacity(communities.len());
+        for c in communities {
+            let revs = self
+                .list_community_membership_revocations_for(&c.community_key_id)
+                .await?;
+            let removed = revs.iter().any(|r| {
+                r.removed_identity_key_id == member_identity_key_id && r.effective_at <= now
+            });
+            if !removed {
+                active.push(c);
+            }
+        }
+        Ok(active)
+    }
 
     /// v4.0 (CIRISPersist#160 comment 4, FSD §4.6) — AV-45 write-path
     /// cohort_scope admission gate, for write paths reachable through

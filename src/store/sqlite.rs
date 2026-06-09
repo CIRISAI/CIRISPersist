@@ -1974,6 +1974,178 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(format!("list_communities_for_member: {e}")))
     }
 
+    // ─── v4.8.0 (CIRISPersist#161, CEG §11.7.1) — membership revocations.
+
+    async fn put_identity_occurrence_revocation(
+        &self,
+        revocation: crate::federation::SignedIdentityOccurrenceRevocation,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = revocation.identity_occurrence_revocation;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let witness = serde_json::to_string(&row.witness_set)
+            .map_err(|e| crate::federation::Error::Backend(format!("witness_set encode: {e}")))?;
+        let conn = self.conn.clone();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
+            conn.execute(
+                "INSERT INTO federation_identity_occurrence_revocations (\
+                    identity_key_id, occurrence_key_id, revoked_at, effective_at, \
+                    reason, witness_set, persist_row_hash\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    row.identity_key_id,
+                    row.occurrence_key_id,
+                    row.revoked_at.to_rfc3339(),
+                    row.effective_at.to_rfc3339(),
+                    row.reason,
+                    witness,
+                    row.persist_row_hash,
+                ],
+            )?;
+            Ok(())
+        })()
+        .map_err(map_revocation_sqlite_err("identity_occurrence_revocation"))?;
+        Ok(())
+    }
+
+    async fn put_family_membership_revocation(
+        &self,
+        revocation: crate::federation::SignedFamilyMembershipRevocation,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = revocation.family_membership_revocation;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let witness = serde_json::to_string(&row.witness_set)
+            .map_err(|e| crate::federation::Error::Backend(format!("witness_set encode: {e}")))?;
+        let conn = self.conn.clone();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
+            conn.execute(
+                "INSERT INTO federation_family_membership_revocations (\
+                    family_key_id, removed_identity_key_id, removed_at, effective_at, \
+                    reason, witness_set, persist_row_hash\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    row.family_key_id,
+                    row.removed_identity_key_id,
+                    row.removed_at.to_rfc3339(),
+                    row.effective_at.to_rfc3339(),
+                    row.reason,
+                    witness,
+                    row.persist_row_hash,
+                ],
+            )?;
+            Ok(())
+        })()
+        .map_err(map_revocation_sqlite_err("family_membership_revocation"))?;
+        Ok(())
+    }
+
+    async fn put_community_membership_revocation(
+        &self,
+        revocation: crate::federation::SignedCommunityMembershipRevocation,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = revocation.community_membership_revocation;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let witness = serde_json::to_string(&row.witness_set)
+            .map_err(|e| crate::federation::Error::Backend(format!("witness_set encode: {e}")))?;
+        let conn = self.conn.clone();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
+            conn.execute(
+                "INSERT INTO federation_community_membership_revocations (\
+                    community_key_id, removed_identity_key_id, removed_at, effective_at, \
+                    reason, witness_set, persist_row_hash\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    row.community_key_id,
+                    row.removed_identity_key_id,
+                    row.removed_at.to_rfc3339(),
+                    row.effective_at.to_rfc3339(),
+                    row.reason,
+                    witness,
+                    row.persist_row_hash,
+                ],
+            )?;
+            Ok(())
+        })()
+        .map_err(map_revocation_sqlite_err("community_membership_revocation"))?;
+        Ok(())
+    }
+
+    async fn list_identity_occurrence_revocations_for(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<crate::federation::IdentityOccurrenceRevocation>, crate::federation::Error>
+    {
+        let conn = self.conn.clone();
+        let key = identity_key_id.to_owned();
+        (move || -> Result<Vec<_>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT identity_key_id, occurrence_key_id, revoked_at, effective_at, \
+                        reason, witness_set, persist_row_hash \
+                     FROM federation_identity_occurrence_revocations \
+                     WHERE identity_key_id = ?1 ORDER BY occurrence_key_id ASC",
+            )?;
+            let rows = stmt.query_map([&key], sqlite_row_to_identity_occurrence_revocation)?;
+            rows.collect()
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "list_identity_occurrence_revocations_for: {e}"
+            ))
+        })
+    }
+
+    async fn list_family_membership_revocations_for(
+        &self,
+        family_key_id: &str,
+    ) -> Result<Vec<crate::federation::FamilyMembershipRevocation>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let key = family_key_id.to_owned();
+        (move || -> Result<Vec<_>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT family_key_id, removed_identity_key_id, removed_at, effective_at, \
+                        reason, witness_set, persist_row_hash \
+                     FROM federation_family_membership_revocations \
+                     WHERE family_key_id = ?1 ORDER BY removed_identity_key_id ASC",
+            )?;
+            let rows = stmt.query_map([&key], sqlite_row_to_family_membership_revocation)?;
+            rows.collect()
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "list_family_membership_revocations_for: {e}"
+            ))
+        })
+    }
+
+    async fn list_community_membership_revocations_for(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Vec<crate::federation::CommunityMembershipRevocation>, crate::federation::Error>
+    {
+        let conn = self.conn.clone();
+        let key = community_key_id.to_owned();
+        (move || -> Result<Vec<_>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT community_key_id, removed_identity_key_id, removed_at, effective_at, \
+                        reason, witness_set, persist_row_hash \
+                     FROM federation_community_membership_revocations \
+                     WHERE community_key_id = ?1 ORDER BY removed_identity_key_id ASC",
+            )?;
+            let rows = stmt.query_map([&key], sqlite_row_to_community_membership_revocation)?;
+            rows.collect()
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "list_community_membership_revocations_for: {e}"
+            ))
+        })
+    }
+
     async fn attach_key_pqc_signature(
         &self,
         key_id: &str,
@@ -6463,6 +6635,89 @@ fn sqlite_row_to_community(
         founded_at: parse_rfc3339(&founded_at),
         consensus_protocol: row.get("consensus_protocol")?,
         policy_blob,
+        persist_row_hash: row.get("persist_row_hash")?,
+    })
+}
+
+// ─── v4.8.0 (CIRISPersist#161) — membership-revocation row decoders +
+//     a shared FK-aware error mapper for the three revocation inserts.
+
+/// Map a SQLite revocation-insert error: a FK violation (subject/removed
+/// key absent from federation_keys) → `InvalidArgument`, else `Backend`.
+fn map_revocation_sqlite_err(
+    op: &'static str,
+) -> impl FnOnce(rusqlite::Error) -> crate::federation::Error {
+    move |e| {
+        let msg = e.to_string();
+        if msg.contains("FOREIGN KEY") {
+            crate::federation::Error::InvalidArgument(format!(
+                "FK constraint violated on {op} insert: {msg}"
+            ))
+        } else {
+            crate::federation::Error::Backend(format!("insert {op}: {msg}"))
+        }
+    }
+}
+
+/// Decode a JSON-TEXT `witness_set` array column (col index `idx` for
+/// the error report).
+fn decode_witness_set(text: &str, idx: usize) -> rusqlite::Result<Vec<String>> {
+    serde_json::from_str(text).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            idx,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        )
+    })
+}
+
+fn sqlite_row_to_identity_occurrence_revocation(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::IdentityOccurrenceRevocation> {
+    let revoked_at: String = row.get("revoked_at")?;
+    let effective_at: String = row.get("effective_at")?;
+    let witness_text: String = row.get("witness_set")?;
+    Ok(crate::federation::IdentityOccurrenceRevocation {
+        identity_key_id: row.get("identity_key_id")?,
+        occurrence_key_id: row.get("occurrence_key_id")?,
+        revoked_at: parse_rfc3339(&revoked_at),
+        effective_at: parse_rfc3339(&effective_at),
+        reason: row.get("reason")?,
+        witness_set: decode_witness_set(&witness_text, 5)?,
+        persist_row_hash: row.get("persist_row_hash")?,
+    })
+}
+
+fn sqlite_row_to_family_membership_revocation(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::FamilyMembershipRevocation> {
+    let removed_at: String = row.get("removed_at")?;
+    let effective_at: String = row.get("effective_at")?;
+    let witness_text: String = row.get("witness_set")?;
+    Ok(crate::federation::FamilyMembershipRevocation {
+        family_key_id: row.get("family_key_id")?,
+        removed_identity_key_id: row.get("removed_identity_key_id")?,
+        removed_at: parse_rfc3339(&removed_at),
+        effective_at: parse_rfc3339(&effective_at),
+        reason: row.get("reason")?,
+        witness_set: decode_witness_set(&witness_text, 5)?,
+        persist_row_hash: row.get("persist_row_hash")?,
+    })
+}
+
+fn sqlite_row_to_community_membership_revocation(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::CommunityMembershipRevocation> {
+    let removed_at: String = row.get("removed_at")?;
+    let effective_at: String = row.get("effective_at")?;
+    let witness_text: String = row.get("witness_set")?;
+    Ok(crate::federation::CommunityMembershipRevocation {
+        community_key_id: row.get("community_key_id")?,
+        removed_identity_key_id: row.get("removed_identity_key_id")?,
+        removed_at: parse_rfc3339(&removed_at),
+        effective_at: parse_rfc3339(&effective_at),
+        reason: row.get("reason")?,
+        witness_set: decode_witness_set(&witness_text, 5)?,
         persist_row_hash: row.get("persist_row_hash")?,
     })
 }
@@ -11101,6 +11356,170 @@ mod tests {
             consensus_protocol_entrenched: false,
             persist_row_hash: String::new(),
         }
+    }
+
+    // ─── v4.8.0 (CIRISPersist#161, CEG §11.7.1) — revocation tests ─────
+
+    /// Revocation round-trip + active-state filtering: a past-effective
+    /// occurrence revocation excludes the binding from
+    /// `list_identity_occurrences_active`; a future-effective one does
+    /// NOT. Family/community removals filter `list_*_for_member_active`.
+    #[tokio::test]
+    async fn membership_revocation_round_trip_and_active_filtering() {
+        use crate::federation::{
+            FamilyMembershipRevocation, IdentityOccurrenceRevocation,
+            SignedFamilyMembershipRevocation, SignedIdentityOccurrenceRevocation,
+        };
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in [
+            "alice-root",
+            "alice-phone",
+            "alice-laptop",
+            "fam-1",
+            "bob-root",
+        ] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, k, k),
+                })
+                .await
+                .unwrap();
+        }
+        // Two occurrences of alice-root.
+        for occ in ["alice-phone", "alice-laptop"] {
+            backend
+                .put_identity_occurrence(crate::federation::SignedIdentityOccurrence {
+                    identity_occurrence: fed_identity_occurrence(
+                        "alice-root",
+                        occ,
+                        crate::federation::types::device_class::PHONE,
+                    ),
+                })
+                .await
+                .unwrap();
+        }
+        // Family with alice-root + bob-root.
+        backend
+            .put_family(crate::federation::SignedFamily {
+                family: fed_family("fam-1", "Fam", vec!["alice-root", "bob-root"], "unanimous"),
+            })
+            .await
+            .unwrap();
+
+        // Revoke alice-phone, effective in the past.
+        backend
+            .put_identity_occurrence_revocation(SignedIdentityOccurrenceRevocation {
+                identity_occurrence_revocation: IdentityOccurrenceRevocation {
+                    identity_key_id: "alice-root".into(),
+                    occurrence_key_id: "alice-phone".into(),
+                    revoked_at: "2026-06-05T00:00:00Z".parse().unwrap(),
+                    effective_at: "2026-06-05T00:00:00Z".parse().unwrap(),
+                    reason: Some("lost device".into()),
+                    witness_set: vec!["alice-root".into()],
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .unwrap();
+
+        // list_*_revocations_for round-trips the row.
+        let revs = backend
+            .list_identity_occurrence_revocations_for("alice-root")
+            .await
+            .unwrap();
+        assert_eq!(revs.len(), 1);
+        assert_eq!(revs[0].occurrence_key_id, "alice-phone");
+        assert_eq!(revs[0].witness_set, vec!["alice-root".to_string()]);
+        assert!(!revs[0].persist_row_hash.is_empty(), "hash computed");
+
+        // active excludes the revoked occurrence; _for keeps both (history).
+        let active = backend
+            .list_identity_occurrences_active("alice-root")
+            .await
+            .unwrap();
+        let active_ids: Vec<_> = active
+            .iter()
+            .map(|o| o.occurrence_key_id.as_str())
+            .collect();
+        assert_eq!(active_ids, vec!["alice-laptop"], "revoked phone excluded");
+        assert_eq!(
+            backend
+                .list_identity_occurrences_for("alice-root")
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "_for is the full-history accessor"
+        );
+
+        // Future-effective revocation does NOT exclude.
+        backend
+            .put_identity_occurrence_revocation(SignedIdentityOccurrenceRevocation {
+                identity_occurrence_revocation: IdentityOccurrenceRevocation {
+                    identity_key_id: "alice-root".into(),
+                    occurrence_key_id: "alice-laptop".into(),
+                    revoked_at: "2026-06-05T00:00:00Z".parse().unwrap(),
+                    effective_at: "2099-01-01T00:00:00Z".parse().unwrap(),
+                    reason: None,
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .unwrap();
+        let active = backend
+            .list_identity_occurrences_active("alice-root")
+            .await
+            .unwrap();
+        assert_eq!(
+            active.len(),
+            1,
+            "future-dated revocation must not take effect yet"
+        );
+
+        // Family removal: bob-root removed, effective in the past.
+        backend
+            .put_family_membership_revocation(SignedFamilyMembershipRevocation {
+                family_membership_revocation: FamilyMembershipRevocation {
+                    family_key_id: "fam-1".into(),
+                    removed_identity_key_id: "bob-root".into(),
+                    removed_at: "2026-06-06T00:00:00Z".parse().unwrap(),
+                    effective_at: "2026-06-06T00:00:00Z".parse().unwrap(),
+                    reason: Some("left household".into()),
+                    witness_set: vec!["alice-root".into()],
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .unwrap();
+        // bob-root no longer an active member; alice-root still is.
+        assert!(
+            backend
+                .list_families_for_member_active("bob-root")
+                .await
+                .unwrap()
+                .is_empty(),
+            "removed member drops out of active families"
+        );
+        assert_eq!(
+            backend
+                .list_families_for_member_active("alice-root")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "remaining member still active"
+        );
+        // _for_member (history) still shows bob in the roster.
+        assert_eq!(
+            backend
+                .list_families_for_member("bob-root")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     /// Round-trip an identity_occurrence: write → list_for → reverse
