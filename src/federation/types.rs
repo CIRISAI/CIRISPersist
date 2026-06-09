@@ -393,6 +393,136 @@ pub struct Attestation {
         skip_serializing_if = "is_default_cohort_scope"
     )]
     pub cohort_scope: String,
+    /// v4.4.0 (CIRISPersist#171, CEG §10.1.3/§10.1.5). Row tier:
+    /// `"local"` (producer-only authority, signature deferred, visible
+    /// ONLY to the producing occurrence) | `"federation"` (hybrid-signed,
+    /// federation-visible). Default `"federation"` (preserves pre-v4.4.0
+    /// rows). **Persist-internal row metadata — NOT part of the
+    /// `attestation_envelope` JCS canonical signing bytes** (CEG
+    /// §10.1.5.3 must #2): the signature covers `attestation_envelope`,
+    /// not this struct, so a promoted row is byte-identical on the wire
+    /// to a natively-federation one. `skip_serializing_if` default keeps
+    /// federation-row JSON output stable across the v4.4 schema bump.
+    #[serde(default = "default_tier", skip_serializing_if = "is_default_tier")]
+    pub tier: String,
+    /// v4.4.0 — wall-clock of the local→federation `attestation_promote`
+    /// transition (the federation-emit moment). `None` for natively-
+    /// federation rows and un-promoted local rows. Persist-internal; not
+    /// in the canonical bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_at: Option<DateTime<Utc>>,
+}
+
+/// v4.4.0 (CIRISPersist#171) — attestation tier wire constants.
+pub mod attestation_tier {
+    /// Producer-only-authority, signature-deferred, self-visible-only.
+    pub const LOCAL: &str = "local";
+    /// Hybrid-signed, federation-visible (status quo + promotion target).
+    pub const FEDERATION: &str = "federation";
+}
+
+/// Default tier for backward compat: pre-v4.4.0 rows are all federation.
+fn default_tier() -> String {
+    attestation_tier::FEDERATION.to_string()
+}
+
+/// True iff the tier equals the default (`federation`) — federation rows
+/// omit the field from JSON so legacy canonical/round-trip output stays
+/// stable across the v4.4 schema bump.
+fn is_default_tier(tier: &str) -> bool {
+    tier == attestation_tier::FEDERATION
+}
+
+/// v4.4.0 (CIRISPersist#171, CEG §10.1.3) — caller input for a local-tier
+/// attestation write (`attestation_upsert_local` / `_insert_local`). The
+/// producer-only-authority self-attestation envelope: the caller supplies
+/// the semantic fields; persist fills the tier (`local`), the deferred
+/// empty-sentinel scrub envelope, `asserted_at`, and the row id. The
+/// signature is deferred to `attestation_promote` (no hybrid sig here).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalAttestationInput {
+    /// The producing occurrence's `federation_keys.key_id` (the
+    /// `witness_relation: self` producer). Must exist in federation_keys.
+    pub attesting_key_id: String,
+    /// Primary attested key. Defaults to `attesting_key_id` (a
+    /// self-attestation) when omitted. Must exist in federation_keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attested_key_id: Option<String>,
+    /// The §3 structural primitive (`scores` / `supersedes` / …).
+    pub attestation_type: String,
+    /// Optional weight signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<f64>,
+    /// Optional expiry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    /// The CEG attestation envelope. MUST carry a `"dimension"` string
+    /// (the `(occurrence, dimension)` upsert key + the §7.5/§10.1.3
+    /// local-tier gates read it).
+    pub attestation_envelope: serde_json::Value,
+    /// §4.2.6 subjects this attestation names (producer-authority rows
+    /// MAY name subjects; the local-tier gate refuses only a subject-side
+    /// revocation, not subject-naming).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subject_key_ids: Vec<String>,
+    /// Producer-side visibility scope. **Local-tier rows MUST be
+    /// `self`** (private to the producing occurrence until promotion;
+    /// the FSD §3 / CEG §10.1.5 tier read-gate is exactly the v4.0
+    /// `self`-cohort gate). Defaults `self`; the write path rejects any
+    /// other value at local tier. Promotion (v4.5) widens the scope.
+    #[serde(default = "default_self_cohort_scope")]
+    pub cohort_scope: String,
+}
+
+/// Default cohort_scope for a local-tier write — `self` (private to the
+/// producing occurrence; CEG §10.1.5 tier read-gate).
+fn default_self_cohort_scope() -> String {
+    cohort_scope::SELF.to_string()
+}
+
+impl LocalAttestationInput {
+    /// The envelope `dimension` (the local-tier key + gate axis).
+    pub fn dimension(&self) -> Option<&str> {
+        self.attestation_envelope
+            .get("dimension")
+            .and_then(|v| v.as_str())
+    }
+
+    /// Build the `local`-tier [`Attestation`] row: caller fields + the
+    /// deferred empty-sentinel scrub envelope (`scrub_signature_classical
+    /// = ""` — admitted at local tier by the V066 CHECK; `scrub_key_id =
+    /// attesting_key_id` so the FK holds; `original_content_hash = ""`,
+    /// recomputed via JCS at promote). `persist_row_hash` is filled by the
+    /// caller after construction (`compute_persist_row_hash`).
+    pub fn into_local_row(self, attestation_id: String, asserted_at: DateTime<Utc>) -> Attestation {
+        let attested_key_id = self
+            .attested_key_id
+            .unwrap_or_else(|| self.attesting_key_id.clone());
+        Attestation {
+            attestation_id,
+            attesting_key_id: self.attesting_key_id.clone(),
+            attested_key_id,
+            attestation_type: self.attestation_type,
+            weight: self.weight,
+            asserted_at,
+            expires_at: self.expires_at,
+            attestation_envelope: self.attestation_envelope,
+            // Sentinel (empty) — local rows defer the scrub envelope.
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            // FK-valid sentinel: the producer's own key.
+            scrub_key_id: self.attesting_key_id,
+            scrub_timestamp: asserted_at,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: self.subject_key_ids,
+            withdraws_admission_rule: None,
+            cohort_scope: self.cohort_scope,
+            tier: attestation_tier::LOCAL.to_string(),
+            promoted_at: None,
+        }
+    }
 }
 
 /// v3.9.0 (CIRISPersist#150) — default cohort_scope for backward compat.

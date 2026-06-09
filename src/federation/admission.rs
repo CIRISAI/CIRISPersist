@@ -761,6 +761,88 @@ pub fn check_cohort_scope(cohort_scope: &str) -> Result<(), Error> {
     }
 }
 
+/// v4.4.0 (CIRISPersist#171, CEG §10.1.3/§10.1.5/§7.5) — gate a row's
+/// eligibility for the **local tier** (signature-deferred,
+/// producer-only-authority). Local-tier eligibility is producer
+/// authority — NOT empty `subject_key_ids` (CEG §4.2.6: producer-
+/// authority rows legitimately name subjects). Exactly two classes are
+/// **refused** at local tier (they MUST be federation-tier, signed):
+///
+///   1. **`capacity:*` (CEG §7.5 anti-Goodhart, AV-62).** A `capacity:*`
+///      dimension rejects self-emission; the local tier's self-write →
+///      self-read → deferred-sig shape is precisely the §7.5 forbidden
+///      loop. Capacity is inherently third-party-attested.
+///   2. **Subject-side revocation (CEG §10.1.3, AV-61).** A `withdraws`
+///      (structural) or a `consent:state:revoked` dimension whose
+///      **writer (`attesting_key_id`) is a member of `subject_key_ids`**
+///      — the subject exercising its own revocation right. Subject-side
+///      revocation is the federation-observability primitive peers
+///      depend on; it cannot ride the deferral path.
+///
+/// `dimension` is the envelope dimension ([`envelope_dimension`]);
+/// `attestation_type` is the §3 structural primitive. Returns
+/// [`Error::InvalidArgument`] on an ineligible row; `Ok(())` otherwise.
+pub fn check_local_tier_eligibility(
+    attestation_type: &str,
+    dimension: Option<&str>,
+    attesting_key_id: &str,
+    subject_key_ids: &[String],
+    cohort_scope: &str,
+) -> Result<(), Error> {
+    // (0) local rows are `self`-scoped (private to the producing
+    // occurrence). The v4.0 `self`-cohort read-gate then IS the tier
+    // read-gate (FSD §3 / CEG §10.1.5, AV-59); promotion widens scope.
+    if cohort_scope != crate::federation::types::cohort_scope::SELF {
+        return Err(Error::InvalidArgument(format!(
+            "local-tier attestations must be cohort_scope='self' (private to the \
+             producing occurrence until promotion; CEG §10.1.5 tier read-gate, AV-59) \
+             — got '{cohort_scope}'"
+        )));
+    }
+    // (1) capacity:* — never local (anti-Goodhart §7.5 / AV-62).
+    if dimension.is_some_and(|d| d.starts_with("capacity:")) {
+        return Err(Error::InvalidArgument(
+            "capacity:* attestations are ineligible for the local tier (CEG §7.5 \
+             anti-Goodhart, AV-62): capacity is third-party-attested — federation-tier, \
+             signed, attesting_key_id != attested_key_id"
+                .to_string(),
+        ));
+    }
+    // (2) subject-side revocation — never local (§10.1.3 / AV-61).
+    let is_revocation = attestation_type == crate::federation::types::attestation_type::WITHDRAWS
+        || dimension.is_some_and(|d| d.starts_with("consent:state:revoked"));
+    if is_revocation && subject_key_ids.iter().any(|s| s == attesting_key_id) {
+        return Err(Error::InvalidArgument(
+            "a subject-side revocation (the writer is a member of subject_key_ids) is NOT \
+             local-tier-eligible (CEG §10.1.3, AV-61): it must be federation-tier signed / \
+             promoted within the bounded window"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// v4.4.0 (CIRISPersist#171, CEG §7.5 / AV-62) — the federation-path
+/// mirror of the `capacity:*` anti-Goodhart rule: a `capacity:*` row
+/// MUST have `attesting_key_id != attested_key_id` (no self-scoring).
+/// Enforced on `put_attestation` / `attestation_promote`. `Ok(())` for
+/// non-capacity rows.
+pub fn check_capacity_not_self_attested(
+    dimension: Option<&str>,
+    attesting_key_id: &str,
+    attested_key_id: &str,
+) -> Result<(), Error> {
+    if dimension.is_some_and(|d| d.starts_with("capacity:")) && attesting_key_id == attested_key_id
+    {
+        return Err(Error::InvalidArgument(
+            "capacity:* attestation must not be self-attested (attesting_key_id == \
+             attested_key_id) — CEG §7.5 anti-Goodhart, AV-62"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// v3.11.0 (CIRISPersist#143, CIRISVerify FEDERATION_THREAT_MODEL
 /// §3.3.2 R1) — admission-gate validation of the producer-side
 /// `observed_region` field on a revocation.

@@ -129,6 +129,74 @@ impl MemoryBackend {
         Self::default()
     }
 
+    /// v4.4.0 (CIRISPersist#171) — local-tier write (upsert/insert)
+    /// parity with the sqlite/postgres backends. Synchronous (in-process).
+    fn memory_write_local_attestation(
+        &self,
+        input: crate::federation::types::LocalAttestationInput,
+        replace: bool,
+    ) -> Result<String, crate::federation::Error> {
+        use crate::federation::Error;
+        let dimension = input.dimension().map(|s| s.to_string()).ok_or_else(|| {
+            Error::InvalidArgument(
+                "local attestation envelope must carry a \"dimension\" string".into(),
+            )
+        })?;
+        crate::federation::admission::check_local_tier_eligibility(
+            &input.attestation_type,
+            Some(dimension.as_str()),
+            &input.attesting_key_id,
+            &input.subject_key_ids,
+            &input.cohort_scope,
+        )?;
+        crate::federation::admission::check_cohort_scope(&input.cohort_scope)?;
+
+        let mut state = self.state.lock().expect("memory backend lock");
+        let identity_type = match state.federation_keys.get(&input.attesting_key_id) {
+            Some(rec) => rec.identity_type.clone(),
+            None => {
+                return Err(Error::InvalidArgument(format!(
+                    "attesting_key_id {} does not exist in federation_keys",
+                    input.attesting_key_id
+                )))
+            }
+        };
+        let dim = crate::federation::admission::envelope_dimension(&input.attestation_envelope);
+        crate::federation::admission::DimensionAdmissionPolicy::default().check(
+            &input.attestation_type,
+            dim,
+            &identity_type,
+        )?;
+        // attested_key_id (defaults to attesting) must exist too.
+        let attested = input
+            .attested_key_id
+            .clone()
+            .unwrap_or_else(|| input.attesting_key_id.clone());
+        if !state.federation_keys.contains_key(&attested) {
+            return Err(Error::InvalidArgument(format!(
+                "attested_key_id {attested} does not exist in federation_keys"
+            )));
+        }
+
+        let attestation_id = uuid::Uuid::new_v4().to_string();
+        let attesting_key_id = input.attesting_key_id.clone();
+        let mut row = input.into_local_row(attestation_id.clone(), chrono::Utc::now());
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+
+        if replace {
+            state.federation_attestations.retain(|a| {
+                !(a.attesting_key_id == attesting_key_id
+                    && a.tier == crate::federation::types::attestation_tier::LOCAL
+                    && a.attestation_envelope
+                        .get("dimension")
+                        .and_then(|v| v.as_str())
+                        == Some(dimension.as_str()))
+            });
+        }
+        state.federation_attestations.push(row);
+        Ok(attestation_id)
+    }
+
     /// Register a public key. For test fixtures. v0.4.0 — writes to
     /// federation_keys (the canonical pubkey directory post-lens#8
     /// ASK 2). Pre-v0.4.0 wrote to a separate `keys` map; the legacy
@@ -626,6 +694,20 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(())
     }
 
+    async fn attestation_upsert_local(
+        &self,
+        input: crate::federation::types::LocalAttestationInput,
+    ) -> Result<String, crate::federation::Error> {
+        self.memory_write_local_attestation(input, true)
+    }
+
+    async fn attestation_insert_local(
+        &self,
+        input: crate::federation::types::LocalAttestationInput,
+    ) -> Result<String, crate::federation::Error> {
+        self.memory_write_local_attestation(input, false)
+    }
+
     async fn list_attestations_for(
         &self,
         attested_key_id: &str,
@@ -634,7 +716,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut rows: Vec<_> = state
             .federation_attestations
             .iter()
-            .filter(|a| a.attested_key_id == attested_key_id)
+            .filter(|a| {
+                a.attested_key_id == attested_key_id
+                    && a.tier == crate::federation::types::attestation_tier::FEDERATION
+            })
             .cloned()
             .collect();
         // Match postgres ORDER BY asserted_at DESC.
@@ -650,7 +735,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut rows: Vec<_> = state
             .federation_attestations
             .iter()
-            .filter(|a| a.attesting_key_id == attesting_key_id)
+            .filter(|a| {
+                a.attesting_key_id == attesting_key_id
+                    && a.tier == crate::federation::types::attestation_tier::FEDERATION
+            })
             .cloned()
             .collect();
         rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
@@ -2710,6 +2798,8 @@ mod tests {
             subject_key_ids: Vec::new(),
             withdraws_admission_rule: None,
             cohort_scope: "federation".to_string(),
+            tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
+            promoted_at: None,
         }
     }
 
@@ -3602,6 +3692,8 @@ mod tests {
             subject_key_ids: Vec::new(),
             withdraws_admission_rule: None,
             cohort_scope: "federation".to_string(),
+            tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
+            promoted_at: None,
         }
     }
 
@@ -3779,6 +3871,8 @@ mod tests {
             subject_key_ids: Vec::new(),
             withdraws_admission_rule: None,
             cohort_scope: "federation".to_string(),
+            tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
+            promoted_at: None,
         };
         backend
             .put_attestation(SignedAttestation { attestation: att })

@@ -5,6 +5,33 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [4.4.0] — 2026-06-08
+
+**Shared CEG attestation surface — phase 1: local-tier write + read-gate (CIRISPersist#171; CEG 0.15 §10.1.3 / §10.1.5; FSD `V4_4_SHARED_ATTESTATION_SURFACE.md`).**
+
+The gating dependency for CIRISAgent#840's hard cut-over (`graph_nodes` → self-level CEG attestations). `federation_attestations` is the single store all four CEG-RC1 implementations read/write; v4.0 gave it the scope-aware **read**, this adds the **local-tier write** half. FSD accepted by all four impls (Agent / Registry / LensCore / NodeCore ✅; Verify ✅ on OQ-4), surface pinned in CEG §10.1.5. **Per the Agent's staging request, this phase lands local operation; `attestation_promote` (federation-emit) is the v4.5 fast-follow — now unblocked by CIRISVerify 4.11.0 JCS.**
+
+### Dependency
+- **CIRISVerify `v4.10.0` → `v4.11.0`** — ships `ciris_verify_core::jcs::{canonicalize, verify_jcs_hybrid_signature}` (RFC 8785; CIRISVerify#59 closed), the OQ-4 deliverable for the v4.5 `promote` path. No persist call site yet; re-pinned now so v4.5 is a pure feature add.
+
+### Added — tier model + local write
+- **V066** — `federation_attestations` gains `tier` (`local | federation`, DEFAULT `federation`) + `promoted_at`. **Purely additive on both backends** (empty-sentinel scrub envelope for local rows — no NOT-NULL relaxation, no table rebuild). CHECK/trigger enforces `tier = federation ⟹ non-empty classical signature` (**AV-60**). `tier`/`promoted_at` are row metadata — NOT in the `attestation_envelope` canonical bytes, so a promoted row will be byte-identical on the wire to a native-federation one (Registry must #2).
+- **`attestation_upsert_local` / `attestation_insert_local`** (+ `_many` defaults) on `FederationDirectory`, all three backends + PyO3. `LocalAttestationInput` → deferred-signature `local` row. **upsert** replaces on `(attesting_key_id, dimension)` (singleton current-state); **insert** appends a fresh id (multi-valued memory / per-thought verdicts) — the Agent's two-write-class correction. `dimension` = the envelope `dimension` (the key + gate axis).
+
+### Enforced at ingest — the §4.1 gates
+- **`capacity:*` ineligible for local tier** (CEG §7.5 anti-Goodhart — the self-write→self-read→deferred-sig loop, **AV-62**); `check_capacity_not_self_attested` for the federation path (`attesting ≠ attested`). Raised as load-bearing by LensCore.
+- **Subject-side revocation ineligible** (`withdraws` / `consent:state:revoked` where the writer ∈ `subject_key_ids` — CEG §10.1.3, **AV-61**).
+- **Local rows are `cohort_scope='self'`** — private to the producing occurrence. The v4.0 `self`-cohort read-gate IS the tier read-gate; combined with the federation-tier filter on the trust-reads below, this closes **AV-59** (local rows never surface to a non-producing caller).
+
+### Changed — read-gate (AV-59)
+- The **`FederationDirectory` trust-reads** (`list_attestations_for` / `list_attestations_by`, the "who-vouches-for-K" reads) now filter `tier = 'federation'` — local self-attestations are not vouches and never appear there. The agent reads its own local state via the scope-gated `ReadEngine` reads (its `self`-cohort rows). No public-signature change.
+
+### Deferred (documented, not silent)
+- **`attestation_promote`** + the dedicated dimension-prefix `attestation_query` + the §5 consent-revocation overdue-scan/`hard_case` emission → **v4.5**. `promote` is unblocked (4.11.0 JCS); the §5 clock trigger is OQ-3 / CIRISPersist#161. The §10.1.3 subject-revocation leak is already closed at ingest (gate above); §5 covers only the residual acquire-after-write case.
+
+### Tests
+Both backends (live PG + SQLite): upsert-replace, insert-append, the three gate negatives (capacity, subject-revocation, non-self-scope), dimension-required, and the AV-59 trust-read exclusion. **1035 lib tests green on live PG**; `-D warnings` clean across no-backend / `test-panic,pyo3` / full-feature; clippy clean over `--tests`.
+
 ## [4.3.0] — 2026-06-07
 
 **Streaming substrate Cut C3b — epoch-DEK `key_grant` cascade + `wrap_algorithm: v2` (PQC) + CIRISVerify 4.10.0 re-pin (CIRISPersist#142, CEG 0.15 §10.5.3).**

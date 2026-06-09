@@ -714,6 +714,51 @@ impl PyEngine {
         Ok(())
     }
 
+    /// v4.4.0 (CIRISPersist#171) — shared dispatch for the local-tier
+    /// attestation write PyO3 methods (`replace` = upsert vs insert).
+    fn local_attestation_write(
+        &self,
+        py: Python<'_>,
+        input_json: &str,
+        replace: bool,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let input: crate::federation::types::LocalAttestationInput =
+                serde_json::from_str(input_json).map_err(|e| {
+                    PyValueError::new_err(format!("LocalAttestationInput JSON decode: {e}"))
+                })?;
+            let runtime = self.runtime.clone();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        if replace {
+                            backend.attestation_upsert_local(input).await
+                        } else {
+                            backend.attestation_insert_local(input).await
+                        }
+                        .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        if replace {
+                            backend.attestation_upsert_local(input).await
+                        } else {
+                            backend.attestation_insert_local(input).await
+                        }
+                        .map_err(federation_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
     /// v3.6.8 (CIRISPersist#138, #140) — select the signer for a
     /// PyO3 sign-emitting method based on the caller-supplied
     /// `attesting_key_id`.
@@ -3197,6 +3242,24 @@ impl PyEngine {
                 }
             })
         })
+    }
+
+    /// v4.4.0 (CIRISPersist#171, CEG §10.1.3) — upsert a local-tier
+    /// self-attestation (`input_json` = a `LocalAttestationInput`).
+    /// Replace-on-`(occurrence, dimension)`; signature deferred; the row
+    /// is `tier=local`, `cohort_scope=self` (private to the producing
+    /// occurrence until promotion). Returns the `attestation_id`.
+    fn attestation_upsert_local(&self, py: Python<'_>, input_json: &str) -> PyResult<String> {
+        self.local_attestation_write(py, input_json, true)
+    }
+
+    /// v4.4.0 (CIRISPersist#171) — insert (append) a local-tier
+    /// attestation for a multi-valued dimension (memory / per-thought
+    /// verdicts). Same shape as
+    /// [`attestation_upsert_local`](Self::attestation_upsert_local);
+    /// appends a fresh row instead of replacing.
+    fn attestation_insert_local(&self, py: Python<'_>, input_json: &str) -> PyResult<String> {
+        self.local_attestation_write(py, input_json, false)
     }
 
     // NB (v4.0 #135) — the legacy `list_attestations_for(attested_key_id)
