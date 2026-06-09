@@ -8227,6 +8227,48 @@ impl crate::read::ReadEngine for SqliteBackend {
                 "pqc_completed_at IS NULL".to_owned()
             });
         }
+        // v4.5 (CEG §10.1.5.4) — open-vocab dimension-prefix filter
+        // (OR-combined LIKE on the envelope dimension).
+        if !filter.dimension_prefixes.is_empty() {
+            let mut ors: Vec<String> = Vec::new();
+            for p in &filter.dimension_prefixes {
+                // LIKE prefix%: escape % and _ in the prefix, then append %.
+                let esc = p
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_");
+                binds.push(SqlValue::Text(format!("{esc}%")));
+                ors.push(format!(
+                    "json_extract(attestation_envelope, '$.dimension') LIKE ?{} ESCAPE '\\'",
+                    binds.len()
+                ));
+            }
+            parts.push(format!("({})", ors.join(" OR ")));
+        }
+        // v4.5 — point-in-time validity.
+        if let Some(va) = filter.valid_at {
+            binds.push(SqlValue::Text(va.to_rfc3339()));
+            let p = binds.len();
+            parts.push(format!(
+                "(asserted_at <= ?{p} AND (expires_at IS NULL OR expires_at > ?{p}))"
+            ));
+        }
+        // v4.5 — confidence floor (NULL weight excluded when a floor is set).
+        if let Some(floor) = filter.confidence_floor {
+            binds.push(SqlValue::Real(floor));
+            parts.push(format!(
+                "(weight IS NOT NULL AND weight >= ?{})",
+                binds.len()
+            ));
+        }
+        // v4.5 — subject membership (subject_key_ids is a JSON array TEXT).
+        if let Some(subj) = &filter.subject_key_id {
+            binds.push(SqlValue::Text(subj.clone()));
+            parts.push(format!(
+                "EXISTS (SELECT 1 FROM json_each(subject_key_ids) WHERE value = ?{})",
+                binds.len()
+            ));
+        }
         // §4.3 scope gate — federation_attestations carries cohort_scope
         // (V056) + attested_key_id (the row's target identity, V055). The
         // gate compares the row's cohort_scope/attested_key_id against the
@@ -12094,6 +12136,107 @@ mod tests {
         assert!(
             matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("revocation")),
             "got: {err:?}"
+        );
+    }
+
+    /// v4.5 attestation_query filters (CEG §10.1.5.4) — dimension prefix,
+    /// valid_at, confidence_floor, subject. Raw-inserts federation rows
+    /// (bypasses write admission) to exercise the read filters directly.
+    #[tokio::test]
+    async fn sqlite_attestation_query_filters() {
+        use crate::ceg::ReadEngine;
+        let backend = fresh_backend_with_occurrence("occ").await;
+        let seed = |id: &str, dim: &str, weight: f64, subjects: &[&str], expires: Option<&str>| {
+            let conn = backend.conn_handle();
+            let conn = conn.lock();
+            let env = serde_json::json!({"id": id, "dimension": dim, "score": 1.0}).to_string();
+            let subj = serde_json::to_string(subjects).unwrap();
+            conn.execute(
+                "INSERT INTO federation_attestations (\
+                    attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                    weight, asserted_at, expires_at, attestation_envelope, original_content_hash, \
+                    scrub_signature_classical, scrub_signature_pqc, scrub_key_id, scrub_timestamp, \
+                    pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, \
+                    cohort_scope, tier, promoted_at\
+                 ) VALUES (?1, 'occ', 'occ', 'scores', ?2, '2026-05-01T00:00:00Z', ?3, ?4, x'', \
+                          'sig', NULL, 'occ', '2026-05-01T00:00:00Z', NULL, '0', ?5, NULL, \
+                          'federation', 'federation', NULL)",
+                rusqlite::params![id, weight, expires, env, subj],
+            )
+            .unwrap();
+        };
+        seed("a", "config:filter:v1", 0.9, &[], None);
+        seed("b", "config:other:v1", 0.4, &[], None);
+        seed(
+            "c",
+            "goal:x:v1",
+            0.95,
+            &["subj-1"],
+            Some("2030-01-01T00:00:00Z"),
+        );
+        seed("d", "goal:y:v1", 0.7, &[], Some("2026-05-02T00:00:00Z")); // expires early
+
+        let q = |f: AttestationFilter| {
+            let backend = &backend;
+            async move {
+                let mut ids: Vec<String> = backend
+                    .list_attestations(f, None, 100, crate::scope::CallerScope::Unauthenticated)
+                    .await
+                    .unwrap()
+                    .items
+                    .into_iter()
+                    .map(|a| a.attestation_id)
+                    .collect();
+                ids.sort();
+                ids
+            }
+        };
+
+        // dimension prefix.
+        assert_eq!(
+            q(AttestationFilter {
+                dimension_prefixes: vec!["config:".into()],
+                ..Default::default()
+            })
+            .await,
+            vec!["a", "b"]
+        );
+        // multiple prefixes OR-combine.
+        assert_eq!(
+            q(AttestationFilter {
+                dimension_prefixes: vec!["config:filter".into(), "goal:".into()],
+                ..Default::default()
+            })
+            .await,
+            vec!["a", "c", "d"]
+        );
+        // confidence floor (NULL excluded; b at 0.4 dropped).
+        assert_eq!(
+            q(AttestationFilter {
+                confidence_floor: Some(0.8),
+                ..Default::default()
+            })
+            .await,
+            vec!["a", "c"]
+        );
+        // subject membership.
+        assert_eq!(
+            q(AttestationFilter {
+                subject_key_id: Some("subj-1".into()),
+                ..Default::default()
+            })
+            .await,
+            vec!["c"]
+        );
+        // valid_at: at 2026-05-03, d has expired (expires 05-02); a/b no expiry, c future.
+        let at = "2026-05-03T00:00:00Z".parse().unwrap();
+        assert_eq!(
+            q(AttestationFilter {
+                valid_at: Some(at),
+                ..Default::default()
+            })
+            .await,
+            vec!["a", "b", "c"]
         );
     }
 

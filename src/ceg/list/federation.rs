@@ -107,7 +107,8 @@ pub struct FederationKeyListPage {
 
 /// Filter for [`crate::ceg::ReadEngine::list_attestations`]. Composes
 /// AND-style.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+// `Eq` dropped in v4.5 — `confidence_floor: Option<f64>` is not `Eq`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AttestationFilter {
     /// Filter by the key id that DID the attesting.
     pub attesting_key_id: Option<String>,
@@ -121,6 +122,31 @@ pub struct AttestationFilter {
 
     /// Filter by PQC completion.
     pub pqc_completed: Option<bool>,
+
+    /// v4.5 (CIRISPersist#171, CEG §10.1.5.4) — **open-vocabulary**
+    /// dimension-prefix filter. Matches rows whose envelope `dimension`
+    /// (`attestation_envelope->>'dimension'`) starts with ANY of these
+    /// prefixes (hierarchical-prefix-matched, OR-combined). Empty = no
+    /// dimension filter. The `attestation_query` axis; validated
+    /// structurally, NOT against a closed enum.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dimension_prefixes: Vec<String>,
+
+    /// v4.5 — point-in-time validity: keep rows with
+    /// `asserted_at <= valid_at < COALESCE(expires_at, +inf)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_at: Option<DateTime<Utc>>,
+
+    /// v4.5 — minimum `weight` (confidence floor): keep rows with
+    /// `weight >= confidence_floor`. Rows with NULL weight are excluded
+    /// when a floor is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence_floor: Option<f64>,
+
+    /// v4.5 — narrow to attestations naming this subject (the key id is
+    /// a member of `subject_key_ids`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_key_id: Option<String>,
 }
 
 /// Opaque cursor for [`crate::ceg::ReadEngine::list_attestations`].
