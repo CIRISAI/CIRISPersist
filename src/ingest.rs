@@ -792,7 +792,18 @@ where
         // and bubbled SignatureMismatch from), we still emit the
         // warn with `None` for the canonical fields and return
         // the typed SignatureMismatch error.
-        match verify_trace(trace, self.canonicalizer, &key) {
+        // v4.6 (#176) — select the canonicalizer by the trace's SIGNED
+        // schema epoch (Python-compat 1.x/2.x, JCS 3.x+), not the
+        // struct's injected default. Signed-bytes-bound, not
+        // caller-selectable. (The injected `self.canonicalizer` remains
+        // the best-effort diagnostic canonicalizer below; in production
+        // it equals the gate's V1 result for current 1.x/2.x traffic.)
+        let canon = crate::verify::canonical::canonicalizer_for(
+            crate::verify::ed25519::canon_version_for_trace_schema(
+                trace.trace_schema_version.as_str(),
+            ),
+        );
+        match verify_trace(trace, canon, &key) {
             Ok(()) => Ok(()),
             Err(VerifyError::SignatureMismatch) => {
                 let diag =

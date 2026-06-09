@@ -499,6 +499,36 @@ where
     Err(Error::SignatureMismatch)
 }
 
+/// v4.6 (CIRISPersist#171 / #176 / CEG §0.9) — map a trace's **signed**
+/// `trace_schema_version` to its canonicalization version (the #176
+/// signed-epoch version gate). The JCS flip is a **major-version** era
+/// boundary: `1.x`/`2.x` are Python-compat (pre-cut); **`3.x`+ is JCS**
+/// (the agent's 2.9.6 / 3.0 flip). Robust to point-version bumps within
+/// an era — no per-point-version enumeration.
+///
+/// `trace_schema_version` is part of the signed canonical bytes, so this
+/// is attacker-uncontrollable (signed-bytes-bound, #176 / #174 §6): a
+/// forged version that flips the canonicalizer changes the canonical →
+/// signature mismatch → rejection, never a check bypass.
+///
+/// **Inert until 3.x lands:** a `3.x` trace is only *reachable* once that
+/// schema is added to `SUPPORTED_VERSIONS` + the field-layout dispatch in
+/// [`verify_trace`]; the exact 3.0 schema string + layout are pinned with
+/// the agent at the CIRISConformance#9 byte-identity validation. Until
+/// then this gate returns `V1Python` for every supported schema — the
+/// production canonicalizer is unchanged, persist 4.6 ships safe + ready.
+pub fn canon_version_for_trace_schema(wire: &str) -> crate::verify::canonical::CanonVersion {
+    use crate::verify::canonical::CanonVersion;
+    if let Some((major, _)) = wire.split_once('.') {
+        if let Ok(m) = major.parse::<u32>() {
+            if m >= 3 {
+                return CanonVersion::V2Jcs;
+            }
+        }
+    }
+    CanonVersion::V1Python
+}
+
 /// Convenience wrapper: verify with a [`PublicKeyDirectory`] in front
 /// (looks up the key by id, then defers to [`verify_trace`]). Useful
 /// for the standalone-verifier test path; production ingest looks up
@@ -527,6 +557,27 @@ mod tests {
     use crate::schema::SchemaVersion;
     use ed25519_dalek::{Signer, SigningKey};
     use std::collections::HashMap;
+
+    /// v4.6 (#176) — the signed-epoch gate: 1.x/2.x → Python-compat,
+    /// 3.x+ → JCS (the agent's 2.9.6 flip era), robust to point bumps;
+    /// unparseable/major-less → Python (safe default).
+    #[test]
+    fn canon_version_gate_by_major() {
+        use crate::verify::canonical::CanonVersion::{V1Python, V2Jcs};
+        for (wire, want) in [
+            ("2.7.0", V1Python),
+            ("2.7.9", V1Python),
+            ("2.7.legacy", V1Python),
+            ("1.0.0", V1Python),
+            ("3.0.0", V2Jcs),
+            ("3.5.2", V2Jcs),
+            ("10.0.0", V2Jcs),
+            ("garbage", V1Python),
+            ("", V1Python),
+        ] {
+            assert_eq!(canon_version_for_trace_schema(wire), want, "schema {wire}");
+        }
+    }
 
     /// In-memory PublicKeyDirectory for tests.
     struct MemKeys {

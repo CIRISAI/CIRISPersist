@@ -247,7 +247,15 @@ where
                     .into_response();
             }
         };
-        if let Err(e) = verify_trace(trace, &PythonJsonDumpsCanonicalizer, &key) {
+        // v4.6 (#176) — select the canonicalizer by the trace's SIGNED
+        // schema epoch (Python-compat for 1.x/2.x, JCS for 3.x+). Signed-
+        // bytes-bound: not caller-selectable.
+        let canon = crate::verify::canonical::canonicalizer_for(
+            crate::verify::ed25519::canon_version_for_trace_schema(
+                trace.trace_schema_version.as_str(),
+            ),
+        );
+        if let Err(e) = verify_trace(trace, canon, &key) {
             return invariant_response(
                 KIND_INNER_SIGNATURE,
                 format!("agent signature failed verify: {e}"),
