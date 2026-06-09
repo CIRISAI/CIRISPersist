@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780970116639,
+  "lastUpdate": 1780971645071,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -16901,6 +16901,264 @@ window.BENCHMARK_DATA = {
             "name": "occurrence_registry/list_live_occurrences/1000",
             "value": 301666,
             "range": "± 1041",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d6d5f5eeab83845337f85ad770880e24e089a059",
+          "message": "v4.4.0 — Shared CEG attestation surface, phase 1: local-tier write + read-gate (#171) (#173)\n\n* v4.4 phase 1 foundation: CIRISVerify 4.11.0 re-pin + V066 attestation tier model (#171)\n\n- Re-pin CIRISVerify 4.10.0 → 4.11.0 (ships ciris_verify_core::jcs for\n  the phase-2 promote path; #59 closed).\n- V066 (both backends): federation_attestations gains tier\n  (local|federation, DEFAULT federation) + promoted_at. Purely additive\n  via empty-sentinel scrub envelope for local rows (no NOT-NULL\n  relaxation, no table rebuild). CHECK/trigger: federation ⟹ non-empty\n  classical signature (AV-60). Partial index on tier='local' for the §5\n  overdue scan + self-read. Applies clean on live PG + SQLite.\n\nFoundation for FSD/V4_4_SHARED_ATTESTATION_SURFACE.md phase 1\n(upsert_local/insert_local/query + gates) — WIP.\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>\n\n* v4.4 phase 1: tier + promoted_at on Attestation (type layer) (#171)\n\n- Attestation gains tier (local|federation, serde-default federation) +\n  promoted_at (Option). Pure row metadata — canonical bytes are over\n  attestation_envelope, NOT the struct, so a promoted row is\n  byte-identical on the wire to a native-federation one (Registry must\n  #2). attestation_tier::{LOCAL,FEDERATION} consts.\n- Both decoders (sqlite_row_to_attestation / pg_row_to_attestation) read\n  the columns; all 5 SELECTs per backend add tier, promoted_at. INSERTs\n  rely on the column DEFAULT 'federation'.\n- 20 federation-write/test construction sites default tier=federation.\n\n69 attestation tests green on live PG + sqlite; -D warnings clean.\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>\n\n* v4.4 phase 1: local-tier write methods (upsert/insert + gates) (#171)\n\nattestation_upsert_local (replace-on-(occurrence,dimension)) +\nattestation_insert_local (append) + _many defaults, on FederationDirectory\nacross sqlite/postgres/memory. CEG §10.1.3 local-tier:\n\n- LocalAttestationInput (caller envelope) → into_local_row fills the\n  deferred empty-sentinel scrub envelope (scrub_signature_classical=\"\",\n  scrub_key_id=attesting for FK, tier=local). Dimension = envelope\n  \"dimension\" (the upsert key + gate axis).\n- §4.1 gates (admission.rs): check_local_tier_eligibility refuses\n  capacity:* (§7.5/AV-62) + subject-side revocation (writer ∈\n  subject_key_ids, §10.1.3/AV-61); check_capacity_not_self_attested for\n  the federation path. Plus shared dimension/cohort_scope admission (no\n  federation trust gate — local is producer-authority).\n- upsert = delete prior local rows for (attesting, dimension) then\n  insert; insert = append fresh id. PG weight via $5::float8::numeric.\n\nTests both backends (live PG + sqlite): upsert-replace, insert-append,\ncapacity reject, subject-revocation reject, dimension-required. -D\nwarnings clean incl. no-backend pyo3.\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>\n\n* v4.4 phase 1: read-gate (AV-59) + PyO3 + ship 4.4.0 (#171)\n\nCompletes the local-tier write+read half:\n- AV-59 read-gate: FederationDirectory trust-reads (list_attestations_for\n  /_by) filter tier='federation' (local self-attestations aren't vouches,\n  never surface there); local rows are cohort_scope='self' (enforced at\n  the write gate) so the v4.0 self-cohort gate IS the tier read-gate. The\n  agent reads its own state via the scoped ReadEngine reads.\n- PyO3: attestation_upsert_local / attestation_insert_local (JSON input).\n- Tests both backends (live PG + sqlite): upsert-replace, insert-append,\n  3 gate negatives (capacity §7.5/AV-62, subject-revocation §10.1.3/AV-61,\n  non-self-scope), dimension-required, AV-59 trust-read exclusion.\n\npromote + dimension-prefix query + §5 overdue-scan → v4.5 (promote\nunblocked by 4.11.0 JCS; §5 clock is OQ-3/#161). Per the Agent's staging\nrequest to land local operation first.\n\n1035 lib tests green on live PG (all features); clippy + cfg-gates clean.\nShips as 4.4.0.\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Opus 4.8 <noreply@anthropic.com>",
+          "timestamp": "2026-06-08T20:54:45-05:00",
+          "tree_id": "8744dddb6367ea324695652146d36b9a44ce9146",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/d6d5f5eeab83845337f85ad770880e24e089a059"
+        },
+        "date": 1780971643298,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 53621133,
+            "range": "± 149222",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 1318450,
+            "range": "± 97792",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 1844,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 4498,
+            "range": "± 20",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 9791,
+            "range": "± 135",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 36407,
+            "range": "± 531",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 5,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 23,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 126,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 383,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 447,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 1650,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 6,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 62,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 193,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 877,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 10,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 37408,
+            "range": "± 1034",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 111147,
+            "range": "± 1812",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 406732,
+            "range": "± 3878",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 7137,
+            "range": "± 1162",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 8160,
+            "range": "± 751",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 12749,
+            "range": "± 1808",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 23203,
+            "range": "± 6080",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 1160877,
+            "range": "± 5270",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 9310705,
+            "range": "± 239873",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 600730,
+            "range": "± 16439",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 1829328,
+            "range": "± 25745",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 90710642,
+            "range": "± 432078",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 3804521,
+            "range": "± 71361",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 16433742,
+            "range": "± 195675",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 226300675,
+            "range": "± 1080106",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 9711288,
+            "range": "± 316066",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 42534507,
+            "range": "± 538557",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 184822,
+            "range": "± 6911",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 172120,
+            "range": "± 7555",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 14312,
+            "range": "± 69",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 90270,
+            "range": "± 241",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 843348,
+            "range": "± 9536",
             "unit": "ns/iter"
           }
         ]
