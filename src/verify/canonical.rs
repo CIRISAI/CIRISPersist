@@ -78,12 +78,26 @@ pub trait Canonicalizer: Send + Sync {
 }
 
 /// Phase 1 canonicalizer — byte-exact match with the agent's
-/// `json.dumps(canonical, sort_keys=True, separators=(",", ":"),
-/// ensure_ascii=True)` output.
+/// `json.dumps(canonical, sort_keys=True, separators=(",", ":"))` output.
 ///
-/// `ensure_ascii=True` is Python's default; the agent code in
-/// `accord_metrics/services.py:208-368` does not pass
-/// `ensure_ascii=False`, so the wire is ASCII-only.
+/// The agent's signing sites
+/// (`ciris_adapters/ciris_accord_metrics/services.py:450`,
+/// `authentication/service.py`, `dsar/signature_service.py`) pass **no**
+/// `ensure_ascii` argument, so Python applies its default
+/// **`ensure_ascii=True`**: every non-ASCII codepoint is `\uXXXX`-escaped
+/// (BMP) or surrogate-pair-escaped (non-BMP). This canonicalizer escapes
+/// identically (see [`write_string`]), so the produced bytes are
+/// pure-ASCII and byte-match the agent in **every** language.
+///
+/// **Contrast with JCS (the v4.6 flip target):** RFC 8785 §3.2.2.2 emits
+/// **raw UTF-8** for non-ASCII (escaping only `"`, `\`, C0 controls). So
+/// Python-compat and JCS agree on pure-ASCII payloads but **diverge on
+/// every non-ASCII character** — not merely the non-BMP tail. Per the
+/// CIRISAgent #174 measurement, that breaking set is the majority of the
+/// multilingual corpus (any `thought_content`/`rationale` in a non-Latin
+/// locale, plus the `⚠️` attestation-disclosure emoji on English traces).
+/// This is why the v4.6 flip needs a signed-epoch version gate, not a
+/// naked swap.
 pub struct PythonJsonDumpsCanonicalizer;
 
 impl Canonicalizer for PythonJsonDumpsCanonicalizer {
