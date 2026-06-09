@@ -41,6 +41,7 @@ pub mod blobs;
 pub mod emit;
 pub mod goal;
 pub mod hardware_attestation;
+pub mod location;
 pub mod perceptual_hash;
 pub mod precedence;
 #[cfg(feature = "cirisaudit")]
@@ -136,10 +137,11 @@ pub use topology::{
 pub use types::{
     Attestation, Community, CommunityMember, CommunityMembershipRevocation, Family, FamilyMember,
     FamilyMembershipRevocation, HybridPendingRow, IdentityOccurrence, IdentityOccurrenceRevocation,
-    KeyRecord, PeerMetadataRow, PeerPolicyBlob, Revocation, SignedAttestation, SignedCommunity,
-    SignedCommunityMembershipRevocation, SignedFamily, SignedFamilyMembershipRevocation,
-    SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation, SignedKeyRecord,
-    SignedRevocation, TrustClass, TrustFilter, TrustGrant, TrustRelationship, TrustRow, TrustType,
+    KeyRecord, LocationProof, PeerMetadataRow, PeerPolicyBlob, Revocation, SignedAttestation,
+    SignedCommunity, SignedCommunityMembershipRevocation, SignedFamily,
+    SignedFamilyMembershipRevocation, SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation,
+    SignedKeyRecord, SignedLocationProof, SignedRevocation, TrustClass, TrustFilter, TrustGrant,
+    TrustRelationship, TrustRow, TrustType,
 };
 
 /// Federation directory trait — the registry/lens/agent's read+write
@@ -531,6 +533,25 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         community_key_id: &str,
     ) -> Result<Vec<CommunityMembershipRevocation>, Error>;
+
+    /// v4.10.0 (CIRISPersist#154, CEG 0.8 §0.8.1) — record a
+    /// `location_proof`. Runs the §0.8 H3 canonicalization gate +
+    /// §0.8.1 **rough-only** bound (`cell_resolution <= 7`) via
+    /// [`location::validate_location_cell`](crate::federation::location::validate_location_cell)
+    /// before computing `persist_row_hash` and inserting — an over-precise
+    /// or malformed cell is **refused** (the substrate is the second line
+    /// of defense after client UI gating). Append-only on the
+    /// `(subject_key_id, asserted_at)` PK.
+    async fn put_location_proof(&self, proof: SignedLocationProof) -> Result<(), Error>;
+
+    /// v4.10.0 — every stored `location_proof` for `subject_key_id`
+    /// (in-force and withdrawn — full history; callers filter on
+    /// `withdrawn_at` / `valid_until` per their freshness policy, same
+    /// shape as `list_identity_occurrences_for`).
+    async fn list_location_proofs_for(
+        &self,
+        subject_key_id: &str,
+    ) -> Result<Vec<LocationProof>, Error>;
 
     /// v4.8.0 (#161 Ask 2) — occurrences of `identity_key_id` that are
     /// **currently active**: admitted AND with no revocation whose
