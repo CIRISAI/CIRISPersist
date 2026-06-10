@@ -5,6 +5,34 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [5.0.0] — 2026-06-10
+
+**The agent-2.9.6 / CEG-1.0 substrate line — persist 5.0 (CIRISPersist#186; #171 / CIRISAgent#840).**
+
+5.0 marks persist as the **CEG-1.0-complete, agent-2.9.6-aligned substrate** (mirrors CIRISVerify 5.0 = "CEG 1.0 / Agent 3.0 substrate"). Breaking the chicken-and-egg with #840: persist ships its complete agent-facing surface **first** so the agent's `graph_nodes → attestations` hard cut migrates *against* it, rather than each side waiting on the other. The CEG conformance breaking work (JCS §0.9) landed in v4.15.0; this cut completes the agent-facing local-tier attestation surface and stamps the line.
+
+### Added — the last agent-facing surface gap (#171)
+- **PyO3 `attestation_upsert_local_many(inputs_json)` / `attestation_insert_local_many(inputs_json)`** — batched bulk local-tier writes (JSON array of `LocalAttestationInput` → JSON array of `attestation_id`s, in order). This is the primitive the agent's boot-time `migrate_graph_nodes_to_attestations()` one-shot backlog transform calls — one round-trip instead of N PyO3 crossings. The trait methods existed since v4.4.0 (default chunked loop); 5.0 exposes them on the wheel. `upsert_many` collapses on `(occurrence, dimension)`; `insert_many` appends per input (multi-valued / event dimensions).
+
+### The agent-facing local-tier attestation surface — now complete (#171, CEG §10.1.3)
+With this cut, all four #171 Engine surfaces are PyO3-exposed and agent-callable:
+- `attestation_upsert_local` / `attestation_insert_local` (+ the new `*_many`) — local-tier self-attestation write, deferred signature (v4.4.0).
+- `list_attestations(filter, …)` — the uniform `AttestationFilter` read the memory/config/consent/audit services become thin wrappers over (ReadEngine v2, scope-gated, cursor-paged).
+- `attestation_promote(id)` — local→federation hybrid-sign transition (v4.9.0); byte-identical to native-federation rows (JCS, v4.15.0).
+- **Coexistence:** no migration drops `cirisgraph.nodes`; the legacy graph table stays resident read-only as the agent's one-release cold backup. No shadow/dual-write path (the agent cuts atomically per occurrence — FSD §5).
+
+### Carried by the 5.0 line (shipped across the 4.x runway)
+JCS canonicalization (v4.15.0) · at-rest Self/Family DEK cascade (v4.14.0) · recipient encryption keys (v4.13.0) · crypto-tier dispatch (v4.12.0) · `attestation_promote` (v4.9.0) · removal/revocation primitives (v4.8.0) · typed `register_public_key` (v4.7.0) · attestation query (v4.5.0) · local-tier write (v4.4.0).
+
+### Tracked follow-up (NOT a migration blocker — runtime enforcement)
+- **Consent-revocation ≤24h auto-promote** (#171 item 4, §10.1.3: a subject-revoked Contribution MUST auto-promote signed to federation tier within the window, else emit `hard_case:consent_revocation_promotion_overdue`) — a substrate *runtime guarantee*, not part of the migration's write/read surface. Tracked under #146 (the CEG-0.6 consent-SLA watcher bundle); lands in a 5.x point. The migration proceeds without it.
+
+### What 5.0 does NOT pull forward
+The agent's #840 migration *execution* (the transform validated against prod-DB dumps + the atomic per-occurrence cut) remains the agent's lockstep event. 5.0 makes persist's half ready and assumes the commit; the agent runs the cut against this surface.
+
+### Tests
+SQLite (1091) + live-PG (782) green. `-D warnings` clippy (both feature sets) + `cargo fmt` + `cargo check --no-default-features` clean. New: `sqlite_local_write_many_batches` (order/count + upsert-collapse vs insert-append).
+
 ## [4.15.0] — 2026-06-09
 
 **JCS (RFC 8785) canonicalization flip — ACTIVATED. The CEG 1.0 §0.9 conformance milestone, in lockstep with the agent 2.9.6 hard-JCS cutover (CIRISPersist#171/#176; FSD `V4_6_JCS_CANONICALIZATION.md`; CIRISAgent#871).**

@@ -759,6 +759,59 @@ impl PyEngine {
         })
     }
 
+    /// v5.0.0 (CIRISPersist#171, CEG §10.1.3) — shared dispatch for the
+    /// **batched** local-tier attestation write PyO3 methods. `input_json`
+    /// is a JSON array of `LocalAttestationInput`; returns a JSON array of
+    /// the new `attestation_id`s in input order. This is the bulk-insert
+    /// the agent's boot-time `migrate_graph_nodes_to_attestations()`
+    /// one-shot backlog transform (CIRISAgent#840) calls — one
+    /// FederationDirectory round-trip instead of N PyO3 crossings.
+    fn local_attestation_write_many(
+        &self,
+        py: Python<'_>,
+        input_json: &str,
+        replace: bool,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let inputs: Vec<crate::federation::types::LocalAttestationInput> =
+                serde_json::from_str(input_json).map_err(|e| {
+                    PyValueError::new_err(format!("Vec<LocalAttestationInput> JSON decode: {e}"))
+                })?;
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let ids: Vec<String> = match &self.backend {
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            if replace {
+                                backend.attestation_upsert_local_many(inputs).await
+                            } else {
+                                backend.attestation_insert_local_many(inputs).await
+                            }
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            if replace {
+                                backend.attestation_upsert_local_many(inputs).await
+                            } else {
+                                backend.attestation_insert_local_many(inputs).await
+                            }
+                        })
+                    }
+                }
+                .map_err(federation_err_to_py)?;
+                serde_json::to_string(&ids)
+                    .map_err(|e| PyRuntimeError::new_err(format!("serialize attestation ids: {e}")))
+            })
+        })
+    }
+
     /// v3.6.8 (CIRISPersist#138, #140) — select the signer for a
     /// PyO3 sign-emitting method based on the caller-supplied
     /// `attesting_key_id`.
@@ -3262,6 +3315,26 @@ impl PyEngine {
     /// appends a fresh row instead of replacing.
     fn attestation_insert_local(&self, py: Python<'_>, input_json: &str) -> PyResult<String> {
         self.local_attestation_write(py, input_json, false)
+    }
+
+    /// v5.0.0 (CIRISPersist#171, CEG §10.1.3) — **batched**
+    /// [`attestation_upsert_local`](Self::attestation_upsert_local).
+    /// `inputs_json` is a JSON array of `LocalAttestationInput`; returns a
+    /// JSON array of `attestation_id`s in input order. The boot-time
+    /// `graph_nodes → attestations` hard-cut migration (CIRISAgent#840)
+    /// calls this to transform the durable identity/config/consent/memory
+    /// backlog in one round-trip rather than N PyO3 crossings.
+    fn attestation_upsert_local_many(&self, py: Python<'_>, inputs_json: &str) -> PyResult<String> {
+        self.local_attestation_write_many(py, inputs_json, true)
+    }
+
+    /// v5.0.0 (CIRISPersist#171) — **batched**
+    /// [`attestation_insert_local`](Self::attestation_insert_local) for
+    /// multi-valued / event dimensions (memory, per-thought verdicts):
+    /// appends a fresh row per input instead of collapsing on
+    /// `(occurrence, dimension)`.
+    fn attestation_insert_local_many(&self, py: Python<'_>, inputs_json: &str) -> PyResult<String> {
+        self.local_attestation_write_many(py, inputs_json, false)
     }
 
     /// v4.9.0 (CIRISPersist#171 phase 2, CEG §10.1.5) — promote a

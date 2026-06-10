@@ -13382,6 +13382,50 @@ mod tests {
         .unwrap()
     }
 
+    /// v5.0.0 (CIRISPersist#171) — the batched bulk-insert the agent's
+    /// boot-time `migrate_graph_nodes_to_attestations()` calls. Returns
+    /// one id per input in order; `upsert_many` collapses same-dimension
+    /// inputs on `(occurrence, dimension)` while `insert_many` appends a
+    /// distinct row per input (multi-valued dimensions).
+    #[tokio::test]
+    async fn sqlite_local_write_many_batches() {
+        let backend = fresh_backend_with_occurrence("occ").await;
+
+        // upsert_many over 3 inputs spanning 2 dimensions → 3 ids back, but
+        // the two `identity_binding:v1` rows collapse to ONE row (upsert).
+        let ids = backend
+            .attestation_upsert_local_many(vec![
+                local_input("occ", SCORES, "identity_binding:v1", vec![]),
+                local_input("occ", SCORES, "capability:reasoning:v1", vec![]),
+                local_input("occ", SCORES, "identity_binding:v1", vec![]),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 3, "one id per input, in order");
+        let upsert_rows = local_rows(&backend, "occ");
+        assert_eq!(
+            upsert_rows.len(),
+            2,
+            "upsert_many collapses the duplicate dimension to one row"
+        );
+
+        // insert_many appends a fresh row per input even on a repeated
+        // dimension (multi-valued / event shape — memory, verdicts).
+        let ins_ids = backend
+            .attestation_insert_local_many(vec![
+                local_input("occ", SCORES, "capability:reasoning:v1", vec![]),
+                local_input("occ", SCORES, "capability:reasoning:v1", vec![]),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(ins_ids.len(), 2);
+        assert_eq!(
+            local_rows(&backend, "occ").len(),
+            4,
+            "insert_many appends 2 distinct rows (no collapse) on top of the 2 upsert rows"
+        );
+    }
+
     #[tokio::test]
     async fn sqlite_local_upsert_replaces_on_dimension() {
         let backend = fresh_backend_with_occurrence("occ").await;
