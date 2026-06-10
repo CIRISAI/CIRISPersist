@@ -5,7 +5,7 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [Unreleased] — 4.14.0 (proposed; awaiting review — NOT tagged)
+## [4.14.0] — 2026-06-09
 
 **Self/family at-rest DEK cascade — the `InvisibleEncrypted` tier: encrypt-at-rest + per-recipient `key_grant` delivery (CIRISPersist#152; CEG 0.18 §10.1.4).**
 
