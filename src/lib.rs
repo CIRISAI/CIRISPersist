@@ -118,6 +118,45 @@ pub mod verify;
 #[cfg(feature = "cirislens_wa_cert")]
 pub mod wa_cert;
 
+/// v4.12.1 (CIRISPersist#189) — verify-style embedded version literal for
+/// the agent Trust-page / bundle-refresh integrity check.
+///
+/// `#[used]` keeps this static through dead-code elimination; the literal
+/// bytes live in the binary's read-only data, which `strip` does **not**
+/// remove (strip drops the symbol *table*, not the data sections). So
+/// `strings libciris_persist.so | grep <version>` succeeds on the
+/// stripped release cdylib — the integrity grep CIRISAgent's
+/// `tools/update_android_libs.py` runs per-ABI `.so`.
+///
+/// **Why a `#[used]` static, not the `#[no_mangle]` C accessor ciris-verify
+/// uses:** persist is crate-level `#![deny(unsafe_code)]` (hard-locked,
+/// audited) — a hand-written `#[no_mangle]` FFI export trips that lint.
+/// ciris-verify exposes its accessor from a dedicated FFI crate that
+/// permits unsafe; persist does not. The **runtime** read (the Trust-page
+/// `binary == pip == registry` check) is served by the PyO3 `__version__`
+/// the wheel already exports — the agent loads persist as a Python module,
+/// so `ciris_persist.__version__` IS the binary's self-reported version.
+/// This static covers the static-grep consumer without breaking the
+/// no-unsafe posture.
+#[used]
+static CIRIS_PERSIST_BUILD_VERSION: &[u8] =
+    concat!("ciris-persist ", env!("CARGO_PKG_VERSION"), "\0").as_bytes();
+
+#[cfg(test)]
+mod build_version_tests {
+    /// The embedded literal carries the live `CARGO_PKG_VERSION` and is
+    /// NUL-terminated (so `strings | grep <version>` finds a clean token).
+    /// Strip-survival itself is verified on the release cdylib at build
+    /// time; this just locks the content.
+    #[test]
+    fn embedded_version_matches_cargo_pkg_version() {
+        let s = std::str::from_utf8(super::CIRIS_PERSIST_BUILD_VERSION).unwrap();
+        assert!(s.contains(env!("CARGO_PKG_VERSION")), "got {s:?}");
+        assert!(s.ends_with('\0'), "must be NUL-terminated: {s:?}");
+        assert!(s.starts_with("ciris-persist "), "grep-identifiable: {s:?}");
+    }
+}
+
 #[cfg(all(feature = "cirisaudit", any(feature = "postgres", feature = "sqlite")))]
 pub use engine::AuditDispatch;
 #[cfg(all(feature = "cirisnode", any(feature = "postgres", feature = "sqlite")))]
