@@ -5,6 +5,24 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased] — 4.14.0 (proposed; awaiting review — NOT tagged)
+
+**Self/family at-rest DEK cascade — the `InvisibleEncrypted` tier: encrypt-at-rest + per-recipient `key_grant` delivery (CIRISPersist#152; CEG 0.18 §10.1.4).**
+
+The substrate-wraps default tier for `cohort_scope: self | family` (FSD `SELF_FAMILY_DEK_CASCADE.md`, OQ-1/3/4). Persist generates a fresh per-write DEK, AES-256-GCM-seals the body at rest, and wraps the DEK to every active recipient occurrence under `wrap_algorithm: v2` (x25519 + ML-KEM-768) — fail-secure excluding any recipient without registered `encryption_pubkeys` (§10.1.4: never a plaintext / v1 fallback). The `CommunityDek` (community) tier and the membership-change watcher (#161 Asks 4–5 / #183) remain **DEFERRED**.
+
+### Added
+- **V070 migration** (PG + SQLite) — `federation_blob_key_grants` (per-`(at_rest_sha256, recipient_key_id)` wrapped DEK rows; substrate state, never a wire attestation) + `federation_content_master` (the software content-master single-row table).
+- **`federation::at_rest_cascade`** — the at-rest ciphertext envelope (`magic ‖ nonce ‖ aes-gcm`, a self-describing format marker), the per-write DEK seal/open, the persist content-master self-retention wrap, the v2 recipient wrap (via `ciris_crypto::key_grant`), and the `orchestrate::{encrypt_and_cascade, read_for_viewer}` cascade (generic over a `FederationDirectory + BlobStorage` backend).
+- **`Engine::put_blob_encrypted_self_family`** — takes plaintext, returns the at-rest SHA + the granted/excluded recipient split. **`Engine::get_blob_for_viewer`** — default-tier read: persist unwraps the DEK and returns plaintext; typed `BlobError::NotGranted` (viewer holds no grant) / `NotHeld` (bytes absent).
+- **`BlobStorage`** at-rest grant methods (`put_at_rest_grant` / `get_at_rest_grant` / `list_at_rest_grant_recipients` / `load_or_init_content_master`) on both SQL backends.
+
+### DEK retention (OQ-4 — the hard question)
+The default tier requires persist to recover the DEK to serve `get_blob_for_viewer`, but persist holds **no content master key / KEM identity** in the `Engine` today (the `SecretsService` master is gated + not composed into the blob path; the signer is sign-only). This cut ships a **software** content-master (generated once, persisted in `federation_content_master`, **honest about being software** — the same posture `secrets/` takes on a no-TPM host). The **hardware-rooted** derivation (HKDF over a TPM/Keystore/Secure-Enclave-sealed seed under `content-at-rest-master-v1`, per `ENCRYPTED_AT_REST.md` §4.3) is the production target and is the one remaining dependency — wiring the sealed seed through the `Engine` is a follow-up.
+
+### Tests
+SQLite + live-PG: self/family cascade round-trip (ciphertext at rest ≠ plaintext; granted recipient reads plaintext; non-recipient → `NotGranted`; keyless occurrence fail-secure excluded with no grant row; no `holds_bytes` emitted), envelope + wrap unit round-trips. `-D warnings` + clippy + `cargo fmt` + `cargo check --no-default-features` + cargo-deny clean.
+
 ## [4.13.0] — 2026-06-10
 
 **Recipient content-encryption pubkeys on `identity_occurrence` — the substrate-wraps DEK-cascade prerequisite (CIRISPersist#192; CEG 0.18 §5.6.8.8 / §10.1.4; CIRISRegistry#69).**

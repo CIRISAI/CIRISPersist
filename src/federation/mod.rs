@@ -33,6 +33,7 @@
 //! complement.
 
 pub mod admission;
+pub mod at_rest_cascade;
 #[cfg(feature = "cirisaudit")]
 pub mod backfill;
 pub mod blackhole;

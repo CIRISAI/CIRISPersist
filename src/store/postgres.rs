@@ -4223,6 +4223,149 @@ impl crate::federation::BlobStorage for PostgresBackend {
         Ok(())
     }
 
+    // v4.14.0 (CIRISPersist#152) — at-rest self/family DEK cascade grants.
+    async fn put_at_rest_grant(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        recipient_key_id: &str,
+        wrap_algorithm: &str,
+        wrapped_dek: &str,
+        cohort_scope: &str,
+    ) -> Result<(), crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let sha_vec = at_rest_sha256.to_vec();
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_blob_key_grants (\
+                    at_rest_sha256, recipient_key_id, wrap_algorithm, wrapped_dek, cohort_scope\
+                 ) VALUES ($1, $2, $3, $4, $5) \
+                 ON CONFLICT (at_rest_sha256, recipient_key_id) DO NOTHING",
+                &[
+                    &sha_vec,
+                    &recipient_key_id,
+                    &wrap_algorithm,
+                    &wrapped_dek,
+                    &cohort_scope,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("put_at_rest_grant: {e}"))
+            })?;
+        Ok(())
+    }
+
+    async fn get_at_rest_grant(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        recipient_key_id: &str,
+    ) -> Result<Option<(String, String)>, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let sha_vec = at_rest_sha256.to_vec();
+        let row = client
+            .query_opt(
+                "SELECT wrap_algorithm, wrapped_dek FROM cirislens.federation_blob_key_grants \
+                 WHERE at_rest_sha256 = $1 AND recipient_key_id = $2",
+                &[&sha_vec, &recipient_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("get_at_rest_grant: {e}"))
+            })?;
+        match row {
+            None => Ok(None),
+            Some(r) => {
+                let wrap_algorithm: String =
+                    r.safe_get_with("wrap_algorithm", crate::federation::BlobError::Backend)?;
+                let wrapped_dek: String =
+                    r.safe_get_with("wrapped_dek", crate::federation::BlobError::Backend)?;
+                Ok(Some((wrap_algorithm, wrapped_dek)))
+            }
+        }
+    }
+
+    async fn list_at_rest_grant_recipients(
+        &self,
+        at_rest_sha256: &[u8; 32],
+    ) -> Result<Vec<String>, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let sha_vec = at_rest_sha256.to_vec();
+        let sentinel = crate::federation::at_rest_cascade::PERSIST_SELF_RECIPIENT;
+        let rows = client
+            .query(
+                "SELECT recipient_key_id FROM cirislens.federation_blob_key_grants \
+                 WHERE at_rest_sha256 = $1 AND recipient_key_id != $2 \
+                 ORDER BY recipient_key_id",
+                &[&sha_vec, &sentinel],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("list_at_rest_grant_recipients: {e}"))
+            })?;
+        rows.iter()
+            .map(|r| r.safe_get_with("recipient_key_id", crate::federation::BlobError::Backend))
+            .collect()
+    }
+
+    async fn load_or_init_content_master(&self) -> Result<[u8; 32], crate::federation::BlobError> {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let fresh = ciris_crypto::random::bytes(32).map_err(|e| {
+            crate::federation::BlobError::Backend(format!("content-master rng: {e}"))
+        })?;
+        let fresh_b64 = B64.encode(&fresh);
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_content_master \
+                    (id, key_kind, master_key_b64, descriptor) \
+                 VALUES (0, 'software', $1, 'software content-at-rest master (no hardware seed wired)') \
+                 ON CONFLICT (id) DO NOTHING",
+                &[&fresh_b64],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("content-master insert: {e}"))
+            })?;
+        let row = client
+            .query_one(
+                "SELECT master_key_b64 FROM cirislens.federation_content_master WHERE id = 0",
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("content-master select: {e}"))
+            })?;
+        let stored_b64: String = row
+            .safe_get_with::<Option<String>, _, _, _>(
+                "master_key_b64",
+                crate::federation::BlobError::Backend,
+            )?
+            .unwrap_or_default();
+        let raw = B64.decode(&stored_b64).map_err(|e| {
+            crate::federation::BlobError::Backend(format!("content-master b64: {e}"))
+        })?;
+        let key: [u8; 32] = raw.try_into().map_err(|v: Vec<u8>| {
+            crate::federation::BlobError::Backend(format!(
+                "content-master is {} bytes, expected 32",
+                v.len()
+            ))
+        })?;
+        Ok(key)
+    }
+
     // v4.1 (CIRISPersist#142, Cut B) — atomic chunked-blob upload.
     // Validates the manifest + every chunk (per-Inline-chunk SHA + size,
     // total_size == sum, 1:1 alignment), then inserts the N chunk rows +
@@ -13133,6 +13276,127 @@ mod tests {
             .await
             .unwrap();
         assert!(none.is_empty());
+    }
+
+    /// v4.14.0 (CIRISPersist#152, CEG 0.18 §10.1.4) — the self/family
+    /// at-rest DEK cascade end-to-end on Postgres (parity with the sqlite
+    /// `at_rest_self_cascade_round_trip_and_fail_secure`): ciphertext at
+    /// rest, granted recipient reads plaintext, fail-secure exclusion of a
+    /// keyless occurrence, NotGranted for a non-recipient.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn at_rest_self_cascade_round_trip_and_fail_secure_pg() {
+        use crate::federation::at_rest_cascade::orchestrate::{
+            encrypt_and_cascade, read_for_viewer,
+        };
+        use crate::federation::types::cohort_scope::SELF;
+        use crate::federation::{BlobStorage, EncryptionPubkeys, FederationDirectory};
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let now = chrono::Utc::now();
+        let suffix = uuid_like();
+        let root = format!("root-{suffix}");
+        let keyed = format!("occ-keyed-{suffix}");
+        let bare = format!("occ-bare-{suffix}");
+        let outsider = format!("outsider-{suffix}");
+        for kid in [&root, &keyed, &bare, &outsider] {
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord {
+                    record: fix_section_i_key(kid, "acme", now, true),
+                })
+                .await
+                .unwrap();
+        }
+
+        let x_pub = ciris_crypto::x25519::public_from_secret(&[0x42; 32]);
+        let (_mp, ml_pub) = ciris_crypto::ml_kem::generate_keypair().unwrap();
+
+        let occ = |occ_key: &str, enc: Option<EncryptionPubkeys>| {
+            crate::federation::SignedIdentityOccurrence {
+                identity_occurrence: crate::federation::IdentityOccurrence {
+                    identity_key_id: root.clone(),
+                    occurrence_key_id: occ_key.into(),
+                    device_class: crate::federation::types::device_class::AGENT.into(),
+                    hardware_attestation: None,
+                    asserted_at: now,
+                    valid_until: None,
+                    encryption_pubkeys: enc,
+                    persist_row_hash: String::new(),
+                },
+            }
+        };
+        backend
+            .put_identity_occurrence(occ(
+                &keyed,
+                Some(EncryptionPubkeys {
+                    x25519_base64: B64.encode(x_pub),
+                    ml_kem_768_base64: B64.encode(&ml_pub),
+                }),
+            ))
+            .await
+            .unwrap();
+        backend
+            .put_identity_occurrence(occ(&bare, None))
+            .await
+            .unwrap();
+
+        let plaintext = b"a private note, scoped to self (pg)";
+        let result = encrypt_and_cascade(&backend, SELF, &root, plaintext, Some("text/plain"))
+            .await
+            .unwrap();
+        assert_eq!(result.granted, vec![keyed.clone()]);
+        assert_eq!(result.excluded, vec![bare.clone()]);
+
+        // Ciphertext at rest (≠ plaintext) carrying the at-rest magic.
+        let stored = backend
+            .get_blob(&result.at_rest_sha256)
+            .await
+            .unwrap()
+            .expect("bytes present");
+        let stored_bytes = match stored {
+            crate::federation::BlobBody::Inline(b) => b,
+            other => panic!("expected inline ciphertext, got {other:?}"),
+        };
+        assert_ne!(stored_bytes, plaintext.to_vec());
+        assert!(crate::federation::at_rest_cascade::AtRestEnvelope::has_magic(&stored_bytes));
+
+        // No holds_bytes (structural invisibility).
+        assert!(backend
+            .list_local_holders(&result.at_rest_sha256)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Granted recipient reads plaintext back.
+        let recovered = read_for_viewer(&backend, &result.at_rest_sha256, &keyed)
+            .await
+            .unwrap();
+        assert_eq!(recovered, plaintext);
+
+        // Fail-secure-excluded + non-recipient both → NotGranted.
+        for viewer in [&bare, &outsider] {
+            let err = read_for_viewer(&backend, &result.at_rest_sha256, viewer)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::federation::BlobError::NotGranted { .. }),
+                "viewer {viewer} must be denied, got: {err:?}"
+            );
+        }
+
+        // Only the keyed occurrence holds a grant row.
+        let recipients = backend
+            .list_at_rest_grant_recipients(&result.at_rest_sha256)
+            .await
+            .unwrap();
+        assert_eq!(recipients, vec![keyed.clone()]);
     }
 
     /// §I list_federation_keys round-trip + cursor pagination.

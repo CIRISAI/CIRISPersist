@@ -1181,6 +1181,111 @@ impl Engine {
         }
     }
 
+    /// v4.14.0 (CIRISPersist#152, CEG 0.18 §10.1.4) — write a
+    /// `cohort_scope: self | family` blob through the **at-rest DEK
+    /// cascade** (the [`CryptoTier::InvisibleEncrypted`](crate::federation::types::cohort_scope::CryptoTier::InvisibleEncrypted)
+    /// tier).
+    ///
+    /// Unlike [`put_blob_signing`](Engine::put_blob_signing) (which takes
+    /// a caller-computed SHA and stores plaintext), this takes the
+    /// **plaintext body** and:
+    ///
+    /// 1. generates a fresh per-write DEK and AES-256-GCM-seals the body
+    ///    into a self-describing ciphertext envelope (the format marker);
+    /// 2. stores the envelope **structurally invisible** (no `holds_bytes`),
+    ///    keyed on the ciphertext SHA-256 — the returned **at-rest content
+    ///    address**;
+    /// 3. records persist's content-master self-retention grant (so the
+    ///    default-tier [`get_blob_for_viewer`](Engine::get_blob_for_viewer)
+    ///    can recover the DEK — OQ-4);
+    /// 4. wraps the DEK (`wrap_algorithm: v2`, X25519+ML-KEM-768) to every
+    ///    **active** recipient occurrence — `list_identity_occurrences_active`
+    ///    for `self`, every member identity's active occurrences for
+    ///    `family` — **fail-secure excluding** any whose occurrence carries
+    ///    no valid `encryption_pubkeys` (§10.1.4: never a plaintext / v1
+    ///    fallback).
+    ///
+    /// `owner_or_family_key_id` is the identity key (self) or the
+    /// family_key_id (family). Returns the
+    /// [`CascadeResult`](crate::federation::at_rest_cascade::orchestrate::CascadeResult)
+    /// — the at-rest SHA + the granted/excluded recipient split. Errors
+    /// with [`BlobError::InvalidArgument`](crate::federation::BlobError::InvalidArgument)
+    /// if `cohort_scope` is not `self`/`family` (the CommunityDek +
+    /// Plaintext tiers go through the existing
+    /// [`put_blob_signing_scoped`](crate::federation::BlobStorage::put_blob_signing_scoped)
+    /// path — DEFERRED for this cut).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn put_blob_encrypted_self_family(
+        &self,
+        cohort_scope: &str,
+        owner_or_family_key_id: &str,
+        plaintext: &[u8],
+        media_type: Option<&str>,
+    ) -> Result<
+        crate::federation::at_rest_cascade::orchestrate::CascadeResult,
+        crate::federation::BlobError,
+    > {
+        use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                encrypt_and_cascade(
+                    arc.as_ref(),
+                    cohort_scope,
+                    owner_or_family_key_id,
+                    plaintext,
+                    media_type,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                encrypt_and_cascade(
+                    arc.as_ref(),
+                    cohort_scope,
+                    owner_or_family_key_id,
+                    plaintext,
+                    media_type,
+                )
+                .await
+            }
+        }
+    }
+
+    /// v4.14.0 (CIRISPersist#152, CEG 0.18 §10.1.4) — the **default-tier**
+    /// read for an at-rest self/family blob: recover the plaintext body
+    /// for a granted `viewer_key_id`.
+    ///
+    /// Persist holds the DEK (OQ-4, default tier): it checks the viewer's
+    /// grant (authorization), recovers the DEK via its own content-master
+    /// self-retention grant, AES-GCM-decrypts the ciphertext envelope, and
+    /// returns the plaintext. The zero-trust-of-host mode (return the
+    /// wrapped DEK + ciphertext for in-enclave unwrap) is a LATER phase.
+    ///
+    /// - [`BlobError::NotGranted`](crate::federation::BlobError::NotGranted)
+    ///   — the viewer holds no grant (non-recipient, revoked, or
+    ///   fail-secure-excluded at write).
+    /// - [`BlobError::NotHeld`](crate::federation::BlobError::NotHeld) —
+    ///   the at-rest bytes are absent.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn get_blob_for_viewer(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        viewer_key_id: &str,
+    ) -> Result<Vec<u8>, crate::federation::BlobError> {
+        use crate::federation::at_rest_cascade::orchestrate::read_for_viewer;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                read_for_viewer(arc.as_ref(), at_rest_sha256, viewer_key_id).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                read_for_viewer(arc.as_ref(), at_rest_sha256, viewer_key_id).await
+            }
+        }
+    }
+
     /// v3.5.0 (CIRISPersist#125) — Engine-facade for
     /// [`BlobStorage::list_held_by`](crate::federation::BlobStorage::list_held_by).
     /// Returns the full SHA-256 of every blob this Engine has a

@@ -18623,6 +18623,13 @@ fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
         // v4.1 (CIRISPersist#142, Cut B) — range over a chunk DAG whose
         // covering chunk is External (persist can't deref).
         crate::federation::BlobError::RangeSpansExternalChunk { .. } => PyValueError::new_err(kind),
+        // v4.14.0 (CIRISPersist#152) — at-rest viewer authorization /
+        // presence denials. NotGranted is the fail-secure self/family
+        // gate; NotHeld is "bytes absent". Both ride the stable kind()
+        // token (`blob_not_granted` / `blob_not_held`) as a ValueError so
+        // Python callers branch on it.
+        crate::federation::BlobError::NotGranted { .. }
+        | crate::federation::BlobError::NotHeld { .. } => PyValueError::new_err(kind),
         crate::federation::BlobError::Backend(_) => PyRuntimeError::new_err(kind),
     }
 }

@@ -927,6 +927,64 @@ pub trait BlobStorage: Send + Sync {
         None
     }
 
+    /// v4.14.0 (CIRISPersist#152, CEG 0.18 §10.1.4) — record one at-rest
+    /// `key_grant` row for the self/family DEK cascade.
+    ///
+    /// Substrate state, NOT a wire attestation: it carries no signature
+    /// and never federates (the secrets-path model). `at_rest_sha256` is
+    /// the SHA-256 of the stored ciphertext envelope (the at-rest content
+    /// address); `recipient_key_id` is the recipient occurrence's
+    /// federation key (or the
+    /// [`PERSIST_SELF_RECIPIENT`](crate::federation::at_rest_cascade::PERSIST_SELF_RECIPIENT)
+    /// sentinel for persist's own content-master self-retention row);
+    /// `wrapped_dek` is the `KeyGrantWrapV2` JSON (recipient) or the
+    /// base64 self-wrap (persist). Idempotent on the
+    /// `(at_rest_sha256, recipient_key_id)` PK — a re-record of the same
+    /// recipient is a no-op (first-write-wins).
+    fn put_at_rest_grant(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        recipient_key_id: &str,
+        wrap_algorithm: &str,
+        wrapped_dek: &str,
+        cohort_scope: &str,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
+    /// v4.14.0 (CIRISPersist#152) — fetch the at-rest grant for
+    /// `(at_rest_sha256, recipient_key_id)`, returning
+    /// `(wrap_algorithm, wrapped_dek)` or `None` if no grant exists (the
+    /// viewer holds no key — `get_blob_for_viewer` maps that to
+    /// [`BlobError::NotGranted`]).
+    fn get_at_rest_grant(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        recipient_key_id: &str,
+    ) -> impl Future<Output = Result<Option<(String, String)>, BlobError>> + Send;
+
+    /// v4.14.0 (CIRISPersist#152) — list every recipient `key_id` that
+    /// already holds an at-rest grant for `at_rest_sha256` (excluding the
+    /// `__persist_self__` sentinel). The retroactive-ADD walk (#161 Ask 2)
+    /// uses this to skip recipients already granted; tests assert the
+    /// fail-secure exclusion shape against it.
+    fn list_at_rest_grant_recipients(
+        &self,
+        at_rest_sha256: &[u8; 32],
+    ) -> impl Future<Output = Result<Vec<String>, BlobError>> + Send;
+
+    /// v4.14.0 (CIRISPersist#152) — load persist's software content
+    /// master key, generating + persisting it once on first call.
+    ///
+    /// The DEK-retention root for the default tier (OQ-4). **Software
+    /// default** — honest about being software (the production target is
+    /// the hardware-rooted HKDF derivation per ENCRYPTED_AT_REST.md §4.3;
+    /// wiring the sealed seed through the Engine is a follow-up). The
+    /// 32-byte key is stored base64 in `federation_content_master`
+    /// (single logical row, `id=0`); concurrent first-callers race on the
+    /// PK insert and converge on the persisted value.
+    fn load_or_init_content_master(
+        &self,
+    ) -> impl Future<Output = Result<[u8; 32], BlobError>> + Send;
+
     /// List the `key_id`s of every **currently-live** attester that
     /// has emitted a `holds_bytes:sha256:<prefix>` attestation for
     /// this blob.
@@ -1235,6 +1293,29 @@ pub enum BlobError {
         chunk_sha_hex: String,
     },
 
+    /// v4.14.0 (CIRISPersist#152, CEG 0.18 §10.1.4) — the at-rest blob
+    /// exists but the viewer holds no `key_grant` for it. This is the
+    /// fail-secure default for the self/family encrypted tier: a viewer
+    /// who is not (or no longer) an active recipient — or whose
+    /// occurrence carried no `encryption_pubkeys` at write time — gets a
+    /// typed denial, never plaintext.
+    #[error("viewer {viewer_key_id} holds no key_grant for blob {sha256_hex}")]
+    NotGranted {
+        /// Hex-encoded at-rest SHA-256 the read targeted.
+        sha256_hex: String,
+        /// The viewer key that holds no grant.
+        viewer_key_id: String,
+    },
+
+    /// v4.14.0 (CIRISPersist#152) — the at-rest blob bytes are not held
+    /// by this substrate (no `federation_blobs` row for the SHA).
+    /// Distinct from [`Self::NotGranted`] (bytes present, no grant).
+    #[error("blob {sha256_hex} is not held by this substrate")]
+    NotHeld {
+        /// Hex-encoded at-rest SHA-256 the read targeted.
+        sha256_hex: String,
+    },
+
     /// Backend-level error (DB connection, serialization, etc.).
     #[error("backend: {0}")]
     Backend(String),
@@ -1253,6 +1334,8 @@ impl BlobError {
             BlobError::HashMatchedKnownBad { .. } => "blob_hash_matched_known_bad",
             BlobError::RangeNotSatisfiable { .. } => "blob_range_not_satisfiable",
             BlobError::RangeSpansExternalChunk { .. } => "blob_range_spans_external_chunk",
+            BlobError::NotGranted { .. } => "blob_not_granted",
+            BlobError::NotHeld { .. } => "blob_not_held",
             BlobError::Backend(_) => "blob_backend",
         }
     }
