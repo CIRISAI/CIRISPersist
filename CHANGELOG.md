@@ -5,9 +5,9 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [Unreleased]
+## [5.1.0] — 2026-06-10
 
-### Added — operational-data admit + merge surface (5.1.0; CEG 1.0-RC2 §5.6.8.13 / §10.1.6; CIRISRegistry#70; CIRISPersist#65)
+### Added — operational-data admit + merge surface (CEG 1.0-RC2 §5.6.8.13 / §10.1.6; CIRISRegistry#70; CIRISPersist#65)
 
 The one scheduled additive item on the 1.0-RC1 frozen surface: cross-region operational Portal data — **organizations, memberships, licenses/partners** — becomes signed CEG envelopes replicated by the same anti-entropy carrier as trust data (CIRISEdge#65 v2 wire). Governing principle (RC2 §5.6.8.13): persist admits + merges the **trust/authz-minimal projection**; PII / business detail never federate and are not stored here. The Registry is the emit-side security boundary; the substrate is **not** a PII filter (it stores what is signed). All three are **Commons tier** (plaintext at rest).
 
