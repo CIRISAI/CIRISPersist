@@ -604,6 +604,98 @@ pub mod cohort_scope {
     pub fn suppresses_holds_bytes(s: &str) -> bool {
         matches!(s, SELF | FAMILY)
     }
+
+    /// v4.12.0 (CIRISPersist#152 / #188, CEG 0.17 §8.1.13.3 / §10.1.4) —
+    /// the at-rest crypto tier a `cohort_scope` resolves to. **Orthogonal
+    /// to [`suppresses_holds_bytes`]**: self/family are encrypted AND
+    /// suppressed; community/affiliations are encrypted but still emit
+    /// `holds_bytes` (with cleartext provenance); Commons is plaintext.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum CryptoTier {
+        /// `self` / `family` — per-write fresh DEK wrapped to every active
+        /// occurrence/member; structurally invisible (no `holds_bytes`).
+        /// **Opt-in / default-off** (defense-in-depth over already-invisible
+        /// bytes; the v1 migration posture). #152.
+        InvisibleEncrypted,
+        /// `community` / `affiliations` — a shared per-community DEK (the
+        /// §10.5.3 epoch-DEK cascade with the roster as subscriber set),
+        /// rotated on membership change; emits `holds_bytes:*` **with**
+        /// cleartext provenance. **Mandatory** (the DEK is community
+        /// content's sole confidentiality boundary). CEG 0.17 §8.1.13.3.
+        CommunityDek,
+        /// Commons (`species` / `biosphere` / `federation`), the
+        /// `cohort_subkind: infrastructure` governance carve-out, and any
+        /// **unrecognized** scope — plaintext, `holds_bytes` normally.
+        Plaintext,
+    }
+
+    /// The §8.1.13.3 / §10.1.4 at-rest dispatch — **NEGATIVE-DEFAULT
+    /// (#188)**: only `self`/`family` and `community`/`affiliations` are
+    /// encrypted; *everything else, including unknown future scopes, falls
+    /// through to plaintext*. A `community` whose `cohort_subkind` is
+    /// `"infrastructure"` (e.g. `ciris-canonical` governance) is the
+    /// plaintext-Commons carve-out — the trust root must be inspectable.
+    pub fn crypto_tier(cohort_scope: &str, cohort_subkind: Option<&str>) -> CryptoTier {
+        match cohort_scope {
+            SELF | FAMILY => CryptoTier::InvisibleEncrypted,
+            COMMUNITY | AFFILIATIONS if cohort_subkind != Some("infrastructure") => {
+                CryptoTier::CommunityDek
+            }
+            // Negative default: Commons, infrastructure communities, and
+            // any scope this build doesn't recognize → plaintext. New
+            // tiers never silently encrypt-or-leak by falling through.
+            _ => CryptoTier::Plaintext,
+        }
+    }
+
+    #[cfg(test)]
+    mod crypto_tier_tests {
+        use super::*;
+
+        #[test]
+        fn self_family_are_invisible_encrypted() {
+            assert_eq!(crypto_tier(SELF, None), CryptoTier::InvisibleEncrypted);
+            assert_eq!(crypto_tier(FAMILY, None), CryptoTier::InvisibleEncrypted);
+            // subkind is irrelevant for self/family.
+            assert_eq!(
+                crypto_tier(SELF, Some("infrastructure")),
+                CryptoTier::InvisibleEncrypted
+            );
+        }
+
+        #[test]
+        fn community_affiliations_are_community_dek() {
+            assert_eq!(crypto_tier(COMMUNITY, None), CryptoTier::CommunityDek);
+            assert_eq!(crypto_tier(AFFILIATIONS, None), CryptoTier::CommunityDek);
+            assert_eq!(
+                crypto_tier(COMMUNITY, Some("geographic")),
+                CryptoTier::CommunityDek
+            );
+        }
+
+        #[test]
+        fn infrastructure_community_is_plaintext_carveout() {
+            assert_eq!(
+                crypto_tier(COMMUNITY, Some("infrastructure")),
+                CryptoTier::Plaintext
+            );
+            assert_eq!(
+                crypto_tier(AFFILIATIONS, Some("infrastructure")),
+                CryptoTier::Plaintext
+            );
+        }
+
+        #[test]
+        fn commons_and_unknown_are_plaintext_negative_default() {
+            for s in [SPECIES, BIOSPHERE, FEDERATION] {
+                assert_eq!(crypto_tier(s, None), CryptoTier::Plaintext);
+            }
+            // The #188 point: an unrecognized scope must NOT fall into an
+            // encrypted arm — negative default.
+            assert_eq!(crypto_tier("planet", None), CryptoTier::Plaintext);
+            assert_eq!(crypto_tier("some_future_tier", None), CryptoTier::Plaintext);
+        }
+    }
 }
 
 impl Attestation {
