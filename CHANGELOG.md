@@ -5,6 +5,24 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [4.13.0] — 2026-06-10
+
+**Recipient content-encryption pubkeys on `identity_occurrence` — the substrate-wraps DEK-cascade prerequisite (CIRISPersist#192; CEG 0.18 §5.6.8.8 / §10.1.4; CIRISRegistry#69).**
+
+Building the #152 at-rest DEK cascade surfaced a load-bearing gap the FSD review missed: substrate-wraps (CEG §10.1.4-mandated) needs each recipient's **x25519 + ML-KEM-768 encryption** pubkeys, but `federation_keys` stores only **signing** keys (ed25519 + ML-DSA-65) — and ML-KEM can't be derived from a signing key, and C3b is *producer*-wraps. CEG 0.18 ruled the encryption keys ride the existing `identity_occurrence` subject_kind (self-certified, hybrid-signed, supersedes-rotatable, already cross-region replicated). This lands persist's half.
+
+### Added
+- **V069 migration** (PG + SQLite) — nullable `pubkey_x25519_base64` + `pubkey_ml_kem_768_base64` on `federation_identity_occurrences`.
+- **`EncryptionPubkeys { x25519_base64, ml_kem_768_base64 }`** + `IdentityOccurrence.encryption_pubkeys: Option<…>` — the `wrap_algorithm: v2` recipient inputs (a fresh content-KEM pair, distinct from the signing keys and the Reticulum transport x25519). Both halves present together or neither.
+- **`FederationDirectory::resolve_encryption_keys(occurrence_key_id)`** — the cascade's per-recipient key lookup: the within-validity occurrence's keys, or `None` ⇒ **fail-secure excluded** from v2 grants (§10.1.4 — never a plaintext fallback). Default trait method over `lookup_identity_for_occurrence`. Round-trips on all three backends.
+- **`check_encryption_pubkeys`** admission — each half MUST base64-decode to its exact raw length (x25519 = 32 B, ML-KEM-768 = 1184 B); a malformed key is refused at admit.
+
+### What this unblocks
+The #152 default-tier cascade can now wrap to recipients with registered encryption keys; #161 Asks 4–5 + #183's Self-DEK inherit it. **Still gated:** producers (agent) must actually register encryption keys (parallel work), and the `ENCRYPTED_AT_REST` at-rest content-encryption foundation is still unbuilt.
+
+### Tests
+SQLite + live-PG: encryption-pubkeys round-trip, `resolve_encryption_keys` (present → keys; absent / unknown → `None` fail-secure), admission length-gate rejection. **1078 lib green on SQLite, 772 on live PG**; `-D warnings` + clippy + cargo-deny clean.
+
 ## [4.12.1] — 2026-06-10
 
 **Embedded version literal in the cdylib — for the agent Trust-page / bundle-refresh integrity check (CIRISPersist#189).**

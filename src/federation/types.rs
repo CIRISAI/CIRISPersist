@@ -913,8 +913,30 @@ pub struct IdentityOccurrence {
     /// When the binding expires. `None` = indefinite.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valid_until: Option<DateTime<Utc>>,
+    /// v4.13.0 (CIRISPersist#192, CEG 0.18 §5.6.8.8) — the occurrence's
+    /// **content-encryption** pubkeys (the `wrap_algorithm: v2` recipient
+    /// inputs). `None` ⇒ this occurrence is **not** a wrap target and is
+    /// fail-secure excluded from v2 grants (§10.1.4). Distinct from the
+    /// signing keys (`federation_keys`) and the transport x25519. Present
+    /// ⇒ both halves present (the field-set is meaningful only as a pair).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption_pubkeys: Option<EncryptionPubkeys>,
     /// **Server-computed.** See [`KeyRecord::persist_row_hash`].
     pub persist_row_hash: String,
+}
+
+/// v4.13.0 (CIRISPersist#192, CEG 0.18 §5.6.8.8) — the hybrid
+/// content-encryption pubkey pair an [`IdentityOccurrence`] registers as
+/// a wrap target. Both halves are required together: the §5.6.8.4
+/// `wrap_algorithm: v2` (`x25519_mlkem768_aes256_gcm_hkdf_sha256`) needs
+/// both. These are a **fresh content-KEM** keypair — never the signing
+/// keys, never the Reticulum transport x25519.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncryptionPubkeys {
+    /// Classical KEM half — base64 x25519 public key (32 bytes raw).
+    pub x25519_base64: String,
+    /// PQC KEM half — base64 ML-KEM-768 public key (FIPS 203; 1184 bytes raw).
+    pub ml_kem_768_base64: String,
 }
 
 /// Wraps an [`IdentityOccurrence`] payload for write submission.

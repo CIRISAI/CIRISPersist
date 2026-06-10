@@ -294,6 +294,7 @@ mod revocation_honesty_tests {
                 hardware_attestation: None,
                 asserted_at: "2026-06-01T00:00:00Z".parse().unwrap(),
                 valid_until: None,
+                encryption_pubkeys: None,
                 persist_row_hash: String::new(),
             },
         })

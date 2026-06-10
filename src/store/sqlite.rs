@@ -1710,15 +1710,24 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<(), crate::federation::Error> {
         let mut row = occurrence.identity_occurrence;
         crate::federation::check_device_class(&row.device_class)?;
+        crate::federation::check_encryption_pubkeys(row.encryption_pubkeys.as_ref())?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let (enc_x25519, enc_ml_kem) = match &row.encryption_pubkeys {
+            Some(k) => (
+                Some(k.x25519_base64.clone()),
+                Some(k.ml_kem_768_base64.clone()),
+            ),
+            None => (None, None),
+        };
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
             conn.execute(
                 "INSERT INTO federation_identity_occurrences (\
                     identity_key_id, occurrence_key_id, device_class, \
-                    hardware_attestation, asserted_at, valid_until, persist_row_hash\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    hardware_attestation, asserted_at, valid_until, persist_row_hash, \
+                    pubkey_x25519_base64, pubkey_ml_kem_768_base64\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 rusqlite::params![
                     row.identity_key_id,
                     row.occurrence_key_id,
@@ -1727,6 +1736,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.asserted_at.to_rfc3339(),
                     row.valid_until.map(|t| t.to_rfc3339()),
                     row.persist_row_hash,
+                    enc_x25519,
+                    enc_ml_kem,
                 ],
             )?;
             Ok(())
@@ -1754,7 +1765,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
                 "SELECT identity_key_id, occurrence_key_id, device_class, \
-                        hardware_attestation, asserted_at, valid_until, persist_row_hash \
+                        hardware_attestation, asserted_at, valid_until, persist_row_hash, \
+                        pubkey_x25519_base64, pubkey_ml_kem_768_base64 \
                      FROM federation_identity_occurrences \
                      WHERE identity_key_id = ?1 \
                      ORDER BY occurrence_key_id ASC",
@@ -1777,7 +1789,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             let conn = conn.lock();
             conn.query_row(
                 "SELECT identity_key_id, occurrence_key_id, device_class, \
-                        hardware_attestation, asserted_at, valid_until, persist_row_hash \
+                        hardware_attestation, asserted_at, valid_until, persist_row_hash, \
+                        pubkey_x25519_base64, pubkey_ml_kem_768_base64 \
                      FROM federation_identity_occurrences \
                      WHERE occurrence_key_id = ?1 LIMIT 1",
                 [&key],
@@ -6663,6 +6676,8 @@ fn sqlite_row_to_identity_occurrence(
 ) -> rusqlite::Result<crate::federation::IdentityOccurrence> {
     let asserted_at: String = row.get("asserted_at")?;
     let valid_until: Option<String> = row.get("valid_until")?;
+    let enc_x25519: Option<String> = row.get("pubkey_x25519_base64")?;
+    let enc_ml_kem: Option<String> = row.get("pubkey_ml_kem_768_base64")?;
     Ok(crate::federation::IdentityOccurrence {
         identity_key_id: row.get("identity_key_id")?,
         occurrence_key_id: row.get("occurrence_key_id")?,
@@ -6670,8 +6685,26 @@ fn sqlite_row_to_identity_occurrence(
         hardware_attestation: row.get("hardware_attestation")?,
         asserted_at: parse_rfc3339(&asserted_at),
         valid_until: valid_until.as_deref().map(parse_rfc3339),
+        encryption_pubkeys: encryption_pubkeys_from_cols(enc_x25519, enc_ml_kem),
         persist_row_hash: row.get("persist_row_hash")?,
     })
+}
+
+/// v4.13.0 (#192) — reassemble the optional [`EncryptionPubkeys`] from its
+/// two nullable columns: present only when **both** halves are stored.
+fn encryption_pubkeys_from_cols(
+    x25519: Option<String>,
+    ml_kem: Option<String>,
+) -> Option<crate::federation::EncryptionPubkeys> {
+    match (x25519, ml_kem) {
+        (Some(x25519_base64), Some(ml_kem_768_base64)) => {
+            Some(crate::federation::EncryptionPubkeys {
+                x25519_base64,
+                ml_kem_768_base64,
+            })
+        }
+        _ => None,
+    }
 }
 
 /// v3.12.0 (CIRISPersist#153 Ask 2) — SQLite row →
@@ -11446,6 +11479,7 @@ mod tests {
             hardware_attestation: None,
             asserted_at: "2026-06-04T00:00:00Z".parse().unwrap(),
             valid_until: None,
+            encryption_pubkeys: None,
             persist_row_hash: String::new(),
         }
     }
@@ -11793,6 +11827,103 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    /// v4.13.0 (#192, CEG 0.18) — occurrence content-encryption pubkeys
+    /// round-trip + `resolve_encryption_keys` + admission length-gate.
+    #[tokio::test]
+    async fn occurrence_encryption_pubkeys_round_trip_and_resolve() {
+        use crate::federation::{EncryptionPubkeys, FederationDirectory};
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in ["root", "occ-enc", "occ-bare"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, k, k),
+                })
+                .await
+                .unwrap();
+        }
+        let x25519 = B64.encode([7u8; 32]); // valid 32-byte x25519
+        let ml_kem = B64.encode([9u8; 1184]); // valid 1184-byte ML-KEM-768
+        let occ =
+            |k: &str, enc: Option<EncryptionPubkeys>| crate::federation::SignedIdentityOccurrence {
+                identity_occurrence: crate::federation::IdentityOccurrence {
+                    identity_key_id: "root".into(),
+                    occurrence_key_id: k.into(),
+                    device_class: crate::federation::types::device_class::AGENT.into(),
+                    hardware_attestation: None,
+                    asserted_at: "2026-06-10T00:00:00Z".parse().unwrap(),
+                    valid_until: None,
+                    encryption_pubkeys: enc,
+                    persist_row_hash: String::new(),
+                },
+            };
+
+        // Occurrence WITH encryption keys → round-trips + resolves.
+        backend
+            .put_identity_occurrence(occ(
+                "occ-enc",
+                Some(EncryptionPubkeys {
+                    x25519_base64: x25519.clone(),
+                    ml_kem_768_base64: ml_kem.clone(),
+                }),
+            ))
+            .await
+            .unwrap();
+        let got = backend
+            .lookup_identity_for_occurrence("occ-enc")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            got.encryption_pubkeys,
+            Some(EncryptionPubkeys {
+                x25519_base64: x25519.clone(),
+                ml_kem_768_base64: ml_kem.clone()
+            })
+        );
+        let resolved = backend
+            .resolve_encryption_keys("occ-enc")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.x25519_base64, x25519);
+        assert_eq!(resolved.ml_kem_768_base64, ml_kem);
+
+        // Occurrence WITHOUT keys → resolve = None (fail-secure exclusion).
+        backend
+            .put_identity_occurrence(occ("occ-bare", None))
+            .await
+            .unwrap();
+        assert!(backend
+            .resolve_encryption_keys("occ-bare")
+            .await
+            .unwrap()
+            .is_none());
+        // Unknown occurrence → None.
+        assert!(backend
+            .resolve_encryption_keys("nope")
+            .await
+            .unwrap()
+            .is_none());
+
+        // Admission rejects a wrong-length key.
+        let err = backend
+            .put_identity_occurrence(occ(
+                "occ-enc",
+                Some(EncryptionPubkeys {
+                    x25519_base64: B64.encode([0u8; 16]), // too short
+                    ml_kem_768_base64: ml_kem,
+                }),
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("x25519_base64")),
+            "got: {err:?}"
         );
     }
 

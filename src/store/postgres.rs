@@ -2008,7 +2008,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     ) -> Result<(), crate::federation::Error> {
         let mut row = occurrence.identity_occurrence;
         crate::federation::check_device_class(&row.device_class)?;
+        crate::federation::check_encryption_pubkeys(row.encryption_pubkeys.as_ref())?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let (enc_x25519, enc_ml_kem) = match &row.encryption_pubkeys {
+            Some(k) => (
+                Some(k.x25519_base64.clone()),
+                Some(k.ml_kem_768_base64.clone()),
+            ),
+            None => (None, None),
+        };
         let client = self
             .get_client()
             .await
@@ -2017,8 +2025,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .execute(
                 "INSERT INTO cirislens.federation_identity_occurrences (\
                     identity_key_id, occurrence_key_id, device_class, \
-                    hardware_attestation, asserted_at, valid_until, persist_row_hash\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                    hardware_attestation, asserted_at, valid_until, persist_row_hash, \
+                    pubkey_x25519_base64, pubkey_ml_kem_768_base64\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
                 &[
                     &row.identity_key_id,
                     &row.occurrence_key_id,
@@ -2027,6 +2036,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.asserted_at,
                     &row.valid_until,
                     &row.persist_row_hash,
+                    &enc_x25519,
+                    &enc_ml_kem,
                 ],
             )
             .await
@@ -2054,7 +2065,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let rows = client
             .query(
                 "SELECT identity_key_id, occurrence_key_id, device_class, \
-                    hardware_attestation, asserted_at, valid_until, persist_row_hash \
+                    hardware_attestation, asserted_at, valid_until, persist_row_hash, \
+                    pubkey_x25519_base64, pubkey_ml_kem_768_base64 \
                  FROM cirislens.federation_identity_occurrences \
                  WHERE identity_key_id = $1 \
                  ORDER BY occurrence_key_id ASC",
@@ -2080,7 +2092,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let row_opt = client
             .query_opt(
                 "SELECT identity_key_id, occurrence_key_id, device_class, \
-                    hardware_attestation, asserted_at, valid_until, persist_row_hash \
+                    hardware_attestation, asserted_at, valid_until, persist_row_hash, \
+                    pubkey_x25519_base64, pubkey_ml_kem_768_base64 \
                  FROM cirislens.federation_identity_occurrences \
                  WHERE occurrence_key_id = $1 LIMIT 1",
                 &[&occurrence_key_id],
@@ -6675,6 +6688,8 @@ fn pg_row_to_identity_occurrence(
     row: tokio_postgres::Row,
 ) -> Result<crate::federation::IdentityOccurrence, crate::federation::Error> {
     let mk_err = crate::federation::Error::Backend;
+    let enc_x25519: Option<String> = row.safe_get_with("pubkey_x25519_base64", mk_err)?;
+    let enc_ml_kem: Option<String> = row.safe_get_with("pubkey_ml_kem_768_base64", mk_err)?;
     Ok(crate::federation::IdentityOccurrence {
         identity_key_id: row.safe_get_with("identity_key_id", mk_err)?,
         occurrence_key_id: row.safe_get_with("occurrence_key_id", mk_err)?,
@@ -6682,6 +6697,15 @@ fn pg_row_to_identity_occurrence(
         hardware_attestation: row.safe_get_with("hardware_attestation", mk_err)?,
         asserted_at: row.safe_get_with("asserted_at", mk_err)?,
         valid_until: row.safe_get_with("valid_until", mk_err)?,
+        encryption_pubkeys: match (enc_x25519, enc_ml_kem) {
+            (Some(x25519_base64), Some(ml_kem_768_base64)) => {
+                Some(crate::federation::EncryptionPubkeys {
+                    x25519_base64,
+                    ml_kem_768_base64,
+                })
+            }
+            _ => None,
+        },
         persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
     })
 }
@@ -20875,6 +20899,7 @@ mod tests {
                 hardware_attestation: None,
                 asserted_at: "2026-06-01T00:00:00Z".parse().unwrap(),
                 valid_until: None,
+                encryption_pubkeys: None,
                 persist_row_hash: String::new(),
             },
         };
@@ -21096,5 +21121,61 @@ mod tests {
         // containing finds it via the JSONB prefilter + h3 containment.
         let hit = backend.communities_containing(&inside).await.unwrap();
         assert!(hit.iter().any(|c| c.community_key_id == comm));
+    }
+
+    /// v4.13.0 (#192, CEG 0.18) — live-PG occurrence encryption-pubkeys
+    /// round-trip + `resolve_encryption_keys` (V069 columns).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_occurrence_encryption_pubkeys_round_trip_and_resolve() {
+        use crate::federation::{EncryptionPubkeys, FederationDirectory, SignedIdentityOccurrence};
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let root = format!("root-{}", uuid_like());
+        let occ = format!("occ-{}", uuid_like());
+        for k in [&root, &occ] {
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord {
+                    record: pg_admission_key(
+                        k,
+                        k,
+                        crate::federation::types::identity_type::PRIMITIVE,
+                    ),
+                })
+                .await
+                .unwrap();
+        }
+        let x25519 = B64.encode([7u8; 32]);
+        let ml_kem = B64.encode([9u8; 1184]);
+        backend
+            .put_identity_occurrence(SignedIdentityOccurrence {
+                identity_occurrence: crate::federation::IdentityOccurrence {
+                    identity_key_id: root.clone(),
+                    occurrence_key_id: occ.clone(),
+                    device_class: crate::federation::types::device_class::AGENT.into(),
+                    hardware_attestation: None,
+                    asserted_at: "2026-06-10T00:00:00Z".parse().unwrap(),
+                    valid_until: None,
+                    encryption_pubkeys: Some(EncryptionPubkeys {
+                        x25519_base64: x25519.clone(),
+                        ml_kem_768_base64: ml_kem.clone(),
+                    }),
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .unwrap();
+        let resolved = backend
+            .resolve_encryption_keys(&occ)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.x25519_base64, x25519);
+        assert_eq!(resolved.ml_kem_768_base64, ml_kem);
     }
 }

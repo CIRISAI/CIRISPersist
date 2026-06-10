@@ -810,6 +810,8 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // v3.12.0 — value-validation admission (closed-set
         // device_class). Trust-graph admission per §5.6.8.8 is v3.13+.
         crate::federation::check_device_class(&row.device_class)?;
+        // v4.13.0 (#192) — validate optional content-encryption pubkeys.
+        crate::federation::check_encryption_pubkeys(row.encryption_pubkeys.as_ref())?;
         let mut state = self.state.lock().expect("memory backend lock");
         if !state.federation_keys.contains_key(&row.identity_key_id) {
             return Err(crate::federation::Error::InvalidArgument(format!(
