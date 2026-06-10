@@ -89,9 +89,10 @@ pub(crate) mod serde_bytes_b64 {
 }
 
 pub use admission::{
-    check_cohort_scope, check_consensus_protocol_form, check_device_class, check_observed_region,
-    AttestationLadderTransitionPolicy, DimensionAdmissionPolicy, DimensionRejectionReason,
-    ReservedPrefixRule, ATTESTATION_LADDER_MECHANISMS,
+    check_cohort_scope, check_consensus_protocol_form, check_device_class,
+    check_encryption_pubkeys, check_observed_region, AttestationLadderTransitionPolicy,
+    DimensionAdmissionPolicy, DimensionRejectionReason, ReservedPrefixRule,
+    ATTESTATION_LADDER_MECHANISMS,
 };
 pub use blackhole::{BlackholeRecord, BlackholeRules, RETICULUM_IDENTITY_HASH_LEN};
 pub use blobs::{
@@ -135,13 +136,13 @@ pub use topology::{
     WithdrawalEntry, MAX_DELEGATION_DEPTH,
 };
 pub use types::{
-    Attestation, Community, CommunityMember, CommunityMembershipRevocation, Family, FamilyMember,
-    FamilyMembershipRevocation, HybridPendingRow, IdentityOccurrence, IdentityOccurrenceRevocation,
-    KeyRecord, LocationProof, PeerMetadataRow, PeerPolicyBlob, Revocation, SignedAttestation,
-    SignedCommunity, SignedCommunityMembershipRevocation, SignedFamily,
-    SignedFamilyMembershipRevocation, SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation,
-    SignedKeyRecord, SignedLocationProof, SignedRevocation, TrustClass, TrustFilter, TrustGrant,
-    TrustRelationship, TrustRow, TrustType,
+    Attestation, Community, CommunityMember, CommunityMembershipRevocation, EncryptionPubkeys,
+    Family, FamilyMember, FamilyMembershipRevocation, HybridPendingRow, IdentityOccurrence,
+    IdentityOccurrenceRevocation, KeyRecord, LocationProof, PeerMetadataRow, PeerPolicyBlob,
+    Revocation, SignedAttestation, SignedCommunity, SignedCommunityMembershipRevocation,
+    SignedFamily, SignedFamilyMembershipRevocation, SignedIdentityOccurrence,
+    SignedIdentityOccurrenceRevocation, SignedKeyRecord, SignedLocationProof, SignedRevocation,
+    TrustClass, TrustFilter, TrustGrant, TrustRelationship, TrustRow, TrustType,
 };
 
 /// Federation directory trait — the registry/lens/agent's read+write
@@ -411,6 +412,32 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         occurrence_key_id: &str,
     ) -> Result<Option<IdentityOccurrence>, Error>;
+
+    /// v4.13.0 (CIRISPersist#192, CEG 0.18 §5.6.8.8 / §10.1.4) — resolve
+    /// an occurrence's **current** content-encryption pubkeys (the
+    /// `wrap_algorithm: v2` recipient inputs for the #152 DEK cascade).
+    ///
+    /// Returns the `encryption_pubkeys` of the occurrence bound to
+    /// `occurrence_key_id` iff it exists, is within validity
+    /// (`valid_until` unset or future), and registered the keys. `None` ⇒
+    /// the recipient is **fail-secure excluded** from v2 grants — the
+    /// cascade MUST NOT fall back to plaintext (§10.1.4). Revocation
+    /// filtering is the enumeration's job
+    /// ([`Self::list_identity_occurrences_active`]); this is the
+    /// per-occurrence key lookup. Default impl over
+    /// [`Self::lookup_identity_for_occurrence`]; backends need not
+    /// override.
+    async fn resolve_encryption_keys(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Option<EncryptionPubkeys>, Error> {
+        let now = chrono::Utc::now();
+        Ok(self
+            .lookup_identity_for_occurrence(occurrence_key_id)
+            .await?
+            .filter(|o| o.valid_until.map_or(true, |vu| vu > now))
+            .and_then(|o| o.encryption_pubkeys))
+    }
 
     /// v3.12.0 (CIRISPersist#153 Ask 2, CEG 0.7 §5.6.8.9) — admit a
     /// `family` row.

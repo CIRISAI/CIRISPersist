@@ -843,6 +843,34 @@ pub fn check_capacity_not_self_attested(
     Ok(())
 }
 
+/// v4.13.0 (CIRISPersist#192, CEG 0.18 §5.6.8.8) — validate an
+/// occurrence's optional content-encryption pubkeys on admit: each half
+/// MUST base64-decode to its exact raw length (x25519 = 32 bytes,
+/// ML-KEM-768 = 1184 bytes, FIPS 203). `Ok(())` when absent. A
+/// malformed-length key would silently break `wrap_algorithm: v2`, so it
+/// is refused at the boundary.
+pub fn check_encryption_pubkeys(
+    keys: Option<&crate::federation::types::EncryptionPubkeys>,
+) -> Result<(), Error> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    let Some(k) = keys else { return Ok(()) };
+    let check = |label: &str, b64: &str, want: usize| -> Result<(), Error> {
+        let raw = B64.decode(b64).map_err(|e| {
+            Error::InvalidArgument(format!("encryption_pubkeys.{label} not valid base64: {e}"))
+        })?;
+        if raw.len() != want {
+            return Err(Error::InvalidArgument(format!(
+                "encryption_pubkeys.{label} must be {want} raw bytes, got {}",
+                raw.len()
+            )));
+        }
+        Ok(())
+    };
+    check("x25519_base64", &k.x25519_base64, 32)?;
+    check("ml_kem_768_base64", &k.ml_kem_768_base64, 1184)?;
+    Ok(())
+}
+
 /// v3.11.0 (CIRISPersist#143, CIRISVerify FEDERATION_THREAT_MODEL
 /// §3.3.2 R1) — admission-gate validation of the producer-side
 /// `observed_region` field on a revocation.
