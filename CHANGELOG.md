@@ -5,6 +5,18 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [4.12.1] — 2026-06-10
+
+**Embedded version literal in the cdylib — for the agent Trust-page / bundle-refresh integrity check (CIRISPersist#189).**
+
+CIRISAgent's Trust page displays each fabric component's version + canonical-build-hash, and its `tools/update_android_libs.py` greps each per-ABI `.so` for the literal version to confirm the binary matches the pinned wheel. ciris-verify embeds its version; persist did not (`strings libciris_persist.so | grep <version>` returned nothing).
+
+### Added
+- **`CIRIS_PERSIST_BUILD_VERSION`** — a `#[used]` static `"ciris-persist <CARGO_PKG_VERSION>\0"` literal that survives `strip`/LTO (strip drops the symbol table, not the rodata bytes), so `strings libciris_persist.so | grep <version>` succeeds on the release cdylib. **Verified** on the stripped release build.
+
+### Why a `#[used]` static, not Verify's `#[no_mangle]` C accessor
+persist is crate-level **`#![deny(unsafe_code)]`** (hard-locked, audited) — a hand-written `#[no_mangle]` FFI export trips that lint. ciris-verify exposes its accessor from a dedicated FFI crate that permits unsafe; persist does not. The agent's two consumers are both served without breaking the no-unsafe posture: the **static-grep** integrity check by this literal, and the **runtime** version read by the PyO3 `__version__` the wheel already exports (the agent loads persist as a Python module, so `ciris_persist.__version__` IS the binary's self-reported version). The native non-Python C accessor (Verify's "ideal") is the only part deferred — flagged on #189.
+
 ## [4.12.0] — 2026-06-10
 
 **At-rest crypto-tier dispatch — the negative-default `cohort_scope` → tier classifier (CIRISPersist#152 / #188; CEG 0.17 §8.1.13.3 / §10.1.4).**
