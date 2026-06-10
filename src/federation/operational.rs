@@ -670,7 +670,16 @@ fn partner_wins(a: &PartnerRecord, b: &PartnerRecord) -> bool {
 /// (`store::sqlite` / `store::postgres`) so the operational-data
 /// round-trip / merge / admission tests don't duplicate hybrid-signing
 /// scaffolding. Crate-internal, test-only.
+///
+/// `#[allow(dead_code)]`: the signed-envelope builders are consumed by the
+/// `sqlite`/`postgres` backend test modules. Under a backend-less test
+/// build (`cargo test --features server`, no backend feature — the
+/// `darwin-aarch64 (no postgres)` CI job) those modules don't compile, so
+/// the builders are legitimately unused there; without this, `-D warnings`
+/// fails the job on dead_code. The operational unit tests in this file
+/// exercise the pure resolvers and don't need the signed-envelope helpers.
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) mod test_support {
     use super::*;
     use base64::Engine as _;

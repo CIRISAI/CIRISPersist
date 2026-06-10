@@ -5,6 +5,11 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [5.1.1] — 2026-06-10
+
+### Fixed — CI only (library identical to the 5.1.0 tag)
+- `federation::operational::test_support` is `#[allow(dead_code)]`. Its signed-envelope builders are consumed only by the `sqlite`/`postgres` backend test modules; under the backend-less `cargo test --features server` build (the `darwin-aarch64 (no postgres)` CI job, run with `-D warnings`) those modules don't compile, so the builders are legitimately unused there and dead_code failed the job. **The shipped library/wheel is byte-identical to the v5.1.0 tag** — the bug was purely in test compilation under one feature combo. **The `v5.1.0` git tag never published to PyPI** (its tag-run CI was red on this); v5.1.1 is the first published 5.1.x. (Lesson folded into the pre-ship gate: run `cargo test --features server` backend-less under `-D warnings`, not just backend-present combos.)
+
 ## [5.1.0] — 2026-06-10
 
 ### Added — operational-data admit + merge surface (CEG 1.0-RC2 §5.6.8.13 / §10.1.6; CIRISRegistry#70; CIRISPersist#65)
