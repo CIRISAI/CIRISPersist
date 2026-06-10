@@ -5,6 +5,21 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [4.12.0] — 2026-06-10
+
+**At-rest crypto-tier dispatch — the negative-default `cohort_scope` → tier classifier (CIRISPersist#152 / #188; CEG 0.17 §8.1.13.3 / §10.1.4).**
+
+The foundation of the at-rest DEK cascade (#152, FSD accepted on PR #185): the three-way dispatch every later phase keys off, landed first as a pure, tested classifier so the encryption-into-`put_blob_signing` cut builds on a conformant spine. No encryption wired yet — this is the decision function.
+
+### Added — `federation::types::cohort_scope`
+- **`CryptoTier`** — `InvisibleEncrypted` (`self`/`family`: per-write DEK, structurally invisible) · `CommunityDek` (`community`/`affiliations`: shared per-community DEK = the §10.5.3 epoch-DEK cascade, `holds_bytes` + provenance, **mandatory**) · `Plaintext` (Commons + the `cohort_subkind: infrastructure` governance carve-out + anything unrecognized). Orthogonal to `suppresses_holds_bytes`.
+- **`crypto_tier(cohort_scope, cohort_subkind) -> CryptoTier`** — **negative-default (#188)**: only `self`/`family` and `community`/`affiliations` encrypt; *everything else, including unknown future scopes, falls through to plaintext* (no new tier silently encrypts-or-leaks). `cohort_subkind: infrastructure` communities route to plaintext-Commons (the trust root must be inspectable).
+
+Resolves the #188 dispatch-shape decision (negative-default, not a scope allowlist) flagged by the CIRISNodeCore review on #152.
+
+### Tests
+Pure classifier coverage: self/family → invisible-encrypted (subkind-irrelevant), community/affiliations → community-DEK, infrastructure-subkind → plaintext carve-out, Commons + unknown scopes → plaintext negative-default. `-D warnings` + clippy clean.
+
 ## [4.11.0] — 2026-06-09
 
 **Geographic `cohort_subkind` community admission + `communities_containing` — closes CIRISPersist#154 (CEG 0.8 §8.1.13.2 / §0.8.2).**
