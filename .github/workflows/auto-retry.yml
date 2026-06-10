@@ -1,0 +1,100 @@
+# Auto-retry CI on transient infrastructure flakes.
+#
+# Why: CI's `linux-x86_64-test` matrix spins up a `services: postgres`
+# container pulled from Docker Hub at job-init. Docker Hub rate-limits /
+# transient outages make that pull fail ("Initialize containers: Docker
+# pull failed with exit code 1") on shared-runner IPs — GitHub's own 3×
+# init-pull retries don't always clear it. Because the tag-gated PyPI
+# publish `needs:` the whole matrix, ONE such flake blocks a release and
+# forces a manual `gh run rerun --failed`. This automates that rerun —
+# but ONLY for transient infra signatures, never to mask a real failure.
+#
+# Pattern: the well-worn `workflow_run`-on-completion auto-retry
+# (meziantou.net/automatically-rerun-failed-github-actions-workflows.htm;
+# GitHub Marketplace "Rerun Failed Jobs") with two project-specific
+# hardenings:
+#   1. NO `branches:` filter — tag runs (v*) have no head branch, and
+#      those are exactly the publish-gating runs we must cover.
+#   2. Targeted detection — rerun iff a transient infra signature is
+#      present AND no genuine compile/test-failure signature is. A real
+#      red stays red. Capped to run_attempt == 1 (one auto-rerun, then
+#      a human looks).
+name: auto-retry
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types:
+      - completed
+
+permissions:
+  actions: write   # gh run rerun --failed
+  checks: read     # inspect job/step conclusions
+  contents: read
+
+jobs:
+  rerun-on-transient-flake:
+    # Only consider the FIRST failure of a run (cap: one auto-rerun).
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.run_attempt == 1
+    runs-on: ubuntu-latest
+    steps:
+      - name: Rerun failed jobs iff the failure is a transient infra flake
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          echo "Inspecting run $RUN_ID (attempt ${{ github.event.workflow_run.run_attempt }})"
+
+          # ── Signal 1: failed STEP names (the init-pull flake fails at
+          # 'Set up job' / 'Initialize containers', often with no
+          # downloadable step log, so the step name is the reliable tell). ──
+          jobs_json=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" --paginate 2>/dev/null || echo '{}')
+          failed_steps=$(echo "$jobs_json" | jq -r '
+            .jobs[]? | select(.conclusion=="failure")
+            | .steps[]? | select(.conclusion=="failure") | .name' | sort -u)
+          echo "Failed steps:"; echo "${failed_steps:-(none reported)}"
+
+          # Infra/setup steps — a failure here is a runner/registry init
+          # flake, not our code. (Anchored names; 'Post …' cleanup too.)
+          infra_only=true
+          if [ -n "$failed_steps" ]; then
+            while IFS= read -r step; do
+              case "$step" in
+                "Set up job"|"Initialize containers"|"Set up runner"|"Complete job") : ;;
+                "Post "*) : ;;
+                *) infra_only=false ;;
+              esac
+            done <<< "$failed_steps"
+          else
+            infra_only=false
+          fi
+
+          # ── Signal 2: transient signatures in the failed-step logs (mid-run
+          # network/registry blips that DO produce logs). ──
+          logs=$(gh run view "$RUN_ID" --repo "$REPO" --log-failed 2>/dev/null || true)
+          transient='Docker pull failed|Initialize containers|toomanyrequests|429 Too Many Requests|TLS handshake timeout|i/o timeout|[Cc]onnection reset|503 Service|502 Bad Gateway|504 Gateway|[Ss]ervice [Uu]navailable|unexpected EOF|net/http: (request canceled|TLS handshake)|failed to (pull|fetch|resolve)|temporary failure in name resolution'
+          # Genuine failures we must NEVER auto-rerun (would mask a real red).
+          genuine='error\[E[0-9]|error: could not compile|test result: FAILED|panicked at|assertion .*failed|thread .* panicked|cargo (test|clippy|fmt).*error'
+
+          transient_hit=false
+          genuine_hit=false
+          if echo "$logs" | grep -qiE "$transient"; then transient_hit=true; fi
+          if echo "$logs" | grep -qE "$genuine"; then genuine_hit=true; fi
+          echo "infra_only=$infra_only transient_hit=$transient_hit genuine_hit=$genuine_hit"
+
+          # ── Decision: rerun iff (all failures are infra-setup) OR (a
+          # transient signature is present), AND no genuine failure is. ──
+          if [ "$genuine_hit" = "true" ]; then
+            echo "::notice::Genuine compile/test failure detected — leaving the run red (no auto-rerun)."
+            exit 0
+          fi
+          if [ "$infra_only" = "true" ] || [ "$transient_hit" = "true" ]; then
+            echo "::notice::Transient infra flake detected — re-running failed jobs (one-shot)."
+            gh run rerun "$RUN_ID" --repo "$REPO" --failed
+          else
+            echo "::notice::No transient-infra signature — leaving as-is for a human."
+          fi
