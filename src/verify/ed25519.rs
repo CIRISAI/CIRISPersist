@@ -470,6 +470,16 @@ where
     let canonical = match wire {
         "2.7.0" => canonical_payload_value(trace),
         "2.7.9" => canonical_payload_value_v279(trace),
+        // v4.15.0 (#871) — the JCS-cutover schema. The canonical FIELD
+        // layout is byte-for-byte the 2.7.9 shape (9-field envelope +
+        // `deployment_profile`, 5-field components) — the agent's 2.9.6
+        // hard-JCS cutover kept the layout and changed only the
+        // canonicalizer (confirmed against `_build_canonical_message`).
+        // So 3.0.0 reuses the v279 payload builder; the ONLY difference
+        // is the canonicalizer the caller selected via
+        // `canon_version_for_trace_schema("3.0.0") -> V2Jcs` (RFC 8785),
+        // versus V1Python for the 2.7.x arms.
+        "3.0.0" => canonical_payload_value_v279(trace),
         "2.7.legacy" => canonical_payload_value_legacy(trace),
         other => {
             // Should be impossible — schema parse already gates on
@@ -511,12 +521,12 @@ where
 /// forged version that flips the canonicalizer changes the canonical →
 /// signature mismatch → rejection, never a check bypass.
 ///
-/// **Inert until 3.x lands:** a `3.x` trace is only *reachable* once that
-/// schema is added to `SUPPORTED_VERSIONS` + the field-layout dispatch in
-/// [`verify_trace`]; the exact 3.0 schema string + layout are pinned with
-/// the agent at the CIRISConformance#9 byte-identity validation. Until
-/// then this gate returns `V1Python` for every supported schema — the
-/// production canonicalizer is unchanged, persist 4.6 ships safe + ready.
+/// **Live as of v4.15.0 (#871):** `"3.0.0"` is in `SUPPORTED_VERSIONS`
+/// with a [`verify_trace`] dispatch arm (reusing the 2.7.9 field layout —
+/// the agent's 2.9.6 cutover kept the layout, changed only the
+/// canonicalizer). A `3.0.0` trace now routes here to `V2Jcs` and verifies
+/// under RFC 8785; `2.7.x` traces stay `V1Python` so pre-cut rows keep
+/// verifying under the legacy canonicalizer (bounded by trace retention).
 pub fn canon_version_for_trace_schema(wire: &str) -> crate::verify::canonical::CanonVersion {
     use crate::verify::canonical::CanonVersion;
     if let Some((major, _)) = wire.split_once('.') {
@@ -1001,6 +1011,96 @@ mod tests {
 
         verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &keys)
             .expect("2.7.9 trace MUST verify via deterministic dispatch to v279 canonical");
+    }
+
+    /// v4.15.0 (#871) — a JCS-signed `"3.0.0"` trace verifies through the
+    /// signed-epoch gate. The agent's 2.9.6 hard-JCS cutover stamps
+    /// `trace_schema_version = "3.0.0"` and signs the (unchanged
+    /// 2.7.9-layout) canonical with RFC 8785 JCS; persist routes
+    /// `3.0.0 -> V2Jcs` and reproduces the exact bytes. A **non-ASCII**
+    /// trace is the discriminating case: it verifies under JCS but MUST
+    /// FAIL under the legacy Python canonicalizer — proving the gate
+    /// selection is load-bearing, not cosmetic. (ASCII traces would pass
+    /// either way, so they couldn't catch a mis-routed gate.)
+    #[test]
+    fn jcs_signed_300_trace_verifies_via_signed_epoch_gate() {
+        use crate::verify::canonical::{
+            canonicalizer_for, CanonVersion, Canonicalizer, JcsCanonicalizer,
+        };
+
+        let sk = fixed_signing_key();
+        let key_id = "test-key:300";
+        let mut data = serde_json::Map::new();
+        // Non-Latin reasoning text + the ⚠️ disclosure emoji — exactly the
+        // corpus where JCS (raw UTF-8) and Python (`\uXXXX`) diverge.
+        data.insert("rationale".into(), serde_json::json!("用户推理 ⚠️ سبب"));
+        let trace_unsigned = CompleteTrace {
+            trace_id: "trace-300-1".into(),
+            thought_id: "th-1".into(),
+            task_id: None,
+            agent_id_hash: "7c3f8e2b1d9a4f60".into(),
+            started_at: "2026-04-30T00:15:53.123456+00:00".parse().unwrap(),
+            completed_at: "2026-04-30T00:16:12.789012+00:00".parse().unwrap(),
+            trace_level: crate::schema::TraceLevel::Generic,
+            trace_schema_version: SchemaVersion::parse("3.0.0").unwrap(),
+            components: vec![crate::schema::TraceComponent {
+                component_type: crate::schema::ComponentType::Conscience,
+                event_type: crate::schema::ReasoningEventType::ConscienceResult,
+                timestamp: "2026-04-30T00:15:53.123456+00:00".parse().unwrap(),
+                data,
+                agent_id_hash: Some("7c3f8e2b1d9a4f60".into()),
+            }],
+            deployment_profile: None,
+            cohort_scope: "federation".into(),
+            cohort_target_id: None,
+            signature: String::new(),
+            signature_key_id: key_id.to_owned(),
+        };
+
+        // The gate MUST route 3.0.0 to JCS.
+        assert_eq!(
+            canon_version_for_trace_schema("3.0.0"),
+            CanonVersion::V2Jcs,
+            "the 3.0.0 cutover schema must select JCS"
+        );
+
+        // Sign exactly as agent 2.9.6 does: JCS over the canonical payload.
+        let payload = canonical_payload_value_v279(&trace_unsigned);
+        let jcs_bytes = JcsCanonicalizer.canonicalize_value(&payload).unwrap();
+        let py_bytes = PythonJsonDumpsCanonicalizer
+            .canonicalize_value(&payload)
+            .unwrap();
+        assert_ne!(
+            jcs_bytes, py_bytes,
+            "non-ASCII payload MUST diverge between JCS and Python — else the test can't discriminate"
+        );
+        let sig = sk.sign(&jcs_bytes);
+        let trace = CompleteTrace {
+            cohort_scope: "federation".into(),
+            cohort_target_id: None,
+            signature: BASE64.encode(sig.to_bytes()),
+            ..trace_unsigned
+        };
+
+        let mut keys = MemKeys {
+            keys: HashMap::new(),
+        };
+        keys.keys.insert(key_id.to_owned(), sk.verifying_key());
+
+        // The gate-selected canonicalizer (JCS) reproduces the signed
+        // bytes → verifies.
+        let gate_canon = canonicalizer_for(canon_version_for_trace_schema(
+            trace.trace_schema_version.as_str(),
+        ));
+        verify_trace_via_directory(&trace, gate_canon, &keys)
+            .expect("3.0.0 JCS-signed trace MUST verify under the gate-selected JCS canonicalizer");
+
+        // The legacy Python canonicalizer MUST NOT verify the JCS
+        // signature on a non-ASCII trace — the gate is load-bearing.
+        assert!(
+            verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &keys).is_err(),
+            "a JCS-signed non-ASCII 3.0.0 trace must FAIL under the legacy Python canonicalizer"
+        );
     }
 
     /// v0.3.0 — Cross-shape field injection defense (§3.1):

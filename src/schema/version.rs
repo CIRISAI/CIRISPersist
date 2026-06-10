@@ -45,7 +45,16 @@ use serde::{Deserialize, Serialize};
 ///     supported dialect in v0.4.3 / CIRISPersist#21 — v0.4.0
 ///     dropped it on a calendar/fleet-migration framing that didn't
 ///     fit the decentralized model.)
-///   - `"2.7.9"` is the current fleet target; no sunset clock running.
+///   - `"2.7.9"` is the pre-JCS-cutover fleet target (Python-compat
+///     canonical); no sunset clock running — pre-cut rows verify under
+///     the legacy canonicalizer until trace retention sunsets them.
+///   - **`"3.0.0"` (v4.15.0 / #871)** is the **JCS cutover** schema: same
+///     9-field + `deployment_profile` canonical layout as `"2.7.9"`
+///     (only the canonicalizer changes — RFC 8785 JCS, selected by the
+///     signed-epoch gate `canon_version_for_trace_schema`: major ≥ 3 ⇒
+///     JCS). The agent stamps `"3.0.0"` on its 2.9.6 hard-JCS cutover so
+///     the signed `trace_schema_version` is the canonicalizer
+///     discriminator (downgrade-safe — it is inside the signed bytes).
 ///
 /// `"2.7.legacy"` covers the pre-2.7.8.9 2-field
 /// `{components, trace_level}` canonical shape (no
@@ -60,7 +69,7 @@ use serde::{Deserialize, Serialize};
 /// because each trace contributes to exactly one canonical shape's
 /// verify path. Peers may also stamp `"2.7.legacy"` explicitly to
 /// hit the same dispatch arm via the sentinel route.
-pub const SUPPORTED_VERSIONS: &[&str] = &["2.7.0", "2.7.9", "2.7.legacy"];
+pub const SUPPORTED_VERSIONS: &[&str] = &["2.7.0", "2.7.9", "2.7.legacy", "3.0.0"];
 
 /// Type-checked wrapper around a schema version string.
 ///
@@ -197,7 +206,7 @@ mod tests {
         match err {
             super::super::Error::UnsupportedSchemaVersion { got, supported } => {
                 assert_eq!(got, "2.6.0");
-                assert_eq!(supported, &["2.7.0", "2.7.9", "2.7.legacy"]);
+                assert_eq!(supported, &["2.7.0", "2.7.9", "2.7.legacy", "3.0.0"]);
             }
             _ => panic!("expected UnsupportedSchemaVersion, got {err:?}"),
         }
@@ -218,7 +227,11 @@ mod tests {
         // require an explicit migrator (FSD §3.4 / version.rs doc), not
         // best-effort parsing.
         assert!(SchemaVersion::parse("2.8.0").is_err());
-        assert!(SchemaVersion::parse("3.0.0").is_err());
+        // "3.0.0" is the JCS-cutover schema (v4.15.0/#871) and is now
+        // supported; a genuinely-future 3.x point/minor without a
+        // dispatch arm still rejects.
+        assert!(SchemaVersion::parse("3.0.1").is_err());
+        assert!(SchemaVersion::parse("3.1.0").is_err());
     }
 
     #[test]

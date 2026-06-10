@@ -185,18 +185,26 @@ pub fn canonicalizer_for(version: CanonVersion) -> &'static dyn Canonicalizer {
 }
 
 /// v4.6 (CIRISPersist#171 / #176) — the canonicalization version persist
-/// **produces** at today. Until the coordinated **2.9.6 cutover**, persist
-/// emits `V1Python` so the still-Python chain (agent ≤ 2.9.5, lens, edge)
-/// can verify persist-produced federation rows; the cutover flips this to
-/// `V2Jcs` in lockstep. It is a `const fn`, not a runtime toggle — the
-/// flip is a release event coordinated chain-wide (the activation is a
-/// one-line change here, re-released as the 2.9.6 triple lands). The
-/// **verify** side gates per-row regardless ([`canonicalizer_for`] keyed
-/// on the row's signed epoch), so persist verifies both V1 and V2 rows no
-/// matter what it produces.
+/// **produces** at today. **v4.15.0 (#871): ACTIVATED — `V2Jcs`.** The
+/// 2.9.6 substrate triple (agent 2.9.6 hard-JCS / persist 4.15 / verify
+/// 5.0) flips persist's produce side to RFC 8785 JCS, the CEG §0.9
+/// conformance state. Every persist-produced CEG signing payload
+/// (attestations / holds_bytes / withdraws / key registration / blob
+/// `original_content_hash` / FFI `canonicalize_envelope`) routes through
+/// [`ceg_produce_canonicalize`], so this one const is the whole produce
+/// flip. persist's produce envelopes are structured-ASCII (key_ids,
+/// SHA-256 hex, ISO timestamps, base64), where Python-compat ≡ JCS
+/// byte-for-byte — so go-forward is byte-identical for the existing
+/// corpus and the flip cannot break a peer still on Python.
+///
+/// It is a `const fn`, not a runtime toggle — the flip is a release event
+/// coordinated chain-wide. The **verify** side gates per-row regardless
+/// ([`canonicalizer_for`] keyed on the row's signed epoch via
+/// [`canon_version_for_trace_schema`](crate::verify::ed25519::canon_version_for_trace_schema)),
+/// so persist verifies both pre-cut V1 (`2.7.x`) and post-cut V2 (`3.0.0`)
+/// rows no matter what it produces.
 pub const fn produce_canon_version() -> CanonVersion {
-    // 2.9.6 cutover flips this to CanonVersion::V2Jcs (lockstep).
-    CanonVersion::V1Python
+    CanonVersion::V2Jcs
 }
 
 /// v4.6 — canonicalize a payload persist is about to **sign/emit**, via

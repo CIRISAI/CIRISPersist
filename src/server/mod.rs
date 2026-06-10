@@ -316,10 +316,11 @@ mod tests {
         let h: HealthOwned = serde_json::from_slice(&body).unwrap();
         assert_eq!(h.status, "ok");
         // v0.4.3 (CIRISPersist#21) — 2.7.legacy restored under the
-        // telemetry-driven sunset rule.
+        // telemetry-driven sunset rule. v4.15.0 (#871) — 3.0.0 added as
+        // the JCS-cutover schema.
         assert_eq!(
             h.schema_versions_supported,
-            vec!["2.7.0", "2.7.9", "2.7.legacy"]
+            vec!["2.7.0", "2.7.9", "2.7.legacy", "3.0.0"]
         );
         assert!(h.queue_capacity_remaining > 0);
     }

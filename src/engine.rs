@@ -3531,11 +3531,11 @@ mod tests {
     /// ship.
     #[cfg(feature = "sqlite")]
     #[tokio::test]
-    async fn put_blob_signing_uses_python_canonicalizer_not_jcs_sqlite() {
+    async fn put_blob_signing_canonicalizes_via_ceg_produce_gate_sqlite() {
         use crate::federation::{
             holds_bytes_attestation_envelope, holds_bytes_attestation_type, BlobBody, BlobStorage,
         };
-        use crate::verify::canonical::{Canonicalizer, PythonJsonDumpsCanonicalizer};
+        use crate::verify::canonical::ceg_produce_canonicalize;
         use sha2::{Digest, Sha256};
 
         let signer = test_signer();
@@ -3548,13 +3548,17 @@ mod tests {
         let bytes = b"canonicalizer-identity-blob".to_vec();
         let sha = sha256_of_bytes(&bytes);
 
-        // Expected hash: SHA-256 of the Python-compat canonical bytes
-        // for the holds_bytes envelope this sha produces.
+        // Expected hash: SHA-256 of the canonical bytes the production
+        // produce gate emits for the holds_bytes envelope. v4.15.0 (#871)
+        // flipped the gate Python-compat → JCS; this envelope is
+        // structured-ASCII (SHA-256 hex + attestation-type string), where
+        // the two canonicalizers are byte-identical, so the invariant is
+        // stable across the flip — and asserting via the gate (not a
+        // pinned canonicalizer) keeps the test honest to whatever the
+        // produce epoch is.
         let envelope = holds_bytes_attestation_envelope(&sha);
-        let py_canonical = PythonJsonDumpsCanonicalizer
-            .canonicalize_value(&envelope)
-            .expect("python canonicalize");
-        let expected_hash_hex = hex::encode(Sha256::digest(&py_canonical));
+        let gate_canonical = ceg_produce_canonicalize(&envelope).expect("ceg produce canonicalize");
+        let expected_hash_hex = hex::encode(Sha256::digest(&gate_canonical));
 
         let now = chrono::Utc::now();
         let attestation_id = uuid::Uuid::new_v4();
@@ -3595,8 +3599,9 @@ mod tests {
 
         assert_eq!(
             stored_hash_hex, expected_hash_hex,
-            "put_blob_signing must canonicalize via PythonJsonDumpsCanonicalizer; \
-             the silent-correctness trap CIRISPersist#121 closes manifests as a \
+            "put_blob_signing must canonicalize via the CEG produce gate \
+             (ceg_produce_canonicalize; JCS as of v4.15.0/#871); the \
+             silent-correctness trap CIRISPersist#121 closes manifests as a \
              mismatch here"
         );
         // Scrub key id comes from the signer (HardwareSigner::current_alias)
@@ -3816,12 +3821,12 @@ mod tests {
     #[cfg(feature = "postgres")]
     #[tokio::test]
     #[serial_test::serial(postgres)]
-    async fn put_blob_signing_uses_python_canonicalizer_not_jcs_postgres() {
+    async fn put_blob_signing_canonicalizes_via_ceg_produce_gate_postgres() {
         use crate::federation::{
             holds_bytes_attestation_envelope, holds_bytes_attestation_type, BlobBody,
             FederationDirectory,
         };
-        use crate::verify::canonical::{Canonicalizer, PythonJsonDumpsCanonicalizer};
+        use crate::verify::canonical::ceg_produce_canonicalize;
         use sha2::{Digest, Sha256};
 
         let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
@@ -3887,10 +3892,8 @@ mod tests {
         };
 
         let envelope = holds_bytes_attestation_envelope(&sha);
-        let py_canonical = PythonJsonDumpsCanonicalizer
-            .canonicalize_value(&envelope)
-            .expect("python canonicalize");
-        let expected_hash_hex = hex::encode(Sha256::digest(&py_canonical));
+        let gate_canonical = ceg_produce_canonicalize(&envelope).expect("ceg produce canonicalize");
+        let expected_hash_hex = hex::encode(Sha256::digest(&gate_canonical));
 
         let now = chrono::Utc::now();
         let attestation_id = uuid::Uuid::new_v4();
@@ -3906,7 +3909,7 @@ mod tests {
             .await
             .expect("put_blob_signing");
 
-        // Pin the stored hash equals the Python-compat canonical
+        // Pin the stored hash equals the CEG produce-gate canonical
         // hash — same invariant the SQLite test checks.
         let attestation_type = holds_bytes_attestation_type(&sha);
         let client = pg.pool().get().await.expect("pg client");

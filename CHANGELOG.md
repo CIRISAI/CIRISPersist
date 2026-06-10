@@ -5,6 +5,30 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [4.15.0] — 2026-06-09
+
+**JCS (RFC 8785) canonicalization flip — ACTIVATED. The CEG 1.0 §0.9 conformance milestone, in lockstep with the agent 2.9.6 hard-JCS cutover (CIRISPersist#171/#176; FSD `V4_6_JCS_CANONICALIZATION.md`; CIRISAgent#871).**
+
+persist's produce-side signing canonicalizer flips Python-compat (`json.dumps(sort_keys=True, ensure_ascii=True)`) → **RFC 8785 JCS**, and the verify side gains the signed-epoch `"3.0.0"` arm so it verifies the agent's JCS-signed traces. The flip closes AV-63 (canonicalizer-mismatch silent signature failure) and is the precondition for `attestation_promote` (#171 phase 2).
+
+### The coordination
+The agent's 2.9.6 cutover (CIRISAgent `9c3546dc8`) flipped trace signing to JCS but initially **kept `trace_schema_version = "2.7.9"`** — which would have defeated persist's signed-epoch gate (`major ≥ 3 ⇒ JCS`) and failed every non-ASCII trace under the Python canonicalizer. Surfaced as CIRISAgent#871; the agent **bumped the stamp to `"3.0.0"`** (`2a228b4a4`, before merge), restoring the clean discriminator. The canonical **field layout is byte-identical** to 2.7.9 (confirmed both sides) — only the canonicalizer changed.
+
+### Changed (produce side — activate)
+- **`produce_canon_version()` → `V2Jcs`.** Every persist-produced CEG signing payload (attestations / holds_bytes / withdraws / key registration / blob-signing `original_content_hash` / FFI `canonicalize_envelope`) routes through `ceg_produce_canonicalize`, so this one const is the whole produce flip. persist's produce envelopes are structured-ASCII (key_ids / SHA-256 hex / ISO timestamps / base64), where Python-compat ≡ JCS byte-for-byte — go-forward is byte-identical for the existing corpus and cannot break a peer still on Python.
+
+### Added (verify side — the 3.0.0 gate)
+- **`"3.0.0"` in `SUPPORTED_VERSIONS`** + a `verify_trace` dispatch arm reusing the 2.7.9 field builder (`canonical_payload_value_v279`) — the layout is unchanged, only the canonicalizer differs, selected by `canon_version_for_trace_schema("3.0.0") → V2Jcs`. Pre-cut `"2.7.x"` rows stay `V1Python` (legacy canonicalizer, bounded by trace retention); post-cut `"3.0.0"` rows verify under JCS. The discriminator is inside the signed bytes — downgrade-safe (FSD §6).
+- New verify test: a JCS-signed **non-ASCII** `"3.0.0"` trace verifies under the gate-selected JCS canonicalizer and **fails** under the legacy Python one — proving the gate is load-bearing, not cosmetic.
+
+### Out of scope (other release tracks — NOT flipped this cut, not silent gaps)
+- **CIRISNodeCore consensus envelopes** (`cirisnode::verify::canonical_bytes_for_envelope`) — NodeCore track; flips on its own lockstep coordination.
+- **CIRISEdge wire envelopes / FFI `canonicalize_envelope_for_signing`** — edge track (edge 1.5.x).
+- **Internal `persist_row_hash` + audit `canonical_bytes_for_entry`** — never cross the federation boundary; stay Python-compat per FSD OQ-2.
+
+### Tests
+SQLite (1090) + live-PG (782) green. `-D warnings` clippy (both feature sets) + `cargo fmt` + `cargo check --no-default-features` clean. Blob-signing produce tests rewritten to assert via the produce gate (flip-agnostic) rather than a pinned canonicalizer.
+
 ## [4.14.0] — 2026-06-09
 
 **Self/family at-rest DEK cascade — the `InvisibleEncrypted` tier: encrypt-at-rest + per-recipient `key_grant` delivery (CIRISPersist#152; CEG 0.18 §10.1.4).**
