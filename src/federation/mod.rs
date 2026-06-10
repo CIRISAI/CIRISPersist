@@ -43,6 +43,11 @@ pub mod emit;
 pub mod goal;
 pub mod hardware_attestation;
 pub mod location;
+// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13 / §10.1.6) — operational-
+// data admit + merge surface (organization / org_membership /
+// partner_record). Row shapes, the four admission checks, and the two
+// CEG-declared merge dispatchers; the backends do the storage I/O.
+pub mod operational;
 pub mod perceptual_hash;
 pub mod precedence;
 #[cfg(feature = "cirisaudit")]
@@ -107,6 +112,10 @@ pub use goal::{
     MetaGoalAlignment,
 };
 pub use hardware_attestation::{HardwareAttestationPolicy, DEFAULT_MAX_NONCE_AGE};
+pub use operational::{
+    MergeIntent, OrgMembership, Organization, PartnerRecord, SignedOrgMembership,
+    SignedOrganization, SignedPartnerRecord, SubjectKind,
+};
 pub use perceptual_hash::{
     HashDatabaseId, HashMatchError, HashMatchResult, MatcherUnreachablePolicy,
     NullPerceptualHashMatcher, OnMatchPolicy, PerceptualHashMatcher, SharedMatcher,
@@ -589,6 +598,130 @@ pub trait FederationDirectory: Send + Sync {
     /// [`location::h3_cell_contained`](crate::federation::location::h3_cell_contained)`(cell_id, constraint_cell)`.
     /// Non-geographic communities are never returned.
     async fn communities_containing(&self, cell_id: &str) -> Result<Vec<Community>, Error>;
+
+    // ── CEG 1.0-RC2 §5.6.8.13 operational data (v5.1.0, #65) ───────
+
+    /// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13 / §10.1.6) — admit
+    /// an `organization` envelope. Role-gated (`lww_skew_bounded`).
+    ///
+    /// Runs the four admission checks in order:
+    /// 1. **Skew-bound** ([`operational::check_skew_bound`]) — reject
+    ///    `asserted_at > now + §0.7 tolerance`.
+    /// 2. **No payment-processor identifier**
+    ///    ([`operational::reject_payment_processor_identifiers`]) over the
+    ///    signed envelope.
+    /// 3. **Authority** — the backend resolves the **current
+    ///    `org_membership` set** for `organization.org_id` from storage,
+    ///    then calls
+    ///    [`ciris_verify_core::operational_admit::resolve_role_authority`]
+    ///    with the caller-supplied `key_directory` + `root_stewards`,
+    ///    requiring [`OrgRole::OrgAdmin`](ciris_verify_core::operational_admit::OrgRole::OrgAdmin).
+    ///    **Fail-closed** — anything but a positive verdict is rejection.
+    ///
+    /// Append-only on `attestation_id`; idempotent re-submit of identical
+    /// content is `Ok(())`. Current-state is resolved at read time by
+    /// [`operational::resolve_lww`] (stable-id grouping on `org_id`).
+    async fn put_organization(
+        &self,
+        signed: SignedOrganization,
+        key_directory: &[ciris_verify_core::threshold::ThresholdMember],
+        root_stewards: &[String],
+    ) -> Result<(), Error>;
+
+    /// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13 / §10.1.6) — admit
+    /// an `org_membership` envelope. Role-gated (`lww_skew_bounded`).
+    ///
+    /// Same four-check pipeline as [`Self::put_organization`]; the
+    /// authority check requires the granter (the operation's
+    /// `attesting_key_id`) hold a role permitting the grant — resolved by
+    /// [`ciris_verify_core::operational_admit::resolve_role_authority`]
+    /// against the current membership set for `org_membership.org_id`
+    /// (requiring `OrgAdmin`), the caller-supplied `key_directory`, and
+    /// `root_stewards`. Fail-closed.
+    ///
+    /// Current-state is resolved at read time by
+    /// [`operational::resolve_lww`] (stable-id grouping on
+    /// `(user_id, org_id)`).
+    async fn put_org_membership(
+        &self,
+        signed: SignedOrgMembership,
+        key_directory: &[ciris_verify_core::threshold::ThresholdMember],
+        root_stewards: &[String],
+    ) -> Result<(), Error>;
+
+    /// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13 / §10.1.6) — admit
+    /// a `partner_record` envelope. M-of-N steward quorum
+    /// (`monotonic_quorum`).
+    ///
+    /// Runs:
+    /// 1. **Skew-bound** ([`operational::check_skew_bound`]).
+    /// 2. **No payment-processor identifier** over the signed envelope.
+    /// 3. **Set-semantics** — capability/restriction arrays sorted
+    ///    ([`ciris_verify_core::operational_admit::check_set_semantics_sorted`]
+    ///    over [`operational::PARTNER_RECORD_SET_FIELDS`]).
+    /// 4. **Quorum** —
+    ///    [`ciris_verify_core::operational_admit::verify_partner_record_quorum`]
+    ///    over `JCS(signed_envelope)` against `steward_roster` at
+    ///    `signed.threshold`. Fail-closed.
+    /// 5. **Anti-rollback** — the `revision` MUST strictly exceed the
+    ///    most-recent admitted `revision` for the same `license_id`
+    ///    (queried from storage), else [`Error::PartnerRecordRollback`].
+    ///    Enforced **at admission**, before the §10.1.6 merge.
+    ///
+    /// Current-state is resolved at read time by
+    /// [`operational::resolve_monotonic_quorum`] (stable-id grouping on
+    /// `license_id`).
+    async fn put_partner_record(
+        &self,
+        signed: SignedPartnerRecord,
+        steward_roster: &[ciris_verify_core::threshold::ThresholdMember],
+    ) -> Result<(), Error>;
+
+    /// v5.1.0 (CIRISPersist#65) — all stored `organization` rows for
+    /// `org_id` (in-force and withdrawn — full history). Callers resolve
+    /// current state via [`operational::resolve_lww`].
+    async fn list_organizations_for(&self, org_id: &str) -> Result<Vec<Organization>, Error>;
+
+    /// v5.1.0 (CIRISPersist#65) — all stored `org_membership` rows for one
+    /// `org_id` (every user; full history). This is the set the role-
+    /// authority resolver groups by `(user_id, org_id)`.
+    async fn list_org_memberships_for(&self, org_id: &str) -> Result<Vec<OrgMembership>, Error>;
+
+    /// v5.1.0 (CIRISPersist#65) — all stored `partner_record` rows for
+    /// `license_id` (full history). Callers resolve current state via
+    /// [`operational::resolve_monotonic_quorum`].
+    async fn list_partner_records_for(&self, license_id: &str)
+        -> Result<Vec<PartnerRecord>, Error>;
+
+    /// v5.1.0 (CIRISPersist#65, CIRISEdge#65 v2 bridge) — bulk-list
+    /// `organization` rows since a cursor, for the anti-entropy carrier.
+    /// `since` filters on `asserted_at > since` (None = from the start);
+    /// rows are returned ordered by `(asserted_at ASC, attestation_id
+    /// ASC)` so the cursor is a stable resumption point. `limit` caps the
+    /// page.
+    async fn list_organizations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<Organization>, Error>;
+
+    /// v5.1.0 (CIRISPersist#65, CIRISEdge#65 v2 bridge) — bulk-list
+    /// `org_membership` rows since a cursor. Same ordering + cursor
+    /// contract as [`Self::list_organizations_since`].
+    async fn list_org_memberships_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<OrgMembership>, Error>;
+
+    /// v5.1.0 (CIRISPersist#65, CIRISEdge#65 v2 bridge) — bulk-list
+    /// `partner_record` rows since a cursor. Same ordering + cursor
+    /// contract as [`Self::list_organizations_since`].
+    async fn list_partner_records_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<PartnerRecord>, Error>;
 
     /// v4.8.0 (#161 Ask 2) — occurrences of `identity_key_id` that are
     /// **currently active**: admitted AND with no revocation whose
@@ -1523,6 +1656,85 @@ pub enum Error {
     #[error("write-path cohort_scope refused: {0}")]
     WriteScopeRefused(#[from] crate::scope::ScopeRefusalReason),
 
+    /// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §10.1.6 / §0.7) — an
+    /// operational-data envelope merging under `lww_skew_bounded`
+    /// (`organization` / `org_membership`) carried an `asserted_at` more
+    /// than the §0.7 clock-skew tolerance (±5 min) in the future.
+    /// Rejected at admission by
+    /// [`operational::check_skew_bound`]; the row is not stored. The LWW
+    /// front-running fix — unbounded LWW on `org_membership.role` is a
+    /// role-escalation surface.
+    #[error(
+        "clock-skew violation: asserted_at {asserted_at} is more than 5 minutes \
+         past now {now} (§0.7)"
+    )]
+    ClockSkewViolation {
+        /// The rejected envelope's `asserted_at` (RFC-3339).
+        asserted_at: String,
+        /// The substrate's `now` the gate compared against (RFC-3339).
+        now: String,
+    },
+
+    /// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13, fail-secure) — an
+    /// operational-data envelope carried a recognizable payment-processor
+    /// (Stripe-shaped) identifier anywhere, including an open-vocabulary
+    /// field or object key. Rejected at admission by
+    /// [`operational::reject_payment_processor_identifiers`]; the row is
+    /// not stored. Defense-in-depth behind the Registry's emit-side
+    /// minimization — billing stays entirely Portal+Stripe, off-wire.
+    #[error(
+        "operational envelope carries a payment-processor identifier \
+         (matched prefix {matched_prefix:?}); billing data MUST NOT federate"
+    )]
+    PaymentProcessorIdentifier {
+        /// The matched payment-processor prefix (e.g. `"cus_"`).
+        matched_prefix: &'static str,
+    },
+
+    /// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13) — an
+    /// operational-data admit failed its authority check: the
+    /// `organization` / `org_membership` actor did not hold the required
+    /// role via a root-anchored grant
+    /// ([`ciris_verify_core::operational_admit::resolve_role_authority`]
+    /// returned `authorized: false`), or the `partner_record` M-of-N
+    /// steward quorum was not met
+    /// ([`ciris_verify_core::operational_admit::verify_partner_record_quorum`]).
+    /// Fail-closed: the absence of a positive verdict is rejection. The
+    /// row is not stored.
+    #[error("operational-data authority not established: {0}")]
+    OperationalAuthority(String),
+
+    /// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13, F-AV-ROLLBACK) — a
+    /// `partner_record` write whose `revision` does not strictly exceed
+    /// the most-recent admitted `revision` for the same `license_id`. The
+    /// monotonic anti-rollback is enforced **at admission**, before the
+    /// §10.1.6 quorum merge — a stale `active` can never overwrite a
+    /// later `revoked`. Equal revisions reject too. The row is not stored.
+    #[error(
+        "partner_record revision rollback for license_id {license_id:?}: \
+         submitted revision {submitted} does not exceed existing {existing}"
+    )]
+    PartnerRecordRollback {
+        /// The `license_id` whose monotonic counter was violated.
+        license_id: String,
+        /// The rejected row's `revision`.
+        submitted: u64,
+        /// The latest already-admitted `revision` for this `license_id`.
+        existing: u64,
+    },
+
+    /// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13 / §0.9.2.1 rule 1)
+    /// — a `partner_record` set-semantics array
+    /// (`capabilities_granted` / `capabilities_denied` /
+    /// `geographic_restrictions` / `allowed_identity_templates`) was not
+    /// lexicographically sorted. Caught by
+    /// [`ciris_verify_core::operational_admit::check_set_semantics_sorted`]
+    /// at the producer *before* M stewards sign divergent JCS bytes —
+    /// far better than a silent quorum collapse at admission. The row is
+    /// not stored.
+    #[error("partner_record set-semantics array not sorted: {0}")]
+    SetSemanticsUnsorted(String),
+
     /// Backend-level error (DB connection, serialization, etc.).
     /// String-typed because each backend has its own error tree.
     #[error("backend: {0}")]
@@ -1564,6 +1776,11 @@ impl Error {
             Error::DeviceClassRejected { .. } => "federation_device_class_rejected",
             Error::ConsensusProtocolMalformed { .. } => "federation_consensus_protocol_malformed",
             Error::WriteScopeRefused(_) => "federation_write_scope_refused",
+            Error::ClockSkewViolation { .. } => "federation_clock_skew_violation",
+            Error::PaymentProcessorIdentifier { .. } => "federation_payment_processor_identifier",
+            Error::OperationalAuthority(_) => "federation_operational_authority",
+            Error::PartnerRecordRollback { .. } => "federation_partner_record_rollback",
+            Error::SetSemanticsUnsorted(_) => "federation_set_semantics_unsorted",
             Error::Backend(_) => "federation_backend",
         }
     }

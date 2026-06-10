@@ -2256,6 +2256,312 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             .collect())
     }
 
+    // ── CEG 1.0-RC2 §5.6.8.13 operational data (v5.1.0, #65) ───────
+
+    async fn put_organization(
+        &self,
+        signed: crate::federation::SignedOrganization,
+        key_directory: &[ciris_verify_core::threshold::ThresholdMember],
+        root_stewards: &[String],
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::operational;
+        let mut row = signed.organization;
+        operational::check_skew_and_payment(
+            row.asserted_at,
+            chrono::Utc::now(),
+            &row.signed_envelope,
+        )?;
+        let current = self.list_org_memberships_for(&row.org_id).await?;
+        operational::check_role_authority(
+            &row.attesting_key_id,
+            &row.org_id,
+            &current,
+            key_directory,
+            root_stewards,
+        )?;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let env_text = serde_json::to_string(&row.signed_envelope)
+            .map_err(|e| crate::federation::Error::Backend(format!("serialize envelope: {e}")))?;
+        let conn = self.conn.clone();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
+            // Idempotent append-only: identical content → no-op; differing
+            // content on the same attestation_id → caller handles via the
+            // UNIQUE PK error below.
+            conn.execute(
+                "INSERT INTO federation_organizations (\
+                    attestation_id, org_id, name, org_type, parent_org_id, partner_id, \
+                    status, asserted_at, valid_until, attesting_key_id, signed_envelope, \
+                    ed25519_signature_base64, mldsa65_signature_base64, withdrawn_at, \
+                    persist_row_hash\
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15) \
+                 ON CONFLICT(attestation_id) DO NOTHING",
+                rusqlite::params![
+                    row.attestation_id,
+                    row.org_id,
+                    row.name,
+                    row.org_type,
+                    row.parent_org_id,
+                    row.partner_id,
+                    row.status,
+                    row.asserted_at.to_rfc3339(),
+                    row.valid_until.map(|t| t.to_rfc3339()),
+                    row.attesting_key_id,
+                    env_text,
+                    row.ed25519_signature_base64,
+                    row.mldsa65_signature_base64,
+                    row.withdrawn_at.map(|t| t.to_rfc3339()),
+                    row.persist_row_hash,
+                ],
+            )?;
+            Ok(())
+        })()
+        .map_err(map_revocation_sqlite_err("organization"))?;
+        Ok(())
+    }
+
+    async fn put_org_membership(
+        &self,
+        signed: crate::federation::SignedOrgMembership,
+        key_directory: &[ciris_verify_core::threshold::ThresholdMember],
+        root_stewards: &[String],
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::operational;
+        let mut row = signed.org_membership;
+        operational::check_skew_and_payment(
+            row.asserted_at,
+            chrono::Utc::now(),
+            &row.signed_envelope,
+        )?;
+        let current = self.list_org_memberships_for(&row.org_id).await?;
+        operational::check_role_authority(
+            &row.attesting_key_id,
+            &row.org_id,
+            &current,
+            key_directory,
+            root_stewards,
+        )?;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let env_text = serde_json::to_string(&row.signed_envelope)
+            .map_err(|e| crate::federation::Error::Backend(format!("serialize envelope: {e}")))?;
+        let conn = self.conn.clone();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
+            conn.execute(
+                "INSERT INTO federation_org_memberships (\
+                    attestation_id, user_id, org_id, role, status, asserted_at, \
+                    valid_until, attesting_key_id, signed_envelope, \
+                    ed25519_signature_base64, mldsa65_signature_base64, withdrawn_at, \
+                    persist_row_hash\
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) \
+                 ON CONFLICT(attestation_id) DO NOTHING",
+                rusqlite::params![
+                    row.attestation_id,
+                    row.user_id,
+                    row.org_id,
+                    row.role,
+                    row.status,
+                    row.asserted_at.to_rfc3339(),
+                    row.valid_until.map(|t| t.to_rfc3339()),
+                    row.attesting_key_id,
+                    env_text,
+                    row.ed25519_signature_base64,
+                    row.mldsa65_signature_base64,
+                    row.withdrawn_at.map(|t| t.to_rfc3339()),
+                    row.persist_row_hash,
+                ],
+            )?;
+            Ok(())
+        })()
+        .map_err(map_revocation_sqlite_err("org_membership"))?;
+        Ok(())
+    }
+
+    async fn put_partner_record(
+        &self,
+        signed: crate::federation::SignedPartnerRecord,
+        steward_roster: &[ciris_verify_core::threshold::ThresholdMember],
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::operational;
+        operational::check_skew_and_payment(
+            signed.partner_record.asserted_at,
+            chrono::Utc::now(),
+            &signed.partner_record.signed_envelope,
+        )?;
+        operational::check_partner_set_and_quorum(&signed, steward_roster)?;
+        // Anti-rollback: revision MUST strictly exceed the existing max
+        // for this license_id (enforced at admission, before any merge).
+        let existing = self
+            .list_partner_records_for(&signed.partner_record.license_id)
+            .await?;
+        let existing_max = existing.iter().map(|p| p.revision).max();
+        operational::check_partner_revision_monotonic(
+            &signed.partner_record.license_id,
+            signed.partner_record.revision,
+            existing_max,
+        )?;
+        let mut row = signed.partner_record;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let env_text = serde_json::to_string(&row.signed_envelope)
+            .map_err(|e| crate::federation::Error::Backend(format!("serialize envelope: {e}")))?;
+        let conn = self.conn.clone();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
+            conn.execute(
+                "INSERT INTO federation_partner_records (\
+                    attestation_id, license_id, partner_id, org_id, license_type, \
+                    max_autonomy_tier, requires_supervisor, deployment_limit, \
+                    offline_grace_hours, status, revision, issued_at, expires_at, \
+                    asserted_at, signed_envelope, withdrawn_at, persist_row_hash\
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17) \
+                 ON CONFLICT(attestation_id) DO NOTHING",
+                rusqlite::params![
+                    row.attestation_id,
+                    row.license_id,
+                    row.partner_id,
+                    row.org_id,
+                    row.license_type,
+                    row.max_autonomy_tier,
+                    i64::from(row.requires_supervisor),
+                    i64::from(row.deployment_limit),
+                    i64::from(row.offline_grace_hours),
+                    row.status,
+                    row.revision as i64,
+                    row.issued_at.to_rfc3339(),
+                    row.expires_at.to_rfc3339(),
+                    row.asserted_at.to_rfc3339(),
+                    env_text,
+                    row.withdrawn_at.map(|t| t.to_rfc3339()),
+                    row.persist_row_hash,
+                ],
+            )?;
+            Ok(())
+        })()
+        .map_err(map_revocation_sqlite_err("partner_record"))?;
+        Ok(())
+    }
+
+    async fn list_organizations_for(
+        &self,
+        org_id: &str,
+    ) -> Result<Vec<crate::federation::Organization>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let org_id = org_id.to_owned();
+        (move || -> Result<Vec<_>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT * FROM federation_organizations WHERE org_id = ?1 \
+                 ORDER BY attestation_id ASC",
+            )?;
+            let rows = stmt.query_map([&org_id], sqlite_row_to_organization)?;
+            rows.collect()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("list_organizations_for: {e}")))
+    }
+
+    async fn list_org_memberships_for(
+        &self,
+        org_id: &str,
+    ) -> Result<Vec<crate::federation::OrgMembership>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let org_id = org_id.to_owned();
+        (move || -> Result<Vec<_>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT * FROM federation_org_memberships WHERE org_id = ?1 \
+                 ORDER BY attestation_id ASC",
+            )?;
+            let rows = stmt.query_map([&org_id], sqlite_row_to_org_membership)?;
+            rows.collect()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("list_org_memberships_for: {e}")))
+    }
+
+    async fn list_partner_records_for(
+        &self,
+        license_id: &str,
+    ) -> Result<Vec<crate::federation::PartnerRecord>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let license_id = license_id.to_owned();
+        (move || -> Result<Vec<_>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT * FROM federation_partner_records WHERE license_id = ?1 \
+                 ORDER BY attestation_id ASC",
+            )?;
+            let rows = stmt.query_map([&license_id], sqlite_row_to_partner_record)?;
+            rows.collect()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("list_partner_records_for: {e}")))
+    }
+
+    async fn list_organizations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::Organization>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let since = since.map(|t| t.to_rfc3339());
+        (move || -> Result<Vec<_>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT * FROM federation_organizations \
+                 WHERE (?1 IS NULL OR asserted_at > ?1) \
+                 ORDER BY asserted_at ASC, attestation_id ASC LIMIT ?2",
+            )?;
+            let rows =
+                stmt.query_map(rusqlite::params![since, limit], sqlite_row_to_organization)?;
+            rows.collect()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("list_organizations_since: {e}")))
+    }
+
+    async fn list_org_memberships_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::OrgMembership>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let since = since.map(|t| t.to_rfc3339());
+        (move || -> Result<Vec<_>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT * FROM federation_org_memberships \
+                 WHERE (?1 IS NULL OR asserted_at > ?1) \
+                 ORDER BY asserted_at ASC, attestation_id ASC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![since, limit],
+                sqlite_row_to_org_membership,
+            )?;
+            rows.collect()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("list_org_memberships_since: {e}")))
+    }
+
+    async fn list_partner_records_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::PartnerRecord>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let since = since.map(|t| t.to_rfc3339());
+        (move || -> Result<Vec<_>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT * FROM federation_partner_records \
+                 WHERE (?1 IS NULL OR asserted_at > ?1) \
+                 ORDER BY asserted_at ASC, attestation_id ASC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![since, limit],
+                sqlite_row_to_partner_record,
+            )?;
+            rows.collect()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("list_partner_records_since: {e}")))
+    }
+
     async fn attach_key_pqc_signature(
         &self,
         key_id: &str,
@@ -6991,6 +7297,101 @@ fn sqlite_row_to_location_proof(
     })
 }
 
+/// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13) — row → Organization.
+fn sqlite_row_to_organization(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::Organization> {
+    let asserted_at: String = row.get("asserted_at")?;
+    let valid_until: Option<String> = row.get("valid_until")?;
+    let withdrawn_at: Option<String> = row.get("withdrawn_at")?;
+    let env_text: String = row.get("signed_envelope")?;
+    let signed_envelope = serde_json::from_str(&env_text).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    Ok(crate::federation::Organization {
+        attestation_id: row.get("attestation_id")?,
+        org_id: row.get("org_id")?,
+        name: row.get("name")?,
+        org_type: row.get("org_type")?,
+        parent_org_id: row.get("parent_org_id")?,
+        partner_id: row.get("partner_id")?,
+        status: row.get("status")?,
+        asserted_at: parse_rfc3339(&asserted_at),
+        valid_until: valid_until.as_deref().map(parse_rfc3339),
+        attesting_key_id: row.get("attesting_key_id")?,
+        signed_envelope,
+        ed25519_signature_base64: row.get("ed25519_signature_base64")?,
+        mldsa65_signature_base64: row.get("mldsa65_signature_base64")?,
+        withdrawn_at: withdrawn_at.as_deref().map(parse_rfc3339),
+        persist_row_hash: row.get("persist_row_hash")?,
+    })
+}
+
+/// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13) — row → OrgMembership.
+fn sqlite_row_to_org_membership(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::OrgMembership> {
+    let asserted_at: String = row.get("asserted_at")?;
+    let valid_until: Option<String> = row.get("valid_until")?;
+    let withdrawn_at: Option<String> = row.get("withdrawn_at")?;
+    let env_text: String = row.get("signed_envelope")?;
+    let signed_envelope = serde_json::from_str(&env_text).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    Ok(crate::federation::OrgMembership {
+        attestation_id: row.get("attestation_id")?,
+        user_id: row.get("user_id")?,
+        org_id: row.get("org_id")?,
+        role: row.get("role")?,
+        status: row.get("status")?,
+        asserted_at: parse_rfc3339(&asserted_at),
+        valid_until: valid_until.as_deref().map(parse_rfc3339),
+        attesting_key_id: row.get("attesting_key_id")?,
+        signed_envelope,
+        ed25519_signature_base64: row.get("ed25519_signature_base64")?,
+        mldsa65_signature_base64: row.get("mldsa65_signature_base64")?,
+        withdrawn_at: withdrawn_at.as_deref().map(parse_rfc3339),
+        persist_row_hash: row.get("persist_row_hash")?,
+    })
+}
+
+/// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13) — row → PartnerRecord.
+fn sqlite_row_to_partner_record(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::PartnerRecord> {
+    let issued_at: String = row.get("issued_at")?;
+    let expires_at: String = row.get("expires_at")?;
+    let asserted_at: String = row.get("asserted_at")?;
+    let withdrawn_at: Option<String> = row.get("withdrawn_at")?;
+    let revision: i64 = row.get("revision")?;
+    let deployment_limit: i64 = row.get("deployment_limit")?;
+    let offline_grace_hours: i64 = row.get("offline_grace_hours")?;
+    let requires_supervisor: i64 = row.get("requires_supervisor")?;
+    let env_text: String = row.get("signed_envelope")?;
+    let signed_envelope = serde_json::from_str(&env_text).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    Ok(crate::federation::PartnerRecord {
+        attestation_id: row.get("attestation_id")?,
+        license_id: row.get("license_id")?,
+        partner_id: row.get("partner_id")?,
+        org_id: row.get("org_id")?,
+        license_type: row.get("license_type")?,
+        max_autonomy_tier: row.get("max_autonomy_tier")?,
+        requires_supervisor: requires_supervisor != 0,
+        deployment_limit: deployment_limit as u32,
+        offline_grace_hours: offline_grace_hours as u32,
+        status: row.get("status")?,
+        revision: revision as u64,
+        issued_at: parse_rfc3339(&issued_at),
+        expires_at: parse_rfc3339(&expires_at),
+        asserted_at: parse_rfc3339(&asserted_at),
+        signed_envelope,
+        withdrawn_at: withdrawn_at.as_deref().map(parse_rfc3339),
+        persist_row_hash: row.get("persist_row_hash")?,
+    })
+}
+
 /// v3.11.0 (CIRISPersist#143, F-AV-ROLLBACK closure) — anti-rollback
 /// admission check for sqlite. Reads the latest `scrub_timestamp` for
 /// the target `revoked_key_id`; rejects with
@@ -11373,6 +11774,355 @@ mod tests {
         assert_eq!(for_a.len(), 1);
         assert_eq!(for_a[0].attestation_id, "att-1");
         assert_eq!(for_a[0].persist_row_hash.len(), 64);
+    }
+
+    // ── CEG 1.0-RC2 §5.6.8.13 operational data (v5.1.0, #65) ───────
+
+    use crate::federation::operational::test_support as op;
+
+    fn op_now() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now()
+    }
+
+    /// org_membership + organization round-trip with a root-anchored
+    /// authorized actor.
+    #[tokio::test]
+    async fn operational_org_membership_round_trip_authorized() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let steward = op::Identity::new("steward-1");
+        let admin = op::Identity::new("admin-1");
+        let dir = vec![steward.member(), admin.member()];
+        let roots = vec!["steward-1".to_string()];
+
+        // steward (root) grants admin OrgAdmin — granter is the steward.
+        let grant = op::signed_membership(
+            "m1",
+            &steward,
+            "admin-1",
+            "org-x",
+            "org_admin",
+            "active",
+            op_now(),
+        );
+        backend
+            .put_org_membership(grant, &dir, &roots)
+            .await
+            .expect("steward-rooted grant admits");
+
+        // Now admin (OrgAdmin) writes an organization row — authorized.
+        let org = op::signed_organization("o1", "org-x", &admin, "active", op_now());
+        backend
+            .put_organization(org, &dir, &roots)
+            .await
+            .expect("OrgAdmin actor admits organization");
+
+        let rows = backend.list_organizations_for("org-x").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].persist_row_hash.len(), 64);
+        let current = crate::federation::operational::resolve_lww(&rows);
+        assert_eq!(current.unwrap().attestation_id, "o1");
+    }
+
+    /// Authority is fail-closed: an actor with no root-anchored grant is
+    /// rejected.
+    #[tokio::test]
+    async fn operational_org_membership_fail_closed_unrooted() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let stranger = op::Identity::new("stranger");
+        let dir = vec![stranger.member()];
+        let roots = vec!["steward-1".to_string()]; // stranger is not rooted
+
+        let org = op::signed_organization("o1", "org-x", &stranger, "active", op_now());
+        let err = backend
+            .put_organization(org, &dir, &roots)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_operational_authority");
+        // nothing stored
+        assert!(backend
+            .list_organizations_for("org-x")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// LWW skew-bound rejects a future-dated org_membership.
+    #[tokio::test]
+    async fn operational_lww_skew_bound_rejects_future() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let steward = op::Identity::new("steward-1");
+        let dir = vec![steward.member()];
+        let roots = vec!["steward-1".to_string()];
+        let future = op_now() + chrono::Duration::minutes(10);
+        let grant = op::signed_membership(
+            "m1",
+            &steward,
+            "admin-1",
+            "org-x",
+            "org_admin",
+            "active",
+            future,
+        );
+        let err = backend
+            .put_org_membership(grant, &dir, &roots)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_clock_skew_violation");
+    }
+
+    /// No-payment-processor reject: a Stripe-shaped id in the envelope is
+    /// refused.
+    #[tokio::test]
+    async fn operational_payment_processor_rejected() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let steward = op::Identity::new("steward-1");
+        let dir = vec![steward.member()];
+        let roots = vec!["steward-1".to_string()];
+        let mut grant = op::signed_membership(
+            "m1",
+            &steward,
+            "admin-1",
+            "org-x",
+            "org_admin",
+            "active",
+            op_now(),
+        );
+        // Inject a payment-processor id into an open-vocab field.
+        grant.org_membership.signed_envelope["billing"] = serde_json::json!("cus_ABC123");
+        let err = backend
+            .put_org_membership(grant, &dir, &roots)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_payment_processor_identifier");
+    }
+
+    /// withdrawal-forward-only: once withdrawn, a later write does not
+    /// resurrect — stable-id resolution returns None.
+    #[tokio::test]
+    async fn operational_withdrawal_forward_only_no_resurrect() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let steward = op::Identity::new("steward-1");
+        let admin = op::Identity::new("admin-1");
+        let dir = vec![steward.member(), admin.member()];
+        let roots = vec!["steward-1".to_string()];
+        backend
+            .put_org_membership(
+                op::signed_membership(
+                    "m1",
+                    &steward,
+                    "admin-1",
+                    "org-x",
+                    "org_admin",
+                    "active",
+                    op_now(),
+                ),
+                &dir,
+                &roots,
+            )
+            .await
+            .unwrap();
+
+        let base = op_now();
+        // active org write, then a deactivated (withdrawn) write, then a
+        // LATER active write — must not resurrect.
+        for (id, status, secs) in [
+            ("o1", "active", 0),
+            ("o2", "deactivated", 60),
+            ("o3", "active", 120),
+        ] {
+            let org = op::signed_organization(
+                id,
+                "org-x",
+                &admin,
+                status,
+                base + chrono::Duration::seconds(secs),
+            );
+            backend.put_organization(org, &dir, &roots).await.unwrap();
+        }
+        let rows = backend.list_organizations_for("org-x").await.unwrap();
+        assert_eq!(rows.len(), 3, "all writes stored (append-only audit)");
+        assert!(
+            crate::federation::operational::resolve_lww(&rows).is_none(),
+            "withdrawal is forward-only — later active does not resurrect"
+        );
+    }
+
+    /// Stable-id convergence under OUT-OF-ORDER arrival — the key
+    /// partition-tolerance property. Insert envelopes in scrambled order;
+    /// the resolved winner is independent of arrival order.
+    #[tokio::test]
+    async fn operational_stable_id_converges_out_of_order() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let steward = op::Identity::new("steward-1");
+        let admin = op::Identity::new("admin-1");
+        let dir = vec![steward.member(), admin.member()];
+        let roots = vec!["steward-1".to_string()];
+        backend
+            .put_org_membership(
+                op::signed_membership(
+                    "m1",
+                    &steward,
+                    "admin-1",
+                    "org-x",
+                    "org_admin",
+                    "active",
+                    op_now(),
+                ),
+                &dir,
+                &roots,
+            )
+            .await
+            .unwrap();
+        let base = op_now();
+        // Arrive newest-first, then oldest, then middle.
+        for (id, secs) in [("o3", 120), ("o1", 0), ("o2", 60)] {
+            let org = op::signed_organization(
+                id,
+                "org-x",
+                &admin,
+                "active",
+                base + chrono::Duration::seconds(secs),
+            );
+            backend.put_organization(org, &dir, &roots).await.unwrap();
+        }
+        let rows = backend.list_organizations_for("org-x").await.unwrap();
+        let current = crate::federation::operational::resolve_lww(&rows).unwrap();
+        // Latest asserted_at (o3) wins regardless of insert order.
+        assert_eq!(current.attestation_id, "o3");
+    }
+
+    /// partner_record M-of-N quorum admit + monotonic merge (revoked >
+    /// active), and revision-decrease rejected at admission.
+    #[tokio::test]
+    async fn operational_partner_record_quorum_and_monotonic() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let s1 = op::Identity::new("s1");
+        let s2 = op::Identity::new("s2");
+        let s3 = op::Identity::new("s3");
+        let roster = vec![
+            s1.founder_member(),
+            s2.founder_member(),
+            s3.founder_member(),
+        ];
+
+        // 2-of-3 quorum, revision 1 active.
+        let pr1 =
+            op::signed_partner_record("pr1", "lic-1", 1, "active", op_now(), &[&s1, &s2], 2, false);
+        backend
+            .put_partner_record(pr1, &roster)
+            .await
+            .expect("2-of-3 admits");
+
+        // revision 2 revoked — admits (revision advances).
+        let pr2 = op::signed_partner_record(
+            "pr2",
+            "lic-1",
+            2,
+            "revoked",
+            op_now(),
+            &[&s1, &s2],
+            2,
+            false,
+        );
+        backend
+            .put_partner_record(pr2, &roster)
+            .await
+            .expect("rev 2 admits");
+
+        // revision-decrease (back to 1) — REJECTED at admission.
+        let pr_rollback =
+            op::signed_partner_record("pr3", "lic-1", 1, "active", op_now(), &[&s1, &s2], 2, false);
+        let err = backend
+            .put_partner_record(pr_rollback, &roster)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_partner_record_rollback");
+
+        // Merge winner: revision 2 revoked beats revision 1 active.
+        let rows = backend.list_partner_records_for("lic-1").await.unwrap();
+        assert_eq!(rows.len(), 2);
+        let current = crate::federation::operational::resolve_monotonic_quorum(&rows).unwrap();
+        assert_eq!(current.attestation_id, "pr2");
+        assert_eq!(current.status, "revoked");
+    }
+
+    /// Insufficient quorum is rejected (only 1 of 3 signs, threshold 2).
+    #[tokio::test]
+    async fn operational_partner_record_insufficient_quorum_rejected() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let s1 = op::Identity::new("s1");
+        let s2 = op::Identity::new("s2");
+        let s3 = op::Identity::new("s3");
+        let roster = vec![
+            s1.founder_member(),
+            s2.founder_member(),
+            s3.founder_member(),
+        ];
+        let pr = op::signed_partner_record("pr1", "lic-1", 1, "active", op_now(), &[&s1], 2, false);
+        let err = backend.put_partner_record(pr, &roster).await.unwrap_err();
+        assert_eq!(err.kind(), "federation_operational_authority");
+    }
+
+    /// Unsorted set-semantics array is caught at admission.
+    #[tokio::test]
+    async fn operational_partner_record_unsorted_caps_rejected() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let s1 = op::Identity::new("s1");
+        let s2 = op::Identity::new("s2");
+        let roster = vec![s1.founder_member(), s2.founder_member()];
+        let pr = op::signed_partner_record(
+            "pr1",
+            "lic-1",
+            1,
+            "active",
+            op_now(),
+            &[&s1, &s2],
+            2,
+            true, // unsorted
+        );
+        let err = backend.put_partner_record(pr, &roster).await.unwrap_err();
+        assert_eq!(err.kind(), "federation_set_semantics_unsorted");
+    }
+
+    /// Bulk-list since-cursor returns ordered rows for the Edge v2 bridge.
+    #[tokio::test]
+    async fn operational_bulk_list_since_cursor() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let s1 = op::Identity::new("s1");
+        let s2 = op::Identity::new("s2");
+        let roster = vec![s1.founder_member(), s2.founder_member()];
+        let base = op_now();
+        for (id, lic, secs) in [("a", "l1", 0), ("b", "l2", 60), ("c", "l3", 120)] {
+            let pr = op::signed_partner_record(
+                id,
+                lic,
+                1,
+                "active",
+                base + chrono::Duration::seconds(secs),
+                &[&s1, &s2],
+                2,
+                false,
+            );
+            backend.put_partner_record(pr, &roster).await.unwrap();
+        }
+        // since = base + 30s → excludes "a", returns "b","c" ordered.
+        let cursor = base + chrono::Duration::seconds(30);
+        let page = backend
+            .list_partner_records_since(Some(cursor), 10)
+            .await
+            .unwrap();
+        let ids: Vec<_> = page.iter().map(|p| p.attestation_id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "c"]);
     }
 
     #[tokio::test]

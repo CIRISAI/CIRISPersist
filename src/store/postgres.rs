@@ -2570,6 +2570,321 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .collect())
     }
 
+    // ── CEG 1.0-RC2 §5.6.8.13 operational data (v5.1.0, #65) ───────
+
+    async fn put_organization(
+        &self,
+        signed: crate::federation::SignedOrganization,
+        key_directory: &[ciris_verify_core::threshold::ThresholdMember],
+        root_stewards: &[String],
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::operational;
+        let mut row = signed.organization;
+        operational::check_skew_and_payment(
+            row.asserted_at,
+            chrono::Utc::now(),
+            &row.signed_envelope,
+        )?;
+        let current = self.list_org_memberships_for(&row.org_id).await?;
+        operational::check_role_authority(
+            &row.attesting_key_id,
+            &row.org_id,
+            &current,
+            key_directory,
+            root_stewards,
+        )?;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_organizations (\
+                    attestation_id, org_id, name, org_type, parent_org_id, partner_id, \
+                    status, asserted_at, valid_until, attesting_key_id, signed_envelope, \
+                    ed25519_signature_base64, mldsa65_signature_base64, withdrawn_at, \
+                    persist_row_hash\
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) \
+                 ON CONFLICT (attestation_id) DO NOTHING",
+                &[
+                    &row.attestation_id,
+                    &row.org_id,
+                    &row.name,
+                    &row.org_type,
+                    &row.parent_org_id,
+                    &row.partner_id,
+                    &row.status,
+                    &row.asserted_at,
+                    &row.valid_until,
+                    &row.attesting_key_id,
+                    &row.signed_envelope,
+                    &row.ed25519_signature_base64,
+                    &row.mldsa65_signature_base64,
+                    &row.withdrawn_at,
+                    &row.persist_row_hash,
+                ],
+            )
+            .await
+            .map_err(map_revocation_pg_err("organization"))?;
+        Ok(())
+    }
+
+    async fn put_org_membership(
+        &self,
+        signed: crate::federation::SignedOrgMembership,
+        key_directory: &[ciris_verify_core::threshold::ThresholdMember],
+        root_stewards: &[String],
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::operational;
+        let mut row = signed.org_membership;
+        operational::check_skew_and_payment(
+            row.asserted_at,
+            chrono::Utc::now(),
+            &row.signed_envelope,
+        )?;
+        let current = self.list_org_memberships_for(&row.org_id).await?;
+        operational::check_role_authority(
+            &row.attesting_key_id,
+            &row.org_id,
+            &current,
+            key_directory,
+            root_stewards,
+        )?;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_org_memberships (\
+                    attestation_id, user_id, org_id, role, status, asserted_at, \
+                    valid_until, attesting_key_id, signed_envelope, \
+                    ed25519_signature_base64, mldsa65_signature_base64, withdrawn_at, \
+                    persist_row_hash\
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
+                 ON CONFLICT (attestation_id) DO NOTHING",
+                &[
+                    &row.attestation_id,
+                    &row.user_id,
+                    &row.org_id,
+                    &row.role,
+                    &row.status,
+                    &row.asserted_at,
+                    &row.valid_until,
+                    &row.attesting_key_id,
+                    &row.signed_envelope,
+                    &row.ed25519_signature_base64,
+                    &row.mldsa65_signature_base64,
+                    &row.withdrawn_at,
+                    &row.persist_row_hash,
+                ],
+            )
+            .await
+            .map_err(map_revocation_pg_err("org_membership"))?;
+        Ok(())
+    }
+
+    async fn put_partner_record(
+        &self,
+        signed: crate::federation::SignedPartnerRecord,
+        steward_roster: &[ciris_verify_core::threshold::ThresholdMember],
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::operational;
+        operational::check_skew_and_payment(
+            signed.partner_record.asserted_at,
+            chrono::Utc::now(),
+            &signed.partner_record.signed_envelope,
+        )?;
+        operational::check_partner_set_and_quorum(&signed, steward_roster)?;
+        let existing = self
+            .list_partner_records_for(&signed.partner_record.license_id)
+            .await?;
+        let existing_max = existing.iter().map(|p| p.revision).max();
+        operational::check_partner_revision_monotonic(
+            &signed.partner_record.license_id,
+            signed.partner_record.revision,
+            existing_max,
+        )?;
+        let mut row = signed.partner_record;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let revision = row.revision as i64;
+        let deployment_limit = i64::from(row.deployment_limit);
+        let offline_grace_hours = i64::from(row.offline_grace_hours);
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_partner_records (\
+                    attestation_id, license_id, partner_id, org_id, license_type, \
+                    max_autonomy_tier, requires_supervisor, deployment_limit, \
+                    offline_grace_hours, status, revision, issued_at, expires_at, \
+                    asserted_at, signed_envelope, withdrawn_at, persist_row_hash\
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) \
+                 ON CONFLICT (attestation_id) DO NOTHING",
+                &[
+                    &row.attestation_id,
+                    &row.license_id,
+                    &row.partner_id,
+                    &row.org_id,
+                    &row.license_type,
+                    &row.max_autonomy_tier,
+                    &row.requires_supervisor,
+                    &deployment_limit,
+                    &offline_grace_hours,
+                    &row.status,
+                    &revision,
+                    &row.issued_at,
+                    &row.expires_at,
+                    &row.asserted_at,
+                    &row.signed_envelope,
+                    &row.withdrawn_at,
+                    &row.persist_row_hash,
+                ],
+            )
+            .await
+            .map_err(map_revocation_pg_err("partner_record"))?;
+        Ok(())
+    }
+
+    async fn list_organizations_for(
+        &self,
+        org_id: &str,
+    ) -> Result<Vec<crate::federation::Organization>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT * FROM cirislens.federation_organizations WHERE org_id = $1 \
+                 ORDER BY attestation_id ASC",
+                &[&org_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_organizations_for: {e}"))
+            })?;
+        rows.into_iter().map(pg_row_to_organization).collect()
+    }
+
+    async fn list_org_memberships_for(
+        &self,
+        org_id: &str,
+    ) -> Result<Vec<crate::federation::OrgMembership>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT * FROM cirislens.federation_org_memberships WHERE org_id = $1 \
+                 ORDER BY attestation_id ASC",
+                &[&org_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_org_memberships_for: {e}"))
+            })?;
+        rows.into_iter().map(pg_row_to_org_membership).collect()
+    }
+
+    async fn list_partner_records_for(
+        &self,
+        license_id: &str,
+    ) -> Result<Vec<crate::federation::PartnerRecord>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT * FROM cirislens.federation_partner_records WHERE license_id = $1 \
+                 ORDER BY attestation_id ASC",
+                &[&license_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_partner_records_for: {e}"))
+            })?;
+        rows.into_iter().map(pg_row_to_partner_record).collect()
+    }
+
+    async fn list_organizations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::Organization>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let limit = i64::from(limit);
+        let rows = client
+            .query(
+                "SELECT * FROM cirislens.federation_organizations \
+                 WHERE ($1::timestamptz IS NULL OR asserted_at > $1) \
+                 ORDER BY asserted_at ASC, attestation_id ASC LIMIT $2",
+                &[&since, &limit],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_organizations_since: {e}"))
+            })?;
+        rows.into_iter().map(pg_row_to_organization).collect()
+    }
+
+    async fn list_org_memberships_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::OrgMembership>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let limit = i64::from(limit);
+        let rows = client
+            .query(
+                "SELECT * FROM cirislens.federation_org_memberships \
+                 WHERE ($1::timestamptz IS NULL OR asserted_at > $1) \
+                 ORDER BY asserted_at ASC, attestation_id ASC LIMIT $2",
+                &[&since, &limit],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_org_memberships_since: {e}"))
+            })?;
+        rows.into_iter().map(pg_row_to_org_membership).collect()
+    }
+
+    async fn list_partner_records_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::PartnerRecord>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let limit = i64::from(limit);
+        let rows = client
+            .query(
+                "SELECT * FROM cirislens.federation_partner_records \
+                 WHERE ($1::timestamptz IS NULL OR asserted_at > $1) \
+                 ORDER BY asserted_at ASC, attestation_id ASC LIMIT $2",
+                &[&since, &limit],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_partner_records_since: {e}"))
+            })?;
+        rows.into_iter().map(pg_row_to_partner_record).collect()
+    }
+
     async fn attach_key_pqc_signature(
         &self,
         key_id: &str,
@@ -6992,6 +7307,81 @@ fn pg_row_to_location_proof(
         asserted_at: row.safe_get_with("asserted_at", mk_err)?,
         valid_until: row.safe_get_with("valid_until", mk_err)?,
         attestation_evidence: row.safe_get_with("attestation_evidence", mk_err)?,
+        withdrawn_at: row.safe_get_with("withdrawn_at", mk_err)?,
+        persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
+    })
+}
+
+/// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13) — row → Organization.
+fn pg_row_to_organization(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::Organization, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    Ok(crate::federation::Organization {
+        attestation_id: row.safe_get_with("attestation_id", mk_err)?,
+        org_id: row.safe_get_with("org_id", mk_err)?,
+        name: row.safe_get_with("name", mk_err)?,
+        org_type: row.safe_get_with("org_type", mk_err)?,
+        parent_org_id: row.safe_get_with("parent_org_id", mk_err)?,
+        partner_id: row.safe_get_with("partner_id", mk_err)?,
+        status: row.safe_get_with("status", mk_err)?,
+        asserted_at: row.safe_get_with("asserted_at", mk_err)?,
+        valid_until: row.safe_get_with("valid_until", mk_err)?,
+        attesting_key_id: row.safe_get_with("attesting_key_id", mk_err)?,
+        signed_envelope: row.safe_get_with("signed_envelope", mk_err)?,
+        ed25519_signature_base64: row.safe_get_with("ed25519_signature_base64", mk_err)?,
+        mldsa65_signature_base64: row.safe_get_with("mldsa65_signature_base64", mk_err)?,
+        withdrawn_at: row.safe_get_with("withdrawn_at", mk_err)?,
+        persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
+    })
+}
+
+/// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13) — row → OrgMembership.
+fn pg_row_to_org_membership(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::OrgMembership, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    Ok(crate::federation::OrgMembership {
+        attestation_id: row.safe_get_with("attestation_id", mk_err)?,
+        user_id: row.safe_get_with("user_id", mk_err)?,
+        org_id: row.safe_get_with("org_id", mk_err)?,
+        role: row.safe_get_with("role", mk_err)?,
+        status: row.safe_get_with("status", mk_err)?,
+        asserted_at: row.safe_get_with("asserted_at", mk_err)?,
+        valid_until: row.safe_get_with("valid_until", mk_err)?,
+        attesting_key_id: row.safe_get_with("attesting_key_id", mk_err)?,
+        signed_envelope: row.safe_get_with("signed_envelope", mk_err)?,
+        ed25519_signature_base64: row.safe_get_with("ed25519_signature_base64", mk_err)?,
+        mldsa65_signature_base64: row.safe_get_with("mldsa65_signature_base64", mk_err)?,
+        withdrawn_at: row.safe_get_with("withdrawn_at", mk_err)?,
+        persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
+    })
+}
+
+/// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13) — row → PartnerRecord.
+fn pg_row_to_partner_record(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::PartnerRecord, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    let revision: i64 = row.safe_get_with("revision", mk_err)?;
+    let deployment_limit: i64 = row.safe_get_with("deployment_limit", mk_err)?;
+    let offline_grace_hours: i64 = row.safe_get_with("offline_grace_hours", mk_err)?;
+    Ok(crate::federation::PartnerRecord {
+        attestation_id: row.safe_get_with("attestation_id", mk_err)?,
+        license_id: row.safe_get_with("license_id", mk_err)?,
+        partner_id: row.safe_get_with("partner_id", mk_err)?,
+        org_id: row.safe_get_with("org_id", mk_err)?,
+        license_type: row.safe_get_with("license_type", mk_err)?,
+        max_autonomy_tier: row.safe_get_with("max_autonomy_tier", mk_err)?,
+        requires_supervisor: row.safe_get_with("requires_supervisor", mk_err)?,
+        deployment_limit: deployment_limit as u32,
+        offline_grace_hours: offline_grace_hours as u32,
+        status: row.safe_get_with("status", mk_err)?,
+        revision: revision as u64,
+        issued_at: row.safe_get_with("issued_at", mk_err)?,
+        expires_at: row.safe_get_with("expires_at", mk_err)?,
+        asserted_at: row.safe_get_with("asserted_at", mk_err)?,
+        signed_envelope: row.safe_get_with("signed_envelope", mk_err)?,
         withdrawn_at: row.safe_get_with("withdrawn_at", mk_err)?,
         persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
     })
@@ -21441,5 +21831,248 @@ mod tests {
             .unwrap();
         assert_eq!(resolved.x25519_base64, x25519);
         assert_eq!(resolved.ml_kem_768_base64, ml_kem);
+    }
+
+    // ── CEG 1.0-RC2 §5.6.8.13 operational data (v5.1.0, #65) ───────
+
+    /// Live-PG: org_membership + organization role-gated round-trip;
+    /// fail-closed when the actor is not rooted; LWW skew-bound reject;
+    /// no-payment-processor reject; withdrawal-forward-only no-resurrect;
+    /// stable-id convergence under out-of-order arrival.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_operational_org_lww_and_admission() {
+        use crate::federation::operational::test_support as op;
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let now = chrono::Utc::now();
+        let org_id = format!("org-{}", uuid_like());
+        let steward = op::Identity::new(&format!("steward-{}", uuid_like()));
+        let admin = op::Identity::new(&format!("admin-{}", uuid_like()));
+        let dir = vec![steward.member(), admin.member()];
+        let roots = vec![steward.key_id.clone()];
+
+        // root steward grants admin OrgAdmin.
+        let grant = op::signed_membership(
+            &format!("m-{}", uuid_like()),
+            &steward,
+            &admin.key_id,
+            &org_id,
+            "org_admin",
+            "active",
+            now,
+        );
+        backend
+            .put_org_membership(grant, &dir, &roots)
+            .await
+            .unwrap();
+
+        // admin writes an organization — authorized.
+        let o1 = format!("o1-{}", uuid_like());
+        backend
+            .put_organization(
+                op::signed_organization(&o1, &org_id, &admin, "active", now),
+                &dir,
+                &roots,
+            )
+            .await
+            .unwrap();
+
+        // fail-closed: a stranger cannot write.
+        let stranger = op::Identity::new(&format!("stranger-{}", uuid_like()));
+        let err = backend
+            .put_organization(
+                op::signed_organization(
+                    &format!("ox-{}", uuid_like()),
+                    &org_id,
+                    &stranger,
+                    "active",
+                    now,
+                ),
+                &[stranger.member()],
+                &roots,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_operational_authority");
+
+        // skew-bound reject.
+        let err = backend
+            .put_organization(
+                op::signed_organization(
+                    &format!("of-{}", uuid_like()),
+                    &org_id,
+                    &admin,
+                    "active",
+                    now + chrono::Duration::minutes(10),
+                ),
+                &dir,
+                &roots,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_clock_skew_violation");
+
+        // payment-processor reject.
+        let mut bad = op::signed_organization(
+            &format!("op-{}", uuid_like()),
+            &org_id,
+            &admin,
+            "active",
+            now,
+        );
+        bad.organization.signed_envelope["billing"] = serde_json::json!("sub_9xKpQ");
+        let err = backend
+            .put_organization(bad, &dir, &roots)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_payment_processor_identifier");
+
+        // out-of-order arrival + withdrawal-forward-only.
+        for (suffix, status, secs) in [("a", "active", 60), ("c", "deactivated", 180)] {
+            backend
+                .put_organization(
+                    op::signed_organization(
+                        &format!("{suffix}-{}", uuid_like()),
+                        &org_id,
+                        &admin,
+                        status,
+                        now + chrono::Duration::seconds(secs),
+                    ),
+                    &dir,
+                    &roots,
+                )
+                .await
+                .unwrap();
+        }
+        let rows = backend.list_organizations_for(&org_id).await.unwrap();
+        // a deactivated (withdrawn) row exists → forward-only → None.
+        assert!(crate::federation::operational::resolve_lww(&rows).is_none());
+    }
+
+    /// Live-PG: partner_record M-of-N quorum admit, monotonic merge
+    /// (revoked > active), revision-decrease rejected at admission,
+    /// insufficient quorum + unsorted set-semantics rejected, bulk since.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_operational_partner_record_quorum_and_monotonic() {
+        use crate::federation::operational::test_support as op;
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let now = chrono::Utc::now();
+        let lic = format!("lic-{}", uuid_like());
+        let s1 = op::Identity::new("s1");
+        let s2 = op::Identity::new("s2");
+        let s3 = op::Identity::new("s3");
+        let roster = vec![
+            s1.founder_member(),
+            s2.founder_member(),
+            s3.founder_member(),
+        ];
+
+        backend
+            .put_partner_record(
+                op::signed_partner_record(
+                    &format!("pr1-{}", uuid_like()),
+                    &lic,
+                    1,
+                    "active",
+                    now,
+                    &[&s1, &s2],
+                    2,
+                    false,
+                ),
+                &roster,
+            )
+            .await
+            .unwrap();
+        let pr2_id = format!("pr2-{}", uuid_like());
+        backend
+            .put_partner_record(
+                op::signed_partner_record(&pr2_id, &lic, 2, "revoked", now, &[&s1, &s2], 2, false),
+                &roster,
+            )
+            .await
+            .unwrap();
+
+        // revision decrease rejected at admission.
+        let err = backend
+            .put_partner_record(
+                op::signed_partner_record(
+                    &format!("pr3-{}", uuid_like()),
+                    &lic,
+                    1,
+                    "active",
+                    now,
+                    &[&s1, &s2],
+                    2,
+                    false,
+                ),
+                &roster,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_partner_record_rollback");
+
+        // insufficient quorum rejected.
+        let err = backend
+            .put_partner_record(
+                op::signed_partner_record(
+                    &format!("prq-{}", uuid_like()),
+                    &lic,
+                    3,
+                    "active",
+                    now,
+                    &[&s1],
+                    2,
+                    false,
+                ),
+                &roster,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_operational_authority");
+
+        // unsorted set-semantics rejected.
+        let err = backend
+            .put_partner_record(
+                op::signed_partner_record(
+                    &format!("pru-{}", uuid_like()),
+                    &lic,
+                    3,
+                    "active",
+                    now,
+                    &[&s1, &s2],
+                    2,
+                    true,
+                ),
+                &roster,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_set_semantics_unsorted");
+
+        // monotonic merge winner: revision 2 revoked.
+        let rows = backend.list_partner_records_for(&lic).await.unwrap();
+        let current = crate::federation::operational::resolve_monotonic_quorum(&rows).unwrap();
+        assert_eq!(current.attestation_id, pr2_id);
+        assert_eq!(current.status, "revoked");
+
+        // bulk since-cursor returns rows after the cursor, ordered.
+        let page = backend
+            .list_partner_records_since(Some(now - chrono::Duration::seconds(1)), 100)
+            .await
+            .unwrap();
+        assert!(page.iter().any(|p| p.license_id == lic));
     }
 }

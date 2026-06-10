@@ -109,6 +109,11 @@ struct State {
     /// `(subject_key_id, asserted_at)` PK.
     federation_location_proofs:
         HashMap<(String, chrono::DateTime<chrono::Utc>), crate::federation::LocationProof>,
+    /// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13) — operational-data
+    /// rows keyed by `attestation_id`.
+    federation_organizations: HashMap<String, crate::federation::Organization>,
+    federation_org_memberships: HashMap<String, crate::federation::OrgMembership>,
+    federation_partner_records: HashMap<String, crate::federation::PartnerRecord>,
 }
 
 impl Default for MemoryBackend {
@@ -133,6 +138,9 @@ impl Default for MemoryBackend {
                 federation_family_membership_revocations: HashMap::new(),
                 federation_community_membership_revocations: HashMap::new(),
                 federation_location_proofs: HashMap::new(),
+                federation_organizations: HashMap::new(),
+                federation_org_memberships: HashMap::new(),
+                federation_partner_records: HashMap::new(),
                 blackhole_rules: HashMap::new(),
             }),
         }
@@ -1133,6 +1141,217 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by(|a, b| a.community_key_id.cmp(&b.community_key_id));
+        Ok(rows)
+    }
+
+    // ── CEG 1.0-RC2 §5.6.8.13 operational data (v5.1.0, #65) ───────
+
+    async fn put_organization(
+        &self,
+        signed: crate::federation::SignedOrganization,
+        key_directory: &[ciris_verify_core::threshold::ThresholdMember],
+        root_stewards: &[String],
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::operational;
+        let mut row = signed.organization;
+        let now = chrono::Utc::now();
+        operational::check_skew_and_payment(row.asserted_at, now, &row.signed_envelope)?;
+        let mut state = self.state.lock().expect("memory backend lock");
+        let current: Vec<_> = state
+            .federation_org_memberships
+            .values()
+            .filter(|m| m.org_id == row.org_id)
+            .cloned()
+            .collect();
+        operational::check_role_authority(
+            &row.attesting_key_id,
+            &row.org_id,
+            &current,
+            key_directory,
+            root_stewards,
+        )?;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        memory_idempotent_insert(
+            &mut state.federation_organizations,
+            row.attestation_id.clone(),
+            row,
+            "organization",
+        )
+    }
+
+    async fn put_org_membership(
+        &self,
+        signed: crate::federation::SignedOrgMembership,
+        key_directory: &[ciris_verify_core::threshold::ThresholdMember],
+        root_stewards: &[String],
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::operational;
+        let mut row = signed.org_membership;
+        let now = chrono::Utc::now();
+        operational::check_skew_and_payment(row.asserted_at, now, &row.signed_envelope)?;
+        let mut state = self.state.lock().expect("memory backend lock");
+        let current: Vec<_> = state
+            .federation_org_memberships
+            .values()
+            .filter(|m| m.org_id == row.org_id)
+            .cloned()
+            .collect();
+        operational::check_role_authority(
+            &row.attesting_key_id,
+            &row.org_id,
+            &current,
+            key_directory,
+            root_stewards,
+        )?;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        memory_idempotent_insert(
+            &mut state.federation_org_memberships,
+            row.attestation_id.clone(),
+            row,
+            "org_membership",
+        )
+    }
+
+    async fn put_partner_record(
+        &self,
+        signed: crate::federation::SignedPartnerRecord,
+        steward_roster: &[ciris_verify_core::threshold::ThresholdMember],
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::operational;
+        let now = chrono::Utc::now();
+        operational::check_skew_and_payment(
+            signed.partner_record.asserted_at,
+            now,
+            &signed.partner_record.signed_envelope,
+        )?;
+        operational::check_partner_set_and_quorum(&signed, steward_roster)?;
+        let mut state = self.state.lock().expect("memory backend lock");
+        let existing_max = state
+            .federation_partner_records
+            .values()
+            .filter(|p| p.license_id == signed.partner_record.license_id)
+            .map(|p| p.revision)
+            .max();
+        operational::check_partner_revision_monotonic(
+            &signed.partner_record.license_id,
+            signed.partner_record.revision,
+            existing_max,
+        )?;
+        let mut row = signed.partner_record;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        memory_idempotent_insert(
+            &mut state.federation_partner_records,
+            row.attestation_id.clone(),
+            row,
+            "partner_record",
+        )
+    }
+
+    async fn list_organizations_for(
+        &self,
+        org_id: &str,
+    ) -> Result<Vec<crate::federation::Organization>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_organizations
+            .values()
+            .filter(|o| o.org_id == org_id)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.attestation_id.cmp(&b.attestation_id));
+        Ok(rows)
+    }
+
+    async fn list_org_memberships_for(
+        &self,
+        org_id: &str,
+    ) -> Result<Vec<crate::federation::OrgMembership>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_org_memberships
+            .values()
+            .filter(|m| m.org_id == org_id)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.attestation_id.cmp(&b.attestation_id));
+        Ok(rows)
+    }
+
+    async fn list_partner_records_for(
+        &self,
+        license_id: &str,
+    ) -> Result<Vec<crate::federation::PartnerRecord>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_partner_records
+            .values()
+            .filter(|p| p.license_id == license_id)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.attestation_id.cmp(&b.attestation_id));
+        Ok(rows)
+    }
+
+    async fn list_organizations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::Organization>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_organizations
+            .values()
+            .filter(|o| since.map_or(true, |s| o.asserted_at > s))
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.asserted_at
+                .cmp(&b.asserted_at)
+                .then_with(|| a.attestation_id.cmp(&b.attestation_id))
+        });
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    async fn list_org_memberships_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::OrgMembership>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_org_memberships
+            .values()
+            .filter(|m| since.map_or(true, |s| m.asserted_at > s))
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.asserted_at
+                .cmp(&b.asserted_at)
+                .then_with(|| a.attestation_id.cmp(&b.attestation_id))
+        });
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    async fn list_partner_records_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::PartnerRecord>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_partner_records
+            .values()
+            .filter(|p| since.map_or(true, |s| p.asserted_at > s))
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.asserted_at
+                .cmp(&b.asserted_at)
+                .then_with(|| a.attestation_id.cmp(&b.attestation_id))
+        });
+        rows.truncate(limit as usize);
         Ok(rows)
     }
 
@@ -2407,6 +2626,29 @@ fn uuid_like_counter() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(1);
     COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Append-only idempotent insert keyed by `attestation_id` (the V071
+/// operational tables): a re-submit of byte-identical content is a no-op
+/// `Ok(())`; a collision with differing content is an
+/// [`Error::Conflict`](crate::federation::Error::Conflict). Mirrors the
+/// `put_public_key` idempotent contract on the in-memory backend.
+fn memory_idempotent_insert<V: PartialEq>(
+    map: &mut std::collections::HashMap<String, V>,
+    key: String,
+    value: V,
+    kind: &str,
+) -> Result<(), crate::federation::Error> {
+    match map.get(&key) {
+        Some(existing) if *existing == value => Ok(()),
+        Some(_) => Err(crate::federation::Error::Conflict(format!(
+            "{kind} attestation_id {key} already exists with differing content"
+        ))),
+        None => {
+            map.insert(key, value);
+            Ok(())
+        }
+    }
 }
 
 /// Helper trait for None-or-zero check used by the memory backend's
