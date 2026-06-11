@@ -5,7 +5,7 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [Unreleased] — 5.4.0
+## [5.4.0] — 2026-06-11
 
 ### Added — versioned `LocalIdentityAggregate` v1 (CIRISPersist#198; CEG 1.0 §5.6.8.8.2)
 
