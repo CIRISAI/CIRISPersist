@@ -5,6 +5,18 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [5.5.0] — 2026-06-11
+
+### Added — LocalIdentityAggregate RET-transport role completes the triple (CIRISPersist#199; CIRISEdge#65 v2.1.0)
+
+`Engine::local_identity_aggregate` / the PyO3 method now accept **caller-supplied** RET-transport pubkeys (`transport_x25519_b64` / `transport_ed25519_b64`, both-or-neither), completing the three-role §5.6.8.8.2 hybrid identity. persist is the substrate and holds no edge handle — the cohabitation runs edge→persist (`PyEdge::engine()` + persist's PyCapsule exporters), so persist does **not** reach into edge; the consumer reads `edge.transport_identity_pubkeys()` (ciris-edge ≥ 2.1.0) and passes the two classical pubkeys in. persist validates (32-byte halves) + hashes them into the single authoritative aggregate. **No `ciris-edge` Rust dependency** — just two base64 strings.
+
+- **§5.6.8.8.2 / #71-C4 key-separation guard:** a transport x25519 that equals the content-KEM x25519 is rejected (the wire-checkable cross-protocol-reuse case). The signing→KEX derivation the original #198 sketch proposed remains structurally impossible (content-KEM is independently minted).
+- All three roles now populate from their conformant sources: signing (local signer) + content-KEM (persist mints+seals) + RET-transport (edge, via the consumer). `aggregate_version` stays 1.
+
+### Tests
+SQLite + live-PG: transport-populated role folds into `identity_hash`; both-or-neither rejects a single half; the §5.6.8.8.2 content==transport reuse is rejected.
+
 ## [5.4.0] — 2026-06-11
 
 ### Added — versioned `LocalIdentityAggregate` v1 (CIRISPersist#198; CEG 1.0 §5.6.8.8.2)

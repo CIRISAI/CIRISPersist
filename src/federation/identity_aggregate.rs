@@ -8,7 +8,7 @@
 //! | Role | Keys | Source | v1 |
 //! |---|---|---|---|
 //! | Signing | Ed25519 + ML-DSA-65 | persist's local signer (held) | populated |
-//! | RET-transport | X25519 + Ed25519 (classical) | edge (`transport_identity_pubkeys()`) | **None — seam for #199** |
+//! | RET-transport | X25519 + Ed25519 (classical) | edge (`transport_identity_pubkeys()`) | **caller-supplied (#199)** |
 //! | Content-KEM | X25519 + ML-KEM-768 | persist mints + seals | populated |
 //!
 //! §5.6.8.8.2 is normative: *"three distinct keypairs; deriving the
@@ -65,10 +65,13 @@ pub struct LocalIdentityAggregate {
 
     // ── RET-transport role (X25519 + Ed25519 classical) — edge ───────
     /// Reticulum transport X25519 pubkey, base64 (32 raw bytes).
-    /// **`None` in v1** — populated from edge once #199 is wired.
+    /// **Caller-supplied (#199):** the cohabiting consumer passes edge's
+    /// `transport_identity_pubkeys()` x25519 in; `None` for transport-less
+    /// Edge. Validated `!=` the content-KEM x25519 (§5.6.8.8.2).
     pub reticulum_x25519_pubkey_b64: Option<String>,
     /// Reticulum transport Ed25519 pubkey, base64 (32 raw bytes).
-    /// **`None` in v1** — populated from edge once #199 is wired.
+    /// **Caller-supplied (#199):** edge's `transport_identity_pubkeys()`
+    /// ed25519; both-or-neither with the x25519 half.
     pub reticulum_ed25519_pubkey_b64: Option<String>,
 
     // ── Content-KEM role (X25519 + ML-KEM-768) — persist mints+seals ─
@@ -146,7 +149,8 @@ impl LocalIdentityAggregate {
     /// `aggregate_version = 1` + `evaluated_at_unix_ms = now`.
     ///
     /// The signing Ed25519 pubkey is required (the signing role is
-    /// mandatory). RET-transport is `None` in v1. Content-KEM pubkeys are
+    /// mandatory). RET-transport is caller-supplied (#199; validated by
+    /// [`validate_transport_pubkeys`]). Content-KEM pubkeys are
     /// the freshly-minted halves from
     /// [`load_or_init_content_kem_identity`](crate::federation::blobs::BlobStorage::load_or_init_content_kem_identity).
     #[allow(clippy::too_many_arguments)]
@@ -206,7 +210,60 @@ pub struct ContentKemIdentity {
     pub ml_kem_768_pubkey_b64: String,
 }
 
-/// Mint a fresh content-KEM keypair pair (X25519 + ML-KEM-768) via
+/// v5.5.0 (CIRISPersist#199) — validate the caller-supplied RET-transport
+/// pubkeys for [`crate::Engine::local_identity_aggregate`]. persist does not
+/// reach into edge (it is the substrate); the cohabiting consumer reads
+/// `edge.transport_identity_pubkeys()` and passes them here.
+///
+/// **Both-or-neither:** both `None` ⇒ `(None, None)` (transport-less Edge);
+/// exactly one set ⇒ error. When both are set, each MUST base64-decode to
+/// exactly 32 raw bytes, and the transport x25519 MUST NOT equal the
+/// content-KEM x25519 — the §5.6.8.8.2 / #71-C4 cross-protocol key-reuse
+/// guard (the one reuse case checkable on the wire).
+///
+/// # Errors
+/// [`crate::federation::BlobError::Backend`] on a both-or-neither violation,
+/// a malformed / wrong-length pubkey, or a transport==content-KEM x25519
+/// reuse.
+pub fn validate_transport_pubkeys(
+    transport_x25519_b64: Option<String>,
+    transport_ed25519_b64: Option<String>,
+    content_x25519_b64: &str,
+) -> Result<(Option<String>, Option<String>), crate::federation::BlobError> {
+    let mk_err = crate::federation::BlobError::Backend;
+    match (transport_x25519_b64, transport_ed25519_b64) {
+        (None, None) => Ok((None, None)),
+        (Some(_), None) | (None, Some(_)) => Err(mk_err(
+            "local_identity_aggregate: RET-transport pubkeys are both-or-neither (got exactly \
+             one of transport_x25519_b64 / transport_ed25519_b64)"
+                .to_string(),
+        )),
+        (Some(x), Some(ed)) => {
+            for (label, b64) in [("transport x25519", &x), ("transport ed25519", &ed)] {
+                let raw = B64.decode(b64.as_bytes()).map_err(|e| {
+                    mk_err(format!("local_identity_aggregate: {label} base64: {e}"))
+                })?;
+                if raw.len() != 32 {
+                    return Err(mk_err(format!(
+                        "local_identity_aggregate: {label} is {} bytes, expected 32",
+                        raw.len()
+                    )));
+                }
+            }
+            // §5.6.8.8.2 / #71-C4: transport x25519 != content-KEM x25519.
+            if x == content_x25519_b64 {
+                return Err(mk_err(
+                    "local_identity_aggregate: RET-transport x25519 equals the content-KEM x25519 \
+                     — cross-protocol key reuse (CEG §5.6.8.8.2 / #71-C4)"
+                        .to_string(),
+                ));
+            }
+            Ok((Some(x), Some(ed)))
+        }
+    }
+}
+
+/// Mint a fresh content-KEM keypair (X25519 + ML-KEM-768) via
 /// `ciris_crypto`, returning `(x25519_priv[32], x25519_pub[32],
 /// ml_kem_priv, ml_kem_pub)`. The x25519 keypair is generated
 /// **independently** (its own CSPRNG draw) — never derived from a

@@ -1305,8 +1305,23 @@ impl Engine {
     /// The `identity_hash` is computed over the present role pubkeys; the
     /// `aggregate_version` is `1`; `evaluated_at_unix_ms` is now.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    /// v5.5.0 (CIRISPersist#199, CIRISEdge#65 v2.1.0) — the **RET-transport
+    /// role** is supplied by the caller, not reached for: persist is the
+    /// substrate and does not hold an edge handle (cohabitation runs
+    /// edge→persist via `PyEdge::engine()` + persist's PyCapsule exporters).
+    /// The cohabiting consumer reads `edge.transport_identity_pubkeys()` and
+    /// passes the two classical pubkeys in; persist validates + hashes them
+    /// into the single authoritative aggregate.
+    ///
+    /// `transport_x25519_b64` / `transport_ed25519_b64` are **both-or-neither**
+    /// (32 raw bytes each, base64-standard). `None`/`None` ⇒ RET-transport
+    /// stays absent (transport-less Edge). A §5.6.8.8.2 key-separation guard
+    /// rejects a transport x25519 that equals the content-KEM x25519 (the
+    /// wire-checkable #71-C4 reuse case).
     pub async fn local_identity_aggregate(
         &self,
+        transport_x25519_b64: Option<String>,
+        transport_ed25519_b64: Option<String>,
     ) -> Result<crate::federation::LocalIdentityAggregate, crate::federation::BlobError> {
         use crate::federation::blobs::BlobStorage;
         use crate::federation::LocalIdentityAggregate;
@@ -1335,12 +1350,13 @@ impl Engine {
             BackendDispatch::Sqlite(arc) => arc.load_or_init_content_kem_identity().await?,
         };
 
-        // ── RET-transport role — None in v1 (#199 seam). ──
-        // RET-transport (#199): populate from
-        // engine.edge.transport_identity_pubkeys() once ciris-edge>=2.1.0
-        // is wired.
-        let reticulum_x25519_pubkey_b64 = None;
-        let reticulum_ed25519_pubkey_b64 = None;
+        // ── RET-transport role — caller-supplied (#199), validated. ──
+        let (reticulum_x25519_pubkey_b64, reticulum_ed25519_pubkey_b64) =
+            crate::federation::identity_aggregate::validate_transport_pubkeys(
+                transport_x25519_b64,
+                transport_ed25519_b64,
+                &content.x25519_pubkey_b64,
+            )?;
 
         let now_ms = chrono::Utc::now().timestamp_millis();
         Ok(LocalIdentityAggregate::assemble(
@@ -4501,7 +4517,10 @@ mod tests {
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine as _;
 
-        let agg = engine.local_identity_aggregate().await.expect("aggregate");
+        let agg = engine
+            .local_identity_aggregate(None, None)
+            .await
+            .expect("aggregate");
 
         // Version + role presence.
         assert_eq!(agg.aggregate_version, 1);
@@ -4543,7 +4562,10 @@ mod tests {
 
         // Stable across two calls (idempotent content-KEM load; identical
         // pubkeys ⇒ identical identity_hash).
-        let agg2 = engine.local_identity_aggregate().await.expect("aggregate2");
+        let agg2 = engine
+            .local_identity_aggregate(None, None)
+            .await
+            .expect("aggregate2");
         assert_eq!(
             agg.content_x25519_pubkey_b64, agg2.content_x25519_pubkey_b64,
             "content-KEM x25519 stable across calls"
@@ -4561,6 +4583,43 @@ mod tests {
         let json = serde_json::to_string(&agg).unwrap();
         let back: crate::federation::LocalIdentityAggregate = serde_json::from_str(&json).unwrap();
         assert_eq!(agg, back);
+
+        // ── v5.5.0 (#199) — caller-supplied RET-transport role. ──
+        // A valid (distinct) transport keypair populates the role and
+        // changes the identity_hash (a new role folded in).
+        let t_x = B64.encode([0x11u8; 32]);
+        let t_ed = B64.encode([0x22u8; 32]);
+        let with_t = engine
+            .local_identity_aggregate(Some(t_x.clone()), Some(t_ed.clone()))
+            .await
+            .expect("transport-populated aggregate");
+        assert_eq!(
+            with_t.reticulum_x25519_pubkey_b64.as_deref(),
+            Some(t_x.as_str())
+        );
+        assert_eq!(
+            with_t.reticulum_ed25519_pubkey_b64.as_deref(),
+            Some(t_ed.as_str())
+        );
+        assert_ne!(
+            with_t.identity_hash, agg.identity_hash,
+            "RET-transport role folds into identity_hash"
+        );
+
+        // both-or-neither: exactly one half → error.
+        assert!(engine
+            .local_identity_aggregate(Some(t_x.clone()), None)
+            .await
+            .is_err());
+
+        // §5.6.8.8.2 / #71-C4: transport x25519 == content-KEM x25519 → reject.
+        assert!(
+            engine
+                .local_identity_aggregate(Some(content_x.clone()), Some(t_ed))
+                .await
+                .is_err(),
+            "transport x25519 reusing the content-KEM x25519 must be rejected (§5.6.8.8.2)"
+        );
     }
 
     #[cfg(feature = "sqlite")]
@@ -4584,7 +4643,7 @@ mod tests {
             .expect("construct engine");
         let engine = Engine::from_shared(signed.backend().clone(), signed.signer().clone());
         let err = engine
-            .local_identity_aggregate()
+            .local_identity_aggregate(None, None)
             .await
             .expect_err("no signer → error");
         assert!(

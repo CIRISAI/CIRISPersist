@@ -2298,16 +2298,26 @@ impl PyEngine {
     /// - **Signing** (Ed25519 + ML-DSA-65) — this Engine's local signer.
     ///   Ed25519 required (raises `ValueError` with no signer); ML-DSA-65
     ///   present only when a PQC signer is wired.
-    /// - **RET-transport** (X25519 + Ed25519) — **`None` in v1**. (#199):
-    ///   populate from `engine.edge.transport_identity_pubkeys()` once
-    ///   ciris-edge >= 2.1.0 is wired.
+    /// - **RET-transport** (X25519 + Ed25519) — **caller-supplied** (#199).
+    ///   persist is the substrate and holds no edge handle, so the cohabiting
+    ///   consumer reads `edge.transport_identity_pubkeys()` (ciris-edge >=
+    ///   2.1.0) and passes the two classical pubkeys in here as
+    ///   `transport_x25519_b64` / `transport_ed25519_b64` (both-or-neither;
+    ///   omit for transport-less Edge). persist validates + hashes them into
+    ///   the single authoritative aggregate.
     /// - **Content-KEM** (X25519 + ML-KEM-768) — a freshly-minted,
     ///   persist-sealed keypair (NOT derived from the signing key —
     ///   §5.6.8.8.2 forbids derivation), stable across calls/reboots.
     ///
     /// The lens publishes one endpoint; agent 2.9.6 calls it once and gets
     /// the role bundle. Returns JSON-encoded `LocalIdentityAggregate`.
-    fn local_identity_aggregate(&self, py: Python<'_>) -> PyResult<String> {
+    #[pyo3(signature = (transport_x25519_b64=None, transport_ed25519_b64=None))]
+    fn local_identity_aggregate(
+        &self,
+        py: Python<'_>,
+        transport_x25519_b64: Option<String>,
+        transport_ed25519_b64: Option<String>,
+    ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
             use crate::federation::blobs::BlobStorage;
@@ -2349,18 +2359,23 @@ impl PyEngine {
                 }
                 .map_err(blob_err_to_py)?;
 
-                // RET-transport role — None in v1.
-                // RET-transport (#199): populate from
-                // engine.edge.transport_identity_pubkeys() once
-                // ciris-edge>=2.1.0 is wired.
+                // RET-transport role — caller-supplied (#199), validated
+                // (both-or-neither, 32-byte halves, != content-KEM x25519).
+                let (ret_x25519, ret_ed25519) =
+                    crate::federation::identity_aggregate::validate_transport_pubkeys(
+                        transport_x25519_b64,
+                        transport_ed25519_b64,
+                        &content.x25519_pubkey_b64,
+                    )
+                    .map_err(blob_err_to_py)?;
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 Ok(LocalIdentityAggregate::assemble(
                     key_id,
                     pqc_key_id,
                     ed25519_pubkey_b64,
                     ml_dsa_65_pubkey_b64,
-                    None,
-                    None,
+                    ret_x25519,
+                    ret_ed25519,
                     Some(content.x25519_pubkey_b64),
                     Some(content.ml_kem_768_pubkey_b64),
                     now_ms,
