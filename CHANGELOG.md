@@ -5,7 +5,7 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [Unreleased] — 5.3.0
+## [5.3.0] — 2026-06-11
 
 ### Added — substrate cache on `aggregate_scoring_factors_batch` (CIRISPersist#195; FSD §7)
 
