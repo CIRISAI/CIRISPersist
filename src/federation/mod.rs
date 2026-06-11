@@ -723,6 +723,24 @@ pub trait FederationDirectory: Send + Sync {
         limit: u32,
     ) -> Result<Vec<PartnerRecord>, Error>;
 
+    /// v5.2.0 (CIRISPersist#194, CIRISEdge#65 v2 bridge) — bulk-list the
+    /// **full [`SignedPartnerRecord`] wrappers** (row + the M-of-N steward
+    /// signature set + threshold) since a cursor, with the same ordering +
+    /// cursor contract as [`Self::list_partner_records_since`]
+    /// (`asserted_at ASC, attestation_id ASC`).
+    ///
+    /// Unlike [`Self::list_partner_records_since`] (which returns rows
+    /// *without* signatures), this re-emits the wrapper the producer signed,
+    /// so the Edge v2 Initiator can recompute a **byte-reproducible**
+    /// `envelope_hash` from JCS bytes identical to the sender's — the
+    /// property anti-entropy convergence depends on. Records admitted before
+    /// v5.2.0 (admit-only era) carry an empty signature set + `threshold: 0`.
+    async fn list_signed_partner_records_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<SignedPartnerRecord>, Error>;
+
     /// v4.8.0 (#161 Ask 2) — occurrences of `identity_key_id` that are
     /// **currently active**: admitted AND with no revocation whose
     /// `effective_at <= now`. This is the honest view

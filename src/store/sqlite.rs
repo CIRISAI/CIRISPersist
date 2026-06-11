@@ -2400,6 +2400,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             signed.partner_record.revision,
             existing_max,
         )?;
+        // v5.2.0 (#194) — persist the M-of-N steward signature set + threshold
+        // so the full SignedPartnerRecord wrapper can be re-emitted for the
+        // Edge v2 bidirectional bridge. Captured before partner_record moves.
+        let steward_sigs_json = serde_json::to_string(&signed.steward_signatures).map_err(|e| {
+            crate::federation::Error::Backend(format!("serialize steward signatures: {e}"))
+        })?;
+        let threshold = signed.threshold as i64;
         let mut row = signed.partner_record;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let env_text = serde_json::to_string(&row.signed_envelope)
@@ -2412,8 +2419,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     attestation_id, license_id, partner_id, org_id, license_type, \
                     max_autonomy_tier, requires_supervisor, deployment_limit, \
                     offline_grace_hours, status, revision, issued_at, expires_at, \
-                    asserted_at, signed_envelope, withdrawn_at, persist_row_hash\
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17) \
+                    asserted_at, signed_envelope, withdrawn_at, persist_row_hash, \
+                    steward_signatures, threshold\
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19) \
                  ON CONFLICT(attestation_id) DO NOTHING",
                 rusqlite::params![
                     row.attestation_id,
@@ -2433,6 +2441,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     env_text,
                     row.withdrawn_at.map(|t| t.to_rfc3339()),
                     row.persist_row_hash,
+                    steward_sigs_json,
+                    threshold,
                 ],
             )?;
             Ok(())
@@ -2560,6 +2570,31 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             rows.collect()
         })()
         .map_err(|e| crate::federation::Error::Backend(format!("list_partner_records_since: {e}")))
+    }
+
+    async fn list_signed_partner_records_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedPartnerRecord>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let since = since.map(|t| t.to_rfc3339());
+        (move || -> Result<Vec<_>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT * FROM federation_partner_records \
+                 WHERE (?1 IS NULL OR asserted_at > ?1) \
+                 ORDER BY asserted_at ASC, attestation_id ASC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![since, limit],
+                sqlite_row_to_signed_partner_record,
+            )?;
+            rows.collect()
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("list_signed_partner_records_since: {e}"))
+        })
     }
 
     async fn attach_key_pqc_signature(
@@ -7392,6 +7427,27 @@ fn sqlite_row_to_partner_record(
     })
 }
 
+/// v5.2.0 (CIRISPersist#194) — row → SignedPartnerRecord: the
+/// [`sqlite_row_to_partner_record`] row plus the persisted M-of-N steward
+/// signature set + threshold, so the full wrapper re-emits for the Edge v2
+/// bidirectional bridge. Pre-v5.2.0 (admit-only) rows carry the `'[]'` / `0`
+/// column defaults → an empty signature set.
+fn sqlite_row_to_signed_partner_record(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::SignedPartnerRecord> {
+    let partner_record = sqlite_row_to_partner_record(row)?;
+    let sigs_text: String = row.get("steward_signatures")?;
+    let steward_signatures = serde_json::from_str(&sigs_text).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let threshold: i64 = row.get("threshold")?;
+    Ok(crate::federation::SignedPartnerRecord {
+        partner_record,
+        steward_signatures,
+        threshold: threshold as usize,
+    })
+}
+
 /// v3.11.0 (CIRISPersist#143, F-AV-ROLLBACK closure) — anti-rollback
 /// admission check for sqlite. Reads the latest `scrub_timestamp` for
 /// the target `revoked_key_id`; rejects with
@@ -12123,6 +12179,80 @@ mod tests {
             .unwrap();
         let ids: Vec<_> = page.iter().map(|p| p.attestation_id.as_str()).collect();
         assert_eq!(ids, vec!["b", "c"]);
+    }
+
+    /// v5.2.0 (#194) — `list_signed_partner_records_since` re-emits the full
+    /// wrapper so anti-entropy converges. The M-of-N steward signatures +
+    /// threshold survive the round-trip (the v5.1 admit-only gap dropped
+    /// them), and the federated parts (inner envelope + signatures +
+    /// threshold) hash identically at both ends — while the naive
+    /// empty-signature reconstruction the issue warns about does NOT.
+    #[tokio::test]
+    async fn operational_list_signed_partner_records_converges() {
+        use sha2::{Digest, Sha256};
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let s1 = op::Identity::new("s1");
+        let s2 = op::Identity::new("s2");
+        let s3 = op::Identity::new("s3");
+        let roster = vec![
+            s1.founder_member(),
+            s2.founder_member(),
+            s3.founder_member(),
+        ];
+
+        let sender =
+            op::signed_partner_record("pr1", "lic-1", 1, "active", op_now(), &[&s1, &s2], 2, false);
+        backend
+            .put_partner_record(sender.clone(), &roster)
+            .await
+            .expect("2-of-3 admits");
+
+        let listed = backend
+            .list_signed_partner_records_since(None, 100)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        let received = &listed[0];
+
+        // The signatures + threshold survived (the gap v5.1 left).
+        assert_eq!(
+            received.steward_signatures, sender.steward_signatures,
+            "M-of-N steward signatures preserved"
+        );
+        assert_eq!(received.threshold, 2);
+        assert_eq!(
+            received.partner_record.signed_envelope, sender.partner_record.signed_envelope,
+            "inner envelope preserved"
+        );
+
+        // The wire-federated triple (envelope + sigs + threshold) hashes
+        // identically at both ends — `persist_row_hash` is server-internal
+        // and excluded, so we hash the federated parts the way the bridge does.
+        let fed = |spr: &crate::federation::SignedPartnerRecord| {
+            let v = serde_json::json!({
+                "envelope": spr.partner_record.signed_envelope,
+                "steward_signatures": spr.steward_signatures,
+                "threshold": spr.threshold,
+            });
+            Sha256::digest(ciris_verify_core::jcs::canonicalize(&v).unwrap())
+        };
+        assert_eq!(
+            fed(&sender),
+            fed(received),
+            "sender and receiver compute an identical envelope_hash"
+        );
+        // The naive empty-signature reconstruction (what admit-only forced) diverges.
+        let empty = crate::federation::SignedPartnerRecord {
+            partner_record: received.partner_record.clone(),
+            steward_signatures: vec![],
+            threshold: 0,
+        };
+        assert_ne!(
+            fed(&sender),
+            fed(&empty),
+            "empty-signature reconstruction diverges — the v5.1 admit-only gap"
+        );
     }
 
     #[tokio::test]

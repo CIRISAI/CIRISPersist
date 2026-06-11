@@ -3805,6 +3805,58 @@ impl PyEngine {
         self.operational_list_since(py, since_rfc3339, limit, OperationalKind::PartnerRecord)
     }
 
+    /// v5.2.0 (CIRISPersist#194, CIRISEdge#65 v2 bridge) — bulk-list the full
+    /// `SignedPartnerRecord` wrappers (row + the M-of-N steward signature set
+    /// + threshold) since a cursor, as a JSON array, with the same
+    /// `(asserted_at ASC, attestation_id ASC)` cursor contract as
+    /// `list_partner_records_since`. The Edge v2 Initiator hashes these to
+    /// advertise a byte-reproducible `envelope_hash` for anti-entropy
+    /// convergence (the unsigned `list_partner_records_since` can't
+    /// reconstruct the wire bytes).
+    fn list_signed_partner_records_since(
+        &self,
+        py: Python<'_>,
+        since_rfc3339: Option<&str>,
+        limit: u32,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let since = match since_rfc3339.filter(|s| !s.is_empty()) {
+            Some(s) => Some(
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .map_err(|e| PyValueError::new_err(format!("since_rfc3339 parse: {e}")))?
+                    .with_timezone(&chrono::Utc),
+            ),
+            None => None,
+        };
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            let rows = b
+                                .list_signed_partner_records_since(since, limit)
+                                .await
+                                .map_err(federation_err_to_py)?;
+                            serde_json::to_string(&rows).map_err(|e| {
+                                PyRuntimeError::new_err(format!(
+                                    "signed partner_record list JSON encode: {e}"
+                                ))
+                            })
+                        }};
+                    }
+                    match &self.backend {
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
     /// Federation directory: attach the cold-path PQC signature to a
     /// hybrid-pending federation_keys row. See docs/FEDERATION_DIRECTORY.md
     /// §"Trust contract" for the writer contract — this is step 4

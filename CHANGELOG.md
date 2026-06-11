@@ -5,6 +5,19 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [5.2.0] — 2026-06-10
+
+### Added — bidirectional `partner_record` replication (CIRISPersist#194; CIRISEdge#65 v2 bridge; CEG 1.0-RC2 §5.6.8.13)
+
+v5.1.x admitted `partner_record` but stored only the envelope — `put_partner_record` verified the M-of-N steward quorum then **discarded the signature set**, so the Edge v2 Initiator couldn't re-emit the full wrapper to advertise a byte-reproducible `envelope_hash` (partner_record was admit-only; anti-entropy couldn't converge for the kind). This persists the signatures and exposes them. (Organizations / org_memberships store their single-signer Ed25519+ML-DSA halves inline and were bidirectional from V071.)
+
+- **V072** (both backends) — `federation_partner_records` gains `steward_signatures` (the serialized `Vec<ThresholdSignature>` — JSONB on PG, TEXT on SQLite) + `threshold` (INTEGER). Additive; admit-only-era rows default to an empty set / `0`.
+- **`put_partner_record`** now persists the steward signature set + threshold (previously dropped after the admission quorum check).
+- **`FederationDirectory::list_signed_partner_records_since`** + PyO3 `PyEngine.list_signed_partner_records_since` — re-emit the full `SignedPartnerRecord` wrapper (row + signature set + threshold), same `(asserted_at ASC, attestation_id ASC)` cursor contract as `list_partner_records_since`. The Edge v2 Initiator hashes these so its `SummaryMessage` `envelope_hash` is byte-reproducible from JCS bytes identical to the sender's.
+
+### Tests
+SQLite (1121) + live-PG (801) green. New convergence tests (both backends): the M-of-N signatures survive the round-trip and the federated triple (envelope + signatures + threshold) hashes identically sender↔receiver, while the empty-signature reconstruction (the v5.1 admit-only path the issue warned about) diverges. Gate now includes the backend-less `cargo test --features server -D warnings` combo.
+
 ## [5.1.1] — 2026-06-10
 
 ### Fixed — CI only (library identical to the 5.1.0 tag)

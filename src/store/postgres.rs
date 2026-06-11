@@ -2707,6 +2707,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             signed.partner_record.revision,
             existing_max,
         )?;
+        // v5.2.0 (#194) — persist the M-of-N steward signature set (JSONB) +
+        // threshold so the full SignedPartnerRecord wrapper re-emits for the
+        // Edge v2 bidirectional bridge. Captured before partner_record moves.
+        let steward_sigs_value = serde_json::to_value(&signed.steward_signatures).map_err(|e| {
+            crate::federation::Error::Backend(format!("serialize steward signatures: {e}"))
+        })?;
+        // `threshold` column is INTEGER (int4) — bind i32, not i64 (a small
+        // M-of-N steward count; tokio-postgres rejects an i64 → INTEGER bind).
+        let threshold = signed.threshold as i32;
         let mut row = signed.partner_record;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let revision = row.revision as i64;
@@ -2722,8 +2731,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     attestation_id, license_id, partner_id, org_id, license_type, \
                     max_autonomy_tier, requires_supervisor, deployment_limit, \
                     offline_grace_hours, status, revision, issued_at, expires_at, \
-                    asserted_at, signed_envelope, withdrawn_at, persist_row_hash\
-                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) \
+                    asserted_at, signed_envelope, withdrawn_at, persist_row_hash, \
+                    steward_signatures, threshold\
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) \
                  ON CONFLICT (attestation_id) DO NOTHING",
                 &[
                     &row.attestation_id,
@@ -2743,6 +2753,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.signed_envelope,
                     &row.withdrawn_at,
                     &row.persist_row_hash,
+                    &steward_sigs_value,
+                    &threshold,
                 ],
             )
             .await
@@ -2883,6 +2895,32 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 crate::federation::Error::Backend(format!("list_partner_records_since: {e}"))
             })?;
         rows.into_iter().map(pg_row_to_partner_record).collect()
+    }
+
+    async fn list_signed_partner_records_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedPartnerRecord>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let limit = i64::from(limit);
+        let rows = client
+            .query(
+                "SELECT * FROM cirislens.federation_partner_records \
+                 WHERE ($1::timestamptz IS NULL OR asserted_at > $1) \
+                 ORDER BY asserted_at ASC, attestation_id ASC LIMIT $2",
+                &[&since, &limit],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_signed_partner_records_since: {e}"))
+            })?;
+        rows.into_iter()
+            .map(pg_row_to_signed_partner_record)
+            .collect()
     }
 
     async fn attach_key_pqc_signature(
@@ -7384,6 +7422,29 @@ fn pg_row_to_partner_record(
         signed_envelope: row.safe_get_with("signed_envelope", mk_err)?,
         withdrawn_at: row.safe_get_with("withdrawn_at", mk_err)?,
         persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
+    })
+}
+
+/// v5.2.0 (CIRISPersist#194) — row → SignedPartnerRecord: the
+/// [`pg_row_to_partner_record`] row plus the persisted M-of-N steward
+/// signature set + threshold, re-emitting the full wrapper for the Edge v2
+/// bidirectional bridge. Pre-v5.2.0 (admit-only) rows carry the `'[]'` / `0`
+/// column defaults → an empty signature set. The borrowing column reads run
+/// before `row` is consumed by [`pg_row_to_partner_record`].
+fn pg_row_to_signed_partner_record(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::SignedPartnerRecord, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    let steward_sigs_value: serde_json::Value = row.safe_get_with("steward_signatures", mk_err)?;
+    let threshold: i32 = row.safe_get_with("threshold", mk_err)?;
+    let steward_signatures = serde_json::from_value(steward_sigs_value).map_err(|e| {
+        crate::federation::Error::Backend(format!("deserialize steward signatures: {e}"))
+    })?;
+    let partner_record = pg_row_to_partner_record(row)?;
+    Ok(crate::federation::SignedPartnerRecord {
+        partner_record,
+        steward_signatures,
+        threshold: threshold as usize,
     })
 }
 
@@ -22074,5 +22135,68 @@ mod tests {
             .await
             .unwrap();
         assert!(page.iter().any(|p| p.license_id == lic));
+    }
+
+    /// Live-PG: v5.2.0 (#194) — `list_signed_partner_records_since` re-emits
+    /// the full wrapper across the JSONB serialize/deserialize round-trip; the
+    /// M-of-N steward signatures + threshold survive and the federated-parts
+    /// hash converges sender↔receiver (vs the empty-sig reconstruction).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_operational_list_signed_partner_records_converges() {
+        use crate::federation::operational::test_support as op;
+        use crate::federation::FederationDirectory;
+        use sha2::{Digest, Sha256};
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let now = chrono::Utc::now();
+        let lic = format!("siglic-{}", uuid_like());
+        let s1 = op::Identity::new("s1");
+        let s2 = op::Identity::new("s2");
+        let s3 = op::Identity::new("s3");
+        let roster = vec![
+            s1.founder_member(),
+            s2.founder_member(),
+            s3.founder_member(),
+        ];
+        let pr_id = format!("sigpr-{}", uuid_like());
+        let sender =
+            op::signed_partner_record(&pr_id, &lic, 1, "active", now, &[&s1, &s2], 2, false);
+        backend
+            .put_partner_record(sender.clone(), &roster)
+            .await
+            .unwrap();
+
+        let listed = backend
+            .list_signed_partner_records_since(Some(now - chrono::Duration::seconds(1)), 200)
+            .await
+            .unwrap();
+        let received = listed
+            .iter()
+            .find(|s| s.partner_record.attestation_id == pr_id)
+            .expect("the signed record is listed back");
+        assert_eq!(
+            received.steward_signatures, sender.steward_signatures,
+            "M-of-N signatures survive the JSONB round-trip"
+        );
+        assert_eq!(received.threshold, 2);
+
+        let fed = |spr: &crate::federation::SignedPartnerRecord| {
+            let v = serde_json::json!({
+                "envelope": spr.partner_record.signed_envelope,
+                "steward_signatures": spr.steward_signatures,
+                "threshold": spr.threshold,
+            });
+            Sha256::digest(ciris_verify_core::jcs::canonicalize(&v).unwrap())
+        };
+        assert_eq!(
+            fed(&sender),
+            fed(received),
+            "sender and receiver compute an identical envelope_hash"
+        );
     }
 }

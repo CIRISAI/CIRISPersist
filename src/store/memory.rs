@@ -114,6 +114,12 @@ struct State {
     federation_organizations: HashMap<String, crate::federation::Organization>,
     federation_org_memberships: HashMap<String, crate::federation::OrgMembership>,
     federation_partner_records: HashMap<String, crate::federation::PartnerRecord>,
+    /// v5.2.0 (#194) — the M-of-N steward signature set + threshold per
+    /// partner_record `attestation_id`, so `list_signed_partner_records_since`
+    /// reconstructs the full wrapper (the row map above holds only the
+    /// unsigned [`PartnerRecord`]).
+    federation_partner_record_sigs:
+        HashMap<String, (Vec<ciris_verify_core::threshold::ThresholdSignature>, usize)>,
 }
 
 impl Default for MemoryBackend {
@@ -141,6 +147,7 @@ impl Default for MemoryBackend {
                 federation_organizations: HashMap::new(),
                 federation_org_memberships: HashMap::new(),
                 federation_partner_records: HashMap::new(),
+                federation_partner_record_sigs: HashMap::new(),
                 blackhole_rules: HashMap::new(),
             }),
         }
@@ -1237,14 +1244,23 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             signed.partner_record.revision,
             existing_max,
         )?;
+        // v5.2.0 (#194) — keep the M-of-N steward signature set + threshold so
+        // list_signed_partner_records_since reconstructs the full wrapper.
+        let steward_signatures = signed.steward_signatures;
+        let threshold = signed.threshold;
         let mut row = signed.partner_record;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let attestation_id = row.attestation_id.clone();
         memory_idempotent_insert(
             &mut state.federation_partner_records,
-            row.attestation_id.clone(),
+            attestation_id.clone(),
             row,
             "partner_record",
-        )
+        )?;
+        state
+            .federation_partner_record_sigs
+            .insert(attestation_id, (steward_signatures, threshold));
+        Ok(())
     }
 
     async fn list_organizations_for(
@@ -1353,6 +1369,41 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         });
         rows.truncate(limit as usize);
         Ok(rows)
+    }
+
+    async fn list_signed_partner_records_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedPartnerRecord>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_partner_records
+            .values()
+            .filter(|p| since.map_or(true, |s| p.asserted_at > s))
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.asserted_at
+                .cmp(&b.asserted_at)
+                .then_with(|| a.attestation_id.cmp(&b.attestation_id))
+        });
+        rows.truncate(limit as usize);
+        Ok(rows
+            .into_iter()
+            .map(|partner_record| {
+                let (steward_signatures, threshold) = state
+                    .federation_partner_record_sigs
+                    .get(&partner_record.attestation_id)
+                    .cloned()
+                    .unwrap_or_default();
+                crate::federation::SignedPartnerRecord {
+                    partner_record,
+                    steward_signatures,
+                    threshold,
+                }
+            })
+            .collect())
     }
 
     async fn attach_key_pqc_signature(
