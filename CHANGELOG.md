@@ -5,6 +5,21 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased] — 5.3.0
+
+### Added — substrate cache on `aggregate_scoring_factors_batch` (CIRISPersist#195; FSD §7)
+
+`get_repository_statistics` already ran a substrate-side LRU+TTL cache (#162); its sibling `aggregate_scoring_factors_batch` did not — every call recomputed (fleet `/scoring/capacity/fleet` ~65s cold; multi-worker uvicorn recomputed 4×). This adds the same cache discipline, at exact parity with the repository-statistics cache.
+
+- **`ScoringFactorAggregate`** gains `evaluated_at_unix_ms: i64` + `cache_hit: bool` (mirrors `RepositoryStatistics`) and now implements `Aggregate` (`sample_count` = `trace_count`). Both fields surface automatically over the serde/PyO3 JSON boundary; both are `#[serde(default)]` so older wire payloads still decode.
+- **`aggregates::scoring`** adds `ScoringFactorsCache` (= `Cache<Vec<ScoringFactorAggregate>>` — the whole batch is one entry), `scoring_factors_cache_key(...)`, and `estimate_size`. The cache-key **filter_digest** folds the **sorted** agent set (set-semantics — caller order is irrelevant), the window, the optional baseline window, and the **ingest watermark**.
+- **Ingest watermark = the invalidation signal.** Before the lookup each backend queries `MAX(ts)` over the requested agents under the SAME §4.3 scope predicate the compute applies (`SELECT MAX(ts) ... WHERE agent_id_hash IN/= ANY(...) AND <scope>`), folding its unix-ms (or 0) into the key. New ingest for any requested agent advances the watermark → new key → miss → recompute. TTL still bounds staleness.
+- **Both backends** (SQLite + Postgres): per-backend-instance `scoring_factors_cache` field + init + `scoring_factors_cache()` accessor, mirroring `repo_stats_cache` (cross-backend-poisoning-safe, dropped with the backend).
+- **Singular `aggregate_scoring_factors` routes through batch-of-one** so the streaming path shares the cache entry; the per-agent compute moved to a private `aggregate_scoring_factors_uncached`. On a hit the cached set is remapped to the caller's input order (the batch contract is input-ordered).
+
+### Tests
+Both backends: cache **hit** (preserved `evaluated_at_unix_ms`, singular path shares the entry), **watermark invalidation** (new ingest for a requested agent flips a prior hit back to a fresh `cache_hit:false` with advanced eval time), **agent-set order independence** (reversed caller order → same key → hit). Gates: backend-less `cargo test --features server -D warnings --no-run`; clippy `-D warnings` for full-feature, sqlite-only, and `cargo check --no-default-features`; live-PG full lib suite (1127) + sqlite-only (1127) green.
+
 ## [5.2.0] — 2026-06-10
 
 ### Added — bidirectional `partner_record` replication (CIRISPersist#194; CIRISEdge#65 v2 bridge; CEG 1.0-RC2 §5.6.8.13)

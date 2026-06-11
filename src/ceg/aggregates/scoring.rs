@@ -37,9 +37,145 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::ceg::types::{DeviationMetric, TimeWindow};
+use crate::ceg::types::{Aggregate, DeviationMetric, TimeWindow};
 
 // ─── Section E — Scoring factor aggregates ─────────────────────────
+
+/// Stable cache method-id for `aggregate_scoring_factors_batch`
+/// (CIRISPersist#195, FSD §7.2). The batch result (a `Vec` of
+/// per-agent aggregates) is cached as ONE entry keyed on the sorted
+/// requested-agent set, so the streaming singular path
+/// (`aggregate_scoring_factors`, routed through batch-of-one) and the
+/// fleet batch path share the same cache entry shape.
+pub const SCORING_FACTORS_METHOD_ID: &str = "aggregate_scoring_factors_batch:v1.0";
+
+/// A scoring-factors cache, owned per backend instance (FSD §7.1 — "one
+/// cache per cohab process"), mirroring
+/// [`RepositoryStatsCache`](crate::ceg::aggregates::repository::RepositoryStatsCache).
+///
+/// The whole batch result is cached as one `Vec<ScoringFactorAggregate>`
+/// entry keyed on the sorted agent set + window + baseline + ingest
+/// watermark (see [`scoring_factors_cache_key`]). Scoped to the backend
+/// instance so a Postgres engine never serves an entry a prior SQLite
+/// engine wrote, and `reset_engine` drops its cache.
+pub type ScoringFactorsCache = crate::cache::Cache<Vec<ScoringFactorAggregate>>;
+
+/// Build the [`crate::cache::CacheKey`] for an
+/// `aggregate_scoring_factors_batch` call (CIRISPersist#195, FSD §7.2 /
+/// §7.3).
+///
+/// The **filter_digest** slot folds, in order, everything that changes
+/// the answer for a fixed scope:
+///
+/// - the `agent_id_hashes` **sorted** — set-semantics, so caller order
+///   never changes the key (two callers requesting the same agent set in
+///   a different order share the entry);
+/// - the main `window` (since + until);
+/// - the optional `baseline_window` (present/absent + its bounds);
+/// - the **ingest watermark** — `max(ts)` over the requested agents under
+///   the same scope predicate the compute applies. This is the §7.3
+///   invalidation signal for this primitive: new ingest for any requested
+///   agent advances the watermark → new key → miss → recompute. TTL still
+///   bounds staleness on top of this.
+///
+/// The `scope_digest` slot reuses repository's
+/// [`scope_digest_for`](crate::ceg::aggregates::repository::scope_digest_for)
+/// (§7.3 scope-disjoint). Window bounds + `bucket` are passed exactly as
+/// in `repository_stats_cache_key` so write-invalidation buckets line up.
+pub fn scoring_factors_cache_key(
+    agent_id_hashes: &[String],
+    window: &TimeWindow,
+    baseline_window: Option<&TimeWindow>,
+    scope: &crate::scope::CallerScope,
+    ingest_watermark_ms: i64,
+    invalidation_bucket: std::time::Duration,
+) -> crate::cache::CacheKey {
+    use crate::ceg::types::filter::canonical_window_bytes;
+
+    let scope_digest = crate::ceg::aggregates::repository::scope_digest_for(scope);
+
+    let mut h = <sha2::Sha256 as sha2::Digest>::new();
+    sha2::Digest::update(&mut h, b"ScoringFactorsFilter:v1.0\0");
+    // Sorted agent set — caller order must not matter (set-semantics).
+    let mut agents: Vec<&String> = agent_id_hashes.iter().collect();
+    agents.sort();
+    sha2::Digest::update(&mut h, (agents.len() as u64).to_le_bytes());
+    for a in agents {
+        sha2::Digest::update(&mut h, (a.len() as u64).to_le_bytes());
+        sha2::Digest::update(&mut h, a.as_bytes());
+    }
+    // Main window.
+    sha2::Digest::update(&mut h, b"|w\0");
+    sha2::Digest::update(&mut h, canonical_window_bytes(window));
+    // Optional baseline window (present/absent is part of the key).
+    sha2::Digest::update(&mut h, b"|b\0");
+    match baseline_window {
+        Some(b) => {
+            sha2::Digest::update(&mut h, [1u8]);
+            sha2::Digest::update(&mut h, canonical_window_bytes(b));
+        }
+        None => sha2::Digest::update(&mut h, [0u8]),
+    }
+    // Ingest watermark — the invalidation signal (load-bearing).
+    sha2::Digest::update(&mut h, b"|iw\0");
+    sha2::Digest::update(&mut h, ingest_watermark_ms.to_le_bytes());
+    let filter_digest: [u8; 32] = sha2::Digest::finalize(h).into();
+
+    crate::cache::CacheKey::new(
+        SCORING_FACTORS_METHOD_ID,
+        &filter_digest,
+        &scope_digest,
+        window.since.timestamp_millis(),
+        window.until.timestamp_millis(),
+        invalidation_bucket,
+    )
+}
+
+/// Reorder a cached batch result onto the caller's requested
+/// `agent_id_hashes` order (CIRISPersist#195).
+///
+/// The cache entry is shared set-wise (the key folds the *sorted* agent
+/// set), but `aggregate_scoring_factors_batch` returns one aggregate per
+/// agent in **input order**. On a hit we therefore remap the cached set
+/// onto the requested order so two callers requesting the same set in
+/// different orders each get their own order back. Any requested agent
+/// not present in the cached set (shouldn't happen — same set produced
+/// the entry) is dropped; the result length matches the cached set.
+pub fn reorder_scoring_to_input(
+    cached: Vec<ScoringFactorAggregate>,
+    agent_id_hashes: &[String],
+) -> Vec<ScoringFactorAggregate> {
+    use std::collections::HashMap;
+    let mut by_agent: HashMap<&str, ScoringFactorAggregate> = cached
+        .iter()
+        .map(|a| (a.agent_id_hash.as_str(), a.clone()))
+        .collect();
+    let mut out = Vec::with_capacity(agent_id_hashes.len());
+    for h in agent_id_hashes {
+        if let Some(a) = by_agent.remove(h.as_str()) {
+            out.push(a);
+        }
+    }
+    out
+}
+
+/// Approximate the resident byte size of a batch result for the cache's
+/// `max_bytes` accounting (§7.2), mirroring repository's `estimate_size`.
+/// Sums a coarse per-aggregate estimate (fixed scalars plus the variable
+/// `recovery_events` / `coherence_decay_series` vecs + the agent-hash
+/// string). Exactness is not load-bearing — LRU budgeting only.
+pub fn estimate_size(batch: &[ScoringFactorAggregate]) -> usize {
+    let base = std::mem::size_of::<Vec<ScoringFactorAggregate>>();
+    base + batch
+        .iter()
+        .map(|a| {
+            std::mem::size_of::<ScoringFactorAggregate>()
+                + a.agent_id_hash.len()
+                + a.recovery_events.len() * (std::mem::size_of::<RecoveryEvent>() + 64)
+                + a.coherence_decay_series.len() * std::mem::size_of::<CoherencePoint>()
+        })
+        .sum::<usize>()
+}
 
 /// One bundled aggregate covering every factor input for a single
 /// agent + window. Lens consumes this to compute the Capacity Score
@@ -100,6 +236,31 @@ pub struct ScoringFactorAggregate {
     /// Coherence pass-rate sampled at fixed-cadence subwindows
     /// across the main window. Lens applies time-decay weighting.
     pub coherence_decay_series: Vec<CoherencePoint>,
+
+    /// Unix-ms the aggregate was computed against the backend (the
+    /// *cached* time when `cache_hit`). Mirrors
+    /// [`RepositoryStatistics::evaluated_at_unix_ms`](crate::ceg::aggregates::repository::RepositoryStatistics).
+    /// CIRISPersist#195.
+    #[serde(default)]
+    pub evaluated_at_unix_ms: i64,
+    /// `true` iff served from the substrate cache (§7). CIRISPersist#195.
+    #[serde(default)]
+    pub cache_hit: bool,
+}
+
+impl Aggregate for ScoringFactorAggregate {
+    /// The window trace count is the scope-filtered windowed sample
+    /// denominator (FSD §6.1) — lens applies its k-anonymity policy
+    /// against this (AV-43).
+    fn sample_count(&self) -> i64 {
+        self.trace_count
+    }
+    fn evaluated_at_unix_ms(&self) -> i64 {
+        self.evaluated_at_unix_ms
+    }
+    fn cache_hit(&self) -> bool {
+        self.cache_hit
+    }
 }
 
 /// One recovery event — the agent's conscience overrode an action

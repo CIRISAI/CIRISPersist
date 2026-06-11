@@ -86,7 +86,11 @@ pub fn repository_stats_cache_key(
 /// (§7.3 scope-disjoint). Unauthenticated → the canonical
 /// unauthenticated digest; Authenticated → folds the resolved
 /// identity + family + community admission sets.
-fn scope_digest_for(scope: &crate::scope::CallerScope) -> [u8; 32] {
+///
+/// `pub(crate)` so the scoring-factors cache key
+/// ([`crate::ceg::aggregates::scoring::scoring_factors_cache_key`])
+/// reuses the identical scope-digest derivation (CIRISPersist#195).
+pub(crate) fn scope_digest_for(scope: &crate::scope::CallerScope) -> [u8; 32] {
     match scope {
         crate::scope::CallerScope::Unauthenticated => {
             crate::cache::key::scope_digest(false, "", &[], &[])

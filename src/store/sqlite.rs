@@ -103,6 +103,11 @@ pub struct SqliteBackend {
     /// backend. `Arc` so the engine layer / FFI `cache_stats()` can hold
     /// a handle to the same cache.
     repo_stats_cache: std::sync::Arc<crate::ceg::aggregates::repository::RepositoryStatsCache>,
+    /// v5.3.0 (CIRISPersist#195) — per-backend-instance scoring-factors
+    /// cache (§7.1), at parity with [`Self::repo_stats_cache`]. Scoped to
+    /// *this* backend so a SQLite engine never serves an entry a prior
+    /// Postgres engine wrote and `reset_engine` drops it with the backend.
+    scoring_factors_cache: std::sync::Arc<crate::ceg::aggregates::scoring::ScoringFactorsCache>,
 }
 
 impl SqliteBackend {
@@ -193,6 +198,7 @@ impl SqliteBackend {
             admission_gate: std::sync::RwLock::new(None),
             perceptual_hash_matcher: std::sync::RwLock::new(None),
             repo_stats_cache: std::sync::Arc::new(crate::cache::Cache::new()),
+            scoring_factors_cache: std::sync::Arc::new(crate::cache::Cache::new()),
         }
     }
 
@@ -204,6 +210,16 @@ impl SqliteBackend {
         &self,
     ) -> &std::sync::Arc<crate::ceg::aggregates::repository::RepositoryStatsCache> {
         &self.repo_stats_cache
+    }
+
+    /// v5.3.0 (CIRISPersist#195) — this backend's scoring-factors cache
+    /// (§7.1). The engine / FFI `cache_stats()` accessor reads from here
+    /// so observability reports *this* backend's cache, not a process
+    /// global. Parity with [`Self::repo_stats_cache`].
+    pub fn scoring_factors_cache(
+        &self,
+    ) -> &std::sync::Arc<crate::ceg::aggregates::scoring::ScoringFactorsCache> {
+        &self.scoring_factors_cache
     }
 
     /// v3.4.0 (CIRISPersist#123) — install the trust-weighted
@@ -346,6 +362,7 @@ impl SqliteBackend {
             admission_gate: std::sync::RwLock::new(None),
             perceptual_hash_matcher: std::sync::RwLock::new(None),
             repo_stats_cache: std::sync::Arc::new(crate::cache::Cache::new()),
+            scoring_factors_cache: std::sync::Arc::new(crate::cache::Cache::new()),
         })
     }
 }
@@ -10098,243 +10115,21 @@ impl crate::read::ReadEngine for SqliteBackend {
         baseline_window: Option<crate::read::TimeWindow>,
         scope: crate::scope::CallerScope,
     ) -> Result<crate::read::ScoringFactorAggregate, crate::read::Error> {
-        let agent = agent_id_hash.to_owned();
-        let since = window.since.to_rfc3339();
-        let until = window.until.to_rfc3339();
-        let window_secs = (window.until - window.since).num_seconds().max(1);
-        let bucket_secs = (window_secs / 24).max(60);
-        // §4.3 scope gate — agent/since/until are ?1/?2/?3 in every
-        // sub-query, scope binds start at ?4. The drift sub-call below
-        // receives the same scope.
-        let (scope_frag, scope_binds) = crate::store::scope_bind::scope_predicate_sqlite(
-            &scope,
-            "cohort_scope",
-            "cohort_target_id",
-            3,
-        );
-        let drift_scope = scope.clone();
-        let conn = self.conn.clone();
-        let agg = (move || -> Result<crate::read::ScoringFactorAggregate, crate::read::Error> {
-            let conn = conn.lock();
-            // [agent, since, until] then scope binds — shared by every
-            // sub-query.
-            let mk_binds = || {
-                let mut b: Vec<SqlValue> = vec![
-                    SqlValue::Text(agent.clone()),
-                    SqlValue::Text(since.clone()),
-                    SqlValue::Text(until.clone()),
-                ];
-                b.extend(scope_binds.iter().cloned());
-                b
-            };
-
-            // Main per-trace collapse + window-wide counts.
-            let main_sql = format!(
-                "WITH per_trace AS ( \
-                       SELECT trace_id, MIN(agent_name) AS agent_name, \
-                              MAX(CASE WHEN event_type = 'CONSCIENCE_RESULT' \
-                                  AND json_extract(payload, '$.action_was_overridden') = 1 \
-                                  THEN 1 ELSE 0 END) AS was_overridden, \
-                              MAX(CASE WHEN event_type = 'CONSCIENCE_RESULT' \
-                                  AND json_extract(payload, '$.conscience_passed') = 0 \
-                                  THEN 1 ELSE 0 END) AS conscience_failed, \
-                              MAX(CASE WHEN event_type = 'ACTION_RESULT' \
-                                  AND json_extract(payload, '$.success') = 1 \
-                                  THEN 1 ELSE 0 END) AS action_succeeded, \
-                              MAX(CASE WHEN audit_sequence_number IS NOT NULL \
-                                  THEN 1 ELSE 0 END) AS has_audit_seq, \
-                              MAX(CASE WHEN audit_signature IS NOT NULL \
-                                  THEN 1 ELSE 0 END) AS has_audit_sig \
-                       FROM trace_events \
-                       WHERE agent_id_hash = ?1 AND ts >= ?2 AND ts < ?3 AND {scope_frag} \
-                       GROUP BY trace_id \
-                   ) \
-                   SELECT COUNT(*) AS trace_count, \
-                          MAX(COUNT(DISTINCT agent_name) - 1, 0) AS identity_changes, \
-                          COALESCE(SUM(was_overridden), 0) AS conscience_overrides, \
-                          COALESCE(SUM(has_audit_seq), 0) AS audit_chain_total, \
-                          COALESCE(SUM(has_audit_sig), 0) AS audit_signed_total, \
-                          COALESCE(SUM(CASE WHEN conscience_failed = 1 \
-                              AND action_succeeded = 1 THEN 1 ELSE 0 END), 0) \
-                              AS unsafe_action_count \
-                   FROM per_trace"
-            );
-            struct Main {
-                trace_count: i64,
-                identity_changes: i64,
-                conscience_overrides: i64,
-                audit_chain_total: i64,
-                audit_signed_total: i64,
-                unsafe_action_count: i64,
-            }
-            let main = {
-                let mut stmt = conn
-                    .prepare(&main_sql)
-                    .map_err(sqlite_read_err("aggregate_scoring_factors main prepare"))?;
-                stmt.query_row(params_from_iter(mk_binds().iter()), |row| {
-                    Ok(Main {
-                        trace_count: row.get("trace_count")?,
-                        identity_changes: row.get("identity_changes")?,
-                        conscience_overrides: row.get("conscience_overrides")?,
-                        audit_chain_total: row.get("audit_chain_total")?,
-                        audit_signed_total: row.get("audit_signed_total")?,
-                        unsafe_action_count: row.get("unsafe_action_count")?,
-                    })
-                })
-                .map_err(sqlite_read_err("aggregate_scoring_factors main"))?
-            };
-            let unsafe_action_rate = if main.trace_count > 0 {
-                main.unsafe_action_count as f64 / main.trace_count as f64
-            } else {
-                0.0
-            };
-
-            // Audit-chain gap count via LAG window.
-            let gaps_sql = format!(
-                "WITH ordered AS ( \
-                                    SELECT audit_sequence_number AS seq, \
-                                           LAG(audit_sequence_number) OVER w AS prev_seq \
-                                    FROM trace_events \
-                                    WHERE agent_id_hash = ?1 AND ts >= ?2 AND ts < ?3 AND {scope_frag} \
-                                          AND audit_sequence_number IS NOT NULL \
-                                    WINDOW w AS (ORDER BY audit_sequence_number) \
-                                ) \
-                                SELECT COUNT(*) AS gap_count FROM ordered \
-                                WHERE prev_seq IS NOT NULL AND seq > prev_seq + 1"
-            );
-            let audit_chain_gaps: i64 = {
-                let mut stmt = conn
-                    .prepare(&gaps_sql)
-                    .map_err(sqlite_read_err("aggregate_scoring_factors gaps prepare"))?;
-                stmt.query_row(params_from_iter(mk_binds().iter()), |r| r.get("gap_count"))
-                    .map_err(sqlite_read_err("aggregate_scoring_factors gaps"))?
-            };
-
-            // Recovery events: top-50 most recent override→pass pairs.
-            let recovery_sql = format!(
-                "WITH per_trace AS ( \
-                       SELECT trace_id, MIN(ts) AS started_at, MAX(ts) AS completed_at, \
-                              MAX(CASE WHEN event_type = 'CONSCIENCE_RESULT' \
-                                  AND json_extract(payload, '$.action_was_overridden') = 1 \
-                                  THEN 1 ELSE 0 END) AS was_overridden, \
-                              MIN(CASE WHEN event_type = 'CONSCIENCE_RESULT' \
-                                  THEN json_extract(payload, '$.coherence_passed') \
-                                  ELSE 1 END) AS coherence_passed \
-                       FROM trace_events \
-                       WHERE agent_id_hash = ?1 AND ts >= ?2 AND ts < ?3 AND {scope_frag} \
-                       GROUP BY trace_id \
-                   ), \
-                   ordered AS ( \
-                       SELECT trace_id, started_at, completed_at, was_overridden, \
-                              LEAD(trace_id) OVER w AS next_trace_id, \
-                              LEAD(started_at) OVER w AS next_started_at, \
-                              LEAD(coherence_passed) OVER w AS next_coherence_passed \
-                       FROM per_trace WINDOW w AS (ORDER BY started_at) \
-                   ) \
-                   SELECT trace_id AS override_trace_id, completed_at AS override_at, \
-                          next_trace_id AS recovery_trace_id, \
-                          next_started_at AS recovery_at \
-                   FROM ordered \
-                   WHERE was_overridden = 1 AND next_trace_id IS NOT NULL \
-                         AND next_coherence_passed = 1 \
-                   ORDER BY override_at DESC LIMIT 50"
-            );
-            let recovery_events: Vec<crate::read::RecoveryEvent> = {
-                let mut stmt = conn.prepare(&recovery_sql).map_err(sqlite_read_err(
-                    "aggregate_scoring_factors recovery prepare",
-                ))?;
-                let collected = stmt
-                    .query_map(params_from_iter(mk_binds().iter()), |row| {
-                        let override_at: String = row.get("override_at")?;
-                        let recovery_at: String = row.get("recovery_at")?;
-                        let o = parse_rfc3339(&override_at);
-                        let r = parse_rfc3339(&recovery_at);
-                        Ok(crate::read::RecoveryEvent {
-                            override_trace_id: row.get("override_trace_id")?,
-                            override_at: o,
-                            recovery_trace_id: row.get("recovery_trace_id")?,
-                            recovery_at: r,
-                            recovery_latency_seconds: (r - o).num_milliseconds() as f64 / 1000.0,
-                        })
-                    })
-                    .map_err(sqlite_read_err("aggregate_scoring_factors recovery query"))?
-                    .collect::<Result<Vec<_>, _>>();
-                collected.map_err(sqlite_read_err("aggregate_scoring_factors recovery row"))?
-            };
-
-            // Coherence decay series — bucketed pass-rate. Bucket on
-            // floor(epoch / bucket_secs) * bucket_secs.
-            let decay_sql = format!(
-                "WITH per_trace AS ( \
-                         SELECT trace_id, MIN(ts) AS started_at, \
-                                MIN(CASE WHEN event_type = 'CONSCIENCE_RESULT' \
-                                    THEN json_extract(payload, '$.coherence_passed') \
-                                    ELSE 1 END) AS coherence_passed \
-                         FROM trace_events \
-                         WHERE agent_id_hash = ?1 AND ts >= ?2 AND ts < ?3 AND {scope_frag} \
-                         GROUP BY trace_id \
-                     ) \
-                     SELECT (CAST(strftime('%s', started_at) AS INTEGER) / {bucket_secs}) \
-                                * {bucket_secs} AS bucket_epoch, \
-                            COUNT(*) AS trace_count, \
-                            SUM(CASE WHEN coherence_passed = 1 THEN 1 ELSE 0 END) \
-                                AS coherence_passed_count \
-                     FROM per_trace GROUP BY bucket_epoch ORDER BY bucket_epoch ASC"
-            );
-            let coherence_decay_series: Vec<crate::read::CoherencePoint> = {
-                let mut stmt = conn
-                    .prepare(&decay_sql)
-                    .map_err(sqlite_read_err("aggregate_scoring_factors decay prepare"))?;
-                let collected = stmt
-                    .query_map(params_from_iter(mk_binds().iter()), |row| {
-                        let bucket_epoch: i64 = row.get("bucket_epoch")?;
-                        let tc: i64 = row.get("trace_count")?;
-                        let pc: i64 = row.get("coherence_passed_count")?;
-                        let at = chrono::DateTime::<chrono::Utc>::from_timestamp(bucket_epoch, 0)
-                            .unwrap_or_else(chrono::Utc::now);
-                        Ok(crate::read::CoherencePoint {
-                            at,
-                            coherence_passed_count: pc,
-                            trace_count: tc,
-                            coherence_pass_rate: if tc > 0 { pc as f64 / tc as f64 } else { 0.0 },
-                        })
-                    })
-                    .map_err(sqlite_read_err("aggregate_scoring_factors decay query"))?
-                    .collect::<Result<Vec<_>, _>>();
-                collected.map_err(sqlite_read_err("aggregate_scoring_factors decay row"))?
-            };
-
-            Ok(crate::read::ScoringFactorAggregate {
-                agent_id_hash: agent,
+        // CIRISPersist#195 — route the streaming singular path through
+        // batch-of-one so it shares the scoring-factors cache with the
+        // fleet batch path. The batch impl IS a loop over the per-agent
+        // compute, so batch-of-one is exactly the prior singular answer.
+        let mut out = self
+            .aggregate_scoring_factors_batch(
+                std::slice::from_ref(&agent_id_hash.to_owned()),
                 window,
-                trace_count: main.trace_count,
-                identity_changes: main.identity_changes,
-                conscience_overrides: main.conscience_overrides,
-                audit_chain_total: main.audit_chain_total,
-                audit_chain_gaps,
-                audit_signed_total: main.audit_signed_total,
-                recovery_events,
-                // drift_z_score filled in by the caller below.
-                drift_z_score: None,
-                calibration_error: None,
-                unsafe_action_rate,
-                coherence_decay_series,
-            })
-        })()?;
-
-        // Drift z-score: when a baseline window is supplied, surface the
-        // CSDMA significance from temporal_drift (matches Postgres).
-        let mut agg = agg;
-        if let Some(base) = baseline_window {
-            let drift_rows = self
-                .temporal_drift(agent_id_hash, base, window, drift_scope)
-                .await?;
-            agg.drift_z_score = drift_rows
-                .iter()
-                .find(|r| r.deviation_metric == crate::read::DeviationMetric::CsdmaPlausibility)
-                .map(|r| r.significance);
-        }
-        Ok(agg)
+                baseline_window,
+                scope,
+            )
+            .await?;
+        // batch-of-one always returns exactly one element (input
+        // non-empty → one aggregate per requested agent).
+        Ok(out.remove(0))
     }
 
     async fn aggregate_scoring_factors_batch(
@@ -10344,16 +10139,57 @@ impl crate::read::ReadEngine for SqliteBackend {
         baseline_window: Option<crate::read::TimeWindow>,
         scope: crate::scope::CallerScope,
     ) -> Result<Vec<crate::read::ScoringFactorAggregate>, crate::read::Error> {
+        use crate::ceg::aggregates::scoring;
+
         if agent_id_hashes.is_empty() {
             return Ok(Vec::new());
         }
+
+        // CIRISPersist#195 — substrate cache (§7), at parity with
+        // `get_repository_statistics`. The whole batch is one entry keyed
+        // on the sorted agent set + window + baseline + ingest watermark.
+        let cache = &self.scoring_factors_cache;
+        let watermark = self
+            .scoring_ingest_watermark_ms(agent_id_hashes, &scope)
+            .await?;
+        let key = scoring::scoring_factors_cache_key(
+            agent_id_hashes,
+            &window,
+            baseline_window.as_ref(),
+            &scope,
+            watermark,
+            cache.config().invalidation_bucket,
+        );
+        if let Some(cached) = cache.try_get(&key) {
+            // Stored entry carries `cache_hit: false` (its value at
+            // compute time); flip it on each served clone so the result
+            // reports the served-from-cache fact (FSD §6.1 / §7.4). The
+            // original `evaluated_at_unix_ms` is preserved.
+            //
+            // The entry is shared set-wise (sorted-agent key), but the
+            // batch contract returns one aggregate per agent in *input*
+            // order — so remap the cached set onto the caller's order.
+            let mut hit = (*cached).clone();
+            for a in &mut hit {
+                a.cache_hit = true;
+            }
+            return Ok(scoring::reorder_scoring_to_input(hit, agent_id_hashes));
+        }
+
         let mut out = Vec::with_capacity(agent_id_hashes.len());
         for aid in agent_id_hashes {
             out.push(
-                self.aggregate_scoring_factors(aid, window, baseline_window, scope.clone())
-                    .await?,
+                self.aggregate_scoring_factors_uncached(
+                    aid,
+                    window,
+                    baseline_window,
+                    scope.clone(),
+                )
+                .await?,
             );
         }
+        let size = scoring::estimate_size(&out);
+        cache.store(key, out.clone(), size);
         Ok(out)
     }
 
@@ -10699,6 +10535,312 @@ fn raw_to_calibration_bundle(
         signing_key_id: r.signing_key_id,
         inserted_at: parse_rfc3339(&r.inserted_at),
     })
+}
+
+impl SqliteBackend {
+    /// CIRISPersist#195 — the uncached per-agent scoring-factor compute.
+    /// Factored out of the (now batch-of-one) public
+    /// [`aggregate_scoring_factors`](crate::read::ReadEngine::aggregate_scoring_factors)
+    /// so the batch path can loop over it under one shared cache entry.
+    async fn aggregate_scoring_factors_uncached(
+        &self,
+        agent_id_hash: &str,
+        window: crate::read::TimeWindow,
+        baseline_window: Option<crate::read::TimeWindow>,
+        scope: crate::scope::CallerScope,
+    ) -> Result<crate::read::ScoringFactorAggregate, crate::read::Error> {
+        // `temporal_drift` is a `ReadEngine` trait method; bring it into
+        // scope for the drift sub-call below.
+        use crate::read::ReadEngine as _;
+        let agent = agent_id_hash.to_owned();
+        let since = window.since.to_rfc3339();
+        let until = window.until.to_rfc3339();
+        let window_secs = (window.until - window.since).num_seconds().max(1);
+        let bucket_secs = (window_secs / 24).max(60);
+        // §4.3 scope gate — agent/since/until are ?1/?2/?3 in every
+        // sub-query, scope binds start at ?4. The drift sub-call below
+        // receives the same scope.
+        let (scope_frag, scope_binds) = crate::store::scope_bind::scope_predicate_sqlite(
+            &scope,
+            "cohort_scope",
+            "cohort_target_id",
+            3,
+        );
+        let drift_scope = scope.clone();
+        let conn = self.conn.clone();
+        let agg = (move || -> Result<crate::read::ScoringFactorAggregate, crate::read::Error> {
+            let conn = conn.lock();
+            // [agent, since, until] then scope binds — shared by every
+            // sub-query.
+            let mk_binds = || {
+                let mut b: Vec<SqlValue> = vec![
+                    SqlValue::Text(agent.clone()),
+                    SqlValue::Text(since.clone()),
+                    SqlValue::Text(until.clone()),
+                ];
+                b.extend(scope_binds.iter().cloned());
+                b
+            };
+
+            // Main per-trace collapse + window-wide counts.
+            let main_sql = format!(
+                "WITH per_trace AS ( \
+                       SELECT trace_id, MIN(agent_name) AS agent_name, \
+                              MAX(CASE WHEN event_type = 'CONSCIENCE_RESULT' \
+                                  AND json_extract(payload, '$.action_was_overridden') = 1 \
+                                  THEN 1 ELSE 0 END) AS was_overridden, \
+                              MAX(CASE WHEN event_type = 'CONSCIENCE_RESULT' \
+                                  AND json_extract(payload, '$.conscience_passed') = 0 \
+                                  THEN 1 ELSE 0 END) AS conscience_failed, \
+                              MAX(CASE WHEN event_type = 'ACTION_RESULT' \
+                                  AND json_extract(payload, '$.success') = 1 \
+                                  THEN 1 ELSE 0 END) AS action_succeeded, \
+                              MAX(CASE WHEN audit_sequence_number IS NOT NULL \
+                                  THEN 1 ELSE 0 END) AS has_audit_seq, \
+                              MAX(CASE WHEN audit_signature IS NOT NULL \
+                                  THEN 1 ELSE 0 END) AS has_audit_sig \
+                       FROM trace_events \
+                       WHERE agent_id_hash = ?1 AND ts >= ?2 AND ts < ?3 AND {scope_frag} \
+                       GROUP BY trace_id \
+                   ) \
+                   SELECT COUNT(*) AS trace_count, \
+                          MAX(COUNT(DISTINCT agent_name) - 1, 0) AS identity_changes, \
+                          COALESCE(SUM(was_overridden), 0) AS conscience_overrides, \
+                          COALESCE(SUM(has_audit_seq), 0) AS audit_chain_total, \
+                          COALESCE(SUM(has_audit_sig), 0) AS audit_signed_total, \
+                          COALESCE(SUM(CASE WHEN conscience_failed = 1 \
+                              AND action_succeeded = 1 THEN 1 ELSE 0 END), 0) \
+                              AS unsafe_action_count \
+                   FROM per_trace"
+            );
+            struct Main {
+                trace_count: i64,
+                identity_changes: i64,
+                conscience_overrides: i64,
+                audit_chain_total: i64,
+                audit_signed_total: i64,
+                unsafe_action_count: i64,
+            }
+            let main = {
+                let mut stmt = conn
+                    .prepare(&main_sql)
+                    .map_err(sqlite_read_err("aggregate_scoring_factors main prepare"))?;
+                stmt.query_row(params_from_iter(mk_binds().iter()), |row| {
+                    Ok(Main {
+                        trace_count: row.get("trace_count")?,
+                        identity_changes: row.get("identity_changes")?,
+                        conscience_overrides: row.get("conscience_overrides")?,
+                        audit_chain_total: row.get("audit_chain_total")?,
+                        audit_signed_total: row.get("audit_signed_total")?,
+                        unsafe_action_count: row.get("unsafe_action_count")?,
+                    })
+                })
+                .map_err(sqlite_read_err("aggregate_scoring_factors main"))?
+            };
+            let unsafe_action_rate = if main.trace_count > 0 {
+                main.unsafe_action_count as f64 / main.trace_count as f64
+            } else {
+                0.0
+            };
+
+            // Audit-chain gap count via LAG window.
+            let gaps_sql = format!(
+                "WITH ordered AS ( \
+                                    SELECT audit_sequence_number AS seq, \
+                                           LAG(audit_sequence_number) OVER w AS prev_seq \
+                                    FROM trace_events \
+                                    WHERE agent_id_hash = ?1 AND ts >= ?2 AND ts < ?3 AND {scope_frag} \
+                                          AND audit_sequence_number IS NOT NULL \
+                                    WINDOW w AS (ORDER BY audit_sequence_number) \
+                                ) \
+                                SELECT COUNT(*) AS gap_count FROM ordered \
+                                WHERE prev_seq IS NOT NULL AND seq > prev_seq + 1"
+            );
+            let audit_chain_gaps: i64 = {
+                let mut stmt = conn
+                    .prepare(&gaps_sql)
+                    .map_err(sqlite_read_err("aggregate_scoring_factors gaps prepare"))?;
+                stmt.query_row(params_from_iter(mk_binds().iter()), |r| r.get("gap_count"))
+                    .map_err(sqlite_read_err("aggregate_scoring_factors gaps"))?
+            };
+
+            // Recovery events: top-50 most recent override→pass pairs.
+            let recovery_sql = format!(
+                "WITH per_trace AS ( \
+                       SELECT trace_id, MIN(ts) AS started_at, MAX(ts) AS completed_at, \
+                              MAX(CASE WHEN event_type = 'CONSCIENCE_RESULT' \
+                                  AND json_extract(payload, '$.action_was_overridden') = 1 \
+                                  THEN 1 ELSE 0 END) AS was_overridden, \
+                              MIN(CASE WHEN event_type = 'CONSCIENCE_RESULT' \
+                                  THEN json_extract(payload, '$.coherence_passed') \
+                                  ELSE 1 END) AS coherence_passed \
+                       FROM trace_events \
+                       WHERE agent_id_hash = ?1 AND ts >= ?2 AND ts < ?3 AND {scope_frag} \
+                       GROUP BY trace_id \
+                   ), \
+                   ordered AS ( \
+                       SELECT trace_id, started_at, completed_at, was_overridden, \
+                              LEAD(trace_id) OVER w AS next_trace_id, \
+                              LEAD(started_at) OVER w AS next_started_at, \
+                              LEAD(coherence_passed) OVER w AS next_coherence_passed \
+                       FROM per_trace WINDOW w AS (ORDER BY started_at) \
+                   ) \
+                   SELECT trace_id AS override_trace_id, completed_at AS override_at, \
+                          next_trace_id AS recovery_trace_id, \
+                          next_started_at AS recovery_at \
+                   FROM ordered \
+                   WHERE was_overridden = 1 AND next_trace_id IS NOT NULL \
+                         AND next_coherence_passed = 1 \
+                   ORDER BY override_at DESC LIMIT 50"
+            );
+            let recovery_events: Vec<crate::read::RecoveryEvent> = {
+                let mut stmt = conn.prepare(&recovery_sql).map_err(sqlite_read_err(
+                    "aggregate_scoring_factors recovery prepare",
+                ))?;
+                let collected = stmt
+                    .query_map(params_from_iter(mk_binds().iter()), |row| {
+                        let override_at: String = row.get("override_at")?;
+                        let recovery_at: String = row.get("recovery_at")?;
+                        let o = parse_rfc3339(&override_at);
+                        let r = parse_rfc3339(&recovery_at);
+                        Ok(crate::read::RecoveryEvent {
+                            override_trace_id: row.get("override_trace_id")?,
+                            override_at: o,
+                            recovery_trace_id: row.get("recovery_trace_id")?,
+                            recovery_at: r,
+                            recovery_latency_seconds: (r - o).num_milliseconds() as f64 / 1000.0,
+                        })
+                    })
+                    .map_err(sqlite_read_err("aggregate_scoring_factors recovery query"))?
+                    .collect::<Result<Vec<_>, _>>();
+                collected.map_err(sqlite_read_err("aggregate_scoring_factors recovery row"))?
+            };
+
+            // Coherence decay series — bucketed pass-rate. Bucket on
+            // floor(epoch / bucket_secs) * bucket_secs.
+            let decay_sql = format!(
+                "WITH per_trace AS ( \
+                         SELECT trace_id, MIN(ts) AS started_at, \
+                                MIN(CASE WHEN event_type = 'CONSCIENCE_RESULT' \
+                                    THEN json_extract(payload, '$.coherence_passed') \
+                                    ELSE 1 END) AS coherence_passed \
+                         FROM trace_events \
+                         WHERE agent_id_hash = ?1 AND ts >= ?2 AND ts < ?3 AND {scope_frag} \
+                         GROUP BY trace_id \
+                     ) \
+                     SELECT (CAST(strftime('%s', started_at) AS INTEGER) / {bucket_secs}) \
+                                * {bucket_secs} AS bucket_epoch, \
+                            COUNT(*) AS trace_count, \
+                            SUM(CASE WHEN coherence_passed = 1 THEN 1 ELSE 0 END) \
+                                AS coherence_passed_count \
+                     FROM per_trace GROUP BY bucket_epoch ORDER BY bucket_epoch ASC"
+            );
+            let coherence_decay_series: Vec<crate::read::CoherencePoint> = {
+                let mut stmt = conn
+                    .prepare(&decay_sql)
+                    .map_err(sqlite_read_err("aggregate_scoring_factors decay prepare"))?;
+                let collected = stmt
+                    .query_map(params_from_iter(mk_binds().iter()), |row| {
+                        let bucket_epoch: i64 = row.get("bucket_epoch")?;
+                        let tc: i64 = row.get("trace_count")?;
+                        let pc: i64 = row.get("coherence_passed_count")?;
+                        let at = chrono::DateTime::<chrono::Utc>::from_timestamp(bucket_epoch, 0)
+                            .unwrap_or_else(chrono::Utc::now);
+                        Ok(crate::read::CoherencePoint {
+                            at,
+                            coherence_passed_count: pc,
+                            trace_count: tc,
+                            coherence_pass_rate: if tc > 0 { pc as f64 / tc as f64 } else { 0.0 },
+                        })
+                    })
+                    .map_err(sqlite_read_err("aggregate_scoring_factors decay query"))?
+                    .collect::<Result<Vec<_>, _>>();
+                collected.map_err(sqlite_read_err("aggregate_scoring_factors decay row"))?
+            };
+
+            Ok(crate::read::ScoringFactorAggregate {
+                agent_id_hash: agent,
+                window,
+                trace_count: main.trace_count,
+                identity_changes: main.identity_changes,
+                conscience_overrides: main.conscience_overrides,
+                audit_chain_total: main.audit_chain_total,
+                audit_chain_gaps,
+                audit_signed_total: main.audit_signed_total,
+                recovery_events,
+                // drift_z_score filled in by the caller below.
+                drift_z_score: None,
+                calibration_error: None,
+                unsafe_action_rate,
+                coherence_decay_series,
+                // CIRISPersist#195 — compute-time honesty fields. The
+                // batch caller stamps `evaluated_at` once for the whole
+                // batch; here we set it per-aggregate at compute time.
+                evaluated_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+                cache_hit: false,
+            })
+        })()?;
+
+        // Drift z-score: when a baseline window is supplied, surface the
+        // CSDMA significance from temporal_drift (matches Postgres).
+        let mut agg = agg;
+        if let Some(base) = baseline_window {
+            let drift_rows = self
+                .temporal_drift(agent_id_hash, base, window, drift_scope)
+                .await?;
+            agg.drift_z_score = drift_rows
+                .iter()
+                .find(|r| r.deviation_metric == crate::read::DeviationMetric::CsdmaPlausibility)
+                .map(|r| r.significance);
+        }
+        Ok(agg)
+    }
+    /// CIRISPersist#195 — the ingest watermark for the scoring-factors
+    /// cache key: `max(ts)` over the requested agents under the SAME
+    /// §4.3 scope predicate the compute applies. New ingest for any
+    /// requested agent advances this → new cache key → miss → recompute
+    /// (the §7.3 invalidation signal for this primitive). Returns the
+    /// max-`ts` unix-ms, or 0 when no matching rows exist.
+    async fn scoring_ingest_watermark_ms(
+        &self,
+        agent_id_hashes: &[String],
+        scope: &crate::scope::CallerScope,
+    ) -> Result<i64, crate::read::Error> {
+        let mut binds: Vec<SqlValue> = Vec::new();
+        let mut ph = Vec::new();
+        for h in agent_id_hashes {
+            binds.push(SqlValue::Text(h.clone()));
+            ph.push(format!("?{}", binds.len()));
+        }
+        let in_list = ph.join(",");
+        let (scope_frag, scope_binds) = crate::store::scope_bind::scope_predicate_sqlite(
+            scope,
+            "cohort_scope",
+            "cohort_target_id",
+            binds.len(),
+        );
+        binds.extend(scope_binds);
+        // MAX(ts) over the requested agents under the scope predicate.
+        // ts is RFC3339 text; MAX over the lexicographically-sortable
+        // RFC3339 form is the chronological max. Parse to unix-ms.
+        let sql = format!(
+            "SELECT MAX(ts) AS w FROM trace_events \
+             WHERE agent_id_hash IN ({in_list}) AND {scope_frag}"
+        );
+        let conn = self.conn.clone();
+        (move || -> Result<i64, crate::read::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(sqlite_read_err("scoring_ingest_watermark prepare"))?;
+            let w: Option<String> = stmt
+                .query_row(params_from_iter(binds.iter()), |r| r.get("w"))
+                .optional()
+                .map_err(sqlite_read_err("scoring_ingest_watermark query"))?
+                .flatten();
+            Ok(w.map(|s| parse_rfc3339(&s).timestamp_millis()).unwrap_or(0))
+        })()
+    }
 }
 
 const SQLITE_BUNDLE_SELECT: &str = "SELECT \
@@ -17795,6 +17937,230 @@ mod tests {
             agg.drift_z_score.is_some(),
             "baseline supplied → drift z-score computed"
         );
+    }
+
+    // ─── CIRISPersist#195 — scoring-factors cache (§7) ─────────────
+
+    fn scoring_window() -> crate::ceg::types::TimeWindow {
+        crate::ceg::types::TimeWindow::new(
+            Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 5, 2, 0, 0, 0).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// Cache HIT: the second identical batch call is served from cache —
+    /// `cache_hit: true`, preserved `evaluated_at_unix_ms`.
+    #[tokio::test]
+    async fn re_scoring_factors_cache_hit() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        insert_trace(
+            &backend,
+            "t1",
+            None,
+            0,
+            "agent-h",
+            "Scout",
+            "legal",
+            true,
+            0.40,
+            Some(1),
+        )
+        .await;
+        let window = scoring_window();
+
+        let a = backend
+            .aggregate_scoring_factors_batch(
+                &["agent-h".to_owned()],
+                window,
+                None,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
+        assert!(!a[0].cache_hit, "first call is a fresh compute");
+        assert!(a[0].evaluated_at_unix_ms > 0);
+
+        let b = backend
+            .aggregate_scoring_factors_batch(
+                &["agent-h".to_owned()],
+                window,
+                None,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
+        assert!(b[0].cache_hit, "second identical call hits the cache");
+        assert_eq!(
+            a[0].evaluated_at_unix_ms, b[0].evaluated_at_unix_ms,
+            "the hit preserves the cached evaluation time"
+        );
+        assert_eq!(a[0].trace_count, b[0].trace_count);
+
+        let stats = backend.scoring_factors_cache().stats();
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.hits, 1);
+
+        // The singular streaming path shares the cache: a third call via
+        // `aggregate_scoring_factors` (batch-of-one) is also a hit.
+        let c = backend
+            .aggregate_scoring_factors(
+                "agent-h",
+                window,
+                None,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
+        assert!(c.cache_hit, "singular path shares the batch cache entry");
+        assert_eq!(backend.scoring_factors_cache().stats().hits, 2);
+    }
+
+    /// Watermark INVALIDATION: ingesting a new trace_event for a
+    /// requested agent flips a prior hit back to a miss (fresh
+    /// `cache_hit: false` + advanced `evaluated_at_unix_ms`).
+    #[tokio::test]
+    async fn re_scoring_factors_cache_watermark_invalidation() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        insert_trace(
+            &backend,
+            "t1",
+            None,
+            0,
+            "agent-h",
+            "Scout",
+            "legal",
+            true,
+            0.40,
+            Some(1),
+        )
+        .await;
+        let window = scoring_window();
+
+        let a = backend
+            .aggregate_scoring_factors_batch(
+                &["agent-h".to_owned()],
+                window,
+                None,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
+        assert!(!a[0].cache_hit);
+        assert_eq!(a[0].trace_count, 1);
+
+        // Confirm it WOULD hit absent new ingest.
+        let hit = backend
+            .aggregate_scoring_factors_batch(
+                &["agent-h".to_owned()],
+                window,
+                None,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
+        assert!(hit[0].cache_hit, "no new ingest → hit");
+
+        // Ingest a NEW trace for the requested agent (later ts → advances
+        // max(ts) watermark → new key → miss → recompute).
+        insert_trace(
+            &backend,
+            "t2",
+            None,
+            60,
+            "agent-h",
+            "Scout",
+            "legal",
+            false,
+            0.55,
+            Some(2),
+        )
+        .await;
+
+        let after = backend
+            .aggregate_scoring_factors_batch(
+                &["agent-h".to_owned()],
+                window,
+                None,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !after[0].cache_hit,
+            "new ingest advanced the watermark → fresh compute, not stale"
+        );
+        assert_eq!(after[0].trace_count, 2, "the new trace is reflected");
+        assert!(
+            after[0].evaluated_at_unix_ms >= a[0].evaluated_at_unix_ms,
+            "the fresh eval time advanced"
+        );
+    }
+
+    /// Agent-set ORDER INDEPENDENCE: the same agent set in a different
+    /// caller order produces the same key → a hit.
+    #[tokio::test]
+    async fn re_scoring_factors_cache_agent_set_order_independent() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        insert_trace(
+            &backend,
+            "a1",
+            None,
+            0,
+            "agent-a",
+            "Scout",
+            "legal",
+            false,
+            0.40,
+            Some(1),
+        )
+        .await;
+        insert_trace(
+            &backend,
+            "b1",
+            None,
+            0,
+            "agent-b",
+            "Scout",
+            "legal",
+            false,
+            0.40,
+            Some(1),
+        )
+        .await;
+        let window = scoring_window();
+
+        let first = backend
+            .aggregate_scoring_factors_batch(
+                &["agent-a".to_owned(), "agent-b".to_owned()],
+                window,
+                None,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
+        assert!(first.iter().all(|a| !a.cache_hit));
+
+        // Same set, reversed caller order → same key → hit.
+        let second = backend
+            .aggregate_scoring_factors_batch(
+                &["agent-b".to_owned(), "agent-a".to_owned()],
+                window,
+                None,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
+        assert!(
+            second.iter().all(|a| a.cache_hit),
+            "reversed agent order must hit the same entry (set-semantics)"
+        );
+        let stats = backend.scoring_factors_cache().stats();
+        assert_eq!(stats.misses, 1, "exactly one compute");
+        assert_eq!(stats.hits, 1);
     }
 
     // ─── DerivedSchema (cirislens_derived) round-trips ─────────────
